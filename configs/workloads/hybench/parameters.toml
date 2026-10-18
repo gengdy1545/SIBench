@@ -1,0 +1,36 @@
+# Derived small dataset for integration validation, not standard HyBench SF.
+[smoke]
+startYear = 2014
+midPoint = 2019
+endYear = 2024
+startDate = "2014-01-01"
+midPointDate="2019-01-01"
+endDate = "2023-12-31"
+LoanDate = "2023-10-01"
+cust_rate = 0.8
+loan_rate = 0.2
+prob_blocked = 0.01
+savingaccount_datapath="savingAccount.csv"
+checkingaccount_datapath="checkingAccount.csv"
+tranfer_datapath="transfer.csv"
+checking_datapath="checking.csv"
+loanapps_datapath="loanApps.csv"
+loantrans_datapath="loanTrans.csv"
+customer_number = 1000
+customer_age_lower = 18
+customer_age_upper = 60
+customer_loanbalance = 10000
+customer_checkingbalance = 5000
+customer_savingbalance = 2000
+customer_datapath = "customer.csv"
+company_loanbalance = 1000000
+company_checkingbalance = 100000
+company_savingbalance = 10000
+company_number = 10
+company_size_lower = 10
+company_size_upper = 100
+company_datapath = "company.csv"
+transfer_number = 10000
+checking_number = 1000
+loanapps_number = 1000
+loantrans_number = 1000

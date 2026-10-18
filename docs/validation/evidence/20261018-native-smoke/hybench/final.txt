@@ -1,0 +1,8 @@
+customer|1000
+company|10
+savingaccount|1010
+checkingaccount|1010
+transfer|71386
+checking|1000
+loanapps|1000
+loantrans|1000

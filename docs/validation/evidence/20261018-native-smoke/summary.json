@@ -1,0 +1,42 @@
+{
+  "date": "2026-10-18T22:23:16.412449+08:00",
+  "scope": "phase-one native PostgreSQL smoke, not performance comparison",
+  "source_commits": {
+    "ycsb": "66302f301b13f60d4bcb2f29f478586bb1d6f2e0",
+    "sysbench": "3ceba0b1e115f8c50d1d045a4574d8ed643bd497",
+    "hybench": "eaad91b52956fddd3d48ce49f792928056b7b360"
+  },
+  "runs": {
+    "ycsb": {
+      "run_directory": "results/phase1/ycsb-20261018-222152-183085",
+      "status": "passed",
+      "initial": "1000|user00000000|user00000999",
+      "final": "1000|user00000000|user00000999"
+    },
+    "sysbench": {
+      "run_directory": "results/phase1/sysbench-20261018-222152-170724",
+      "status": "passed",
+      "initial": "1000|1|1000",
+      "final": "1000|1|1000"
+    },
+    "hybench": {
+      "run_directory": "results/phase1/hybench-20261018-222150-993068",
+      "status": "passed",
+      "initial": "customer|1000\ncompany|10\nsavingaccount|1010\ncheckingaccount|1010\ntransfer|10000\nchecking|1000\nloanapps|1000\nloantrans|1000",
+      "final": "customer|1000\ncompany|10\nsavingaccount|1010\ncheckingaccount|1010\ntransfer|71386\nchecking|1000\nloanapps|1000\nloantrans|1000"
+    }
+  },
+  "environment": {
+    "java": "openjdk version \"17.0.20\" 2026-07-21\nOpenJDK Runtime Environment (build 17.0.20+8-1-22.04-Ubuntu)\nOpenJDK 64-Bit Server VM (build 17.0.20+8-1-22.04-Ubuntu, mixed mode, sharing)",
+    "postgres": "postgres (PostgreSQL) 14.24 (Ubuntu 14.24-0ubuntu0.22.04.1)",
+    "sysbench": "sysbench 1.1.0",
+    "maven": "Apache Maven 3.9.8 (36645f6c9b5079805ea5009217e36f2cffd34256)\nMaven home: /mnt/disk1/opt/maven\nJava version: 23.0.2, vendor: Azul Systems, Inc., runtime: /usr/lib/jvm/zulu-23-amd64\nDefault locale: en, platform encoding: UTF-8\nOS name: \"linux\", version: \"5.15.0-171-generic\", arch: \"amd64\", family: \"unix\"",
+    "maven_note": "mvn -version reflects shell default Java; builds use JAVA_HOME=Java17 explicitly."
+  },
+  "limitations": [
+    "No index server/object storage execution",
+    "HyBench Maven dependency graph blocked; javac path validated",
+    "Derived workloads; no full standard-suite validation",
+    "First sysbench config-file attempt loaded 10000 rather than 1000; excluded"
+  ]
+}

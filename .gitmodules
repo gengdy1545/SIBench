@@ -1,12 +1,12 @@
 [submodule "HyBench-2024"]
-	path = HyBench-2024
+	path = benchmark/HyBench-2024
 	url = https://github.com/gengdy1545/HyBench-2024.git
 	branch = master
 [submodule "sysbench"]
-	path = sysbench
+	path = benchmark/sysbench
 	url = https://github.com/gengdy1545/sysbench.git
 	branch = master
 [submodule "YCSB"]
-	path = YCSB
+	path = benchmark/YCSB
 	url = https://github.com/gengdy1545/YCSB.git
 	branch = master

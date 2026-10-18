@@ -1,0 +1,192 @@
+{
+  "benchmark": "hybench",
+  "started_at": "20261018-234303-269208",
+  "port": 55432,
+  "steps": [
+    {
+      "name": "create-database",
+      "argv": [
+        "/mnt/disk1/SIBench/build/services/postgres/runtime/usr/lib/postgresql/14/bin/psql",
+        "-X",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "55432",
+        "-U",
+        "postgres",
+        "-d",
+        "postgres",
+        "-c",
+        "CREATE DATABASE sibench_hybench"
+      ],
+      "cwd": "/mnt/disk1/SIBench",
+      "exit_code": 0
+    },
+    {
+      "name": "generate",
+      "argv": [
+        "/usr/lib/jvm/java-17-openjdk-amd64/bin/java",
+        "-cp",
+        "/mnt/disk1/SIBench/results/native-validation/hybench-20261018-234303-269208/resources:/mnt/disk1/SIBench/build/benchmarks/HyBench-2024/target/classes:/mnt/disk1/SIBench/build/benchmarks/HyBench-2024/lib/*",
+        "com.hybench.HyBench",
+        "-c",
+        "/mnt/disk1/SIBench/results/native-validation/hybench-20261018-234303-269208/hybench.props",
+        "-t",
+        "gendata"
+      ],
+      "cwd": "/mnt/disk1/SIBench/results/native-validation/hybench-20261018-234303-269208",
+      "exit_code": 0
+    },
+    {
+      "name": "ddl",
+      "argv": [
+        "/mnt/disk1/SIBench/build/services/postgres/runtime/usr/lib/postgresql/14/bin/psql",
+        "-X",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "55432",
+        "-U",
+        "postgres",
+        "-d",
+        "sibench_hybench",
+        "-f",
+        "/mnt/disk1/SIBench/build/benchmarks/HyBench-2024/conf/ddl_pg.sql"
+      ],
+      "cwd": "/mnt/disk1/SIBench",
+      "exit_code": 0
+    },
+    {
+      "name": "load",
+      "argv": [
+        "/mnt/disk1/SIBench/build/services/postgres/runtime/usr/lib/postgresql/14/bin/psql",
+        "-X",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "55432",
+        "-U",
+        "postgres",
+        "-d",
+        "sibench_hybench",
+        "-f",
+        "/mnt/disk1/SIBench/results/native-validation/hybench-20261018-234303-269208/load.sql"
+      ],
+      "cwd": "/mnt/disk1/SIBench/results/native-validation/hybench-20261018-234303-269208",
+      "exit_code": 0
+    },
+    {
+      "name": "indexes",
+      "argv": [
+        "/mnt/disk1/SIBench/build/services/postgres/runtime/usr/lib/postgresql/14/bin/psql",
+        "-X",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "55432",
+        "-U",
+        "postgres",
+        "-d",
+        "sibench_hybench",
+        "-f",
+        "/mnt/disk1/SIBench/build/benchmarks/HyBench-2024/conf/create_index_pg.sql"
+      ],
+      "cwd": "/mnt/disk1/SIBench",
+      "exit_code": 0
+    },
+    {
+      "name": "initial",
+      "argv": [
+        "/mnt/disk1/SIBench/build/services/postgres/runtime/usr/lib/postgresql/14/bin/psql",
+        "-X",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "55432",
+        "-U",
+        "postgres",
+        "-d",
+        "sibench_hybench",
+        "-At",
+        "-c",
+        "SELECT 'customer',count(*) FROM customer UNION ALL SELECT 'company',count(*) FROM company UNION ALL SELECT 'savingaccount',count(*) FROM savingaccount UNION ALL SELECT 'checkingaccount',count(*) FROM checkingaccount UNION ALL SELECT 'transfer',count(*) FROM transfer UNION ALL SELECT 'checking',count(*) FROM checking UNION ALL SELECT 'loanapps',count(*) FROM loanapps UNION ALL SELECT 'loantrans',count(*) FROM loantrans"
+      ],
+      "cwd": "/mnt/disk1/SIBench",
+      "exit_code": 0
+    },
+    {
+      "name": "run",
+      "argv": [
+        "/usr/lib/jvm/java-17-openjdk-amd64/bin/java",
+        "-cp",
+        "/mnt/disk1/SIBench/results/native-validation/hybench-20261018-234303-269208/resources:/mnt/disk1/SIBench/build/benchmarks/HyBench-2024/target/classes:/mnt/disk1/SIBench/build/benchmarks/HyBench-2024/lib/*",
+        "com.hybench.HyBench",
+        "-c",
+        "/mnt/disk1/SIBench/results/native-validation/hybench-20261018-234303-269208/hybench.props",
+        "-t",
+        "runtp",
+        "-f",
+        "/mnt/disk1/SIBench/build/benchmarks/HyBench-2024/conf/stmt_postgres.toml"
+      ],
+      "cwd": "/mnt/disk1/SIBench/results/native-validation/hybench-20261018-234303-269208",
+      "exit_code": 0
+    },
+    {
+      "name": "final",
+      "argv": [
+        "/mnt/disk1/SIBench/build/services/postgres/runtime/usr/lib/postgresql/14/bin/psql",
+        "-X",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "55432",
+        "-U",
+        "postgres",
+        "-d",
+        "sibench_hybench",
+        "-At",
+        "-c",
+        "SELECT 'customer',count(*) FROM customer UNION ALL SELECT 'company',count(*) FROM company UNION ALL SELECT 'savingaccount',count(*) FROM savingaccount UNION ALL SELECT 'checkingaccount',count(*) FROM checkingaccount UNION ALL SELECT 'transfer',count(*) FROM transfer UNION ALL SELECT 'checking',count(*) FROM checking UNION ALL SELECT 'loanapps',count(*) FROM loanapps UNION ALL SELECT 'loantrans',count(*) FROM loantrans"
+      ],
+      "cwd": "/mnt/disk1/SIBench",
+      "exit_code": 0
+    },
+    {
+      "name": "drop-database",
+      "argv": [
+        "/mnt/disk1/SIBench/build/services/postgres/runtime/usr/lib/postgresql/14/bin/psql",
+        "-X",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "55432",
+        "-U",
+        "postgres",
+        "-d",
+        "postgres",
+        "-c",
+        "DROP DATABASE sibench_hybench"
+      ],
+      "cwd": "/mnt/disk1/SIBench",
+      "exit_code": 0
+    }
+  ],
+  "scope": "native smoke; no trace capture or index server replay",
+  "initial": "customer|1000\ncompany|10\nsavingaccount|1010\ncheckingaccount|1010\ntransfer|10000\nchecking|1000\nloanapps|1000\nloantrans|1000",
+  "final": "customer|1000\ncompany|10\nsavingaccount|1010\ncheckingaccount|1010\ntransfer|72195\nchecking|1000\nloanapps|1000\nloantrans|1000",
+  "status": "passed"
+}

@@ -1,0 +1,116 @@
+2026-10-18 22:21:52 [main] INFO  HyBench:307 - Hi~Bench, HyBench
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:38 - ===============configuration==================
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - xapclient = 1
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - at2_percent = 25
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp2_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp16_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp18_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - dist = uniform
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp6_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - at4_percent = 15
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp8_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tpclient = 1
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - password = 
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - risk_rate = 0.1
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - power_alpha = 0.1
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - at6_percent = 3
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - apclient = 1
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp10_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - contention_num = 10
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp12_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp5_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp14_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp3_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - xpRunMins = 1
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - at1_percent = 35
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp1_percent = 50
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - at3_percent = 15
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp7_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp17_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - sf = smoke
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - username_ap = postgres
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp9_percent = 50
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - xtpclient = 1
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - apRunMins = 1
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - at5_percent = 7
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - url_ap = jdbc:postgresql://127.0.0.1:55432/sibench_hybench
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - classname_ap = org.postgresql.Driver
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - apround = 1
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - url_tp = jdbc:postgresql://127.0.0.1:55432/sibench_hybench
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - url = jdbc:postgresql://127.0.0.1:55432/sibench_hybench
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tpRunMins = 1
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp11_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp13_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - fresh_interval = 20
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - classname = org.postgresql.Driver
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - password_ap = 
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp15_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - db = postgreSQL
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - tp4_percent = 0
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:40 - username = postgres
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:42 - ===============configuration==================
+2026-10-18 22:21:52 [main] INFO  ConfigLoader:43 - 
+2026-10-18 22:21:52 [main] INFO  HyBench:57 - Begin TP Workload
+2026-10-18 22:21:52 [pool-3-thread-1] INFO  Client:326 - Begin to run :TPClient, Test Duration is 1 mins
+2026-10-18 22:21:58 [Thread-0] INFO  Client:360 - Transaction 1 : max rt : 12.0 | min rt :0.0 | avg rt : 0.11 | 95% rt : 1.00 | 99% rt : 1.00
+2026-10-18 22:21:58 [Thread-0] INFO  Client:360 - Transaction 9 : max rt : 9.0 | min rt :0.0 | avg rt : 0.89 | 95% rt : 1.00 | 99% rt : 2.00
+2026-10-18 22:21:58 [Thread-0] INFO  Client:370 - Current 1/10 time TP TPS is 1920.17
+2026-10-18 22:22:04 [Thread-0] INFO  Client:360 - Transaction 1 : max rt : 12.0 | min rt :0.0 | avg rt : 0.11 | 95% rt : 1.00 | 99% rt : 1.00
+2026-10-18 22:22:04 [Thread-0] INFO  Client:360 - Transaction 9 : max rt : 9.0 | min rt :0.0 | avg rt : 0.89 | 95% rt : 1.00 | 99% rt : 2.00
+2026-10-18 22:22:04 [Thread-0] INFO  Client:370 - Current 2/10 time TP TPS is 1945.83
+2026-10-18 22:22:10 [Thread-0] INFO  Client:360 - Transaction 1 : max rt : 12.0 | min rt :0.0 | avg rt : 0.11 | 95% rt : 1.00 | 99% rt : 1.00
+2026-10-18 22:22:10 [Thread-0] INFO  Client:360 - Transaction 9 : max rt : 9.0 | min rt :0.0 | avg rt : 0.88 | 95% rt : 1.00 | 99% rt : 2.00
+2026-10-18 22:22:10 [Thread-0] INFO  Client:370 - Current 3/10 time TP TPS is 1961.94
+2026-10-18 22:22:16 [Thread-0] INFO  Client:360 - Transaction 1 : max rt : 12.0 | min rt :0.0 | avg rt : 0.11 | 95% rt : 1.00 | 99% rt : 1.00
+2026-10-18 22:22:16 [Thread-0] INFO  Client:360 - Transaction 9 : max rt : 9.0 | min rt :0.0 | avg rt : 0.88 | 95% rt : 1.00 | 99% rt : 2.00
+2026-10-18 22:22:16 [Thread-0] INFO  Client:370 - Current 4/10 time TP TPS is 1985.25
+2026-10-18 22:22:22 [Thread-0] INFO  Client:360 - Transaction 1 : max rt : 12.0 | min rt :0.0 | avg rt : 0.11 | 95% rt : 1.00 | 99% rt : 1.00
+2026-10-18 22:22:22 [Thread-0] INFO  Client:360 - Transaction 9 : max rt : 9.0 | min rt :0.0 | avg rt : 0.87 | 95% rt : 1.00 | 99% rt : 2.00
+2026-10-18 22:22:22 [Thread-0] INFO  Client:370 - Current 5/10 time TP TPS is 1987.13
+2026-10-18 22:22:28 [Thread-0] INFO  Client:360 - Transaction 1 : max rt : 12.0 | min rt :0.0 | avg rt : 0.11 | 95% rt : 1.00 | 99% rt : 1.00
+2026-10-18 22:22:28 [Thread-0] INFO  Client:360 - Transaction 9 : max rt : 9.0 | min rt :0.0 | avg rt : 0.87 | 95% rt : 1.00 | 99% rt : 2.00
+2026-10-18 22:22:28 [Thread-0] INFO  Client:370 - Current 6/10 time TP TPS is 1993.06
+2026-10-18 22:22:34 [Thread-0] INFO  Client:360 - Transaction 1 : max rt : 12.0 | min rt :0.0 | avg rt : 0.11 | 95% rt : 1.00 | 99% rt : 1.00
+2026-10-18 22:22:34 [Thread-0] INFO  Client:360 - Transaction 9 : max rt : 9.0 | min rt :0.0 | avg rt : 0.87 | 95% rt : 1.00 | 99% rt : 2.00
+2026-10-18 22:22:34 [Thread-0] INFO  Client:370 - Current 7/10 time TP TPS is 1993.93
+2026-10-18 22:22:40 [Thread-0] INFO  Client:360 - Transaction 1 : max rt : 12.0 | min rt :0.0 | avg rt : 0.11 | 95% rt : 1.00 | 99% rt : 1.00
+2026-10-18 22:22:40 [Thread-0] INFO  Client:360 - Transaction 9 : max rt : 9.0 | min rt :0.0 | avg rt : 0.86 | 95% rt : 1.00 | 99% rt : 2.00
+2026-10-18 22:22:40 [Thread-0] INFO  Client:370 - Current 8/10 time TP TPS is 2011.98
+2026-10-18 22:22:46 [Thread-0] INFO  Client:360 - Transaction 1 : max rt : 12.0 | min rt :0.0 | avg rt : 0.11 | 95% rt : 1.00 | 99% rt : 1.00
+2026-10-18 22:22:46 [Thread-0] INFO  Client:360 - Transaction 9 : max rt : 9.0 | min rt :0.0 | avg rt : 0.86 | 95% rt : 1.00 | 99% rt : 2.00
+2026-10-18 22:22:46 [Thread-0] INFO  Client:370 - Current 9/10 time TP TPS is 2018.31
+2026-10-18 22:22:52 [Thread-0] INFO  Client:360 - Transaction 1 : max rt : 12.0 | min rt :0.0 | avg rt : 0.12 | 95% rt : 1.00 | 99% rt : 1.00
+2026-10-18 22:22:52 [Thread-0] INFO  Client:360 - Transaction 9 : max rt : 34.0 | min rt :0.0 | avg rt : 0.86 | 95% rt : 1.00 | 99% rt : 2.00
+2026-10-18 22:22:52 [Thread-0] INFO  Client:370 - Current 10/10 time TP TPS is 2024.05
+2026-10-18 22:22:52 [pool-3-thread-1] INFO  Client:461 - Finished to execute TPClient
+2026-10-18 22:22:52 [main] INFO  HyBench:101 - TP Workload is done.
+2026-10-18 22:22:52 [main] INFO  HyBench:387 - Congs~ Test is done! Bye!
+2026-10-18 22:22:52 [main] INFO  Result:166 - ====================Test Summary========================
+2026-10-18 22:22:52 [main] INFO  Result:167 - Test starts at 2026-10-18 22:21:52
+2026-10-18 22:22:52 [main] INFO  Result:168 - Test ends at 2026-10-18 22:22:52
+2026-10-18 22:22:52 [main] INFO  Result:169 - Risk Rate is 0.1
+2026-10-18 22:22:52 [main] INFO  Result:180 - AP Concurrency is 0
+2026-10-18 22:22:52 [main] INFO  Result:181 - TP Concurrency is 1
+2026-10-18 22:22:52 [main] INFO  Result:182 - Total amount of TP Transaction is 121444
+2026-10-18 22:22:52 [main] INFO  Result:183 - TPS is 2024.07
+2026-10-18 22:22:52 [main] INFO  Result:230 - Query/Transaction response time(ms) histogram : 
+------------TP-------------------
+TP Transaction  1 : max rt :      12.00 | min rt :       0.00 | avg rt :       0.12 | 95% rt :       1.00 | 99% rt :       1.00 
+TP Transaction  2 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction  3 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction  4 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction  5 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction  6 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction  7 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction  8 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction  9 : max rt :      34.00 | min rt :       0.00 | avg rt :       0.86 | 95% rt :       1.00 | 99% rt :       2.00 
+TP Transaction 10 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction 11 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction 12 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction 13 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction 14 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction 15 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction 16 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction 17 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+TP Transaction 18 : max rt :        NaN | min rt :        NaN | avg rt :        NaN | 95% rt :        NaN | 99% rt :        NaN 
+2026-10-18 22:22:52 [main] INFO  Result:317 - ====================Thank you!========================

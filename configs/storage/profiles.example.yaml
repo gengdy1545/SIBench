@@ -1,0 +1,42 @@
+# Design examples only. native_smoke.py does not load this file.
+contract_version: 1
+workload:
+  trace_manifest: null  # Produced by the trace capture implementation
+  value_bytes: 100
+  value_generator: deterministic_pseudorandom  # Algorithm version fixed in the trace capture implementation
+  seed: 42
+target:
+  adapter: null        # Actual index server not provided
+  endpoint: null
+artifacts:
+  kind: local
+  directory: results/
+storage_profiles:
+  local:
+    kind: local
+    server_config: null
+    placement: {index: local, value: local, wal: unknown, cache: unknown}
+    acknowledgement: unknown
+    cache_bytes: null
+  object:
+    kind: object
+    server_config: null
+    placement: {index: object, value: object, wal: unknown, cache: unknown}
+    object_store:
+      api: s3
+      provider: null
+      endpoint: null
+      region: null
+      bucket: null
+      prefix_template: 'sibench/{run_id}/'
+      access_key_env: SIBENCH_S3_ACCESS_KEY
+      secret_key_env: SIBENCH_S3_SECRET_KEY
+    acknowledgement: unknown
+    cache_bytes: null
+  hybrid:
+    kind: hybrid
+    server_config: null
+    placement: {index: unknown, value: object, wal: local, cache: local}
+    object_profile: object
+    acknowledgement: unknown
+    cache_bytes: null

@@ -1,0 +1,13 @@
+db-driver=pgsql
+pgsql-host=127.0.0.1
+pgsql-port=@PORT@
+pgsql-user=postgres
+pgsql-db=sibench_sysbench
+tables=1
+table-size=1000
+threads=1
+events=20
+time=0
+rand-seed=42
+rand-type=uniform
+range-size=10
