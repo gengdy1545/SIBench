@@ -1,0 +1,39 @@
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local environment settings
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Root-level build and temporary directories
+/build/
+/dist/
+/target/
+/tmp/
+/temp/
+
+# Local benchmark output (keep shared fixtures and reports elsewhere)
+/results/
+/logs/
+*.log
+*.pid
+
+# Submodules are tracked; manage their generated files in their own .gitignore.

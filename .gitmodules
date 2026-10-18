@@ -1,0 +1,12 @@
+[submodule "HyBench-2024"]
+	path = HyBench-2024
+	url = https://github.com/gengdy1545/HyBench-2024.git
+	branch = master
+[submodule "sysbench"]
+	path = sysbench
+	url = https://github.com/gengdy1545/sysbench.git
+	branch = master
+[submodule "YCSB"]
+	path = YCSB
+	url = https://github.com/gengdy1545/YCSB.git
+	branch = master
