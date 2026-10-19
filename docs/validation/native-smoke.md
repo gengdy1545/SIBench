@@ -14,7 +14,7 @@
 | [参数和能力矩阵](../benchmarks/capability-matrix.md) | 跨工具参数含义、PK映射及实测边界 |
 | [最小记录契约](../contracts/trace.md) | 类型化键、范围、事务、未知状态及统计口径 |
 | [存储后端实验契约](../contracts/storage.md) | SSD/对象/混合部署、持久化、缓存、指标与验收 |
-| [配置样例](../../configs) | 三种原生配置、HyBench参数、记录与存储设计样例 |
+| [配置样例](../../config) | 三种原生配置、HyBench参数、记录与存储设计样例 |
 | [验证脚本](../../scripts) | 固定源码构建、专属PostgreSQL、原生smoke运行 |
 | [验证证据](evidence/20261018-native-smoke) | 机器可读摘要、命令记录、构建与运行日志副本及校验值 |
 
@@ -96,5 +96,11 @@ https://www.postgresql.org/docs/14/app-pg-ctl.html
 ## 目录职责调整后的复验
 
 三个 benchmark 已在 `build/benchmarks/` 重新构建，并通过 `scripts/validation/native_smoke.py` 完成 PostgreSQL 最小案例。服务程序及数据使用 `build/services/postgres/`，负载配置按 benchmark 从 `configs/workloads/` 加载。脚本语法、文档链接、配置样例以及新证据快照校验值均检查通过。PostgreSQL 已停止。
+
+## 配置目录迁移
+
+2026-10-19，项目配置统一从 `configs/` 迁移到根目录 `config/`。当前运行脚本及文档链接已使用新路径；上述历史验证描述、`evidence/` 内的日志和 SHA256SUMS 保留原样。核对旧 manifest 时，应将历史 `configs/` 路径映射到 `config/`；内容已演进的文件需使用对应历史版本核对，不重新计算或覆盖历史摘要。新的证据采集使用 `config/`。
+
+大规模配置使用 `config/workloads/hybench/sf1000.yaml`、`config/workloads/ycsb/large.yaml` 和 `config/workloads/sysbench/large.yaml`。这些配置尚未执行全量生成，不属于原生 smoke 的已验证产物。
 
 本次复验的命令、运行结果和校验值见 [复验证据](evidence/20261018-234423-122683-native-smoke/summary.json)。历史证据保留原样。

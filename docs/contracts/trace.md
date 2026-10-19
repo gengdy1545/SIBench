@@ -1,6 +1,6 @@
 # 最小负载记录契约
 
-状态为采集接口设计 `trace_version=1`，供采集器实现。当前 smoke 仅输出运行日志和数据库行数，不产生本契约的真实逐请求记录。[records.example.jsonl](../../configs/trace/records.example.jsonl) 是人工构造的说明样例。
+状态为采集接口设计 `trace_version=1`，供采集器实现。当前 smoke 仅输出运行日志和数据库行数，不产生本契约的真实逐请求记录。[records.example.jsonl](../../config/trace/records.example.jsonl) 是人工构造的说明样例。
 
 ## 文件和标识
 

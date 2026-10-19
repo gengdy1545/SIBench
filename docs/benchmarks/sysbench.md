@@ -20,9 +20,19 @@ python3 scripts/validation/native_smoke.py --benchmark sysbench
 
 原生命令结构是 `sysbench [options] <脚本路径> prepare|run|cleanup`。`prepare` 在目标库创建表和数据；`run` 在线生成 SQL；`cleanup` 删除表。数据库由外层验证脚本创建和删除。
 
-配置来源 [smoke.conf.in](../../configs/workloads/sysbench/smoke.conf.in)。**当前版本不能依赖 `--config-file` 设置 Lua 参数**：第一次测试指定 table-size=1000 却加载 10000，源码 `sb_register_arg_set` 注册默认值会覆盖提前读入的选项。验证脚本保留配置文件，但将各项转换为 `--key=value` 传入，并断言实际行数。本结论适用于当前固定版本，不推断所有版本均如此。
+配置来源 [smoke.conf.in](../../config/workloads/sysbench/smoke.conf.in)。**当前版本不能依赖 `--config-file` 设置 Lua 参数**：第一次测试指定 table-size=1000 却加载 10000，源码 `sb_register_arg_set` 注册默认值会覆盖提前读入的选项。验证脚本保留配置文件，但将各项转换为 `--key=value` 传入，并断言实际行数。本结论适用于当前固定版本，不推断所有版本均如此。
 
 ## 参数与数据结构
+
+### 大规模初始数据配置
+
+[large.yaml](../../config/workloads/sysbench/large.yaml) 使用候选档位 `tables=100`、`table-size=10000000`，合计 1000000000 行。每表 ID 保持在原生 int32 范围；100 张表和每表 1000 万行是本项目的整洁规模选择，不是上游标准规模。表数影响命名空间与访问分布，必须在可比实验间固定；不要求与 HyBench 的行数或字节量精确相等。
+
+原生生成的 c/pad 分别是 119/59 个 ASCII 字符，SQL 列宽为 CHAR(120)/CHAR(60)。仅生成文本共 178000000000 字节（178 GB，十进制），不含 id、k、CHAR 补齐、编码、压缩及数据库开销；不能将它作为 Parquet 实际大小。calibration_status 为 pending，须用样本判断规模和容量是否合适。报告分别列出记录数、逻辑内容字节、Parquet 字节和索引大小，不宣称不同 benchmark 按字节等价。
+
+配置显式设定 `rand-seed=20261019` 与 uniform 分布；uniform 为派生选择。原生支持种子不等于并发全局操作序列确定。初始数据的 Parquet 适配器尚未实现，增量事务组合另行配置。文件目标、row group 行数及 Zstd level 3 与其他两套配置一致。使用 `java -jar build/sibench/sibench.jar inspect-scale` 核验配置；固定版本的原生 Lua 参数仍需由适配器转换为命令行参数。
+
+### 原生参数
 
 | 维度 | 原生参数 | 含义 |
 | --- | --- | --- |

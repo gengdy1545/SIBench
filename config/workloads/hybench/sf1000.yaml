@@ -1,0 +1,44 @@
+schema_version: 1
+purpose: baseline_scale
+benchmark: hybench
+source:
+  path: benchmark/HyBench-2024
+  commit: eaad91b52956fddd3d48ce49f792928056b7b360
+  definition: src/main/resources/parameters.toml
+  definition_sha256: 663ac0c2559720fd75044391510a75620ccbdc37f56c1c05fc49d5d3371ae900
+scale:
+  basis: native_parameters
+  calibration_status: pending
+  total_rows: 8706000000
+  table_rows:
+    customer: 300000000
+    company: 2000000
+    savingaccount: 302000000
+    checkingaccount: 302000000
+    transfer: 6000000000
+    checking: 600000000
+    loanapps: 600000000
+    loantrans: 600000000
+native:
+  sf: 1000x
+data_layout:
+  parquet:
+    target_file_size_bytes: 268435456
+    row_group_max_rows: 1048576
+    compression: zstd
+    compression_level: 3
+reproducibility:
+  requested_seed: 20261019
+  native_seed_verified: false
+  require_deterministic_generator: true
+  require_manifest: true
+  require_content_checksums: true
+generation:
+  adapter_status: not_implemented
+  output_directory: results/datasets/hybench/sf1000
+  require_measured_capacity_estimate: true
+  notes:
+    - Native generation mixes Random, ThreadLocalRandom and wall-clock dates.
+    - transfer.id exceeds signed int32; use int64 in the data adapter.
+    - Native PostgreSQL transfer.id is int32 and cannot load all SF1000 IDs.
+    - loantrans row count follows the loanapps generation loop.

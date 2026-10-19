@@ -54,7 +54,8 @@ for name,cmd in commands.items():
 summary['environment']['maven_note']='mvn -version reflects shell default Java; builds use JAVA_HOME=Java17 explicitly.'
 (evidence/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
 # Include source artifacts and binaries to tie outcomes to configuration/code.
-files=list(evidence.rglob('*'))+list((root/'configs').rglob('*'))+list((root/'scripts').rglob('*.py'))+list((root/'scripts').rglob('*.sh'))
+files=list(evidence.rglob('*'))+list((root/'config').rglob('*'))+list((root/'scripts').rglob('*.py'))+list((root/'scripts').rglob('*.sh'))
+files += list((root/'src').rglob('*.java')) + [root/'pom.xml']
 files += [root/'build/benchmarks/sysbench/src/sysbench',root/'build/benchmarks/YCSB/core/target/core-0.18.0-SNAPSHOT.jar',root/'build/benchmarks/YCSB/jdbc/target/jdbc-binding-0.18.0-SNAPSHOT.jar']
 files += list((root/'build/benchmarks/HyBench-2024/target/classes').rglob('*.class'))
 lines=[]

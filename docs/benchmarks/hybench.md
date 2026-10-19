@@ -20,9 +20,21 @@ python3 scripts/validation/native_smoke.py --benchmark hybench
 4. `java ... com.hybench.HyBench -t runtp -c <props> -f conf/stmt_postgres.toml`。
 5. 删除本次专属数据库；生成数据保留在运行目录便于核验。
 
-`-f` 在运行阶段指定 SQL 模板。`gendata` 的规模参数来自 classpath 中的 `parameters.toml`，不是 `-f`。验证使用 [parameters.toml](../../configs/workloads/hybench/parameters.toml) 的 `[smoke]` 段覆盖资源，生成和执行必须使用同一份资源。
+`-f` 在运行阶段指定 SQL 模板。`gendata` 的规模参数来自 classpath 中的 `parameters.toml`，不是 `-f`。验证使用 [parameters.toml](../../config/workloads/hybench/parameters.toml) 的 `[smoke]` 段覆盖资源，生成和执行必须使用同一份资源。
 
 ## 规模与工作负载参数
+
+### SIBench SF1000 初始规模配置
+
+[sf1000.yaml](../../config/workloads/hybench/sf1000.yaml) 固定本报告对应源码版本的 `sf=1000x`。各表为 customer 300000000、company 2000000、savingaccount/checkingaccount 各 302000000、transfer 6000000000、checking/loanapps/loantrans 各 600000000，共 **8706000000 行**。此处 SF1000 不是压缩后 1 TB 的承诺。
+
+该配置仅定义初始数据规模及 Parquet 生成参数，不代表生成器已经实现。统一文件目标 256 MiB、每个 row group 最多 1048576 行；先显式选用 Zstd level 3 作为可配置的生成基线，不作压缩算法性能比较。
+
+原生生成器混用未固定种子的随机源，并在部分时间戳生成中读取当前时间。`requested_seed` 是 SIBench 适配器必须实现的要求，不会自动使原生代码可复现。SF1000 的 transfer 主键达到 6000000000，生成器记录类型是 long，但原生 PostgreSQL DDL 为 int，不能直接全量加载；Parquet 适配器需使用 int64 并记录类型转换。
+
+规模检查命令为 `java -jar build/sibench/sibench.jar inspect-scale`（先使用 JDK 17 执行 `mvn package`）。它只核验配置、源码版本和定义文件摘要，输出容量信息及未满足的生成条件，不生成数据。完整生成前需要使用覆盖全规模键空间和真实字段分布的样本校准 Parquet 大小、生成速率与峰值空间，预算须包括 Baseline、增量、Rewrite、保留文件和临时产物。
+
+### 原生参数
 
 | 维度 | 配置 | 含义 |
 | --- | --- | --- |

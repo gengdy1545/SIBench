@@ -53,7 +53,7 @@ def main():
     try:
         # CREATE fails if the name already exists: never overwrite another experiment.
         run('create-database', psql + ['-d', 'postgres', '-c', f'CREATE DATABASE {db}'])
-        template = ROOT / 'configs/workloads' / args.benchmark
+        template = ROOT / 'config/workloads' / args.benchmark
         name = {'ycsb': 'ycsb.properties', 'sysbench': 'sysbench.conf', 'hybench': 'hybench.props'}[args.benchmark]
         config = out / name
         config.write_text((template / ('smoke' + Path(name).suffix + '.in')).read_text().replace('@PORT@', str(args.port)))

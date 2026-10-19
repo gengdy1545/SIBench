@@ -1,0 +1,43 @@
+schema_version: 1
+purpose: baseline_scale
+benchmark: ycsb
+source:
+  path: benchmark/YCSB
+  commit: 66302f301b13f60d4bcb2f29f478586bb1d6f2e0
+  definition: core/src/main/java/site/ycsb/workloads/CoreWorkload.java
+  definition_sha256: b872f2c2e585e90d56cd9f08e050f26c18ee1d834c26f537793fa4df4258bbc1
+scale:
+  basis: native_parameters
+  calibration_status: pending
+  total_rows: 1000000000
+native:
+  recordcount: 1000000000
+  insertstart: 0
+  insertcount: 1000000000
+  fieldcount: 10
+  fieldlength: 100
+  fieldlengthdistribution: constant
+  insertorder: hashed
+  zeropadding: 1
+data_layout:
+  parquet:
+    target_file_size_bytes: 268435456
+    row_group_max_rows: 1048576
+    compression: zstd
+    compression_level: 3
+reproducibility:
+  requested_seed: 20261019
+  native_seed_verified: false
+  require_deterministic_generator: true
+  require_manifest: true
+  require_content_checksums: true
+generation:
+  adapter_status: not_implemented
+  output_directory: results/datasets/ycsb/large
+  require_measured_capacity_estimate: true
+  notes:
+    - Candidate large-scale profile using native row shape; no exact cross-benchmark matching.
+    - This record count is an experiment choice, not an upstream standard scale.
+    - Field payload is 1000000000000 bytes before keys, encoding and compression.
+    - Native CoreWorkload has no verified deterministic seed integration.
+    - Incremental workload selection and operation proportions are separate from baseline scale.

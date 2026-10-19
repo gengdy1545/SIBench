@@ -4,7 +4,7 @@
 
 ## 配置与职责
 
-[profiles.example.yaml](../../configs/storage/profiles.example.yaml) 是后续配置设计样例，当前 native_smoke.py 脚本不消费它。`workload` 指逻辑负载，`target` 指server接入，`storage_profile` 指被测数据存储，`artifacts` 指实验产物位置。目标协议、endpoint及server配置路径未提供时必须显式未配置，不能默认连到某个服务。
+[profiles.example.yaml](../../config/storage/profiles.example.yaml) 是后续配置设计样例，当前 native_smoke.py 脚本不消费它。`workload` 指逻辑负载，`target` 指server接入，`storage_profile` 指被测数据存储，`artifacts` 指实验产物位置。目标协议、endpoint及server配置路径未提供时必须显式未配置，不能默认连到某个服务。
 
 SIBench保存配置、驱动逻辑键操作和汇总指标；server决定一个对象包含多少索引页或键、何时上传、如何缓存、合并和回收。对象大小不能由 `value_bytes` 推导，逻辑scan也不等同于S3 LIST或字节Range GET。对象存储实验产物上传是独立功能，不计作后端验收。
 

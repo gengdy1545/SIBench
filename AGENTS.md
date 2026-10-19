@@ -7,9 +7,16 @@
   `new`, and `final` as organizational names.
 - Keep upstream benchmark sources in `benchmark/` submodules. Store generated
   builds under `build/benchmarks/` and local service state under `build/services/`.
-- Keep workload configurations in `configs/workloads/<benchmark>/`, trace
-  examples in `configs/trace/`, and storage configuration in `configs/storage/`.
-- Group scripts under `scripts/benchmarks/`, `scripts/services/`, or
+- Keep workload configurations in `config/workloads/<benchmark>/`, trace
+  examples in `config/trace/`, and storage configuration in `config/storage/`.
+- Implement the core in Java under `src/main/java/org/sibench/`, organized by
+  responsibility, including configuration, generation, trace, replay and adapters.
+  Keep Java tests under `src/test/java/org/sibench/` and core builds under
+  `build/sibench/`. Use JDK 17 and the root Maven project.
+- Use Python/Shell for orchestration, offline analysis and reporting; call the
+  Java CLI instead of duplicating core configuration or workload semantics.
+- Keep operational scripts (build, service management and experiment validation)
+  under `scripts/benchmarks/`, `scripts/services/`, or
   `scripts/validation/`; documentation under `docs/benchmarks/`, `docs/contracts/`,
   or `docs/validation/` according to purpose.
 - Development milestones belong in `plan.md`, not directory names. Dates and

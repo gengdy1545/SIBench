@@ -10,7 +10,7 @@
 python3 scripts/validation/native_smoke.py --benchmark ycsb
 ```
 
-脚本创建独立数据库 `sibench_ycsb`，建表、加载、运行、核对行数后删除该数据库。如果数据库已存在则失败，不覆盖已有数据。配置来源为 [smoke.properties.in](../../configs/workloads/ycsb/smoke.properties.in)，`@PORT@` 由脚本替换。
+脚本创建独立数据库 `sibench_ycsb`，建表、加载、运行、核对行数后删除该数据库。如果数据库已存在则失败，不覆盖已有数据。配置来源为 [smoke.properties.in](../../config/workloads/ycsb/smoke.properties.in)，`@PORT@` 由脚本替换。
 
 原生构建命令为 `mvn -pl site.ycsb:jdbc-binding -am -DskipTests package`。本次使用 Java 17，构建版本为 `0.18.0-SNAPSHOT`；解压 JDBC 分发包后使用其中 `lib/*`、`jdbc-binding/lib/*` 和 PostgreSQL JDBC jar。只加 `jdbc/target/dependency/*` 会缺少 Core 传递依赖，例如 HTrace。
 
@@ -19,6 +19,16 @@ python3 scripts/validation/native_smoke.py --benchmark ycsb
 表为 `usertable(YCSB_KEY varchar(255) primary key, FIELD0 text, …, FIELD9 text)`；验证显式使用 `COLLATE "C"`。字段数量与 `fieldcount` 对齐。JDBC 的 cleanup 是连接收尾，不是删除数据；测试数据库由脚本单独清理。
 
 ## 参数与生成方式
+
+### 大规模初始数据配置
+
+[large.yaml](../../config/workloads/ycsb/large.yaml) 使用候选档位 `recordcount=1000000000`、`insertstart=0`、`insertcount=1000000000`。保留 10 个字段、每字段 100 字节的固定长度配置，以及 hashed 键生成规则。10 亿条是本项目选择的整洁规模档位，不是上游标准规模，也不要求与 HyBench SF1000 的记录数或字节量精确相等。
+
+字段内容合计 1000000000000 字节（1 TB，十进制），不包含键、编码和存储开销；这不是 Parquet 落盘大小估计。配置的 calibration_status 为 pending，生成代表性样本后再评估与其他来源的规模差距及磁盘预算，必要时调整记录数档位；不通过改变原生行形态精确配平。报告分别列出记录数、逻辑内容字节、Parquet 字节和索引大小。
+
+该配置是初始规模配置，尚未指定 A-F 的增量负载，不是可以直接运行的原生 properties 文件。`requested_seed` 需由确定性适配器落实。文件目标、row group 行数及 Zstd level 3 与 HyBench 配置一致；所有 Backend 必须复用同一生成产物。使用 `java -jar build/sibench/sibench.jar inspect-scale` 核验配置及生成条件。
+
+### 原生参数
 
 | 维度 | 原生配置 | 含义 |
 | --- | --- | --- |

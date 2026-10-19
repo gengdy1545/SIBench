@@ -1,0 +1,51 @@
+schema_version: 1
+purpose: baseline_scale
+benchmark: sysbench
+source:
+  path: benchmark/sysbench
+  commit: 3ceba0b1e115f8c50d1d045a4574d8ed643bd497
+  definition: src/lua/oltp_common.lua
+  definition_sha256: 02f2cbbacbabe6666d866641f856261953fe10663592a3605881e5561958ded9
+scale:
+  basis: native_parameters
+  calibration_status: pending
+  total_rows: 1000000000
+native:
+  tables: 100
+  table-size: 10000000
+  rand-seed: 20261019
+  rand-type: uniform
+  auto-inc: true
+  secondary: false
+  create-secondary: true
+row_shape:
+  id_type: int32
+  k_type: int32
+  c_generated_characters: 119
+  pad_generated_characters: 59
+  c_sql_width: 120
+  pad_sql_width: 60
+data_layout:
+  parquet:
+    target_file_size_bytes: 268435456
+    row_group_max_rows: 1048576
+    compression: zstd
+    compression_level: 3
+reproducibility:
+  requested_seed: 20261019
+  native_seed_verified: true
+  require_deterministic_generator: true
+  require_manifest: true
+  require_content_checksums: true
+generation:
+  adapter_status: not_implemented
+  output_directory: results/datasets/sysbench/large
+  require_measured_capacity_estimate: true
+  notes:
+    - Candidate large-scale profile using native row shape; no exact cross-benchmark matching.
+    - This table count and size are experiment choices, not an upstream standard scale.
+    - Each native int32 primary key remains in range.
+    - Table count changes namespace and access distribution and must remain fixed.
+    - Uniform distribution is an explicit derived profile, not the upstream default.
+    - A native RNG seed alone does not fix concurrent execution order.
+    - Native options must be passed as command arguments for the pinned sysbench version.
