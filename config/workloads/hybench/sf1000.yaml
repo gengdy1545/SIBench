@@ -1,5 +1,5 @@
 schema_version: 1
-purpose: baseline_scale
+purpose: baseline_generation
 benchmark: hybench
 source:
   path: benchmark/HyBench-2024
@@ -22,23 +22,22 @@ scale:
 native:
   sf: 1000x
 data_layout:
+  partitioning: none
+  buckets: 1
+  bucket_function: ordinal_mod
   parquet:
     target_file_size_bytes: 268435456
     row_group_max_rows: 1048576
+    row_group_buffer_bytes: 67108864
+    page_size_bytes: 1048576
+    dictionary_page_size_bytes: 1048576
+    dictionary_enabled: true
     compression: zstd
     compression_level: 3
-reproducibility:
-  requested_seed: 20261019
-  native_seed_verified: false
-  require_deterministic_generator: true
-  require_manifest: true
-  require_content_checksums: true
 generation:
-  adapter_status: not_implemented
+  adapter: sibench-baseline-v1
+  mode: deterministic_derived
+  seed: 20261019
+  baseline_timestamp: 0
   output_directory: results/datasets/hybench/sf1000
-  require_measured_capacity_estimate: true
-  notes:
-    - Native generation mixes Random, ThreadLocalRandom and wall-clock dates.
-    - transfer.id exceeds signed int32; use int64 in the data adapter.
-    - Native PostgreSQL transfer.id is int32 and cannot load all SF1000 IDs.
-    - loantrans row count follows the loanapps generation loop.
+  min_free_disk_bytes: 21474836480

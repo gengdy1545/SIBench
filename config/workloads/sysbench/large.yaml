@@ -1,5 +1,5 @@
 schema_version: 1
-purpose: baseline_scale
+purpose: baseline_generation
 benchmark: sysbench
 source:
   path: benchmark/sysbench
@@ -15,37 +15,23 @@ native:
   table-size: 10000000
   rand-seed: 20261019
   rand-type: uniform
-  auto-inc: true
-  secondary: false
-  create-secondary: true
-row_shape:
-  id_type: int32
-  k_type: int32
-  c_generated_characters: 119
-  pad_generated_characters: 59
-  c_sql_width: 120
-  pad_sql_width: 60
 data_layout:
+  partitioning: none
+  buckets: 1
+  bucket_function: ordinal_mod
   parquet:
     target_file_size_bytes: 268435456
     row_group_max_rows: 1048576
+    row_group_buffer_bytes: 67108864
+    page_size_bytes: 1048576
+    dictionary_page_size_bytes: 1048576
+    dictionary_enabled: true
     compression: zstd
     compression_level: 3
-reproducibility:
-  requested_seed: 20261019
-  native_seed_verified: true
-  require_deterministic_generator: true
-  require_manifest: true
-  require_content_checksums: true
 generation:
-  adapter_status: not_implemented
+  adapter: sibench-baseline-v1
+  mode: deterministic_derived
+  seed: 20261019
+  baseline_timestamp: 0
   output_directory: results/datasets/sysbench/large
-  require_measured_capacity_estimate: true
-  notes:
-    - Candidate large-scale profile using native row shape; no exact cross-benchmark matching.
-    - This table count and size are experiment choices, not an upstream standard scale.
-    - Each native int32 primary key remains in range.
-    - Table count changes namespace and access distribution and must remain fixed.
-    - Uniform distribution is an explicit derived profile, not the upstream default.
-    - A native RNG seed alone does not fix concurrent execution order.
-    - Native options must be passed as command arguments for the pinned sysbench version.
+  min_free_disk_bytes: 21474836480

@@ -15,10 +15,8 @@
   `build/sibench/`. Use JDK 17 and the root Maven project.
 - Use Python/Shell for orchestration, offline analysis and reporting; call the
   Java CLI instead of duplicating core configuration or workload semantics.
-- Keep operational scripts (build, service management and experiment validation)
-  under `scripts/benchmarks/`, `scripts/services/`, or
-  `scripts/validation/`; documentation under `docs/benchmarks/`, `docs/contracts/`,
-  or `docs/validation/` according to purpose.
+- Keep documentation under `docs/benchmarks/`, `docs/contracts/`, or
+  `docs/validation/` according to purpose.
 - Development milestones belong in `plan.md`, not directory names. Dates and
   run identifiers may identify archived experiment evidence. Preserve historical
   logs and manifests as recorded; document relocations separately.

@@ -1,5 +1,6 @@
 package org.sibench.workloads;
 
+import org.sibench.generation.GenerationConfig;
 import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.constructor.SafeConstructor;
@@ -72,6 +73,23 @@ public final class ScaleInspector {
         if (!commit.equals(string(source, "commit"))) {
             throw new IllegalArgumentException("Source commit changed: " + sourcePath);
         }
+        Process status =
+                new ProcessBuilder(
+                                "git",
+                                "-C",
+                                sourcePath.toString(),
+                                "status",
+                                "--porcelain=v1",
+                                "--untracked-files=all")
+                        .redirectErrorStream(true)
+                        .start();
+        String changes =
+                new String(status.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+        if (status.waitFor() != 0 || !changes.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Benchmark source must be clean: " + sourcePath + "\n" + changes);
+        }
+        GenerationConfig.from(root, config);
         report.put("profile", root.relativize(path).toString());
         report.put("profile_sha256", sha256(bytes));
         report.put("source_commit", commit);
@@ -88,7 +106,7 @@ public final class ScaleInspector {
     static Map<String, Object> validate(Map<String, Object> config) {
         require(
                 integer(config, "schema_version") == 1
-                        && string(config, "purpose").equals("baseline_scale"),
+                        && string(config, "purpose").equals("baseline_generation"),
                 "Unsupported profile schema or purpose");
         Map<String, Object> scale = object(config, "scale");
         require(
@@ -150,11 +168,7 @@ public final class ScaleInspector {
                 require(
                         perTable <= Integer.MAX_VALUE,
                         "sysbench baseline IDs exceed native signed int32");
-                Map<String, Object> shape = object(config, "row_shape");
-                long width =
-                        Math.addExact(
-                                positive(shape, "c_generated_characters"),
-                                positive(shape, "pad_generated_characters"));
+                long width = 119 + 59;
                 estimates.put(
                         "generated_ascii_text_bytes_excluding_id_and_k",
                         Math.multiplyExact(rows, width));
@@ -164,7 +178,7 @@ public final class ScaleInspector {
         Map<String, Object> parquet = object(object(config, "data_layout"), "parquet");
         positive(parquet, "target_file_size_bytes");
         positive(parquet, "row_group_max_rows");
-        long seed = positive(object(config, "reproducibility"), "requested_seed");
+        long seed = integer(object(config, "generation"), "seed");
         if (benchmark.equals("sysbench")) {
             require(
                     integer(nativeConfig, "rand-seed") == seed,
@@ -180,15 +194,16 @@ public final class ScaleInspector {
         report.put("uncompressed_content_estimates", estimates);
         report.put("estimated_parquet_bytes", null);
         report.put("parquet", parquet);
-        report.put("requested_seed", seed);
-        report.put("generation_ready", false);
+        report.put("generation_seed", seed);
+        report.put("generation_implemented", true);
+        report.put("generation_verified", false);
+        report.put("capacity_calibrated", false);
         report.put(
                 "blockers",
                 List.of(
-                        "Deterministic Parquet baseline adapters are not implemented.",
+                        "Parquet generation has not been executed or end-to-end verified.",
                         "Representative full-scale-key samples are required for capacity"
-                            + " calibration."));
-        report.put("notes", object(config, "generation").get("notes"));
+                                + " calibration."));
         return report;
     }
 

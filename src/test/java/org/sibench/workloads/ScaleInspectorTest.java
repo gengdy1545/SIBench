@@ -27,7 +27,7 @@ public class ScaleInspectorTest {
             Map<String, Object> report =
                     ScaleInspector.inspect(ROOT, Path.of(ScaleInspector.DEFAULT_PROFILES.get(i)));
             assertEquals(counts[i], report.get("baseline_rows"));
-            assertFalse((Boolean) report.get("generation_ready"));
+            assertFalse((Boolean) report.get("generation_verified"));
             assertTrue(report.containsKey("estimated_parquet_bytes"));
             assertNull(report.get("estimated_parquet_bytes"));
         }
