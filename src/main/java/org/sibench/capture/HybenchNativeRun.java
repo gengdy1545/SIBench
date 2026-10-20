@@ -8,7 +8,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.util.Properties;
 
-/** Calls unmodified native TPClient methods using a recording JDBC connection. */
+/** Runs native HyBench stages, or the explicit TP diagnostic, through recording JDBC. */
 public final class HybenchNativeRun {
     private HybenchNativeRun() {}
 
@@ -28,7 +28,8 @@ public final class HybenchNativeRun {
         if (args.length != 4)
             throw new IllegalArgumentException(
                     "HybenchNativeRun PROPERTIES SQL_TOML SECONDS CAPTURE_DIR");
-        try (CaptureRun run = CaptureRun.begin(Path.of(args[3]))) {
+        boolean htap = config != null && config.mode().equals("runhtap");
+        try (CaptureRun run = CaptureRun.begin(Path.of(args[3]), htap)) {
             try {
                 if (config != null) {
                     CapturePoc.checkServer(config);
@@ -41,15 +42,76 @@ public final class HybenchNativeRun {
                                 .store(output, "Resolved SF1 capture configuration");
                     }
                 }
-                long[] counts = execute(args);
+                long[] counts = htap ? executeHtap(args, run) : execute(args);
                 run.complete(counts);
-                System.out.println(
-                        "Native transaction counts: " + java.util.Arrays.toString(counts));
+                System.out.println(htap ? "Native runHTAP capture complete: AP -> TP -> XP"
+                        : "Native transaction counts: " + java.util.Arrays.toString(counts));
             } catch (Exception | Error error) {
                 run.fail(error, java.util.Map.of("operation", "native_run"));
                 throw error;
             }
         }
+    }
+
+    private static long[] executeHtap(String[] args, CaptureRun run) throws Exception {
+        System.setProperty("sibench.capture.directory", Path.of(args[3]).toAbsolutePath().toString());
+        Properties properties = new Properties();
+        try (InputStream input = Files.newInputStream(Path.of(args[0]))) {
+            properties.load(input);
+        }
+        Class<?> loader = Class.forName("com.hybench.ConfigLoader");
+        loader.getField("prop").set(null, properties);
+        loader.getField("confFile").set(null, Path.of(args[0]).toAbsolutePath().toString());
+        Class.forName(CaptureDriver.class.getName());
+        Class<?> hybench = Class.forName("com.hybench.HyBench");
+        Object benchmark = hybench.getConstructor().newInstance();
+        Object reader = Class.forName("com.hybench.workload.SqlReader")
+                .getConstructor(String.class).newInstance(args[1]);
+        Object sql = reader.getClass().getMethod("loader").invoke(reader);
+        var setSqls = hybench.getDeclaredMethod("setSqls",
+                Class.forName("com.hybench.workload.Sqlstmts"));
+        setSqls.setAccessible(true);
+        setSqls.invoke(benchmark, sql);
+        Field verbose = hybench.getDeclaredField("verbose");
+        verbose.setAccessible(true);
+        verbose.set(benchmark, false);
+        Object result = hybench.getMethod("getRes").invoke(benchmark);
+        Object hist = result.getClass().getMethod("getHist").invoke(result);
+        for (String phase : new String[] {"ap", "tp", "xp"}) {
+            run.phase(phase, null);
+            long started = System.nanoTime();
+            try {
+                if (phase.equals("xp")) hybench.getMethod("runXP", int.class).invoke(benchmark, 0);
+                else hybench.getMethod(phase.equals("ap") ? "runAP" : "runTP").invoke(benchmark);
+            } catch (java.lang.reflect.InvocationTargetException error) {
+                if (error.getCause() instanceof Exception cause) throw cause;
+                throw error;
+            }
+            run.drainSessions();
+            CaptureRun.checkFailure();
+            var summary = new java.util.LinkedHashMap<String, Object>();
+            summary.put("elapsed_seconds", (System.nanoTime() - started) / 1e9);
+            String method = phase.equals("ap") ? "getAPItem" : phase.equals("tp") ? "getTPItem" : "getXPIQItem";
+            int size = phase.equals("ap") ? 13 : phase.equals("tp") ? 18 : 6;
+            var counts = new java.util.LinkedHashMap<String, Long>();
+            for (int i = 0; i < size; i++) {
+                Object item = hist.getClass().getMethod(method, int.class).invoke(hist, i);
+                counts.put((phase.equals("xp") ? "iq" : phase) + (i + 1),
+                        ((Number) item.getClass().getMethod("getN").invoke(item)).longValue());
+            }
+            summary.put("method_counts", counts);
+            if (phase.equals("xp")) {
+                var atCounts = new java.util.LinkedHashMap<String, Long>();
+                for (int i = 0; i < 6; i++) {
+                    Object item = hist.getClass().getMethod("getXPATItem", int.class).invoke(hist, i);
+                    atCounts.put("at" + (i + 1),
+                            ((Number) item.getClass().getMethod("getN").invoke(item)).longValue());
+                }
+                summary.put("transaction_method_counts", atCounts);
+            }
+            run.phase(phase, summary);
+        }
+        return new long[19];
     }
 
     private static long[] execute(String[] args) throws Exception {

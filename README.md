@@ -1,6 +1,6 @@
 # SIBench
 
-通过原生 benchmark 执行、真实 Parquet 和确定性索引 Trace，评估 KV Index Service。当前完成 HyBench SF1 单会话子集的采集、编译及版本化参考验证，另有三个来源的派生 Baseline 生成器。真实 Backend 和 SF1000 正式实验尚未完成。
+通过原生 benchmark 执行、真实 Parquet 和确定性索引 Trace，评估 KV Index Service。HyBench 默认采用原生 `runHTAP`：AP → TP → 并发 AT/IQ，保留原生事务比例和业务分支。既有单会话 TP 子集另支持 v4 编译及版本化参考验证；完整 HTAP 的 KV 投影、真实 Backend 和 SF1000 正式实验尚未完成。
 
 ## 构建
 
@@ -15,12 +15,21 @@ java -jar build/sibench/sibench.jar inspect-scale
 
 ## 原生采集与回放
 
-流程：原生数据生成与 PG Load → 静止边界导出并独立验证 Baseline → 连续原生事务采集 → Java 离线编译 → Index Replay。回放不执行 SQL、不连接 PG。
+流程：原生数据生成与 PG Load/建索引 → 静止边界导出并独立验证 Baseline → 原生 `runHTAP` 采集 → 同次请求/结果核对、八表最终状态审计、无损原始事件打包。AP/TP/XP 阶段之间不重新加载或恢复数据。
 
-[hybench_sf1.yaml](config/hybench_sf1.yaml) 是当前原生采集配置；[index_replay.yaml](config/index_replay.yaml) 控制下游发送。以下使用已验证的本地 SF1 产物：
+[hybench_sf1.yaml](config/hybench_sf1.yaml) 是默认 HTAP 配置；PG 必须预先准备，`run` 的工作目录包含原生 `Data_1x`，classpath 包含 HyBench classes/lib。完整步骤见 [HTAP SF1 验证](docs/validation/hybench-sf1-htap.md)。
 
 ```bash
 java -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc check "$PWD" config/hybench_sf1.yaml
+java -Xmx3g -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc audit "$PWD" config/hybench_sf1.yaml results/poc/hybench-htap-sf1/state-audit-check.json
+java -Xmx3g -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc pack "$PWD" config/hybench_sf1.yaml results/poc/hybench-htap-sf1/trace-check
+```
+
+`pack` 保存原始索引事件及完整 JSON payload，不等于规范 KV Trace；HTAP 输入会被单会话 v4 编译器显式拒绝。完整并发快照、范围/变长键投影仍待实现。
+
+[hybench_tp_subset_sf1.yaml](config/hybench_tp_subset_sf1.yaml) 保留 TP3/TP5/TP9=35/30/35 诊断负载；[index_replay.yaml](config/index_replay.yaml) 控制下游发送。以下回放既有子集产物，不执行 SQL、不连接 PG：
+
+```bash
 java -Xmx3g -jar build/sibench/sibench.jar check-replay config/index_replay.yaml results/validation/hybench-sf1-snapshot-lookup-20261020/normalized
 java -Xmx3g -jar build/sibench/sibench.jar replay config/index_replay.yaml results/validation/hybench-sf1-snapshot-lookup-20261020/normalized results/validation/hybench-sf1-snapshot-lookup-20261020/replay-check.json
 java -Xmx3g -jar build/sibench/sibench.jar validate-snapshots config/index_replay.yaml results/validation/hybench-sf1-snapshot-lookup-20261020/normalized results/validation/hybench-sf1-snapshot-lookup-20261020/snapshots-check.json
@@ -30,10 +39,11 @@ java -Xmx3g -jar build/sibench/sibench.jar validate-snapshots config/index_repla
 
 - `target.secondary_indexes.enabled` 默认 true；false 过滤全部二级加载、查询和维护，完整 Trace/Parquet 不变。
 - `target.transaction_writes.coalesce_same_key` 默认 true；只合并同事务同索引键最后效果，原始修改保留。
+- 默认只向下游发送已提交变更，不限定 Index Service 场景。支持范围内的 v4 编译排除回滚修改，不生成反向操作；原始 Trace 保留回滚事实，查询按独立可见性契约处理，无回撤开关。
 - [long_replay.yaml](config/long_replay.yaml) 要求 single_pass、666,000,000 个有效操作；SF1 短输入会在预检失败。持续调度和分段供应尚未实现。
 - 异常运行保留诊断并拒绝编译；修复后从明确初始状态换新目录重跑。
 
-原生 PG 构建、采集入口、参数和验证结果见 [SF1 报告](docs/validation/hybench-sf1-poc.md)。
+旧子集的编译、版本验证及证据见 [TP 子集 SF1 报告](docs/validation/hybench-sf1-poc.md)。
 
 ## Baseline 生成配置
 

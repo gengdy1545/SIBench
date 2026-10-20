@@ -104,10 +104,12 @@ public final class CaptureDriver implements Driver {
         private final Gson json = new GsonBuilder().serializeNulls().create();
         private long request, transaction = 1;
         private String application;
+        private final String phase = CaptureRun.phase();
+        private final Path path;
 
         Session(Connection connection, Path directory) throws IOException, SQLException {
             this.connection = connection;
-            Path path =
+            path =
                     directory.resolve(
                             "jdbc-" + ProcessHandle.current().pid() + "-" + id + ".jsonl");
             output = Files.newBufferedWriter(path, StandardOpenOption.CREATE_NEW);
@@ -158,6 +160,7 @@ public final class CaptureDriver implements Driver {
             entry.put("transaction", transaction);
             entry.put("request", request);
             entry.put("application", application);
+            if (phase != null) entry.put("phase", phase);
             entry.putAll(details);
             try {
                 output.write(json.toJson(entry));
@@ -206,6 +209,7 @@ public final class CaptureDriver implements Driver {
                                     } finally {
                                         try {
                                             output.close();
+                                            CaptureRun.sessionClosed(path);
                                         } catch (IOException close) {
                                             if (failure == null)
                                                 failure =
@@ -227,6 +231,8 @@ public final class CaptureDriver implements Driver {
                                                         invoke(method, connection, args);
                                         return statement(statement, (String) args[0]);
                                     }
+                                    if (name.equals("createStatement"))
+                                        return statement((Statement) invoke(method, connection, args), null);
                                     if (name.equals("commit") || name.equals("rollback")) {
                                         Object result = invoke(method, connection, args);
                                         emit(name, Map.of());
@@ -249,14 +255,17 @@ public final class CaptureDriver implements Driver {
                             });
         }
 
-        PreparedStatement statement(PreparedStatement statement, String sql) {
+        Statement statement(Statement statement, String sql) {
             Map<Integer, Object> parameters = new LinkedHashMap<>();
-            return (PreparedStatement)
+            Map<String, Object> resultIdentity = new LinkedHashMap<>();
+            return (Statement)
                     Proxy.newProxyInstance(
                             CaptureDriver.class.getClassLoader(),
-                            new Class<?>[] {PreparedStatement.class},
+                            new Class<?>[] {sql == null ? Statement.class : PreparedStatement.class},
                             (proxy, method, args) -> {
                                 String name = method.getName();
+                                String executedSql = sql == null && args != null && args.length > 0
+                                        && args[0] instanceof String text ? text : sql;
                                 try {
                                     if (name.startsWith("set")
                                             && args != null
@@ -269,7 +278,11 @@ public final class CaptureDriver implements Driver {
                                     if (name.equals("executeQuery")
                                             || name.equals("executeUpdate")
                                             || name.equals("execute")) {
-                                        mark(sql, parameters);
+                                        mark(executedSql, parameters);
+                                        resultIdentity.clear();
+                                        resultIdentity.put("application", application);
+                                        resultIdentity.put("request", request);
+                                        resultIdentity.put("transaction", transaction);
                                         Object result = invoke(method, statement, args);
                                         emit(
                                                 "request_return",
@@ -279,21 +292,27 @@ public final class CaptureDriver implements Driver {
                                                         "update_count",
                                                         statement.getUpdateCount()));
                                         if (result instanceof ResultSet rows)
-                                            return rows(rows, sql);
+                                            return rows(rows, executedSql, resultIdentity);
                                         return result;
+                                    }
+                                    if (name.equals("getResultSet")) {
+                                        Object result = invoke(method, statement, args);
+                                        return result instanceof ResultSet rows
+                                                ? rows(rows, sql, resultIdentity) : result;
                                     }
                                     return invoke(method, statement, args);
                                 } catch (SQLException error) {
-                                    Map<String, Object> details = context(name, sql);
+                                    Map<String, Object> details = context(name, executedSql);
                                     details.put("parameters", new LinkedHashMap<>(parameters));
                                     CaptureRun.recordFailure(error, details);
-                                    error(error, "request_error", name, sql);
+                                    error(error, "request_error", name, executedSql);
                                     throw error;
                                 }
                             });
         }
 
-        ResultSet rows(ResultSet rows, String sql) {
+        ResultSet rows(ResultSet rows, String sql, Map<String, Object> resultIdentity) {
+            Map<String, Object> identity = new LinkedHashMap<>(resultIdentity);
             return (ResultSet)
                     Proxy.newProxyInstance(
                             CaptureDriver.class.getClassLoader(),
@@ -303,11 +322,16 @@ public final class CaptureDriver implements Driver {
                                     Object result = invoke(method, rows, args);
                                     if (method.getName().equals("next")
                                             && Boolean.TRUE.equals(result)) {
-                                        Map<String, Object> values = new LinkedHashMap<>();
+                                        Map<String, Object> values = new LinkedHashMap<>(identity);
+                                        Map<String, Integer> types = new LinkedHashMap<>();
+                                        ResultSetMetaData metadata = rows.getMetaData();
                                         for (int i = 1;
-                                                i <= rows.getMetaData().getColumnCount();
-                                                i++)
+                                                i <= metadata.getColumnCount();
+                                                i++) {
                                             values.put(Integer.toString(i), rows.getString(i));
+                                            types.put(Integer.toString(i), metadata.getColumnType(i));
+                                        }
+                                        values.put("column_types", types);
                                         emit("consumed_row", values);
                                     }
                                     return result;

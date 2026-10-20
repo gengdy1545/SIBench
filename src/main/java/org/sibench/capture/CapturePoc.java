@@ -16,34 +16,36 @@ public final class CapturePoc {
     public static void main(String[] args) throws Exception {
         if (args.length < 3)
             throw new IllegalArgumentException(
-                    "CapturePoc check|export|run|compile|replay ROOT CONFIG [PG_TRACE] [OUTPUT]");
+                    "CapturePoc check|export|run|compile|pack|audit|replay ROOT CONFIG [INPUT] [OUTPUT]");
         CaptureConfig config = CaptureConfig.read(Path.of(args[1]), Path.of(args[2]));
         switch (args[0]) {
-            case "check" ->
-                    System.out.println(
-                            new GsonBuilder()
-                                    .setPrettyPrinting()
-                                    .create()
-                                    .toJson(
-                                            Map.of(
-                                                    "status",
-                                                    "configuration_valid",
-                                                    "source",
-                                                    config.source().toString(),
-                                                    "jdbc",
-                                                    config.jdbc(),
-                                                    "seconds",
-                                                    config.seconds(),
-                                                    "clients",
-                                                    config.clients(),
-                                                    "tables",
-                                                    8,
-                                                    "baseline_rows",
-                                                    8706000,
-                                                    "artifacts",
-                                                    config.artifacts().toString(),
-                                                    "scope",
-                                                    "single-session TP3/TP5/TP9 capture")));
+            case "check" -> {
+                Map<String, Object> details = new LinkedHashMap<>();
+                details.putAll(Map.of(
+                        "status", "configuration_valid",
+                        "source", config.source().toString(),
+                        "jdbc", config.jdbc(),
+                        "native_mode", config.mode(),
+                        "tables", 8,
+                        "baseline_rows", 8706000,
+                        "artifacts", config.artifacts().toString()));
+                Properties p = config.nativeProperties();
+                details.put("tp_clients", config.clients());
+                details.put("change_delivery", "committed_only");
+                details.put("default_seconds", config.seconds());
+                details.put("scope", config.mode().equals("runhtap")
+                        ? "native AP -> TP -> concurrent AT/IQ"
+                        : "single-session TP3/TP5/TP9 capture");
+                if (config.mode().equals("runhtap")) {
+                    details.put("ap_clients", Integer.parseInt(p.getProperty("apclient")));
+                    details.put("xp_transaction_clients", Integer.parseInt(p.getProperty("xtpclient")));
+                    details.put("xp_query_clients", Integer.parseInt(p.getProperty("xapclient")));
+                    details.put("phase_minutes", Map.of("ap", Integer.parseInt(p.getProperty("apRunMins")),
+                            "tp", Integer.parseInt(p.getProperty("tpRunMins")),
+                            "xp", Integer.parseInt(p.getProperty("xpRunMins"))));
+                }
+                System.out.println(new GsonBuilder().setPrettyPrinting().create().toJson(details));
+            }
             case "export" -> {
                 checkServer(config);
                 PgBaselineExport.export(config.jdbc(), config.layout().output(), config.layout());
@@ -55,6 +57,17 @@ public final class CapturePoc {
                 if (args.length != 5)
                     throw new IllegalArgumentException("compile requires PG_TRACE and OUTPUT");
                 IndexTraceCompiler.compile(config, Path.of(args[3]), Path.of(args[4]));
+            }
+            case "pack" -> {
+                if (args.length != 4) throw new IllegalArgumentException("pack requires OUTPUT");
+                CaptureRun.verifyInput(config.raw());
+                PgTraceBlocks.compile(config.raw(), Path.of(args[3]));
+            }
+            case "audit" -> {
+                if (args.length != 4) throw new IllegalArgumentException("audit requires REPORT");
+                if (!config.mode().equals("runhtap"))
+                    throw new IllegalArgumentException("audit requires native runhtap configuration");
+                HybenchHtapAudit.audit(config.jdbc(), config.layout().output(), config.raw(), Path.of(args[3]));
             }
             case "replay" -> {
                 if (args.length != 5 && args.length != 6)

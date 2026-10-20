@@ -8,6 +8,7 @@
 - 固定上游提交、PG 环境和一次采集事实；不重跑 SQL 补结果，不模拟业务分支，不猜测修复 PG 内部实现。
 - 非预期错误使本次采集无效。保留原始诊断，依据原因修复，恢复明确初始状态并换新运行目录重跑；不拼接失败前缀。预期业务失败按来源语义处理，失败写入不发布。
 - 原始事实与规范索引操作分层保存，转换可追溯；不支持的语义显式拒绝，不能用最终状态正确代替访问负载审计。
+- 默认只向下游发送已提交变更，不限定具体 Index Service 场景。原始 Trace 完整保留修改尝试和回滚；回滚事务的修改不发布，不生成反向补偿操作，不增加回撤开关。查询发送按独立查询契约处理。
 - 主键和二级索引使用统一 KV 契约；Trace 保留完整支持范围，二级发送开关只改变下游负载。
 - 同事务一个 CommitVersion，查询使用独立 ReadTimestamp；事务内原始修改保留，发送默认合并同键最后效果，不跨事务合并历史版本。
 - Baseline 只 INSERT；增量追加写。Rewrite 只改变布局，不改变键、逻辑版本和 RowID。Locator 更新位置，RowID 不产生搬迁写入，不引入额外位置映射服务。
@@ -23,18 +24,21 @@
 | 派生数据 | HyBench、YCSB、sysbench 的 Java Baseline、源码指纹校验和 dry-run |
 | 原生采集 | PG 14.24 插桩、JDBC 请求关联、行变化、事务与结果采集；异常独立追踪、运行完成审计、输入摘要校验 |
 | SF1 基线 | 原生 8 表、8,706,000 行，全部 PG/Parquet 值和身份独立核对 |
-| SF1 负载 | 单会话 TP3/TP5/TP9=35/30/35，60 秒；请求、候选集合、提交修改和最终状态核对 |
+| 原生模式 | 默认 `runHTAP`：AP1–13 → TP1–18 → 并发 AT1–6/IQ1–6；保留原生选择器、比例、计时和 SQL，八表行变化采集 |
+| SF1 负载 | HTAP 四会话 5,837 请求关联通过；八表最终 8,707,767 行全量状态核对通过；AP13/TP18/AT6 均实跑，IQ5 本轮未抽中 |
 | 文件与 Trace | 统一 Parquet writer，256 MiB 目标、1,048,576 行组上限；v4 二进制 Trace、事务边界、提交版本、读取点；重复编译字节一致 |
+| HTAP 原始 Trace | 51,111,329 事件无损打包，12,479 CRC32C 块、摘要及解码计数通过；非规范 KV Trace |
 | 发送与回放 | 二级开关、默认事务内同键合并、单次输入预算；Locator/RowID 串行参考回放 |
+| 提交变更筛选 | 单会话 v4 排除回滚行修改及其索引写入；不推进版本或分配 RowID；保留受支持查询，原始/排除/提交/发送量分别报告 |
 | 版本正确性 | 历史主键点查、transfer 二级等值查询、逻辑删除、精确版本搬迁；独立行历史 oracle 与受控边界测试 |
 
-当前原生修改只有 savingaccount UPDATE 和 transfer INSERT，没有 AP、DELETE 或指定历史点的 SQL。DELETE/重插入是受控验证，不代表原生覆盖。参考模型面向 SF1，不是真实 Backend 或 SF1000 状态方案。
+默认采集配置为 `config/hybench_sf1.yaml`；旧子集显式使用 `config/hybench_tp_subset_sf1.yaml`。HTAP 原始事件可无损打包，不按 PID、XID 或文件排序推定全局提交顺序，完整 HTAP 不能交给单会话 v4 编译器。原生 `runHTAP` 不调用 freshness DELETE 路径，DELETE/重插入仍是受控验证，不代表原生覆盖。参考模型面向 TP 子集 SF1，不是真实 Backend 或 SF1000 状态方案。
 
-使用与实验结果见 [README](README.md)、[SF1 验证](docs/validation/hybench-sf1-poc.md)。格式和责任边界以 [Trace](docs/contracts/trace.md)、[存储](docs/contracts/storage.md) 为准。
+使用与实验结果见 [README](README.md)、[HTAP SF1 验证](docs/validation/hybench-sf1-htap.md)、[TP 子集验证](docs/validation/hybench-sf1-poc.md)。格式和责任边界以 [Trace](docs/contracts/trace.md)、[存储](docs/contracts/storage.md) 为准。
 
 ## 未完成
 
-1. **原生覆盖与审计**：完整 HyBench 多表 CRUD、索引列变更、预期失败/回滚/重试转换、读己之写、并发快照映射、范围查询；lossy bitmap/残余过滤归因、插桩开销及全局丢事件验证。其他来源补齐原生执行接入。
+1. **原生覆盖与规范转换**：HTAP 已接入原生执行，单会话支持范围内的回滚筛选已实现；完整多表索引维护、索引列变更、来源预期 SQL 错误/重试的规范转换、读己之写、并发快照映射和范围键投影仍未完成。异常或未完成输入仍拒绝。lossy bitmap/残余过滤归因、插桩开销及全局丢事件验证。其他来源补齐原生执行接入。
 2. **公共查询能力**：保序复合/变长键、当前与历史范围查询；point/range/snapshot 独立发送开关，默认开启，未出现的原生查询不得凭空补入。
 3. **版本与文件生命周期**：保留窗口和过期、物理 GC、快照保护下的自然 Rewrite、发布屏障及旧文件回收。规则见存储契约。
 4. **大规模准备**：有界内存/可落盘状态、增量文件 rollover、连续事务边界分段、确定性续编译和 Checkpoint；统一构建、初始加载、导出与采集编排。

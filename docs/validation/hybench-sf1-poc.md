@@ -1,4 +1,6 @@
-# HyBench SF1 验证
+# HyBench SF1 TP 子集验证
+
+此报告记录历史 TP 子集及 v4 回放证据。默认入口已切换到原生 `runHTAP`，对应 [HTAP SF1 报告](hybench-sf1-htap.md)；本报告不作为 HTAP 访问负载的验证结论。
 
 更新：2026-10-20。结论：原生单会话子集、数据核对、v4 编译及历史版本参考验证通过。真实 Backend、完整 HyBench 和 SF1000 正式 Trace 尚未验收。
 
@@ -63,20 +65,20 @@ TP3 是主键查询；TP5 按 transfer 两个二级索引访问候选，保留 O
 
 非预期 PG/JDBC/采集错误使本次运行无效。`capture-run.json` 保存首个原因、SQLSTATE、请求/事务上下文和堆栈；即使原生方法捕获异常，也不能发布完成状态。正常关闭并通过同次 JDBC/PG 审计后才标 complete；编译复核摘要并拒绝 failed/running。旧采集必须通过配对日志审计。
 
-依据真实报错修复配置、适配或采集问题，恢复明确初始状态，用新运行目录重跑；不维护或猜测 PG 内部算法、不拼接失败前缀。来源预期失败不改变其业务语义；当前规范成功事务投影对回滚拒绝，完整失败转换仍待实现。
+依据真实报错修复配置、适配或采集问题，恢复明确初始状态，用新运行目录重跑；不维护或猜测 PG 内部算法、不拼接失败前缀。来源预期失败不改变其业务语义。本节历史错误策略验证时规范成功事务投影仍拒绝回滚；当前单会话 v4 已改为排除配对审计通过的回滚修改，见 [提交变更筛选验证](committed-change-delivery.md)。来源预期 SQL 错误与重试的完整转换仍待实现。
 
 错误路径通过 JDBC 代理测试覆盖请求执行、准备、提交、连接设置、结果读取、会话标记、关闭及初始化；还验证首个错误保留、缺失服务端日志、失败前缀、旧日志回滚/错误/截断拒绝和文件被改动。JDK 17 离线构建与 48 项测试通过。此次未新运行 PG 原生事务。
 
 ## 使用入口
 
 ```bash
-java -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc check "$PWD" config/hybench_sf1.yaml
-java -Xmx2g -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc compile "$PWD" config/hybench_sf1.yaml results/poc/hybench-sf1/raw/pg-1475807.jsonl results/poc/hybench-sf1/normalized-check
+java -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc check "$PWD" config/hybench_tp_subset_sf1.yaml
+java -Xmx2g -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc compile "$PWD" config/hybench_tp_subset_sf1.yaml results/poc/hybench-sf1/raw/pg-1475807.jsonl results/poc/hybench-sf1/normalized-check
 ```
 
 `check` 不连接 PG。`export`/`run` 使用预先准备的专用 PG，不隐式启动服务；新运行使用新 artifacts/raw 目录和同一初始逻辑数据。`run` 在原生 `Data_1x` 所在工作目录执行，classpath 包含固定 HyBench classes/lib 和不再覆盖的 SIBench JAR。编译要求独立验证的 Baseline，输出目录必须不存在。回放命令见 [README](../../README.md#原生采集与回放)。
 
-PG 构建：固定 14.24 源码解压到 `build/benchmarks/postgresql-14.24/`，执行 `make -C src/main/native/postgres install extension`，只作用于隔离副本。启动设置 `SIBENCH_CAPTURE_DIR` 为与 JDBC 一致的 raw 目录，使用独立数据目录、端口和 UTC。application_name 前缀为 `sibench:`；触发器安装时由 `capture_library` 指定 row_capture.so，只覆盖 savingaccount/transfer。自动编排尚未完成。
+PG 构建：固定 14.24 源码解压到 `build/benchmarks/postgresql-14.24/`，执行 `make -C src/main/native/postgres install extension`，只作用于隔离副本。启动设置 `SIBENCH_CAPTURE_DIR` 为与 JDBC 一致的 raw 目录，使用独立数据目录、端口和 UTC。application_name 前缀为 `sibench:`；触发器安装时由 `capture_library` 指定 row_capture.so。历史运行只安装 savingaccount/transfer 触发器，当前安装脚本扩展到八表。自动编排尚未完成。
 
 ## 证据与剩余工作
 
@@ -86,4 +88,6 @@ PG 构建：固定 14.24 源码解压到 `build/benchmarks/postgresql-14.24/`，
 
 本次错误策略离线回归位于 `results/validation/hybench-sf1-capture-policy-20261020/`：原始配对日志审计通过，重新编译的两份 Trace 和两个增量 Parquet 摘要与当前 v4 证据一致，默认发送配置下 Locator/RowID 回放通过。
 
-剩余：完整多表 CRUD/索引列变更、预期失败转换、读己之写/并发快照/历史范围、全局完整性与采集开销、真实 Backend、自然 Rewrite/GC、历史 payload 回读、大规模状态/rollover/Checkpoint 和长时调度。当前状态与验收统一见 [计划](../../plan.md)。
+后续“默认只发送已提交变更”的代码、受控回滚测试和既有 SF1 离线回归单独记录于 [提交变更筛选验证](committed-change-delivery.md)，不改写本报告历史日志与计数。
+
+剩余：完整多表 CRUD/索引列变更、来源预期 SQL 错误/重试转换、读己之写/并发快照/历史范围、全局完整性与采集开销、真实 Backend、自然 Rewrite/GC、历史 payload 回读、大规模状态/rollover/Checkpoint 和长时调度。当前状态与验收统一见 [计划](../../plan.md)。

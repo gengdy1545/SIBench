@@ -7,6 +7,7 @@ import org.apache.parquet.hadoop.ParquetReader;
 import org.apache.parquet.hadoop.example.GroupReadSupport;
 import org.sibench.generation.BaselineGenerator;
 
+import java.io.IOException;
 import java.nio.file.*;
 import java.security.MessageDigest;
 import java.sql.*;
@@ -153,5 +154,27 @@ public final class PgBaselineVerify {
                 partial,
                 directory.resolve("verified-manifest.json"),
                 StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    static void verifyFiles(Path baseline) throws Exception {
+        Path verified = baseline.resolve("verified-manifest.json");
+        if (!Files.exists(verified))
+            throw new IOException("Independent verified baseline manifest required");
+        JsonObject verification = JsonParser.parseString(Files.readString(verified)).getAsJsonObject();
+        if (!verification.get("status").getAsString().equals("verified_complete"))
+            throw new IOException("Baseline is not verified");
+        if (!BaselineGenerator.sha256(baseline.resolve("files.jsonl"))
+                .equals(verification.get("files_manifest_sha256").getAsString()))
+            throw new IOException("Baseline file manifest changed");
+        if (!BaselineGenerator.sha256(baseline.resolve("locators.tsv"))
+                .equals(verification.get("locators_sha256").getAsString()))
+            throw new IOException("Baseline locators changed");
+        for (JsonElement item : verification.getAsJsonArray("files")) {
+            JsonObject file = item.getAsJsonObject();
+            Path data = baseline.resolve(file.get("path").getAsString()).normalize();
+            if (!data.startsWith(baseline.normalize())
+                    || !BaselineGenerator.sha256(data).equals(file.get("sha256").getAsString()))
+                throw new IOException("Baseline data changed");
+        }
     }
 }

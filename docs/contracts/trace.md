@@ -4,7 +4,9 @@
 
 原始层保存一次实际执行的请求、参数、结果、索引候选、行变更和提交/回滚。规范层只转换已声明支持的索引操作，保留源事件关联，不重执行 SQL 推测结果。PG 页分裂、HOT、VACUUM 等内部实现不转换为下游 KV 算法。
 
-当前原生范围：8 表主键加载、savingaccount 主键查询/修改、transfer 两个 sourceid/targetid 二级索引。未支持的事件或可见性拒绝转换。详细覆盖见 [SF1 验证](../validation/hybench-sf1-poc.md)。
+默认原生执行为 HyBench `runHTAP`，保存 AP/TP/并发 AT-IQ 的多会话采集，行变化触发器覆盖八表。当前 v4 **规范投影**仍限于显式 TP 子集：8 表主键加载、savingaccount 主键查询/修改、transfer 两个 sourceid/targetid 二级索引。HTAP 不套用单会话提交顺序，未支持的事件或可见性拒绝转换。覆盖见 [HTAP 验证](../validation/hybench-sf1-htap.md) 和 [TP 子集验证](../validation/hybench-sf1-poc.md)。
+
+`CapturePoc pack` 将 HTAP PG 原始事件写入 64 字节 access 记录及无损 `payload.jsonl`；块使用 CRC32C，输入及输出保存 SHA256。事件码 1–15 不变，16 为 `executor_run_end`，记录执行器返回的事实；`executor_end` 是清理生命周期事件，关闭连接时可能没有该事件。按文件名排序保留各会话内部顺序，不声明全局提交顺序或 KV 回放语义。
 
 ## 身份与版本
 
@@ -17,6 +19,7 @@ LogicalValue = RowID
 
 - IndexID=0 为主键，transfer 的 1/2 为 sourceid/targetid。二级非唯一谓词是前缀查询，不改为一次 PK Get。
 - CommitVersion 由 SIBench 按原始单会话每次提交顺序递增，包括只读提交，Baseline=0；同事务所有修改一致。不使用业务 timestamp、墙钟、XID 大小或下游完成顺序。
+- 回滚不推进 CommitVersion，不分配 RowID，不改变已提交索引状态，也不写入增量 Parquet。后续事务从最近的已提交状态继续。
 - transactionId 是源提交事件序号，mutationOrdinal 是事务内行修改序号；二级展开共享序号。两者不作为版本后缀。
 - ReadTimestamp 表示查询可见的提交上界，在 T 选择同键最大版本 `<=T`。没有版本或选中删除版本时不存在，不能跳过删除标记返回旧值。
 - 原生当前查询在扫描开始保存最新已发布点。历史查询须显式标记，未来读点拒绝。并发快照、读己之写尚无完整映射，不能把原始 xmin/xmax/xip 当作通用提交版本。
@@ -44,6 +47,12 @@ v4 使用 112 字节记录、每块 4096 条、little-endian 和 CRC32C。字段
 
 ## 发送选择
 
+默认只向下游发送已提交变更；这一约定不限定具体 Index Service 场景。原始 Trace 完整保留修改尝试、提交和回滚，规范转换识别事务结果，只将已提交业务变更展开为下游索引修改。回滚事务的修改不发布，不生成反向补偿操作，也不增加回撤开关。正常业务回滚不等于采集失败；未完成事务不得当作回滚处理后静默消费。
+
+这里的“只发送已提交变更”约束写入，不关闭或自动过滤查询。查询按独立的发送和可见性契约处理；不能把读取自身未提交修改的查询直接转换为仅查询已提交版本的普通 SEARCH。报告分别统计原始修改尝试、因回滚排除的修改、已提交修改和实际发送量。
+
+当前单会话 v4 编译器在提交时才展开待发布行修改，遇到配对审计通过的 abort 则丢弃这些修改；回滚前已完成且符合已提交读取点契约的 SEARCH 保留。规范 Trace 不生成 ABORT 或反向操作；回滚事实在原始 Trace 中保留。编译 manifest 的 `change_delivery=committed_only`、`raw_row_changes`、`discarded_aborted_row_changes`、`logical_row_version_writes` 和 `index_version_writes` 分别说明发送约定、原始行修改、回滚排除量、已提交行修改和展开后的索引写入；`aborted_transactions` 包括显式回滚和关闭连接产生的 abort。回放报告另给出过滤、合并后的实际发送量，不把 PG `index_insert_attempt` 等同于下游写入。
+
 ```yaml
 target:
   secondary_indexes:
@@ -68,11 +77,11 @@ target:
 
 - `running`：未完成，不能编译。
 - `failed`：保留首个错误、SQLSTATE、请求/事务上下文及堆栈；不能编译或续接。
-- `complete`：连接正常关闭，同次 JDBC/PG 请求、结果和提交关联审计通过，保存两份原始文件 SHA256。
+- `complete`：连接正常关闭，同次 JDBC/PG 请求、结果和提交关联审计通过。HTAP 保存 phases 和所有 sessions 的配对原始文件 SHA256，消费前复核全部配对摘要、清单及审计；旧子集保留单会话格式。
 
 JDBC 异常即使被原生方法捕获也会使当前运行失败；记录或清理异常不覆盖原始原因。旧无运行 manifest 的采集必须找到唯一配对 JDBC 日志并通过同样审计。审计不等于全局丢事件证明。
 
-非预期错误依据诊断修复，恢复明确初始状态并换新目录重跑，不猜测 PG 内部实现、不补造事件。来源预期失败保留实际查询/回滚且不发布失败修改；当前成功事务投影尚不支持其完整转换，遇到回滚明确拒绝，不自动忽略或重试。
+非预期错误依据诊断修复，恢复明确初始状态并换新目录重跑，不猜测 PG 内部实现、不补造事件。单会话及 HTAP 原始审计核对显式业务回滚和关闭 abort 的请求身份；关闭时仍有事务必须存在对应服务端结束边界，不能因文件已关闭而静默丢弃。八表状态审计和支持范围内的 v4 编译均排除回滚修改，不据此拒绝整次有效采集，也不自动重试。v4 仍拒绝事务 XID 不匹配、未完成扫描、读己之写和完整 HTAP 输入。最终状态正确不能替代并发访问可见性或全局事件完整性证明。
 
 ## 长时输入与验证
 

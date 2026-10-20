@@ -192,7 +192,7 @@ public class CaptureRunTest {
     }
 
     @Test
-    public void legacyCaptureAlsoRejectsFailureRollbackAndTruncatedClientOutput() throws Exception {
+    public void legacyCaptureRejectsErrorsTruncationAndUnmatchedRollback() throws Exception {
         Path directory = temporary.newFolder().toPath();
         Path pg = directory.resolve("pg-123.jsonl");
         Files.writeString(
@@ -225,6 +225,119 @@ public class CaptureRunTest {
         Files.writeString(jdbc, prefix + close);
         Files.writeString(pg, Files.readString(pg) + event("transaction_abort", "fixture", ""));
         assertThrows(IOException.class, () -> CaptureRun.verifyInput(pg));
+        Files.writeString(jdbc, prefix + "{\"event\":\"rollback\",\"application\":\"fixture\"}\n" + close);
+        CaptureRun.verifyInput(pg);
+    }
+
+    @Test
+    public void htapAuditsAllSessionsAndAcceptsMatchedBusinessRollback() throws Exception {
+        Path directory = temporary.newFolder().toPath();
+        try (CaptureRun run = CaptureRun.begin(directory, true)) {
+            run.phase("xp", null);
+            for (int pid : new int[] {123, 124}) {
+                Path jdbc = directory.resolve("jdbc-" + pid + ".jsonl");
+                CaptureRun.session(jdbc, pid);
+                Files.writeString(jdbc, """
+                        {"event":"connection","pid":%d,"phase":"xp"}
+                        {"event":"request_start","application":"p%d","sql":"SELECT 1","parameters":{}}
+                        {"event":"request_return","application":"p%d"}
+                        {"event":"rollback","application":"p%d"}
+                        {"event":"close","application":"p%d"}
+                        """.formatted(pid, pid, pid, pid, pid));
+                Files.writeString(directory.resolve("pg-" + pid + ".jsonl"), """
+                        {"event":"executor_start","pid":%d,"application":"p%d","sql":"SELECT 1"}
+                        {"event":"executor_end","pid":%d,"application":"p%d"}
+                        {"event":"executor_run_end","pid":%d,"application":"p%d"}
+                        {"event":"transaction_abort","pid":%d,"application":"p%d"}
+                        """.formatted(pid, pid, pid, pid, pid, pid, pid, pid));
+                CaptureRun.sessionClosed(jdbc);
+            }
+            run.complete(new long[19]);
+        }
+        assertEquals(2, manifest(directory).getAsJsonArray("sessions").size());
+        CaptureRun.verifyInput(directory);
+        Path output = directory.resolve("normalized");
+        assertThrows(IOException.class, () -> IndexTraceCompiler.compile(null, directory, output));
+        assertFalse(Files.exists(output));
+        Path extra = directory.resolve("pg-unregistered.jsonl");
+        Files.writeString(extra, "{}\n");
+        assertThrows(IOException.class, () -> CaptureRun.verifyInput(directory));
+        Files.delete(extra);
+        Path server = directory.resolve("pg-124.jsonl");
+        Files.writeString(server, Files.readString(server) + "{}\n");
+        assertThrows(IOException.class, () -> CaptureRun.verifyInput(directory));
+    }
+
+    @Test
+    public void failureInWorkerThreadInvalidatesHtapRun() throws Exception {
+        Path directory = temporary.newFolder().toPath();
+        try (CaptureRun run = CaptureRun.begin(directory, true)) {
+            SQLException original = new SQLException("worker failure", "08006");
+            Thread worker = new Thread(() -> CaptureRun.recordFailure(original, Map.of("operation", "worker")));
+            worker.start();
+            worker.join();
+            assertSame(original, assertThrows(SQLException.class, CaptureRun::checkFailure));
+        }
+        assertEquals("failed", manifest(directory).get("status").getAsString());
+    }
+
+    @Test
+    public void delayedResultConsumptionKeepsItsOriginalRequestIdentity() throws Exception {
+        Path directory = temporary.newFolder().toPath();
+        ResultSet result = proxy(ResultSet.class, (p, m, a) -> switch (m.getName()) {
+            case "next" -> true;
+            case "getMetaData" -> proxy(java.sql.ResultSetMetaData.class,
+                    (q, n, b) -> n.getName().equals("getColumnCount") ? 1 : java.sql.Types.INTEGER);
+            case "getString" -> "42";
+            default -> null;
+        });
+        Connection actual = actual("", null, new boolean[1]);
+        Connection delayed = proxy(Connection.class, (p, m, a) -> {
+            if (m.getName().equals("prepareStatement"))
+                return proxy(PreparedStatement.class, (q, n, b) -> switch (n.getName()) {
+                    case "executeQuery", "getResultSet" -> result;
+                    case "executeUpdate", "getUpdateCount" -> 0;
+                    default -> null;
+                });
+            return m.invoke(actual, a);
+        });
+        try (CaptureRun run = CaptureRun.begin(directory, true);
+                Connection connection = CaptureDriver.wrap(delayed, directory)) {
+            PreparedStatement first = connection.prepareStatement("SELECT 42");
+            ResultSet rows = first.executeQuery();
+            connection.prepareStatement("UPDATE savingaccount SET balance = 1").executeUpdate();
+            rows.next();
+            first.getResultSet().next();
+        }
+        var events = Files.readAllLines(jdbc(directory)).stream()
+                .map(line -> JsonParser.parseString(line).getAsJsonObject()).toList();
+        String application = events.stream()
+                .filter(e -> e.get("event").getAsString().equals("request_start"))
+                .findFirst().orElseThrow().get("application").getAsString();
+        var consumed = events.stream()
+                .filter(e -> e.get("event").getAsString().equals("consumed_row")).toList();
+        assertEquals(2, consumed.size());
+        for (var row : consumed) {
+            assertEquals(application, row.get("application").getAsString());
+            assertEquals(1, row.get("request").getAsInt());
+            assertEquals("42", row.get("1").getAsString());
+        }
+    }
+
+    @Test
+    public void ordinaryStatementsUseSameRequestCaptureAsPreparedStatements() throws Exception {
+        Path directory = temporary.newFolder().toPath();
+        try (CaptureRun run = CaptureRun.begin(directory, true);
+                Connection connection =
+                        CaptureDriver.wrap(actual("", null, new boolean[1]), directory)) {
+            connection.createStatement().executeQuery("SELECT 1");
+        }
+        var request = Files.readAllLines(jdbc(directory)).stream()
+                .map(line -> JsonParser.parseString(line).getAsJsonObject())
+                .filter(e -> e.get("event").getAsString().equals("request_start"))
+                .findFirst().orElseThrow();
+        assertEquals("SELECT 1", request.get("sql").getAsString());
+        assertTrue(request.getAsJsonObject("parameters").isEmpty());
     }
 
     private static Connection actual(String failed, SQLException error, boolean[] closed) {
@@ -250,6 +363,7 @@ public class CaptureRunTest {
                         (p, m, a) -> {
                             if (failed.equals("execute") && m.getName().equals("execute"))
                                 throw error;
+                            if (m.getName().equals("getUpdateCount")) return -1;
                             return m.getName().equals("executeQuery")
                                     ? pid
                                     : m.getName().equals("execute") ? true : null;

@@ -178,7 +178,7 @@ public final class PgCaptureAudit {
                 continue;
             }
             String x = a.getAsString(), y = b.getAsString();
-            if (key.equals("balance") || key.equals("amount")) {
+            if (key.equals("balance") || key.equals("amount") || key.equals("loan_balance")) {
                 if (Float.floatToIntBits(Float.parseFloat(x))
                         != Float.floatToIntBits(Float.parseFloat(y))) return false;
             } else if (key.contains("timestamp") || key.equals("fresh_ts")) {

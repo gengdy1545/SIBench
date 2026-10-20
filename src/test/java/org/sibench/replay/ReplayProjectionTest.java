@@ -70,6 +70,7 @@ public class ReplayProjectionTest {
                 projection.accept(IndexOperationTrace.transaction(11, 7, 11, 2, 1));
                 assertEquals(writes.size() + 1L, projection.dispatched());
                 assertEquals(2L, projection.describe().get("committed_transactions"));
+                assertEquals("committed_only", projection.describe().get("change_delivery"));
             }
         }
     }

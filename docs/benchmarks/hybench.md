@@ -4,11 +4,19 @@
 
 ## 原生路径
 
-[hybench_sf1.yaml](../../config/hybench_sf1.yaml) 使用原生数据生成、DDL、索引和 TPClient 事务方法。SIBench 反射调用原生方法并采集实际执行，当前为单会话 TP3/TP5/TP9=35/30/35，不是完整混合比例。流程与参数见 [SF1 验证](../validation/hybench-sf1-poc.md)。
+[hybench_sf1.yaml](../../config/hybench_sf1.yaml) 默认 `runhtap`。SIBench 调用未修改的 `HyBench.runAP()`、`runTP()`、`runXP(0)`，使用原生 SQL、随机选择、计时器和客户端；阶段之间只等待连接排空，不恢复数据。流程见 [HTAP SF1 验证](../validation/hybench-sf1-htap.md)。
 
-运行期只有 savingaccount UPDATE、transfer INSERT 和相关主键/二级查询；没有 AP 或 DELETE。AT-00 有 DELETE 模板，但原生默认 runner 的 execFresh3 调用被注释，不能据模板宣称运行覆盖。完整多表 CRUD、索引列变更和其他二级索引仍待适配。
+| 阶段 | 原生负载 | 默认选择 |
+| --- | --- | --- |
+| AP | AP1–AP13 | 原生每轮随机顺序，按完整轮结束 |
+| TP | TP1–TP18 | 权重依次为 5/3/5/5/3/3/3/3/7/7/7/7/6/4/4/4/12/12 |
+| XP | AT1–AT6 与 IQ1–IQ6 并发 | AT 权重 35/25/15/15/7/3；IQ 使用原生随机选择 |
 
-发送设置独立于原生采集，详见 [Trace](../contracts/trace.md)。长时采用连续原生采集，不循环；SF1000 原生入口尚未实现。
+属性以固定上游 `conf/pg.props` 为底，仅覆盖连接、客户端数和阶段时长；不手工构造事务或补齐随机分支。行变化采集触发器覆盖八张表，但某表没有实际写入时不会补造修改。AT-00 有 DELETE 模板，原生默认 runner 的 execFresh3 调用被注释，`runHTAP` 不调用该路径；不能据模板宣称 DELETE 覆盖。
+
+[hybench_tp_subset_sf1.yaml](../../config/hybench_tp_subset_sf1.yaml) 显式保留旧 TP3/TP5/TP9=35/30/35 诊断。该子集只有 savingaccount UPDATE、transfer INSERT 和相关查询，v4 规范 Trace 与版本化参考回放的证据限定在这个范围，见 [子集报告](../validation/hybench-sf1-poc.md)。完整 HTAP 当前保存无损原始事件并审计八表状态，不支持 v4 的并发快照、范围或变长键投影。
+
+发送设置独立于原生采集，默认只向下游发送已提交变更。原始 Trace 保留业务回滚及修改尝试；支持范围内的单会话 v4 编译排除回滚修改，不生成反向操作，不改变原生事务比例。写入后回滚的受控测试独立于原生覆盖，详见 [Trace](../contracts/trace.md) 和 [回滚验证](../validation/committed-change-delivery.md)。长时采用连续原生采集，不循环；SF1000 原生入口尚未实现。
 
 ## 派生 Baseline
 

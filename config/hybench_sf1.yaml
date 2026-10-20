@@ -5,24 +5,26 @@ source:
   path: benchmark/HyBench-2024
   commit: eaad91b52956fddd3d48ce49f792928056b7b360
 native:
+  mode: runhtap
   sf: 1x
   clients: 1
+  ap_clients: 1
+  xp_transaction_clients: 1
+  xp_query_clients: 1
   duration_minutes: 1
-  transaction_percentages:
-    tp3: 35
-    tp5: 30
-    tp9: 35
+  phase_duration_minutes:
+    tp: 2
 postgres:
   version: '14.24'
   port: 55433
-  database: sibench_sf1
+  database: sibench_htap_sf1_capture
   user: postgres
   isolation: read_committed
   max_parallel_workers_per_gather: 0
 capture:
   mode: instrumented_native_execution
   application_prefix: 'sibench:'
-  raw_directory: results/poc/hybench-sf1/raw
+  raw_directory: results/poc/hybench-htap-sf1/raw
   allow_event_loss: false
   statement_results: server_rows_and_consumed_rows
 data_layout:
@@ -33,4 +35,4 @@ data_layout:
   compression: zstd
   compression_level: 3
 artifacts:
-  directory: results/poc/hybench-sf1
+  directory: results/poc/hybench-htap-sf1

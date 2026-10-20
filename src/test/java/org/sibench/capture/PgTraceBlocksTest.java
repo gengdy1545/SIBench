@@ -11,6 +11,26 @@ import java.util.zip.CRC32C;
 
 public class PgTraceBlocksTest {
     @Test
+    public void packsExecutionReturnsWithLosslessPayload() throws Exception {
+        Path directory = Files.createTempDirectory("sibench-payload-test-");
+        Path raw = Files.createDirectory(directory.resolve("raw"));
+        Path output = directory.resolve("trace");
+        String event = "{\"event\":\"executor_run_end\",\"pid\":42,\"application\":\"request\"}\n";
+        try {
+            Files.writeString(raw.resolve("pg-42.jsonl"), event);
+            PgTraceBlocks.compile(raw, output);
+            assertEquals(1, PgTraceBlocks.decode(output.resolve("access.bin")));
+            assertEquals(event, Files.readString(output.resolve("payload.jsonl")));
+            assertFalse(Files.exists(output.resolve("INCOMPLETE")));
+        } finally {
+            try (var paths = Files.walk(directory)) {
+                for (Path path : paths.sorted(java.util.Comparator.reverseOrder()).toList())
+                    Files.delete(path);
+            }
+        }
+    }
+
+    @Test
     public void decodesAndRejectsDamage() throws Exception {
         Path file = Files.createTempFile("sibench-block-test-", ".bin");
         try {

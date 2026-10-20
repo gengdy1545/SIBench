@@ -7,7 +7,7 @@ import org.sibench.generation.GenerationConfig;
 import java.nio.file.*;
 import java.util.*;
 
-/** Configuration contract for the bounded native SF1 capture. */
+/** Configuration contract for native SF1 capture and the explicitly selected TP diagnostic. */
 public record CaptureConfig(
         Path root,
         Path source,
@@ -40,14 +40,20 @@ public record CaptureConfig(
         var nativeConfig = object(doc, "native");
         require(string(nativeConfig, "sf").equals("1x"), "Capture currently requires native SF1");
         int clients = Math.toIntExact(positive(nativeConfig, "clients"));
-        require(clients == 1, "Only single-session capture normalization is implemented");
+        String mode = nativeConfig.containsKey("mode") ? string(nativeConfig, "mode") : "runhtap";
+        require(Set.of("runhtap", "tp_subset").contains(mode), "Unsupported native mode: " + mode);
+        require(mode.equals("runhtap") || clients == 1,
+                "Only single-session TP subset normalization is implemented");
         int seconds =
                 Math.toIntExact(Math.multiplyExact(positive(nativeConfig, "duration_minutes"), 60));
         Map<Integer, Integer> percentages = new LinkedHashMap<>();
         int total = 0;
-        for (var entry : object(nativeConfig, "transaction_percentages").entrySet()) {
+        Map<String, Object> configuredPercentages = nativeConfig.containsKey("transaction_percentages")
+                ? object(nativeConfig, "transaction_percentages") : Map.of();
+        for (var entry : configuredPercentages.entrySet()) {
             require(
-                    Set.of("tp3", "tp5", "tp9").contains(entry.getKey()),
+                    mode.equals("runhtap") ? entry.getKey().matches("tp([1-9]|1[0-8])")
+                            : Set.of("tp3", "tp5", "tp9").contains(entry.getKey()),
                     "Unsupported transaction: " + entry.getKey());
             int percent =
                     Math.toIntExact(
@@ -58,7 +64,20 @@ public record CaptureConfig(
             total += percent;
             percentages.put(Integer.parseInt(entry.getKey().substring(2)), percent);
         }
-        require(total == 100, "Transaction percentages must sum to 100");
+        require(mode.equals("runhtap") ? configuredPercentages.isEmpty() || total == 100 : total == 100,
+                "Transaction percentages must sum to 100");
+        if (mode.equals("runhtap")) {
+            for (String field : List.of("ap_clients", "xp_transaction_clients", "xp_query_clients"))
+                require(positive(nativeConfig, field) <= 256, "Invalid client count: " + field);
+            require(clients <= 256, "Invalid TP client count");
+            if (nativeConfig.containsKey("phase_duration_minutes")) {
+                var durations = object(nativeConfig, "phase_duration_minutes");
+                for (String phase : durations.keySet()) {
+                    require(Set.of("ap", "tp", "xp").contains(phase), "Unknown phase: " + phase);
+                    require(positive(durations, phase) <= 1440, "Invalid phase duration");
+                }
+            }
+        }
         var pg = object(doc, "postgres");
         require(string(pg, "version").equals("14.24"), "Capture patch requires PG 14.24");
         require(string(pg, "isolation").equals("read_committed"), "Only read_committed supported");
@@ -155,17 +174,49 @@ public record CaptureConfig(
 
     public Properties nativeProperties() {
         Properties p = new Properties();
+        if (mode().equals("runhtap")) {
+            try (var input = Files.newInputStream(source.resolve("conf/pg.props"))) {
+                p.load(input);
+            } catch (java.io.IOException error) {
+                throw new java.io.UncheckedIOException(error);
+            }
+        }
         p.setProperty("sf", "1x");
         p.setProperty("db", "postgreSQL");
-        p.setProperty("tpclient", "1");
-        p.setProperty("contention_num", "100");
-        p.setProperty("risk_rate", "0.1");
+        p.setProperty("tpclient", Integer.toString(clients));
+        if (mode().equals("tp_subset")) {
+            p.setProperty("contention_num", "100");
+            p.setProperty("risk_rate", "0.1");
+        }
         p.setProperty("username", user);
         p.setProperty("password", "");
         p.setProperty("url", jdbc.replace("jdbc:postgresql:", "jdbc:sibench:"));
         p.setProperty("classname", CaptureDriver.class.getName());
-        for (int i = 1; i <= 18; i++)
-            p.setProperty("tp" + i + "_percent", Integer.toString(percentages.getOrDefault(i, 0)));
+        if (mode().equals("runhtap")) {
+            p.setProperty("url_ap", p.getProperty("url"));
+            p.setProperty("username_ap", user);
+            p.setProperty("password_ap", "");
+            p.setProperty("classname_ap", CaptureDriver.class.getName());
+            var nativeConfig = object(document, "native");
+            p.setProperty("apclient", Long.toString(positive(nativeConfig, "ap_clients")));
+            p.setProperty("xtpclient", Long.toString(positive(nativeConfig, "xp_transaction_clients")));
+            p.setProperty("xapclient", Long.toString(positive(nativeConfig, "xp_query_clients")));
+            for (String name : List.of("apRunMins", "tpRunMins", "xpRunMins"))
+                p.setProperty(name, Integer.toString(seconds / 60));
+            if (nativeConfig.containsKey("phase_duration_minutes")) {
+                var durations = object(nativeConfig, "phase_duration_minutes");
+                for (String phase : durations.keySet())
+                    p.setProperty(phase + "RunMins", Long.toString(positive(durations, phase)));
+            }
+        }
+        if (!percentages.isEmpty() || mode().equals("tp_subset"))
+            for (int i = 1; i <= 18; i++)
+                p.setProperty("tp" + i + "_percent", Integer.toString(percentages.getOrDefault(i, 0)));
         return p;
+    }
+
+    public String mode() {
+        var nativeConfig = object(document, "native");
+        return nativeConfig.containsKey("mode") ? string(nativeConfig, "mode") : "runhtap";
     }
 }

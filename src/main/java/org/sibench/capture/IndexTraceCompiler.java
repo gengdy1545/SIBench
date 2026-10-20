@@ -14,7 +14,7 @@ import java.io.*;
 import java.nio.file.*;
 import java.util.*;
 
-/** Deterministic commit/read-point mapping of an explicitly limited single-session capture. */
+/** Maps supported single-session reads and committed changes; aborts remain in the raw trace. */
 public final class IndexTraceCompiler {
     private static final Map<String, Integer> TABLE_IDS = new LinkedHashMap<>();
 
@@ -84,23 +84,23 @@ public final class IndexTraceCompiler {
 
     public static void compile(CaptureConfig capture, Path raw, Path output) throws Exception {
         CaptureRun.verifyInput(raw);
+        Path rawDirectory = Files.isDirectory(raw) ? raw : raw.toAbsolutePath().getParent();
+        Path runManifest = rawDirectory.resolve("capture-run.json");
+        boolean htapInput =
+                Files.exists(runManifest)
+                        && JsonParser.parseString(Files.readString(runManifest))
+                                .getAsJsonObject()
+                                .has("sessions");
+        if (htapInput || capture != null && capture.mode().equals("runhtap"))
+            throw new IOException(
+                    "Native runHTAP requires concurrent snapshot/range/variable-key projection; use"
+                        + " the lossless PgTraceBlocks container, not the single-session v4"
+                        + " compiler");
         Path baseline = capture.layout().output();
+        PgBaselineVerify.verifyFiles(baseline);
         Path verified = baseline.resolve("verified-manifest.json");
-        if (!Files.exists(verified))
-            throw new IOException("Independent verified baseline manifest required");
         JsonObject verification =
                 JsonParser.parseString(Files.readString(verified)).getAsJsonObject();
-        if (!verification.get("status").getAsString().equals("verified_complete"))
-            throw new IOException("Baseline is not verified");
-        if (!BaselineGenerator.sha256(baseline.resolve("files.jsonl"))
-                .equals(verification.get("files_manifest_sha256").getAsString()))
-            throw new IOException("Baseline file manifest changed");
-        for (JsonElement item : verification.getAsJsonArray("files")) {
-            JsonObject file = item.getAsJsonObject();
-            if (!BaselineGenerator.sha256(baseline.resolve(file.get("path").getAsString()))
-                    .equals(file.get("sha256").getAsString()))
-                throw new IOException("Baseline data changed");
-        }
         Files.createDirectory(output);
         Files.writeString(
                 output.resolve("INCOMPLETE"),
@@ -176,8 +176,11 @@ public final class IndexTraceCompiler {
         Set<Long> deletedAccounts = new HashSet<>();
         long event = 0, version = 0, operationsCount, mutations = 0, searches = 0, rawInserts = 0;
         long inserts = 0, updates = 0, deletes = 0, commits = 0;
+        long rawMutations = 0, aborts = 0, discardedMutations = 0, discardedIndexInserts = 0;
+        long pendingIndexInserts = 0;
         int expectedPid = 0;
         long pendingXid = 0;
+        boolean transactionOpen = false;
         List<Map<String, Object>> files = new ArrayList<>();
         try (var reader = Files.newBufferedReader(raw);
                 var operations = new IndexOperationTrace.Writer(output.resolve("workload.ops"))) {
@@ -190,6 +193,10 @@ public final class IndexTraceCompiler {
                 else if (pid != expectedPid)
                     throw new IOException("Single-session projection only");
                 String type = e.get("event").getAsString();
+                if (type.equals("executor_start")
+                        || type.equals("scan_rescan")
+                        || type.equals("row_change")
+                        || type.equals("index_insert_attempt")) transactionOpen = true;
                 if (type.equals("executor_start")
                         && !pending.isEmpty()
                         && e.get("sql")
@@ -254,12 +261,22 @@ public final class IndexTraceCompiler {
                     pendingXid = xid;
                     e.addProperty("source_event", event);
                     pending.add(e);
-                } else if (type.equals("index_insert_attempt")) rawInserts++;
-                else if (type.equals("transaction_abort"))
-                    throw new IOException(
-                            "Abort is preserved raw, not supported by this committed-state"
-                                    + " projection");
-                else if (type.equals("transaction_commit")) {
+                    rawMutations++;
+                } else if (type.equals("index_insert_attempt")) {
+                    rawInserts++;
+                    pendingIndexInserts++;
+                } else if (type.equals("transaction_abort")) {
+                    if (!scans.isEmpty()) throw new IOException("Abort with unfinished scans");
+                    if (!pending.isEmpty() && pendingXid != e.get("xid").getAsLong())
+                        throw new IOException("Abort XID mismatch");
+                    aborts++;
+                    discardedMutations += pending.size();
+                    discardedIndexInserts += pendingIndexInserts;
+                    pending.clear();
+                    pendingXid = 0;
+                    pendingIndexInserts = 0;
+                    transactionOpen = false;
+                } else if (type.equals("transaction_commit")) {
                     if (!scans.isEmpty()) throw new IOException("Commit with unfinished scans");
                     if (!pending.isEmpty() && pendingXid != e.get("xid").getAsLong())
                         throw new IOException("Commit XID mismatch");
@@ -373,9 +390,13 @@ public final class IndexTraceCompiler {
                                     version,
                                     ordinal));
                     pending.clear();
+                    pendingXid = 0;
+                    pendingIndexInserts = 0;
+                    transactionOpen = false;
                 } else if (!Set.of(
                                 "executor_start",
                                 "executor_end",
+                                "executor_run_end",
                                 "scan_next",
                                 "bitmap_end",
                                 "result_row")
@@ -383,7 +404,7 @@ public final class IndexTraceCompiler {
                     throw new IOException("Unsupported raw event: " + type);
                 }
             }
-            if (!pending.isEmpty() || !scans.isEmpty())
+            if (transactionOpen || !pending.isEmpty() || !scans.isEmpty())
                 throw new IOException("Truncated runtime capture");
             for (var entry : writers.entrySet()) {
                 Output writer = entry.getValue();
@@ -432,6 +453,11 @@ public final class IndexTraceCompiler {
         report.put("workload_operations", operationsCount);
         report.put("searches", searches);
         report.put("logical_row_version_writes", mutations);
+        report.put("change_delivery", "committed_only");
+        report.put("raw_row_changes", rawMutations);
+        report.put("discarded_aborted_row_changes", discardedMutations);
+        report.put("aborted_transactions", aborts);
+        report.put("discarded_aborted_index_insert_attempts", discardedIndexInserts);
         report.put(
                 "business_changes",
                 Map.of("insert", inserts, "update", updates, "delete", deletes));
@@ -470,7 +496,7 @@ public final class IndexTraceCompiler {
                 "limitations",
                 List.of(
                         "Not PG physical-index equivalence",
-                        "No transaction rollback or concurrent snapshots",
+                        "No concurrent snapshots or transaction-local read-after-write projection",
                         "Search event source ordering retained as source_event but emitted on scan"
                                 + " end",
                         "No historical lookup or Rewrite events in this native trace",

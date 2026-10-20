@@ -7,9 +7,16 @@ JOBS ?= 8
 .PHONY: patch build install extension
 patch:
 	@test -f "$(PG_SRC)/configure" || (echo "Extract PostgreSQL 14.24 into PG_SRC first"; exit 1)
-	@grep -q 'PACKAGE_VERSION='\''14.24'\''' "$(PG_SRC)/configure"
+	@rg -q 'PACKAGE_VERSION='\''14.24'\''' "$(PG_SRC)/configure"
 	@if ! test -f "$(PG_SRC)/.sibench-patched"; then \
-	  cd "$(PG_SRC)" && patch --batch --forward -p1 < "$(CURDIR)/postgresql-14.24.patch" && touch .sibench-patched; \
+	  if ! rg -q 'sib_wrap_receiver' "$(PG_SRC)/src/backend/executor/execMain.c"; then \
+	    cd "$(PG_SRC)" && patch --batch --forward -p1 < "$(CURDIR)/postgresql-14.24.patch"; \
+	  fi && touch "$(PG_SRC)/.sibench-patched"; \
+	fi
+	@if ! test -f "$(PG_SRC)/.sibench-execution-completion"; then \
+	  if ! rg -q 'sib_emit\("executor_run_end"' "$(PG_SRC)/src/backend/executor/execMain.c"; then \
+	    cd "$(PG_SRC)" && patch --batch --forward -p1 < "$(CURDIR)/execution-completion.patch"; \
+	  fi && touch "$(PG_SRC)/.sibench-execution-completion"; \
 	fi
 	cp sibench_capture.h sibench_receiver.h "$(PG_SRC)/src/include/"
 	touch "$(PG_SRC)/src/backend/access/index/indexam.c" "$(PG_SRC)/src/backend/nodes/tidbitmap.c" \
