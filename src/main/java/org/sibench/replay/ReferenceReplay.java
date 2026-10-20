@@ -2,6 +2,7 @@ package org.sibench.replay;
 
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParser;
+
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexReferenceReplay;
 import org.sibench.generation.BaselineGenerator;
@@ -19,7 +20,8 @@ import java.util.Map;
 public final class ReferenceReplay {
     private ReferenceReplay() {}
 
-    public static Map<String, Object> check(Path directory, ReplayConfig config) throws IOException {
+    public static Map<String, Object> check(Path directory, ReplayConfig config)
+            throws IOException {
         if (Files.exists(directory.resolve("INCOMPLETE"))
                 || !Files.isRegularFile(directory.resolve("manifest.json")))
             throw new IOException("Incomplete normalized dataset");
@@ -33,13 +35,16 @@ public final class ReferenceReplay {
                             .equals(manifest.get(checksum).getAsString()))
                 throw new IOException("Trace checksum mismatch: " + name);
         }
-        var checked = checkFiles(directory.resolve("baseline.ops"), directory.resolve("workload.ops"), config);
+        var checked =
+                checkFiles(
+                        directory.resolve("baseline.ops"),
+                        directory.resolve("workload.ops"),
+                        config);
         for (String name : List.of("baseline", "workload")) {
             var counts = (Map<?, ?>) checked.get(name);
             String countKey = name + "_operations";
             if (!manifest.has(countKey)
-                    || manifest.get(countKey).getAsLong()
-                            != (long) counts.get("encoded_records"))
+                    || manifest.get(countKey).getAsLong() != (long) counts.get("encoded_records"))
                 throw new IOException("Trace record count mismatch: " + name);
         }
         return checked;
@@ -71,7 +76,9 @@ public final class ReferenceReplay {
         report.put("baseline", loadCounts);
         report.put("workload", runtimeCounts);
         report.put("budget_scope", "input supply only; no rate scheduling or duration guarantee");
-        report.put("validation_scope", "binary integrity and input counts; state/result semantics checked during replay");
+        report.put(
+                "validation_scope",
+                "binary integrity and input counts; state/result semantics checked during replay");
         return report;
     }
 
@@ -90,7 +97,8 @@ public final class ReferenceReplay {
     public static Map<String, Object> runFiles(
             Path baseline, Path workload, ReplayConfig config, Path report) throws IOException {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
-        return runChecked(baseline, workload, config, checkFiles(baseline, workload, config), report);
+        return runChecked(
+                baseline, workload, config, checkFiles(baseline, workload, config), report);
     }
 
     private static Map<String, Object> runChecked(
@@ -105,15 +113,17 @@ public final class ReferenceReplay {
         for (boolean rowId : new boolean[] {false, true}) {
             var index = new IndexReferenceReplay(rowId, config.secondaryIndexes(), versioned);
             var load = new ReplayProjection(config.secondaryIndexes(), index::accept);
-            var runtime = new ReplayProjection(config,
-                    IndexOperationTrace.formatVersion(workload) >= 3, index::accept);
+            var runtime =
+                    new ReplayProjection(
+                            config,
+                            IndexOperationTrace.formatVersion(workload) >= 3,
+                            index::accept);
             long start = System.nanoTime();
             IndexOperationTrace.readExpanded(baseline, load);
             double loadSeconds = (System.nanoTime() - start) / 1e9;
             start = System.nanoTime();
             IndexOperationTrace.readExpanded(workload, runtime);
             runtime.finish();
-            index.finish();
             double seconds = (System.nanoTime() - start) / 1e9;
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("mode", rowId ? "rowid" : "locator");
@@ -129,10 +139,14 @@ public final class ReferenceReplay {
             result.put("relocation_writes", index.relocationWrites());
             result.put("result_checksum", index.checksum());
             result.put("primary_state_checksum", index.stateChecksum());
-            result.put("selected_version_checksum", versioned ? index.selectedVersionChecksum() : null);
+            result.put(
+                    "selected_version_checksum",
+                    versioned ? index.selectedVersionChecksum() : null);
             result.put("snapshot_queries", index.snapshotQueries());
             result.put("retained_index_versions", versioned ? index.retainedVersions() : null);
-            result.put("read_model", versioned ? "committed_version_at_read_timestamp" : "legacy_latest_state");
+            result.put(
+                    "read_model",
+                    versioned ? "committed_version_at_read_timestamp" : "legacy_latest_state");
             results.add(result);
         }
         Map<String, Object> output = new LinkedHashMap<>();
@@ -141,10 +155,10 @@ public final class ReferenceReplay {
         output.put("results", results);
         output.put(
                 "scope",
-                "serial correctness reference; v3/v4 commit-bounded version history and timestamp lookup,"
-                        + " v1/v2 latest-state compatibility; supported primary/transfer indexes only;"
-                        + " no RPC, persistence, concurrent PG MVCC, range query, physical GC,"
-                        + " rate scheduling or sustained-duration proof");
+                "single-thread ordered correctness reference; v3-v5 committed-source version"
+                    + " history and timestamp lookup, v1/v2 latest-state compatibility; supported"
+                    + " primary/transfer indexes only; no RPC, persistence, concurrent PG MVCC,"
+                    + " range query, physical GC, rate scheduling or sustained-duration proof");
         Files.writeString(
                 report,
                 new GsonBuilder().setPrettyPrinting().create().toJson(output),

@@ -14,9 +14,9 @@
 
 属性以固定上游 `conf/pg.props` 为底，仅覆盖连接、客户端数和阶段时长；不手工构造事务或补齐随机分支。行变化采集触发器覆盖八张表，但某表没有实际写入时不会补造修改。AT-00 有 DELETE 模板，原生默认 runner 的 execFresh3 调用被注释，`runHTAP` 不调用该路径；不能据模板宣称 DELETE 覆盖。
 
-[hybench_tp_subset_sf1.yaml](../../config/hybench_tp_subset_sf1.yaml) 显式保留旧 TP3/TP5/TP9=35/30/35 诊断。该子集只有 savingaccount UPDATE、transfer INSERT 和相关查询，v4 规范 Trace 与版本化参考回放的证据限定在这个范围，见 [子集报告](../validation/hybench-sf1-poc.md)。完整 HTAP 当前保存无损原始事件并审计八表状态，不支持 v4 的并发快照、范围或变长键投影。
+[hybench_tp_subset_sf1.yaml](../../config/hybench_tp_subset_sf1.yaml) 显式保留旧 TP3/TP5/TP9=35/30/35 诊断。该子集只有 savingaccount UPDATE、transfer INSERT 和相关查询，当前 v5 规范 Trace 与版本化参考回放的原生证据限定在这个范围，见 [子集报告](../validation/hybench-sf1-poc.md)。完整 HTAP 当前保存无损原始事件并审计八表状态，不支持并发快照、全局顺序、范围或变长键的规范投影。
 
-发送设置独立于原生采集，默认只向下游发送已提交变更。原始 Trace 保留业务回滚及修改尝试；支持范围内的单会话 v4 编译排除回滚修改，不生成反向操作，不改变原生事务比例。写入后回滚的受控测试独立于原生覆盖，详见 [Trace](../contracts/trace.md) 和 [回滚验证](../validation/committed-change-delivery.md)。长时采用连续原生采集，不循环；SF1000 原生入口尚未实现。
+发送设置独立于原生采集，默认只向下游发送已提交变更。原始 Trace 保留业务回滚及修改尝试；单会话编译排除回滚修改及修改后的查询，不生成反向操作，不改变原生事务比例。已提交事务保留查询与修改的原始相对顺序，支持写后查询；operation/transaction 两种发送模式均单线程同步，不要求索引事务 API。受控测试独立于原生覆盖，详见 [Trace](../contracts/trace.md) 和 [发送验证](../validation/committed-change-delivery.md)。长时采用连续原生采集，不循环；SF1000 原生入口尚未实现。
 
 ## 派生 Baseline
 

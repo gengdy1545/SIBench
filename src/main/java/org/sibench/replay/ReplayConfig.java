@@ -15,15 +15,26 @@ public record ReplayConfig(
         long plannedOperationsPerSecond,
         long warmupOperations,
         int reservePercent,
-        boolean coalesceTransactionWrites) {
+        String dispatchMode) {
     public ReplayConfig(
-            boolean secondaryIndexes, String gcOwner, long durationSeconds,
-            long plannedOperationsPerSecond, long warmupOperations, int reservePercent) {
-        this(secondaryIndexes, gcOwner, durationSeconds, plannedOperationsPerSecond,
-                warmupOperations, reservePercent, true);
+            boolean secondaryIndexes,
+            String gcOwner,
+            long durationSeconds,
+            long plannedOperationsPerSecond,
+            long warmupOperations,
+            int reservePercent) {
+        this(
+                secondaryIndexes,
+                gcOwner,
+                durationSeconds,
+                plannedOperationsPerSecond,
+                warmupOperations,
+                reservePercent,
+                "operation");
     }
 
     public ReplayConfig {
+        require(Set.of("operation", "transaction").contains(dispatchMode), "Invalid dispatch mode");
         require(Set.of("benchmark", "backend", "none").contains(gcOwner), "Invalid GC owner");
         require(durationSeconds >= 0 && plannedOperationsPerSecond >= 0, "Invalid trace budget");
         require(
@@ -31,7 +42,8 @@ public record ReplayConfig(
                 "Duration and planned rate must both be specified");
         require(warmupOperations >= 0, "Warmup operations must not be negative");
         require(reservePercent >= 0 && reservePercent <= 100, "Reserve must be between 0 and 100");
-        requiredOperations(durationSeconds, plannedOperationsPerSecond, warmupOperations, reservePercent);
+        requiredOperations(
+                durationSeconds, plannedOperationsPerSecond, warmupOperations, reservePercent);
     }
 
     public static ReplayConfig defaults() {
@@ -45,20 +57,20 @@ public record ReplayConfig(
     public static ReplayConfig from(Map<String, Object> document) {
         keys(document, Set.of("schema_version", "purpose", "target", "replay", "versions"));
         require(integer(document, "schema_version") == 1, "Expected replay config v1");
-        require(string(document, "purpose").equals("index_replay"), "Expected index_replay purpose");
+        require(
+                string(document, "purpose").equals("index_replay"),
+                "Expected index_replay purpose");
         var target = object(document, "target");
-        keys(target, Set.of("secondary_indexes", "transaction_writes"));
-        boolean coalesce = true;
-        if (target.containsKey("transaction_writes")) {
-            var writes = object(target, "transaction_writes");
-            keys(writes, Set.of("coalesce_same_key"));
-            coalesce = bool(writes, "coalesce_same_key");
-        }
+        keys(target, Set.of("secondary_indexes"));
         var secondary = object(target, "secondary_indexes");
         keys(secondary, Set.of("enabled"));
         var replay = object(document, "replay");
-        keys(replay, Set.of("strategy", "trace_budget"));
-        require(string(replay, "strategy").equals("single_pass"), "Only single_pass replay is supported");
+        keys(replay, Set.of("strategy", "dispatch_mode", "trace_budget"));
+        String dispatchMode =
+                replay.containsKey("dispatch_mode") ? string(replay, "dispatch_mode") : "operation";
+        require(
+                string(replay, "strategy").equals("single_pass"),
+                "Only single_pass replay is supported");
         var versions = object(document, "versions");
         keys(versions, Set.of("gc"));
         var gc = object(versions, "gc");
@@ -80,7 +92,13 @@ public record ReplayConfig(
             reserve = Math.toIntExact(integer(budget, "reserve_percent"));
         }
         return new ReplayConfig(
-                bool(secondary, "enabled"), string(gc, "owner"), seconds, rate, warmup, reserve, coalesce);
+                bool(secondary, "enabled"),
+                string(gc, "owner"),
+                seconds,
+                rate,
+                warmup,
+                reserve,
+                dispatchMode);
     }
 
     public long requiredOperations() {
@@ -98,14 +116,15 @@ public record ReplayConfig(
     public void requireReferenceCapabilities() {
         require(
                 gcOwner.equals("none"),
-                "Reference replay supports GC owner none only; physical GC/backend retention is not implemented");
+                "Reference replay supports GC owner none only; physical GC/backend retention is not"
+                    + " implemented");
     }
 
     public Map<String, Object> describe() {
         return Map.of(
                 "strategy", "single_pass",
                 "secondary_indexes_enabled", secondaryIndexes,
-                "coalesce_transaction_writes", coalesceTransactionWrites,
+                "dispatch_mode", dispatchMode,
                 "gc_owner", gcOwner,
                 "duration_seconds", durationSeconds,
                 "planned_operations_per_second", plannedOperationsPerSecond,

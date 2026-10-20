@@ -26,16 +26,24 @@ public final class IndexTraceCompiler {
     private IndexTraceCompiler() {}
 
     private static final class Search {
-        final long event, key, readTimestamp;
-        final int table, index;
+        final JsonObject captured;
         long count;
 
-        Search(long event, long key, int table, int index, long readTimestamp) {
-            this.event = event;
-            this.key = key;
-            this.table = table;
-            this.index = index;
-            this.readTimestamp = readTimestamp;
+        Search(
+                long event,
+                long key,
+                int table,
+                int index,
+                long readTimestamp,
+                long precedingMutations) {
+            this.captured = new JsonObject();
+            captured.addProperty("event", "search");
+            captured.addProperty("source_event", event);
+            captured.addProperty("table", table);
+            captured.addProperty("index", index);
+            captured.addProperty("key", key);
+            captured.addProperty("read_timestamp", readTimestamp);
+            captured.addProperty("preceding_mutations", precedingMutations);
         }
     }
 
@@ -94,8 +102,8 @@ public final class IndexTraceCompiler {
         if (htapInput || capture != null && capture.mode().equals("runhtap"))
             throw new IOException(
                     "Native runHTAP requires concurrent snapshot/range/variable-key projection; use"
-                        + " the lossless PgTraceBlocks container, not the single-session v4"
-                        + " compiler");
+                            + " the lossless PgTraceBlocks container, not the single-session"
+                            + " compiler");
         Path baseline = capture.layout().output();
         PgBaselineVerify.verifyFiles(baseline);
         Path verified = baseline.resolve("verified-manifest.json");
@@ -178,6 +186,7 @@ public final class IndexTraceCompiler {
         long inserts = 0, updates = 0, deletes = 0, commits = 0;
         long rawMutations = 0, aborts = 0, discardedMutations = 0, discardedIndexInserts = 0;
         long pendingIndexInserts = 0;
+        long pendingMutations = 0, discardedSearches = 0, localSearches = 0;
         int expectedPid = 0;
         long pendingXid = 0;
         boolean transactionOpen = false;
@@ -197,17 +206,6 @@ public final class IndexTraceCompiler {
                         || type.equals("scan_rescan")
                         || type.equals("row_change")
                         || type.equals("index_insert_attempt")) transactionOpen = true;
-                if (type.equals("executor_start")
-                        && !pending.isEmpty()
-                        && e.get("sql")
-                                .getAsString()
-                                .stripLeading()
-                                .toLowerCase(Locale.ROOT)
-                                .startsWith("select")) {
-                    throw new IOException(
-                            "Read after transaction-local write requires a richer visibility"
-                                    + " model");
-                }
                 if (type.equals("scan_rescan")) {
                     String index = e.get("relation").getAsString();
                     int table, indexId;
@@ -228,15 +226,17 @@ public final class IndexTraceCompiler {
                     if (k.get("strategy").getAsInt() != 3 || k.get("flags").getAsInt() != 0)
                         throw new IOException("Unsupported scan predicate");
                     String id = e.get("scan").getAsString();
-                    if (scans.put(
-                                    id,
-                                    new Search(
-                                            event,
-                                            k.get("value").getAsLong(),
-                                            table,
-                                            indexId,
-                                            version))
-                            != null) throw new IOException("Repeated live scan identity");
+                    Search search =
+                            new Search(
+                                    event,
+                                    k.get("value").getAsLong(),
+                                    table,
+                                    indexId,
+                                    version,
+                                    pendingMutations);
+                    if (scans.put(id, search) != null)
+                        throw new IOException("Repeated live scan identity");
+                    pending.add(search.captured);
                 } else if (type.equals("bitmap_candidate") || type.equals("heap_visibility")) {
                     Search search = scans.get(e.get("scan").getAsString());
                     if (search == null) throw new IOException("Unmatched candidate event");
@@ -244,41 +244,51 @@ public final class IndexTraceCompiler {
                 } else if (type.equals("scan_end")) {
                     Search search = scans.remove(e.get("scan").getAsString());
                     if (search == null) throw new IOException("Unmatched scan end");
-                    operations.append(
-                            IndexOperationTrace.search(
-                                    search.event,
-                                    search.table,
-                                    search.index,
-                                    search.key,
-                                    search.readTimestamp,
-                                    search.count,
-                                    0));
-                    searches++;
+                    search.captured.addProperty("count", search.count);
                 } else if (type.equals("row_change")) {
                     long xid = e.get("xid").getAsLong();
-                    if (!pending.isEmpty() && pendingXid != xid)
+                    if (pendingMutations != 0 && pendingXid != xid)
                         throw new IOException("Interleaved transactions unsupported");
                     pendingXid = xid;
                     e.addProperty("source_event", event);
                     pending.add(e);
                     rawMutations++;
+                    pendingMutations++;
                 } else if (type.equals("index_insert_attempt")) {
                     rawInserts++;
                     pendingIndexInserts++;
                 } else if (type.equals("transaction_abort")) {
                     if (!scans.isEmpty()) throw new IOException("Abort with unfinished scans");
-                    if (!pending.isEmpty() && pendingXid != e.get("xid").getAsLong())
+                    if (pendingMutations != 0 && pendingXid != e.get("xid").getAsLong())
                         throw new IOException("Abort XID mismatch");
                     aborts++;
-                    discardedMutations += pending.size();
+                    discardedMutations += pendingMutations;
                     discardedIndexInserts += pendingIndexInserts;
+                    for (JsonObject item : pending) {
+                        if (!item.get("event").getAsString().equals("search")) continue;
+                        if (item.get("preceding_mutations").getAsLong() != 0) {
+                            discardedSearches++;
+                            continue;
+                        }
+                        operations.append(
+                                IndexOperationTrace.search(
+                                        item.get("source_event").getAsLong(),
+                                        item.get("table").getAsInt(),
+                                        item.get("index").getAsInt(),
+                                        item.get("key").getAsLong(),
+                                        item.get("read_timestamp").getAsLong(),
+                                        item.get("count").getAsLong(),
+                                        0));
+                        searches++;
+                    }
                     pending.clear();
                     pendingXid = 0;
                     pendingIndexInserts = 0;
+                    pendingMutations = 0;
                     transactionOpen = false;
                 } else if (type.equals("transaction_commit")) {
                     if (!scans.isEmpty()) throw new IOException("Commit with unfinished scans");
-                    if (!pending.isEmpty() && pendingXid != e.get("xid").getAsLong())
+                    if (pendingMutations != 0 && pendingXid != e.get("xid").getAsLong())
                         throw new IOException("Commit XID mismatch");
                     version = Math.incrementExact(version);
                     commits++;
@@ -291,6 +301,26 @@ public final class IndexTraceCompiler {
                                     version,
                                     0));
                     for (JsonObject change : pending) {
+                        if (change.get("event").getAsString().equals("search")) {
+                            long preceding = change.get("preceding_mutations").getAsLong();
+                            boolean local = preceding != 0;
+                            operations.append(
+                                    IndexOperationTrace.transactionSearch(
+                                            change.get("source_event").getAsLong(),
+                                            change.get("table").getAsInt(),
+                                            change.get("index").getAsInt(),
+                                            change.get("key").getAsLong(),
+                                            local
+                                                    ? version
+                                                    : change.get("read_timestamp").getAsLong(),
+                                            change.get("count").getAsLong(),
+                                            transactionId,
+                                            preceding,
+                                            local));
+                            searches++;
+                            if (local) localSearches++;
+                            continue;
+                        }
                         ordinal++;
                         String table = change.get("relation").getAsString();
                         Output destination = writers.get(table);
@@ -392,6 +422,7 @@ public final class IndexTraceCompiler {
                     pending.clear();
                     pendingXid = 0;
                     pendingIndexInserts = 0;
+                    pendingMutations = 0;
                     transactionOpen = false;
                 } else if (!Set.of(
                                 "executor_start",
@@ -403,6 +434,8 @@ public final class IndexTraceCompiler {
                         .contains(type)) {
                     throw new IOException("Unsupported raw event: " + type);
                 }
+                if (pending.size() > org.sibench.replay.ReplayProjection.MAX_TRANSACTION_OPERATIONS)
+                    throw new IOException("Source transaction exceeds operation buffer limit");
             }
             if (transactionOpen || !pending.isEmpty() || !scans.isEmpty())
                 throw new IOException("Truncated runtime capture");
@@ -458,6 +491,9 @@ public final class IndexTraceCompiler {
         report.put("discarded_aborted_row_changes", discardedMutations);
         report.put("aborted_transactions", aborts);
         report.put("discarded_aborted_index_insert_attempts", discardedIndexInserts);
+        report.put("discarded_aborted_transaction_local_searches", discardedSearches);
+        report.put("transaction_local_searches", localSearches);
+        report.put("ordering", "original_single_session_transaction_and_operation_order");
         report.put(
                 "business_changes",
                 Map.of("insert", inserts, "update", updates, "delete", deletes));
@@ -485,20 +521,21 @@ public final class IndexTraceCompiler {
                 "version_rule",
                 "SIBench assigns one commit version in original single-session commit order,"
                     + " without reordering; transaction-local mutation ordinal preserves all row"
-                    + " changes; boundaries publish final state atomically in reference");
+                    + " changes; source boundaries group ordered operations and are not index"
+                    + " transactions");
         report.put(
                 "read_timestamp_rule",
-                "latest published commit at native scan start, in the same logical coordinate as"
-                        + " CommitVersion; not business time, reader commit time or a general"
-                        + " concurrent PG snapshot conversion");
+                "pre-write searches use the preceding commit; transaction-local searches use their"
+                    + " source commit version and preceding mutation position; single-session"
+                    + " only");
         report.put("snapshot_searches", 0);
         report.put(
                 "limitations",
                 List.of(
                         "Not PG physical-index equivalence",
-                        "No concurrent snapshots or transaction-local read-after-write projection",
-                        "Search event source ordering retained as source_event but emitted on scan"
-                                + " end",
+                        "No concurrent snapshot projection or inferred cross-session ordering",
+                        "Searches occupy native scan-start positions; candidates finalized at scan"
+                            + " end",
                         "No historical lookup or Rewrite events in this native trace",
                         "Fixed-width codec; composite and variable-length keys unsupported"));
         Files.writeString(

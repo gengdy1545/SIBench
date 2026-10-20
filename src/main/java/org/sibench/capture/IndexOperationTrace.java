@@ -16,8 +16,9 @@ public final class IndexOperationTrace {
     public static final int TRANSACTION_BEGIN = 6, TRANSACTION_COMMIT = 7;
     public static final int BUSINESS_INSERT = 1, BUSINESS_UPDATE = 2;
     public static final int SNAPSHOT_SEARCH = 1, DERIVED_SEARCH = 2;
+    public static final int TRANSACTION_LOCAL_SEARCH = 4;
     public static final int RECORD_BYTES = 112, BLOCK_RECORDS = 4096;
-    public static final int VERSION = 4;
+    public static final int VERSION = 5;
     private static final int MAGIC = 0x53494f50;
 
     private IndexOperationTrace() {}
@@ -53,31 +54,131 @@ public final class IndexOperationTrace {
             long mutationOrdinal,
             long readTimestamp) {
         public Operation(
-                long sourceEvent, int kind, int table, int index, int flags, long key,
-                long version, long file, long position, long rowId, long secondarySource,
-                long secondaryTarget, long expectedCount, long transactionId, long mutationOrdinal) {
-            this(sourceEvent, kind, table, index, flags, key, kind == SEARCH ? 0 : version,
-                    file, position, rowId, secondarySource, secondaryTarget, expectedCount,
-                    transactionId, mutationOrdinal, kind == SEARCH ? version : -1);
+                long sourceEvent,
+                int kind,
+                int table,
+                int index,
+                int flags,
+                long key,
+                long version,
+                long file,
+                long position,
+                long rowId,
+                long secondarySource,
+                long secondaryTarget,
+                long expectedCount,
+                long transactionId,
+                long mutationOrdinal) {
+            this(
+                    sourceEvent,
+                    kind,
+                    table,
+                    index,
+                    flags,
+                    key,
+                    kind == SEARCH ? 0 : version,
+                    file,
+                    position,
+                    rowId,
+                    secondarySource,
+                    secondaryTarget,
+                    expectedCount,
+                    transactionId,
+                    mutationOrdinal,
+                    kind == SEARCH ? version : -1);
         }
 
         public Operation(
-                long sourceEvent, int kind, int table, int index, int flags, long key,
-                long version, long file, long position, long rowId, long secondarySource,
-                long secondaryTarget, long expectedCount) {
-            this(sourceEvent, kind, table, index, flags, key, version, file, position, rowId,
-                    secondarySource, secondaryTarget, expectedCount, 0, 0);
+                long sourceEvent,
+                int kind,
+                int table,
+                int index,
+                int flags,
+                long key,
+                long version,
+                long file,
+                long position,
+                long rowId,
+                long secondarySource,
+                long secondaryTarget,
+                long expectedCount) {
+            this(
+                    sourceEvent,
+                    kind,
+                    table,
+                    index,
+                    flags,
+                    key,
+                    version,
+                    file,
+                    position,
+                    rowId,
+                    secondarySource,
+                    secondaryTarget,
+                    expectedCount,
+                    0,
+                    0);
         }
     }
 
     public static Operation search(
-            long source, int table, int index, long key, long readTimestamp, long count, int flags) {
-        return new Operation(source, SEARCH, table, index, flags, key, 0,
-                0, 0, 0, 0, 0, count, 0, 0, readTimestamp);
+            long source,
+            int table,
+            int index,
+            long key,
+            long readTimestamp,
+            long count,
+            int flags) {
+        return new Operation(
+                source,
+                SEARCH,
+                table,
+                index,
+                flags,
+                key,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                count,
+                0,
+                0,
+                readTimestamp);
     }
 
     public static boolean isMutation(Operation o) {
         return o.kind() == UPSERT || o.kind() == LOGICAL_DELETE;
+    }
+
+    public static Operation transactionSearch(
+            long source,
+            int table,
+            int index,
+            long key,
+            long readTimestamp,
+            long count,
+            long transactionId,
+            long precedingMutations,
+            boolean local) {
+        return new Operation(
+                source,
+                SEARCH,
+                table,
+                index,
+                local ? TRANSACTION_LOCAL_SEARCH : 0,
+                key,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                count,
+                transactionId,
+                precedingMutations,
+                readTimestamp);
     }
 
     public static boolean isControl(Operation o) {
@@ -94,10 +195,21 @@ public final class IndexOperationTrace {
             for (int index = 1; index <= 2; index++)
                 consumer.accept(
                         new Operation(
-                                row.sourceEvent(), row.kind(), row.table(), index, row.flags(),
-                                row.key(), row.version(), row.file(), row.position(), row.rowId(),
-                                row.secondarySource(), row.secondaryTarget(), row.expectedCount(),
-                                row.transactionId(), row.mutationOrdinal()));
+                                row.sourceEvent(),
+                                row.kind(),
+                                row.table(),
+                                index,
+                                row.flags(),
+                                row.key(),
+                                row.version(),
+                                row.file(),
+                                row.position(),
+                                row.rowId(),
+                                row.secondarySource(),
+                                row.secondaryTarget(),
+                                row.expectedCount(),
+                                row.transactionId(),
+                                row.mutationOrdinal()));
         }
     }
 
@@ -186,19 +298,22 @@ public final class IndexOperationTrace {
         return read(file, consumer, true);
     }
 
-    private static long read(Path file, Consumer consumer, boolean expandLegacy) throws IOException {
+    private static long read(Path file, Consumer consumer, boolean expandLegacy)
+            throws IOException {
         try (FileChannel channel = FileChannel.open(file)) {
             ByteBuffer header = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
             fill(channel, header);
             header.flip();
             int magic = header.getInt(), version = header.getInt();
             int recordBytes = recordBytes(version);
-            if (magic != MAGIC || version < 1 || version > VERSION
-                    || header.getInt() != recordBytes || header.getInt() != BLOCK_RECORDS)
+            if (magic != MAGIC
+                    || version < 1
+                    || version > VERSION
+                    || header.getInt() != recordBytes
+                    || header.getInt() != BLOCK_RECORDS)
                 throw new IOException("Unknown normalized trace header");
             ByteBuffer block =
-                    ByteBuffer.allocate(recordBytes * BLOCK_RECORDS)
-                            .order(ByteOrder.LITTLE_ENDIAN);
+                    ByteBuffer.allocate(recordBytes * BLOCK_RECORDS).order(ByteOrder.LITTLE_ENDIAN);
             long count = 0;
             while (channel.position() < channel.size()) {
                 header.clear().limit(12);
@@ -236,14 +351,30 @@ public final class IndexOperationTrace {
                                     version >= 3 ? block.getLong() : 0,
                                     version >= 3 ? block.getLong() : 0,
                                     version >= 4 ? block.getLong() : -1);
-                    Operation o = version >= 4 ? decoded : new Operation(
-                            decoded.sourceEvent(), decoded.kind(), decoded.table(), decoded.index(),
-                            decoded.flags(), decoded.key(), decoded.version(), decoded.file(),
-                            decoded.position(), decoded.rowId(), decoded.secondarySource(),
-                            decoded.secondaryTarget(), decoded.expectedCount(), decoded.transactionId(),
-                            decoded.mutationOrdinal());
+                    Operation o =
+                            version >= 4
+                                    ? decoded
+                                    : new Operation(
+                                            decoded.sourceEvent(),
+                                            decoded.kind(),
+                                            decoded.table(),
+                                            decoded.index(),
+                                            decoded.flags(),
+                                            decoded.key(),
+                                            decoded.version(),
+                                            decoded.file(),
+                                            decoded.position(),
+                                            decoded.rowId(),
+                                            decoded.secondarySource(),
+                                            decoded.secondaryTarget(),
+                                            decoded.expectedCount(),
+                                            decoded.transactionId(),
+                                            decoded.mutationOrdinal());
                     if (o.kind < INSERT
-                            || o.kind > (version == 1 ? RELOCATE : version == 2 ? LOGICAL_DELETE : TRANSACTION_COMMIT)
+                            || o.kind
+                                    > (version == 1
+                                            ? RELOCATE
+                                            : version == 2 ? LOGICAL_DELETE : TRANSACTION_COMMIT)
                             || o.table < (isControl(o) ? 0 : 1)
                             || o.table > (isControl(o) ? 0 : 8)
                             || o.index < 0
@@ -263,7 +394,9 @@ public final class IndexOperationTrace {
             fill(channel, header);
             header.flip();
             int magic = header.getInt(), version = header.getInt();
-            if (magic != MAGIC || version < 1 || version > VERSION
+            if (magic != MAGIC
+                    || version < 1
+                    || version > VERSION
                     || header.getInt() != recordBytes(version)
                     || header.getInt() != BLOCK_RECORDS)
                 throw new IOException("Unknown normalized trace header");

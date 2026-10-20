@@ -92,11 +92,19 @@ public final class RelocationCheck {
         }
         List<Map<String, Object>> results = new ArrayList<>();
         for (boolean rowId : new boolean[] {false, true}) {
-            var model = new IndexReferenceReplay(rowId, true,
-                    IndexOperationTrace.formatVersion(input.resolve("workload.ops")) >= 3);
+            var model =
+                    new IndexReferenceReplay(
+                            rowId,
+                            true,
+                            IndexOperationTrace.formatVersion(input.resolve("workload.ops")) >= 3);
             IndexOperationTrace.readExpanded(input.resolve("baseline.ops"), model::accept);
-            IndexOperationTrace.readExpanded(input.resolve("workload.ops"), model::accept);
-            model.finish();
+            var runtime =
+                    new org.sibench.replay.ReplayProjection(
+                            org.sibench.replay.ReplayConfig.defaults(),
+                            IndexOperationTrace.formatVersion(input.resolve("workload.ops")) >= 3,
+                            model::accept);
+            IndexOperationTrace.readExpanded(input.resolve("workload.ops"), runtime);
+            runtime.finish();
             IndexOperationTrace.read(output.resolve("relocation.ops"), model::accept);
             long index = 0;
             for (Group row : latest.values()) {
@@ -126,7 +134,7 @@ public final class RelocationCheck {
         report.put(
                 "scope",
                 "forced latest-only layout control over modified accounts; no snapshots retained;"
-                    + " not a naturally triggered validity rewrite, no old files reclaimed");
+                        + " not a naturally triggered validity rewrite, no old files reclaimed");
         Files.writeString(
                 output.resolve("report.json"),
                 new GsonBuilder().setPrettyPrinting().create().toJson(report),

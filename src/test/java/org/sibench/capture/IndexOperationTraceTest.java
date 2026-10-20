@@ -52,7 +52,8 @@ public class IndexOperationTraceTest {
             assertEquals(rowId ? 0 : 1, model.relocationWrites());
             assertEquals(rowId ? 302001 : IndexReferenceReplay.locator(11, 0), model.value(3, 1));
             model.accept(new Operation(4, 4, 3, 0, 0, 1, 1, 11, 1, 302001, 0, 0, 0));
-            assertEquals(rowId ? 302001 : IndexReferenceReplay.locator(11, 1),
+            assertEquals(
+                    rowId ? 302001 : IndexReferenceReplay.locator(11, 1),
                     model.lookupPrimary(3, 1, 1).value());
         }
     }
@@ -60,7 +61,7 @@ public class IndexOperationTraceTest {
     @Test
     public void recordsExplicitIndexesAndLegacyExpansionIsReadOnly() throws Exception {
         Path directory = Files.createTempDirectory("sibench-codec-");
-        Path explicit = directory.resolve("v4.ops"), legacy = directory.resolve("v1.ops");
+        Path explicit = directory.resolve("v5.ops"), legacy = directory.resolve("v1.ops");
         var row = new Operation(12, 1, 5, 0, 0, 4, 0, 5, 6, 9, 2, 3, 0);
         try {
             try (var writer = new IndexOperationTrace.Writer(explicit)) {
@@ -69,16 +70,19 @@ public class IndexOperationTraceTest {
             List<Operation> ops = new ArrayList<>();
             assertEquals(3, IndexOperationTrace.readExpanded(explicit, ops::add));
             assertEquals(List.of(0, 1, 2), ops.stream().map(Operation::index).toList());
-            assertTrue(ops.stream().allMatch(o -> o.key() == 4 && o.position() == 6 && o.rowId() == 9));
+            assertTrue(
+                    ops.stream()
+                            .allMatch(o -> o.key() == 4 && o.position() == 6 && o.rowId() == 9));
             byte[] bytes = legacyBytes(row, 1);
             Files.write(legacy, bytes);
             ops.clear();
             assertEquals(1, IndexOperationTrace.readExpanded(legacy, ops::add));
             assertEquals(3, ops.size());
             assertArrayEquals(bytes, Files.readAllBytes(legacy));
-            bytes[4] = 5;
+            bytes[4] = 6;
             Files.write(legacy, bytes);
-            assertThrows(IOException.class, () -> IndexOperationTrace.readExpanded(legacy, o -> {}));
+            assertThrows(
+                    IOException.class, () -> IndexOperationTrace.readExpanded(legacy, o -> {}));
             Files.write(legacy, legacyBytes(row, 2));
             ops.clear();
             assertEquals(1, IndexOperationTrace.readExpanded(legacy, ops::add));
@@ -92,19 +96,37 @@ public class IndexOperationTraceTest {
 
     private static byte[] legacyBytes(Operation o, int version) {
         var record = java.nio.ByteBuffer.allocate(88).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-        record.putLong(o.sourceEvent()).putInt(o.kind()).putInt(o.table()).putInt(o.index()).putInt(o.flags())
-                .putLong(o.key()).putLong(o.version()).putLong(o.file()).putLong(o.position())
-                .putLong(o.rowId()).putLong(o.secondarySource()).putLong(o.secondaryTarget()).putLong(o.expectedCount());
+        record.putLong(o.sourceEvent())
+                .putInt(o.kind())
+                .putInt(o.table())
+                .putInt(o.index())
+                .putInt(o.flags())
+                .putLong(o.key())
+                .putLong(o.version())
+                .putLong(o.file())
+                .putLong(o.position())
+                .putLong(o.rowId())
+                .putLong(o.secondarySource())
+                .putLong(o.secondaryTarget())
+                .putLong(o.expectedCount());
         var crc = new java.util.zip.CRC32C();
         crc.update(record.array(), 0, 88);
-        return java.nio.ByteBuffer.allocate(16 + 12 + 88).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                .putInt(0x53494f50).putInt(version).putInt(88).putInt(4096)
-                .putInt(88).putInt(1).putInt((int) crc.getValue()).put(record.array()).array();
+        return java.nio.ByteBuffer.allocate(16 + 12 + 88)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .putInt(0x53494f50)
+                .putInt(version)
+                .putInt(88)
+                .putInt(4096)
+                .putInt(88)
+                .putInt(1)
+                .putInt((int) crc.getValue())
+                .put(record.array())
+                .array();
     }
 
     @Test
     public void preservesTransactionIdentityAndOrdinalAcrossIndexExpansion() throws Exception {
-        Path file = Files.createTempDirectory("sibench-v4-").resolve("transaction.ops");
+        Path file = Files.createTempDirectory("sibench-v5-").resolve("transaction.ops");
         try {
             try (var writer = new IndexOperationTrace.Writer(file)) {
                 writer.append(IndexOperationTrace.transaction(20, 6, 20, 5, 0));
@@ -112,9 +134,10 @@ public class IndexOperationTraceTest {
                 writer.append(IndexOperationTrace.transaction(20, 7, 20, 5, 1));
             }
             List<Operation> operations = new ArrayList<>();
-            assertEquals(4, IndexOperationTrace.formatVersion(file));
+            assertEquals(5, IndexOperationTrace.formatVersion(file));
             assertEquals(5, IndexOperationTrace.readExpanded(file, operations::add));
-            assertTrue(operations.stream().allMatch(o -> o.transactionId() == 20 && o.version() == 5));
+            assertTrue(
+                    operations.stream().allMatch(o -> o.transactionId() == 20 && o.version() == 5));
             assertTrue(operations.subList(1, 4).stream().allMatch(o -> o.mutationOrdinal() == 1));
         } finally {
             Files.deleteIfExists(file);
@@ -123,31 +146,66 @@ public class IndexOperationTraceTest {
     }
 
     @Test
-    public void v4SeparatesReadTimestampAndReadsV3WithoutChangingHistoricalBytes() throws Exception {
+    public void separatesReadTimestampAndReadsV3WithoutChangingHistoricalBytes() throws Exception {
         Path directory = Files.createTempDirectory("sibench-read-time-");
         try {
-            Path current = directory.resolve("v4.ops"), old = directory.resolve("v3.ops");
-            Operation search = IndexOperationTrace.search(1, 3, 0, 1, 105, 1,
-                    IndexOperationTrace.SNAPSHOT_SEARCH);
+            Path current = directory.resolve("v5.ops"), old = directory.resolve("v3.ops");
+            Operation search =
+                    IndexOperationTrace.search(
+                            1, 3, 0, 1, 105, 1, IndexOperationTrace.SNAPSHOT_SEARCH);
             try (var writer = new IndexOperationTrace.Writer(current)) {
                 writer.append(search);
-                assertThrows(IOException.class, () -> writer.append(new Operation(
-                        1, 2, 3, 0, 0, 1, 105, 0, 0, 0, 0, 0, 1, 0, 0, 105)));
+                assertThrows(
+                        IOException.class,
+                        () ->
+                                writer.append(
+                                        new Operation(
+                                                1, 2, 3, 0, 0, 1, 105, 0, 0, 0, 0, 0, 1, 0, 0,
+                                                105)));
             }
             List<Operation> actual = new ArrayList<>();
             IndexOperationTrace.read(current, actual::add);
             assertEquals(List.of(search), actual);
             assertEquals(0, actual.get(0).version());
             assertEquals(105, actual.get(0).readTimestamp());
+            byte[] v4 = Files.readAllBytes(current);
+            java.nio.ByteBuffer.wrap(v4).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(4, 4);
+            Path previous = directory.resolve("v4.ops");
+            Files.write(previous, v4);
+            actual.clear();
+            IndexOperationTrace.read(previous, actual::add);
+            assertEquals(List.of(search), actual);
+            assertArrayEquals(v4, Files.readAllBytes(previous));
             var record = java.nio.ByteBuffer.allocate(104).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-            record.putLong(1).putInt(2).putInt(3).putInt(0).putInt(0)
-                    .putLong(1).putLong(105).putLong(0).putLong(0).putLong(0)
-                    .putLong(0).putLong(0).putLong(1).putLong(0).putLong(0);
+            record.putLong(1)
+                    .putInt(2)
+                    .putInt(3)
+                    .putInt(0)
+                    .putInt(0)
+                    .putLong(1)
+                    .putLong(105)
+                    .putLong(0)
+                    .putLong(0)
+                    .putLong(0)
+                    .putLong(0)
+                    .putLong(0)
+                    .putLong(1)
+                    .putLong(0)
+                    .putLong(0);
             var crc = new java.util.zip.CRC32C();
             crc.update(record.array(), 0, 104);
-            byte[] bytes = java.nio.ByteBuffer.allocate(16 + 12 + 104).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                    .putInt(0x53494f50).putInt(3).putInt(104).putInt(4096)
-                    .putInt(104).putInt(1).putInt((int) crc.getValue()).put(record.array()).array();
+            byte[] bytes =
+                    java.nio.ByteBuffer.allocate(16 + 12 + 104)
+                            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                            .putInt(0x53494f50)
+                            .putInt(3)
+                            .putInt(104)
+                            .putInt(4096)
+                            .putInt(104)
+                            .putInt(1)
+                            .putInt((int) crc.getValue())
+                            .put(record.array())
+                            .array();
             Files.write(old, bytes);
             actual.clear();
             IndexOperationTrace.read(old, actual::add);
@@ -157,8 +215,32 @@ public class IndexOperationTraceTest {
             assertArrayEquals(bytes, Files.readAllBytes(old));
         } finally {
             try (var files = Files.walk(directory)) {
-                for (Path file : files.sorted(Comparator.reverseOrder()).toList()) Files.delete(file);
+                for (Path file : files.sorted(Comparator.reverseOrder()).toList())
+                    Files.delete(file);
             }
+        }
+    }
+
+    @Test
+    public void roundTripsTransactionLocalSearchPosition() throws Exception {
+        Path file = Files.createTempFile("sibench-local-read-", ".ops");
+        Files.delete(file);
+        try {
+            Operation search =
+                    IndexOperationTrace.transactionSearch(11, 3, 0, 1, 5, 1, 20, 2, true);
+            try (var writer = new IndexOperationTrace.Writer(file)) {
+                writer.append(search);
+            }
+            List<Operation> actual = new ArrayList<>();
+            IndexOperationTrace.read(file, actual::add);
+            assertEquals(List.of(search), actual);
+            assertEquals(0, search.version());
+            assertEquals(5, search.readTimestamp());
+            assertEquals(IndexOperationTrace.TRANSACTION_LOCAL_SEARCH, search.flags());
+            assertEquals(20, search.transactionId());
+            assertEquals(2, search.mutationOrdinal());
+        } finally {
+            Files.deleteIfExists(file);
         }
     }
 }

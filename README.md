@@ -1,6 +1,6 @@
 # SIBench
 
-通过原生 benchmark 执行、真实 Parquet 和确定性索引 Trace，评估 KV Index Service。HyBench 默认采用原生 `runHTAP`：AP → TP → 并发 AT/IQ，保留原生事务比例和业务分支。既有单会话 TP 子集另支持 v4 编译及版本化参考验证；完整 HTAP 的 KV 投影、真实 Backend 和 SF1000 正式实验尚未完成。
+通过原生 benchmark 执行、真实 Parquet 和确定性索引 Trace，评估 KV Index Service。HyBench 默认采用原生 `runHTAP`：AP → TP → 并发 AT/IQ，保留原生事务比例和业务分支。单会话 TP 子集支持 v5 编译、事务内写后查询及版本化参考验证；完整 HTAP 的 KV 投影、真实 Backend 和 SF1000 正式实验尚未完成。
 
 ## 构建
 
@@ -25,7 +25,7 @@ java -Xmx3g -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc audit "
 java -Xmx3g -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc pack "$PWD" config/hybench_sf1.yaml results/poc/hybench-htap-sf1/trace-check
 ```
 
-`pack` 保存原始索引事件及完整 JSON payload，不等于规范 KV Trace；HTAP 输入会被单会话 v4 编译器显式拒绝。完整并发快照、范围/变长键投影仍待实现。
+`pack` 保存原始索引事件及完整 JSON payload，不等于规范 KV Trace；HTAP 输入会被单会话编译器显式拒绝。完整并发快照、全局操作顺序、范围/变长键投影仍待实现。
 
 [hybench_tp_subset_sf1.yaml](config/hybench_tp_subset_sf1.yaml) 保留 TP3/TP5/TP9=35/30/35 诊断负载；[index_replay.yaml](config/index_replay.yaml) 控制下游发送。以下回放既有子集产物，不执行 SQL、不连接 PG：
 
@@ -38,12 +38,12 @@ java -Xmx3g -jar build/sibench/sibench.jar validate-snapshots config/index_repla
 报告必须是新文件。`check-replay` 检查 Trace 完整性与有效操作预算；`replay` 是两种 value 的进程内正确性检查；`validate-snapshots` 使用独立行历史 oracle，派生探针不计入原生负载或性能。
 
 - `target.secondary_indexes.enabled` 默认 true；false 过滤全部二级加载、查询和维护，完整 Trace/Parquet 不变。
-- `target.transaction_writes.coalesce_same_key` 默认 true；只合并同事务同索引键最后效果，原始修改保留。
-- 默认只向下游发送已提交变更，不限定 Index Service 场景。支持范围内的 v4 编译排除回滚修改，不生成反向操作；原始 Trace 保留回滚事实，查询按独立可见性契约处理，无回撤开关。
+- `replay.dispatch_mode` 默认 `operation`，逐操作发送；[index_replay_transaction.yaml](config/index_replay_transaction.yaml) 使用 `transaction` 按已提交源事务分组。两者均单线程同步保序，不合并修改，不向索引发送事务控制，也不要求下游事务 API。
+- 默认只向下游发送已提交变更，不限定 Index Service 场景。源 commit 后保留事务内查询与修改的原始顺序；写后查询携带源提交时间戳及此前修改位置。回滚修改及修改后的查询排除，修改前的受支持查询保留；原始事实不变，无反向操作或回撤开关。
 - [long_replay.yaml](config/long_replay.yaml) 要求 single_pass、666,000,000 个有效操作；SF1 短输入会在预检失败。持续调度和分段供应尚未实现。
 - 异常运行保留诊断并拒绝编译；修复后从明确初始状态换新目录重跑。
 
-旧子集的编译、版本验证及证据见 [TP 子集 SF1 报告](docs/validation/hybench-sf1-poc.md)。
+既有子集证据见 [TP 子集 SF1 报告](docs/validation/hybench-sf1-poc.md)，当前保序发送及写后查询验证见 [已提交变更发送验证](docs/validation/committed-change-delivery.md)。
 
 ## Baseline 生成配置
 

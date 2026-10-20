@@ -1,0 +1,11 @@
+schema_version: 1
+purpose: index_replay
+target:
+  secondary_indexes:
+    enabled: true
+replay:
+  strategy: single_pass
+  dispatch_mode: transaction
+versions:
+  gc:
+    owner: none

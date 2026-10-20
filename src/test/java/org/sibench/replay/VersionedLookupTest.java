@@ -1,11 +1,14 @@
 package org.sibench.replay;
 
+import static org.junit.Assert.*;
+
+import com.google.gson.Gson;
+
 import org.junit.Test;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexReferenceReplay;
 import org.sibench.generation.BaselineGenerator;
-import com.google.gson.Gson;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -14,38 +17,60 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
-import static org.junit.Assert.*;
-
 public class VersionedLookupTest {
-    private static Operation row(int table, long key, long version, long position,
-            long rowId, int kind, long ordinal) {
-        return new Operation(ordinal, kind, table, 0, kind == 3 ? 2 : 0,
-                key, version, kind == 5 ? 0 : 9, position, rowId, 10, 20, 0, version, ordinal);
+    private static Operation row(
+            int table, long key, long version, long position, long rowId, int kind, long ordinal) {
+        return new Operation(
+                ordinal,
+                kind,
+                table,
+                0,
+                kind == 3 ? 2 : 0,
+                key,
+                version,
+                kind == 5 ? 0 : 9,
+                position,
+                rowId,
+                10,
+                20,
+                0,
+                version,
+                ordinal);
     }
 
-    private static void commit(ReplayProjection target, long version, Operation... rows) throws Exception {
+    private static void commit(ReplayProjection target, long version, Operation... rows)
+            throws Exception {
         target.accept(IndexOperationTrace.transaction(version, 6, version, version, 0));
         for (Operation row : rows) IndexOperationTrace.expandRow(row, target);
         target.accept(IndexOperationTrace.transaction(version, 7, version, version, rows.length));
     }
 
     private static Operation snapshot(int table, int index, long key, long timestamp, long count) {
-        return IndexOperationTrace.search(1000, table, index, key, timestamp, count,
+        return IndexOperationTrace.search(
+                1000,
+                table,
+                index,
+                key,
+                timestamp,
+                count,
                 IndexOperationTrace.SNAPSHOT_SEARCH | IndexOperationTrace.DERIVED_SEARCH);
     }
 
     @Test
-    public void selectsCommittedVersionNotReaderCommitAndPreservesBaselineDeletionAndReinsert() throws Exception {
+    public void selectsCommittedVersionNotReaderCommitAndPreservesBaselineDeletionAndReinsert()
+            throws Exception {
         for (boolean rowIds : new boolean[] {false, true}) {
-            for (boolean coalesce : new boolean[] {false, true}) {
+            for (String dispatchMode : new String[] {"operation", "transaction"}) {
                 var model = new IndexReferenceReplay(rowIds, false);
-                var replay = new ReplayProjection(new ReplayConfig(false, "none", 0, 0, 0, 0, coalesce),
-                        true, model::accept);
+                var replay =
+                        new ReplayProjection(
+                                new ReplayConfig(false, "none", 0, 0, 0, 0, dispatchMode),
+                                true,
+                                model::accept);
                 model.accept(new Operation(0, 1, 3, 0, 0, 2, 0, 3, 0, 52, 0, 0, 0));
                 commit(replay, 100, row(3, 1, 100, 0, 50, 3, 1));
                 commit(replay, 110, row(3, 1, 110, 1, 50, 3, 1));
-                commit(replay, 120, row(3, 1, 120, 2, 50, 3, 1),
-                        row(3, 1, 120, 3, 50, 3, 2));
+                commit(replay, 120, row(3, 1, 120, 2, 50, 3, 1), row(3, 1, 120, 3, 50, 3, 2));
                 commit(replay, 130);
                 replay.accept(snapshot(3, 0, 1, 90, 0));
                 replay.accept(snapshot(3, 0, 1, 105, 1));
@@ -55,7 +80,8 @@ public class VersionedLookupTest {
                 assertEquals(100, model.lookupPrimary(3, 1, 105).commitVersion());
                 assertEquals(110, model.lookupPrimary(3, 1, 110).commitVersion());
                 assertEquals(120, model.lookupPrimary(3, 1, 130).commitVersion());
-                assertEquals(rowIds ? 50 : IndexReferenceReplay.locator(9, 3),
+                assertEquals(
+                        rowIds ? 50 : IndexReferenceReplay.locator(9, 3),
                         model.lookupPrimary(3, 1, 120).value());
                 assertEquals(0, model.lookupPrimary(3, 2, 90).commitVersion());
                 assertEquals(4, model.retainedVersions());
@@ -66,76 +92,103 @@ public class VersionedLookupTest {
                 commit(replay, 150, row(3, 1, 150, 4, 51, 3, 1));
                 assertNull(model.lookupPrimary(3, 1, 149));
                 assertEquals(150, model.lookupPrimary(3, 1, 150).commitVersion());
-                assertEquals(rowIds ? 51 : IndexReferenceReplay.locator(9, 4),
+                assertEquals(
+                        rowIds ? 51 : IndexReferenceReplay.locator(9, 4),
                         model.lookupPrimary(3, 1, 150).value());
                 assertEquals(6, model.retainedVersions());
                 replay.finish();
-                model.finish();
             }
         }
     }
 
     @Test
-    public void secondaryHistoryIncludesDeletedEntriesExcludesFutureInsertsAndRelocatesExactVersion()
-            throws Exception {
+    public void
+            secondaryHistoryIncludesDeletedEntriesExcludesFutureInsertsAndRelocatesExactVersion()
+                    throws Exception {
         for (boolean rowIds : new boolean[] {false, true}) {
             var model = new IndexReferenceReplay(rowIds, true);
             var replay = new ReplayProjection(ReplayConfig.defaults(), true, model::accept);
-            IndexOperationTrace.expandRow(new Operation(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0),
-                    model::accept);
-            commit(replay, 100, row(5, 1, 100, 1, 50, 3, 1),
-                    row(5, 2, 100, 2, 51, 3, 2));
+            IndexOperationTrace.expandRow(
+                    new Operation(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0), model::accept);
+            commit(replay, 100, row(5, 1, 100, 1, 50, 3, 1), row(5, 2, 100, 2, 51, 3, 2));
             commit(replay, 110, row(5, 1, 110, 0, 50, 5, 1));
             commit(replay, 130);
             assertEquals(1, model.lookupSecondary(1, 10, 0).size());
             assertEquals(2, model.lookupSecondary(1, 10, 105).size());
-            assertEquals(List.of(2L), model.lookupSecondary(1, 10, 130).stream()
-                    .map(IndexReferenceReplay.LookupResult::key).toList());
+            assertEquals(
+                    List.of(2L),
+                    model.lookupSecondary(1, 10, 130).stream()
+                            .map(IndexReferenceReplay.LookupResult::key)
+                            .toList());
             replay.accept(snapshot(5, 1, 10, 105, 2));
             replay.accept(snapshot(5, 2, 20, 0, 1));
-            IndexOperationTrace.expandRow(new Operation(200, 4, 5, 0, 0, 1, 100,
-                    11, 7, 50, 10, 20, 0), model::accept);
+            IndexOperationTrace.expandRow(
+                    new Operation(200, 4, 5, 0, 0, 1, 100, 11, 7, 50, 10, 20, 0), model::accept);
             assertEquals(rowIds ? 0 : 3, model.relocationWrites());
-            assertEquals(rowIds ? 50 : IndexReferenceReplay.locator(11, 7),
+            assertEquals(
+                    rowIds ? 50 : IndexReferenceReplay.locator(11, 7),
                     model.lookupPrimary(5, 1, 105).value());
-            assertEquals(rowIds ? 50 : IndexReferenceReplay.locator(11, 7),
-                    model.lookupSecondary(1, 10, 105).stream().filter(o -> o.key() == 1)
-                            .findFirst().orElseThrow().value());
+            assertEquals(
+                    rowIds ? 50 : IndexReferenceReplay.locator(11, 7),
+                    model.lookupSecondary(1, 10, 105).stream()
+                            .filter(o -> o.key() == 1)
+                            .findFirst()
+                            .orElseThrow()
+                            .value());
             assertNull(model.lookupPrimary(5, 1, 130));
-            assertThrows(IOException.class, () -> model.accept(
-                    new Operation(201, 4, 5, 0, 0, 1, 110, 11, 8, 50, 10, 20, 0)));
-            assertThrows(IOException.class, () -> model.accept(
-                    new Operation(201, 4, 5, 0, 0, 1, 99, 11, 8, 50, 10, 20, 0)));
+            assertThrows(
+                    IOException.class,
+                    () ->
+                            model.accept(
+                                    new Operation(201, 4, 5, 0, 0, 1, 110, 11, 8, 50, 10, 20, 0)));
+            assertThrows(
+                    IOException.class,
+                    () ->
+                            model.accept(
+                                    new Operation(201, 4, 5, 0, 0, 1, 99, 11, 8, 50, 10, 20, 0)));
             if (rowIds)
-                assertThrows(IOException.class, () -> model.accept(
-                        new Operation(201, 4, 5, 0, 0, 1, 100, 11, 8, 99, 10, 20, 0)));
+                assertThrows(
+                        IOException.class,
+                        () ->
+                                model.accept(
+                                        new Operation(
+                                                201, 4, 5, 0, 0, 1, 100, 11, 8, 99, 10, 20, 0)));
         }
     }
 
     @Test
     public void rejectsFutureReadsAndUnmarkedHistoricalQueriesEvenWhenFiltered() throws Exception {
-        var replay = new ReplayProjection(new ReplayConfig(false, "none", 0, 0, 0, 0),
-                true, o -> {});
+        for (Operation invalid :
+                List.of(
+                        snapshot(5, 1, 10, 101, 0),
+                        IndexOperationTrace.search(0, 5, 1, 10, 99, 0, 0),
+                        snapshot(5, 1, 10, -1, 0))) {
+            var rejected =
+                    new ReplayProjection(
+                            new ReplayConfig(false, "none", 0, 0, 0, 0), true, o -> {});
+            commit(rejected, 100);
+            assertThrows(IOException.class, () -> rejected.accept(invalid));
+        }
+        var replay =
+                new ReplayProjection(new ReplayConfig(false, "none", 0, 0, 0, 0), true, o -> {});
         commit(replay, 100);
-        assertThrows(IOException.class, () -> replay.accept(snapshot(5, 1, 10, 101, 0)));
-        assertThrows(IOException.class, () -> replay.accept(
-                IndexOperationTrace.search(0, 5, 1, 10, 99, 0, 0)));
-        assertThrows(IOException.class, () -> replay.accept(snapshot(5, 1, 10, -1, 0)));
         replay.accept(snapshot(5, 1, 10, 99, 0));
         replay.accept(IndexOperationTrace.search(0, 3, 0, 1, 100, 0, 0));
         assertEquals(1, replay.dispatched());
         var model = new IndexReferenceReplay(true, false);
-        assertThrows(IOException.class, () -> model.lookupPrimary(3, 1, 1));
-        assertThrows(IOException.class, () -> model.accept(snapshot(3, 0, 1, 1, 0)));
-        assertThrows(IOException.class, () -> new IndexReferenceReplay(true, false, false)
-                .accept(snapshot(3, 0, 1, 0, 0)));
+        assertNull(model.lookupPrimary(3, 1, 1));
+        assertThrows(
+                IOException.class,
+                () -> new IndexReferenceReplay(true, false, false).accept(snapshot(3, 0, 1, 0, 0)));
     }
 
     @Test
-    public void v4SnapshotTraceReplaysAllDispatchVariantsWithoutLosingHistoricalVersions() throws Exception {
+    public void snapshotTraceReplaysAllDispatchVariantsWithoutLosingHistoricalVersions()
+            throws Exception {
         Path directory = Files.createTempDirectory("sibench-snapshots-");
         try {
-            Path baseline = directory.resolve("baseline.ops"), workload = directory.resolve("workload.ops");
+            Path baseline = directory.resolve("baseline.ops"),
+                    workload = directory.resolve("workload.ops");
             try (var writer = new IndexOperationTrace.Writer(baseline)) {
                 writer.appendRow(new Operation(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0));
             }
@@ -152,16 +205,29 @@ public class VersionedLookupTest {
                 writer.append(snapshot(5, 2, 20, 0, 1));
                 writer.append(snapshot(5, 0, 1, 110, 0));
             }
-            Files.writeString(directory.resolve("manifest.json"), new Gson().toJson(Map.of(
-                    "baseline_operations", 3, "workload_operations", 17,
-                    "baseline_trace_sha256", BaselineGenerator.sha256(baseline),
-                    "workload_trace_sha256", BaselineGenerator.sha256(workload))));
+            Files.writeString(
+                    directory.resolve("manifest.json"),
+                    new Gson()
+                            .toJson(
+                                    Map.of(
+                                            "baseline_operations",
+                                            3,
+                                            "workload_operations",
+                                            17,
+                                            "baseline_trace_sha256",
+                                            BaselineGenerator.sha256(baseline),
+                                            "workload_trace_sha256",
+                                            BaselineGenerator.sha256(workload))));
             for (boolean secondary : new boolean[] {false, true}) {
                 List<?> previous = null;
-                for (boolean coalesce : new boolean[] {false, true}) {
-                    var result = ReferenceReplay.runFiles(baseline, workload,
-                            new ReplayConfig(secondary, "none", 0, 0, 0, 0, coalesce),
-                            directory.resolve("report-" + secondary + "-" + coalesce + ".json"));
+                for (String dispatchMode : new String[] {"operation", "transaction"}) {
+                    var result =
+                            ReferenceReplay.runFiles(
+                                    baseline,
+                                    workload,
+                                    new ReplayConfig(secondary, "none", 0, 0, 0, 0, dispatchMode),
+                                    directory.resolve(
+                                            "report-" + secondary + "-" + dispatchMode + ".json"));
                     var modes = (List<?>) result.get("results");
                     for (int mode = 0; mode < 2; mode++) {
                         var report = (Map<?, ?>) modes.get(mode);
@@ -169,15 +235,22 @@ public class VersionedLookupTest {
                         assertEquals(secondary ? 9L : 3L, report.get("retained_index_versions"));
                         if (previous != null) {
                             var before = (Map<?, ?>) previous.get(mode);
-                            assertEquals(before.get("result_checksum"), report.get("result_checksum"));
-                            assertEquals(before.get("selected_version_checksum"), report.get("selected_version_checksum"));
+                            assertEquals(
+                                    before.get("result_checksum"), report.get("result_checksum"));
+                            assertEquals(
+                                    before.get("selected_version_checksum"),
+                                    report.get("selected_version_checksum"));
                         }
                     }
                     previous = modes;
-                    var derived = SnapshotLookupValidation.run(directory,
-                            new ReplayConfig(secondary, "none", 0, 0, 0, 0, coalesce),
-                            directory.resolve("derived-" + secondary + "-" + coalesce + ".json"));
-                    assertEquals("explicitly_derived_history_validation_not_native_hybench_queries",
+                    var derived =
+                            SnapshotLookupValidation.run(
+                                    directory,
+                                    new ReplayConfig(secondary, "none", 0, 0, 0, 0, dispatchMode),
+                                    directory.resolve(
+                                            "derived-" + secondary + "-" + dispatchMode + ".json"));
+                    assertEquals(
+                            "explicitly_derived_history_validation_not_native_hybench_queries",
                             derived.get("provenance"));
                     assertEquals(1, derived.get("changed_primary_keys"));
                     var checked = (Map<?, ?>) ((List<?>) derived.get("results")).get(0);
@@ -187,7 +260,8 @@ public class VersionedLookupTest {
             }
         } finally {
             try (var files = Files.walk(directory)) {
-                for (Path file : files.sorted(Comparator.reverseOrder()).toList()) Files.delete(file);
+                for (Path file : files.sorted(Comparator.reverseOrder()).toList())
+                    Files.delete(file);
             }
         }
     }

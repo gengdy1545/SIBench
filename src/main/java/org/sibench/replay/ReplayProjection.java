@@ -9,57 +9,37 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** Applies index selection at the dispatch boundary, including loading and maintenance. */
+/**
+ * Validates source groups, then dispatches synchronously without reordering or transaction RPCs.
+ */
 public final class ReplayProjection implements IndexOperationTrace.Consumer {
-    private final boolean secondaryIndexes;
-    private final IndexOperationTrace.Consumer target;
-    private final boolean transactional, coalesce;
-    private long source,
-            dispatched,
-            primary,
-            secondary,
-            filtered,
-            coalesced,
-            transactions,
-            controls;
-    private long activeTransaction, activeVersion, lastVersion, lastOrdinal, lastTransactionId;
-    private int lastIndex;
-    private Operation lastMutation;
-    private final List<Operation> pending = new ArrayList<>();
-    private final Map<Key, Operation> finalWrites = new LinkedHashMap<>();
-    private final Map<String, Long> kinds = new LinkedHashMap<>();
     public static final int MAX_TRANSACTION_OPERATIONS = 1_000_000;
-    private int transactionOperations;
-
-    private record Key(int table, int index, long key, long indexedValue) {
-        static Key of(Operation o) {
-            return new Key(
-                    o.table(),
-                    o.index(),
-                    o.key(),
-                    o.index() == 1
-                            ? o.secondarySource()
-                            : o.index() == 2 ? o.secondaryTarget() : 0);
-        }
-    }
+    private final boolean secondaryIndexes, sourceTransactions;
+    private final String dispatchMode;
+    private final ReplayTarget target;
+    private final List<Operation> pending = new ArrayList<>();
+    private final Map<String, Long> kinds = new LinkedHashMap<>();
+    private long source, dispatched, primary, secondary, filtered, transactions, controls, requests;
+    private long activeTransaction, activeVersion, lastVersion, lastOrdinal, lastTransactionId;
+    private long lastSourceEvent;
+    private int lastIndex, transactionOperations;
+    private Operation lastMutation;
+    private Thread owner;
+    private boolean failed;
 
     public ReplayProjection(boolean secondaryIndexes, IndexOperationTrace.Consumer target) {
-        this(secondaryIndexes, false, false, target);
+        this(new ReplayConfig(secondaryIndexes, "none", 0, 0, 0, 0), false, target);
     }
 
     public ReplayProjection(
-            ReplayConfig config, boolean transactional, IndexOperationTrace.Consumer target) {
-        this(config.secondaryIndexes(), transactional, config.coalesceTransactionWrites(), target);
+            ReplayConfig config, boolean sourceTransactions, IndexOperationTrace.Consumer target) {
+        this(config, sourceTransactions, ReplayTarget.ordered(target));
     }
 
-    private ReplayProjection(
-            boolean secondaryIndexes,
-            boolean transactional,
-            boolean coalesce,
-            IndexOperationTrace.Consumer target) {
-        this.secondaryIndexes = secondaryIndexes;
-        this.transactional = transactional;
-        this.coalesce = coalesce;
+    public ReplayProjection(ReplayConfig config, boolean sourceTransactions, ReplayTarget target) {
+        this.secondaryIndexes = config.secondaryIndexes();
+        this.sourceTransactions = sourceTransactions;
+        this.dispatchMode = config.dispatchMode();
         this.target = target;
     }
 
@@ -67,8 +47,25 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
         return secondaryIndexes || operation.index() == 0;
     }
 
+    private synchronized void checkThread() throws IOException {
+        if (owner == null) owner = Thread.currentThread();
+        if (owner != Thread.currentThread())
+            throw new IOException("Replay must remain on one sending thread");
+        if (failed) throw new IOException("Replay failed; continuation is not allowed");
+    }
+
     @Override
     public void accept(Operation operation) throws IOException {
+        checkThread();
+        try {
+            acceptOrdered(operation);
+        } catch (IOException | RuntimeException error) {
+            failed = true;
+            throw error;
+        }
+    }
+
+    private void acceptOrdered(Operation operation) throws IOException {
         if (IndexOperationTrace.isControl(operation)) {
             control(operation);
             return;
@@ -76,48 +73,69 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
         source++;
         if (operation.index() == 0) primary++;
         else secondary++;
-        if (transactional && IndexOperationTrace.isMutation(operation)) validateMutation(operation);
-        else if (transactional
-                && (activeTransaction != 0
-                        || operation.transactionId() != 0
-                        || operation.mutationOrdinal() != 0))
-            throw new IOException("Non-mutation inside transaction or with transaction metadata");
-        if (operation.kind() == IndexOperationTrace.SEARCH) {
-            if (operation.version() != 0
-                    || operation.readTimestamp() < 0
-                    || (operation.flags()
-                                    & ~(IndexOperationTrace.SNAPSHOT_SEARCH
-                                            | IndexOperationTrace.DERIVED_SEARCH))
-                            != 0
-                    || operation.expectedCount() < 0)
-                throw new IOException("Invalid search timestamp/flags/count");
-            if (transactional
-                    && (operation.readTimestamp() > lastVersion
-                            || (operation.readTimestamp() != lastVersion
-                                    && (operation.flags() & IndexOperationTrace.SNAPSHOT_SEARCH)
-                                            == 0)))
-                throw new IOException(
-                        "Search requires a published read point; historical reads must be explicit"
-                            + " snapshots");
-        } else if (operation.readTimestamp() != -1)
+        if (activeTransaction != 0 && ++transactionOperations > MAX_TRANSACTION_OPERATIONS)
+            throw new IOException("Source transaction exceeds operation buffer limit");
+        if (activeTransaction != 0) {
+            if (operation.sourceEvent() < lastSourceEvent)
+                throw new IOException("Source operation order moved backwards");
+            lastSourceEvent = operation.sourceEvent();
+        }
+        if (activeTransaction != 0
+                && !IndexOperationTrace.isMutation(operation)
+                && operation.kind() != IndexOperationTrace.SEARCH)
+            throw new IOException("Only mutations and searches are allowed inside a source group");
+        if (sourceTransactions && IndexOperationTrace.isMutation(operation))
+            validateMutation(operation);
+        else if (operation.kind() != IndexOperationTrace.SEARCH
+                && (operation.transactionId() != 0 || operation.mutationOrdinal() != 0))
+            throw new IOException("Unexpected source transaction metadata");
+        if (operation.kind() == IndexOperationTrace.SEARCH) validateSearch(operation);
+        else if (operation.readTimestamp() != -1)
             throw new IOException("ReadTimestamp is only valid on searches");
         if (!includes(operation)) {
             filtered++;
             return;
         }
-        if (transactional && IndexOperationTrace.isMutation(operation)) {
-            if (coalesce) {
-                Key key = Key.of(operation);
-                if (finalWrites.remove(key) != null) coalesced++;
-                finalWrites.put(key, operation);
-            } else pending.add(operation);
-            return;
-        }
-        dispatch(operation);
+        if (activeTransaction != 0) pending.add(operation);
+        else sendOperation(operation);
     }
 
-    private void dispatch(Operation operation) throws IOException {
+    private void validateSearch(Operation o) throws IOException {
+        int allowed =
+                IndexOperationTrace.SNAPSHOT_SEARCH
+                        | IndexOperationTrace.DERIVED_SEARCH
+                        | IndexOperationTrace.TRANSACTION_LOCAL_SEARCH;
+        boolean local = (o.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0;
+        if (o.version() != 0
+                || o.readTimestamp() < 0
+                || (o.flags() & ~allowed) != 0
+                || o.expectedCount() < 0)
+            throw new IOException("Invalid search timestamp/flags/count");
+        if (activeTransaction != 0) {
+            requireCompleteExpansion();
+            if (o.transactionId() != activeTransaction || o.mutationOrdinal() != lastOrdinal)
+                throw new IOException("Search source transaction position mismatch");
+        } else if (o.transactionId() != 0 || o.mutationOrdinal() != 0 || local)
+            throw new IOException("Transaction-local search outside source group");
+        if (local) {
+            if (lastOrdinal == 0
+                    || o.readTimestamp() != activeVersion
+                    || o.flags() != IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
+                throw new IOException("Invalid transaction-local read point");
+        } else if (sourceTransactions
+                && (o.readTimestamp() > lastVersion
+                        || (o.readTimestamp() != lastVersion
+                                && (o.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) == 0)))
+            throw new IOException("Search requires an available read point");
+    }
+
+    private void sendOperation(Operation operation) throws IOException {
         target.accept(operation);
+        requests++;
+        countDispatch(operation);
+    }
+
+    private void countDispatch(Operation operation) {
         dispatched++;
         kinds.merge(IndexOperationTrace.kindName(operation.kind()), 1L, Long::sum);
     }
@@ -127,9 +145,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
                 || o.transactionId() != activeTransaction
                 || o.version() != activeVersion
                 || o.mutationOrdinal() < 1)
-            throw new IOException("Mutation missing matching transaction boundary/version");
-        if (++transactionOperations > MAX_TRANSACTION_OPERATIONS)
-            throw new IOException("Transaction exceeds reference operation buffer limit");
+            throw new IOException("Mutation missing matching source group/version");
         if (o.mutationOrdinal() == lastOrdinal) {
             if (lastMutation == null
                     || lastMutation.table() != 5
@@ -148,7 +164,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
         } else {
             requireCompleteExpansion();
             if (o.mutationOrdinal() != lastOrdinal + 1 || o.index() != 0)
-                throw new IOException("Non-contiguous transaction mutation ordinal");
+                throw new IOException("Non-contiguous source mutation ordinal");
             lastOrdinal = o.mutationOrdinal();
             lastMutation = o;
         }
@@ -161,42 +177,38 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
     }
 
     private void control(Operation o) throws IOException {
-        if (!transactional
+        if (!sourceTransactions
                 || o.transactionId() < 1
                 || o.version() < 1
                 || o.index() != 0
                 || o.mutationOrdinal() != 0)
-            throw new IOException("Unexpected transaction control");
+            throw new IOException("Unexpected source transaction control");
         controls++;
         if (o.kind() == IndexOperationTrace.TRANSACTION_BEGIN) {
             if (activeTransaction != 0
                     || o.version() <= lastVersion
                     || o.transactionId() <= lastTransactionId
                     || o.expectedCount() != 0)
-                throw new IOException("Invalid transaction begin/version");
+                throw new IOException("Invalid source group begin/order");
             activeTransaction = o.transactionId();
             activeVersion = o.version();
             lastOrdinal = 0;
             lastMutation = null;
+            lastSourceEvent = 0;
             transactionOperations = 0;
         } else {
             if (activeTransaction == 0
                     || o.transactionId() != activeTransaction
                     || o.version() != activeVersion
                     || o.expectedCount() != lastOrdinal)
-                throw new IOException("Commit boundary or mutation count mismatch");
+                throw new IOException("Source commit or mutation count mismatch");
             requireCompleteExpansion();
-            target.accept(
-                    IndexOperationTrace.transaction(
-                            o.sourceEvent(),
-                            IndexOperationTrace.TRANSACTION_BEGIN,
-                            activeTransaction,
-                            activeVersion,
-                            0));
-            for (Operation write : coalesce ? finalWrites.values() : pending) dispatch(write);
-            target.accept(o);
+            if (dispatchMode.equals("transaction") && !pending.isEmpty()) {
+                target.acceptGroup(List.copyOf(pending));
+                requests++;
+                for (Operation operation : pending) countDispatch(operation);
+            } else for (Operation operation : pending) sendOperation(operation);
             pending.clear();
-            finalWrites.clear();
             lastVersion = activeVersion;
             lastTransactionId = activeTransaction;
             activeTransaction = 0;
@@ -205,7 +217,9 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
     }
 
     public void finish() throws IOException {
-        if (activeTransaction != 0) throw new IOException("Truncated transaction without commit");
+        checkThread();
+        if (activeTransaction != 0)
+            throw new IOException("Truncated source transaction without commit");
     }
 
     public long dispatched() {
@@ -219,17 +233,14 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
         report.put("source_secondary_operations", secondary);
         report.put("dispatched_operations", dispatched);
         report.put("filtered_secondary_operations", filtered);
-        report.put("coalesced_operations", coalesced);
         report.put("committed_transactions", transactions);
-        report.put(
-                "change_delivery",
-                transactional ? "committed_only" : "unavailable_legacy_or_baseline");
+        report.put("change_delivery", sourceTransactions ? "committed_only" : "baseline_or_legacy");
         report.put("transaction_control_records", controls);
-        report.put(
-                "transaction_coalescing",
-                transactional
-                        ? coalesce ? "enabled" : "disabled"
-                        : "unavailable_legacy_or_baseline");
+        report.put("dispatch_mode", dispatchMode);
+        report.put("target_calls", requests);
+        report.put("sending_threads", 1);
+        report.put("ordering", "source_transaction_and_operation_order");
+        report.put("downstream_transaction_api_required", false);
         report.put("dispatched_by_kind", new LinkedHashMap<>(kinds));
         return report;
     }

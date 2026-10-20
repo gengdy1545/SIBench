@@ -214,7 +214,7 @@ public class IndexTraceCompilerTest {
         var manifest =
                 JsonParser.parseString(Files.readString(output.resolve("manifest.json")))
                         .getAsJsonObject();
-        assertEquals(4, manifest.get("operation_trace_version").getAsInt());
+        assertEquals(5, manifest.get("operation_trace_version").getAsInt());
         assertEquals(4, manifest.get("baseline_operations").getAsLong());
         assertEquals(15, manifest.get("workload_operations").getAsLong());
         assertEquals(1, manifest.getAsJsonObject("business_changes").get("delete").getAsLong());
@@ -236,12 +236,12 @@ public class IndexTraceCompilerTest {
         assertEquals(IndexOperationTrace.LOGICAL_DELETE, events.get(9).kind());
         assertEquals(2, events.get(9).version());
         assertEquals(1, events.get(9).rowId());
-        assertEquals(0, events.get(7).version());
-        assertEquals(1, events.get(7).readTimestamp());
-        assertEquals(2, events.get(11).readTimestamp());
+        assertEquals(0, events.get(8).version());
+        assertEquals(1, events.get(8).readTimestamp());
+        assertEquals(2, events.get(12).readTimestamp());
         assertEquals(3, events.get(14).readTimestamp());
         assertEquals(3, manifest.get("committed_transactions").getAsLong());
-        assertEquals(14, events.get(12).transactionId());
+        assertEquals(14, events.get(11).transactionId());
         assertEquals(0, manifest.get("snapshot_searches").getAsLong());
         try (var reader =
                 org.apache.parquet.hadoop.ParquetReader.builder(
@@ -260,13 +260,14 @@ public class IndexTraceCompilerTest {
             assertNull(reader.read());
         }
         for (boolean secondary : new boolean[] {true, false})
-            for (boolean coalesce : new boolean[] {true, false}) {
-                Path report = fixture.resolve("replay-" + secondary + "-" + coalesce + ".json");
+            for (String dispatchMode : new String[] {"operation", "transaction"}) {
+                Path report = fixture.resolve("replay-" + secondary + "-" + dispatchMode + ".json");
                 assertEquals(
                         "passed",
                         ReferenceReplay.run(
                                         output,
-                                        new ReplayConfig(secondary, "none", 0, 0, 0, 0, coalesce),
+                                        new ReplayConfig(
+                                                secondary, "none", 0, 0, 0, 0, dispatchMode),
                                         report)
                                 .get("status"));
             }
@@ -355,12 +356,13 @@ public class IndexTraceCompilerTest {
             }
         }
         for (boolean secondary : new boolean[] {true, false})
-            for (boolean coalesce : new boolean[] {true, false}) {
+            for (String dispatchMode : new String[] {"operation", "transaction"}) {
                 var result =
                         ReferenceReplay.run(
                                 output,
-                                new ReplayConfig(secondary, "none", 0, 0, 0, 0, coalesce),
-                                fixture.resolve("replay-" + secondary + "-" + coalesce + ".json"));
+                                new ReplayConfig(secondary, "none", 0, 0, 0, 0, dispatchMode),
+                                fixture.resolve(
+                                        "replay-" + secondary + "-" + dispatchMode + ".json"));
                 assertEquals("passed", result.get("status"));
             }
         Path repeated = fixture.resolve("compiled-repeat");
@@ -408,9 +410,9 @@ public class IndexTraceCompilerTest {
                         unfinishedScan,
                         List.of(
                                 """
-                                {"event":"scan_rescan","scan":"a","relation":"savingaccount_pkey","keys":[{"strategy":3,"flags":0,"value":1}]}
-                                {"event":"transaction_abort","xid":0}
-                                """));
+{"event":"scan_rescan","scan":"a","relation":"savingaccount_pkey","keys":[{"strategy":3,"flags":0,"value":1}]}
+{"event":"transaction_abort","xid":0}
+"""));
         assertThrows(
                 java.io.IOException.class,
                 () ->
@@ -429,11 +431,11 @@ public class IndexTraceCompilerTest {
                         fixture,
                         List.of(
                                 """
-                                {"event":"row_change","xid":9,"relation":"savingaccount","operation":"update","new":{"accountid":1,"balance":8}}
-                                {"event":"row_change","xid":9,"relation":"transfer","operation":"insert","new":{"id":2,"sourceid":10,"targetid":20,"amount":2}}
-                                {"event":"row_change","xid":9,"relation":"savingaccount","operation":"delete","old":{"accountid":1,"balance":8}}
-                                {"event":"transaction_abort","xid":9}
-                                """));
+{"event":"row_change","xid":9,"relation":"savingaccount","operation":"update","new":{"accountid":1,"balance":8}}
+{"event":"row_change","xid":9,"relation":"transfer","operation":"insert","new":{"id":2,"sourceid":10,"targetid":20,"amount":2}}
+{"event":"row_change","xid":9,"relation":"savingaccount","operation":"delete","old":{"accountid":1,"balance":8}}
+{"event":"transaction_abort","xid":9}
+"""));
         Path client = fixture.resolve("jdbc-fixture.jsonl");
         Files.write(
                 client,
@@ -462,7 +464,7 @@ public class IndexTraceCompilerTest {
     }
 
     @Test
-    public void stillRejectsReadAfterUncommittedWriteEvenWhenTransactionAborts() throws Exception {
+    public void excludesAbortedWriteDependentSearchWithoutRejectingCapture() throws Exception {
         Path fixture = temporary.newFolder().toPath();
         CaptureConfig capture = createBaseline(fixture);
         Path raw =
@@ -474,11 +476,120 @@ public class IndexTraceCompilerTest {
 """,
                                 accountSearch("a")
                                         + "{\"event\":\"transaction_abort\",\"xid\":9}\n"));
-        assertThrows(
-                java.io.IOException.class,
-                () -> IndexTraceCompiler.compile(capture, raw, fixture.resolve("compiled")));
-        assertTrue(Files.exists(fixture.resolve("compiled/INCOMPLETE")));
-        assertFalse(Files.exists(fixture.resolve("compiled/manifest.json")));
+        Path output = fixture.resolve("compiled");
+        IndexTraceCompiler.compile(capture, raw, output);
+        var manifest =
+                JsonParser.parseString(Files.readString(output.resolve("manifest.json")))
+                        .getAsJsonObject();
+        assertEquals(0, manifest.get("workload_operations").getAsLong());
+        assertEquals(1, manifest.get("discarded_aborted_transaction_local_searches").getAsLong());
+        assertEquals(1, manifest.get("discarded_aborted_row_changes").getAsLong());
+    }
+
+    @Test
+    public void compilesCommittedWriteReadWriteAndInsertSearchInOriginalOrder() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        CaptureConfig capture = createBaseline(fixture);
+        Path raw =
+                writeCapture(
+                        fixture,
+                        List.of(
+                                accountSearch("before"),
+                                """
+{"event":"row_change","xid":9,"relation":"savingaccount","operation":"update","new":{"accountid":1,"balance":8}}
+""",
+                                accountSearch("first"),
+                                """
+{"event":"row_change","xid":9,"relation":"savingaccount","operation":"update","new":{"accountid":1,"balance":7}}
+""",
+                                accountSearch("second"),
+                                """
+{"event":"row_change","xid":9,"relation":"transfer","operation":"insert","new":{"id":2,"sourceid":77,"targetid":88,"amount":2}}
+""",
+                                """
+{"event":"scan_rescan","scan":"inserted","relation":"idx_transfer_1","keys":[{"strategy":3,"flags":0,"value":77}]}
+{"event":"bitmap_candidate","scan":"inserted","found":true}
+{"event":"scan_end","scan":"inserted"}
+""",
+                                """
+{"event":"row_change","xid":9,"relation":"savingaccount","operation":"delete","old":{"accountid":1,"balance":7}}
+""",
+                                """
+{"event":"scan_rescan","scan":"deleted","relation":"savingaccount_pkey","keys":[{"strategy":3,"flags":0,"value":1}]}
+{"event":"scan_end","scan":"deleted"}
+{"event":"transaction_commit","xid":9}
+"""));
+        String rawChecksum = BaselineGenerator.sha256(raw);
+        Path output = fixture.resolve("compiled");
+        IndexTraceCompiler.compile(capture, raw, output);
+        Path repeat = fixture.resolve("compiled-repeat");
+        IndexTraceCompiler.compile(capture, raw, repeat);
+        for (String file :
+                List.of(
+                        "baseline.ops",
+                        "workload.ops",
+                        "account-versions.parquet",
+                        "transfer-versions.parquet",
+                        "manifest.json"))
+            assertEquals(
+                    BaselineGenerator.sha256(output.resolve(file)),
+                    BaselineGenerator.sha256(repeat.resolve(file)));
+        assertEquals(rawChecksum, BaselineGenerator.sha256(raw));
+        List<IndexOperationTrace.Operation> operations = new ArrayList<>();
+        IndexOperationTrace.read(output.resolve("workload.ops"), operations::add);
+        assertEquals(
+                List.of(6, 2, 3, 2, 3, 2, 3, 3, 3, 2, 5, 2, 7),
+                operations.stream().map(IndexOperationTrace.Operation::kind).toList());
+        assertEquals(0, operations.get(1).readTimestamp());
+        assertEquals(0, operations.get(1).mutationOrdinal());
+        assertEquals(1, operations.get(3).readTimestamp());
+        assertEquals(1, operations.get(3).mutationOrdinal());
+        assertEquals(2, operations.get(5).mutationOrdinal());
+        assertEquals(3, operations.get(9).mutationOrdinal());
+        assertEquals(4, operations.get(11).mutationOrdinal());
+        long previousEvent = 0;
+        for (var operation : operations) {
+            if (IndexOperationTrace.isControl(operation)) continue;
+            assertTrue(operation.sourceEvent() >= previousEvent);
+            previousEvent = operation.sourceEvent();
+            assertEquals(operations.get(0).transactionId(), operation.transactionId());
+        }
+        for (String mode : new String[] {"operation", "transaction"})
+            for (boolean secondary : new boolean[] {true, false})
+                for (boolean rowIds : new boolean[] {true, false}) {
+                    var model = new org.sibench.capture.IndexReferenceReplay(rowIds, secondary);
+                    IndexOperationTrace.readExpanded(
+                            output.resolve("baseline.ops"),
+                            new org.sibench.replay.ReplayProjection(secondary, model::accept));
+                    List<Long> seen = new ArrayList<>();
+                    var replay =
+                            new org.sibench.replay.ReplayProjection(
+                                    new ReplayConfig(secondary, "none", 0, 0, 0, 0, mode),
+                                    true,
+                                    operation -> {
+                                        model.accept(operation);
+                                        if (operation.kind() == IndexOperationTrace.SEARCH
+                                                && operation.table() == 3
+                                                && operation.expectedCount() == 1)
+                                            seen.add(
+                                                    model.lookupPrimary(
+                                                                    3, 1, operation.readTimestamp())
+                                                            .value());
+                                    });
+                    IndexOperationTrace.readExpanded(output.resolve("workload.ops"), replay);
+                    replay.finish();
+                    assertEquals(
+                            rowIds
+                                    ? List.of(1L, 1L, 1L)
+                                    : List.of(
+                                            org.sibench.capture.IndexReferenceReplay.locator(1, 0),
+                                            org.sibench.capture.IndexReferenceReplay.locator(3, 0),
+                                            org.sibench.capture.IndexReferenceReplay.locator(3, 1)),
+                            seen);
+                    assertNull(model.lookupPrimary(3, 1, 1));
+                    assertNotNull(model.lookupPrimary(3, 1, 0));
+                    assertEquals(secondary ? 5 : 4, model.queries());
+                }
     }
 
     private static String accountSearch(String scan) {

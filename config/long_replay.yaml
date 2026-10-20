@@ -3,10 +3,9 @@ purpose: index_replay
 target:
   secondary_indexes:
     enabled: true
-  transaction_writes:
-    coalesce_same_key: true
 replay:
   strategy: single_pass
+  dispatch_mode: operation
   trace_budget:
     duration_seconds: 1800
     planned_operations_per_second: 300000
