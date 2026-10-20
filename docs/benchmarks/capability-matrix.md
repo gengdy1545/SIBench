@@ -1,19 +1,19 @@
-# 数据来源与当前能力
+# 当前能力
 
-本矩阵描述当前实现，不引用已清理的原生运行验证。来源细节见 [HyBench](hybench.md)、[YCSB](ycsb.md)、[sysbench](sysbench.md)。
+来源说明：[HyBench](hybench.md)、[YCSB](ycsb.md)、[sysbench](sysbench.md)。各来源独立选规模，不要求行数或字节量相等。
 
-| 维度 | HyBench | YCSB | sysbench |
+| 能力 | HyBench | YCSB | sysbench |
 | --- | --- | --- | --- |
-| 原生规模参数 | sf 对应各表行数 | recordcount、fieldcount、fieldlength | tables、table-size |
-| 当前配置 | 1000x | 10 亿行，10 × 100 字节字段 | 100 表 × 1000 万行 |
-| 来源适配 | 确定性派生，读取参数及词表 | 确定性派生，保留键与字段规则 | 确定性派生，保留表结构与 uniform 分布 |
-| Baseline Java 实现 | 已实现 | 已实现 | 已实现 |
-| 配置与 schema dry-run | 已通过 | 已通过 | 已通过 |
-| 实际 Parquet 写入及重建验证 | 未执行 | 未执行 | 未执行 |
-| 容量及吞吐校准 | 未执行 | 未执行 | 未执行 |
-| 增量 Trace、Rewrite、Checkpoint | 待实现 | 待实现 | 待实现 |
-| Index Backend 回放 | 待实现 | 待实现 | 待实现 |
+| 派生 Baseline / dry-run | 已实现 / 通过 | 已实现 / 通过 | 已实现 / 通过 |
+| 候选大规模配置 | 1000x，87.06 亿行 | 10 亿行，10 × 100 字节 | 100 表 × 1000 万行 |
+| 全量容量校准 | 未执行 | 未执行 | 未执行 |
+| 原生执行采集 | SF1 单会话 TP3/TP5/TP9 | 未实现 | 未实现 |
+| Parquet 核对 | SF1 原生全行与增量重复编译通过 | 来源产物未验证 | 来源产物未验证 |
+| 规范 Trace | v4，当前/历史点及 transfer 二级等值 | 未实现 | 未实现 |
+| 参考回放 | 两种 value、二级/合并开关、历史 oracle | 未实现 | 未实现 |
+| 真实 Backend | 未接入 | 未接入 | 未接入 |
+| 自然 Rewrite / GC / Checkpoint | 未实现 | 未实现 | 未实现 |
 
-配置校验与 dry-run 不生成记录或数据文件。各来源独立选择规模，不要求记录数或字节量精确相同。FileID + FileRowPosition 与 RowID 两种 value 模式及版本语义以 [计划](../../plan.md) 为准。
+SF1 原生修改为两表 UPDATE/INSERT，没有 AP、DELETE 或历史点 SQL；DELETE/重插入仅受控测试。历史主键与二级等值查找已完成，完整多表 CRUD、历史范围、并发可见性和持续调度未完成。
 
-后续增量适配必须处理真实键与范围、版本时间点、业务修改的前置查询及结果依赖；不能把数据库 SQL 数或事务数直接当成索引操作数。
+详细结果见 [SF1 验证](../validation/hybench-sf1-poc.md)，统一版本及发送语义见 [Trace 契约](../contracts/trace.md)，剩余工作见 [计划](../../plan.md)。

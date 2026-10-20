@@ -18,13 +18,15 @@ import java.nio.file.Path;
 import java.util.Map;
 
 /** Explicit group boundaries over parquet-java encoders; no reflective writer internals. */
-final class ParquetDataFile implements AutoCloseable {
+public final class ParquetDataFile implements AutoCloseable {
     private final GenerationConfig config;
     private final MessageType schema;
     private final ParquetProperties properties;
     private final CodecFactory codecs;
     private final ParquetFileWriter file;
     private final Map<String, String> metadata;
+    private final Path path;
+    private boolean closed;
     private ColumnChunkPageWriteStore pages;
     private ColumnWriteStore columns;
     private RecordConsumer consumer;
@@ -32,12 +34,13 @@ final class ParquetDataFile implements AutoCloseable {
     private long groupRows;
     private int ordinal;
 
-    ParquetDataFile(
+    public ParquetDataFile(
             Path path, TableData table, GenerationConfig config, Map<String, String> metadata)
             throws IOException {
         this.config = config;
+        this.path = path;
         this.schema = table.schema();
-        this.metadata = metadata;
+        this.metadata = new java.util.TreeMap<>(metadata);
         Configuration hadoop = new Configuration(false);
         hadoop.setInt("parquet.compression.codec.zstd.level", config.codecLevel());
         hadoop.setInt("parquet.compression.codec.zstd.workers", 0);
@@ -77,7 +80,7 @@ final class ParquetDataFile implements AutoCloseable {
         writer = new GroupWriter(consumer, schema);
     }
 
-    boolean write(Group row) throws IOException {
+    public boolean write(Group row) throws IOException {
         if (columns == null) openGroup();
         writer.write(row);
         groupRows++;
@@ -111,14 +114,19 @@ final class ParquetDataFile implements AutoCloseable {
         ordinal++;
     }
 
-    ParquetMetadata finish() throws IOException {
+    public ParquetMetadata finish() throws IOException {
         flushGroup();
         file.end(metadata);
-        return file.getFooter();
+        ParquetMetadata footer = file.getFooter();
+        close();
+        CanonicalParquetFooter.normalize(path);
+        return footer;
     }
 
     @Override
     public void close() throws IOException {
+        if (closed) return;
+        closed = true;
         try {
             if (columns != null) {
                 columns.close();

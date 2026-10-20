@@ -45,7 +45,12 @@ public class SibenchTest {
             {"inspect-scale", "--unknown"},
             {"generate"},
             {"generate", "--help"},
-            {"inspect-scale", "config/workloads/ycsb/large.yaml", "missing.yaml"}
+            {"replay", "config/index_replay.yaml"},
+            {"check-replay", "config/index_replay.yaml", "missing-trace"},
+            {"replay", "--repeat", "2"},
+            {"validate-snapshots", "config/index_replay.yaml"},
+            {"validate-snapshots", "config/index_replay.yaml", "missing-trace", "missing-report.json"},
+            {"inspect-scale", "config/ycsb_large.yaml", "missing.yaml"}
         };
         for (String[] args : invalid) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();

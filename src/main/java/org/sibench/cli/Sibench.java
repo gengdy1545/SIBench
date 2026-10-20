@@ -4,6 +4,9 @@ import com.google.gson.GsonBuilder;
 
 import org.sibench.generation.BaselineGenerator;
 import org.sibench.workloads.ScaleInspector;
+import org.sibench.replay.ReferenceReplay;
+import org.sibench.replay.ReplayConfig;
+import org.sibench.replay.SnapshotLookupValidation;
 import org.yaml.snakeyaml.error.YAMLException;
 
 import java.io.IOException;
@@ -28,7 +31,7 @@ public final class Sibench {
             return 0;
         }
         try {
-            if (!args[0].equals("inspect-scale") && !args[0].equals("prepare")) {
+            if (!List.of("inspect-scale", "prepare", "replay", "check-replay", "validate-snapshots").contains(args[0])) {
                 throw new IllegalArgumentException("Unknown command: " + args[0]);
             }
             Path root = Path.of("").toAbsolutePath();
@@ -52,6 +55,22 @@ public final class Sibench {
                 }
             }
             root = root.toRealPath();
+            if (List.of("replay", "check-replay", "validate-snapshots").contains(args[0])) {
+                boolean check = args[0].equals("check-replay");
+                if (profiles.size() != (check ? 2 : 3))
+                    throw new IllegalArgumentException(
+                            args[0] + " requires REPLAY_CONFIG NORMALIZED_DIRECTORY"
+                                    + (check ? "" : " REPORT"));
+                ReplayConfig config = ReplayConfig.read(root, Path.of(profiles.get(0)));
+                Path directory = root.resolve(profiles.get(1));
+                var result = check
+                        ? ReferenceReplay.check(directory, config)
+                        : args[0].equals("validate-snapshots")
+                                ? SnapshotLookupValidation.run(directory, config, root.resolve(profiles.get(2)))
+                                : ReferenceReplay.run(directory, config, root.resolve(profiles.get(2)));
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result));
+                return 0;
+            }
             if (args[0].equals("prepare")) {
                 if (profiles.size() != 1)
                     throw new IllegalArgumentException(
@@ -90,13 +109,13 @@ public final class Sibench {
             return 0;
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
-            err.println("Scale validation interrupted");
+            err.println("SIBench interrupted");
             return 1;
         } catch (IOException
                 | IllegalArgumentException
                 | ArithmeticException
                 | YAMLException error) {
-            err.println("Scale validation failed: " + error.getMessage());
+            err.println("SIBench failed: " + error.getMessage());
             return 1;
         }
     }
@@ -112,5 +131,15 @@ public final class Sibench {
         out.println(
                 "prepare writes baseline Parquet files; --dry-run only validates and describes"
                     + " schemas.");
+        out.println(
+                "       java -jar build/sibench/sibench.jar check-replay [--root PATH]"
+                        + " REPLAY_CONFIG NORMALIZED_DIRECTORY");
+        out.println(
+                "       java -jar build/sibench/sibench.jar replay [--root PATH]"
+                        + " REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT");
+        out.println("replay runs the in-process reference once; no real backend or trace repetition.");
+        out.println("       java -jar build/sibench/sibench.jar validate-snapshots [--root PATH]"
+                + " REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT");
+        out.println("validate-snapshots runs derived history correctness probes, not native workload or performance.");
     }
 }

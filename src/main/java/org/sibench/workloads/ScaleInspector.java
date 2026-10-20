@@ -22,9 +22,9 @@ import java.util.Set;
 public final class ScaleInspector {
     public static final List<String> DEFAULT_PROFILES =
             List.of(
-                    "config/workloads/hybench/sf1000.yaml",
-                    "config/workloads/ycsb/large.yaml",
-                    "config/workloads/sysbench/large.yaml");
+                    "config/hybench_sf1000.yaml",
+                    "config/ycsb_large.yaml",
+                    "config/sysbench_large.yaml");
 
     // Reviewed against the pinned HyBench resource and generation loops.
     private static final Map<String, Long> HYBENCH_SF1000_ROWS =

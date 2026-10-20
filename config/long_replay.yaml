@@ -1,0 +1,17 @@
+schema_version: 1
+purpose: index_replay
+target:
+  secondary_indexes:
+    enabled: true
+  transaction_writes:
+    coalesce_same_key: true
+replay:
+  strategy: single_pass
+  trace_budget:
+    duration_seconds: 1800
+    planned_operations_per_second: 300000
+    warmup_operations: 18000000
+    reserve_percent: 20
+versions:
+  gc:
+    owner: none

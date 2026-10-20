@@ -4,10 +4,10 @@
 
 ## 当前入口
 
-使用 [large.yaml](../../config/workloads/sysbench/large.yaml) 配置 Java Baseline：
+使用 [sysbench_large.yaml](../../config/sysbench_large.yaml) 配置 Java Baseline：
 
 ```bash
-java -jar build/sibench/sibench.jar prepare --dry-run config/workloads/sysbench/large.yaml
+java -jar build/sibench/sibench.jar prepare --dry-run config/sysbench_large.yaml
 ```
 
 去掉 `--dry-run` 会实际生成数据。参数选择和产物格式见 [README](../../README.md#baseline-生成配置)。
@@ -24,7 +24,7 @@ java -jar build/sibench/sibench.jar prepare --dry-run config/workloads/sysbench/
 
 原生 oltp_read_write 的 event 包含多条查询和修改，event 数不等于索引操作数。范围为 BETWEEN 闭区间，可能超出已有键范围；聚合与排序不能计入索引查询时间。index update 修改 k，non-index update 修改 c；两者必须保留来源标签。delete-insert 删除后重新插入同键，需要保留顺序及身份规则。
 
-当前只实现 Baseline 入口，实际 Parquet 写入尚未验证，增量 Trace 与索引回放待实现。
+当前只实现派生 Baseline；该来源产物与容量尚未验证，原生增量采集与索引回放待实现。
 
 ## 源码入口
 

@@ -1,0 +1,195 @@
+--- a/src/backend/access/index/indexam.c
++++ b/src/backend/access/index/indexam.c
+@@ -42,6 +42,9 @@
+  */
+ 
+ #include "postgres.h"
++#include "sibench_capture.h"
++
++IndexScanDesc sibench_bitmap_scan = NULL;
+ 
+ #include "access/amapi.h"
+ #include "access/heapam.h"
+@@ -232,6 +235,7 @@
+ 									   (ItemPointer) NULL,
+ 									   InvalidBlockNumber);
+ 
++	sib_index_insert(indexRelation, values, isnull, heap_t_ctid, checkUnique);
+ 	return indexRelation->rd_indam->aminsert(indexRelation, values, isnull,
+ 											 heap_t_ctid, heapRelation,
+ 											 checkUnique, indexUnchanged,
+@@ -342,6 +346,7 @@
+ {
+ 	SCAN_CHECKS;
+ 	CHECK_SCAN_PROCEDURE(amrescan);
++	sib_scan("scan_rescan", scan, keys ? keys : scan->keyData, keys ? nkeys : scan->numberOfKeys, NULL, 0, false);
+ 
+ 	Assert(nkeys == scan->numberOfKeys);
+ 	Assert(norderbys == scan->numberOfOrderBys);
+@@ -366,6 +371,7 @@
+ {
+ 	SCAN_CHECKS;
+ 	CHECK_SCAN_PROCEDURE(amendscan);
++	sib_scan("scan_end", scan, NULL, 0, NULL, 0, false);
+ 
+ 	/* Release resources (like buffer pins) from table accesses */
+ 	if (scan->xs_heapfetch)
+@@ -573,6 +579,7 @@
+ 	 * pay no attention to those fields here.
+ 	 */
+ 	found = scan->indexRelation->rd_indam->amgettuple(scan, direction);
++	sib_scan("scan_next", scan, NULL, 0, found ? &scan->xs_heaptid : NULL, direction, found);
+ 
+ 	/* Reset kill flag immediately for safety */
+ 	scan->kill_prior_tuple = false;
+@@ -623,6 +630,7 @@
+ 									scan->xs_snapshot, slot,
+ 									&scan->xs_heap_continue, &all_dead);
+ 
++	sib_scan("heap_visibility", scan, NULL, 0, found ? &slot->tts_tid : &scan->xs_heaptid, 0, found);
+ 	if (found)
+ 		pgstat_count_heap_fetch(scan->indexRelation);
+ 
+@@ -713,7 +721,17 @@
+ 	/*
+ 	 * have the am's getbitmap proc do all the work.
+ 	 */
+-	ntids = scan->indexRelation->rd_indam->amgetbitmap(scan, bitmap);
++	sibench_bitmap_scan = scan;
++	PG_TRY();
++	{
++		ntids = scan->indexRelation->rd_indam->amgetbitmap(scan, bitmap);
++	}
++	PG_FINALLY();
++	{
++		sibench_bitmap_scan = NULL;
++	}
++	PG_END_TRY();
++	sib_scan("bitmap_end", scan, NULL, 0, NULL, 0, false);
+ 
+ 	pgstat_count_index_tuples(scan->indexRelation, ntids);
+ 
+--- a/src/backend/executor/execMain.c
++++ b/src/backend/executor/execMain.c
+@@ -36,6 +36,8 @@
+  *-------------------------------------------------------------------------
+  */
+ #include "postgres.h"
++#include "sibench_capture.h"
++#include "sibench_receiver.h"
+ 
+ #include "access/heapam.h"
+ #include "access/htup_details.h"
+@@ -149,6 +151,15 @@
+ 	EState	   *estate;
+ 	MemoryContext oldcontext;
+ 
++	if (sib_enabled())
++	{
++		StringInfoData detail;
++		initStringInfo(&detail);
++		appendStringInfoString(&detail, "\"sql\":");
++		escape_json(&detail, queryDesc->sourceText ? queryDesc->sourceText : "");
++		sib_emit("executor_start", NULL, detail.data);
++		pfree(detail.data);
++	}
+ 	/* sanity checks: queryDesc must not be started already */
+ 	Assert(queryDesc != NULL);
+ 	Assert(queryDesc->estate == NULL);
+@@ -340,6 +351,7 @@
+ 	 */
+ 	operation = queryDesc->operation;
+ 	dest = queryDesc->dest;
++	if (sib_enabled()) dest = sib_wrap_receiver(dest);
+ 
+ 	/*
+ 	 * startup tuple receiver, if we will be emitting tuples
+@@ -463,6 +475,12 @@
+ {
+ 	EState	   *estate;
+ 	MemoryContext oldcontext;
++	if (sib_enabled())
++	{
++		char detail[128];
++		snprintf(detail, sizeof(detail), "\"processed\":%llu", (unsigned long long) queryDesc->estate->es_processed);
++		sib_emit("executor_end", NULL, detail);
++	}
+ 
+ 	/* sanity checks */
+ 	Assert(queryDesc != NULL);
+--- a/src/backend/catalog/index.c
++++ b/src/backend/catalog/index.c
+@@ -20,6 +20,7 @@
+  *-------------------------------------------------------------------------
+  */
+ #include "postgres.h"
++#include "sibench_capture.h"
+ 
+ #include <unistd.h>
+ 
+@@ -3042,9 +3043,16 @@
+ 	/*
+ 	 * Call the access method's build procedure
+ 	 */
++	if (sib_relation(indexRelation)) sib_emit("index_build_start", indexRelation, NULL);
+ 	stats = indexRelation->rd_indam->ambuild(heapRelation, indexRelation,
+ 											 indexInfo);
+ 	Assert(PointerIsValid(stats));
++	if (sib_relation(indexRelation))
++	{
++		char detail[160];
++		snprintf(detail, sizeof(detail), "\"heap_rows\":%.0f,\"index_rows\":%.0f", stats->heap_tuples, stats->index_tuples);
++		sib_emit("index_build_end", indexRelation, detail);
++	}
+ 
+ 	/*
+ 	 * If this is an unlogged index, we may need to write out an init fork for
+--- a/src/backend/access/transam/xact.c
++++ b/src/backend/access/transam/xact.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "postgres.h"
++#include "sibench_capture.h"
+ 
+ #include <time.h>
+ #include <unistd.h>
+@@ -2239,6 +2240,7 @@
+ 	 * state.
+ 	 */
+ 
++	sib_emit("transaction_commit", NULL, NULL);
+ 	CallXactCallbacks(is_parallel_worker ? XACT_EVENT_PARALLEL_COMMIT
+ 					  : XACT_EVENT_COMMIT);
+ 
+@@ -2776,7 +2778,10 @@
+ 		if (is_parallel_worker)
+ 			CallXactCallbacks(XACT_EVENT_PARALLEL_ABORT);
+ 		else
++		{
++			sib_emit("transaction_abort", NULL, NULL);
+ 			CallXactCallbacks(XACT_EVENT_ABORT);
++		}
+ 
+ 		ResourceOwnerRelease(TopTransactionResourceOwner,
+ 							 RESOURCE_RELEASE_BEFORE_LOCKS,
+--- a/src/backend/nodes/tidbitmap.c
++++ b/src/backend/nodes/tidbitmap.c
+@@ -37,6 +37,7 @@
+  *-------------------------------------------------------------------------
+  */
+ #include "postgres.h"
++#include "sibench_capture.h"
+ 
+ #include <limits.h>
+ 
+@@ -380,6 +381,9 @@
+ 	PagetableEntry *page = NULL;	/* only valid when currblk is valid */
+ 	int			i;
+ 
++	if (sibench_bitmap_scan)
++		for (i = 0; i < ntids; i++)
++			sib_scan("bitmap_candidate", sibench_bitmap_scan, NULL, 0, (ItemPointer) (tids+i), 0, true);
+ 	Assert(tbm->iterating == TBM_NOT_ITERATING);
+ 	for (i = 0; i < ntids; i++)
+ 	{

@@ -4,10 +4,10 @@
 
 ## 当前入口
 
-使用 [large.yaml](../../config/workloads/ycsb/large.yaml) 配置 Java Baseline：
+使用 [ycsb_large.yaml](../../config/ycsb_large.yaml) 配置 Java Baseline：
 
 ```bash
-java -jar build/sibench/sibench.jar prepare --dry-run config/workloads/ycsb/large.yaml
+java -jar build/sibench/sibench.jar prepare --dry-run config/ycsb_large.yaml
 ```
 
 去掉 `--dry-run` 会实际生成数据。参数选择和产物格式见 [README](../../README.md#baseline-生成配置)。
@@ -25,7 +25,7 @@ java -jar build/sibench/sibench.jar prepare --dry-run config/workloads/ycsb/larg
 
 原生 A–F 的 read、update、insert、scan、read-modify-write 比例及分布需要在增量实现中保留或明确标为派生负载。标准 A–F 不产生 delete。scan 使用起始键与数量上限，不能将结束键推导为数值起点加数量。read-modify-write 是多个 API 调用，不能默认具有事务原子性。
 
-当前只实现 Baseline 入口，实际 Parquet 写入尚未验证，增量 Trace 与索引回放待实现。
+当前只实现派生 Baseline；使用 binary 字段和固定随机流替代 ThreadLocalRandom，不增加全量 hashed key 去重。该来源产物与容量尚未验证，原生增量采集与索引回放待实现。
 
 ## 源码入口
 

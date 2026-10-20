@@ -11,6 +11,7 @@ import org.yaml.snakeyaml.error.YAMLException;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 
 public class ScaleInspectorTest {
@@ -21,12 +22,23 @@ public class ScaleInspectorTest {
     }
 
     @Test
+    public void defaultProfilesUseFlatBenchmarkNames() {
+        assertEquals(
+                List.of(
+                        "config/hybench_sf1000.yaml",
+                        "config/ycsb_large.yaml",
+                        "config/sysbench_large.yaml"),
+                ScaleInspector.DEFAULT_PROFILES);
+    }
+
+    @Test
     public void profilesPreserveLargeIntegerCounts() throws Exception {
         long[] counts = {8706000000L, 1000000000L, 1000000000L};
         for (int i = 0; i < counts.length; i++) {
             Map<String, Object> report =
                     ScaleInspector.inspect(ROOT, Path.of(ScaleInspector.DEFAULT_PROFILES.get(i)));
             assertEquals(counts[i], report.get("baseline_rows"));
+            assertEquals(ScaleInspector.DEFAULT_PROFILES.get(i), report.get("profile"));
             assertFalse((Boolean) report.get("generation_verified"));
             assertTrue(report.containsKey("estimated_parquet_bytes"));
             assertNull(report.get("estimated_parquet_bytes"));

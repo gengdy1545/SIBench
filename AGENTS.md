@@ -7,8 +7,9 @@
   `new`, and `final` as organizational names.
 - Keep upstream benchmark sources in `benchmark/` submodules. Store generated
   builds under `build/benchmarks/` and local service state under `build/services/`.
-- Keep workload configurations in `config/workloads/<benchmark>/`, trace
-  examples in `config/trace/`, and storage configuration in `config/storage/`.
+- Keep project configurations directly in `config/`, without nested directories.
+  Name workload files `<benchmark>_<scale>.yaml`; use descriptive filenames for
+  trace examples and storage configuration.
 - Implement the core in Java under `src/main/java/org/sibench/`, organized by
   responsibility, including configuration, generation, trace, replay and adapters.
   Keep Java tests under `src/test/java/org/sibench/` and core builds under
