@@ -12,7 +12,7 @@
 
 YCSB 固定使用 `JdbcDBCreateTable`，不是普通字段为 VARCHAR 的 SQL 模板。`fieldcount` 默认配置为 10，可按配置解析，当前最多 1024。sysbench 固定 `secondary=false`、`create-secondary=true`，`auto-inc` 默认 true，也允许 false；Redshift、主键替换模式和自定义建表选项拒绝。这些是源布局约束，不是下游二级发送开关。
 
-只有单列主键自身的唯一性需要支持；额外 UNIQUE、复合、表达式、partial、INCLUDE、自定义 operator class / collation / 排序及其它索引访问方法不在这三种目标布局内，明确拒绝。运行期动态 DDL 和 PK 值 UPDATE 也不是当前标准负载要求，不为它们增加虚构事件。Schema catalog 支持不意味着 YCSB / sysbench 的原生采集、字符串主键 Trace 或范围投影已完成。
+只有单列主键自身的唯一性需要支持；额外 UNIQUE、复合、表达式、partial、INCLUDE、自定义 operator class / collation / 排序及其它索引访问方法不在这三种目标布局内，明确拒绝。运行期动态 DDL 不在范围内。固定标准负载不改写已有行的主键值：PK 值 UPDATE 明确拒绝，包括随后回滚的尝试，不作为待实现功能，也不补造此类负载。这不排除普通列 / 二级索引列 UPDATE、新版本主键索引写入或同主键 DELETE / 重插入。Schema catalog 和公共行审计支持不意味着 YCSB / sysbench 的原生采集、字符串主键 Trace 或范围投影已完成。
 
 ## 核对与失败
 
@@ -27,7 +27,7 @@ YCSB 固定使用 `JdbcDBCreateTable`，不是普通字段为 VARCHAR 的 SQL �
 
 成功报告为 `schema_verified`，差异为 `schema_mismatch`，包含期望与实际定义、环境、源码摘要和具体差异。检查是采集前的时点事实，不是整个运行期 DDL 漂移检测；实验环境应禁止外部 DDL，不宣称持有跨运行发布屏障。
 
-HyBench `CapturePoc check` 现在连接 PG 并执行预检，不再是纯离线配置检查。Baseline export 在创建输出目录前检查，保存 `schema-preflight.json`；原生 run 在打开记录 JDBC 会话和调用 benchmark 方法前检查，在 `capture-run.json` 保存结果。失败 run 保留诊断，但没有业务采集会话。已移除无固定配置的原生运行与 Baseline export 旧 CLI 入口。
+HyBench `CapturePoc check` 连接 PG 并执行预检。Baseline export 在创建输出目录前检查，保存 `schema-preflight.json`；原生 run 在打开记录 JDBC 会话和调用 benchmark 方法前检查，在 `capture-run.json` 保存结果。失败 run 保留诊断，但没有业务采集会话。
 
 YCSB / sysbench 目前可执行独立预检；它们的原生采集入口尚未实现，未来接入必须调用相同检查，不得以独立预检通过替代采集验收。
 

@@ -30,11 +30,15 @@ java -jar build/sibench/sibench.jar check-schema config/hybench_sf1.yaml \
 
 ```bash
 java -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc check "$PWD" config/hybench_sf1.yaml
-java -Xmx3g -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc audit "$PWD" config/hybench_sf1.yaml results/poc/hybench-htap-sf1/state-audit-check.json
+java -Xmx3g -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc audit "$PWD" config/hybench_sf1.yaml
 java -Xmx3g -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc pack "$PWD" config/hybench_sf1.yaml results/poc/hybench-htap-sf1/trace-check
 ```
 
 `pack` 保存原始索引事件及完整 JSON payload，不等于规范 KV Trace；HTAP 输入会被单会话编译器显式拒绝。完整并发快照、全局操作顺序、范围/变长键投影仍待实现。
+
+源行核验统一由 `RowStateAudit` 完成：完整旧 / 新行和最终 PG 状态在同一次审计中核对。默认在 raw 目录保存 `row-state-audit.json` 及已审计变化；相同报告与输入重复调用只复核摘要，不重查 PG。新编译和维护诊断必须先有匹配报告，既有规范产物回放不变。三来源 PK 值 UPDATE（包括回滚尝试）固定拒绝，不影响普通列 / 二级索引列 UPDATE 或同主键删除重插入。
+
+三来源通用入口为 `audit-rows PROFILE BASELINE RAW [REPORT] --jdbc URL --user ROLE`；`CapturePoc audit` 同时支持 HyBench HTAP 和 TP 子集。指定自定义报告时，`CapturePoc compile ROOT CONFIG PG_TRACE OUTPUT [ROW_AUDIT]` 与 `IndexMaintenanceValidation ROOT CONFIG BASELINE RAW REPORT [ROW_AUDIT]` 可显式引用它。审计前业务库必须处于原采集结束的静止状态；历史报告不改写，详情见 [统一行状态审计](docs/validation/row-state-audit.md)。
 
 [hybench_tp_subset_sf1.yaml](config/hybench_tp_subset_sf1.yaml) 保留 TP3/TP5/TP9=35/30/35 诊断负载；[index_replay.yaml](config/index_replay.yaml) 控制下游发送。以下回放既有子集产物，不执行 SQL、不连接 PG：
 
@@ -44,7 +48,7 @@ java -Xmx16g -jar build/sibench/sibench.jar replay config/index_replay_128client
 java -Xmx16g -jar build/sibench/sibench.jar validate-snapshots config/index_replay_128clients.yaml results/validation/hybench-sf1-secondary-indexes-20261021/normalized-jdk17 results/validation/hybench-sf1-secondary-indexes-20261021/snapshots-check.json
 ```
 
-报告必须是新文件。`check-replay` 检查 Trace 完整性、工作单元身份摘要、过滤后的 client 覆盖与有效操作预算；`replay` 是两种 value 的进程内正确性检查，不代表已连接真实的 128 个网络 client；`validate-snapshots` 使用独立行历史 oracle，派生探针不计入原生负载或性能。
+回放和快照报告必须是新文件。`check-replay` 检查 Trace 完整性、工作单元身份摘要、过滤后的 client 覆盖与有效操作预算；`replay` 是两种 value 的进程内正确性检查，不代表已连接真实的 128 个网络 client；`validate-snapshots` 使用独立行历史 oracle，派生探针不计入原生负载或性能。
 
 - `target.secondary_indexes.enabled` 默认 true；false 过滤全部二级加载、查询和维护，完整 Trace/Parquet 不变。
 - `replay.dispatch_mode` 默认 `operation`，以操作为驱动输入单位；[index_replay_transaction.yaml](config/index_replay_transaction.yaml) 使用 `transaction` 按已提交源事务组织输入。两者最终均逐操作路由、单线程保序发送，不合并修改，不向索引发送事务控制，也不要求下游事务 API。

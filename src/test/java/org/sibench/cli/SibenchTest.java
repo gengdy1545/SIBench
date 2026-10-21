@@ -49,11 +49,35 @@ public class SibenchTest {
             {"check-replay", "config/index_replay.yaml", "missing-trace"},
             {"replay", "--repeat", "2"},
             {"validate-snapshots", "config/index_replay.yaml"},
-            {"validate-snapshots", "config/index_replay.yaml", "missing-trace", "missing-report.json"},
+            {
+                "validate-snapshots",
+                "config/index_replay.yaml",
+                "missing-trace",
+                "missing-report.json"
+            },
             {"check-schema", "config/ycsb_large.yaml"},
             {"check-schema", "--jdbc"},
             {"check-schema", "--user"},
-            {"check-schema", "config/ycsb_large.yaml", "--jdbc", "jdbc:mysql:localhost", "--user", "postgres"},
+            {"audit-rows", "config/ycsb_large.yaml"},
+            {"audit-rows", "--jdbc"},
+            {
+                "audit-rows",
+                "config/ycsb_large.yaml",
+                "missing-baseline",
+                "missing-raw",
+                "--jdbc",
+                "jdbc:mysql:localhost",
+                "--user",
+                "postgres"
+            },
+            {
+                "check-schema",
+                "config/ycsb_large.yaml",
+                "--jdbc",
+                "jdbc:mysql:localhost",
+                "--user",
+                "postgres"
+            },
             {"inspect-scale", "config/ycsb_large.yaml", "missing.yaml"}
         };
         for (String[] args : invalid) {

@@ -10,6 +10,16 @@
 
 `CapturePoc pack` 将 HTAP PG 原始事件写入 64 字节 access 记录及无损 `payload.jsonl`；块使用 CRC32C，输入及输出保存 SHA256。事件码 1–15 不变，16 为 `executor_run_end`，记录执行器返回的事实；`executor_end` 是清理生命周期事件，关闭连接时可能没有该事件。按文件名排序保留各会话内部顺序，不声明全局提交顺序或 KV 回放语义。
 
+## 核验职责
+
+源行状态只由 `RowStateAudit` 核验：以已验证 Baseline 为初始状态，按 schema 类型比较完整旧 / 新行，提交变化推进状态，回滚变化排除；在采集结束且业务库静止时与 PG 全表最终状态对账。单会话严格保留来源操作顺序；多会话只连接保留各会话同键顺序的行因果链，不据此生成全局提交版本或查询快照。回滚变化检查行形状、类型及主键稳定性，不作为已提交修改链的组成部分。
+
+默认产物为 raw 目录的 `row-state-audit.json` 和 `row-state-audit.json.changes.jsonl`，报告摘要绑定 schema、原始输入、已验证 Baseline 和已审计变化。同一报告路径重复调用只复核摘要，不重新查询 PG 或核验行链；输入改变则拒绝。报告最后原子发布，失败残留不视为成功，使用新的报告路径重试。旧历史报告保持原样，不能充当新格式报告；重新审计必须使用原采集结束时的最终数据库状态或其准确恢复副本。
+
+编译器和 `IndexMaintenanceValidation` 要求匹配报告。编译器检查转换所需的字段、身份及支持范围；维护诊断消费已审计的每键变化顺序。转换产物验收负责源事件到 Parquet / 完整索引展开的映射，独立 Parquet oracle 负责当前 / 历史键、版本和值，Backend 回放负责目标返回结果；这些检查不重新证明源行状态。换 client 数、发送开关或 Backend 复用来源审计结论，并复核文件摘要。
+
+三来源 PK 值 UPDATE 固定为范围外负载，提交及回滚尝试均拒绝；同主键普通列 / 二级索引列 UPDATE、DELETE / 重插入仍支持。CHAR 只忽略尾部 ASCII 空格，VARCHAR / TEXT 保留原文，REAL 按源单精度比较，date / timestamp 按类型比较。
+
 ## 身份与版本
 
 ```text
@@ -59,7 +69,7 @@ v7 使用 132 字节固定前缀加可空 UTF-8 索引值，每块最多 4096 �
 
 Baseline 每索引 INSERT；运行期 INSERT 每索引 UPSERT；DELETE 失效主键及全部二级条目。同主键重插入分配新 RowID，UPDATE 保留原 RowID。旧、新条目及主键共享来源事件、版本、事务、mutationOrdinal、workUnitId 和 RowID；除删除条目无物理位置外，值位置一致。`expansionPosition` 从 0 连续编号，`expansionSize` 为完整展开宽度，查询和控制不得插入其中。预检在二级过滤前核对全清单、完整展开和源工作单元绑定，截断或漏项拒绝。
 
-增量文件按实际表惰性创建 `<table>-versions.parquet`，FileID 从基线最大值加 TableID 分配；每次写入保留 `_sib_timestamp`、`_sib_mutation_ordinal` 和 `_sib_row_id`。同键同版本按序覆盖，中间效果服务于原始事务内查询，不产生额外提交版本；后续源事务只能看到最终提交效果。主键值 UPDATE 尚未支持，明确拒绝；增量 rollover 尚未实现，到达阈值使编译失败而非丢弃后续行。
+增量文件按实际表惰性创建 `<table>-versions.parquet`，FileID 从基线最大值加 TableID 分配；每次写入保留 `_sib_timestamp`、`_sib_mutation_ordinal` 和 `_sib_row_id`。同键同版本按序覆盖，中间效果服务于原始事务内查询，不产生额外提交版本；后续源事务只能看到最终提交效果。主键值 UPDATE 是范围外操作，明确拒绝；增量 rollover 尚未实现，到达阈值使编译失败而非丢弃后续行。
 
 读兼容：v6 为 120 字节，维护范围仍为历史的主键和 transfer 两个二级索引；v4/v5 为 112 字节，v5 包含组内写后查询契约；v3 为 104 字节，旧 SEARCH.version 映射为 ReadTimestamp；v1/v2 为 88 字节，仅支持最新状态兼容，不具备可信事务版本。v1 的 transfer 行写入在读取时展开，其他格式已显式展开。v1–v5 没有工作单元身份，读取为 0，仅允许单 client。旧文件不改写，不把它们升级声称为全索引覆盖；新编译只输出 v7。
 

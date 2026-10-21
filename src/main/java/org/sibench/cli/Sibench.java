@@ -2,16 +2,16 @@ package org.sibench.cli;
 
 import com.google.gson.GsonBuilder;
 
+import org.sibench.capture.RowStateAudit;
 import org.sibench.config.ConfigValues;
 import org.sibench.generation.BaselineGenerator;
 import org.sibench.replay.ReferenceReplay;
 import org.sibench.replay.ReplayConfig;
 import org.sibench.replay.SnapshotLookupValidation;
 import org.sibench.schema.PgSchemaCheck;
+import org.sibench.schema.SourceSchema;
 import org.sibench.workloads.ScaleInspector;
-import org.yaml.snakeyaml.error.YAMLException;
 
-import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -39,7 +39,8 @@ public final class Sibench {
                             "replay",
                             "check-replay",
                             "validate-snapshots",
-                            "check-schema")
+                            "check-schema",
+                            "audit-rows")
                     .contains(args[0])) {
                 throw new IllegalArgumentException("Unknown command: " + args[0]);
             }
@@ -53,11 +54,13 @@ public final class Sibench {
                     return 0;
                 } else if (args[i].equals("--dry-run") && args[0].equals("prepare")) {
                     dryRun = true;
-                } else if (args[0].equals("check-schema") && args[i].equals("--jdbc")) {
+                } else if (List.of("check-schema", "audit-rows").contains(args[0])
+                        && args[i].equals("--jdbc")) {
                     if (++i == args.length)
                         throw new IllegalArgumentException("--jdbc requires a URL");
                     jdbc = args[i];
-                } else if (args[0].equals("check-schema") && args[i].equals("--user")) {
+                } else if (List.of("check-schema", "audit-rows").contains(args[0])
+                        && args[i].equals("--user")) {
                     if (++i == args.length)
                         throw new IllegalArgumentException("--user requires a role");
                     user = args[i];
@@ -73,6 +76,28 @@ public final class Sibench {
                 }
             }
             root = root.toRealPath();
+            if (args[0].equals("audit-rows")) {
+                if ((profiles.size() != 3 && profiles.size() != 4) || jdbc == null || user == null)
+                    throw new IllegalArgumentException(
+                            "audit-rows requires PROFILE BASELINE RAW [REPORT] --jdbc URL --user"
+                                + " ROLE");
+                if (!jdbc.startsWith("jdbc:postgresql:"))
+                    throw new IllegalArgumentException("audit-rows requires a PostgreSQL JDBC URL");
+                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
+                Path raw = root.resolve(profiles.get(2));
+                var report =
+                        RowStateAudit.audit(
+                                jdbc,
+                                user,
+                                SourceSchema.read(root, document),
+                                root.resolve(profiles.get(1)),
+                                raw,
+                                profiles.size() == 4
+                                        ? root.resolve(profiles.get(3))
+                                        : RowStateAudit.defaultReport(raw));
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(report));
+                return 0;
+            }
             if (args[0].equals("check-schema")) {
                 if (profiles.size() != 1 || jdbc == null || user == null)
                     throw new IllegalArgumentException(
@@ -151,11 +176,7 @@ public final class Sibench {
             Thread.currentThread().interrupt();
             err.println("SIBench interrupted");
             return 1;
-        } catch (java.sql.SQLException
-                | IOException
-                | IllegalArgumentException
-                | ArithmeticException
-                | YAMLException error) {
+        } catch (Exception error) {
             err.println("SIBench failed: " + error.getMessage());
             return 1;
         }
@@ -170,8 +191,13 @@ public final class Sibench {
                 "       java -jar build/sibench/sibench.jar check-schema [--root PATH]"
                         + " PROFILE --jdbc URL --user ROLE");
         out.println(
+                "       java -jar build/sibench/sibench.jar audit-rows [--root PATH]"
+                        + " PROFILE BASELINE RAW [REPORT] --jdbc URL --user ROLE");
+        out.println(
+                "audit-rows verifies source row state once; unchanged inputs reuse the report.");
+        out.println(
                 "check-schema reads the live PG catalog; it never creates or repairs"
-                    + " tables/indexes.");
+                        + " tables/indexes.");
         out.println(
                 "       java -jar build/sibench/sibench.jar prepare [--root PATH] [--dry-run]"
                         + " PROFILE");
@@ -191,6 +217,6 @@ public final class Sibench {
                         + " REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT");
         out.println(
                 "validate-snapshots runs derived history correctness probes, not native workload or"
-                    + " performance.");
+                        + " performance.");
     }
 }

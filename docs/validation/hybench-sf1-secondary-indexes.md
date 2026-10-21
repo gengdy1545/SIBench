@@ -91,12 +91,12 @@ JDK 17 离线 `mvn -o -q package`：88 项测试，失败 / 错误为 0。当前
 
 ## 复验命令
 
-从仓库根目录运行，使用 JDK 17；输出必须是新目录 / 新报告，不能覆盖或拼接失败前缀。
+从仓库根目录运行，使用 JDK 17；输出必须是新目录 / 新报告，不能覆盖或拼接失败前缀。编译和维护诊断复用 [统一行状态审计](row-state-audit.md) 报告；先对各自采集执行一次 `audit-rows`，下面的 `TP_ROW_AUDIT.json` 和 `HTAP_ROW_AUDIT.json` 分别指向对应成功报告。
 
 ```bash
-java -Xmx16g -cp build/sibench/sibench.jar org.sibench.capture.IndexTraceCompiler /mnt/disk1/SIBench config/hybench_tp_subset_sf1.yaml results/poc/hybench-sf1/raw/pg-1475807.jsonl NEW_NORMALIZED
+java -Xmx16g -cp build/sibench/sibench.jar org.sibench.capture.IndexTraceCompiler /mnt/disk1/SIBench config/hybench_tp_subset_sf1.yaml results/poc/hybench-sf1/raw/pg-1475807.jsonl NEW_NORMALIZED TP_ROW_AUDIT.json
 java -Xmx16g -cp build/sibench/sibench.jar org.sibench.replay.ReplayMatrixValidation NEW_NORMALIZED NEW_REPORT_DIRECTORY
-java -Xmx12g -cp build/sibench/sibench.jar org.sibench.capture.IndexMaintenanceValidation /mnt/disk1/SIBench config/hybench_sf1.yaml results/poc/hybench-htap-sf1/baseline results/poc/hybench-htap-sf1/raw NEW_REPORT.json
+java -Xmx12g -cp build/sibench/sibench.jar org.sibench.capture.IndexMaintenanceValidation /mnt/disk1/SIBench config/hybench_sf1.yaml results/poc/hybench-htap-sf1/baseline results/poc/hybench-htap-sf1/raw NEW_REPORT.json HTAP_ROW_AUDIT.json
 java -Xmx16g -cp build/sibench/sibench.jar org.sibench.capture.RelocationCheck /mnt/disk1/SIBench config/hybench_tp_subset_sf1.yaml NEW_NORMALIZED NEW_RELOCATION_DIRECTORY
 ```
 

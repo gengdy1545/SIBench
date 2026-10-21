@@ -16,6 +16,7 @@
 | --- | --- |
 | 来源真实性 | 固定上游提交、PG 环境和一次采集事实；保留原生选择器、比例、业务分支、计时及 SQL。不重跑 SQL 补结果，不模拟业务，不猜测修复 PG 内部实现。派生 Baseline 单独标识，不替代原生执行。 |
 | 审计与失败 | 原始事实与规范操作分层保存，转换可追溯；不支持的语义显式拒绝。非预期错误使采集无效，保留诊断，修复后从明确初始状态换新目录重跑，不拼接失败前缀。预期业务失败按来源语义处理；最终状态正确不能替代访问负载审计。 |
+| 核验职责 | `RowStateAudit` 在采集后统一核对源行修改链和最终 PG 状态，同一份输入只审计一次。编译与维护诊断验证摘要并复用来源结论；转换产物验收只核对源事件到 Parquet / 索引操作的映射，Backend 回放只验证目标结果，不重复核验源行修改链。 |
 | 提交与查询 | 默认只发送已提交变更；原始 Trace 保留修改尝试和回滚，不生成反向补偿或回撤开关。当前单会话转换排除回滚修改及修改后的查询，保留修改前的受支持查询；已提交事务保留写后查询及原始操作位置，不合并修改。 |
 | 时间戳与发送 | 同源事务一个 `CommitVersion`，查询携带独立 `ReadTimestamp` 和此前修改位置。`operation` / `transaction` 只决定驱动输入单位，最终均逐项发送；源控制记录不发送给索引，不要求下游事务 API。 |
 | client 路由 | 默认 1 client，按源 SQL 请求工作单元确定性轮询，不按索引键或事务绑定；同请求的展开共用 client，同事务允许跨 client。同一 Trace 支持 1/64/128 及更多 client，过滤后必须覆盖全部配置 client，不伪造身份或重复负载填充。 |
@@ -25,7 +26,7 @@
 
 具体字段、失败处理和责任边界以 [Trace 契约](docs/contracts/trace.md)、[存储契约](docs/contracts/storage.md) 为准。
 
-目标来源限定 HyBench、YCSB JDBC、sysbench PG 的固定标准布局：单列主键及来源实际定义的普通单列二级索引。不要求额外 UNIQUE、复合、表达式、partial 或动态 DDL；范围外定义显式拒绝，详见 [来源 Schema 契约](docs/contracts/source-schema.md)。
+目标来源限定 HyBench、YCSB JDBC、sysbench PG 的固定标准布局：单列主键及来源实际定义的普通单列二级索引。不要求额外 UNIQUE、复合、表达式、partial 或动态 DDL。标准负载不改写已有行的主键值；PK 值 UPDATE 是固定范围外操作，提交及回滚尝试均拒绝，不列为待实现功能。普通列 / 二级索引列 UPDATE 及同主键 DELETE / 重插入仍在范围内，详见 [来源 Schema 契约](docs/contracts/source-schema.md)。
 
 ## 当前能力与范围
 
@@ -36,7 +37,8 @@
 | HyBench 原生采集 | PG 插桩、JDBC 请求关联、八表行变化、事务和结果采集；异常追踪、完成审计及摘要校验。默认 `runHTAP`：AP1–13 → TP1–18 → 并发 AT1–6/IQ1–6。当前限定 native SF1、PG14.24、read_committed、无 parallel worker、postgres 角色、Zstd 和 `results/poc`，各类源会话配置最多 256；诊断 `tp_subset` 只允许单会话 TP3/5/9。 |
 | 文件与规范 Trace | 统一 Parquet writer，256 MiB 目标、1,048,576 行组上限；v7 保留提交版本、读取点、事务内位置、源 SQL 工作单元及连续维护展开，支持可空 UTF-8 等值索引值。目录级预检核对源码清单、摘要、工作单元绑定和完整展开；历史格式只读兼容。完整 HTAP 输入仍被单会话编译器拒绝。 |
 | 索引清单与维护 | `IndexCatalog` 复用来源 schema，保持 HyBench 历史索引编号及清单顺序。提交 INSERT / UPDATE / DELETE 统一展开；改键为旧身份 LOGICAL_DELETE + 新身份 UPSERT，未改键也刷新关联版本 / 值；UPDATE 保留 RowID，重插入分配新身份。PK 值 UPDATE 及范围外索引定义拒绝；YCSB / sysbench catalog 支持不代表其 Trace 编译完成。 |
-| 提交变更转换 | 单会话支持范围内的回滚筛选与已提交事务写后查询，不合并同事务修改；回滚不推进版本或分配 RowID。核对身份及索引列 old/new，但未逐修改独立核对普通列完整 before-image；原始、排除、提交及发送量分别报告。 |
+| 源行状态审计 | `RowStateAudit` 按三来源 schema 统一核对完整列和旧 / 新行；支持字符串及非连续 int64 主键、DELETE / 重插入与插入键交错。单会话保留来源顺序，多会话连接保留各会话同键顺序的因果链，不推断全局提交。静止边界最终 PG 全行对账，摘要绑定报告和已审计变化；重复调用不查询 PG。Baseline 按来源 schema 验证全值和身份，要求主键有序、RowID 连续。 |
+| 提交变更转换 | 单会话支持范围内的回滚筛选与已提交事务写后查询，不合并同事务修改；回滚不推进版本或分配 RowID。编译前要求匹配的源行审计报告，不再维护普通列完整旧行核验模型；原始、排除、提交及发送量分别报告。 |
 | 多 client 驱动 | 两种输入模式、全部二级统一过滤、单发送线程、源工作单元路由、异步响应、在途上限、超时、排空和失败清理；过滤后 client 覆盖及单次输入预算预检。源 SQL / 基线每 4096 行工作单元是任务近似，不是实际 serverless DAG；参考 client 共享进程内模型，不模拟网络可见性。 |
 | 版本参考与查询核验 | Locator / RowID、通用表 / 索引命名空间、当前及历史主键 / 二级等值、null 和非连续 int64 PK、逻辑删除及全索引精确版本搬迁。Parquet oracle 全改动身份逐版本核对，非唯一谓词每索引最多 64 个抽样；裸文件回放不证明源清单完整。原生 null 扫描标记拒绝，无范围、复合、表达式或 collation 等价转换。 |
 | 状态与文件生命周期 | 参考模型使用分页 PK 存储和稀疏历史，但仍驻内存；源事务缓冲最多 1,000,000 个展开操作。Locator 打包限制 FileID <= `Integer.MAX_VALUE`、行位置 <= `0xffffffff`；增量 rollover 到阈值拒绝。搬迁控制仅选择实际修改表的最新存活行，不保留受保护历史集合、不自然触发、不回收旧文件；不是 SF1000 有界状态方案。 |
@@ -48,11 +50,12 @@ HyBench 完整 TP / AT 的索引列值更新来自 `loanapps.timestamp`（AT3）
 | 验证 | 已通过证据 | 不代表 |
 | --- | --- | --- |
 | SF1 Baseline / 原生 HTAP | 八表 8,706,000 基线行的 PG / Parquet 全值和身份核对；四会话 HTAP 请求关联、最终八表状态及原始事件无损打包通过，见 [HTAP 验证](docs/validation/hybench-sf1-htap.md)。 | 大规模容量、全局事件无丢失、完整 HTAP 访问 / 快照投影已验证。 |
+| 统一行审计实库重验 | JDK17 / PG14.24 上，原生 HTAP 最终 8,707,767 行、5,408 次提交修改，以及 TP 子集最终 8,731,627 行、76,881 次提交修改全表对账通过。TP 使用审计报告重新编译的 Trace / Parquet / 工作单元与既有通过产物摘要一致，128-client 预检通过，见 [统一审计验证](docs/validation/row-state-audit.md)。 | 原生 SQL 重跑；全局事件无丢失或并发查询快照等价已证明。 |
 | SF1 全索引 TP 子集 | 基线 31,212,000 索引条目；重复编译 Trace / Parquet / 工作单元字节一致、manifest 结构化一致；12 组 client / 模式 / 二级变体及最终构建 128 client Parquet oracle 通过，见 [全索引验证](docs/validation/hybench-sf1-secondary-indexes.md)。 | TP 子集发生了索引列值 UPDATE；真实网络、吞吐或持久化已验证。 |
 | SF1 原生改键维护 | 真实已提交改键 34 次：loanapps.timestamp 15 次、loantrans.timestamp 19 次，逐键因果维护及两种 value 核验通过。 | 逐键派生版本是全局提交顺序；完整 HTAP 快照或规范 Trace 已实现。 |
 | SF1 搬迁控制 | 最新存活修改行的真实 Parquet 内容不变，全部关联索引精确版本 Locator 搬迁与 RowID 无搬迁写核验通过。 | 自然 Rewrite、受保护历史集合搬迁、发布屏障或旧文件回收已完成。 |
 | 实际 PG schema 预检 | PG14.24 上 51 项检查通过：既有 HyBench SF1、源 DDL 和三来源独立布局、完整表 / 列 / 默认值 / 索引差异、quoted 名称与 search_path；差异发生在导出创建输出及 run 业务采集前，保留失败诊断，见 [预检验证](docs/validation/source-schema-preflight.md)。 | YCSB / sysbench 原生客户端生成 / 执行已验收；运行期外部 DDL 漂移检测已实现。 |
-| 受控语义与预检测试 | 104 项测试零失败，覆盖三来源 schema、列 / 索引差异、JDBC 元数据与搜索路径、采集失败证据，以及回滚改键、写后查询、DELETE / 重插入、版本搬迁、展开完整性及异步发送边界。 | 测试桩是实际 PG 集成证据；原生负载实际覆盖全部受控操作；原生 DELETE / 重插入及写入后回滚仍无实跑证据。 |
+| 受控语义与预检测试 | JDK17 完整构建 110 项测试零失败，覆盖三来源 schema、完整行审计及摘要复用、双会话同键因果链、提交 / 回滚 PK 改写拒绝、列 / 索引差异、JDBC 元数据与搜索路径、采集失败证据，以及回滚改键、写后查询、DELETE / 重插入、版本搬迁、展开完整性及异步发送边界。另有三来源实际 PG 采集与行审计 9 项检查通过，包括 DELETE / 重插入、写入后回滚及提交 / 回滚 PK 改写拒绝，见 [统一审计验证](docs/validation/row-state-audit.md)。 | 受控 SQL 是原生客户端执行；原生负载实际覆盖全部受控操作；原生 DELETE / 重插入及写入后回滚已有实跑证据。 |
 
 默认采集使用 `config/hybench_sf1.yaml`，诊断 TP 子集使用 `config/hybench_tp_subset_sf1.yaml`。实验数量、摘要、命令和历史记录保留在验证文档及产物中；本计划仅记录当前验收依据与能力边界。
 
@@ -62,12 +65,11 @@ HyBench 完整 TP / AT 的索引列值更新来自 `loanapps.timestamp`（AT3）
 
 ### 1. 补齐原生规范转换
 
-- [ ] **行变更完整性**：逐修改独立核对完整 before-image，包括普通列；全行最终状态审计不能替代修改链核对。三来源标准负载不更新 PK 值，继续明确拒绝该范围外操作，不将其列为必需实现。
 - [ ] **完整访问投影**：审计 AP / TP / AT / IQ 的实际索引扫描、运行时绑定、重扫与结果，补齐 lossy bitmap / recheck / 残余过滤归因；区分索引候选、可见行和 SQL 最终结果，不以聚合、排序或 LIMIT 后数量代替索引命中数。未支持谓词 / 计划显式拒绝，范围及变长键使用第 2 节的公共能力。
 - [ ] **并发顺序与快照**：采集可验证的跨会话顺序事实，保留各会话请求 / 修改顺序，并建立源提交到逻辑版本的映射；不能按 PID、XID 大小、文件排序或墙钟推断全局顺序。按实际语句快照映射可见提交及事务内此前修改，验证单一 `ReadTimestamp` 能否表达原生可见集合；不能表达时先补齐契约或拒绝，不复用单会话写后查询假设。
 - [ ] **来源预期失败与重试**：按固定源码明确业务回滚、预期 SQL / API 失败、原生重试和非预期错误；保留 SQLSTATE / 状态码、请求与事务身份、每次尝试及最终结果，只发布成功提交的修改。重试仅保留来源实际行为，不由编译器或发送端补造；完成分类和实跑验证前，当前 JDBC 异常使采集失败的规则不放宽。
 - [ ] **采集完整性与开销**：跨会话全局丢事件检测及故障注入；核对请求、扫描、行变化、事务边界和原始 / 排除 / 提交 / 展开操作量，分别测量插桩前后开销。请求配对、CRC 或最终状态正确不能单独证明无丢事件。
-- [ ] **通用来源审计**：推广 `CapturePoc` / `PgBaselineVerify` 的固定 SF1 行数验收、`PgQueryAudit` 的 transfer dense int 数组及 `PgCaptureAudit` 的两表诊断范围；以实际 schema / manifest 和负载语义核对多表、多规模访问，不将历史 TP3/5/9 特例用于完整 HTAP 验收。
+- [ ] **通用访问审计**：推广 `CapturePoc` 的固定 SF1 入口与 `PgQueryAudit` 的 transfer dense int 数组；以实际 schema / manifest 和负载语义核对多表、多规模访问，不将历史 TP3/5/9 特例用于完整 HTAP 验收。行状态核验统一由 `RowStateAudit` 负责，不新增并行修改链检查器。
 - [ ] **YCSB / sysbench 原生接入**：执行固定上游客户端 / 脚本并采集调用、参数、结果与修改；开采前调用统一 PG 预检，不以独立检查替代入口接入。YCSB 保留 A–F 比例、字段更新、scan 上限及 read-modify-write 非默认原子性，标准 JDBC 仅主键。sysbench 保留 event 内顺序，分别标识 k 索引列 UPDATE、c 普通列 UPDATE 和 DELETE / 重插入，不混算覆盖。
 - [ ] **完整转换验收**：完成访问 / 快照投影后，独立核对原生查询可见集合、提交状态、增量 Parquet 和两种 value 的当前 / 历史结果，再验多 client；扩展当前抽样 oracle 的覆盖以满足目标负载。逐键维护审计、受控用例或 TP 子集回放不能替代完整原生验收。
 
@@ -91,7 +93,7 @@ HyBench 完整 TP / AT 的索引列值更新来自 `loanapps.timestamp`（AT3）
 
 ### 5. 支持大规模连续输入
 
-- [ ] 编译、源事务缓冲、工作单元和参考历史的有界内存 / 可落盘状态，以及增量文件 rollover。
+- [ ] 源行审计的修改集合、编译、源事务缓冲、工作单元和参考历史的有界内存 / 可落盘状态，以及增量文件 rollover；通用 schema / 主键支持不代表大规模审计容量已验收。
 - [ ] 通用 int64 FileID / 行位置 Locator，解除参考打包宽度限制并验证全部身份边界。
 - [ ] 连续事务边界分段、确定性续编译、Checkpoint 及恢复。
 - [ ] 统一构建、初始加载、导出与采集编排，按目标负载推广当前 PG / 会话 / 角色 / codec / 输出目录限制；回放 client 无 128 硬上限不代表采集限制已解除。
@@ -122,6 +124,7 @@ HyBench 完整 TP / AT 的索引列值更新来自 `loanapps.timestamp`（AT3）
 - [Trace 契约](docs/contracts/trace.md)、[存储契约](docs/contracts/storage.md)：详细语义与责任边界。
 - [来源 Schema 契约](docs/contracts/source-schema.md)：三来源实际布局、PG 预检及验收边界。
 - [来源 Schema 预检验证](docs/validation/source-schema-preflight.md)：离线差异 / JDBC 测试、实际 SF1 与三来源 PG 集成证据及边界。
+- [统一行状态审计](docs/validation/row-state-audit.md)：一次审计的职责、三来源测试与 PK 值改写拒绝边界。
 - [HTAP SF1 验证](docs/validation/hybench-sf1-htap.md)：原生 HTAP 采集、八表状态及无损原始 Trace。
 - [全索引 SF1 验证](docs/validation/hybench-sf1-secondary-indexes.md)：当前 v7、全部二级维护、真实索引列值更新、12 组回放及 Parquet oracle。
 - 历史证据：[TP 子集验证](docs/validation/hybench-sf1-poc.md)、[提交变更及多 client 验证](docs/validation/committed-change-delivery.md)；不作为当前功能范围说明。

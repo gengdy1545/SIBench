@@ -9,6 +9,7 @@ import org.apache.parquet.hadoop.example.GroupReadSupport;
 import org.apache.parquet.schema.MessageType;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.generation.*;
+import org.sibench.schema.SourceSchema;
 
 import java.io.*;
 import java.nio.file.*;
@@ -87,14 +88,25 @@ public final class IndexTraceCompiler {
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 4)
+        if (args.length != 4 && args.length != 5)
             throw new IllegalArgumentException(
-                    "IndexTraceCompiler ROOT CAPTURE_CONFIG RAW_RUNTIME_PG OUTPUT");
+                    "IndexTraceCompiler ROOT CAPTURE_CONFIG RAW_RUNTIME_PG OUTPUT [ROW_AUDIT]");
         CaptureConfig capture = CaptureConfig.read(Path.of(args[0]), Path.of(args[1]));
-        compile(capture, Path.of(args[2]), Path.of(args[3]));
+        compile(
+                capture,
+                Path.of(args[2]),
+                Path.of(args[3]),
+                args.length == 5
+                        ? Path.of(args[4])
+                        : RowStateAudit.defaultReport(Path.of(args[2])));
     }
 
     public static void compile(CaptureConfig capture, Path raw, Path output) throws Exception {
+        compile(capture, raw, output, RowStateAudit.defaultReport(raw));
+    }
+
+    public static void compile(CaptureConfig capture, Path raw, Path output, Path auditReport)
+            throws Exception {
         CaptureRun.verifyInput(raw);
         Path rawDirectory = Files.isDirectory(raw) ? raw : raw.toAbsolutePath().getParent();
         Path runManifest = rawDirectory.resolve("capture-run.json");
@@ -109,7 +121,8 @@ public final class IndexTraceCompiler {
                             + " the lossless PgTraceBlocks container, not the single-session"
                             + " compiler");
         Path baseline = capture.layout().output();
-        PgBaselineVerify.verifyFiles(baseline);
+        SourceSchema sourceSchema = SourceSchema.hybench(capture.source());
+        RowStateAudit.reuse(sourceSchema, baseline, raw, auditReport);
         Path verified = baseline.resolve("verified-manifest.json");
         JsonObject verification =
                 JsonParser.parseString(Files.readString(verified)).getAsJsonObject();
@@ -264,6 +277,12 @@ public final class IndexTraceCompiler {
                     if (search == null) throw new IOException("Unmatched scan end");
                     search.captured.addProperty("count", search.count);
                 } else if (type.equals("row_change")) {
+                    var sourceTable =
+                            sourceSchema.tables().stream()
+                                    .filter(t -> t.name().equals(e.get("relation").getAsString()))
+                                    .findFirst()
+                                    .orElseThrow(() -> new IOException("Unknown source row table"));
+                    SourceRow.requireStablePrimaryKey(sourceTable, e);
                     long xid = e.get("xid").getAsLong();
                     if (pendingMutations != 0 && pendingXid != xid)
                         throw new IOException("Interleaved transactions unsupported");
@@ -593,6 +612,7 @@ public final class IndexTraceCompiler {
         report.put("incremental_files", files);
         report.put("raw_runtime_sha256", BaselineGenerator.sha256(raw));
         report.put("baseline_verified_manifest_sha256", BaselineGenerator.sha256(verified));
+        report.put("row_state_audit_sha256", BaselineGenerator.sha256(auditReport));
         report.put(
                 "baseline_trace_sha256", BaselineGenerator.sha256(output.resolve("baseline.ops")));
         report.put(
@@ -623,7 +643,7 @@ public final class IndexTraceCompiler {
                                 + " end",
                         "No historical lookup or Rewrite events in this native trace",
                         "Single-column equality keys only; ordered range/composite encoding not"
-                            + " implemented",
+                                + " implemented",
                         "Incremental rollover and disk-backed compilation state not implemented"));
         Files.writeString(
                 output.resolve("manifest.json"),

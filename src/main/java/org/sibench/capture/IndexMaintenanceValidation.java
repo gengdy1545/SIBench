@@ -7,71 +7,60 @@ import org.apache.parquet.hadoop.ParquetReader;
 import org.apache.parquet.hadoop.example.GroupReadSupport;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.generation.BaselineGenerator;
+import org.sibench.schema.SourceSchema;
 
 import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
 
-/** Audits real committed row changes using per-row causal chains, never a fabricated HTAP order. */
+/** Checks index maintenance from audited transitions, without re-auditing source row state. */
 public final class IndexMaintenanceValidation {
     private record Key(String table, long key) {}
 
     private IndexMaintenanceValidation() {}
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 5)
+        if (args.length != 5 && args.length != 6)
             throw new IllegalArgumentException(
-                    "IndexMaintenanceValidation ROOT CONFIG BASELINE RAW REPORT");
+                    "IndexMaintenanceValidation ROOT CONFIG BASELINE RAW REPORT [ROW_AUDIT]");
+        CaptureConfig config = CaptureConfig.read(Path.of(args[0]), Path.of(args[1]));
         validate(
-                IndexCatalog.read(CaptureConfig.read(Path.of(args[0]), Path.of(args[1])).source()),
+                IndexCatalog.read(config.source()),
+                SourceSchema.hybench(config.source()),
                 Path.of(args[2]),
                 Path.of(args[3]),
-                Path.of(args[4]));
+                Path.of(args[4]),
+                args.length == 6
+                        ? Path.of(args[5])
+                        : RowStateAudit.defaultReport(Path.of(args[3])));
     }
 
     public static Map<String, Object> validate(
-            IndexCatalog catalog, Path baseline, Path raw, Path report) throws Exception {
+            IndexCatalog catalog,
+            SourceSchema schema,
+            Path baseline,
+            Path raw,
+            Path report,
+            Path auditReport)
+            throws Exception {
         if (Files.exists(report)) throw new IOException("Validation report exists");
-        CaptureRun.verifyInput(raw);
-        PgBaselineVerify.verifyFiles(baseline);
+        RowStateAudit.reuse(schema, baseline, raw, auditReport);
         var changes = new LinkedHashMap<Key, List<JsonObject>>();
-        JsonObject run =
-                JsonParser.parseString(Files.readString(raw.resolve("capture-run.json")))
-                        .getAsJsonObject();
-        long committed = 0, discarded = 0;
-        for (JsonElement session : run.getAsJsonArray("sessions")) {
-            var pending = new ArrayList<JsonObject>();
-            try (var reader =
-                    Files.newBufferedReader(
-                            raw.resolve(session.getAsJsonObject().get("pg_file").getAsString()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    JsonObject event = JsonParser.parseString(line).getAsJsonObject();
-                    String type = event.get("event").getAsString();
-                    if (type.equals("row_change")) pending.add(event);
-                    else if (type.equals("transaction_abort")) {
-                        discarded += pending.size();
-                        pending.clear();
-                    } else if (type.equals("transaction_commit")) {
-                        for (JsonObject change : pending) {
-                            String table = change.get("relation").getAsString();
-                            JsonObject row =
-                                    change.get("new").isJsonNull()
-                                            ? change.getAsJsonObject("old")
-                                            : change.getAsJsonObject("new");
-                            Key key =
-                                    new Key(
-                                            table,
-                                            row.get(PgBaselineExport.TABLES.get(table))
-                                                    .getAsLong());
-                            changes.computeIfAbsent(key, ignored -> new ArrayList<>()).add(change);
-                            committed++;
-                        }
-                        pending.clear();
-                    }
-                }
+        JsonObject run = JsonParser.parseString(Files.readString(auditReport)).getAsJsonObject();
+        long committed = run.get("committed_row_changes").getAsLong();
+        long discarded = run.get("discarded_aborted_row_changes").getAsLong();
+        try (var reader = Files.newBufferedReader(RowStateAudit.changesFile(auditReport, run))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                JsonObject change = JsonParser.parseString(line).getAsJsonObject();
+                String table = change.get("relation").getAsString();
+                JsonObject row =
+                        change.get("new").isJsonNull()
+                                ? change.getAsJsonObject("old")
+                                : change.getAsJsonObject("new");
+                Key key = new Key(table, row.get(PgBaselineExport.TABLES.get(table)).getAsLong());
+                changes.computeIfAbsent(key, ignored -> new ArrayList<>()).add(change);
             }
-            if (!pending.isEmpty()) throw new IOException("Unfinished source row changes");
         }
         var initial = new HashMap<Key, JsonObject>();
         long baselineRows = 0, baselineIndexEntries = 0;
@@ -95,7 +84,7 @@ public final class IndexMaintenanceValidation {
                     for (int index : indexed.keySet())
                         counts.merge(table + "/" + index, 1L, Long::sum);
                     Key key = new Key(table, row.getLong(PgBaselineExport.TABLES.get(table), 0));
-                    if (changes.containsKey(key)) initial.put(key, json(row));
+                    if (changes.containsKey(key)) initial.put(key, SourceRow.json(row));
                 }
             }
         }
@@ -104,7 +93,6 @@ public final class IndexMaintenanceValidation {
         for (var entry : changes.entrySet()) {
             Key key = entry.getKey();
             JsonObject state = initial.get(key);
-            var pending = new ArrayList<>(entry.getValue());
             var models = List.of(new IndexReferenceReplay(false), new IndexReferenceReplay(true));
             Map<Integer, String> initialKeys =
                     state == null ? Map.of() : catalog.keys(key.table(), state);
@@ -132,20 +120,7 @@ public final class IndexMaintenanceValidation {
             for (var definition : catalog.secondary(IndexCatalog.tableId(key.table())))
                 predicates.put(definition.indexId(), new HashSet<>());
             initialKeys.forEach((index, value) -> predicates.get(index).add(value));
-            while (!pending.isEmpty()) {
-                JsonObject matched = null;
-                for (JsonObject change : pending) {
-                    JsonObject before =
-                            change.get("old").isJsonNull() ? null : change.getAsJsonObject("old");
-                    if ((state == null && before == null)
-                            || state != null
-                                    && before != null
-                                    && PgCaptureAudit.equalRow(state, before)) {
-                        matched = change;
-                        break;
-                    }
-                }
-                if (matched == null) throw new IOException("No causal source row chain: " + key);
+            for (JsonObject matched : entry.getValue()) {
                 JsonObject next =
                         matched.get("new").isJsonNull() ? null : matched.getAsJsonObject("new");
                 Map<Integer, String> before =
@@ -215,7 +190,6 @@ public final class IndexMaintenanceValidation {
                         }
                 }
                 state = next;
-                pending.remove(matched);
             }
         }
         var output = new LinkedHashMap<String, Object>();
@@ -231,9 +205,12 @@ public final class IndexMaintenanceValidation {
         output.put("indexed_value_changes", rekeys);
         output.put("indexed_value_changes_by_index", rekeysByIndex);
         output.put("locator_and_rowid_visibility_probes", probes);
+        Path rawDirectory = Files.isDirectory(raw) ? raw : raw.toAbsolutePath().getParent();
+        Path captureManifest = rawDirectory.resolve("capture-run.json");
         output.put(
                 "source_manifest_sha256",
-                BaselineGenerator.sha256(raw.resolve("capture-run.json")));
+                BaselineGenerator.sha256(Files.exists(captureManifest) ? captureManifest : raw));
+        output.put("row_state_audit_sha256", BaselineGenerator.sha256(auditReport));
         output.put(
                 "scope",
                 "All baseline indexed values decoded; real committed per-key transitions checked in"
@@ -245,16 +222,5 @@ public final class IndexMaintenanceValidation {
                 new GsonBuilder().setPrettyPrinting().create().toJson(output),
                 StandardOpenOption.CREATE_NEW);
         return output;
-    }
-
-    private static JsonObject json(Group group) {
-        var row = new JsonObject();
-        for (int column = 0; column < group.getType().getFieldCount(); column++) {
-            String name = group.getType().getFieldName(column);
-            if (name.startsWith("_sib_")) continue;
-            if (group.getFieldRepetitionCount(column) == 0) row.add(name, JsonNull.INSTANCE);
-            else row.addProperty(name, group.getValueToString(column, 0));
-        }
-        return row;
     }
 }

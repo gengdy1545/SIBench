@@ -5,7 +5,9 @@ import com.google.gson.*;
 import org.apache.parquet.example.data.Group;
 import org.apache.parquet.hadoop.ParquetReader;
 import org.apache.parquet.hadoop.example.GroupReadSupport;
+import org.sibench.config.ConfigValues;
 import org.sibench.generation.BaselineGenerator;
+import org.sibench.schema.SourceSchema;
 
 import java.io.IOException;
 import java.nio.file.*;
@@ -18,20 +20,49 @@ public final class PgBaselineVerify {
     private PgBaselineVerify() {}
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 2)
-            throw new IllegalArgumentException("PgBaselineVerify JDBC_URL BASELINE_DIR");
-        Path directory = Path.of(args[1]);
+        if (args.length != 6 || !args[0].equals("--config"))
+            throw new IllegalArgumentException(
+                    "PgBaselineVerify --config ROOT PROFILE JDBC_URL USER BASELINE_DIR");
+        Path root = Path.of(args[1]);
+        SourceSchema schema =
+                SourceSchema.read(
+                        root, ConfigValues.parse(Files.readString(root.resolve(args[2]))));
+        verify(args[3], args[4], schema, Path.of(args[5]));
+    }
+
+    static void verify(String jdbc, String user, SourceSchema schema, Path directory)
+            throws Exception {
+        try (Connection pg =
+                DriverManager.getConnection(
+                        jdbc, user, System.getenv().getOrDefault("PGPASSWORD", ""))) {
+            verify(pg, schema, directory);
+        }
+    }
+
+    static void verify(Connection pg, SourceSchema schema, Path directory) throws Exception {
+        if (Files.exists(directory.resolve("verified-manifest.json")))
+            throw new IOException("Baseline verification already exists");
         List<JsonObject> files =
                 Files.readAllLines(directory.resolve("files.jsonl")).stream()
                         .map(line -> JsonParser.parseString(line).getAsJsonObject())
                         .toList();
         List<Map<String, Object>> tables = new ArrayList<>();
-        long rowId = 1, total = 0;
-        try (Connection pg = DriverManager.getConnection(args[0], "postgres", "")) {
+        Set<String> expectedTables =
+                schema.tables().stream()
+                        .map(SourceSchema.Table::name)
+                        .collect(java.util.stream.Collectors.toSet());
+        for (JsonObject file : files)
+            if (!expectedTables.contains(file.get("table").getAsString()))
+                throw new IOException("Unknown baseline manifest table");
+        long total = 0;
+        long rowId = 1;
+        if (!pg.getAutoCommit())
+            throw new IOException("Baseline verification requires a fresh autocommit connection");
+        try {
             pg.setAutoCommit(false);
             pg.setReadOnly(true);
             pg.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
-            for (var table : PgBaselineExport.TABLES.entrySet()) {
+            for (var table : schema.tables()) {
                 MessageDigest digest = MessageDigest.getInstance("SHA-256");
                 long count = 0;
                 try (Statement statement = pg.createStatement()) {
@@ -39,11 +70,18 @@ public final class PgBaselineVerify {
                     try (ResultSet expected =
                             statement.executeQuery(
                                     "SELECT * FROM "
-                                            + table.getKey()
+                                            + "\""
+                                            + table.name()
+                                            + "\""
                                             + " ORDER BY "
-                                            + table.getValue())) {
+                                            + "\""
+                                            + SourceRow.primary(table).name()
+                                            + "\""
+                                            + (SourceRow.primary(table).type().equals("integer")
+                                                    ? ""
+                                                    : " COLLATE \"C\""))) {
                         for (JsonObject file : files) {
-                            if (!file.get("table").getAsString().equals(table.getKey())) continue;
+                            if (!file.get("table").getAsString().equals(table.name())) continue;
                             Path path = directory.resolve(file.get("path").getAsString());
                             long fileCount = 0;
                             try (ParquetReader<Group> reader =
@@ -55,39 +93,23 @@ public final class PgBaselineVerify {
                                 while ((actual = reader.read()) != null) {
                                     if (!expected.next())
                                         throw new IllegalStateException(
-                                                "Extra parquet row: " + table.getKey());
-                                    for (int i = 1;
-                                            i <= expected.getMetaData().getColumnCount();
-                                            i++) {
-                                        String name = expected.getMetaData().getColumnName(i);
-                                        String value = expected.getString(i);
-                                        boolean present = actual.getFieldRepetitionCount(name) > 0;
-                                        if ((value != null) != present)
-                                            throw new IllegalStateException(
-                                                    "Null mismatch: " + name);
-                                        if (value == null) continue;
-                                        String normalized =
-                                                switch (actual.getType()
-                                                        .getType(name)
-                                                        .asPrimitiveType()
-                                                        .getPrimitiveTypeName()) {
-                                                    case INT64 ->
-                                                            Long.toString(expected.getLong(i));
-                                                    case DOUBLE ->
-                                                            Double.toString(expected.getDouble(i));
-                                                    default -> value;
-                                                };
-                                        if (!normalized.equals(
-                                                actual.getValueToString(
-                                                        actual.getType().getFieldIndex(name), 0)))
-                                            throw new IllegalStateException(
-                                                    "Value mismatch: "
-                                                            + table.getKey()
-                                                            + "/"
-                                                            + name
-                                                            + " row="
-                                                            + count);
+                                                "Extra parquet row: " + table.name());
+                                    JsonObject source = new JsonObject();
+                                    for (var column : table.columns()) {
+                                        String value = expected.getString(column.name());
+                                        if (value == null)
+                                            source.add(column.name(), JsonNull.INSTANCE);
+                                        else source.addProperty(column.name(), value);
                                     }
+                                    if (!SourceRow.values(table, source)
+                                            .equals(
+                                                    SourceRow.values(
+                                                            table, SourceRow.json(actual))))
+                                        throw new IOException(
+                                                "Baseline row mismatch: "
+                                                        + table.name()
+                                                        + "/"
+                                                        + count);
                                     if (actual.getLong("_sib_row_id", 0) != rowId++
                                             || actual.getLong("_sib_timestamp", 0) != 0)
                                         throw new IllegalStateException(
@@ -113,13 +135,13 @@ public final class PgBaselineVerify {
                         }
                         if (expected.next())
                             throw new IllegalStateException(
-                                    "Missing Parquet rows: " + table.getKey());
+                                    "Missing Parquet rows: " + table.name());
                     }
                 }
                 tables.add(
                         Map.of(
                                 "table",
-                                table.getKey(),
+                                table.name(),
                                 "rows",
                                 count,
                                 "row_digest",
@@ -127,20 +149,27 @@ public final class PgBaselineVerify {
                                 "verified",
                                 true));
                 total += count;
-                System.out.println("Verified " + table.getKey() + " rows=" + count);
+                System.out.println("Verified " + table.name() + " rows=" + count);
             }
             pg.commit();
+        } catch (Exception error) {
+            try {
+                pg.rollback();
+            } catch (SQLException rollback) {
+                error.addSuppressed(rollback);
+            }
+            throw error;
         }
-        if (total != 8706000L) throw new IllegalStateException("SF1 total mismatch");
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "verified_complete");
         result.put("rows", total);
         result.put("tables", tables);
         result.put("files", files);
+        result.put("source_schema", schema.tables());
+        result.put("source_schema_sha256", schema.fingerprints());
         result.put(
                 "verification",
-                "independent PG load from original CSV; all Parquet values and row identities"
-                    + " compared");
+                "all Parquet values and row identities compared with the unchanged source PG");
         result.put(
                 "files_manifest_sha256",
                 BaselineGenerator.sha256(directory.resolve("files.jsonl")));
@@ -160,7 +189,8 @@ public final class PgBaselineVerify {
         Path verified = baseline.resolve("verified-manifest.json");
         if (!Files.exists(verified))
             throw new IOException("Independent verified baseline manifest required");
-        JsonObject verification = JsonParser.parseString(Files.readString(verified)).getAsJsonObject();
+        JsonObject verification =
+                JsonParser.parseString(Files.readString(verified)).getAsJsonObject();
         if (!verification.get("status").getAsString().equals("verified_complete"))
             throw new IOException("Baseline is not verified");
         if (!BaselineGenerator.sha256(baseline.resolve("files.jsonl"))

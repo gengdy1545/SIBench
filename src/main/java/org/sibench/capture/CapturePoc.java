@@ -5,6 +5,7 @@ import com.google.gson.GsonBuilder;
 import org.sibench.replay.ReferenceReplay;
 import org.sibench.replay.ReplayConfig;
 import org.sibench.schema.PgSchemaCheck;
+import org.sibench.schema.SourceSchema;
 
 import java.nio.file.*;
 import java.util.*;
@@ -17,7 +18,7 @@ public final class CapturePoc {
         if (args.length < 3)
             throw new IllegalArgumentException(
                     "CapturePoc check|export|run|compile|pack|audit|replay ROOT CONFIG [INPUT]"
-                        + " [OUTPUT]");
+                            + " [OUTPUT]");
         CaptureConfig config = CaptureConfig.read(Path.of(args[1]), Path.of(args[2]));
         switch (args[0]) {
             case "check" -> {
@@ -65,9 +66,16 @@ public final class CapturePoc {
                 HybenchNativeRun.main(new String[] {args[1], args[2]});
             }
             case "compile" -> {
-                if (args.length != 5)
-                    throw new IllegalArgumentException("compile requires PG_TRACE and OUTPUT");
-                IndexTraceCompiler.compile(config, Path.of(args[3]), Path.of(args[4]));
+                if (args.length != 5 && args.length != 6)
+                    throw new IllegalArgumentException(
+                            "compile requires PG_TRACE OUTPUT [ROW_AUDIT]");
+                IndexTraceCompiler.compile(
+                        config,
+                        Path.of(args[3]),
+                        Path.of(args[4]),
+                        args.length == 6
+                                ? Path.of(args[5])
+                                : RowStateAudit.defaultReport(Path.of(args[3])));
             }
             case "pack" -> {
                 if (args.length != 4) throw new IllegalArgumentException("pack requires OUTPUT");
@@ -75,12 +83,17 @@ public final class CapturePoc {
                 PgTraceBlocks.compile(config.raw(), Path.of(args[3]));
             }
             case "audit" -> {
-                if (args.length != 4) throw new IllegalArgumentException("audit requires REPORT");
-                if (!config.mode().equals("runhtap"))
-                    throw new IllegalArgumentException(
-                            "audit requires native runhtap configuration");
-                HybenchHtapAudit.audit(
-                        config.jdbc(), config.layout().output(), config.raw(), Path.of(args[3]));
+                if (args.length != 3 && args.length != 4)
+                    throw new IllegalArgumentException("audit accepts an optional REPORT");
+                RowStateAudit.audit(
+                        config.jdbc(),
+                        config.user(),
+                        SourceSchema.read(config.root(), config.document()),
+                        config.layout().output(),
+                        config.raw(),
+                        args.length == 4
+                                ? Path.of(args[3])
+                                : RowStateAudit.defaultReport(config.raw()));
             }
             case "replay" -> {
                 if (args.length != 5 && args.length != 6)

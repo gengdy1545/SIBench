@@ -11,6 +11,7 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.sibench.generation.*;
 import org.sibench.replay.*;
+import org.sibench.schema.SourceSchema;
 
 import java.nio.file.*;
 import java.util.*;
@@ -44,12 +45,18 @@ public class IndexTraceCompilerTest {
         var files = new ArrayList<Map<String, Object>>();
         var hashes = new ArrayList<Map<String, Object>>();
         for (var table : PgBaselineExport.TABLES.entrySet()) {
+            var sourceTable =
+                    SourceSchema.hybench(original.source()).tables().stream()
+                            .filter(t -> t.name().equals(table.getKey()))
+                            .findFirst()
+                            .orElseThrow();
             var columns = new LinkedHashMap<String, String>();
-            columns.put(table.getValue(), "int64");
-            for (var index :
-                    IndexCatalog.read(original.source())
-                            .secondary(IndexCatalog.tableId(table.getKey())))
-                columns.put(index.column(), index.type().equals("int") ? "int64" : "binary");
+            for (var column : sourceTable.columns())
+                columns.put(
+                        column.name(),
+                        column.type().equals("integer")
+                                ? "int64"
+                                : column.type().equals("real") ? "double" : "binary");
             StringBuilder text = new StringBuilder("message " + table.getKey() + " { ");
             columns.forEach(
                     (name, type) ->
@@ -61,12 +68,16 @@ public class IndexTraceCompilerTest {
             text.append("required int64 _sib_row_id; required int64 _sib_timestamp; }");
             var schema = MessageTypeParser.parseMessageType(text.toString());
             var row = new SimpleGroupFactory(schema).newGroup();
-            for (var column : columns.entrySet()) {
-                if (column.getValue().equals("int64")) row.add(column.getKey(), 1L);
+            for (var column : sourceTable.columns()) {
+                boolean indexed =
+                        sourceTable.indexes().stream()
+                                .anyMatch(i -> i.column().equals(column.name()));
+                if (!indexed) continue;
+                if (column.type().equals("integer")) row.add(column.name(), 1L);
                 else
                     row.add(
-                            column.getKey(),
-                            column.getKey().equals("timestamp")
+                            column.name(),
+                            column.type().equals("timestamp without time zone")
                                     ? "2024-01-01 00:00:00"
                                     : "initial");
             }
@@ -218,7 +229,27 @@ public class IndexTraceCompilerTest {
     }
 
     private static String row(String timestamp) {
-        return "{\"id\":1,\"applicantid\":1,\"timestamp\":\"" + timestamp + "\"}";
+        return "{\"id\":1,\"applicantid\":1,\"appid\":null,\"amount\":null,\"status\":null,"
+                + "\"timestamp\":\""
+                + timestamp
+                + "\",\"duration\":null,\"contract_timestamp\":null,"
+                + "\"delinquency\":null}";
+    }
+
+    private void audit(CaptureConfig config, Path raw, String finalRow) throws Exception {
+        var schema = SourceSchema.hybench(config.source());
+        var contents = RowAuditTestSupport.baseline(config.layout().output());
+        contents.put(
+                "loantrans",
+                finalRow == null
+                        ? List.of()
+                        : List.of(JsonParser.parseString(finalRow).getAsJsonObject()));
+        RowStateAudit.audit(
+                RowAuditTestSupport.connection(schema, contents, new int[1]),
+                schema,
+                config.layout().output(),
+                raw,
+                RowStateAudit.defaultReport(raw));
     }
 
     private static String search(String scan, int found) {
@@ -259,6 +290,20 @@ public class IndexTraceCompilerTest {
                                 change("insert", "null", second)
                                         + "{\"event\":\"transaction_commit\",\"xid\":9}\n"));
         Path output = fixture.resolve("compiled"), repeat = fixture.resolve("repeat");
+        audit(config, raw, second);
+        Path sourceAudit = RowStateAudit.defaultReport(raw);
+        String auditHash = BaselineGenerator.sha256(sourceAudit);
+        var maintenance =
+                IndexMaintenanceValidation.validate(
+                        IndexCatalog.read(config.source()),
+                        SourceSchema.hybench(config.source()),
+                        config.layout().output(),
+                        raw,
+                        fixture.resolve("maintenance.json"),
+                        sourceAudit);
+        assertEquals("passed", maintenance.get("status"));
+        assertEquals(auditHash, maintenance.get("row_state_audit_sha256"));
+        assertEquals(auditHash, BaselineGenerator.sha256(sourceAudit));
         IndexTraceCompiler.compile(config, raw, output);
         IndexTraceCompiler.compile(config, raw, repeat);
         var manifest =
@@ -363,6 +408,11 @@ public class IndexTraceCompilerTest {
                     capture(
                             fixture,
                             List.of(request + "{\"event\":\"transaction_commit\",\"xid\":9}\n"));
+            if (request.contains("scan_rescan")) audit(config, raw, row("2024-01-01 00:00:00"));
+            else
+                assertThrows(
+                        java.io.IOException.class,
+                        () -> audit(config, raw, row("2024-01-02 00:00:00")));
             assertThrows(
                     java.io.IOException.class,
                     () -> IndexTraceCompiler.compile(config, raw, fixture.resolve("compiled")));
@@ -391,6 +441,7 @@ public class IndexTraceCompilerTest {
                                 search("published", 1)
                                         + "{\"event\":\"transaction_commit\",\"xid\":9}\n"));
         Path output = fixture.resolve("compiled");
+        audit(config, raw, second);
         IndexTraceCompiler.compile(config, raw, output);
         JsonObject manifest =
                 JsonParser.parseString(Files.readString(output.resolve("manifest.json")))
@@ -431,6 +482,49 @@ public class IndexTraceCompilerTest {
                     Exception.class,
                     () -> IndexTraceCompiler.compile(config, raw, fixture.resolve("compiled")));
             assertFalse(Files.exists(fixture.resolve("compiled/manifest.json")));
+        }
+    }
+
+    @Test
+    public void sourceAuditIsRequiredBeforeOutputAndRejectsPrimaryKeyRewriteEvenAfterAbort()
+            throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        var config = baseline(fixture);
+        String initial = row("2024-01-01 00:00:00");
+        Path raw =
+                capture(
+                        fixture,
+                        List.of(
+                                change("update", initial, initial)
+                                        + "{\"event\":\"transaction_commit\",\"xid\":9}\n"));
+        Path output = fixture.resolve("compiled");
+        assertTrue(
+                assertThrows(
+                                java.io.IOException.class,
+                                () -> IndexTraceCompiler.compile(config, raw, output))
+                        .getMessage()
+                        .contains("row audit required"));
+        assertFalse(Files.exists(output));
+
+        for (String boundary : List.of("transaction_commit", "transaction_abort")) {
+            Path another = temporary.newFolder().toPath();
+            var next = baseline(another);
+            Path rewrite =
+                    capture(
+                            another,
+                            List.of(
+                                    change(
+                                                    "update",
+                                                    initial,
+                                                    initial.replace("\"id\":1", "\"id\":2"))
+                                            + "{\"event\":\""
+                                            + boundary
+                                            + "\",\"xid\":9}\n"));
+            assertTrue(
+                    assertThrows(java.io.IOException.class, () -> audit(next, rewrite, initial))
+                            .getMessage()
+                            .contains("Primary key value UPDATE"));
+            assertFalse(Files.exists(RowStateAudit.defaultReport(rewrite)));
         }
     }
 }
