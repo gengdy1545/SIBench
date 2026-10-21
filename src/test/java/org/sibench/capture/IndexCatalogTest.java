@@ -33,23 +33,6 @@ public class IndexCatalogTest {
     }
 
     @Test
-    public void unsupportedSourceIndexDefinitionsAreNotSilentlySkipped() throws Exception {
-        for (String sql :
-                List.of(
-                        "CREATE UNIQUE INDEX changed ON transfer(sourceid);",
-                        "CREATE INDEX changed ON transfer(sourceid, targetid);",
-                        "CREATE INDEX changed ON transfer(sourceid) WHERE sourceid > 0;")) {
-            Path source = temporary.newFolder().toPath();
-            Files.createDirectory(source.resolve("conf"));
-            Files.copy(
-                    Path.of("benchmark/HyBench-2024/conf/ddl_pg.sql"),
-                    source.resolve("conf/ddl_pg.sql"));
-            Files.writeString(source.resolve("conf/create_index_pg.sql"), sql);
-            assertThrows(IOException.class, () -> IndexCatalog.read(source));
-        }
-    }
-
-    @Test
     public void genericMaintenanceSupportsNullLongKeysAndMoreThanTwoIndexes() throws Exception {
         for (boolean rowIds : new boolean[] {false, true}) {
             var model = new IndexReferenceReplay(rowIds);

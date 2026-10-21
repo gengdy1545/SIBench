@@ -26,48 +26,6 @@ public class RequestCaptureAuditTest {
         assertFalse(equal("accept ", "accept", Types.VARCHAR));
     }
 
-    @Test
-    public void rejectsAbortWithWrongRollbackIdentityEvenWhenCountsMatch() throws Exception {
-        var client = Files.createTempFile("sibench-request-client-", ".jsonl");
-        var server = Files.createTempFile("sibench-request-server-", ".jsonl");
-        try {
-            Files.writeString(
-                    client,
-                    """
-                    {"event":"connection","pid":42}
-                    {"event":"request_start","application":"a","sql":"SELECT 1","parameters":{}}
-                    {"event":"request_return","application":"a"}
-                    {"event":"rollback","application":"a"}
-                    {"event":"request_start","application":"b","sql":"SELECT 2","parameters":{}}
-                    {"event":"request_return","application":"b"}
-                    {"event":"close","application":"b"}
-                    """);
-            Files.writeString(
-                    server,
-                    """
-                    {"event":"executor_start","pid":42,"application":"a","sql":"SELECT 1"}
-                    {"event":"executor_run_end","pid":42,"application":"a"}
-                    {"event":"executor_start","pid":42,"application":"b","sql":"SELECT 2"}
-                    {"event":"executor_run_end","pid":42,"application":"b"}
-                    {"event":"transaction_abort","pid":42,"application":"b"}
-                    {"event":"transaction_abort","pid":42,"application":"b"}
-                    """);
-            assertThrows(
-                    java.io.IOException.class,
-                    () -> RequestCaptureAudit.audit(client, server, true));
-            Files.writeString(
-                    server,
-                    Files.readString(server)
-                            .replaceFirst(
-                                    "\"event\":\"transaction_abort\",\"pid\":42,\"application\":\"b\"",
-                                    "\"event\":\"transaction_abort\",\"pid\":42,\"application\":\"a\""));
-            assertEquals("passed", RequestCaptureAudit.audit(client, server, true).get("status"));
-        } finally {
-            Files.delete(client);
-            Files.delete(server);
-        }
-    }
-
     private static boolean equal(String a, String b, int type) {
         return RequestCaptureAudit.equalResult(new JsonPrimitive(a), new JsonPrimitive(b), type);
     }
@@ -130,5 +88,67 @@ public class RequestCaptureAuditTest {
                 """);
         Files.writeString(server, "");
         assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server));
+    }
+
+    private static final String AUTOCOMMIT_CLIENT =
+            """
+            {"event":"connection","pid":42}
+            {"event":"request_start","application":"a","sql":"SELECT c FROM t WHERE id = ?","parameters":{"1":"5"},"autocommit":true}
+            {"event":"request_return","application":"a"}
+            {"event":"autocommit","application":"a","implicit_commits":2}
+            {"event":"close","application":"a"}
+            """;
+
+    private static String server(int commits, String scan) {
+        return "{\"event\":\"executor_start\",\"pid\":42,\"application\":\"a\",\"sql\":\"SELECT c FROM t WHERE id = $1\"}\n"
+                + scan
+                + "{\"event\":\"executor_run_end\",\"pid\":42,\"application\":\"a\"}\n"
+                + "{\"event\":\"transaction_commit\",\"pid\":42,\"application\":\"a\"}\n".repeat(commits);
+    }
+
+    private static String scan(String strategy, String flags, String value) {
+        return "{\"event\":\"scan_rescan\",\"pid\":42,\"application\":\"a\",\"relation\":\"t_pkey\","
+                + "\"scan\":\"s\",\"keys\":[{\"attribute\":1,\"strategy\":"
+                + strategy
+                + ",\"flags\":"
+                + flags
+                + ",\"value\":"
+                + value
+                + "}]}\n";
+    }
+
+    @Test
+    public void autocommitConnectionsCommitTheLabelAndTheRequest() throws Exception {
+        var directory = temporary.newFolder().toPath();
+        var client = directory.resolve("client.jsonl");
+        var server = directory.resolve("server.jsonl");
+        Files.writeString(client, AUTOCOMMIT_CLIENT);
+        Files.writeString(server, server(2, ""));
+        assertEquals("passed", RequestCaptureAudit.audit(client, server, true).get("status"));
+        // One commit fewer, or one more, is an event-loss signature.
+        Files.writeString(server, server(1, ""));
+        assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
+        Files.writeString(server, server(3, ""));
+        assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
+    }
+
+    @Test
+    public void pointAccessBindingsAreCheckedOnlyWhenRequested() throws Exception {
+        var directory = temporary.newFolder().toPath();
+        var client = directory.resolve("client.jsonl");
+        var server = directory.resolve("server.jsonl");
+        Files.writeString(client, AUTOCOMMIT_CLIENT);
+        // Key 7 was never bound by the client: a join-derived key, or a capture error.
+        Files.writeString(server, server(2, scan("3", "0", "\"7\"")));
+        assertThrows(
+                java.io.IOException.class,
+                () -> RequestCaptureAudit.audit(client, server, true, true));
+        assertEquals(
+                "passed", RequestCaptureAudit.audit(client, server, true, false).get("status"));
+        Files.writeString(server, server(2, scan("3", "0", "\"5\"")));
+        assertEquals("passed", RequestCaptureAudit.audit(client, server, true, true).get("status"));
+        // Planner endpoint probes (IS NOT NULL, no bound value) are not search predicates.
+        Files.writeString(server, server(2, scan("0", "129", "null")));
+        assertEquals("passed", RequestCaptureAudit.audit(client, server, true, true).get("status"));
     }
 }

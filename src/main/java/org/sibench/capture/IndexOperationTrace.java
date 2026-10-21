@@ -375,32 +375,6 @@ public final class IndexOperationTrace {
         return new Operation(source, kind, 0, 0, 0, 0, version, 0, 0, 0, 0, 0, rows, id, 0);
     }
 
-    private static void expandLegacyRow(Operation row, Consumer consumer) throws IOException {
-        consumer.accept(row);
-        if (row.table() == 5 && row.index() == 0 && row.kind() != SEARCH) {
-            for (int index = 1; index <= 2; index++)
-                consumer.accept(
-                        new Operation(
-                                        row.sourceEvent(),
-                                        row.kind(),
-                                        row.table(),
-                                        index,
-                                        row.flags(),
-                                        row.key(),
-                                        row.version(),
-                                        row.file(),
-                                        row.position(),
-                                        row.rowId(),
-                                        row.secondarySource(),
-                                        row.secondaryTarget(),
-                                        row.expectedCount(),
-                                        row.transactionId(),
-                                        row.mutationOrdinal())
-                                .withWorkUnitId(row.workUnitId()));
-        }
-    }
-
-    @FunctionalInterface
     public interface Consumer {
         void accept(Operation operation) throws IOException;
     }
@@ -487,27 +461,15 @@ public final class IndexOperationTrace {
         }
     }
 
+    /** Reads a current-format trace; every other version is rejected. */
     public static long read(Path file, Consumer consumer) throws IOException {
-        return read(file, consumer, false);
-    }
-
-    /** Legacy reads normalize SEARCH.version into ReadTimestamp without rewriting source files. */
-    public static long readExpanded(Path file, Consumer consumer) throws IOException {
-        return read(file, consumer, true);
-    }
-
-    private static long read(Path file, Consumer consumer, boolean expandLegacy)
-            throws IOException {
         try (FileChannel channel = FileChannel.open(file)) {
             ByteBuffer header = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
             fill(channel, header);
             header.flip();
-            int magic = header.getInt(), version = header.getInt();
-            int recordBytes = recordBytes(version);
-            if (magic != MAGIC
-                    || version < 1
-                    || version > VERSION
-                    || header.getInt() != recordBytes
+            if (header.getInt() != MAGIC
+                    || header.getInt() != VERSION
+                    || header.getInt() != RECORD_BYTES
                     || header.getInt() != BLOCK_RECORDS)
                 throw new IOException("Unknown normalized trace header");
             long count = 0;
@@ -516,13 +478,12 @@ public final class IndexOperationTrace {
                 fill(channel, header);
                 header.flip();
                 int bytes = header.getInt(), records = header.getInt(), checksum = header.getInt();
+                // Records carry a variable-length indexed value, so only a lower bound is fixed.
                 if (bytes <= 0
                         || bytes > 256 * 1024 * 1024
                         || records < 1
                         || records > BLOCK_RECORDS
-                        || (version < 7
-                                && (bytes % recordBytes != 0 || records != bytes / recordBytes))
-                        || bytes < (long) records * recordBytes)
+                        || bytes < (long) records * RECORD_BYTES)
                     throw new IOException("Invalid normalized block length");
                 ByteBuffer block = ByteBuffer.allocate(bytes).order(ByteOrder.LITTLE_ENDIAN);
                 fill(channel, block);
@@ -532,130 +493,73 @@ public final class IndexOperationTrace {
                 if ((int) crc.getValue() != checksum)
                     throw new IOException("Normalized block checksum mismatch");
                 for (int i = 0; i < records; i++) {
-                    if (block.remaining() < recordBytes)
+                    if (block.remaining() < RECORD_BYTES)
                         throw new IOException("Truncated normalized operation prefix");
-                    Operation decoded =
-                            new Operation(
-                                    block.getLong(),
-                                    block.getInt(),
-                                    block.getInt(),
-                                    block.getInt(),
-                                    block.getInt(),
-                                    block.getLong(),
-                                    block.getLong(),
-                                    block.getLong(),
-                                    block.getLong(),
-                                    block.getLong(),
-                                    block.getLong(),
-                                    block.getLong(),
-                                    block.getLong(),
-                                    version >= 3 ? block.getLong() : 0,
-                                    version >= 3 ? block.getLong() : 0,
-                                    version >= 4 ? block.getLong() : -1,
-                                    version >= 6 ? block.getLong() : 0);
-                    Operation o =
-                            version >= 4
-                                    ? decoded
-                                    : new Operation(
-                                            decoded.sourceEvent(),
-                                            decoded.kind(),
-                                            decoded.table(),
-                                            decoded.index(),
-                                            decoded.flags(),
-                                            decoded.key(),
-                                            decoded.version(),
-                                            decoded.file(),
-                                            decoded.position(),
-                                            decoded.rowId(),
-                                            decoded.secondarySource(),
-                                            decoded.secondaryTarget(),
-                                            decoded.expectedCount(),
-                                            decoded.transactionId(),
-                                            decoded.mutationOrdinal());
-                    if (version >= 7) {
-                        int expansionPosition = block.getInt(), expansionSize = block.getInt();
-                        int length = block.getInt();
-                        if (length < -1
-                                || length > 32768
-                                || length > block.remaining() - (records - i - 1) * recordBytes)
-                            throw new IOException("Invalid indexed value length");
-                        String indexedValue = null;
-                        if (length >= 0) {
-                            byte[] value = new byte[length];
-                            block.get(value);
-                            indexedValue =
-                                    StandardCharsets.UTF_8
-                                            .newDecoder()
-                                            .onMalformedInput(CodingErrorAction.REPORT)
-                                            .onUnmappableCharacter(CodingErrorAction.REPORT)
-                                            .decode(ByteBuffer.wrap(value))
-                                            .toString();
-                        }
-                        o =
-                                new Operation(
-                                        o.sourceEvent(),
-                                        o.kind(),
-                                        o.table(),
-                                        o.index(),
-                                        o.flags(),
-                                        o.key(),
-                                        o.version(),
-                                        o.file(),
-                                        o.position(),
-                                        o.rowId(),
-                                        o.secondarySource(),
-                                        o.secondaryTarget(),
-                                        o.expectedCount(),
-                                        o.transactionId(),
-                                        o.mutationOrdinal(),
-                                        o.readTimestamp(),
-                                        o.workUnitId(),
-                                        indexedValue,
-                                        expansionPosition,
-                                        expansionSize);
+                    long sourceEvent = block.getLong();
+                    int kind = block.getInt(), table = block.getInt(), index = block.getInt();
+                    int flags = block.getInt();
+                    long key = block.getLong(), version = block.getLong(), file1 = block.getLong();
+                    long position = block.getLong(), rowId = block.getLong();
+                    long secondarySource = block.getLong(), secondaryTarget = block.getLong();
+                    long expectedCount = block.getLong(), transactionId = block.getLong();
+                    long mutationOrdinal = block.getLong(), readTimestamp = block.getLong();
+                    long workUnitId = block.getLong();
+                    int expansionPosition = block.getInt(), expansionSize = block.getInt();
+                    int length = block.getInt();
+                    if (length < -1
+                            || length > 32768
+                            || length > block.remaining() - (records - i - 1) * RECORD_BYTES)
+                        throw new IOException("Invalid indexed value length");
+                    String indexedValue = null;
+                    if (length >= 0) {
+                        byte[] value = new byte[length];
+                        block.get(value);
+                        indexedValue =
+                                StandardCharsets.UTF_8
+                                        .newDecoder()
+                                        .onMalformedInput(CodingErrorAction.REPORT)
+                                        .onUnmappableCharacter(CodingErrorAction.REPORT)
+                                        .decode(ByteBuffer.wrap(value))
+                                        .toString();
                     }
+                    Operation o =
+                            new Operation(
+                                    sourceEvent,
+                                    kind,
+                                    table,
+                                    index,
+                                    flags,
+                                    key,
+                                    version,
+                                    file1,
+                                    position,
+                                    rowId,
+                                    secondarySource,
+                                    secondaryTarget,
+                                    expectedCount,
+                                    transactionId,
+                                    mutationOrdinal,
+                                    readTimestamp,
+                                    workUnitId,
+                                    indexedValue,
+                                    expansionPosition,
+                                    expansionSize);
                     if (o.kind < INSERT
-                            || o.kind
-                                    > (version == 1
-                                            ? RELOCATE
-                                            : version == 2 ? LOGICAL_DELETE : TRANSACTION_COMMIT)
+                            || o.kind > TRANSACTION_COMMIT
                             || o.table < (isControl(o) ? 0 : 1)
                             || o.table > (isControl(o) ? 0 : 8)
                             || o.index < 0
-                            || o.index > (version >= 7 ? 1024 : 2)
+                            || o.index > 1024
                             || o.workUnitId() < 0
                             || isControl(o) && o.workUnitId() != 0)
                         throw new IOException("Invalid normalized operation");
-                    if (expandLegacy && version == 1) expandLegacyRow(o, consumer);
-                    else consumer.accept(o);
+                    consumer.accept(o);
                     count++;
                 }
                 if (block.hasRemaining()) throw new IOException("Trailing operation block bytes");
             }
             return count;
         }
-    }
-
-    public static int formatVersion(Path file) throws IOException {
-        try (var channel = FileChannel.open(file)) {
-            var header = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
-            fill(channel, header);
-            header.flip();
-            int magic = header.getInt(), version = header.getInt();
-            if (magic != MAGIC
-                    || version < 1
-                    || version > VERSION
-                    || header.getInt() != recordBytes(version)
-                    || header.getInt() != BLOCK_RECORDS)
-                throw new IOException("Unknown normalized trace header");
-            return version;
-        }
-    }
-
-    private static int recordBytes(int version) {
-        return version < 3
-                ? 88
-                : version == 3 ? 104 : version < 6 ? 112 : version == 6 ? 120 : RECORD_BYTES;
     }
 
     private static void fill(FileChannel channel, ByteBuffer target) throws IOException {

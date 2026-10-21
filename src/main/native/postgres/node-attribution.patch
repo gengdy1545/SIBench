@@ -1,0 +1,68 @@
+diff -ruN a/src/backend/executor/nodeBitmapIndexscan.c b/src/backend/executor/nodeBitmapIndexscan.c
+--- a/src/backend/executor/nodeBitmapIndexscan.c	2026-10-21 16:26:58.197652490 +0800
++++ b/src/backend/executor/nodeBitmapIndexscan.c	2026-10-21 16:26:58.197652490 +0800
+@@ -20,6 +20,7 @@
+  *		ExecEndBitmapIndexScan		releases all storage.
+  */
+ #include "postgres.h"
++#include "sibench_capture.h"
+ 
+ #include "access/genam.h"
+ #include "executor/execdebug.h"
+@@ -312,6 +313,7 @@
+ 		index_beginscan_bitmap(indexstate->biss_RelationDesc,
+ 							   estate->es_snapshot,
+ 							   indexstate->biss_NumScanKeys);
++	sib_plan_scan("bitmap", node->scan.plan.plan_node_id, indexstate->biss_ScanDesc);
+ 
+ 	/*
+ 	 * If no run-time keys to calculate, go ahead and pass the scankeys to the
+diff -ruN a/src/backend/executor/nodeIndexonlyscan.c b/src/backend/executor/nodeIndexonlyscan.c
+--- a/src/backend/executor/nodeIndexonlyscan.c	2026-10-21 16:26:58.197652490 +0800
++++ b/src/backend/executor/nodeIndexonlyscan.c	2026-10-21 16:26:58.197652490 +0800
+@@ -29,6 +29,7 @@
+  *		ExecIndexOnlyScanInitializeWorker attach to DSM info in parallel worker
+  */
+ #include "postgres.h"
++#include "sibench_capture.h"
+ 
+ #include "access/genam.h"
+ #include "access/htup_details.h"
+@@ -100,6 +101,7 @@
+ 								   node->ioss_NumOrderByKeys);
+ 
+ 		node->ioss_ScanDesc = scandesc;
++		sib_plan_scan("index_only", node->ss.ps.plan->plan_node_id, scandesc);
+ 
+ 
+ 		/* Set it up for index-only scan */
+diff -ruN a/src/backend/executor/nodeIndexscan.c b/src/backend/executor/nodeIndexscan.c
+--- a/src/backend/executor/nodeIndexscan.c	2026-10-21 16:26:58.197652490 +0800
++++ b/src/backend/executor/nodeIndexscan.c	2026-10-21 16:26:58.197652490 +0800
+@@ -28,6 +28,10 @@
+  *		ExecIndexScanInitializeWorker attach to DSM info in parallel worker
+  */
+ #include "postgres.h"
++#include "sibench_capture.h"
++
++int sibench_depth = 0;
++uint64 sibench_request = 0;
+ 
+ #include "access/nbtree.h"
+ #include "access/relscan.h"
+@@ -116,6 +120,7 @@
+ 								   node->iss_NumOrderByKeys);
+ 
+ 		node->iss_ScanDesc = scandesc;
++		sib_plan_scan("index", node->ss.ps.plan->plan_node_id, scandesc);
+ 
+ 		/*
+ 		 * If no run-time keys to calculate or they are ready, go ahead and
+@@ -211,6 +216,7 @@
+ 								   node->iss_NumOrderByKeys);
+ 
+ 		node->iss_ScanDesc = scandesc;
++		sib_plan_scan("index", node->ss.ps.plan->plan_node_id, scandesc);
+ 
+ 		/*
+ 		 * If no run-time keys to calculate or they are ready, go ahead and

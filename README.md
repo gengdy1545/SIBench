@@ -26,7 +26,16 @@ java -jar build/sibench/sibench.jar check-schema config/hybench_sf1.yaml \
   --jdbc jdbc:postgresql://127.0.0.1:55433/sibench_htap_sf1_capture --user postgres
 ```
 
-支持范围与 YCSB / sysbench 用法见 [来源 Schema 契约](docs/contracts/source-schema.md)。YCSB / sysbench 的 catalog 已支持，原生采集及规范 Trace 仍未实现；不支持额外索引类型或运行期动态 DDL。
+支持范围与 YCSB / sysbench 用法见 [来源 Schema 契约](docs/contracts/source-schema.md)。YCSB / sysbench 已有与 HyBench SF1 同行数（8,706,000）的单会话原生采集（见下），规范 Trace 仍未实现；不支持额外索引类型或运行期动态 DDL。
+
+```bash
+make -C src/main/native/postgres install extension
+scripts/native-capture.sh config/ycsb_8m.yaml        # 约 48 分钟
+scripts/native-capture.sh config/sysbench_8m.yaml    # 约 13 分钟
+java -jar build/sibench/sibench.jar access-ledger config/ycsb_8m.yaml results/poc/ycsb-8m/raw REPORT
+```
+
+脚本启停本地 PG 并依次执行建库加载、预检、Baseline 导出、原生执行、行状态审计和访问账本；已有数据库或输出目录会被拒绝。`access-ledger` 按 PG 追踪把索引事件划分为访问单元，不连接 PG，REPORT 必须是新文件。`config/*_small.yaml` 是约 15 秒的冒烟配置。证据见 [原生采集验证](docs/validation/ycsb-sysbench-native-capture.md)。
 
 ```bash
 java -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc check "$PWD" config/hybench_sf1.yaml
@@ -85,6 +94,7 @@ dry-run 只校验源码指纹、配置和 schema，不创建数据。去掉 `--d
 | `benchmark/` | 固定上游子模块，不直接修改 |
 | `src/main/java/org/sibench/`、`src/test/java/org/sibench/` | Java 核心与测试，按职责组织 |
 | `src/main/native/postgres/` | PG 14.24 最小采集插桩，作用于隔离构建副本 |
+| `scripts/` | 串联已有 Java CLI 阶段的编排脚本，不含来源语义 |
 | `config/` | 平铺配置，工作负载命名 `<benchmark>_<scale>.yaml` |
 | `build/sibench/`、`build/benchmarks/`、`build/services/` | 核心构建、上游构建、本地服务状态 |
 | `results/` | 本地数据与实验证据，不纳入源码 |
@@ -92,6 +102,7 @@ dry-run 只校验源码指纹、配置和 schema，不创建数据。去掉 `--d
 - [计划](plan.md)：当前实现、未完成项与验收。
 - [Trace 契约](docs/contracts/trace.md)：版本、操作、发送及完整性。
 - [来源 Schema 契约](docs/contracts/source-schema.md)：三来源布局、PG 预检及失败边界。
+- [YCSB / sysbench 原生采集](docs/validation/ycsb-sysbench-native-capture.md)：原生客户端对账、访问账本与已知差异。
 - [存储契约](docs/contracts/storage.md)：布局、Rewrite、GC 和测量边界。
 - [能力矩阵](docs/benchmarks/capability-matrix.md)：各来源当前覆盖。
 - 来源差异：[HyBench](docs/benchmarks/hybench.md)、[YCSB](docs/benchmarks/ycsb.md)、[sysbench](docs/benchmarks/sysbench.md)。

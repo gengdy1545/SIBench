@@ -27,6 +27,15 @@ public final class RequestCaptureAudit {
     }
 
     static Map<String, Object> audit(Path jdbc, Path pg, boolean htap) throws Exception {
+        return audit(jdbc, pg, htap, !htap);
+    }
+
+    /**
+     * {@code bindings} additionally requires every runtime equality key to be a value bound by
+     * the client: true for point-access workloads, false for joins whose keys come from rows.
+     */
+    static Map<String, Object> audit(Path jdbc, Path pg, boolean htap, boolean bindings)
+            throws Exception {
         Map<String, JsonObject> requests = new LinkedHashMap<>();
         Set<String> returned = new HashSet<>();
         Map<String, List<JsonObject>> consumed = new HashMap<>();
@@ -83,6 +92,16 @@ public final class RequestCaptureAudit {
                             throw new IOException("Rollback without completed request");
                         clientRollbacks++;
                         rollbackRequests.merge(app, 1L, Long::sum);
+                        clientTransactionOpen = false;
+                    }
+                    case "autocommit" -> {
+                        // An autocommit connection ends every request with an implicit commit; the
+                        // server also commits the label statement that names the request.
+                        if (!returned.contains(app))
+                            throw new IOException("Autocommit without completed request");
+                        long implicit = e.get("implicit_commits").getAsLong();
+                        clientCommits += implicit;
+                        clientCommitRequests.merge(app, implicit, Long::sum);
                         clientTransactionOpen = false;
                     }
                     case "close" -> {
@@ -153,15 +172,16 @@ public final class RequestCaptureAudit {
                     abortRequests.merge(app, 1L, Long::sum);
                     serverTransactionOpen = false;
                 }
-                if (event.equals("scan_rescan") && !htap) {
-                    List<String> bindings =
+                if (event.equals("scan_rescan") && bindings && !isPlannerProbe(e)) {
+                    List<String> bound =
                             request.getAsJsonObject("parameters").entrySet().stream()
                                     .filter(p -> !p.getValue().isJsonNull())
                                     .map(p -> p.getValue().getAsString())
                                     .toList();
                     for (JsonElement item : e.getAsJsonArray("keys")) {
                         JsonObject key = item.getAsJsonObject();
-                        if (!bindings.contains(key.get("value").getAsString()))
+                        if (key.get("value").isJsonNull()) continue;
+                        if (!bound.contains(key.get("value").getAsString()))
                             throw new IOException(
                                     "Runtime search key is not a bound template value");
                     }
@@ -275,6 +295,17 @@ public final class RequestCaptureAudit {
             report.put("executor_cleanup_events", finished.size());
         }
         return report;
+    }
+
+    /** Planner endpoint probes carry no bound value; they are not search predicates. */
+    static boolean isPlannerProbe(JsonObject scan) {
+        JsonArray keys = scan.getAsJsonArray("keys");
+        if (keys.size() != 1) return false;
+        JsonObject key = keys.get(0).getAsJsonObject();
+        return key.has("strategy")
+                && key.has("flags")
+                && key.get("strategy").getAsInt() == 0
+                && (key.get("flags").getAsInt() & 0x80) != 0;
     }
 
     private static String normalize(String sql) {

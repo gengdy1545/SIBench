@@ -29,7 +29,7 @@ YCSB 固定使用 `JdbcDBCreateTable`，不是普通字段为 VARCHAR 的 SQL �
 
 HyBench `CapturePoc check` 连接 PG 并执行预检。Baseline export 在创建输出目录前检查，保存 `schema-preflight.json`；原生 run 在打开记录 JDBC 会话和调用 benchmark 方法前检查，在 `capture-run.json` 保存结果。失败 run 保留诊断，但没有业务采集会话。
 
-YCSB / sysbench 目前可执行独立预检；它们的原生采集入口尚未实现，未来接入必须调用相同检查，不得以独立预检通过替代采集验收。
+YCSB / sysbench 的单会话原生采集入口（`NativeCapture`，见 [原生采集验证](../validation/ycsb-sysbench-native-capture.md)）在采集前调用相同检查并保存结果；独立预检通过不替代采集验收。构建副本中参与执行的上游源码须与固定子模块逐字节一致，否则在建库前拒绝。
 
 ## 使用
 

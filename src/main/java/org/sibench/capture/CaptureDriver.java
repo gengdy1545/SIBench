@@ -184,6 +184,8 @@ public final class CaptureDriver implements Driver {
             details.put("sql", sql);
             details.put("parameters", new LinkedHashMap<>(parameters));
             details.put("start_ns", System.nanoTime());
+            // An autocommit connection commits the label and then the request itself.
+            if (connection.getAutoCommit()) details.put("autocommit", true);
             emit("request_start", details);
         }
 
@@ -291,6 +293,9 @@ public final class CaptureDriver implements Driver {
                                                         System.nanoTime(),
                                                         "update_count",
                                                         statement.getUpdateCount()));
+                                        // The server committed the label statement and the request.
+                                        if (connection.getAutoCommit())
+                                            emit("autocommit", Map.of("implicit_commits", 2));
                                         if (result instanceof ResultSet rows)
                                             return rows(rows, executedSql, resultIdentity);
                                         return result;

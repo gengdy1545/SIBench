@@ -295,10 +295,26 @@ final class RowAuditTestSupport {
                                 "close",
                                 "application",
                                 "fixture-" + (transactions.size() - 1))));
-        Files.write(directory.resolve("jdbc-fixture.jsonl"), client);
+        Path jdbc = directory.resolve("jdbc-fixture.jsonl");
+        Files.write(jdbc, client);
         Path raw = directory.resolve("runtime.jsonl");
         Files.write(raw, server);
+        complete(directory, jdbc, raw);
         return raw;
+    }
+
+    /** Publishes the completion manifest a real capture writes, binding one JDBC/PG trace pair. */
+    static void complete(Path directory, Path client, Path server) throws java.io.IOException {
+        Files.writeString(
+                directory.resolve("capture-run.json"),
+                JSON.toJson(
+                        Map.of(
+                                "status", "complete",
+                                "pg_file", server.getFileName().toString(),
+                                "pg_sha256", org.sibench.generation.BaselineGenerator.sha256(server),
+                                "jdbc_file", client.getFileName().toString(),
+                                "jdbc_sha256",
+                                        org.sibench.generation.BaselineGenerator.sha256(client))));
     }
 
     static JsonObject change(String table, String operation, JsonObject before, JsonObject after) {

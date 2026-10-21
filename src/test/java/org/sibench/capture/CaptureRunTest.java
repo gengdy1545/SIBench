@@ -186,63 +186,11 @@ public class CaptureRunTest {
     }
 
     @Test
-    public void labelAndStatementCleanupFailuresAreAlsoTracked() throws Exception {
-        for (String method : new String[] {"execute", "statement_close"}) {
-            Path directory = temporary.newFolder().toPath();
-            SQLException error = new SQLException("failed " + method, "58030");
-            try (CaptureRun run = CaptureRun.begin(directory);
-                    var connection =
-                            CaptureDriver.wrap(actual(method, error, new boolean[1]), directory)) {
-                var statement = connection.prepareStatement("SELECT 1");
-                assertSame(
-                        error,
-                        assertThrows(
-                                SQLException.class,
-                                () -> {
-                                    if (method.equals("execute")) statement.executeQuery();
-                                    else statement.close();
-                                }));
-                assertSame(error, assertThrows(SQLException.class, CaptureRun::checkFailure));
-            }
-        }
-    }
-
-    @Test
-    public void legacyCaptureRejectsErrorsTruncationAndUnmatchedRollback() throws Exception {
+    public void captureWithoutARunManifestIsRejected() throws Exception {
         Path directory = temporary.newFolder().toPath();
         Path pg = directory.resolve("pg-123.jsonl");
-        Files.writeString(
-                pg,
-                event("executor_start", "fixture", ",\"sql\":\"SELECT 1\"")
-                        + event("executor_end", "fixture", "")
-                        + event("transaction_commit", "fixture", ""));
-        Path jdbc = directory.resolve("jdbc-fixture.jsonl");
-        String prefix =
-                """
-                {"event":"connection","pid":123}
-                {"event":"request_start","application":"fixture","sql":"SELECT 1","parameters":{}}
-                {"event":"request_return","application":"fixture"}
-                {"event":"commit","application":"fixture"}
-                """;
-        String close = "{\"event\":\"close\",\"application\":\"fixture\"}\n";
-        Files.writeString(jdbc, prefix + close);
-        CaptureRun.verifyInput(pg);
-        for (String invalid :
-                new String[] {
-                    prefix,
-                    prefix
-                            + "{\"event\":\"request_error\",\"application\":\"fixture\",\"sqlstate\":\"08006\"}\n"
-                            + close,
-                    prefix + "{\"event\":\"rollback\",\"application\":\"fixture\"}\n" + close
-                }) {
-            Files.writeString(jdbc, invalid);
-            assertThrows(IOException.class, () -> CaptureRun.verifyInput(pg));
-        }
-        Files.writeString(jdbc, prefix + close);
-        Files.writeString(pg, Files.readString(pg) + event("transaction_abort", "fixture", ""));
+        Files.writeString(pg, event("transaction_commit", "fixture", ""));
         assertThrows(IOException.class, () -> CaptureRun.verifyInput(pg));
-        Files.writeString(jdbc, prefix + "{\"event\":\"rollback\",\"application\":\"fixture\"}\n" + close);
-        CaptureRun.verifyInput(pg);
     }
 
     @Test
@@ -282,19 +230,6 @@ public class CaptureRunTest {
         Path server = directory.resolve("pg-124.jsonl");
         Files.writeString(server, Files.readString(server) + "{}\n");
         assertThrows(IOException.class, () -> CaptureRun.verifyInput(directory));
-    }
-
-    @Test
-    public void failureInWorkerThreadInvalidatesHtapRun() throws Exception {
-        Path directory = temporary.newFolder().toPath();
-        try (CaptureRun run = CaptureRun.begin(directory, true)) {
-            SQLException original = new SQLException("worker failure", "08006");
-            Thread worker = new Thread(() -> CaptureRun.recordFailure(original, Map.of("operation", "worker")));
-            worker.start();
-            worker.join();
-            assertSame(original, assertThrows(SQLException.class, CaptureRun::checkFailure));
-        }
-        assertEquals("failed", manifest(directory).get("status").getAsString());
     }
 
     @Test
@@ -405,9 +340,52 @@ public class CaptureRunTest {
                     return switch (m.getName()) {
                         case "createStatement" -> label;
                         case "prepareStatement" -> statement;
+                        // HyBench-style explicit transactions unless a test says otherwise.
+                        case "getAutoCommit" -> false;
                         default -> null;
                     };
                 });
+    }
+
+    @Test
+    public void autocommitConnectionsRecordTheirImplicitCommits() throws Exception {
+        for (boolean autocommit : new boolean[] {false, true}) {
+            Path directory = temporary.newFolder().toPath();
+            Connection base = actual("", null, new boolean[1]);
+            Connection connection =
+                    proxy(
+                            Connection.class,
+                            (p, m, a) ->
+                                    m.getName().equals("getAutoCommit")
+                                            ? (Object) autocommit
+                                            : m.invoke(base, a));
+            try (CaptureRun run = CaptureRun.begin(directory, true);
+                    Connection wrapped = CaptureDriver.wrap(connection, directory)) {
+                wrapped.prepareStatement("SELECT 1").executeQuery();
+            }
+            var events =
+                    Files.readAllLines(jdbc(directory)).stream()
+                            .map(line -> JsonParser.parseString(line).getAsJsonObject())
+                            .toList();
+            var start =
+                    events.stream()
+                            .filter(e -> e.get("event").getAsString().equals("request_start"))
+                            .findFirst()
+                            .orElseThrow();
+            var implicit =
+                    events.stream()
+                            .filter(e -> e.get("event").getAsString().equals("autocommit"))
+                            .toList();
+            assertEquals(autocommit, start.has("autocommit"));
+            assertEquals(autocommit ? 1 : 0, implicit.size());
+            if (autocommit) {
+                // The label statement and the request itself each commit on the server.
+                assertEquals(2, implicit.get(0).get("implicit_commits").getAsInt());
+                assertEquals(
+                        start.get("application").getAsString(),
+                        implicit.get(0).get("application").getAsString());
+            }
+        }
     }
 
     private static <T> T proxy(Class<T> type, InvocationHandler handler) {

@@ -34,7 +34,11 @@ public final class PgTraceBlocks {
                     Map.entry("executor_start", 13),
                     Map.entry("executor_end", 14),
                     Map.entry("result_row", 15),
-                    Map.entry("executor_run_end", 16));
+                    Map.entry("executor_run_end", 16),
+                    Map.entry("plan_scan", 17));
+
+    private static final int MAX_TYPE =
+            TYPES.values().stream().mapToInt(Integer::intValue).max().orElseThrow();
 
     private PgTraceBlocks() {}
 
@@ -229,7 +233,7 @@ public final class PgTraceBlocks {
                 for (int i = 0; i < events; i++) {
                     long seq = block.getLong();
                     int type = block.getInt();
-                    if (seq != ++count || type < 1 || type > 16)
+                    if (seq != ++count || type < 1 || type > MAX_TYPE)
                         throw new IOException("Invalid sequence or event");
                     block.position(block.position() + RECORD_BYTES - 12);
                 }

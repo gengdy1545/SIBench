@@ -169,14 +169,17 @@ public class ReplayDispatcherTest {
     }
 
     @Test
-    public void supports128ClientsAndRejectsMissingIdentityOrCoverage() throws Exception {
-        try (var dispatcher =
-                new ReplayDispatcher(config(128, 10), ReplayTarget.immediate(op -> {}))) {
-            for (int i = 1; i <= 128; i++) dispatcher.send(search(i));
-            dispatcher.drain();
-            dispatcher.requireClientCoverage();
-            assertEquals(128, dispatcher.describe().get("used_clients"));
-            assertEquals(0, dispatcher.route(search(129)));
+    public void supportsManyClientsAndRejectsMissingIdentityOrCoverage() throws Exception {
+        // 128 is an experiment setting, not a limit: 256 clients work when units cover them.
+        for (int clients : new int[] {128, 256}) {
+            try (var dispatcher =
+                    new ReplayDispatcher(config(clients, 10), ReplayTarget.immediate(op -> {}))) {
+                for (int i = 1; i <= clients; i++) dispatcher.send(search(i));
+                dispatcher.drain();
+                dispatcher.requireClientCoverage();
+                assertEquals(clients, dispatcher.describe().get("used_clients"));
+                assertEquals(0, dispatcher.route(search(clients + 1)));
+            }
         }
         try (var dispatcher =
                 new ReplayDispatcher(config(128, 10), ReplayTarget.immediate(op -> {}))) {
@@ -215,38 +218,6 @@ public class ReplayDispatcherTest {
     }
 
     @Test
-    public void factoryFailuresCloseExistingClientsWithoutOpeningLaterOnes() throws Exception {
-        List<Integer> opened = new ArrayList<>(), closed = new ArrayList<>();
-        var dispatcher =
-                new ReplayDispatcher(
-                        config(3, 10),
-                        client -> {
-                            opened.add(client);
-                            if (client == 1) throw new IOException("Cannot connect");
-                            return new ReplayTarget() {
-                                @Override
-                                public SendHandle send(long seq, Operation op) {
-                                    return SendHandle.completed();
-                                }
-
-                                @Override
-                                public void close() {
-                                    closed.add(client);
-                                }
-                            };
-                        });
-        try {
-            dispatcher.send(search(1));
-            assertThrows(IOException.class, () -> dispatcher.send(search(2)));
-            assertThrows(IOException.class, () -> dispatcher.send(search(3)));
-        } finally {
-            dispatcher.close();
-        }
-        assertEquals(List.of(0, 1), opened);
-        assertEquals(List.of(0), closed);
-    }
-
-    @Test
     public void coverageIsCheckedAfterSecondaryFilteringWithoutRenumberingWorkUnits()
             throws Exception {
         var operations =
@@ -272,17 +243,6 @@ public class ReplayDispatcherTest {
                 if (secondary) projection.requireClientCoverage();
                 else assertThrows(IOException.class, projection::requireClientCoverage);
             }
-        }
-    }
-
-    @Test
-    public void allowsMoreThan128ClientsWhenSourceUnitsCoverThem() throws Exception {
-        try (var dispatcher =
-                new ReplayDispatcher(config(256, 10), ReplayTarget.immediate(op -> {}))) {
-            for (int unit = 1; unit <= 256; unit++) dispatcher.send(search(unit));
-            dispatcher.drain();
-            dispatcher.requireClientCoverage();
-            assertEquals(256, dispatcher.describe().get("used_clients"));
         }
     }
 

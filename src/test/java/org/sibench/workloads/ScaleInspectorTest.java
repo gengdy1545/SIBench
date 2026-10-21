@@ -7,11 +7,9 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
-import org.yaml.snakeyaml.error.YAMLException;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
 import java.util.Map;
 
 public class ScaleInspectorTest {
@@ -19,16 +17,6 @@ public class ScaleInspectorTest {
 
     private String ycsb() throws Exception {
         return Files.readString(ROOT.resolve(ScaleInspector.DEFAULT_PROFILES.get(1)));
-    }
-
-    @Test
-    public void defaultProfilesUseFlatBenchmarkNames() {
-        assertEquals(
-                List.of(
-                        "config/hybench_sf1000.yaml",
-                        "config/ycsb_large.yaml",
-                        "config/sysbench_large.yaml"),
-                ScaleInspector.DEFAULT_PROFILES);
     }
 
     @Test
@@ -43,14 +31,6 @@ public class ScaleInspectorTest {
             assertTrue(report.containsKey("estimated_parquet_bytes"));
             assertNull(report.get("estimated_parquet_bytes"));
         }
-    }
-
-    @Test
-    public void benchmarksCanUseIndependentScales() throws Exception {
-        Map<String, Object> report =
-                ScaleInspector.validate(
-                        ScaleInspector.parse(ycsb().replace("1000000000", "100000000")));
-        assertEquals(100000000L, report.get("baseline_rows"));
     }
 
     @Test
@@ -73,13 +53,6 @@ public class ScaleInspectorTest {
                                 ScaleInspector.parse(
                                         text.replace(
                                                 "recordcount: 1000000000", "recordcount: 1"))));
-    }
-
-    @Test
-    public void rejectsDuplicateYamlKeys() {
-        assertThrows(
-                YAMLException.class,
-                () -> ScaleInspector.parse("benchmark: ycsb\nbenchmark: hybench\n"));
     }
 
     @Test

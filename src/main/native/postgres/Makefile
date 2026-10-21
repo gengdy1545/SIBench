@@ -18,10 +18,16 @@ patch:
 	    cd "$(PG_SRC)" && patch --batch --forward -p1 < "$(CURDIR)/execution-completion.patch"; \
 	  fi && touch "$(PG_SRC)/.sibench-execution-completion"; \
 	fi
+	@if ! test -f "$(PG_SRC)/.sibench-node-attribution"; then \
+	  if ! rg -q 'sib_plan_scan' "$(PG_SRC)/src/backend/executor/nodeIndexscan.c"; then \
+	    cd "$(PG_SRC)" && patch --batch --forward -p1 < "$(CURDIR)/node-attribution.patch"; \
+	  fi && touch "$(PG_SRC)/.sibench-node-attribution"; \
+	fi
 	cp sibench_capture.h sibench_receiver.h "$(PG_SRC)/src/include/"
 	touch "$(PG_SRC)/src/backend/access/index/indexam.c" "$(PG_SRC)/src/backend/nodes/tidbitmap.c" \
 	  "$(PG_SRC)/src/backend/executor/execMain.c" "$(PG_SRC)/src/backend/catalog/index.c" \
-	  "$(PG_SRC)/src/backend/access/transam/xact.c"
+	  "$(PG_SRC)/src/backend/access/transam/xact.c" "$(PG_SRC)/src/backend/executor/nodeIndexscan.c" \
+	  "$(PG_SRC)/src/backend/executor/nodeIndexonlyscan.c" "$(PG_SRC)/src/backend/executor/nodeBitmapIndexscan.c"
 
 build: patch
 	cd "$(PG_SRC)" && ./configure --prefix="$(PREFIX)" --without-readline --without-zlib

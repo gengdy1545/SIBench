@@ -1,0 +1,53 @@
+schema_version: 1
+purpose: native_capture_poc
+benchmark: ycsb
+source:
+  path: benchmark/YCSB
+  commit: 66302f301b13f60d4bcb2f29f478586bb1d6f2e0
+native:
+  table: usertable
+  jdbc_table_creator: JdbcDBCreateTable
+  recordcount: 1000
+  insertstart: 0
+  insertcount: 1000
+  fieldcount: 10
+  fieldlength: 100
+  fieldlengthdistribution: constant
+  insertorder: hashed
+  zeropadding: 1
+  threads: 1
+  build_directory: build/benchmarks/YCSB
+  client_libraries: jdbc/target/ycsb-jdbc-binding-0.18.0-SNAPSHOT/lib
+  # Upstream workload files run in this order on one growing table; each is a separate client JVM.
+  workloads:
+    workloada: {operationcount: 300}
+    workloadb: {operationcount: 300}
+    workloadc: {operationcount: 200}
+    workloadf: {operationcount: 200}
+    workloadd: {operationcount: 300}
+    # The pinned JDBC binding fills scan results only for explicit fields; with readallfields=true
+    # CoreWorkload divides by the empty result and the client thread dies.
+    workloade: {operationcount: 100, properties: {readallfields: false}}
+postgres:
+  schema: public
+  version: '14.24'
+  port: 55433
+  database: sibench_ycsb_small_capture
+  user: postgres
+  isolation: read_committed
+  max_parallel_workers_per_gather: 0
+capture:
+  mode: instrumented_native_execution
+  application_prefix: 'sibench:'
+  raw_directory: results/poc/ycsb-small/raw
+  allow_event_loss: false
+  statement_results: server_rows_and_consumed_rows
+data_layout:
+  target_file_size_bytes: 268435456
+  row_group_max_rows: 1048576
+  row_group_buffer_bytes: 67108864
+  page_size_bytes: 1048576
+  compression: zstd
+  compression_level: 3
+artifacts:
+  directory: results/poc/ycsb-small

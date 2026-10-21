@@ -11,28 +11,6 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class ReplayProjectionTest {
-    @Test
-    public void disablesAllSecondaryKindsWithoutChangingPrimaryIdentityOrOrder() throws Exception {
-        List<Operation> primary = new ArrayList<>(), received = new ArrayList<>();
-        var projection = new ReplayProjection(false, received::add);
-        for (int kind : new int[] {1, 2, 3, 4, 5}) {
-            var row = new Operation(9, kind, 5, 0, 0, 7, 4, 8, 12, 20, 3, 6, 1);
-            primary.add(row);
-            if (kind == IndexOperationTrace.SEARCH) {
-                projection.accept(row);
-                projection.accept(new Operation(9, kind, 5, 1, 0, 3, 4, 0, 0, 0, 0, 0, 1));
-                projection.accept(new Operation(9, kind, 5, 2, 0, 6, 4, 0, 0, 0, 0, 0, 1));
-            } else org.sibench.capture.LegacyIndexFixtures.expandRow(row, projection);
-        }
-        assertEquals(primary, received);
-        assertEquals(15L, projection.describe().get("source_operations"));
-        assertEquals(10L, projection.describe().get("filtered_secondary_operations"));
-        assertEquals(5, projection.dispatched());
-        var all = new ReplayProjection(true, operation -> {});
-        for (Operation row : primary) all.accept(row);
-        assertEquals(0L, all.describe().get("filtered_secondary_operations"));
-    }
-
     private static Operation mutation(
             int table, long key, long version, long tx, long ordinal, int kind) {
         return new Operation(
@@ -62,11 +40,11 @@ public class ReplayProjectionTest {
                 var config = new ReplayConfig(secondary, "none", 0, 0, 0, 0, mode);
                 var projection = new ReplayProjection(config, true, received::add);
                 projection.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
-                org.sibench.capture.LegacyIndexFixtures.expandRow(
+                org.sibench.capture.TransferIndexFixtures.expandRow(
                         mutation(5, 1, 1, 10, 1, 3), projection);
-                org.sibench.capture.LegacyIndexFixtures.expandRow(
+                org.sibench.capture.TransferIndexFixtures.expandRow(
                         mutation(5, 2, 1, 10, 2, 3), projection);
-                org.sibench.capture.LegacyIndexFixtures.expandRow(
+                org.sibench.capture.TransferIndexFixtures.expandRow(
                         mutation(5, 1, 1, 10, 3, 3), projection);
                 projection.accept(mutation(3, 1, 1, 10, 4, 3));
                 projection.accept(mutation(3, 1, 1, 10, 5, 5));

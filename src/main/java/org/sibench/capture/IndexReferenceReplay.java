@@ -82,7 +82,7 @@ public final class IndexReferenceReplay {
         }
     }
 
-    private final boolean rowIds, secondaryIndexes, versionedReads;
+    private final boolean rowIds, secondaryIndexes;
     private final Map<Namespace, Store> stores = new LinkedHashMap<>();
     private final Map<Entry, NavigableMap<Long, StoredVersion>> history = new HashMap<>();
     private final Map<Entry, WritePosition> writePositions = new HashMap<>();
@@ -94,13 +94,8 @@ public final class IndexReferenceReplay {
     }
 
     public IndexReferenceReplay(boolean rowIds, boolean secondaryIndexes) {
-        this(rowIds, secondaryIndexes, true);
-    }
-
-    public IndexReferenceReplay(boolean rowIds, boolean secondaryIndexes, boolean versionedReads) {
         this.rowIds = rowIds;
         this.secondaryIndexes = secondaryIndexes;
-        this.versionedReads = versionedReads;
     }
 
     private static Entry identity(Operation operation) {
@@ -224,7 +219,6 @@ public final class IndexReferenceReplay {
     }
 
     private StoredVersion visible(Entry entry, long timestamp) {
-        if (!versionedReads) return current(entry);
         var chain = history.get(entry);
         if (chain != null) {
             var selected = chain.floorEntry(timestamp);
@@ -287,8 +281,6 @@ public final class IndexReferenceReplay {
                 || operation.expectedCount() < 0
                 || (operation.flags() & ~allowed) != 0)
             throw new IOException("Invalid search metadata");
-        if (!versionedReads && (operation.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0)
-            throw new IOException("Legacy input has no snapshot contract");
         if ((operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0
                 && (operation.transactionId() <= 0
                         || operation.mutationOrdinal() <= 0

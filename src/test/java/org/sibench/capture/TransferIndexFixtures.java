@@ -4,9 +4,9 @@ import org.sibench.capture.IndexOperationTrace.Operation;
 
 import java.io.IOException;
 
-/** Partial transfer fixtures for historical behavior; never used by the current compiler. */
-public final class LegacyIndexFixtures {
-    private LegacyIndexFixtures() {}
+/** Explicit transfer secondary operations for tests that hand-build traces; the compiler derives them from the source catalog. */
+public final class TransferIndexFixtures {
+    private TransferIndexFixtures() {}
 
     public static void expandRow(Operation row, IndexOperationTrace.Consumer consumer)
             throws IOException {

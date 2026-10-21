@@ -2,6 +2,7 @@ package org.sibench.cli;
 
 import com.google.gson.GsonBuilder;
 
+import org.sibench.capture.AccessLedger;
 import org.sibench.capture.RowStateAudit;
 import org.sibench.config.ConfigValues;
 import org.sibench.generation.BaselineGenerator;
@@ -40,7 +41,8 @@ public final class Sibench {
                             "check-replay",
                             "validate-snapshots",
                             "check-schema",
-                            "audit-rows")
+                            "audit-rows",
+                            "access-ledger")
                     .contains(args[0])) {
                 throw new IllegalArgumentException("Unknown command: " + args[0]);
             }
@@ -95,6 +97,21 @@ public final class Sibench {
                                 profiles.size() == 4
                                         ? root.resolve(profiles.get(3))
                                         : RowStateAudit.defaultReport(raw));
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(report));
+                return 0;
+            }
+            if (args[0].equals("access-ledger")) {
+                if (profiles.size() != 2 && profiles.size() != 3)
+                    throw new IllegalArgumentException("access-ledger requires PROFILE RAW [REPORT]");
+                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
+                Path raw = root.resolve(profiles.get(1));
+                var report =
+                        AccessLedger.audit(
+                                SourceSchema.read(root, document),
+                                raw,
+                                profiles.size() == 3
+                                        ? root.resolve(profiles.get(2))
+                                        : AccessLedger.defaultReport(raw));
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(report));
                 return 0;
             }
@@ -195,6 +212,11 @@ public final class Sibench {
                         + " PROFILE BASELINE RAW [REPORT] --jdbc URL --user ROLE");
         out.println(
                 "audit-rows verifies source row state once; unchanged inputs reuse the report.");
+        out.println(
+                "       java -jar build/sibench/sibench.jar access-ledger [--root PATH]"
+                        + " PROFILE RAW [REPORT]");
+        out.println(
+                "access-ledger partitions raw PG index events into access units; it never touches PG.");
         out.println(
                 "check-schema reads the live PG catalog; it never creates or repairs"
                         + " tables/indexes.");

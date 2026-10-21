@@ -215,9 +215,11 @@ public class IndexTraceCompilerTest {
                                         "close",
                                         "application",
                                         "fixture-" + (transactions.size() - 1))));
-        Files.write(directory.resolve("jdbc-fixture.jsonl"), client);
+        Path jdbc = directory.resolve("jdbc-fixture.jsonl");
+        Files.write(jdbc, client);
         Path raw = directory.resolve("runtime.jsonl");
         Files.write(raw, server);
+        RowAuditTestSupport.complete(directory, jdbc, raw);
         return raw;
     }
 
@@ -253,7 +255,12 @@ public class IndexTraceCompilerTest {
     }
 
     private static String search(String scan, int found) {
-        return "{\"event\":\"scan_rescan\",\"scan\":\""
+        // Modern captures bind each scan descriptor to its plan node before the first rescan; the
+        // compiler must accept that event without changing the operations it emits.
+        return "{\"event\":\"plan_scan\",\"scan\":\""
+                + scan
+                + "\",\"relation\":\"idx_loantrans_2\",\"plan_node\":1,\"kind\":\"index\"}\n"
+                + "{\"event\":\"scan_rescan\",\"scan\":\""
                 + scan
                 + "\",\"relation\":\"idx_loantrans_2\",\"keys\":[{\"strategy\":3,\"flags\":0,"
                 + "\"value\":\"2024-01-02 00:00:00\"}]}\n"

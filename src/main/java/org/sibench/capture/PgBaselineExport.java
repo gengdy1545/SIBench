@@ -8,6 +8,7 @@ import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.MessageTypeParser;
 import org.sibench.generation.*;
 import org.sibench.schema.PgSchemaCheck;
+import org.sibench.schema.SourceSchema;
 
 import java.io.BufferedWriter;
 import java.nio.file.*;
@@ -43,10 +44,7 @@ public final class PgBaselineExport {
 
     public static void export(String jdbc, Path output, GenerationConfig config) throws Exception {
         Map<String, Object> document = config.document();
-        if (!"hybench".equals(document.get("benchmark"))) {
-            throw new IllegalArgumentException(
-                    "PG baseline export currently supports only HyBench");
-        }
+        var source = SourceSchema.read(config.root(), document);
         var preflight = PgSchemaCheck.check(config.root(), document, jdbc, "postgres");
         Files.createDirectory(output);
         Files.writeString(
@@ -66,8 +64,9 @@ public final class PgBaselineExport {
             connection.setAutoCommit(false);
             connection.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
             connection.setReadOnly(true);
-            for (var table : TABLES.entrySet()) {
-                String name = table.getKey(), key = table.getValue();
+            for (var table : source.tables()) {
+                String name = table.name(), key = SourceRow.primary(table).name();
+                boolean integerKey = SourceRow.primary(table).type().equals("integer");
                 MessageDigest digest = MessageDigest.getInstance("SHA-256");
                 long count = 0;
                 List<Path> tableFiles = new ArrayList<>();
@@ -75,10 +74,13 @@ public final class PgBaselineExport {
                     statement.setFetchSize(8192);
                     try (ResultSet rows =
                             statement.executeQuery(
-                                    "SELECT ctid::text AS _sib_pg_tid, * FROM "
+                                    "SELECT ctid::text AS _sib_pg_tid, * FROM \""
                                             + name
-                                            + " ORDER BY "
-                                            + key)) {
+                                            + "\" ORDER BY \""
+                                            + key
+                                            + "\""
+                                            // Same C ordering PgBaselineVerify applies to text keys.
+                                            + (integerKey ? "" : " COLLATE \"C\""))) {
                         ResultSetMetaData columns = rows.getMetaData();
                         StringBuilder schemaText = new StringBuilder("message " + name + " { ");
                         for (int col = 2; col <= columns.getColumnCount(); col++) {
@@ -114,10 +116,11 @@ public final class PgBaselineExport {
                         TableData descriptor = new TableData(name, 0, rowId, key, schema, null);
                         ParquetDataFile writer = null;
                         Path path = null;
-                        long fileRows = 0, firstKey = 0, lastKey = 0;
+                        long fileRows = 0;
+                        Object firstKey = null, lastKey = null;
                         try {
                             while (rows.next()) {
-                                long pk = rows.getLong(key);
+                                Object pk = integerKey ? (Object) rows.getLong(key) : rows.getString(key);
                                 lastKey = pk;
                                 if (writer == null) {
                                     path =
@@ -276,8 +279,8 @@ public final class PgBaselineExport {
             String key,
             long id,
             long rows,
-            long first,
-            long last,
+            Object first,
+            Object last,
             long maxRows)
             throws Exception {
         var footer = writer.finish();

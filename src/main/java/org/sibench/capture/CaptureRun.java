@@ -34,6 +34,10 @@ final class CaptureRun implements AutoCloseable {
     private final boolean nativeHtap;
 
     private CaptureRun(Path directory, boolean nativeHtap) throws IOException {
+        this(directory, nativeHtap, nativeHtap ? "runhtap" : "tp_subset");
+    }
+
+    private CaptureRun(Path directory, boolean nativeHtap, String mode) throws IOException {
         this.nativeHtap = nativeHtap;
         this.directory = directory.toAbsolutePath().normalize();
         Files.createDirectories(this.directory);
@@ -43,7 +47,7 @@ final class CaptureRun implements AutoCloseable {
                         "Capture directory already contains a runtime; use a fresh run");
         }
         manifest.put("schema_version", 1);
-        manifest.put("native_mode", nativeHtap ? "runhtap" : "tp_subset");
+        manifest.put("native_mode", mode);
         manifest.put("status", "running");
         manifest.put("started_at", Instant.now().toString());
         Files.writeString(this.directory.resolve(MANIFEST), json(), StandardOpenOption.CREATE_NEW);
@@ -56,6 +60,17 @@ final class CaptureRun implements AutoCloseable {
     static synchronized CaptureRun begin(Path directory, boolean nativeHtap) throws IOException {
         if (active != null) throw new IOException("A capture is already active");
         CaptureRun run = new CaptureRun(directory, nativeHtap);
+        active = run;
+        return run;
+    }
+
+    /**
+     * A run whose native client is a separate process (YCSB, sysbench). The client's sessions are
+     * discovered in the directory once it has exited; see {@link #completeExternal}.
+     */
+    static synchronized CaptureRun beginExternal(Path directory, String mode) throws IOException {
+        if (active != null) throw new IOException("A capture is already active");
+        CaptureRun run = new CaptureRun(directory, true, mode);
         active = run;
         return run;
     }
@@ -78,6 +93,28 @@ final class CaptureRun implements AutoCloseable {
     static void recordFailure(Throwable error, Map<String, ?> context) {
         CaptureRun run = active;
         if (run != null) run.fail(error, context);
+        else recordExternalFailure(error, context);
+    }
+
+    /**
+     * A native client runs in its own JVM, where no CaptureRun is active; its failures are left as
+     * files in the capture directory for the controlling run to find.
+     */
+    private static void recordExternalFailure(Throwable error, Map<String, ?> context) {
+        String directory = System.getProperty("sibench.capture.directory");
+        if (directory == null) return;
+        Map<String, Object> details = new LinkedHashMap<>(context);
+        details.put("type", error.getClass().getName());
+        details.put("message", error.getMessage());
+        try {
+            Files.writeString(
+                    Path.of(directory)
+                            .resolve("capture-failure-" + ProcessHandle.current().pid() + ".json"),
+                    new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(details),
+                    StandardOpenOption.CREATE_NEW);
+        } catch (IOException ignored) {
+            // The client already fails; the missing marker is detected by its absent sessions.
+        }
     }
 
     static void checkFailure() throws Exception {
@@ -133,6 +170,87 @@ final class CaptureRun implements AutoCloseable {
         } catch (Exception | Error error) {
             fail(error, Map.of("operation", "complete_capture"));
             throw error;
+        }
+    }
+
+    /**
+     * Pairs every server session with the JDBC trace of the same backend, when the client had one,
+     * and audits each session once. {@code bindings} requires runtime keys to be client-bound.
+     */
+    void completeExternal(boolean bindings, Map<String, Object> client) throws Exception {
+        try {
+            checkFailure();
+            try (var failures = Files.list(directory)) {
+                var names =
+                        failures.map(p -> p.getFileName().toString())
+                                .filter(n -> n.startsWith("capture-failure-"))
+                                .sorted()
+                                .toList();
+                if (!names.isEmpty())
+                    throw new IOException("Native client reported capture failures: " + names);
+            }
+            var clients = new java.util.TreeMap<Integer, Path>();
+            var servers = new java.util.TreeMap<Integer, Path>();
+            try (var paths = Files.list(directory)) {
+                for (Path path : paths.sorted().toList()) {
+                    String name = path.getFileName().toString();
+                    if (name.startsWith("jdbc-") && name.endsWith(".jsonl")) {
+                        int pid = connectionPid(path);
+                        if (clients.put(pid, path) != null)
+                            throw new IOException("Several JDBC traces for backend " + pid);
+                    } else if (name.startsWith("pg-") && name.endsWith(".jsonl")) {
+                        servers.put(
+                                Integer.parseInt(name.substring(3, name.length() - ".jsonl".length())),
+                                path);
+                    }
+                }
+            }
+            if (servers.isEmpty()) throw new IOException("Native client produced no server trace");
+            var records = new java.util.ArrayList<Map<String, Object>>();
+            for (var entry : servers.entrySet()) {
+                Path server = entry.getValue(), jdbcTrace = clients.remove(entry.getKey());
+                var record = new LinkedHashMap<String, Object>();
+                if (jdbcTrace != null) {
+                    record.put("jdbc_file", jdbcTrace.getFileName().toString());
+                    record.put("jdbc_sha256", BaselineGenerator.sha256(jdbcTrace));
+                }
+                record.put("pg_file", server.getFileName().toString());
+                record.put("pg_sha256", BaselineGenerator.sha256(server));
+                record.put("bindings", bindings);
+                record.put(
+                        "audit",
+                        jdbcTrace != null
+                                ? RequestCaptureAudit.audit(jdbcTrace, server, true, bindings)
+                                : ServerCaptureAudit.audit(server));
+                records.add(record);
+            }
+            if (!clients.isEmpty())
+                throw new IOException("JDBC traces without a server trace: " + clients.values());
+            var inventory = new java.util.HashSet<String>();
+            for (var record : records) {
+                inventory.add((String) record.get("pg_file"));
+                if (record.containsKey("jdbc_file")) inventory.add((String) record.get("jdbc_file"));
+            }
+            verifyInventory(directory, inventory);
+            manifest.put("sessions", records);
+            manifest.put("client", client);
+            manifest.put("completed_at", Instant.now().toString());
+            manifest.put("status", "complete");
+            publish();
+        } catch (Exception | Error error) {
+            fail(error, Map.of("operation", "complete_capture"));
+            throw error;
+        }
+    }
+
+    private static int connectionPid(Path jdbc) throws IOException {
+        try (var input = Files.newBufferedReader(jdbc)) {
+            String line = input.readLine();
+            if (line == null) throw new IOException("Empty JDBC trace: " + jdbc.getFileName());
+            JsonObject first = JsonParser.parseString(line).getAsJsonObject();
+            if (!first.get("event").getAsString().equals("connection"))
+                throw new IOException("JDBC trace does not start with its connection");
+            return first.get("pid").getAsInt();
         }
     }
 
@@ -206,76 +324,58 @@ final class CaptureRun implements AutoCloseable {
         raw = raw.toAbsolutePath().normalize();
         Path directory = Files.isDirectory(raw) ? raw : raw.getParent();
         Path manifestPath = directory.resolve(MANIFEST);
-        if (Files.exists(manifestPath)) {
-            JsonObject doc =
-                    JsonParser.parseString(Files.readString(manifestPath)).getAsJsonObject();
-            if (!doc.get("status").getAsString().equals("complete"))
-                throw new IOException("Capture is failed or incomplete; fix the cause and rerun");
-            if (doc.has("sessions")) {
-                var inventory = new java.util.HashSet<String>();
-                for (var item : doc.getAsJsonArray("sessions")) {
-                    var session = item.getAsJsonObject();
-                    if (!inventory.add(session.get("pg_file").getAsString())
-                            || !inventory.add(session.get("jdbc_file").getAsString()))
-                        throw new IOException("Duplicate capture session files");
-                }
-                if (inventory.isEmpty()) throw new IOException("Empty HTAP capture");
-                verifyInventory(directory, inventory);
-                for (var item : doc.getAsJsonArray("sessions")) {
-                    var session = item.getAsJsonObject();
-                    Path server = checkedPath(directory, session.get("pg_file").getAsString());
-                    Path client = checkedPath(directory, session.get("jdbc_file").getAsString());
-                    if (!BaselineGenerator.sha256(server).equals(session.get("pg_sha256").getAsString())
-                            || !BaselineGenerator.sha256(client).equals(session.get("jdbc_sha256").getAsString()))
-                        throw new IOException("HTAP capture changed after completion");
-                    RequestCaptureAudit.audit(client, server, true);
-                }
-                String rawName = raw.getFileName().toString();
-                if (!raw.equals(directory) && !doc.getAsJsonArray("sessions").asList().stream()
-                        .anyMatch(e -> e.getAsJsonObject().get("pg_file").getAsString()
-                                .equals(rawName)))
-                    throw new IOException("Trace is not part of completed HTAP capture");
-                return;
+        if (!Files.exists(manifestPath))
+            throw new IOException("Capture has no run manifest: " + manifestPath);
+        JsonObject doc =
+                JsonParser.parseString(Files.readString(manifestPath)).getAsJsonObject();
+        if (!doc.get("status").getAsString().equals("complete"))
+            throw new IOException("Capture is failed or incomplete; fix the cause and rerun");
+        if (doc.has("sessions")) {
+            var inventory = new java.util.HashSet<String>();
+            for (var item : doc.getAsJsonArray("sessions")) {
+                var session = item.getAsJsonObject();
+                if (!inventory.add(session.get("pg_file").getAsString())
+                        || session.has("jdbc_file")
+                                && !inventory.add(session.get("jdbc_file").getAsString()))
+                    throw new IOException("Duplicate capture session files");
             }
-            if (!raw.getFileName().toString().equals(doc.get("pg_file").getAsString())
-                    || !BaselineGenerator.sha256(raw).equals(doc.get("pg_sha256").getAsString()))
-                throw new IOException("PG trace does not match the completed capture");
-            String jdbcName = doc.get("jdbc_file").getAsString();
-            if (!Path.of(jdbcName).getFileName().toString().equals(jdbcName))
-                throw new IOException("Invalid JDBC trace path");
-            Path jdbc = directory.resolve(jdbcName);
-            if (!BaselineGenerator.sha256(jdbc).equals(doc.get("jdbc_sha256").getAsString()))
-                throw new IOException("JDBC trace changed after capture completion");
-            RequestCaptureAudit.audit(jdbc, raw);
+            if (inventory.isEmpty()) throw new IOException("Empty HTAP capture");
+            verifyInventory(directory, inventory);
+            for (var item : doc.getAsJsonArray("sessions")) {
+                var session = item.getAsJsonObject();
+                Path server = checkedPath(directory, session.get("pg_file").getAsString());
+                if (!BaselineGenerator.sha256(server).equals(session.get("pg_sha256").getAsString()))
+                    throw new IOException("Capture changed after completion");
+                if (!session.has("jdbc_file")) {
+                    ServerCaptureAudit.audit(server);
+                    continue;
+                }
+                Path client = checkedPath(directory, session.get("jdbc_file").getAsString());
+                if (!BaselineGenerator.sha256(client).equals(session.get("jdbc_sha256").getAsString()))
+                    throw new IOException("Capture changed after completion");
+                RequestCaptureAudit.audit(
+                        client,
+                        server,
+                        true,
+                        session.has("bindings") && session.get("bindings").getAsBoolean());
+            }
+            String rawName = raw.getFileName().toString();
+            if (!raw.equals(directory) && !doc.getAsJsonArray("sessions").asList().stream()
+                    .anyMatch(e -> e.getAsJsonObject().get("pg_file").getAsString()
+                            .equals(rawName)))
+                throw new IOException("Trace is not part of completed HTAP capture");
             return;
         }
-        // Existing evidence predates run manifests; require its actual paired JDBC trace.
-        int pid;
-        try (var input = Files.newBufferedReader(raw)) {
-            String line = input.readLine();
-            if (line == null) throw new IOException("Empty PG trace");
-            pid = JsonParser.parseString(line).getAsJsonObject().get("pid").getAsInt();
-        }
-        Path match = null;
-        try (var paths = Files.list(directory)) {
-            for (Path candidate :
-                    paths.filter(p -> p.getFileName().toString().startsWith("jdbc-"))
-                            .sorted()
-                            .toList()) {
-                try (var input = Files.newBufferedReader(candidate)) {
-                    String line = input.readLine();
-                    if (line == null) continue;
-                    JsonObject connection = JsonParser.parseString(line).getAsJsonObject();
-                    if (connection.get("event").getAsString().equals("connection")
-                            && connection.get("pid").getAsInt() == pid) {
-                        if (match != null) throw new IOException("Ambiguous JDBC capture");
-                        match = candidate;
-                    }
-                }
-            }
-        }
-        if (match == null) throw new IOException("Paired JDBC trace required for legacy capture");
-        RequestCaptureAudit.audit(match, raw);
+        if (!raw.getFileName().toString().equals(doc.get("pg_file").getAsString())
+                || !BaselineGenerator.sha256(raw).equals(doc.get("pg_sha256").getAsString()))
+            throw new IOException("PG trace does not match the completed capture");
+        String jdbcName = doc.get("jdbc_file").getAsString();
+        if (!Path.of(jdbcName).getFileName().toString().equals(jdbcName))
+            throw new IOException("Invalid JDBC trace path");
+        Path jdbc = directory.resolve(jdbcName);
+        if (!BaselineGenerator.sha256(jdbc).equals(doc.get("jdbc_sha256").getAsString()))
+            throw new IOException("JDBC trace changed after capture completion");
+        RequestCaptureAudit.audit(jdbc, raw);
     }
 
     private static Path checkedPath(Path directory, String name) throws IOException {

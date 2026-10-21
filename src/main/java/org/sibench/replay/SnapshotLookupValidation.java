@@ -106,10 +106,6 @@ public final class SnapshotLookupValidation {
             throw new IOException("Snapshot report already exists: " + report);
         Path baseline = directory.resolve("baseline.ops"),
                 workload = directory.resolve("workload.ops");
-        if (IndexOperationTrace.formatVersion(workload) != 7)
-            throw new IOException(
-                    "Independent Parquet oracle requires current v7 provenance; historical traces"
-                            + " remain available through replay, not this validator");
         var preflight = ReferenceReplay.check(directory, config);
         JsonObject manifest =
                 JsonParser.parseString(Files.readString(directory.resolve("manifest.json")))

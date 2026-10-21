@@ -522,6 +522,7 @@ public final class IndexTraceCompiler {
                                 "executor_run_end",
                                 "scan_next",
                                 "bitmap_end",
+                                "plan_scan",
                                 "result_row")
                         .contains(type)) {
                     throw new IOException("Unsupported raw event: " + type);

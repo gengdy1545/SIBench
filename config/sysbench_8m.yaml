@@ -1,0 +1,54 @@
+schema_version: 1
+purpose: native_capture_poc
+benchmark: sysbench
+source:
+  path: benchmark/sysbench
+  commit: 3ceba0b1e115f8c50d1d045a4574d8ed643bd497
+native:
+  # 8 tables x 1,088,250 rows = 8,706,000 rows: the HyBench SF1 baseline row count and table count.
+  tables: 8
+  table-size: 1088250
+  secondary: false
+  create-secondary: true
+  auto-inc: true
+  rand-seed: 20261019
+  rand-type: uniform
+  # One captured thread; prepare fills different tables in parallel.
+  threads: 1
+  prepare_threads: 8
+  timeout_minutes: 360
+  build_directory: build/benchmarks/sysbench
+  binary: src/sysbench
+  # Upstream Lua scripts run in this order on the same tables; each is a separate client process.
+  # Upstream Lua scripts run in this order on the same tables; each is a separate client process.
+  # Event counts give about 60k committed row changes in total, the order of the HyBench TP subset.
+  workloads:
+    oltp_read_write: {events: 8000}
+    oltp_update_index: {events: 10000}
+    oltp_update_non_index: {events: 10000}
+    oltp_delete: {events: 5000}
+    oltp_insert: {events: 5000}
+    oltp_point_select: {events: 20000}
+postgres:
+  schema: public
+  version: '14.24'
+  port: 55433
+  database: sibench_sysbench_8m_capture
+  user: postgres
+  isolation: read_committed
+  max_parallel_workers_per_gather: 0
+capture:
+  mode: instrumented_native_execution
+  application_prefix: 'sibench:'
+  raw_directory: results/poc/sysbench-8m/raw
+  allow_event_loss: false
+  statement_results: server_rows_and_consumed_rows
+data_layout:
+  target_file_size_bytes: 268435456
+  row_group_max_rows: 1048576
+  row_group_buffer_bytes: 67108864
+  page_size_bytes: 1048576
+  compression: zstd
+  compression_level: 3
+artifacts:
+  directory: results/poc/sysbench-8m

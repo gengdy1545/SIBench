@@ -300,7 +300,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         report.put("dispatched_operations", dispatched);
         report.put("filtered_secondary_operations", filtered);
         report.put("committed_transactions", transactions);
-        report.put("change_delivery", sourceTransactions ? "committed_only" : "baseline_or_legacy");
+        report.put("change_delivery", sourceTransactions ? "committed_only" : "baseline");
         report.put("transaction_control_records", controls);
         report.put("dispatch_mode", dispatchMode);
         report.put("source_dispatch_groups", groups);

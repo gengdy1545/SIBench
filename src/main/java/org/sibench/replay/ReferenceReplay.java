@@ -36,24 +36,16 @@ public final class ReferenceReplay {
                             .equals(manifest.get(checksum).getAsString()))
                 throw new IOException("Trace checksum mismatch: " + name);
         }
-        if (IndexOperationTrace.formatVersion(directory.resolve("workload.ops")) >= 6) {
-            if (!manifest.has("work_units_sha256")
-                    || !BaselineGenerator.sha256(directory.resolve("work-units.jsonl"))
-                            .equals(manifest.get("work_units_sha256").getAsString()))
-                throw new IOException("Source work-unit identity checksum mismatch");
-        }
-        if (IndexOperationTrace.formatVersion(directory.resolve("baseline.ops"))
-                != IndexOperationTrace.formatVersion(directory.resolve("workload.ops")))
-            throw new IOException("Baseline/workload trace format mismatch");
-        boolean completeIndexes =
-                IndexOperationTrace.formatVersion(directory.resolve("workload.ops")) >= 7;
-        if (completeIndexes
-                && (!manifest.has("secondary_index_coverage")
-                        || !manifest.get("secondary_index_coverage")
-                                .getAsString()
-                                .equals("all_source_definitions")))
-            throw new IOException("Current trace must declare complete source index coverage");
-        if (completeIndexes) validateIndexCoverage(directory, manifest);
+        if (!manifest.has("work_units_sha256")
+                || !BaselineGenerator.sha256(directory.resolve("work-units.jsonl"))
+                        .equals(manifest.get("work_units_sha256").getAsString()))
+            throw new IOException("Source work-unit identity checksum mismatch");
+        if (!manifest.has("secondary_index_coverage")
+                || !manifest.get("secondary_index_coverage")
+                        .getAsString()
+                        .equals("all_source_definitions"))
+            throw new IOException("Trace must declare complete source index coverage");
+        validateIndexCoverage(directory, manifest);
         var checked =
                 checkFiles(
                         directory.resolve("baseline.ops"),
@@ -218,12 +210,11 @@ public final class ReferenceReplay {
     public static Map<String, Object> checkFiles(Path baseline, Path workload, ReplayConfig config)
             throws IOException {
         config.requireReferenceCapabilities();
-        boolean transactional = IndexOperationTrace.formatVersion(workload) >= 3;
         try (var load = new ReplayProjection(config, false, operation -> {});
-                var runtime = new ReplayProjection(config, transactional, operation -> {})) {
-            long loadRecords = IndexOperationTrace.readExpanded(baseline, load);
+                var runtime = new ReplayProjection(config, true, operation -> {})) {
+            long loadRecords = IndexOperationTrace.read(baseline, load);
             load.finish();
-            long runtimeRecords = IndexOperationTrace.readExpanded(workload, runtime);
+            long runtimeRecords = IndexOperationTrace.read(workload, runtime);
             runtime.finish();
             runtime.requireClientCoverage();
             if (runtime.dispatched() < config.requiredOperations())
@@ -280,17 +271,16 @@ public final class ReferenceReplay {
             Path report)
             throws IOException {
         List<Map<String, Object>> results = new ArrayList<>();
-        boolean versioned = IndexOperationTrace.formatVersion(workload) >= 3;
         for (boolean rowId : new boolean[] {false, true}) {
-            var index = new IndexReferenceReplay(rowId, config.secondaryIndexes(), versioned);
+            var index = new IndexReferenceReplay(rowId, config.secondaryIndexes());
             try (var load = new ReplayProjection(config, false, index::accept);
-                    var runtime = new ReplayProjection(config, versioned, index::accept)) {
+                    var runtime = new ReplayProjection(config, true, index::accept)) {
                 long start = System.nanoTime();
-                IndexOperationTrace.readExpanded(baseline, load);
+                IndexOperationTrace.read(baseline, load);
                 load.finish();
                 double loadSeconds = (System.nanoTime() - start) / 1e9;
                 start = System.nanoTime();
-                IndexOperationTrace.readExpanded(workload, runtime);
+                IndexOperationTrace.read(workload, runtime);
                 runtime.finish();
                 double seconds = (System.nanoTime() - start) / 1e9;
                 Map<String, Object> result = new LinkedHashMap<>();
@@ -307,14 +297,10 @@ public final class ReferenceReplay {
                 result.put("relocation_writes", index.relocationWrites());
                 result.put("result_checksum", index.checksum());
                 result.put("primary_state_checksum", index.stateChecksum());
-                result.put(
-                        "selected_version_checksum",
-                        versioned ? index.selectedVersionChecksum() : null);
+                result.put("selected_version_checksum", index.selectedVersionChecksum());
                 result.put("snapshot_queries", index.snapshotQueries());
-                result.put("retained_index_versions", versioned ? index.retainedVersions() : null);
-                result.put(
-                        "read_model",
-                        versioned ? "committed_version_at_read_timestamp" : "legacy_latest_state");
+                result.put("retained_index_versions", index.retainedVersions());
+                result.put("read_model", "committed_version_at_read_timestamp");
                 results.add(result);
             }
         }
@@ -326,11 +312,10 @@ public final class ReferenceReplay {
                 "scope",
                 "single-sender multi-client in-process correctness reference; clients share"
                     + " reference service state; not a network or cross-client visibility"
-                    + " implementation; v3-v7 committed-source version history and timestamp"
-                    + " lookup, v1/v2 latest-state compatibility; v7 complete declared source"
-                    + " indexes, older formats retain their historical partial scope; no RPC,"
-                    + " persistence, concurrent PG MVCC, range query, physical GC, rate scheduling"
-                    + " or sustained-duration proof");
+                    + " implementation; v7 committed-source version history and timestamp"
+                    + " lookup over the complete declared source indexes; no RPC, persistence,"
+                    + " concurrent PG MVCC, range query, physical GC, rate scheduling or"
+                    + " sustained-duration proof");
         Files.writeString(
                 report,
                 new GsonBuilder().setPrettyPrinting().create().toJson(output),

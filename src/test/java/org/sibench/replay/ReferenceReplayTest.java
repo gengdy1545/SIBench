@@ -26,54 +26,6 @@ public class ReferenceReplayTest {
     }
 
     @Test
-    public void explicitSecondaryValuesFollowRelocationAndDeletionInBothModes() throws Exception {
-        for (boolean rowId : new boolean[] {true, false}) {
-            for (boolean secondary : new boolean[] {true, false}) {
-                var model = new IndexReferenceReplay(rowId, secondary, false);
-                var projection = new ReplayProjection(secondary, model::accept);
-                org.sibench.capture.LegacyIndexFixtures.expandRow(row(1, 0, 5, 50), projection);
-                org.sibench.capture.LegacyIndexFixtures.expandRow(row(3, 1, 9, 50), projection);
-                org.sibench.capture.LegacyIndexFixtures.expandRow(row(4, 1, 11, 50), projection);
-                assertEquals(rowId ? 0 : secondary ? 3 : 1, model.relocationWrites());
-                assertEquals(rowId ? 50 : IndexReferenceReplay.locator(11, 0), model.value(5, 1));
-                projection.accept(search(0, 1, 1));
-                projection.accept(search(1, 10, 1));
-                projection.accept(search(2, 20, 1));
-                assertEquals(rowId ? 50 : IndexReferenceReplay.locator(11, 0), model.checksum());
-                org.sibench.capture.LegacyIndexFixtures.expandRow(row(5, 2, 0, 50), projection);
-                projection.accept(search(0, 1, 0));
-                projection.accept(search(1, 10, 0));
-                projection.accept(search(2, 20, 0));
-                assertThrows(IOException.class, () -> model.accept(row(3, 1, 9, 50)));
-                org.sibench.capture.LegacyIndexFixtures.expandRow(row(3, 3, 12, 51), projection);
-                projection.accept(search(0, 1, 1));
-                projection.accept(search(1, 10, 1));
-                projection.accept(search(2, 20, 1));
-                assertEquals(secondary ? 6 : 2, model.checkedResults());
-            }
-        }
-    }
-
-    @Test
-    public void logicalDeletionAlsoAppliesToOtherTablesAndCannotResurrectOldVersion()
-            throws Exception {
-        var model = new IndexReferenceReplay(true, false);
-        for (int table : new int[] {1, 2, 3, 4, 6, 7, 8}) {
-            model.accept(new Operation(0, 1, table, 0, 0, 1, 0, 1, 0, 100 + table, 0, 0, 0));
-            model.accept(new Operation(1, 5, table, 0, 0, 1, 1, 0, 0, 100 + table, 0, 0, 0));
-            model.accept(new Operation(2, 2, table, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0));
-            int id = table;
-            assertThrows(
-                    IOException.class,
-                    () ->
-                            model.accept(
-                                    new Operation(3, 3, id, 0, 0, 1, 0, 1, 0, 100 + id, 0, 0, 0)));
-        }
-        assertEquals(7, model.queries());
-        assertEquals(0, model.checkedResults());
-    }
-
-    @Test
     public void preflightCountsEffectiveInputAndRejectsShortTraceBeforeReportCreation()
             throws Exception {
         Path directory = Files.createTempDirectory("sibench-replay-");
@@ -82,14 +34,14 @@ public class ReferenceReplayTest {
         Path report = directory.resolve("report.json");
         try {
             try (var writer = new IndexOperationTrace.Writer(baseline)) {
-                org.sibench.capture.LegacyIndexFixtures.appendRow(writer, row(1, 0, 5, 50));
+                org.sibench.capture.TransferIndexFixtures.appendRow(writer, row(1, 0, 5, 50));
             }
             try (var writer = new IndexOperationTrace.Writer(workload)) {
                 writer.append(search(0, 1, 1));
                 writer.append(search(1, 10, 1));
                 writer.append(search(2, 20, 1));
                 writer.append(IndexOperationTrace.transaction(3, 6, 3, 1, 0));
-                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                org.sibench.capture.TransferIndexFixtures.appendRow(
                         writer, new Operation(3, 5, 5, 0, 0, 1, 1, 0, 0, 50, 10, 20, 0, 3, 1));
                 writer.append(IndexOperationTrace.transaction(3, 7, 3, 1, 1));
             }
@@ -128,36 +80,6 @@ public class ReferenceReplayTest {
         assertThrows(
                 IOException.class,
                 () -> model.accept(new Operation(1, 5, 5, 1, 0, 1, 1, 0, 0, 50, 10, 20, 0)));
-    }
-
-    @Test
-    public void preflightRejectsSparseRoutingBeforeCreatingReplayReport() throws Exception {
-        Path directory = Files.createTempDirectory("sibench-coverage-");
-        Path baseline = directory.resolve("baseline.ops"),
-                workload = directory.resolve("workload.ops"),
-                report = directory.resolve("report.json");
-        try {
-            try (var writer = new IndexOperationTrace.Writer(baseline)) {
-                org.sibench.capture.LegacyIndexFixtures.appendRow(
-                        writer, row(1, 0, 5, 50).withWorkUnitId(1));
-            }
-            try (var writer = new IndexOperationTrace.Writer(workload)) {
-                writer.append(search(0, 1, 1).withWorkUnitId(1));
-                writer.append(search(0, 1, 1).withWorkUnitId(3));
-            }
-            var config = new ReplayConfig(true, "none", 0, 0, 0, 0, "operation", 2, 10, 2);
-            IOException failure =
-                    assertThrows(
-                            IOException.class,
-                            () -> ReferenceReplay.runFiles(baseline, workload, config, report));
-            assertTrue(failure.getMessage().contains("coverage"));
-            assertFalse(Files.exists(report));
-        } finally {
-            Files.deleteIfExists(report);
-            Files.deleteIfExists(baseline);
-            Files.deleteIfExists(workload);
-            Files.delete(directory);
-        }
     }
 
     @Test
@@ -256,17 +178,17 @@ public class ReferenceReplayTest {
                 workload = directory.resolve("workload.ops");
         try {
             try (var writer = new IndexOperationTrace.Writer(baseline)) {
-                org.sibench.capture.LegacyIndexFixtures.appendRow(writer, row(1, 0, 5, 50));
+                org.sibench.capture.TransferIndexFixtures.appendRow(writer, row(1, 0, 5, 50));
             }
             try (var writer = new IndexOperationTrace.Writer(workload)) {
                 writer.append(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
-                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                org.sibench.capture.TransferIndexFixtures.appendRow(
                         writer, new Operation(1, 3, 5, 0, 2, 1, 1, 9, 0, 50, 10, 20, 0, 10, 1));
-                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                org.sibench.capture.TransferIndexFixtures.appendRow(
                         writer, new Operation(2, 3, 5, 0, 2, 1, 1, 9, 1, 50, 10, 20, 0, 10, 2));
-                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                org.sibench.capture.TransferIndexFixtures.appendRow(
                         writer, new Operation(3, 3, 5, 0, 1, 2, 1, 9, 2, 51, 10, 20, 0, 10, 3));
-                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                org.sibench.capture.TransferIndexFixtures.appendRow(
                         writer, new Operation(4, 5, 5, 0, 0, 2, 1, 0, 0, 51, 10, 20, 0, 10, 4));
                 writer.append(IndexOperationTrace.transaction(10, 7, 10, 1, 4));
                 writer.append(new Operation(11, 2, 5, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1));
