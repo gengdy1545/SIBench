@@ -13,6 +13,9 @@ scale:
 native:
   tables: 100
   table-size: 10000000
+  secondary: false
+  create-secondary: true
+  auto-inc: true
   rand-seed: 20261019
   rand-type: uniform
 data_layout:

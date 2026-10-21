@@ -23,9 +23,11 @@ java -jar build/sibench/sibench.jar prepare --dry-run config/ycsb_large.yaml
 
 ## 增量适配边界
 
+来源 catalog 固定采用上游 `JdbcDBCreateTable`：`YCSB_KEY VARCHAR PRIMARY KEY`，配置数量的 FIELD 列为 TEXT，无二级索引；不使用 FIELD 为 VARCHAR 的 SQL 模板。已提供独立只读 PG 预检，见 [来源 Schema 契约](../contracts/source-schema.md)；原生采集入口接入仍待实现。
+
 原生 A–F 的 read、update、insert、scan、read-modify-write 比例及分布需要在增量实现中保留或明确标为派生负载。标准 A–F 不产生 delete。scan 使用起始键与数量上限，不能将结束键推导为数值起点加数量。read-modify-write 是多个 API 调用，不能默认具有事务原子性。
 
-当前只实现派生 Baseline；使用 binary 字段和固定随机流替代 ThreadLocalRandom，不增加全量 hashed key 去重。该来源产物与容量尚未验证，原生增量采集与索引回放待实现。
+数据生成目前仅实现派生 Baseline；使用 binary 字段和固定随机流替代 ThreadLocalRandom，不增加全量 hashed key 去重。该来源产物与容量尚未验证，原生增量采集与索引回放待实现；schema catalog 与独立 PG 预检不替代这些验收。
 
 ## 源码入口
 

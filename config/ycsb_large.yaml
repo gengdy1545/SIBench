@@ -11,6 +11,8 @@ scale:
   calibration_status: pending
   total_rows: 1000000000
 native:
+  table: usertable
+  jdbc_table_creator: JdbcDBCreateTable
   recordcount: 1000000000
   insertstart: 0
   insertcount: 1000000000

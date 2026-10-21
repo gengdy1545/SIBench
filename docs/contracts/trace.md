@@ -4,7 +4,9 @@
 
 原始层保存一次实际执行的请求、参数、结果、索引候选、行变更和提交/回滚。规范层只转换已声明支持的索引操作，保留源事件关联，不重执行 SQL 推测结果。PG 页分裂、HOT、VACUUM 等内部实现不转换为下游 KV 算法。
 
-默认原生执行为 HyBench `runHTAP`，保存 AP/TP/并发 AT-IQ 的多会话采集，行变化触发器覆盖八表。当前 v6 **规范投影**仍限于显式单会话 TP 子集：8 表主键加载、savingaccount 主键查询/修改、transfer 两个 sourceid/targetid 二级索引；支持已提交事务内的写后查询和多 client 路由。HTAP 不套用单会话提交顺序，未支持的事件或可见性拒绝转换。覆盖见 [HTAP 验证](../validation/hybench-sf1-htap.md)、[TP 子集验证](../validation/hybench-sf1-poc.md) 和 [保序发送验证](../validation/committed-change-delivery.md)。
+采集及 Baseline export 前按 [来源 Schema 契约](source-schema.md) 核对实际 PG 表、完整列及全部主键 / 二级索引与固定源码和配置一致。检查只读，不补建或修复环境；原生运行保存预检结果，旧历史产物不补造此证据。三来源 catalog 支持与各自规范 Trace 支持分别验收。
+
+默认原生执行为 HyBench `runHTAP`，保存 AP/TP/并发 AT-IQ 的多会话采集，行变化触发器覆盖八表。当前 v7 **规范投影**仍限于单会话、单列等值扫描，但索引维护覆盖固定 DDL 的八表主键及全部 13 个二级索引，支持索引列值 UPDATE、DELETE / 重插入、已提交事务写后查询及多 client 路由。维护覆盖完整不代表访问投影完整：HTAP 不套用单会话提交顺序，未支持的谓词或可见性拒绝转换。原生 HTAP 的逐行因果维护审计不生成全局提交版本，也不替代完整 HTAP 回放。
 
 `CapturePoc pack` 将 HTAP PG 原始事件写入 64 字节 access 记录及无损 `payload.jsonl`；块使用 CRC32C，输入及输出保存 SHA256。事件码 1–15 不变，16 为 `executor_run_end`，记录执行器返回的事实；`executor_end` 是清理生命周期事件，关闭连接时可能没有该事件。按文件名排序保留各会话内部顺序，不声明全局提交顺序或 KV 回放语义。
 
@@ -17,7 +19,8 @@ Locator      = (FileID, FileRowPosition)
 LogicalValue = RowID
 ```
 
-- IndexID=0 为主键，transfer 的 1/2 为 sourceid/targetid。二级非唯一谓词是前缀查询，不改为一次 PK Get。
+- IndexID=0 为主键；TableID 按八表固定契约分配，二级 IndexID 按每表源 `CREATE INDEX` 顺序分配。`IndexCatalog` 读取固定源码 `ddl_pg.sql` / `create_index_pg.sql`；manifest 保存完整定义及源文件 SHA256，预检逐项核对，不接受自声明的部分清单。transfer 的 1/2/3 分别是 sourceid/targetid/type。二级非唯一谓词是前缀查询，不改为一次 PK Get。
+- 索引值规范化：int 为十进制 int64，timestamp 为无时区 `LocalDateTime` 文本，CHAR 仅去掉尾部 ASCII 空格，VARCHAR 保留原文。null 单独编码，不与空字符串或 `"null"` 混同。这里只支持等值语义，不声明文本字节序就是 PostgreSQL collation 或范围顺序；原生 null 扫描谓词当前拒绝，null 维护及派生核验支持。
 - CommitVersion 由 SIBench 按原始单会话每次提交顺序递增，包括只读提交，Baseline=0；同事务所有修改一致。不使用业务 timestamp、墙钟、XID 大小或下游完成顺序。
 - 回滚不推进 CommitVersion，不分配 RowID，不改变已提交索引状态，也不写入增量 Parquet。后续事务从最近的已提交状态继续。
 - transactionId 是源提交事件序号。修改的 mutationOrdinal 是事务内行修改序号，二级展开共享序号；组内查询携带同一 transactionId，mutationOrdinal 表示查询前已发生的行修改数。两者只用于来源关联和顺序校验，不作为 KV 版本后缀，不要求索引维护事务状态。
@@ -39,7 +42,7 @@ LogicalValue = RowID
 
 ## 当前二进制格式
 
-v6 使用 120 字节记录、每块 4096 条、little-endian 和 CRC32C；在原 112 字节字段后追加 int64 `workUnitId`。控制记录使用 0，编译生成的运行期/加载操作使用正数。字段由 `IndexOperationTrace` 编解码，组边界、查询位置和展开顺序由 `ReplayProjection` 校验。
+v7 使用 132 字节固定前缀加可空 UTF-8 索引值，每块最多 4096 条、little-endian 和 CRC32C。在 v6 的 120 字节字段后增加 int32 `expansionPosition`、`expansionSize`、`indexedValueLength`；长度 -1 表示 null，0 表示空串，最大支持 32,768 字节。解码拒绝损坏长度、非法 UTF-8 和尾部多余字节。`workUnitId` 对控制记录为 0，编译生成的运行期/加载操作为正数。
 
 | 操作 | 语义 |
 | --- | --- |
@@ -50,11 +53,15 @@ v6 使用 120 字节记录、每块 4096 条、little-endian 和 CRC32C；在原
 | RELOCATE | 更新完整索引键的确切版本位置；删除或不存在版本拒绝 |
 | TRANSACTION_BEGIN / COMMIT | 已提交源事务的操作组边界，TableID=0；仅驱动消费，不发送给目标索引 |
 
-非 SEARCH 的 readTimestamp=-1。transfer 每行展开主键和两个二级条目，发送端不得再次隐式维护。当前编译器仅支持 savingaccount 的受控 DELETE，拒绝原生重插入及索引列变更。
+非 SEARCH 的 readTimestamp=-1。每行由 `IndexMutation` 显式展开主键及该表全部二级索引，发送端不得再次隐式维护。当前生产写入接口不再提供 transfer-only 展开；旧格式隐式展开只存在于读取兼容路径。
 
-规范 Trace 保留已提交源事务内查询与修改的原始相对顺序，查询占据原生扫描开始的位置，候选数在扫描结束时补齐。transfer 的一次行修改连续展开为主键、sourceid、targetid 三项，查询不得插在展开中间。增量 Parquet 保留每次修改，行含 `_sib_timestamp` 和 `_sib_mutation_ordinal`。同键同版本按序覆盖，中间效果服务于原始事务内查询，不产生额外提交版本；后续源事务只能看到最终提交效果。
+规范 Trace 保留已提交源事务内查询与修改的原始相对顺序，查询占据原生扫描开始的位置，候选数在扫描结束时补齐。每次修改先写主键，再按 IndexID 递增展开；索引列值改变时对旧 `(Table, IndexID, IndexedValue, PK)` 写同提交版本的 LOGICAL_DELETE，再对新身份 UPSERT。未改键的二级条目也 UPSERT，以刷新行版本及 Locator / RowID。这不是修改索引定义，也不是删除业务行或物理删除历史版本。
 
-读兼容：v4/v5 为 112 字节，v5 包含组内写后查询契约；v3 为 104 字节，旧 SEARCH.version 映射为 ReadTimestamp；v1/v2 为 88 字节，仅支持最新状态兼容，不具备可信事务版本。v1 的 transfer 行写入在读取时展开，其他格式已显式展开。旧格式没有工作单元身份，读取为 0，仅允许单 client，不猜测补齐身份。旧文件不改写，新编译输出 v6；只保留历史格式读取，不保留废弃发送策略。测试或派生探针允许身份 0，但不能据此进行多 client 原生回放。
+Baseline 每索引 INSERT；运行期 INSERT 每索引 UPSERT；DELETE 失效主键及全部二级条目。同主键重插入分配新 RowID，UPDATE 保留原 RowID。旧、新条目及主键共享来源事件、版本、事务、mutationOrdinal、workUnitId 和 RowID；除删除条目无物理位置外，值位置一致。`expansionPosition` 从 0 连续编号，`expansionSize` 为完整展开宽度，查询和控制不得插入其中。预检在二级过滤前核对全清单、完整展开和源工作单元绑定，截断或漏项拒绝。
+
+增量文件按实际表惰性创建 `<table>-versions.parquet`，FileID 从基线最大值加 TableID 分配；每次写入保留 `_sib_timestamp`、`_sib_mutation_ordinal` 和 `_sib_row_id`。同键同版本按序覆盖，中间效果服务于原始事务内查询，不产生额外提交版本；后续源事务只能看到最终提交效果。主键值 UPDATE 尚未支持，明确拒绝；增量 rollover 尚未实现，到达阈值使编译失败而非丢弃后续行。
+
+读兼容：v6 为 120 字节，维护范围仍为历史的主键和 transfer 两个二级索引；v4/v5 为 112 字节，v5 包含组内写后查询契约；v3 为 104 字节，旧 SEARCH.version 映射为 ReadTimestamp；v1/v2 为 88 字节，仅支持最新状态兼容，不具备可信事务版本。v1 的 transfer 行写入在读取时展开，其他格式已显式展开。v1–v5 没有工作单元身份，读取为 0，仅允许单 client。旧文件不改写，不把它们升级声称为全索引覆盖；新编译只输出 v7。
 
 ## 发送选择
 
@@ -113,4 +120,6 @@ JDBC 异常即使被原生方法捕获也会使当前运行失败；记录或清
 
 预算按二级过滤后的有效运行期操作计算，两种发送模式预算相同，排除 Baseline、控制和派生探针：预热操作 + ceil(速率 × 测量秒数 × (1 + 余量))。`long_replay.yaml` 为 18,000,000 + 300,000 × 1,800 × 1.2 = 666,000,000。不足在加载/发送前拒绝；当前预检只证明数量，不证明持续调度。
 
-`check-replay` 校验 manifest、摘要、工作单元清单摘要、格式、记录数、CRC、过滤后的 client 覆盖和预算，不调用真实 adapter；`replay` 执行两种 value 的状态与查询核对。`validate-snapshots` 要求完整 v3–v6 且无 relocation，以独立行历史 oracle 比较 key/version/value：全部修改主键的基线、每个提交前/提交点和最终点；每个二级索引最多 64 个修改谓词的基线、首次修改前/修改点和最终点。探针独立报告，不写入 Trace 或计入原生负载。
+`check-replay` 校验 manifest、摘要、固定源索引清单、完整展开、源工作单元绑定、格式、记录数、CRC、过滤后的 client 覆盖和预算，不调用真实 adapter；`replay` 执行两种 value 的状态与查询核对。裸文件 `runFiles/checkFiles` 仅用于历史兼容或受控测试，不具有来源清单完整性证明，生产入口使用目录级预检。
+
+`validate-snapshots` 要求带源码与基线来源的 v7、无 relocation。oracle 独立读取基线和增量 Parquet，不从二级 Trace 值推导预期：核对全部修改主键与完整二级身份在基线、每次该键提交前/提交点和最终点的 key/version/Locator/RowID；每个源二级索引最多 64 个确定性谓词在基线、首次相关修改前/修改点和最终点核对非唯一结果集。源文件摘要、增量位置、RowID、版本和事务内修改位置同时核对。该抽样不是全谓词证明；探针独立报告，不写入 Trace 或计入原生负载。

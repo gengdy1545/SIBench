@@ -14,6 +14,7 @@ native:
     tp5: 30
     tp9: 35
 postgres:
+  schema: public
   version: '14.24'
   port: 55433
   database: sibench_sf1

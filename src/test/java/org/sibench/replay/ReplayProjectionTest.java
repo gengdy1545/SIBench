@@ -22,7 +22,7 @@ public class ReplayProjectionTest {
                 projection.accept(row);
                 projection.accept(new Operation(9, kind, 5, 1, 0, 3, 4, 0, 0, 0, 0, 0, 1));
                 projection.accept(new Operation(9, kind, 5, 2, 0, 6, 4, 0, 0, 0, 0, 0, 1));
-            } else IndexOperationTrace.expandRow(row, projection);
+            } else org.sibench.capture.LegacyIndexFixtures.expandRow(row, projection);
         }
         assertEquals(primary, received);
         assertEquals(15L, projection.describe().get("source_operations"));
@@ -62,9 +62,12 @@ public class ReplayProjectionTest {
                 var config = new ReplayConfig(secondary, "none", 0, 0, 0, 0, mode);
                 var projection = new ReplayProjection(config, true, received::add);
                 projection.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
-                IndexOperationTrace.expandRow(mutation(5, 1, 1, 10, 1, 3), projection);
-                IndexOperationTrace.expandRow(mutation(5, 2, 1, 10, 2, 3), projection);
-                IndexOperationTrace.expandRow(mutation(5, 1, 1, 10, 3, 3), projection);
+                org.sibench.capture.LegacyIndexFixtures.expandRow(
+                        mutation(5, 1, 1, 10, 1, 3), projection);
+                org.sibench.capture.LegacyIndexFixtures.expandRow(
+                        mutation(5, 2, 1, 10, 2, 3), projection);
+                org.sibench.capture.LegacyIndexFixtures.expandRow(
+                        mutation(5, 1, 1, 10, 3, 3), projection);
                 projection.accept(mutation(3, 1, 1, 10, 4, 3));
                 projection.accept(mutation(3, 1, 1, 10, 5, 5));
                 assertTrue(received.isEmpty());

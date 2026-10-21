@@ -3,6 +3,7 @@ package org.sibench.replay;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParser;
 
+import org.sibench.capture.IndexCatalog;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexReferenceReplay;
 import org.sibench.generation.BaselineGenerator;
@@ -41,6 +42,18 @@ public final class ReferenceReplay {
                             .equals(manifest.get("work_units_sha256").getAsString()))
                 throw new IOException("Source work-unit identity checksum mismatch");
         }
+        if (IndexOperationTrace.formatVersion(directory.resolve("baseline.ops"))
+                != IndexOperationTrace.formatVersion(directory.resolve("workload.ops")))
+            throw new IOException("Baseline/workload trace format mismatch");
+        boolean completeIndexes =
+                IndexOperationTrace.formatVersion(directory.resolve("workload.ops")) >= 7;
+        if (completeIndexes
+                && (!manifest.has("secondary_index_coverage")
+                        || !manifest.get("secondary_index_coverage")
+                                .getAsString()
+                                .equals("all_source_definitions")))
+            throw new IOException("Current trace must declare complete source index coverage");
+        if (completeIndexes) validateIndexCoverage(directory, manifest);
         var checked =
                 checkFiles(
                         directory.resolve("baseline.ops"),
@@ -54,6 +67,152 @@ public final class ReferenceReplay {
                 throw new IOException("Trace record count mismatch: " + name);
         }
         return checked;
+    }
+
+    private static void validateIndexCoverage(Path directory, com.google.gson.JsonObject manifest)
+            throws IOException {
+        IndexCatalog.fromManifest(manifest);
+        Map<Long, Long> units = new LinkedHashMap<>();
+        long lastUnit = 0, lastEvent = 0;
+        for (String line : Files.readAllLines(directory.resolve("work-units.jsonl"))) {
+            var unit = JsonParser.parseString(line).getAsJsonObject();
+            long id = unit.get("work_unit_id").getAsLong(),
+                    event = unit.get("source_event").getAsLong();
+            if (id != lastUnit + 1
+                    || event <= lastEvent
+                    || unit.get("pid").getAsInt() < 1
+                    || unit.get("application").getAsString().isEmpty())
+                throw new IOException("Invalid source work-unit catalog order/identity");
+            units.put(id, event);
+            lastUnit = id;
+            lastEvent = event;
+        }
+        if (manifest.has("source_work_units")
+                && manifest.get("source_work_units").getAsLong() != units.size())
+            throw new IOException("Source work-unit count mismatch");
+        Map<Integer, java.util.Set<Integer>> catalog = new LinkedHashMap<>();
+        for (var item : manifest.getAsJsonArray("index_definitions")) {
+            var definition = item.getAsJsonObject();
+            int table = definition.get("table_id").getAsInt(),
+                    index = definition.get("index_id").getAsInt();
+            if (!catalog.computeIfAbsent(table, ignored -> new java.util.TreeSet<>()).add(index))
+                throw new IOException("Duplicate index catalog identity");
+        }
+        for (String name : List.of("baseline", "workload")) {
+            java.util.Set<Integer> seen = new java.util.HashSet<>();
+            IndexOperationTrace.Operation[] primary = {null};
+            IndexOperationTrace.Operation[] previous = {null};
+            int[] position = {0};
+            long[] rows = {0};
+            java.util.Set<Integer> loadedTables = new java.util.HashSet<>();
+            IndexOperationTrace.read(
+                    directory.resolve(name + ".ops"),
+                    operation -> {
+                        if (!IndexOperationTrace.isControl(operation) && name.equals("workload")) {
+                            Long start = units.get(operation.workUnitId());
+                            Long next = units.get(operation.workUnitId() + 1);
+                            if (start == null
+                                    || operation.sourceEvent() < start
+                                    || next != null && operation.sourceEvent() >= next)
+                                throw new IOException(
+                                        "Operation not bound to its source SQL request");
+                        }
+                        if (operation.kind() == IndexOperationTrace.SEARCH
+                                || IndexOperationTrace.isControl(operation)) {
+                            if (primary[0] != null)
+                                throw new IOException("Interrupted index maintenance unit");
+                            if (operation.expansionSize() != 0
+                                    || operation.expansionPosition() != 0)
+                                throw new IOException("Unexpected search/control expansion");
+                        }
+                        if (operation.kind() == IndexOperationTrace.SEARCH) {
+                            if (!catalog.getOrDefault(operation.table(), java.util.Set.of())
+                                    .contains(operation.index()))
+                                throw new IOException("Search outside source catalog");
+                            return;
+                        }
+                        if (IndexOperationTrace.isControl(operation)) return;
+                        if (operation.expansionSize() < 1)
+                            throw new IOException(
+                                    "Current index write missing complete maintenance unit");
+                        if (operation.expansionPosition() == 0) {
+                            if (primary[0] != null)
+                                throw new IOException("Truncated index maintenance unit");
+                            if (operation.index() != 0)
+                                throw new IOException("Maintenance unit missing primary");
+                            seen.clear();
+                            primary[0] = operation;
+                            previous[0] = null;
+                            position[0] = 0;
+                            if (name.equals("baseline")) {
+                                if (operation.workUnitId()
+                                        != 1 + rows[0]++ / IndexOperationTrace.BLOCK_RECORDS)
+                                    throw new IOException(
+                                            "Invalid baseline source-row work-unit assignment");
+                                loadedTables.add(operation.table());
+                            }
+                        }
+                        if (primary[0] == null
+                                || operation.table() != primary[0].table()
+                                || operation.key() != primary[0].key()
+                                || operation.expansionSize() != primary[0].expansionSize()
+                                || operation.expansionPosition() != position[0]++
+                                || operation.rowId() != primary[0].rowId()
+                                || operation.version() != primary[0].version()
+                                || operation.transactionId() != primary[0].transactionId()
+                                || operation.mutationOrdinal() != primary[0].mutationOrdinal()
+                                || operation.workUnitId() != primary[0].workUnitId()
+                                || operation.sourceEvent() != primary[0].sourceEvent()
+                                || operation.flags() != primary[0].flags()
+                                || (operation.index() == 0 && operation.indexedValue() != null)
+                                || (name.equals("baseline")
+                                        && operation.kind() != IndexOperationTrace.INSERT)
+                                || (operation.kind() != primary[0].kind()
+                                        && operation.kind() != IndexOperationTrace.LOGICAL_DELETE))
+                            throw new IOException("Invalid maintenance unit identity");
+                        if (operation.index() > 0
+                                && operation.kind() != IndexOperationTrace.LOGICAL_DELETE
+                                && (operation.file() != primary[0].file()
+                                        || operation.position() != primary[0].position()))
+                            throw new IOException("Secondary value location differs from primary");
+                        if (operation.kind() == IndexOperationTrace.LOGICAL_DELETE
+                                && (operation.file() != 0 || operation.position() != 0))
+                            throw new IOException("Logical deletion has a physical location");
+                        if (!catalog.getOrDefault(operation.table(), java.util.Set.of())
+                                .contains(operation.index()))
+                            throw new IOException("Write outside source catalog");
+                        if (previous[0] != null) {
+                            var prior = previous[0];
+                            if (operation.index() < prior.index()
+                                    || operation.index() > prior.index() + 1
+                                    || (operation.index() != prior.index()
+                                            && prior.kind() != primary[0].kind())
+                                    || (operation.index() == prior.index()
+                                            && (prior.kind() != IndexOperationTrace.LOGICAL_DELETE
+                                                    || operation.kind()
+                                                            != IndexOperationTrace.UPSERT
+                                                    || java.util.Objects.equals(
+                                                            prior.indexedValue(),
+                                                            operation.indexedValue()))))
+                                throw new IOException("Invalid source index maintenance order");
+                        }
+                        previous[0] = operation;
+                        seen.add(operation.index());
+                        if (operation.expansionPosition() == operation.expansionSize() - 1) {
+                            if (!seen.equals(catalog.get(operation.table()))
+                                    || operation.kind() != primary[0].kind())
+                                throw new IOException(
+                                        "Partial source index maintenance is not supported");
+                            primary[0] = null;
+                        }
+                    });
+            if (primary[0] != null) throw new IOException("Unfinished index maintenance unit");
+            if (name.equals("baseline")
+                    && manifest.has("baseline_rows")
+                    && (manifest.get("baseline_rows").getAsLong() != rows[0]
+                            || !loadedTables.equals(catalog.keySet())))
+                throw new IOException("Baseline row/table coverage mismatch");
+        }
     }
 
     public static Map<String, Object> checkFiles(Path baseline, Path workload, ReplayConfig config)
@@ -87,8 +246,9 @@ public final class ReferenceReplay {
                     "budget_scope", "input supply only; no rate scheduling or duration guarantee");
             report.put(
                     "validation_scope",
-                    "binary integrity and input counts; state/result semantics checked during"
-                        + " replay");
+                    "bare-file binary integrity and supply only; no source catalog/provenance"
+                        + " guarantee; directory check additionally validates complete source"
+                        + " catalog and maintenance units; state/results checked during replay");
             return report;
         }
     }
@@ -166,10 +326,11 @@ public final class ReferenceReplay {
                 "scope",
                 "single-sender multi-client in-process correctness reference; clients share"
                     + " reference service state; not a network or cross-client visibility"
-                    + " implementation; v3-v6 committed-source version history and timestamp"
-                    + " lookup, v1/v2 latest-state compatibility; supported primary/transfer"
-                    + " indexes only; no RPC, persistence, concurrent PG MVCC, range query,"
-                    + " physical GC, rate scheduling or sustained-duration proof");
+                    + " implementation; v3-v7 committed-source version history and timestamp"
+                    + " lookup, v1/v2 latest-state compatibility; v7 complete declared source"
+                    + " indexes, older formats retain their historical partial scope; no RPC,"
+                    + " persistence, concurrent PG MVCC, range query, physical GC, rate scheduling"
+                    + " or sustained-duration proof");
         Files.writeString(
                 report,
                 new GsonBuilder().setPrettyPrinting().create().toJson(output),

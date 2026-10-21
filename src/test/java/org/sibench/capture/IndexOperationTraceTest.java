@@ -11,6 +11,43 @@ import java.util.*;
 
 public class IndexOperationTraceTest {
     @Test
+    public void variableValuesRoundTripAndInvalidUtf8OrWidthsFail() throws Exception {
+        Path directory = Files.createTempDirectory("sibench-variable-values-");
+        Path file = directory.resolve("trace.ops");
+        try {
+            try (var writer = new IndexOperationTrace.Writer(file)) {
+                for (String value : new String[] {null, "", "ordinary", "\u4e2d\u6587"})
+                    writer.append(
+                            IndexOperationTrace.search(1, 5, 3, 0, 0, 0, 0)
+                                    .withIndexedValue(value));
+                assertThrows(
+                        IOException.class,
+                        () ->
+                                writer.append(
+                                        IndexOperationTrace.search(1, 5, 3, 0, 0, 0, 0)
+                                                .withIndexedValue("x".repeat(32769))));
+            }
+            var decoded = new ArrayList<Operation>();
+            IndexOperationTrace.read(file, decoded::add);
+            assertNull(decoded.get(0).indexedValue());
+            assertEquals("", decoded.get(1).indexedValue());
+            assertEquals("\u4e2d\u6587", decoded.get(3).indexedValue());
+            byte[] bytes = Files.readAllBytes(file);
+            bytes[bytes.length - 1] = (byte) 0xff;
+            var crc = new java.util.zip.CRC32C();
+            crc.update(bytes, 28, bytes.length - 28);
+            java.nio.ByteBuffer.wrap(bytes)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    .putInt(24, (int) crc.getValue());
+            Files.write(file, bytes);
+            assertThrows(IOException.class, () -> IndexOperationTrace.read(file, ignored -> {}));
+        } finally {
+            Files.deleteIfExists(file);
+            Files.delete(directory);
+        }
+    }
+
+    @Test
     public void roundTripsBlockBoundariesAndRejectsDamage() throws Exception {
         Path directory = Files.createTempDirectory("sibench-ops-");
         Path file = directory.resolve("trace.bin");
@@ -87,7 +124,7 @@ public class IndexOperationTraceTest {
         var row = new Operation(12, 1, 5, 0, 0, 4, 0, 5, 6, 9, 2, 3, 0).withWorkUnitId(42);
         try {
             try (var writer = new IndexOperationTrace.Writer(explicit)) {
-                writer.appendRow(row);
+                org.sibench.capture.LegacyIndexFixtures.appendRow(writer, row);
             }
             List<Operation> ops = new ArrayList<>();
             assertEquals(3, IndexOperationTrace.readExpanded(explicit, ops::add));
@@ -153,11 +190,12 @@ public class IndexOperationTraceTest {
         try {
             try (var writer = new IndexOperationTrace.Writer(file)) {
                 writer.append(IndexOperationTrace.transaction(20, 6, 20, 5, 0));
-                writer.appendRow(new Operation(10, 3, 5, 0, 1, 1, 5, 9, 0, 50, 10, 20, 0, 20, 1));
+                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                        writer, new Operation(10, 3, 5, 0, 1, 1, 5, 9, 0, 50, 10, 20, 0, 20, 1));
                 writer.append(IndexOperationTrace.transaction(20, 7, 20, 5, 1));
             }
             List<Operation> operations = new ArrayList<>();
-            assertEquals(6, IndexOperationTrace.formatVersion(file));
+            assertEquals(IndexOperationTrace.VERSION, IndexOperationTrace.formatVersion(file));
             assertEquals(5, IndexOperationTrace.readExpanded(file, operations::add));
             assertTrue(
                     operations.stream().allMatch(o -> o.transactionId() == 20 && o.version() == 5));

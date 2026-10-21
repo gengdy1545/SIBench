@@ -21,3 +21,10 @@
 - Development milestones belong in `plan.md`, not directory names. Dates and
   run identifiers may identify archived experiment evidence. Preserve historical
   logs and manifests as recorded; document relocations separately.
+
+## Plan Maintenance
+
+Plans should always reflect the current design and remaining work, rather than
+accumulate historical implementation states. When updating a plan, integrate new
+information into the appropriate existing context and remove obsolete or
+redundant content.

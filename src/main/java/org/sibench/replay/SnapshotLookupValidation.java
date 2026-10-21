@@ -1,32 +1,102 @@
 package org.sibench.replay;
 
-import com.google.gson.GsonBuilder;
+import com.google.gson.*;
 
-import org.sibench.capture.IndexOperationTrace;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.hadoop.ParquetReader;
+import org.apache.parquet.hadoop.example.GroupReadSupport;
+import org.sibench.capture.*;
 import org.sibench.capture.IndexOperationTrace.Operation;
-import org.sibench.capture.IndexReferenceReplay;
 import org.sibench.capture.IndexReferenceReplay.LookupResult;
 import org.sibench.generation.BaselineGenerator;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
+import java.nio.file.*;
 import java.util.*;
 
-/** Out-of-band derived probes, never counted as native workload or long-replay input supply. */
+/** Independent Parquet row oracle; derived probes are not native workload or timed performance. */
 public final class SnapshotLookupValidation {
     private static final int SECONDARY_PREDICATES = 64;
 
-    private record Key(int table, long key) implements Comparable<Key> {
-        @Override
-        public int compareTo(Key other) {
-            int tableOrder = Integer.compare(table, other.table);
-            return tableOrder == 0 ? Long.compare(key, other.key) : tableOrder;
+    private record Key(int table, long key) {}
+
+    private record Predicate(int table, int index, String value) {}
+
+    private record Row(long version, long rowId, long locator, Map<Integer, String> indexes) {
+        LookupResult result(long key, boolean rowIds) {
+            return new LookupResult(key, version, rowIds ? rowId : locator);
         }
     }
 
-    private record ExpectedRow(Operation baseline, List<Operation> commits) {}
+    private static final class History {
+        Row baseline;
+        final NavigableMap<Long, Row> commits = new TreeMap<>();
+        final Map<Integer, Set<String>> indexedValues = new LinkedHashMap<>();
+
+        void remember(Row row) {
+            if (row != null)
+                row.indexes()
+                        .forEach(
+                                (index, value) ->
+                                        indexedValues
+                                                .computeIfAbsent(index, ignored -> new HashSet<>())
+                                                .add(value));
+        }
+
+        Row at(long timestamp) {
+            var entry = commits.floorEntry(timestamp);
+            return entry == null ? baseline : entry.getValue();
+        }
+    }
+
+    private static final class Keys {
+        final List<long[]> chunks = new ArrayList<>();
+        int size;
+
+        void add(long key) throws IOException {
+            if (size > 0 && get(size - 1) >= key)
+                throw new IOException("Baseline predicate keys must be strictly ordered");
+            if (size % 4096 == 0) chunks.add(new long[4096]);
+            chunks.get(size / 4096)[size++ % 4096] = key;
+        }
+
+        long get(int index) {
+            return chunks.get(index / 4096)[index % 4096];
+        }
+
+        boolean contains(long key) {
+            int low = 0, high = size - 1;
+            while (low <= high) {
+                int middle = (low + high) >>> 1;
+                long value = get(middle);
+                if (value == key) return true;
+                if (value < key) low = middle + 1;
+                else high = middle - 1;
+            }
+            return false;
+        }
+    }
+
+    private static final class Locations {
+        private final Map<Key, long[][]> pages = new HashMap<>();
+
+        void add(int table, long key, long rowId, long locator) {
+            long[][] page =
+                    pages.computeIfAbsent(new Key(table, key >>> 12), ignored -> new long[2][4096]);
+            page[0][(int) (key & 4095)] = rowId;
+            page[1][(int) (key & 4095)] = locator;
+        }
+
+        LookupResult get(int table, long key, boolean rowIds) {
+            long[][] page = pages.get(new Key(table, key >>> 12));
+            return new LookupResult(key, 0, page[rowIds ? 0 : 1][(int) (key & 4095)]);
+        }
+    }
+
+    @FunctionalInterface
+    private interface RowConsumer {
+        void accept(int table, long key, Row row) throws IOException;
+    }
 
     private SnapshotLookupValidation() {}
 
@@ -36,169 +106,344 @@ public final class SnapshotLookupValidation {
             throw new IOException("Snapshot report already exists: " + report);
         Path baseline = directory.resolve("baseline.ops"),
                 workload = directory.resolve("workload.ops");
-        if (IndexOperationTrace.formatVersion(workload) < 3)
+        if (IndexOperationTrace.formatVersion(workload) != 7)
             throw new IOException(
-                    "Snapshot validation requires captured transaction commit versions (v3-v6)");
+                    "Independent Parquet oracle requires current v7 provenance; historical traces"
+                            + " remain available through replay, not this validator");
         var preflight = ReferenceReplay.check(directory, config);
-        Map<Key, List<Operation>> changes = new TreeMap<>();
+        JsonObject manifest =
+                JsonParser.parseString(Files.readString(directory.resolve("manifest.json")))
+                        .getAsJsonObject();
+        IndexCatalog catalog = IndexCatalog.fromManifest(manifest);
+        Path sourceBaseline = Path.of(manifest.get("baseline_directory").getAsString());
+        if (!BaselineGenerator.sha256(sourceBaseline.resolve("verified-manifest.json"))
+                .equals(manifest.get("baseline_verified_manifest_sha256").getAsString()))
+            throw new IOException("Baseline verification provenance mismatch");
+        JsonObject verification =
+                JsonParser.parseString(
+                                Files.readString(sourceBaseline.resolve("verified-manifest.json")))
+                        .getAsJsonObject();
+        if (!verification.get("status").getAsString().equals("verified_complete")
+                || !BaselineGenerator.sha256(sourceBaseline.resolve("files.jsonl"))
+                        .equals(verification.get("files_manifest_sha256").getAsString())
+                || !BaselineGenerator.sha256(sourceBaseline.resolve("locators.tsv"))
+                        .equals(verification.get("locators_sha256").getAsString()))
+            throw new IOException("Independent baseline manifests changed or are incomplete");
+        for (var item : verification.getAsJsonArray("files"))
+            verifyFile(sourceBaseline, item.getAsJsonObject());
+        Map<Key, History> histories = new LinkedHashMap<>();
         Map<Key, Operation> pending = new LinkedHashMap<>();
-        long[] published = {0};
+        Map<String, Operation> payloadOperations = new HashMap<>();
+        long[] lastCommit = {0};
         IndexOperationTrace.read(
                 workload,
-                o -> {
-                    if (o.kind() == IndexOperationTrace.RELOCATE)
+                operation -> {
+                    if (operation.kind() == IndexOperationTrace.RELOCATE)
                         throw new IOException(
-                                "Derived source-row oracle requires a workload without relocation"
-                                        + " events");
-                    if (IndexOperationTrace.isMutation(o) && o.index() == 0)
-                        pending.put(new Key(o.table(), o.key()), o);
-                    else if (o.kind() == IndexOperationTrace.TRANSACTION_COMMIT) {
+                                "Source-row oracle does not infer relocation history");
+                    if (IndexOperationTrace.isMutation(operation) && operation.index() == 0) {
+                        pending.put(new Key(operation.table(), operation.key()), operation);
+                        if (operation.kind() != IndexOperationTrace.LOGICAL_DELETE
+                                && payloadOperations.put(
+                                                location(operation.file(), operation.position()),
+                                                operation)
+                                        != null)
+                            throw new IOException("Duplicate incremental payload location");
+                    } else if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) {
                         for (var entry : pending.entrySet())
-                            changes.computeIfAbsent(entry.getKey(), key -> new ArrayList<>())
-                                    .add(entry.getValue());
+                            histories
+                                    .computeIfAbsent(entry.getKey(), ignored -> new History())
+                                    .commits
+                                    .put(operation.version(), null);
                         pending.clear();
-                        published[0] = o.version();
+                        lastCommit[0] = operation.version();
                     }
                 });
-        if (changes.isEmpty())
-            throw new IOException("No committed row changes available for derived history probes");
-
-        Map<Integer, SortedSet<Long>> predicates = new TreeMap<>();
-        for (int index = 1; index <= 2; index++) {
-            var candidates = new TreeSet<Long>();
-            for (var entry : changes.entrySet())
-                if (entry.getKey().table() == 5)
-                    for (Operation o : entry.getValue()) candidates.add(indexed(o, index));
-            var selected = new TreeSet<Long>();
-            if (config.secondaryIndexes())
-                candidates.stream().limit(SECONDARY_PREDICATES).forEach(selected::add);
-            predicates.put(index, selected);
+        if (histories.isEmpty()) throw new IOException("No committed row changes to validate");
+        Map<String, Row> payloadRows = new HashMap<>();
+        for (var item : manifest.getAsJsonArray("incremental_files")) {
+            JsonObject file = item.getAsJsonObject();
+            verifyFile(directory, file);
+            long[] position = {0};
+            readFile(
+                    directory,
+                    file,
+                    catalog,
+                    (table, key, row) -> {
+                        String identity = location(file.get("file_id").getAsLong(), position[0]++);
+                        Operation operation = payloadOperations.get(identity);
+                        if (operation == null
+                                || operation.table() != table
+                                || operation.key() != key
+                                || operation.version() != row.version()
+                                || operation.rowId() != row.rowId())
+                            throw new IOException(
+                                    "Incremental source row identity/version mismatch");
+                        payloadRows.put(identity, row);
+                        histories.get(new Key(table, key)).remember(row);
+                    },
+                    payloadOperations);
         }
-        Map<Key, ExpectedRow> oracle = new TreeMap<>();
-        changes.forEach((key, versions) -> oracle.put(key, new ExpectedRow(null, versions)));
-        IndexOperationTrace.readExpanded(
-                baseline,
-                o -> {
-                    if (o.index() != 0) return;
-                    Key key = new Key(o.table(), o.key());
-                    if (changes.containsKey(key)
-                            || (o.table() == 5
-                                    && (predicates.get(1).contains(o.secondarySource())
-                                            || predicates.get(2).contains(o.secondaryTarget()))))
-                        oracle.put(key, new ExpectedRow(o, changes.getOrDefault(key, List.of())));
+        if (payloadRows.size() != payloadOperations.size())
+            throw new IOException("Missing incremental Parquet payload");
+        pending.clear();
+        IndexOperationTrace.read(
+                workload,
+                operation -> {
+                    if (IndexOperationTrace.isMutation(operation) && operation.index() == 0)
+                        pending.put(new Key(operation.table(), operation.key()), operation);
+                    else if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) {
+                        for (var entry : pending.entrySet()) {
+                            Operation write = entry.getValue();
+                            histories
+                                    .get(entry.getKey())
+                                    .commits
+                                    .put(
+                                            operation.version(),
+                                            write.kind() == IndexOperationTrace.LOGICAL_DELETE
+                                                    ? null
+                                                    : payloadRows.get(
+                                                            location(
+                                                                    write.file(),
+                                                                    write.position())));
+                        }
+                        pending.clear();
+                    }
                 });
+        Map<String, SortedSet<String>> changedValues = new TreeMap<>(),
+                baselineValues = new TreeMap<>();
+        Comparator<String> values = Comparator.nullsFirst(Comparator.naturalOrder());
+        for (var definition : catalog.definitions())
+            if (definition.indexId() > 0) {
+                String id = definition.tableId() + "/" + definition.indexId();
+                changedValues.put(id, new TreeSet<>(values));
+                baselineValues.put(id, new TreeSet<>(values));
+            }
+        for (var entry : histories.entrySet())
+            entry.getValue()
+                    .indexedValues
+                    .forEach(
+                            (index, valuesForIndex) ->
+                                    changedValues
+                                            .get(entry.getKey().table() + "/" + index)
+                                            .addAll(valuesForIndex));
+        List<JsonObject> sourceFiles =
+                Files.readAllLines(sourceBaseline.resolve("files.jsonl")).stream()
+                        .map(line -> JsonParser.parseString(line).getAsJsonObject())
+                        .toList();
+        for (JsonObject file : sourceFiles)
+            readFile(
+                    sourceBaseline,
+                    file,
+                    catalog,
+                    (table, key, row) -> {
+                        History history = histories.get(new Key(table, key));
+                        if (history != null) {
+                            history.baseline = row;
+                            history.remember(row);
+                            row.indexes()
+                                    .forEach(
+                                            (index, value) ->
+                                                    changedValues
+                                                            .get(table + "/" + index)
+                                                            .add(value));
+                        }
+                        row.indexes()
+                                .forEach(
+                                        (index, value) -> {
+                                            SortedSet<String> sample =
+                                                    baselineValues.get(table + "/" + index);
+                                            sample.add(value);
+                                            if (sample.size() > SECONDARY_PREDICATES)
+                                                sample.remove(sample.last());
+                                        });
+                    },
+                    null);
+        Map<Predicate, Keys> buckets = new LinkedHashMap<>();
+        if (config.secondaryIndexes())
+            for (var definition : catalog.definitions()) {
+                if (definition.indexId() == 0) continue;
+                String id = definition.tableId() + "/" + definition.indexId();
+                var selected = new LinkedHashSet<String>();
+                changedValues.get(id).stream().limit(SECONDARY_PREDICATES).forEach(selected::add);
+                baselineValues.get(id).stream()
+                        .limit(SECONDARY_PREDICATES - selected.size())
+                        .forEach(selected::add);
+                for (String value : selected)
+                    buckets.put(
+                            new Predicate(definition.tableId(), definition.indexId(), value),
+                            new Keys());
+            }
+        Locations locations = new Locations();
+        for (JsonObject file : sourceFiles)
+            readFile(
+                    sourceBaseline,
+                    file,
+                    catalog,
+                    (table, key, row) -> {
+                        boolean retained = false;
+                        for (var indexed : row.indexes().entrySet()) {
+                            Keys keys =
+                                    buckets.get(
+                                            new Predicate(
+                                                    table, indexed.getKey(), indexed.getValue()));
+                            if (keys != null) {
+                                keys.add(key);
+                                retained = true;
+                            }
+                        }
+                        if (retained) locations.add(table, key, row.rowId(), row.locator());
+                    },
+                    null);
         List<Map<String, Object>> modes = new ArrayList<>();
         for (boolean rowIds : new boolean[] {false, true}) {
             var model = new IndexReferenceReplay(rowIds, config.secondaryIndexes());
             try (var load = new ReplayProjection(config, false, model::accept);
                     var runtime = new ReplayProjection(config, true, model::accept)) {
-                IndexOperationTrace.readExpanded(baseline, load);
+                IndexOperationTrace.read(baseline, load);
                 load.finish();
-                IndexOperationTrace.readExpanded(workload, runtime);
+                IndexOperationTrace.read(workload, runtime);
                 runtime.finish();
                 long primaryProbes = 0, secondaryProbes = 0, items = 0;
-                long initialQueries = model.queries();
-                for (var entry : changes.entrySet()) {
+                for (var entry : histories.entrySet()) {
                     Key key = entry.getKey();
-                    var times = new TreeSet<Long>(List.of(0L, published[0]));
-                    for (Operation o : entry.getValue()) {
-                        times.add(o.version() - 1);
-                        times.add(o.version());
-                    }
-                    for (long time : times) {
-                        LookupResult expected = expected(key, oracle.get(key), time, rowIds);
-                        LookupResult actual =
-                                model.lookupPrimary(key.table(), Math.toIntExact(key.key()), time);
-                        if (!Objects.equals(expected, actual))
+                    var indexedValues = entry.getValue().indexedValues;
+                    for (long time : times(entry.getValue(), lastCommit[0])) {
+                        Row row = entry.getValue().at(time);
+                        LookupResult expected = row == null ? null : row.result(key.key(), rowIds);
+                        if (!Objects.equals(
+                                expected, model.lookupPrimary(key.table(), key.key(), time)))
                             throw new IOException(
-                                    "Historical primary result mismatch: " + key + " at " + time);
-                        model.accept(
-                                probe(key.table(), 0, key.key(), time, expected == null ? 0 : 1));
+                                    "Historical primary mismatch: " + key + " at " + time);
                         primaryProbes++;
                         if (expected != null) items++;
+                        if (config.secondaryIndexes())
+                            for (var index : indexedValues.entrySet())
+                                for (String value : index.getValue()) {
+                                    LookupResult expectedEntry =
+                                            row != null
+                                                            && Objects.equals(
+                                                                    row.indexes()
+                                                                            .get(index.getKey()),
+                                                                    value)
+                                                    ? row.result(key.key(), rowIds)
+                                                    : null;
+                                    LookupResult actualEntry =
+                                            model.lookupEntry(
+                                                    key.table(),
+                                                    index.getKey(),
+                                                    key.key(),
+                                                    value,
+                                                    time);
+                                    if (!Objects.equals(expectedEntry, actualEntry))
+                                        throw new IOException(
+                                                "Historical secondary entry mismatch: "
+                                                        + key
+                                                        + " at "
+                                                        + time);
+                                    secondaryProbes++;
+                                    if (expectedEntry != null) items++;
+                                }
                     }
                 }
-                for (var indexEntry : predicates.entrySet()) {
-                    int index = indexEntry.getKey();
-                    for (long predicate : indexEntry.getValue()) {
-                        Map<Key, ExpectedRow> bucket = new TreeMap<>();
-                        long firstChange = Long.MAX_VALUE;
-                        for (var entry : oracle.entrySet()) {
-                            if (entry.getKey().table() != 5) continue;
-                            ExpectedRow row = entry.getValue();
-                            boolean matches =
-                                    row.baseline() != null
-                                            && indexed(row.baseline(), index) == predicate;
-                            for (Operation o : row.commits())
-                                if (indexed(o, index) == predicate) {
-                                    matches = true;
-                                    firstChange = Math.min(firstChange, o.version());
-                                }
-                            if (matches) bucket.put(entry.getKey(), row);
+                for (var entry : buckets.entrySet()) {
+                    Predicate predicate = entry.getKey();
+                    Keys keys = entry.getValue();
+                    var relevant = new LinkedHashMap<Long, History>();
+                    var times = new TreeSet<Long>(List.of(0L, lastCommit[0]));
+                    long first = Long.MAX_VALUE;
+                    for (var change : histories.entrySet())
+                        if (change.getKey().table() == predicate.table()
+                                && matchesHistory(change.getValue(), predicate)) {
+                            relevant.put(change.getKey().key(), change.getValue());
+                            first = Math.min(first, change.getValue().commits.firstKey());
                         }
-                        var times = new TreeSet<Long>(List.of(0L, published[0]));
-                        if (firstChange != Long.MAX_VALUE) {
-                            times.add(firstChange - 1);
-                            times.add(firstChange);
+                    if (first != Long.MAX_VALUE) {
+                        times.add(first - 1);
+                        times.add(first);
+                    }
+                    for (long time : times) {
+                        long expectedCount = keys.size;
+                        for (var change : relevant.entrySet()) {
+                            if (keys.contains(change.getKey())) expectedCount--;
+                            if (matches(change.getValue().at(time), predicate)) expectedCount++;
                         }
-                        for (long time : times) {
-                            Set<LookupResult> expected = new HashSet<>();
-                            for (var entry : bucket.entrySet()) {
-                                Operation selected = select(entry.getValue(), time);
-                                if (selected != null && indexed(selected, index) == predicate) {
-                                    LookupResult value =
-                                            expected(
-                                                    entry.getKey(), entry.getValue(), time, rowIds);
-                                    if (value != null) expected.add(value);
-                                }
+                        var actual =
+                                model.lookupSecondary(
+                                        predicate.table(),
+                                        predicate.index(),
+                                        predicate.value(),
+                                        time);
+                        if (actual.size() != expectedCount)
+                            throw new IOException(
+                                    "Historical secondary count mismatch: "
+                                            + predicate
+                                            + " at "
+                                            + time);
+                        long previous = 0;
+                        for (LookupResult result : actual) {
+                            if (result.key() <= previous)
+                                throw new IOException("Duplicate/unordered secondary results");
+                            previous = result.key();
+                            History history =
+                                    histories.get(new Key(predicate.table(), result.key()));
+                            LookupResult expected;
+                            if (history != null) {
+                                Row row = history.at(time);
+                                if (!matches(row, predicate))
+                                    throw new IOException("Unexpected historical secondary key");
+                                expected = row.result(result.key(), rowIds);
+                            } else {
+                                if (!keys.contains(result.key()))
+                                    throw new IOException("Unexpected baseline secondary key");
+                                expected = locations.get(predicate.table(), result.key(), rowIds);
                             }
-                            var actual =
-                                    model.lookupSecondary(index, Math.toIntExact(predicate), time);
-                            if (actual.size() != expected.size()
-                                    || !new HashSet<>(actual).equals(expected))
-                                throw new IOException(
-                                        "Historical secondary result mismatch: index "
-                                                + index
-                                                + ", predicate "
-                                                + predicate
-                                                + " at "
-                                                + time);
-                            model.accept(probe(5, index, predicate, time, expected.size()));
-                            secondaryProbes++;
-                            items += expected.size();
+                            if (!expected.equals(result))
+                                throw new IOException("Secondary source value/version mismatch");
                         }
+                        secondaryProbes++;
+                        items += actual.size();
                     }
                 }
-                Map<String, Object> result = new LinkedHashMap<>();
-                result.put("mode", rowIds ? "rowid" : "locator");
-                result.put("native_queries", initialQueries);
-                result.put("derived_primary_probes", primaryProbes);
-                result.put("derived_secondary_probes", secondaryProbes);
-                result.put("derived_checked_result_items", items);
-                result.put("selected_version_checksum", model.selectedVersionChecksum());
-                result.put("retained_index_versions", model.retainedVersions());
-                result.put("workload_dispatch", runtime.describe());
-                modes.add(result);
+                modes.add(
+                        Map.of(
+                                "mode",
+                                rowIds ? "rowid" : "locator",
+                                "native_queries",
+                                model.queries(),
+                                "derived_primary_probes",
+                                primaryProbes,
+                                "derived_secondary_probes",
+                                secondaryProbes,
+                                "derived_checked_result_items",
+                                items,
+                                "retained_index_versions",
+                                model.retainedVersions(),
+                                "workload_dispatch",
+                                runtime.describe()));
             }
         }
         Map<String, Object> output = new LinkedHashMap<>();
         output.put("status", "passed");
         output.put(
-                "provenance", "explicitly_derived_history_validation_not_native_hybench_queries");
+                "provenance",
+                "derived_history_validation_from_independent_parquet_rows_not_native_queries");
         output.put("preflight", preflight);
         output.put("baseline_trace_sha256", BaselineGenerator.sha256(baseline));
         output.put("workload_trace_sha256", BaselineGenerator.sha256(workload));
-        output.put("changed_primary_keys", changes.size());
+        output.put("changed_primary_keys", histories.size());
         output.put("secondary_predicate_sample_limit_per_index", SECONDARY_PREDICATES);
-        output.put("last_published_commit_version", published[0]);
+        output.put("sampled_secondary_predicates", buckets.size());
+        output.put("last_published_commit_version", lastCommit[0]);
         output.put("results", modes);
         output.put(
                 "scope",
-                "all changed primary keys at baseline, before/at each commit and final publication;"
-                    + " deterministic sampled secondary equality predicates at baseline/first"
-                    + " change/final; exact key/version/value comparison against independent"
-                    + " source-row history; no native SQL snapshot claim, Parquet payload readback,"
-                    + " GC, range queries or timed performance");
+                "All changed primary keys and full secondary identities at baseline, before/at"
+                    + " every per-key commit and final; sampled nonunique equality predicates for"
+                    + " every source index at baseline, before/at first relevant change and final."
+                    + " Exact key/version/Locator/RowID comparison against independently decoded"
+                    + " baseline and incremental Parquet, including old/new values; not full HTAP"
+                    + " snapshots, range queries, relocation/GC or performance.");
         Files.writeString(
                 report,
                 new GsonBuilder().setPrettyPrinting().create().toJson(output),
@@ -206,39 +451,70 @@ public final class SnapshotLookupValidation {
         return output;
     }
 
-    private static Operation probe(int table, int index, long key, long timestamp, long count) {
-        return IndexOperationTrace.search(
-                0,
-                table,
-                index,
-                key,
-                timestamp,
-                count,
-                IndexOperationTrace.SNAPSHOT_SEARCH | IndexOperationTrace.DERIVED_SEARCH);
+    private static boolean matches(Row row, Predicate predicate) {
+        return row != null
+                && row.indexes().containsKey(predicate.index())
+                && Objects.equals(row.indexes().get(predicate.index()), predicate.value());
     }
 
-    private static long indexed(Operation o, int index) {
-        return index == 1 ? o.secondarySource() : o.secondaryTarget();
+    private static boolean matchesHistory(History history, Predicate predicate) {
+        return matches(history.baseline, predicate)
+                || history.commits.values().stream().anyMatch(row -> matches(row, predicate));
     }
 
-    private static Operation select(ExpectedRow row, long timestamp) {
-        Operation selected = row.baseline();
-        for (Operation o : row.commits()) {
-            if (o.version() > timestamp) break;
-            selected = o;
+    private static SortedSet<Long> times(History history, long last) {
+        var times = new TreeSet<Long>(List.of(0L, last));
+        for (long version : history.commits.keySet()) {
+            times.add(version - 1);
+            times.add(version);
         }
-        return selected;
+        return times;
     }
 
-    private static LookupResult expected(Key key, ExpectedRow row, long timestamp, boolean rowIds)
+    private static String location(long file, long position) {
+        return file + "/" + position;
+    }
+
+    private static void verifyFile(Path directory, JsonObject file) throws IOException {
+        Path path = directory.resolve(file.get("path").getAsString());
+        if (!BaselineGenerator.sha256(path).equals(file.get("sha256").getAsString()))
+            throw new IOException("Parquet checksum mismatch: " + path);
+    }
+
+    private static void readFile(
+            Path directory,
+            JsonObject file,
+            IndexCatalog catalog,
+            RowConsumer consumer,
+            Map<String, Operation> writes)
             throws IOException {
-        Operation selected = select(row, timestamp);
-        if (selected == null || selected.kind() == IndexOperationTrace.LOGICAL_DELETE) return null;
-        return new LookupResult(
-                key.key(),
-                selected.version(),
-                rowIds
-                        ? selected.rowId()
-                        : IndexReferenceReplay.locator(selected.file(), selected.position()));
+        String table = file.get("table").getAsString();
+        long fileId = file.get("file_id").getAsLong(), position = 0;
+        try (ParquetReader<Group> reader =
+                ParquetReader.builder(
+                                new GroupReadSupport(),
+                                new org.apache.hadoop.fs.Path(
+                                        directory.resolve(file.get("path").getAsString()).toUri()))
+                        .build()) {
+            Group group;
+            while ((group = reader.read()) != null) {
+                if (writes != null) {
+                    Operation operation = writes.get(location(fileId, position));
+                    if (operation == null
+                            || group.getLong("_sib_mutation_ordinal", 0)
+                                    != operation.mutationOrdinal())
+                        throw new IOException("Incremental mutation position mismatch");
+                }
+                consumer.accept(
+                        IndexCatalog.tableId(table),
+                        group.getLong(PgBaselineExport.TABLES.get(table), 0),
+                        new Row(
+                                group.getLong("_sib_timestamp", 0), group.getLong("_sib_row_id", 0),
+                                IndexReferenceReplay.locator(fileId, position++),
+                                        catalog.keys(table, group)));
+            }
+        }
+        if (position != file.get("rows").getAsLong())
+            throw new IOException("Parquet row count mismatch");
     }
 }

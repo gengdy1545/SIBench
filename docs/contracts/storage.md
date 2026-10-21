@@ -35,6 +35,8 @@
 
 Rewrite 不改变键、CommitVersion、RowID 或逻辑可见性。保留窗口、检查周期、装箱单位及并发失败处理仍需固定；所有 Backend 复用相同布局和发布序列。
 
+`RelocationCheck` 是 manifest 驱动的受控诊断：选择全部实际修改表的最新存活行，分配高于已有文件的 FileID，写回真实 Parquet 并更新全部源索引的精确版本 Locator；RowID 验证不产生索引搬迁写。它不保留或搬迁受保护旧版本，不自然触发、不回收旧文件；不能据此宣称 Rewrite 生命周期完成。参考模型仅把 Locator 打包为 int64（FileID 最大 `Integer.MAX_VALUE`，行位置最大 `0xffffffff`），超过宽度拒绝；通用 Locator 结构尚待实现。
+
 ## 真实索引测量
 
 声明索引、WAL、缓存位置、资源预算、协议和确认层级，区分已接收、本地持久化与远端持久化。加载、就绪、缓存设置、预热、前台测量、后台排空和结果核对分别计量。

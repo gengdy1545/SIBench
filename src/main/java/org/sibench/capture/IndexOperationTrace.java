@@ -1,24 +1,27 @@
 package org.sibench.capture;
 
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.zip.CRC32C;
 
-/** PoC normalized operation blocks, separate from the raw PG access projection. */
+/** Versioned normalized operation blocks, separate from raw PG access facts. */
 public final class IndexOperationTrace {
     public static final int INSERT = 1, SEARCH = 2, UPSERT = 3, RELOCATE = 4, LOGICAL_DELETE = 5;
     public static final int TRANSACTION_BEGIN = 6, TRANSACTION_COMMIT = 7;
     public static final int BUSINESS_INSERT = 1, BUSINESS_UPDATE = 2;
     public static final int SNAPSHOT_SEARCH = 1, DERIVED_SEARCH = 2;
     public static final int TRANSACTION_LOCAL_SEARCH = 4;
-    public static final int RECORD_BYTES = 120, BLOCK_RECORDS = 4096;
-    public static final int VERSION = 6;
+    public static final int RECORD_BYTES = 132, BLOCK_RECORDS = 4096;
+    public static final int VERSION = 7;
     private static final int MAGIC = 0x53494f50;
 
     private IndexOperationTrace() {}
@@ -53,7 +56,128 @@ public final class IndexOperationTrace {
             long transactionId,
             long mutationOrdinal,
             long readTimestamp,
-            long workUnitId) {
+            long workUnitId,
+            String indexedValue,
+            int expansionPosition,
+            int expansionSize) {
+        public Operation(
+                long sourceEvent,
+                int kind,
+                int table,
+                int index,
+                int flags,
+                long key,
+                long version,
+                long file,
+                long position,
+                long rowId,
+                long secondarySource,
+                long secondaryTarget,
+                long expectedCount,
+                long transactionId,
+                long mutationOrdinal,
+                long readTimestamp,
+                long workUnitId) {
+            this(
+                    sourceEvent,
+                    kind,
+                    table,
+                    index,
+                    flags,
+                    key,
+                    version,
+                    file,
+                    position,
+                    rowId,
+                    secondarySource,
+                    secondaryTarget,
+                    expectedCount,
+                    transactionId,
+                    mutationOrdinal,
+                    readTimestamp,
+                    workUnitId,
+                    index == 0
+                            ? null
+                            : Long.toString(
+                                    kind == SEARCH
+                                            ? key
+                                            : index == 1 ? secondarySource : secondaryTarget),
+                    0,
+                    0);
+        }
+
+        public Operation withIndex(int id, String value, int operationKind) {
+            return new Operation(
+                    sourceEvent,
+                    operationKind,
+                    table,
+                    id,
+                    flags,
+                    key,
+                    version,
+                    operationKind == LOGICAL_DELETE ? 0 : file,
+                    operationKind == LOGICAL_DELETE ? 0 : position,
+                    rowId,
+                    secondarySource,
+                    secondaryTarget,
+                    expectedCount,
+                    transactionId,
+                    mutationOrdinal,
+                    readTimestamp,
+                    workUnitId,
+                    value,
+                    expansionPosition,
+                    expansionSize);
+        }
+
+        public Operation withExpansion(int ordinal, int count) {
+            return new Operation(
+                    sourceEvent,
+                    kind,
+                    table,
+                    index,
+                    flags,
+                    key,
+                    version,
+                    file,
+                    position,
+                    rowId,
+                    secondarySource,
+                    secondaryTarget,
+                    expectedCount,
+                    transactionId,
+                    mutationOrdinal,
+                    readTimestamp,
+                    workUnitId,
+                    indexedValue,
+                    ordinal,
+                    count);
+        }
+
+        public Operation withIndexedValue(String value) {
+            return new Operation(
+                    sourceEvent,
+                    kind,
+                    table,
+                    index,
+                    flags,
+                    key,
+                    version,
+                    file,
+                    position,
+                    rowId,
+                    secondarySource,
+                    secondaryTarget,
+                    expectedCount,
+                    transactionId,
+                    mutationOrdinal,
+                    readTimestamp,
+                    workUnitId,
+                    value,
+                    expansionPosition,
+                    expansionSize);
+        }
+
         public Operation(
                 long sourceEvent,
                 int kind,
@@ -109,7 +233,10 @@ public final class IndexOperationTrace {
                     transactionId,
                     mutationOrdinal,
                     readTimestamp,
-                    id);
+                    id,
+                    indexedValue,
+                    expansionPosition,
+                    expansionSize);
         }
 
         public Operation(
@@ -248,7 +375,7 @@ public final class IndexOperationTrace {
         return new Operation(source, kind, 0, 0, 0, 0, version, 0, 0, 0, 0, 0, rows, id, 0);
     }
 
-    public static void expandRow(Operation row, Consumer consumer) throws IOException {
+    private static void expandLegacyRow(Operation row, Consumer consumer) throws IOException {
         consumer.accept(row);
         if (row.table() == 5 && row.index() == 0 && row.kind() != SEARCH) {
             for (int index = 1; index <= 2; index++)
@@ -280,8 +407,7 @@ public final class IndexOperationTrace {
 
     public static final class Writer implements Closeable {
         private final FileChannel channel;
-        private final ByteBuffer block =
-                ByteBuffer.allocate(RECORD_BYTES * BLOCK_RECORDS).order(ByteOrder.LITTLE_ENDIAN);
+        private final ByteArrayOutputStream block = new ByteArrayOutputStream();
         private long count;
 
         public Writer(Path file) throws IOException {
@@ -292,19 +418,20 @@ public final class IndexOperationTrace {
             write(channel, header);
         }
 
-        public void appendRow(Operation row) throws IOException {
-            if (row.index() != 0 || row.kind() == SEARCH)
-                throw new IllegalArgumentException("Expected primary row mutation");
-            expandRow(row, this::append);
-        }
-
         public void append(Operation o) throws IOException {
             if ((o.kind() == SEARCH && (o.version() != 0 || o.readTimestamp() < 0))
                     || (o.kind() != SEARCH && o.readTimestamp() != -1)
                     || o.workUnitId() < 0
                     || isControl(o) && o.workUnitId() != 0)
                 throw new IOException("Invalid CommitVersion/ReadTimestamp fields");
-            block.putLong(o.sourceEvent)
+            byte[] value =
+                    o.indexedValue == null ? null : o.indexedValue.getBytes(StandardCharsets.UTF_8);
+            if (value != null && value.length > 32768)
+                throw new IOException("Indexed value exceeds supported encoded key width");
+            ByteBuffer record =
+                    ByteBuffer.allocate(RECORD_BYTES + (value == null ? 0 : value.length))
+                            .order(ByteOrder.LITTLE_ENDIAN);
+            record.putLong(o.sourceEvent)
                     .putInt(o.kind)
                     .putInt(o.table)
                     .putInt(o.index)
@@ -320,9 +447,14 @@ public final class IndexOperationTrace {
                     .putLong(o.transactionId)
                     .putLong(o.mutationOrdinal)
                     .putLong(o.readTimestamp)
-                    .putLong(o.workUnitId);
+                    .putLong(o.workUnitId)
+                    .putInt(o.expansionPosition)
+                    .putInt(o.expansionSize)
+                    .putInt(value == null ? -1 : value.length);
+            if (value != null) record.put(value);
+            block.writeBytes(record.array());
             count++;
-            if (!block.hasRemaining()) flush();
+            if (count % BLOCK_RECORDS == 0) flush();
         }
 
         public long count() {
@@ -330,16 +462,19 @@ public final class IndexOperationTrace {
         }
 
         private void flush() throws IOException {
-            if (block.position() == 0) return;
-            int length = block.position();
+            if (block.size() == 0) return;
+            byte[] payload = block.toByteArray();
+            int length = payload.length;
             CRC32C crc = new CRC32C();
-            crc.update(block.array(), 0, length);
+            crc.update(payload, 0, length);
             ByteBuffer header = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
-            header.putInt(length).putInt(length / RECORD_BYTES).putInt((int) crc.getValue()).flip();
+            header.putInt(length)
+                    .putInt((int) ((count - 1) % BLOCK_RECORDS + 1))
+                    .putInt((int) crc.getValue())
+                    .flip();
             write(channel, header);
-            block.flip();
-            write(channel, block);
-            block.clear();
+            write(channel, ByteBuffer.wrap(payload));
+            block.reset();
         }
 
         @Override
@@ -375,8 +510,6 @@ public final class IndexOperationTrace {
                     || header.getInt() != recordBytes
                     || header.getInt() != BLOCK_RECORDS)
                 throw new IOException("Unknown normalized trace header");
-            ByteBuffer block =
-                    ByteBuffer.allocate(recordBytes * BLOCK_RECORDS).order(ByteOrder.LITTLE_ENDIAN);
             long count = 0;
             while (channel.position() < channel.size()) {
                 header.clear().limit(12);
@@ -384,11 +517,14 @@ public final class IndexOperationTrace {
                 header.flip();
                 int bytes = header.getInt(), records = header.getInt(), checksum = header.getInt();
                 if (bytes <= 0
-                        || bytes > block.capacity()
-                        || bytes % recordBytes != 0
-                        || records != bytes / recordBytes)
+                        || bytes > 256 * 1024 * 1024
+                        || records < 1
+                        || records > BLOCK_RECORDS
+                        || (version < 7
+                                && (bytes % recordBytes != 0 || records != bytes / recordBytes))
+                        || bytes < (long) records * recordBytes)
                     throw new IOException("Invalid normalized block length");
-                block.clear().limit(bytes);
+                ByteBuffer block = ByteBuffer.allocate(bytes).order(ByteOrder.LITTLE_ENDIAN);
                 fill(channel, block);
                 block.flip();
                 CRC32C crc = new CRC32C();
@@ -396,6 +532,8 @@ public final class IndexOperationTrace {
                 if ((int) crc.getValue() != checksum)
                     throw new IOException("Normalized block checksum mismatch");
                 for (int i = 0; i < records; i++) {
+                    if (block.remaining() < recordBytes)
+                        throw new IOException("Truncated normalized operation prefix");
                     Operation decoded =
                             new Operation(
                                     block.getLong(),
@@ -434,6 +572,48 @@ public final class IndexOperationTrace {
                                             decoded.expectedCount(),
                                             decoded.transactionId(),
                                             decoded.mutationOrdinal());
+                    if (version >= 7) {
+                        int expansionPosition = block.getInt(), expansionSize = block.getInt();
+                        int length = block.getInt();
+                        if (length < -1
+                                || length > 32768
+                                || length > block.remaining() - (records - i - 1) * recordBytes)
+                            throw new IOException("Invalid indexed value length");
+                        String indexedValue = null;
+                        if (length >= 0) {
+                            byte[] value = new byte[length];
+                            block.get(value);
+                            indexedValue =
+                                    StandardCharsets.UTF_8
+                                            .newDecoder()
+                                            .onMalformedInput(CodingErrorAction.REPORT)
+                                            .onUnmappableCharacter(CodingErrorAction.REPORT)
+                                            .decode(ByteBuffer.wrap(value))
+                                            .toString();
+                        }
+                        o =
+                                new Operation(
+                                        o.sourceEvent(),
+                                        o.kind(),
+                                        o.table(),
+                                        o.index(),
+                                        o.flags(),
+                                        o.key(),
+                                        o.version(),
+                                        o.file(),
+                                        o.position(),
+                                        o.rowId(),
+                                        o.secondarySource(),
+                                        o.secondaryTarget(),
+                                        o.expectedCount(),
+                                        o.transactionId(),
+                                        o.mutationOrdinal(),
+                                        o.readTimestamp(),
+                                        o.workUnitId(),
+                                        indexedValue,
+                                        expansionPosition,
+                                        expansionSize);
+                    }
                     if (o.kind < INSERT
                             || o.kind
                                     > (version == 1
@@ -442,14 +622,15 @@ public final class IndexOperationTrace {
                             || o.table < (isControl(o) ? 0 : 1)
                             || o.table > (isControl(o) ? 0 : 8)
                             || o.index < 0
-                            || o.index > 2
+                            || o.index > (version >= 7 ? 1024 : 2)
                             || o.workUnitId() < 0
                             || isControl(o) && o.workUnitId() != 0)
                         throw new IOException("Invalid normalized operation");
-                    if (expandLegacy && version == 1) expandRow(o, consumer);
+                    if (expandLegacy && version == 1) expandLegacyRow(o, consumer);
                     else consumer.accept(o);
                     count++;
                 }
+                if (block.hasRemaining()) throw new IOException("Trailing operation block bytes");
             }
             return count;
         }
@@ -472,7 +653,9 @@ public final class IndexOperationTrace {
     }
 
     private static int recordBytes(int version) {
-        return version < 3 ? 88 : version == 3 ? 104 : version < 6 ? 112 : RECORD_BYTES;
+        return version < 3
+                ? 88
+                : version == 3 ? 104 : version < 6 ? 112 : version == 6 ? 120 : RECORD_BYTES;
     }
 
     private static void fill(FileChannel channel, ByteBuffer target) throws IOException {

@@ -31,21 +31,21 @@ public class ReferenceReplayTest {
             for (boolean secondary : new boolean[] {true, false}) {
                 var model = new IndexReferenceReplay(rowId, secondary, false);
                 var projection = new ReplayProjection(secondary, model::accept);
-                IndexOperationTrace.expandRow(row(1, 0, 5, 50), projection);
-                IndexOperationTrace.expandRow(row(3, 1, 9, 50), projection);
-                IndexOperationTrace.expandRow(row(4, 1, 11, 50), projection);
+                org.sibench.capture.LegacyIndexFixtures.expandRow(row(1, 0, 5, 50), projection);
+                org.sibench.capture.LegacyIndexFixtures.expandRow(row(3, 1, 9, 50), projection);
+                org.sibench.capture.LegacyIndexFixtures.expandRow(row(4, 1, 11, 50), projection);
                 assertEquals(rowId ? 0 : secondary ? 3 : 1, model.relocationWrites());
                 assertEquals(rowId ? 50 : IndexReferenceReplay.locator(11, 0), model.value(5, 1));
                 projection.accept(search(0, 1, 1));
                 projection.accept(search(1, 10, 1));
                 projection.accept(search(2, 20, 1));
                 assertEquals(rowId ? 50 : IndexReferenceReplay.locator(11, 0), model.checksum());
-                IndexOperationTrace.expandRow(row(5, 2, 0, 50), projection);
+                org.sibench.capture.LegacyIndexFixtures.expandRow(row(5, 2, 0, 50), projection);
                 projection.accept(search(0, 1, 0));
                 projection.accept(search(1, 10, 0));
                 projection.accept(search(2, 20, 0));
                 assertThrows(IOException.class, () -> model.accept(row(3, 1, 9, 50)));
-                IndexOperationTrace.expandRow(row(3, 3, 12, 51), projection);
+                org.sibench.capture.LegacyIndexFixtures.expandRow(row(3, 3, 12, 51), projection);
                 projection.accept(search(0, 1, 1));
                 projection.accept(search(1, 10, 1));
                 projection.accept(search(2, 20, 1));
@@ -82,14 +82,15 @@ public class ReferenceReplayTest {
         Path report = directory.resolve("report.json");
         try {
             try (var writer = new IndexOperationTrace.Writer(baseline)) {
-                writer.appendRow(row(1, 0, 5, 50));
+                org.sibench.capture.LegacyIndexFixtures.appendRow(writer, row(1, 0, 5, 50));
             }
             try (var writer = new IndexOperationTrace.Writer(workload)) {
                 writer.append(search(0, 1, 1));
                 writer.append(search(1, 10, 1));
                 writer.append(search(2, 20, 1));
                 writer.append(IndexOperationTrace.transaction(3, 6, 3, 1, 0));
-                writer.appendRow(new Operation(3, 5, 5, 0, 0, 1, 1, 0, 0, 50, 10, 20, 0, 3, 1));
+                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                        writer, new Operation(3, 5, 5, 0, 0, 1, 1, 0, 0, 50, 10, 20, 0, 3, 1));
                 writer.append(IndexOperationTrace.transaction(3, 7, 3, 1, 1));
             }
             assertThrows(
@@ -137,7 +138,8 @@ public class ReferenceReplayTest {
                 report = directory.resolve("report.json");
         try {
             try (var writer = new IndexOperationTrace.Writer(baseline)) {
-                writer.appendRow(row(1, 0, 5, 50).withWorkUnitId(1));
+                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                        writer, row(1, 0, 5, 50).withWorkUnitId(1));
             }
             try (var writer = new IndexOperationTrace.Writer(workload)) {
                 writer.append(search(0, 1, 1).withWorkUnitId(1));
@@ -166,24 +168,37 @@ public class ReferenceReplayTest {
         Path units = directory.resolve("work-units.jsonl");
         try {
             try (var writer = new IndexOperationTrace.Writer(baseline)) {
-                writer.appendRow(row(1, 0, 5, 50));
+                org.sibench.capture.IndexMutation.emit(
+                        row(1, 0, 5, 50).withWorkUnitId(1),
+                        Map.of(),
+                        Map.of(1, "10", 2, "20", 3, "type"),
+                        writer::append);
             }
             try (var writer = new IndexOperationTrace.Writer(workload)) {
-                writer.append(search(0, 1, 1));
+                writer.append(search(0, 1, 1).withWorkUnitId(1));
             }
             var manifest =
                     new java.util.LinkedHashMap<String, Object>(
                             Map.of(
                                     "baseline_operations",
-                                    3L,
+                                    4L,
                                     "workload_operations",
                                     1L,
                                     "baseline_trace_sha256",
                                     BaselineGenerator.sha256(baseline),
                                     "workload_trace_sha256",
                                     BaselineGenerator.sha256(workload)));
-            Files.writeString(units, "");
+            String identities =
+                    "{\"work_unit_id\":1,\"source_event\":1,\"pid\":1,\"application\":\"request\"}\n";
+            Files.writeString(units, identities);
             manifest.put("work_units_sha256", BaselineGenerator.sha256(units));
+            manifest.put("secondary_index_coverage", "all_source_definitions");
+            Path source = Path.of("benchmark/HyBench-2024").toAbsolutePath();
+            manifest.put("source_directory", source.toString());
+            manifest.put(
+                    "source_schema_sha256", org.sibench.capture.IndexCatalog.fingerprints(source));
+            manifest.put(
+                    "index_definitions", org.sibench.capture.IndexCatalog.read(source).describe());
             Path manifestPath = directory.resolve("manifest.json");
             Files.writeString(manifestPath, new Gson().toJson(manifest));
             assertEquals(
@@ -193,7 +208,7 @@ public class ReferenceReplayTest {
             assertThrows(
                     IOException.class,
                     () -> ReferenceReplay.check(directory, ReplayConfig.defaults()));
-            Files.writeString(units, "");
+            Files.writeString(units, identities);
             manifest.put("baseline_operations", 1L);
             Files.writeString(manifestPath, new Gson().toJson(manifest));
             assertThrows(
@@ -241,14 +256,18 @@ public class ReferenceReplayTest {
                 workload = directory.resolve("workload.ops");
         try {
             try (var writer = new IndexOperationTrace.Writer(baseline)) {
-                writer.appendRow(row(1, 0, 5, 50));
+                org.sibench.capture.LegacyIndexFixtures.appendRow(writer, row(1, 0, 5, 50));
             }
             try (var writer = new IndexOperationTrace.Writer(workload)) {
                 writer.append(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
-                writer.appendRow(new Operation(1, 3, 5, 0, 2, 1, 1, 9, 0, 50, 10, 20, 0, 10, 1));
-                writer.appendRow(new Operation(2, 3, 5, 0, 2, 1, 1, 9, 1, 50, 10, 20, 0, 10, 2));
-                writer.appendRow(new Operation(3, 3, 5, 0, 1, 2, 1, 9, 2, 51, 10, 20, 0, 10, 3));
-                writer.appendRow(new Operation(4, 5, 5, 0, 0, 2, 1, 0, 0, 51, 10, 20, 0, 10, 4));
+                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                        writer, new Operation(1, 3, 5, 0, 2, 1, 1, 9, 0, 50, 10, 20, 0, 10, 1));
+                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                        writer, new Operation(2, 3, 5, 0, 2, 1, 1, 9, 1, 50, 10, 20, 0, 10, 2));
+                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                        writer, new Operation(3, 3, 5, 0, 1, 2, 1, 9, 2, 51, 10, 20, 0, 10, 3));
+                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                        writer, new Operation(4, 5, 5, 0, 0, 2, 1, 0, 0, 51, 10, 20, 0, 10, 4));
                 writer.append(IndexOperationTrace.transaction(10, 7, 10, 1, 4));
                 writer.append(new Operation(11, 2, 5, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1));
                 writer.append(new Operation(12, 2, 5, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0));

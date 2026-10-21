@@ -7,6 +7,7 @@ import org.apache.parquet.example.data.simple.SimpleGroupFactory;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.MessageTypeParser;
 import org.sibench.generation.*;
+import org.sibench.schema.PgSchemaCheck;
 
 import java.io.BufferedWriter;
 import java.nio.file.*;
@@ -34,37 +35,24 @@ public final class PgBaselineExport {
     private PgBaselineExport() {}
 
     public static void main(String[] args) throws Exception {
-        if (args.length == 3 && args[0].equals("--config")) {
-            CaptureConfig config = CaptureConfig.read(Path.of(args[1]), Path.of(args[2]));
-            export(config.jdbc(), config.layout().output(), config.layout());
-            return;
-        }
-        if (args.length != 2)
-            throw new IllegalArgumentException("PgBaselineExport JDBC_URL OUTPUT_DIRECTORY");
-        Path output = Path.of(args[1]).toAbsolutePath();
-        GenerationConfig config =
-                new GenerationConfig(
-                        Path.of("").toAbsolutePath(),
-                        Map.of(),
-                        "hybench",
-                        0,
-                        268435456,
-                        1048576,
-                        67108864,
-                        1048576,
-                        1048576,
-                        true,
-                        org.apache.parquet.hadoop.metadata.CompressionCodecName.ZSTD,
-                        3,
-                        1,
-                        0,
-                        output,
-                        21474836480L);
-        export(args[0], output, config);
+        if (args.length != 3 || !args[0].equals("--config"))
+            throw new IllegalArgumentException("PgBaselineExport --config ROOT CONFIG");
+        CaptureConfig config = CaptureConfig.read(Path.of(args[1]), Path.of(args[2]));
+        export(config.jdbc(), config.layout().output(), config.layout());
     }
 
     public static void export(String jdbc, Path output, GenerationConfig config) throws Exception {
+        Map<String, Object> document = config.document();
+        if (!"hybench".equals(document.get("benchmark"))) {
+            throw new IllegalArgumentException(
+                    "PG baseline export currently supports only HyBench");
+        }
+        var preflight = PgSchemaCheck.check(config.root(), document, jdbc, "postgres");
         Files.createDirectory(output);
+        Files.writeString(
+                output.resolve("schema-preflight.json"),
+                PgSchemaCheck.json(preflight),
+                StandardOpenOption.CREATE_NEW);
         Files.writeString(
                 output.resolve("INCOMPLETE"),
                 "PG baseline export in progress\n",

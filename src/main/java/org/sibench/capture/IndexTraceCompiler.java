@@ -53,11 +53,13 @@ public final class IndexTraceCompiler {
         final Path path;
         final ParquetDataFile writer;
         final MessageType schema;
+        final long fileId;
         long rows;
 
-        Output(Path path, MessageType schema, GenerationConfig config, String table)
+        Output(Path path, MessageType schema, GenerationConfig config, String table, long fileId)
                 throws IOException {
             this.path = path;
+            this.fileId = fileId;
             var fields = new ArrayList<>(schema.getFields());
             fields.add(
                     org.apache.parquet.schema.Types.required(
@@ -117,7 +119,8 @@ public final class IndexTraceCompiler {
                 "Compilation not committed\n",
                 StandardOpenOption.CREATE_NEW);
         Map<String, MessageType> schemas = new HashMap<>();
-        Map<String, Long> rowIdOffsets = new HashMap<>();
+        IndexCatalog catalog = IndexCatalog.read(capture.source());
+        var identities = new IndexReferenceReplay(true, false);
         long maximumRowId = 0, maximumFileId = 0, baselineCount, baselineRows = 0;
         try (var operations = new IndexOperationTrace.Writer(output.resolve("baseline.ops"))) {
             for (String line : Files.readAllLines(baseline.resolve("files.jsonl"))) {
@@ -139,11 +142,8 @@ public final class IndexTraceCompiler {
                                 table, new MessageType(table, row.getType().getFields()));
                         long key = row.getLong(PgBaselineExport.TABLES.get(table), 0),
                                 rowId = row.getLong("_sib_row_id", 0);
-                        Long old = rowIdOffsets.putIfAbsent(table, rowId - key);
-                        if (old != null && old != rowId - key)
-                            throw new IOException("PoC expects contiguous native baseline IDs");
                         maximumRowId = Math.max(maximumRowId, rowId);
-                        operations.appendRow(
+                        Operation primary =
                                 new Operation(
                                                 0,
                                                 IndexOperationTrace.INSERT,
@@ -155,18 +155,17 @@ public final class IndexTraceCompiler {
                                                 fileId,
                                                 position++,
                                                 rowId,
-                                                table.equals("transfer")
-                                                        ? row.getLong("sourceid", 0)
-                                                        : 0,
-                                                table.equals("transfer")
-                                                        ? row.getLong("targetid", 0)
-                                                        : 0,
+                                                0,
+                                                0,
                                                 0)
                                         .withWorkUnitId(
                                                 1
                                                         + baselineRows++
                                                                 / IndexOperationTrace
-                                                                        .BLOCK_RECORDS));
+                                                                        .BLOCK_RECORDS);
+                        identities.accept(primary);
+                        IndexMutation.emit(
+                                primary, Map.of(), catalog.keys(table, row), operations::append);
                     }
                 }
                 if (position != file.get("rows").getAsLong())
@@ -174,25 +173,10 @@ public final class IndexTraceCompiler {
             }
             baselineCount = operations.count();
         }
-        final long accountFile = maximumFileId + 1, transferFile = maximumFileId + 2;
+        final long firstIncrementalFile = maximumFileId;
         Map<String, Output> writers = new LinkedHashMap<>();
-        writers.put(
-                "savingaccount",
-                new Output(
-                        output.resolve("account-versions.parquet"),
-                        schemas.get("savingaccount"),
-                        capture.layout(),
-                        "savingaccount"));
-        writers.put(
-                "transfer",
-                new Output(
-                        output.resolve("transfer-versions.parquet"),
-                        schemas.get("transfer"),
-                        capture.layout(),
-                        "transfer"));
         Map<String, Search> scans = new LinkedHashMap<>();
         List<JsonObject> pending = new ArrayList<>();
-        Set<Long> deletedAccounts = new HashSet<>();
         long event = 0, version = 0, operationsCount, mutations = 0, searches = 0, rawInserts = 0;
         long inserts = 0, updates = 0, deletes = 0, commits = 0;
         long rawMutations = 0, aborts = 0, discardedMutations = 0, discardedIndexInserts = 0;
@@ -239,17 +223,8 @@ public final class IndexTraceCompiler {
                         || type.equals("index_insert_attempt")) transactionOpen = true;
                 if (type.equals("scan_rescan")) {
                     String index = e.get("relation").getAsString();
-                    int table, indexId;
-                    if (index.equals("savingaccount_pkey")) {
-                        table = 3;
-                        indexId = 0;
-                    } else if (index.equals("idx_transfer_1")) {
-                        table = 5;
-                        indexId = 1;
-                    } else if (index.equals("idx_transfer_2")) {
-                        table = 5;
-                        indexId = 2;
-                    } else throw new IOException("Unsupported accessed index: " + index);
+                    var definition = catalog.named(index);
+                    int table = definition.tableId(), indexId = definition.indexId();
                     JsonArray keys = e.getAsJsonArray("keys");
                     if (keys.size() != 1)
                         throw new IOException("Only single equality scan supported");
@@ -260,12 +235,23 @@ public final class IndexTraceCompiler {
                     Search search =
                             new Search(
                                     event,
-                                    k.get("value").getAsLong(),
+                                    indexId == 0
+                                            ? k.get("value").getAsLong()
+                                            : definition.type().equals("int")
+                                                    ? k.get("value").getAsLong()
+                                                    : 0,
                                     table,
                                     indexId,
                                     version,
                                     pendingMutations,
                                     requireWorkUnit(requestUnits, application));
+                    if (indexId > 0)
+                        search.captured.addProperty(
+                                "indexed_value",
+                                definition.normalize(
+                                        k.get("value").isJsonNull()
+                                                ? null
+                                                : k.get("value").getAsString()));
                     if (scans.put(id, search) != null)
                         throw new IOException("Repeated live scan identity");
                     pending.add(search.captured);
@@ -312,7 +298,15 @@ public final class IndexTraceCompiler {
                                                 item.get("read_timestamp").getAsLong(),
                                                 item.get("count").getAsLong(),
                                                 0)
-                                        .withWorkUnitId(item.get("work_unit_id").getAsLong()));
+                                        .withWorkUnitId(item.get("work_unit_id").getAsLong())
+                                        .withIndex(
+                                                item.get("index").getAsInt(),
+                                                item.has("indexed_value")
+                                                                && !item.get("indexed_value")
+                                                                        .isJsonNull()
+                                                        ? item.get("indexed_value").getAsString()
+                                                        : null,
+                                                IndexOperationTrace.SEARCH));
                         emittedUnits.add(item.get("work_unit_id").getAsLong());
                         searches++;
                     }
@@ -355,24 +349,42 @@ public final class IndexTraceCompiler {
                                                     transactionId,
                                                     preceding,
                                                     local)
-                                            .withWorkUnitId(workUnitId));
+                                            .withWorkUnitId(workUnitId)
+                                            .withIndex(
+                                                    change.get("index").getAsInt(),
+                                                    change.has("indexed_value")
+                                                                    && !change.get("indexed_value")
+                                                                            .isJsonNull()
+                                                            ? change.get("indexed_value")
+                                                                    .getAsString()
+                                                            : null,
+                                                    IndexOperationTrace.SEARCH));
                             searches++;
                             if (local) localSearches++;
                             continue;
                         }
                         ordinal++;
                         String table = change.get("relation").getAsString();
-                        Output destination = writers.get(table);
-                        if (destination == null) throw new IOException("Unsupported changed table");
+                        int tableId = IndexCatalog.tableId(table);
                         String operation = change.get("operation").getAsString();
-                        if (table.equals("savingaccount") && operation.equals("delete")) {
+                        JsonObject oldValue =
+                                change.has("old") && change.get("old").isJsonObject()
+                                        ? change.getAsJsonObject("old")
+                                        : null;
+                        if (!operation.equals("insert") && oldValue == null)
+                            throw new IOException("Missing before-image for row change");
+                        Map<Integer, String> before =
+                                operation.equals("insert")
+                                        ? Map.of()
+                                        : catalog.keys(table, oldValue);
+                        if (operation.equals("delete")) {
                             long key =
                                     change.getAsJsonObject("old")
                                             .get(PgBaselineExport.TABLES.get(table))
                                             .getAsLong();
-                            if (!deletedAccounts.add(key))
-                                throw new IOException("Repeated deletion of absent account");
-                            operations.append(
+                            var previous = identities.lookupPrimary(tableId, key, version);
+                            if (previous == null) throw new IOException("Deletion of absent row");
+                            Operation primary =
                                     new Operation(
                                                     change.get("source_event").getAsLong(),
                                                     IndexOperationTrace.LOGICAL_DELETE,
@@ -383,28 +395,50 @@ public final class IndexTraceCompiler {
                                                     version,
                                                     0,
                                                     0,
-                                                    rowIdOffsets.get(table) + key,
+                                                    previous.value(),
                                                     0,
                                                     0,
                                                     0,
                                                     transactionId,
                                                     ordinal)
-                                            .withWorkUnitId(workUnitId));
+                                            .withWorkUnitId(workUnitId);
+                            identities.accept(primary);
+                            IndexMutation.emit(primary, before, Map.of(), operations::append);
                             deletes++;
                             mutations++;
                             continue;
                         }
-                        if (!operation.equals(table.equals("transfer") ? "insert" : "update"))
+                        if (!Set.of("insert", "update").contains(operation))
                             throw new IOException("Unsupported change kind");
                         JsonObject value = change.getAsJsonObject("new");
                         long key = value.get(PgBaselineExport.TABLES.get(table)).getAsLong();
-                        if (table.equals("savingaccount") && deletedAccounts.contains(key))
+                        var previous = identities.lookupPrimary(tableId, key, version);
+                        if (operation.equals("update")
+                                && (previous == null
+                                        || oldValue.get(PgBaselineExport.TABLES.get(table))
+                                                        .getAsLong()
+                                                != key))
                             throw new IOException(
-                                    "Update after deletion requires a new row identity");
+                                    "Update requires an existing unchanged primary key");
+                        if (operation.equals("insert") && previous != null)
+                            throw new IOException("Insertion of existing primary key");
                         long rowId =
-                                table.equals("savingaccount")
-                                        ? rowIdOffsets.get(table) + key
-                                        : ++maximumRowId;
+                                operation.equals("update")
+                                        ? previous.value()
+                                        : (maximumRowId = Math.incrementExact(maximumRowId));
+                        Output destination = writers.get(table);
+                        if (destination == null) {
+                            if (!schemas.containsKey(table))
+                                throw new IOException("Missing baseline table schema");
+                            destination =
+                                    new Output(
+                                            output.resolve(table + "-versions.parquet"),
+                                            schemas.get(table),
+                                            capture.layout(),
+                                            table,
+                                            firstIncrementalFile + tableId);
+                            writers.put(table, destination);
+                        }
                         Group row = new SimpleGroupFactory(destination.schema).newGroup();
                         for (var field : destination.schema.getFields()) {
                             String name = field.getName();
@@ -420,8 +454,7 @@ public final class IndexTraceCompiler {
                         row.add("_sib_row_id", rowId);
                         row.add("_sib_timestamp", version);
                         row.add("_sib_mutation_ordinal", ordinal);
-                        long file = table.equals("savingaccount") ? accountFile : transferFile;
-                        operations.appendRow(
+                        Operation primary =
                                 new Operation(
                                                 change.get("source_event").getAsLong(),
                                                 IndexOperationTrace.UPSERT,
@@ -432,19 +465,18 @@ public final class IndexTraceCompiler {
                                                         : IndexOperationTrace.BUSINESS_UPDATE,
                                                 key,
                                                 version,
-                                                file,
+                                                destination.fileId,
                                                 destination.rows++,
                                                 rowId,
-                                                table.equals("transfer")
-                                                        ? value.get("sourceid").getAsLong()
-                                                        : 0,
-                                                table.equals("transfer")
-                                                        ? value.get("targetid").getAsLong()
-                                                        : 0,
+                                                0,
+                                                0,
                                                 0,
                                                 transactionId,
                                                 ordinal)
-                                        .withWorkUnitId(workUnitId));
+                                        .withWorkUnitId(workUnitId);
+                        identities.accept(primary);
+                        IndexMutation.emit(
+                                primary, before, catalog.keys(table, value), operations::append);
                         if (destination.writer.write(row))
                             throw new IOException(
                                     "PoC incremental file reached rollover limit; extend compiler"
@@ -499,7 +531,7 @@ public final class IndexTraceCompiler {
                                 "table",
                                 entry.getKey(),
                                 "file_id",
-                                entry.getKey().equals("savingaccount") ? accountFile : transferFile,
+                                writer.fileId,
                                 "path",
                                 writer.path.getFileName().toString(),
                                 "rows",
@@ -517,11 +549,11 @@ public final class IndexTraceCompiler {
         report.put("status", "complete_for_declared_projection");
         report.put("operation_trace_version", IndexOperationTrace.VERSION);
         report.put("secondary_operations_explicit", true);
-        report.put(
-                "index_definitions",
-                List.of(
-                        Map.of("table", "transfer", "index_id", 1, "column", "sourceid"),
-                        Map.of("table", "transfer", "index_id", 2, "column", "targetid")));
+        report.put("index_definitions", catalog.describe());
+        report.put("secondary_index_coverage", "all_source_definitions");
+        report.put("source_directory", capture.source().toAbsolutePath().toString());
+        report.put("source_schema_sha256", IndexCatalog.fingerprints(capture.source()));
+        report.put("baseline_directory", baseline.toAbsolutePath().toString());
         report.put("baseline_operations", baselineCount);
         report.put("baseline_rows", verification.get("rows").getAsLong());
         report.put(
@@ -556,9 +588,7 @@ public final class IndexTraceCompiler {
         report.put("transaction_control_records", commits * 2);
         report.put("workload_index_operations", operationsCount - commits * 2);
         report.put("index_version_writes", operationsCount - searches - commits * 2);
-        report.put(
-                "secondary_index_scope",
-                "transfer source/target only; other PG indexes remain raw");
+        report.put("secondary_index_scope", "all secondary indexes in pinned source DDL");
         report.put("raw_index_insert_attempts", rawInserts);
         report.put("incremental_files", files);
         report.put("raw_runtime_sha256", BaselineGenerator.sha256(raw));
@@ -569,9 +599,9 @@ public final class IndexTraceCompiler {
                 "workload_trace_sha256", BaselineGenerator.sha256(output.resolve("workload.ops")));
         report.put(
                 "scope",
-                "single-session commit-version projection; preserves observed primary and transfer"
-                    + " source/target equality searches; row writes are service-version projection,"
-                    + " not PG physical index writes");
+                "single-session commit-version projection; preserves supported observed equality"
+                    + " searches; complete source index maintenance; row writes are service-version"
+                    + " projection, not PG physical index writes");
         report.put(
                 "version_rule",
                 "SIBench assigns one commit version in original single-session commit order,"
@@ -592,7 +622,9 @@ public final class IndexTraceCompiler {
                         "Searches occupy native scan-start positions; candidates finalized at scan"
                                 + " end",
                         "No historical lookup or Rewrite events in this native trace",
-                        "Fixed-width codec; composite and variable-length keys unsupported"));
+                        "Single-column equality keys only; ordered range/composite encoding not"
+                            + " implemented",
+                        "Incremental rollover and disk-backed compilation state not implemented"));
         Files.writeString(
                 output.resolve("manifest.json"),
                 new GsonBuilder().setPrettyPrinting().create().toJson(report),

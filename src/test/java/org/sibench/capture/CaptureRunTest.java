@@ -25,6 +25,22 @@ public class CaptureRunTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     @Test
+    public void preflightMismatchKeepsEvidenceAndStartsNoNativeSession() throws Exception {
+        Path directory = temporary.newFolder().toPath();
+        try (CaptureRun run = CaptureRun.begin(directory)) {
+            run.schemaPreflight(Map.of("status", "schema_mismatch",
+                    "differences", java.util.List.of("missing index idx_transfer_3")));
+            run.fail(new IOException("schema mismatch"), Map.of("operation", "native_run"));
+        }
+        JsonObject manifest = manifest(directory);
+        assertEquals("failed", manifest.get("status").getAsString());
+        assertEquals("schema_mismatch", manifest.getAsJsonObject("schema_preflight").get("status").getAsString());
+        try (var paths = Files.list(directory)) {
+            assertEquals(0, paths.filter(p -> p.getFileName().toString().startsWith("jdbc-")).count());
+        }
+    }
+
+    @Test
     public void swallowedJdbcFailuresStillInvalidateRunAndKeepOriginalCause() throws Exception {
         for (String method :
                 new String[] {

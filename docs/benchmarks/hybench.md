@@ -14,7 +14,9 @@
 
 属性以固定上游 `conf/pg.props` 为底，仅覆盖连接、客户端数和阶段时长；不手工构造事务或补齐随机分支。行变化采集触发器覆盖八张表，但某表没有实际写入时不会补造修改。AT-00 有 DELETE 模板，原生默认 runner 的 execFresh3 调用被注释，`runHTAP` 不调用该路径；不能据模板宣称 DELETE 覆盖。
 
-[hybench_tp_subset_sf1.yaml](../../config/hybench_tp_subset_sf1.yaml) 显式保留旧 TP3/TP5/TP9=35/30/35 诊断。该子集只有 savingaccount UPDATE、transfer INSERT 和相关查询，当前 v6 规范 Trace 与版本化参考回放的原生证据限定在这个范围，见 [子集报告](../validation/hybench-sf1-poc.md)。完整 HTAP 当前保存无损原始事件并审计八表状态，不支持并发快照、全局顺序、范围或变长键的规范投影。
+[hybench_tp_subset_sf1.yaml](../../config/hybench_tp_subset_sf1.yaml) 显式保留 TP3/TP5/TP9=35/30/35 诊断。该子集只有 savingaccount UPDATE、transfer INSERT 和相关查询，不包含已有索引列值 UPDATE。当前 v7 编译维护八表主键及固定 DDL 全部 13 二级索引；维护逻辑支持八表提交修改、索引列值更新和 DELETE / 重插入，不再只展开 transfer。二级默认启用，开关对全部二级加载 / 查询 / 维护统一生效。
+
+既有完整 HTAP 原始输入的逐键因果维护审计确认 34 次真实提交改键：loanapps.timestamp 15 次、loantrans.timestamp 19 次，见 [全索引 SF1 验证](../validation/hybench-sf1-secondary-indexes.md)。这里是已建索引的列值改变，不是从一列换到另一列建索引，也不是修改 CommitVersion。完整 HTAP 的并发快照、全局顺序和范围访问投影仍未实现；该审计不产生完整 HTAP 规范 Trace。
 
 发送设置独立于原生采集，默认只向下游发送已提交变更。原始 Trace 保留业务回滚及修改尝试；单会话编译排除回滚修改及修改后的查询，不生成反向操作，不改变原生事务比例。已提交事务保留查询与修改的原始相对顺序，支持写后查询；operation/transaction 两种驱动输入模式最终均逐项发送，不要求索引事务 API。一个源 SQL 请求对应一个工作单元，按编号轮询路由；默认 1 client，同一 Trace 可用于 64/128 及更多 client，同事务可跨 client，过滤后覆盖不足拒绝。一个全局线程只保证本地发送顺序，不等待跨 client 可见性；服务端自行实现可见性，响应独立核对。受控测试独立于原生覆盖，详见 [Trace](../contracts/trace.md) 和 [发送验证](../validation/committed-change-delivery.md)。长时采用连续原生采集，不循环；SF1000 原生入口尚未实现。
 

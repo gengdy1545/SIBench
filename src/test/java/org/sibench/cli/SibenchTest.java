@@ -50,6 +50,10 @@ public class SibenchTest {
             {"replay", "--repeat", "2"},
             {"validate-snapshots", "config/index_replay.yaml"},
             {"validate-snapshots", "config/index_replay.yaml", "missing-trace", "missing-report.json"},
+            {"check-schema", "config/ycsb_large.yaml"},
+            {"check-schema", "--jdbc"},
+            {"check-schema", "--user"},
+            {"check-schema", "config/ycsb_large.yaml", "--jdbc", "jdbc:mysql:localhost", "--user", "postgres"},
             {"inspect-scale", "config/ycsb_large.yaml", "missing.yaml"}
         };
         for (String[] args : invalid) {

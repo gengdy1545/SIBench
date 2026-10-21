@@ -22,6 +22,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     private long lastSourceEvent;
     private int lastIndex, transactionOperations;
     private Operation lastMutation;
+    private final List<Operation> expansion = new ArrayList<>();
     private Thread owner;
     private boolean failed;
 
@@ -150,6 +151,53 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
                 || o.version() != activeVersion
                 || o.mutationOrdinal() < 1)
             throw new IOException("Mutation missing matching source group/version");
+        if (o.expansionSize() > 0) {
+            if (o.mutationOrdinal() != lastOrdinal) {
+                requireCompleteExpansion();
+                if (o.mutationOrdinal() != lastOrdinal + 1
+                        || o.index() != 0
+                        || o.expansionPosition() != 0)
+                    throw new IOException("Non-contiguous source mutation");
+                expansion.clear();
+                lastOrdinal = o.mutationOrdinal();
+                lastMutation = o;
+            } else if (lastMutation == null
+                    || o.expansionSize() != lastMutation.expansionSize()
+                    || o.expansionPosition() != expansion.size()
+                    || o.table() != lastMutation.table()
+                    || o.key() != lastMutation.key()
+                    || o.rowId() != lastMutation.rowId()
+                    || o.sourceEvent() != lastMutation.sourceEvent()
+                    || o.workUnitId() != lastMutation.workUnitId()
+                    || o.index() <= 0
+                    || o.flags() != lastMutation.flags()
+                    || (o.kind() != lastMutation.kind()
+                            && o.kind() != IndexOperationTrace.LOGICAL_DELETE)
+                    || (o.kind() != IndexOperationTrace.LOGICAL_DELETE
+                            && (o.file() != lastMutation.file()
+                                    || o.position() != lastMutation.position()))
+                    || (o.kind() == IndexOperationTrace.LOGICAL_DELETE
+                            && (o.file() != 0 || o.position() != 0)))
+                throw new IOException("Invalid index maintenance identity/position");
+            if (o.expansionSize() > MAX_TRANSACTION_OPERATIONS
+                    || o.expansionPosition() < 0
+                    || o.expansionPosition() >= o.expansionSize())
+                throw new IOException("Invalid index maintenance width");
+            if (o.index() > 0 && !expansion.isEmpty()) {
+                Operation previous = expansion.get(expansion.size() - 1);
+                if (o.index() < previous.index()
+                        || o.index() > previous.index() + 1
+                        || (o.index() == previous.index()
+                                && (previous.kind() != IndexOperationTrace.LOGICAL_DELETE
+                                        || o.kind() != IndexOperationTrace.UPSERT
+                                        || java.util.Objects.equals(
+                                                previous.indexedValue(), o.indexedValue()))))
+                    throw new IOException("Invalid secondary delete/write expansion");
+            }
+            expansion.add(o);
+            lastIndex = o.index();
+            return;
+        }
         if (o.mutationOrdinal() == lastOrdinal) {
             if (lastMutation == null
                     || lastMutation.table() != 5
@@ -177,6 +225,11 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     }
 
     private void requireCompleteExpansion() throws IOException {
+        if (lastMutation != null && lastMutation.expansionSize() > 0) {
+            if (expansion.size() != lastMutation.expansionSize())
+                throw new IOException("Incomplete index maintenance unit");
+            return;
+        }
         if (lastMutation != null && lastMutation.table() == 5 && lastIndex != 2)
             throw new IOException("Incomplete explicit transfer index expansion");
     }
@@ -199,6 +252,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
             activeVersion = o.version();
             lastOrdinal = 0;
             lastMutation = null;
+            expansion.clear();
             lastSourceEvent = 0;
             transactionOperations = 0;
         } else {

@@ -1,5 +1,7 @@
 package org.sibench.capture;
 
+import org.sibench.schema.PgSchemaCheck;
+
 import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
@@ -13,40 +15,41 @@ public final class HybenchNativeRun {
     private HybenchNativeRun() {}
 
     public static void main(String[] args) throws Exception {
-        CaptureConfig config = null;
-        if (args.length == 2) {
-            config = CaptureConfig.read(Path.of(args[0]), Path.of(args[1]));
-            Path properties = config.artifacts().resolve("native/capture-resolved.props");
-            args =
-                    new String[] {
-                        properties.toString(),
-                        config.source().resolve("conf/stmt_postgres.toml").toString(),
-                        Integer.toString(config.seconds()),
-                        config.raw().toString()
-                    };
-        }
-        if (args.length != 4)
-            throw new IllegalArgumentException(
-                    "HybenchNativeRun PROPERTIES SQL_TOML SECONDS CAPTURE_DIR");
-        boolean htap = config != null && config.mode().equals("runhtap");
+        if (args.length != 2) throw new IllegalArgumentException("HybenchNativeRun ROOT CONFIG");
+        CaptureConfig config = CaptureConfig.read(Path.of(args[0]), Path.of(args[1]));
+        Path properties = config.artifacts().resolve("native/capture-resolved.props");
+        args =
+                new String[] {
+                    properties.toString(),
+                    config.source().resolve("conf/stmt_postgres.toml").toString(),
+                    Integer.toString(config.seconds()),
+                    config.raw().toString()
+                };
+        boolean htap = config.mode().equals("runhtap");
         try (CaptureRun run = CaptureRun.begin(Path.of(args[3]), htap)) {
             try {
-                if (config != null) {
-                    CapturePoc.checkServer(config);
-                    Files.createDirectories(Path.of(args[0]).getParent());
-                    try (var output =
-                            Files.newOutputStream(
-                                    Path.of(args[0]),
-                                    java.nio.file.StandardOpenOption.CREATE_NEW)) {
-                        config.nativeProperties()
-                                .store(output, "Resolved SF1 capture configuration");
-                    }
+                run.schemaPreflight(CapturePoc.checkServer(config));
+                Files.createDirectories(Path.of(args[0]).getParent());
+                try (var output =
+                        Files.newOutputStream(
+                                Path.of(args[0]), java.nio.file.StandardOpenOption.CREATE_NEW)) {
+                    config.nativeProperties().store(output, "Resolved SF1 capture configuration");
                 }
                 long[] counts = htap ? executeHtap(args, run) : execute(args);
                 run.complete(counts);
-                System.out.println(htap ? "Native runHTAP capture complete: AP -> TP -> XP"
-                        : "Native transaction counts: " + java.util.Arrays.toString(counts));
+                System.out.println(
+                        htap
+                                ? "Native runHTAP capture complete: AP -> TP -> XP"
+                                : "Native transaction counts: "
+                                        + java.util.Arrays.toString(counts));
             } catch (Exception | Error error) {
+                if (error instanceof PgSchemaCheck.Mismatch mismatch) {
+                    try {
+                        run.schemaPreflight(mismatch.report());
+                    } catch (java.io.IOException logging) {
+                        error.addSuppressed(logging);
+                    }
+                }
                 run.fail(error, java.util.Map.of("operation", "native_run"));
                 throw error;
             }
@@ -54,7 +57,8 @@ public final class HybenchNativeRun {
     }
 
     private static long[] executeHtap(String[] args, CaptureRun run) throws Exception {
-        System.setProperty("sibench.capture.directory", Path.of(args[3]).toAbsolutePath().toString());
+        System.setProperty(
+                "sibench.capture.directory", Path.of(args[3]).toAbsolutePath().toString());
         Properties properties = new Properties();
         try (InputStream input = Files.newInputStream(Path.of(args[0]))) {
             properties.load(input);
@@ -65,11 +69,14 @@ public final class HybenchNativeRun {
         Class.forName(CaptureDriver.class.getName());
         Class<?> hybench = Class.forName("com.hybench.HyBench");
         Object benchmark = hybench.getConstructor().newInstance();
-        Object reader = Class.forName("com.hybench.workload.SqlReader")
-                .getConstructor(String.class).newInstance(args[1]);
+        Object reader =
+                Class.forName("com.hybench.workload.SqlReader")
+                        .getConstructor(String.class)
+                        .newInstance(args[1]);
         Object sql = reader.getClass().getMethod("loader").invoke(reader);
-        var setSqls = hybench.getDeclaredMethod("setSqls",
-                Class.forName("com.hybench.workload.Sqlstmts"));
+        var setSqls =
+                hybench.getDeclaredMethod(
+                        "setSqls", Class.forName("com.hybench.workload.Sqlstmts"));
         setSqls.setAccessible(true);
         setSqls.invoke(benchmark, sql);
         Field verbose = hybench.getDeclaredField("verbose");
@@ -91,20 +98,26 @@ public final class HybenchNativeRun {
             CaptureRun.checkFailure();
             var summary = new java.util.LinkedHashMap<String, Object>();
             summary.put("elapsed_seconds", (System.nanoTime() - started) / 1e9);
-            String method = phase.equals("ap") ? "getAPItem" : phase.equals("tp") ? "getTPItem" : "getXPIQItem";
+            String method =
+                    phase.equals("ap")
+                            ? "getAPItem"
+                            : phase.equals("tp") ? "getTPItem" : "getXPIQItem";
             int size = phase.equals("ap") ? 13 : phase.equals("tp") ? 18 : 6;
             var counts = new java.util.LinkedHashMap<String, Long>();
             for (int i = 0; i < size; i++) {
                 Object item = hist.getClass().getMethod(method, int.class).invoke(hist, i);
-                counts.put((phase.equals("xp") ? "iq" : phase) + (i + 1),
+                counts.put(
+                        (phase.equals("xp") ? "iq" : phase) + (i + 1),
                         ((Number) item.getClass().getMethod("getN").invoke(item)).longValue());
             }
             summary.put("method_counts", counts);
             if (phase.equals("xp")) {
                 var atCounts = new java.util.LinkedHashMap<String, Long>();
                 for (int i = 0; i < 6; i++) {
-                    Object item = hist.getClass().getMethod("getXPATItem", int.class).invoke(hist, i);
-                    atCounts.put("at" + (i + 1),
+                    Object item =
+                            hist.getClass().getMethod("getXPATItem", int.class).invoke(hist, i);
+                    atCounts.put(
+                            "at" + (i + 1),
                             ((Number) item.getClass().getMethod("getN").invoke(item)).longValue());
                 }
                 summary.put("transaction_method_counts", atCounts);

@@ -143,6 +143,11 @@ final class CaptureRun implements AutoCloseable {
         publish();
     }
 
+    synchronized void schemaPreflight(Map<String, Object> report) throws IOException {
+        manifest.put("schema_preflight", report);
+        publish();
+    }
+
     static String phase() {
         CaptureRun run = active;
         return run == null ? null : run.phase;

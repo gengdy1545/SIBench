@@ -2,11 +2,13 @@ package org.sibench.cli;
 
 import com.google.gson.GsonBuilder;
 
+import org.sibench.config.ConfigValues;
 import org.sibench.generation.BaselineGenerator;
-import org.sibench.workloads.ScaleInspector;
 import org.sibench.replay.ReferenceReplay;
 import org.sibench.replay.ReplayConfig;
 import org.sibench.replay.SnapshotLookupValidation;
+import org.sibench.schema.PgSchemaCheck;
+import org.sibench.workloads.ScaleInspector;
 import org.yaml.snakeyaml.error.YAMLException;
 
 import java.io.IOException;
@@ -31,18 +33,34 @@ public final class Sibench {
             return 0;
         }
         try {
-            if (!List.of("inspect-scale", "prepare", "replay", "check-replay", "validate-snapshots").contains(args[0])) {
+            if (!List.of(
+                            "inspect-scale",
+                            "prepare",
+                            "replay",
+                            "check-replay",
+                            "validate-snapshots",
+                            "check-schema")
+                    .contains(args[0])) {
                 throw new IllegalArgumentException("Unknown command: " + args[0]);
             }
             Path root = Path.of("").toAbsolutePath();
             List<String> profiles = new ArrayList<>();
             boolean dryRun = false;
+            String jdbc = null, user = null;
             for (int i = 1; i < args.length; i++) {
                 if (args[i].equals("--help") || args[i].equals("-h")) {
                     printHelp(out);
                     return 0;
                 } else if (args[i].equals("--dry-run") && args[0].equals("prepare")) {
                     dryRun = true;
+                } else if (args[0].equals("check-schema") && args[i].equals("--jdbc")) {
+                    if (++i == args.length)
+                        throw new IllegalArgumentException("--jdbc requires a URL");
+                    jdbc = args[i];
+                } else if (args[0].equals("check-schema") && args[i].equals("--user")) {
+                    if (++i == args.length)
+                        throw new IllegalArgumentException("--user requires a role");
+                    user = args[i];
                 } else if (args[i].equals("--root")) {
                     if (++i == args.length) {
                         throw new IllegalArgumentException("--root requires a path");
@@ -55,19 +73,41 @@ public final class Sibench {
                 }
             }
             root = root.toRealPath();
+            if (args[0].equals("check-schema")) {
+                if (profiles.size() != 1 || jdbc == null || user == null)
+                    throw new IllegalArgumentException(
+                            "check-schema requires PROFILE --jdbc URL --user ROLE");
+                if (!jdbc.startsWith("jdbc:postgresql:"))
+                    throw new IllegalArgumentException(
+                            "check-schema requires a PostgreSQL JDBC URL");
+                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
+                try {
+                    out.println(
+                            PgSchemaCheck.json(PgSchemaCheck.check(root, document, jdbc, user)));
+                    return 0;
+                } catch (PgSchemaCheck.Mismatch mismatch) {
+                    out.println(PgSchemaCheck.json(mismatch.report()));
+                    err.println(mismatch.getMessage());
+                    return 1;
+                }
+            }
             if (List.of("replay", "check-replay", "validate-snapshots").contains(args[0])) {
                 boolean check = args[0].equals("check-replay");
                 if (profiles.size() != (check ? 2 : 3))
                     throw new IllegalArgumentException(
-                            args[0] + " requires REPLAY_CONFIG NORMALIZED_DIRECTORY"
+                            args[0]
+                                    + " requires REPLAY_CONFIG NORMALIZED_DIRECTORY"
                                     + (check ? "" : " REPORT"));
                 ReplayConfig config = ReplayConfig.read(root, Path.of(profiles.get(0)));
                 Path directory = root.resolve(profiles.get(1));
-                var result = check
-                        ? ReferenceReplay.check(directory, config)
-                        : args[0].equals("validate-snapshots")
-                                ? SnapshotLookupValidation.run(directory, config, root.resolve(profiles.get(2)))
-                                : ReferenceReplay.run(directory, config, root.resolve(profiles.get(2)));
+                var result =
+                        check
+                                ? ReferenceReplay.check(directory, config)
+                                : args[0].equals("validate-snapshots")
+                                        ? SnapshotLookupValidation.run(
+                                                directory, config, root.resolve(profiles.get(2)))
+                                        : ReferenceReplay.run(
+                                                directory, config, root.resolve(profiles.get(2)));
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result));
                 return 0;
             }
@@ -111,7 +151,8 @@ public final class Sibench {
             Thread.currentThread().interrupt();
             err.println("SIBench interrupted");
             return 1;
-        } catch (IOException
+        } catch (java.sql.SQLException
+                | IOException
                 | IllegalArgumentException
                 | ArithmeticException
                 | YAMLException error) {
@@ -126,20 +167,30 @@ public final class Sibench {
                         + " ...]");
         out.println("Root defaults to the working directory. Profiles are relative to root.");
         out.println(
+                "       java -jar build/sibench/sibench.jar check-schema [--root PATH]"
+                        + " PROFILE --jdbc URL --user ROLE");
+        out.println(
+                "check-schema reads the live PG catalog; it never creates or repairs"
+                    + " tables/indexes.");
+        out.println(
                 "       java -jar build/sibench/sibench.jar prepare [--root PATH] [--dry-run]"
-                    + " PROFILE");
+                        + " PROFILE");
         out.println(
                 "prepare writes baseline Parquet files; --dry-run only validates and describes"
-                    + " schemas.");
+                        + " schemas.");
         out.println(
                 "       java -jar build/sibench/sibench.jar check-replay [--root PATH]"
                         + " REPLAY_CONFIG NORMALIZED_DIRECTORY");
         out.println(
                 "       java -jar build/sibench/sibench.jar replay [--root PATH]"
                         + " REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT");
-        out.println("replay runs the in-process reference once; no real backend or trace repetition.");
-        out.println("       java -jar build/sibench/sibench.jar validate-snapshots [--root PATH]"
-                + " REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT");
-        out.println("validate-snapshots runs derived history correctness probes, not native workload or performance.");
+        out.println(
+                "replay runs the in-process reference once; no real backend or trace repetition.");
+        out.println(
+                "       java -jar build/sibench/sibench.jar validate-snapshots [--root PATH]"
+                        + " REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT");
+        out.println(
+                "validate-snapshots runs derived history correctness probes, not native workload or"
+                    + " performance.");
     }
 }

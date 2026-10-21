@@ -41,7 +41,7 @@ public class VersionedLookupTest {
     private static void commit(ReplayProjection target, long version, Operation... rows)
             throws Exception {
         target.accept(IndexOperationTrace.transaction(version, 6, version, version, 0));
-        for (Operation row : rows) IndexOperationTrace.expandRow(row, target);
+        for (Operation row : rows) org.sibench.capture.LegacyIndexFixtures.expandRow(row, target);
         target.accept(IndexOperationTrace.transaction(version, 7, version, version, rows.length));
     }
 
@@ -108,7 +108,7 @@ public class VersionedLookupTest {
         for (boolean rowIds : new boolean[] {false, true}) {
             var model = new IndexReferenceReplay(rowIds, true);
             var replay = new ReplayProjection(ReplayConfig.defaults(), true, model::accept);
-            IndexOperationTrace.expandRow(
+            org.sibench.capture.LegacyIndexFixtures.expandRow(
                     new Operation(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0), model::accept);
             commit(replay, 100, row(5, 1, 100, 1, 50, 3, 1), row(5, 2, 100, 2, 51, 3, 2));
             commit(replay, 110, row(5, 1, 110, 0, 50, 5, 1));
@@ -122,7 +122,7 @@ public class VersionedLookupTest {
                             .toList());
             replay.accept(snapshot(5, 1, 10, 105, 2));
             replay.accept(snapshot(5, 2, 20, 0, 1));
-            IndexOperationTrace.expandRow(
+            org.sibench.capture.LegacyIndexFixtures.expandRow(
                     new Operation(200, 4, 5, 0, 0, 1, 100, 11, 7, 50, 10, 20, 0), model::accept);
             assertEquals(rowIds ? 0 : 3, model.relocationWrites());
             assertEquals(
@@ -190,15 +190,19 @@ public class VersionedLookupTest {
             Path baseline = directory.resolve("baseline.ops"),
                     workload = directory.resolve("workload.ops");
             try (var writer = new IndexOperationTrace.Writer(baseline)) {
-                writer.appendRow(new Operation(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0));
+                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                        writer, new Operation(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0));
             }
             try (var writer = new IndexOperationTrace.Writer(workload)) {
                 writer.append(IndexOperationTrace.transaction(100, 6, 100, 100, 0));
-                writer.appendRow(row(5, 1, 100, 1, 50, 3, 1));
-                writer.appendRow(row(5, 1, 100, 2, 50, 3, 2));
+                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                        writer, row(5, 1, 100, 1, 50, 3, 1));
+                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                        writer, row(5, 1, 100, 2, 50, 3, 2));
                 writer.append(IndexOperationTrace.transaction(100, 7, 100, 100, 2));
                 writer.append(IndexOperationTrace.transaction(110, 6, 110, 110, 0));
-                writer.appendRow(row(5, 1, 110, 0, 50, 5, 1));
+                org.sibench.capture.LegacyIndexFixtures.appendRow(
+                        writer, row(5, 1, 110, 0, 50, 5, 1));
                 writer.append(IndexOperationTrace.transaction(110, 7, 110, 110, 1));
                 writer.append(snapshot(5, 0, 1, 105, 1));
                 writer.append(snapshot(5, 1, 10, 105, 1));
@@ -247,19 +251,6 @@ public class VersionedLookupTest {
                         }
                     }
                     previous = modes;
-                    var derived =
-                            SnapshotLookupValidation.run(
-                                    directory,
-                                    new ReplayConfig(secondary, "none", 0, 0, 0, 0, dispatchMode),
-                                    directory.resolve(
-                                            "derived-" + secondary + "-" + dispatchMode + ".json"));
-                    assertEquals(
-                            "explicitly_derived_history_validation_not_native_hybench_queries",
-                            derived.get("provenance"));
-                    assertEquals(1, derived.get("changed_primary_keys"));
-                    var checked = (Map<?, ?>) ((List<?>) derived.get("results")).get(0);
-                    assertEquals(5L, checked.get("derived_primary_probes"));
-                    assertEquals(secondary ? 8L : 0L, checked.get("derived_secondary_probes"));
                 }
             }
         } finally {

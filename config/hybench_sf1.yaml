@@ -15,6 +15,7 @@ native:
   phase_duration_minutes:
     tp: 2
 postgres:
+  schema: public
   version: '14.24'
   port: 55433
   database: sibench_htap_sf1_capture
