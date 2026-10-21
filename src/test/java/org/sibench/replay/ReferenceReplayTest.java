@@ -130,10 +130,40 @@ public class ReferenceReplayTest {
     }
 
     @Test
+    public void preflightRejectsSparseRoutingBeforeCreatingReplayReport() throws Exception {
+        Path directory = Files.createTempDirectory("sibench-coverage-");
+        Path baseline = directory.resolve("baseline.ops"),
+                workload = directory.resolve("workload.ops"),
+                report = directory.resolve("report.json");
+        try {
+            try (var writer = new IndexOperationTrace.Writer(baseline)) {
+                writer.appendRow(row(1, 0, 5, 50).withWorkUnitId(1));
+            }
+            try (var writer = new IndexOperationTrace.Writer(workload)) {
+                writer.append(search(0, 1, 1).withWorkUnitId(1));
+                writer.append(search(0, 1, 1).withWorkUnitId(3));
+            }
+            var config = new ReplayConfig(true, "none", 0, 0, 0, 0, "operation", 2, 10, 2);
+            IOException failure =
+                    assertThrows(
+                            IOException.class,
+                            () -> ReferenceReplay.runFiles(baseline, workload, config, report));
+            assertTrue(failure.getMessage().contains("coverage"));
+            assertFalse(Files.exists(report));
+        } finally {
+            Files.deleteIfExists(report);
+            Files.deleteIfExists(baseline);
+            Files.deleteIfExists(workload);
+            Files.delete(directory);
+        }
+    }
+
+    @Test
     public void checksManifestAgainstEncodedRatherThanExpandedRecordCount() throws Exception {
         Path directory = Files.createTempDirectory("sibench-manifest-");
         Path baseline = directory.resolve("baseline.ops"),
                 workload = directory.resolve("workload.ops");
+        Path units = directory.resolve("work-units.jsonl");
         try {
             try (var writer = new IndexOperationTrace.Writer(baseline)) {
                 writer.appendRow(row(1, 0, 5, 50));
@@ -152,11 +182,18 @@ public class ReferenceReplayTest {
                                     BaselineGenerator.sha256(baseline),
                                     "workload_trace_sha256",
                                     BaselineGenerator.sha256(workload)));
+            Files.writeString(units, "");
+            manifest.put("work_units_sha256", BaselineGenerator.sha256(units));
             Path manifestPath = directory.resolve("manifest.json");
             Files.writeString(manifestPath, new Gson().toJson(manifest));
             assertEquals(
                     "trace_integrity_and_supply_valid",
                     ReferenceReplay.check(directory, ReplayConfig.defaults()).get("status"));
+            Files.writeString(units, "tampered");
+            assertThrows(
+                    IOException.class,
+                    () -> ReferenceReplay.check(directory, ReplayConfig.defaults()));
+            Files.writeString(units, "");
             manifest.put("baseline_operations", 1L);
             Files.writeString(manifestPath, new Gson().toJson(manifest));
             assertThrows(
@@ -164,6 +201,7 @@ public class ReferenceReplayTest {
                     () -> ReferenceReplay.check(directory, ReplayConfig.defaults()));
         } finally {
             Files.deleteIfExists(directory.resolve("manifest.json"));
+            Files.deleteIfExists(units);
             Files.deleteIfExists(baseline);
             Files.deleteIfExists(workload);
             Files.delete(directory);

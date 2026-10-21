@@ -1,6 +1,6 @@
 # SIBench
 
-通过原生 benchmark 执行、真实 Parquet 和确定性索引 Trace，评估 KV Index Service。HyBench 默认采用原生 `runHTAP`：AP → TP → 并发 AT/IQ，保留原生事务比例和业务分支。单会话 TP 子集支持 v5 编译、事务内写后查询及版本化参考验证；完整 HTAP 的 KV 投影、真实 Backend 和 SF1000 正式实验尚未完成。
+通过原生 benchmark 执行、真实 Parquet 和确定性索引 Trace，评估 KV Index Service。HyBench 默认采用原生 `runHTAP`：AP → TP → 并发 AT/IQ，保留原生事务比例和业务分支。单会话 TP 子集支持 v6 编译、事务内写后查询、工作单元路由和多 client 版本化参考验证；完整 HTAP 的 KV 投影、真实 Backend 和 SF1000 正式实验尚未完成。
 
 ## 构建
 
@@ -30,15 +30,17 @@ java -Xmx3g -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc pack "$
 [hybench_tp_subset_sf1.yaml](config/hybench_tp_subset_sf1.yaml) 保留 TP3/TP5/TP9=35/30/35 诊断负载；[index_replay.yaml](config/index_replay.yaml) 控制下游发送。以下回放既有子集产物，不执行 SQL、不连接 PG：
 
 ```bash
-java -Xmx3g -jar build/sibench/sibench.jar check-replay config/index_replay.yaml results/validation/hybench-sf1-snapshot-lookup-20261020/normalized
-java -Xmx3g -jar build/sibench/sibench.jar replay config/index_replay.yaml results/validation/hybench-sf1-snapshot-lookup-20261020/normalized results/validation/hybench-sf1-snapshot-lookup-20261020/replay-check.json
-java -Xmx3g -jar build/sibench/sibench.jar validate-snapshots config/index_replay.yaml results/validation/hybench-sf1-snapshot-lookup-20261020/normalized results/validation/hybench-sf1-snapshot-lookup-20261020/snapshots-check.json
+java -Xmx3g -jar build/sibench/sibench.jar check-replay config/index_replay_128clients.yaml results/validation/hybench-sf1-multiclient-20261020/normalized
+java -Xmx3g -jar build/sibench/sibench.jar replay config/index_replay_128clients.yaml results/validation/hybench-sf1-multiclient-20261020/normalized results/validation/hybench-sf1-multiclient-20261020/replay-check.json
+java -Xmx3g -jar build/sibench/sibench.jar validate-snapshots config/index_replay_128clients.yaml results/validation/hybench-sf1-multiclient-20261020/normalized results/validation/hybench-sf1-multiclient-20261020/snapshots-check.json
 ```
 
-报告必须是新文件。`check-replay` 检查 Trace 完整性与有效操作预算；`replay` 是两种 value 的进程内正确性检查；`validate-snapshots` 使用独立行历史 oracle，派生探针不计入原生负载或性能。
+报告必须是新文件。`check-replay` 检查 Trace 完整性、工作单元身份摘要、过滤后的 client 覆盖与有效操作预算；`replay` 是两种 value 的进程内正确性检查，不代表已连接真实的 128 个网络 client；`validate-snapshots` 使用独立行历史 oracle，派生探针不计入原生负载或性能。
 
 - `target.secondary_indexes.enabled` 默认 true；false 过滤全部二级加载、查询和维护，完整 Trace/Parquet 不变。
-- `replay.dispatch_mode` 默认 `operation`，逐操作发送；[index_replay_transaction.yaml](config/index_replay_transaction.yaml) 使用 `transaction` 按已提交源事务分组。两者均单线程同步保序，不合并修改，不向索引发送事务控制，也不要求下游事务 API。
+- `replay.dispatch_mode` 默认 `operation`，以操作为驱动输入单位；[index_replay_transaction.yaml](config/index_replay_transaction.yaml) 使用 `transaction` 按已提交源事务组织输入。两者最终均逐操作路由、单线程保序发送，不合并修改，不向索引发送事务控制，也不要求下游事务 API。
+- `replay.client_count` 默认 1；[64 client](config/index_replay_64clients.yaml) 和 [128 client](config/index_replay_128clients.yaml) 使用同一份 v6 Trace。按源 SQL 请求分配 `workUnitId`，固定路由为 `(workUnitId - 1) % client_count`；同请求的主键/二级展开共用 client，同事务可跨 client。不按索引键或事务绑定，不增加其他路由策略。数量可超过 128，但过滤后的运行期操作必须覆盖全部配置 client，不足则拒绝并继续原生采集。
+- 本地发送完成后即可发下一项，不等待执行完成或跨 client 可见。`sent`/`response` 分开确认；`max_in_flight` 默认 4096，`request_timeout_seconds` 默认 60。驱动只在背压及最终排空时等待响应，遇到错误停止并清理，不通过屏障、重试或补偿修复服务端可见性。
 - 默认只向下游发送已提交变更，不限定 Index Service 场景。源 commit 后保留事务内查询与修改的原始顺序；写后查询携带源提交时间戳及此前修改位置。回滚修改及修改后的查询排除，修改前的受支持查询保留；原始事实不变，无反向操作或回撤开关。
 - [long_replay.yaml](config/long_replay.yaml) 要求 single_pass、666,000,000 个有效操作；SF1 短输入会在预检失败。持续调度和分段供应尚未实现。
 - 异常运行保留诊断并拒绝编译；修复后从明确初始状态换新目录重跑。

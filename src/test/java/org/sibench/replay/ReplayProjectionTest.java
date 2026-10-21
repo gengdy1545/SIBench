@@ -77,9 +77,7 @@ public class ReplayProjectionTest {
                 assertEquals(2, writes.get(transferWidth).key());
                 assertEquals(1, writes.get(transferWidth * 2).key());
                 assertTrue(received.stream().noneMatch(IndexOperationTrace::isControl));
-                assertEquals(
-                        mode.equals("transaction") ? 1L : (long) writes.size(),
-                        projection.describe().get("target_calls"));
+                assertEquals((long) writes.size(), projection.describe().get("target_calls"));
                 projection.accept(IndexOperationTrace.transaction(11, 6, 11, 2, 0));
                 projection.accept(mutation(3, 1, 2, 11, 1, 3));
                 projection.accept(IndexOperationTrace.transaction(11, 7, 11, 2, 1));
@@ -106,27 +104,19 @@ public class ReplayProjectionTest {
     }
 
     @Test
-    public void groupCallsPreserveQueriesAndRejectThreadSwitching() throws Exception {
+    public void sourceGroupsPreserveQueriesAndRejectThreadSwitching() throws Exception {
         for (String mode : new String[] {"operation", "transaction"}) {
             List<Operation> received = new ArrayList<>();
-            List<Integer> groups = new ArrayList<>();
             Thread owner = Thread.currentThread();
-            ReplayTarget target =
-                    new ReplayTarget() {
-                        @Override
-                        public void accept(Operation o) {
-                            assertSame(owner, Thread.currentThread());
-                            received.add(o);
-                        }
-
-                        @Override
-                        public void acceptGroup(List<Operation> operations) {
-                            groups.add(operations.size());
-                            for (Operation o : operations) accept(o);
-                        }
-                    };
+            ReplayTarget.Factory target =
+                    clientId ->
+                            (sequence, o) -> {
+                                assertSame(owner, Thread.currentThread());
+                                received.add(o);
+                                return ReplayTarget.SendHandle.completed();
+                            };
             var replay =
-                    new ReplayProjection(
+                    ReplayProjection.withClients(
                             new ReplayConfig(false, "none", 0, 0, 0, 0, mode), true, target);
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
             Operation write = mutation(3, 1, 1, 10, 1, 3);
@@ -137,7 +127,9 @@ public class ReplayProjectionTest {
             replay.accept(IndexOperationTrace.transaction(10, 7, 10, 1, 1));
             replay.finish();
             assertEquals(List.of(write, search), received);
-            assertEquals(mode.equals("transaction") ? List.of(2) : List.of(), groups);
+            assertEquals(
+                    mode.equals("transaction") ? 1L : 0L,
+                    replay.describe().get("source_dispatch_groups"));
             var error = new java.util.concurrent.atomic.AtomicReference<Throwable>();
             Thread other =
                     new Thread(

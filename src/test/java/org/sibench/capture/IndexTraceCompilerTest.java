@@ -214,7 +214,7 @@ public class IndexTraceCompilerTest {
         var manifest =
                 JsonParser.parseString(Files.readString(output.resolve("manifest.json")))
                         .getAsJsonObject();
-        assertEquals(5, manifest.get("operation_trace_version").getAsInt());
+        assertEquals(6, manifest.get("operation_trace_version").getAsInt());
         assertEquals(4, manifest.get("baseline_operations").getAsLong());
         assertEquals(15, manifest.get("workload_operations").getAsLong());
         assertEquals(1, manifest.getAsJsonObject("business_changes").get("delete").getAsLong());
@@ -340,6 +340,11 @@ public class IndexTraceCompilerTest {
         assertEquals(0, operations.get(7).expectedCount());
         assertEquals(1, operations.get(7).readTimestamp());
         assertEquals(2, operations.get(11).readTimestamp());
+        assertEquals(1, operations.get(0).workUnitId());
+        assertEquals(2, operations.get(2).workUnitId());
+        assertEquals(2, operations.get(3).workUnitId());
+        assertEquals(3, operations.get(7).workUnitId());
+        assertEquals(5, operations.get(11).workUnitId());
         assertTrue(
                 operations.stream().noneMatch(o -> o.kind() == IndexOperationTrace.LOGICAL_DELETE));
         for (String table : List.of("account", "transfer")) {
@@ -373,6 +378,7 @@ public class IndexTraceCompilerTest {
                         "workload.ops",
                         "account-versions.parquet",
                         "transfer-versions.parquet",
+                        "work-units.jsonl",
                         "manifest.json"))
             assertEquals(file, -1, Files.mismatch(output.resolve(file), repeated.resolve(file)));
         assertEquals(rawHash, BaselineGenerator.sha256(raw));
@@ -530,6 +536,7 @@ public class IndexTraceCompilerTest {
                         "workload.ops",
                         "account-versions.parquet",
                         "transfer-versions.parquet",
+                        "work-units.jsonl",
                         "manifest.json"))
             assertEquals(
                     BaselineGenerator.sha256(output.resolve(file)),
@@ -547,6 +554,36 @@ public class IndexTraceCompilerTest {
         assertEquals(2, operations.get(5).mutationOrdinal());
         assertEquals(3, operations.get(9).mutationOrdinal());
         assertEquals(4, operations.get(11).mutationOrdinal());
+        assertEquals(
+                List.of(0L, 1L, 2L, 3L, 4L, 5L, 6L, 6L, 6L, 7L, 8L, 9L, 0L),
+                operations.stream().map(IndexOperationTrace.Operation::workUnitId).toList());
+        var identities = Files.readAllLines(output.resolve("work-units.jsonl"));
+        assertEquals(9, identities.size());
+        for (int i = 0; i < identities.size(); i++)
+            assertEquals(
+                    i + 1L,
+                    JsonParser.parseString(identities.get(i))
+                            .getAsJsonObject()
+                            .get("work_unit_id")
+                            .getAsLong());
+        for (String mode : new String[] {"operation", "transaction"}) {
+            List<Integer> routes = new ArrayList<>();
+            try (var replay =
+                    org.sibench.replay.ReplayProjection.withClients(
+                            new ReplayConfig(true, "none", 0, 0, 0, 0, mode, 3, 10, 2),
+                            true,
+                            client ->
+                                    (sequence, operation) -> {
+                                        routes.add(client);
+                                        return org.sibench.replay.ReplayTarget.SendHandle
+                                                .completed();
+                                    })) {
+                IndexOperationTrace.read(output.resolve("workload.ops"), replay);
+                replay.finish();
+                replay.requireClientCoverage();
+                assertEquals(List.of(0, 1, 2, 0, 1, 2, 2, 2, 0, 1, 2), routes);
+            }
+        }
         long previousEvent = 0;
         for (var operation : operations) {
             if (IndexOperationTrace.isControl(operation)) continue;

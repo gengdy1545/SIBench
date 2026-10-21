@@ -17,8 +17,8 @@ public final class IndexOperationTrace {
     public static final int BUSINESS_INSERT = 1, BUSINESS_UPDATE = 2;
     public static final int SNAPSHOT_SEARCH = 1, DERIVED_SEARCH = 2;
     public static final int TRANSACTION_LOCAL_SEARCH = 4;
-    public static final int RECORD_BYTES = 112, BLOCK_RECORDS = 4096;
-    public static final int VERSION = 5;
+    public static final int RECORD_BYTES = 120, BLOCK_RECORDS = 4096;
+    public static final int VERSION = 6;
     private static final int MAGIC = 0x53494f50;
 
     private IndexOperationTrace() {}
@@ -52,7 +52,66 @@ public final class IndexOperationTrace {
             long expectedCount,
             long transactionId,
             long mutationOrdinal,
-            long readTimestamp) {
+            long readTimestamp,
+            long workUnitId) {
+        public Operation(
+                long sourceEvent,
+                int kind,
+                int table,
+                int index,
+                int flags,
+                long key,
+                long version,
+                long file,
+                long position,
+                long rowId,
+                long secondarySource,
+                long secondaryTarget,
+                long expectedCount,
+                long transactionId,
+                long mutationOrdinal,
+                long readTimestamp) {
+            this(
+                    sourceEvent,
+                    kind,
+                    table,
+                    index,
+                    flags,
+                    key,
+                    version,
+                    file,
+                    position,
+                    rowId,
+                    secondarySource,
+                    secondaryTarget,
+                    expectedCount,
+                    transactionId,
+                    mutationOrdinal,
+                    readTimestamp,
+                    0);
+        }
+
+        public Operation withWorkUnitId(long id) {
+            return new Operation(
+                    sourceEvent,
+                    kind,
+                    table,
+                    index,
+                    flags,
+                    key,
+                    version,
+                    file,
+                    position,
+                    rowId,
+                    secondarySource,
+                    secondaryTarget,
+                    expectedCount,
+                    transactionId,
+                    mutationOrdinal,
+                    readTimestamp,
+                    id);
+        }
+
         public Operation(
                 long sourceEvent,
                 int kind,
@@ -195,21 +254,22 @@ public final class IndexOperationTrace {
             for (int index = 1; index <= 2; index++)
                 consumer.accept(
                         new Operation(
-                                row.sourceEvent(),
-                                row.kind(),
-                                row.table(),
-                                index,
-                                row.flags(),
-                                row.key(),
-                                row.version(),
-                                row.file(),
-                                row.position(),
-                                row.rowId(),
-                                row.secondarySource(),
-                                row.secondaryTarget(),
-                                row.expectedCount(),
-                                row.transactionId(),
-                                row.mutationOrdinal()));
+                                        row.sourceEvent(),
+                                        row.kind(),
+                                        row.table(),
+                                        index,
+                                        row.flags(),
+                                        row.key(),
+                                        row.version(),
+                                        row.file(),
+                                        row.position(),
+                                        row.rowId(),
+                                        row.secondarySource(),
+                                        row.secondaryTarget(),
+                                        row.expectedCount(),
+                                        row.transactionId(),
+                                        row.mutationOrdinal())
+                                .withWorkUnitId(row.workUnitId()));
         }
     }
 
@@ -240,7 +300,9 @@ public final class IndexOperationTrace {
 
         public void append(Operation o) throws IOException {
             if ((o.kind() == SEARCH && (o.version() != 0 || o.readTimestamp() < 0))
-                    || (o.kind() != SEARCH && o.readTimestamp() != -1))
+                    || (o.kind() != SEARCH && o.readTimestamp() != -1)
+                    || o.workUnitId() < 0
+                    || isControl(o) && o.workUnitId() != 0)
                 throw new IOException("Invalid CommitVersion/ReadTimestamp fields");
             block.putLong(o.sourceEvent)
                     .putInt(o.kind)
@@ -257,7 +319,8 @@ public final class IndexOperationTrace {
                     .putLong(o.expectedCount)
                     .putLong(o.transactionId)
                     .putLong(o.mutationOrdinal)
-                    .putLong(o.readTimestamp);
+                    .putLong(o.readTimestamp)
+                    .putLong(o.workUnitId);
             count++;
             if (!block.hasRemaining()) flush();
         }
@@ -350,7 +413,8 @@ public final class IndexOperationTrace {
                                     block.getLong(),
                                     version >= 3 ? block.getLong() : 0,
                                     version >= 3 ? block.getLong() : 0,
-                                    version >= 4 ? block.getLong() : -1);
+                                    version >= 4 ? block.getLong() : -1,
+                                    version >= 6 ? block.getLong() : 0);
                     Operation o =
                             version >= 4
                                     ? decoded
@@ -378,7 +442,10 @@ public final class IndexOperationTrace {
                             || o.table < (isControl(o) ? 0 : 1)
                             || o.table > (isControl(o) ? 0 : 8)
                             || o.index < 0
-                            || o.index > 2) throw new IOException("Invalid normalized operation");
+                            || o.index > 2
+                            || o.workUnitId() < 0
+                            || isControl(o) && o.workUnitId() != 0)
+                        throw new IOException("Invalid normalized operation");
                     if (expandLegacy && version == 1) expandRow(o, consumer);
                     else consumer.accept(o);
                     count++;
@@ -405,7 +472,7 @@ public final class IndexOperationTrace {
     }
 
     private static int recordBytes(int version) {
-        return version < 3 ? 88 : version == 3 ? 104 : RECORD_BYTES;
+        return version < 3 ? 88 : version == 3 ? 104 : version < 6 ? 112 : RECORD_BYTES;
     }
 
     private static void fill(FileChannel channel, ByteBuffer target) throws IOException {

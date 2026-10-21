@@ -15,7 +15,31 @@ public record ReplayConfig(
         long plannedOperationsPerSecond,
         long warmupOperations,
         int reservePercent,
-        String dispatchMode) {
+        String dispatchMode,
+        int clientCount,
+        int maxInFlight,
+        long requestTimeoutSeconds) {
+    public ReplayConfig(
+            boolean secondaryIndexes,
+            String gcOwner,
+            long durationSeconds,
+            long plannedOperationsPerSecond,
+            long warmupOperations,
+            int reservePercent,
+            String dispatchMode) {
+        this(
+                secondaryIndexes,
+                gcOwner,
+                durationSeconds,
+                plannedOperationsPerSecond,
+                warmupOperations,
+                reservePercent,
+                dispatchMode,
+                1,
+                4096,
+                60);
+    }
+
     public ReplayConfig(
             boolean secondaryIndexes,
             String gcOwner,
@@ -35,6 +59,11 @@ public record ReplayConfig(
 
     public ReplayConfig {
         require(Set.of("operation", "transaction").contains(dispatchMode), "Invalid dispatch mode");
+        require(clientCount > 0, "Client count must be positive");
+        require(maxInFlight > 0, "Maximum in-flight requests must be positive");
+        require(
+                requestTimeoutSeconds > 0 && requestTimeoutSeconds <= 86400,
+                "Request timeout must be between 1 and 86400 seconds");
         require(Set.of("benchmark", "backend", "none").contains(gcOwner), "Invalid GC owner");
         require(durationSeconds >= 0 && plannedOperationsPerSecond >= 0, "Invalid trace budget");
         require(
@@ -65,7 +94,15 @@ public record ReplayConfig(
         var secondary = object(target, "secondary_indexes");
         keys(secondary, Set.of("enabled"));
         var replay = object(document, "replay");
-        keys(replay, Set.of("strategy", "dispatch_mode", "trace_budget"));
+        keys(
+                replay,
+                Set.of(
+                        "strategy",
+                        "dispatch_mode",
+                        "client_count",
+                        "max_in_flight",
+                        "request_timeout_seconds",
+                        "trace_budget"));
         String dispatchMode =
                 replay.containsKey("dispatch_mode") ? string(replay, "dispatch_mode") : "operation";
         require(
@@ -98,7 +135,16 @@ public record ReplayConfig(
                 rate,
                 warmup,
                 reserve,
-                dispatchMode);
+                dispatchMode,
+                replay.containsKey("client_count")
+                        ? Math.toIntExact(integer(replay, "client_count"))
+                        : 1,
+                replay.containsKey("max_in_flight")
+                        ? Math.toIntExact(integer(replay, "max_in_flight"))
+                        : 4096,
+                replay.containsKey("request_timeout_seconds")
+                        ? integer(replay, "request_timeout_seconds")
+                        : 60);
     }
 
     public long requiredOperations() {
@@ -117,20 +163,25 @@ public record ReplayConfig(
         require(
                 gcOwner.equals("none"),
                 "Reference replay supports GC owner none only; physical GC/backend retention is not"
-                    + " implemented");
+                        + " implemented");
     }
 
     public Map<String, Object> describe() {
-        return Map.of(
-                "strategy", "single_pass",
-                "secondary_indexes_enabled", secondaryIndexes,
-                "dispatch_mode", dispatchMode,
-                "gc_owner", gcOwner,
-                "duration_seconds", durationSeconds,
-                "planned_operations_per_second", plannedOperationsPerSecond,
-                "warmup_operations", warmupOperations,
-                "reserve_percent", reservePercent,
-                "required_effective_workload_operations", requiredOperations());
+        var report = new java.util.LinkedHashMap<String, Object>();
+        report.put("strategy", "single_pass");
+        report.put("secondary_indexes_enabled", secondaryIndexes);
+        report.put("dispatch_mode", dispatchMode);
+        report.put("client_count", clientCount);
+        report.put("client_routing", "source_work_unit_round_robin");
+        report.put("max_in_flight", maxInFlight);
+        report.put("request_timeout_seconds", requestTimeoutSeconds);
+        report.put("gc_owner", gcOwner);
+        report.put("duration_seconds", durationSeconds);
+        report.put("planned_operations_per_second", plannedOperationsPerSecond);
+        report.put("warmup_operations", warmupOperations);
+        report.put("reserve_percent", reservePercent);
+        report.put("required_effective_workload_operations", requiredOperations());
+        return report;
     }
 
     private static void keys(Map<String, Object> map, Set<String> allowed) {

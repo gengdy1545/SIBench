@@ -35,7 +35,8 @@ public final class IndexTraceCompiler {
                 int table,
                 int index,
                 long readTimestamp,
-                long precedingMutations) {
+                long precedingMutations,
+                long workUnitId) {
             this.captured = new JsonObject();
             captured.addProperty("event", "search");
             captured.addProperty("source_event", event);
@@ -44,6 +45,7 @@ public final class IndexTraceCompiler {
             captured.addProperty("key", key);
             captured.addProperty("read_timestamp", readTimestamp);
             captured.addProperty("preceding_mutations", precedingMutations);
+            captured.addProperty("work_unit_id", workUnitId);
         }
     }
 
@@ -116,7 +118,7 @@ public final class IndexTraceCompiler {
                 StandardOpenOption.CREATE_NEW);
         Map<String, MessageType> schemas = new HashMap<>();
         Map<String, Long> rowIdOffsets = new HashMap<>();
-        long maximumRowId = 0, maximumFileId = 0, baselineCount;
+        long maximumRowId = 0, maximumFileId = 0, baselineCount, baselineRows = 0;
         try (var operations = new IndexOperationTrace.Writer(output.resolve("baseline.ops"))) {
             for (String line : Files.readAllLines(baseline.resolve("files.jsonl"))) {
                 JsonObject file = JsonParser.parseString(line).getAsJsonObject();
@@ -143,19 +145,28 @@ public final class IndexTraceCompiler {
                         maximumRowId = Math.max(maximumRowId, rowId);
                         operations.appendRow(
                                 new Operation(
-                                        0,
-                                        IndexOperationTrace.INSERT,
-                                        TABLE_IDS.get(table),
-                                        0,
-                                        0,
-                                        key,
-                                        0,
-                                        fileId,
-                                        position++,
-                                        rowId,
-                                        table.equals("transfer") ? row.getLong("sourceid", 0) : 0,
-                                        table.equals("transfer") ? row.getLong("targetid", 0) : 0,
-                                        0));
+                                                0,
+                                                IndexOperationTrace.INSERT,
+                                                TABLE_IDS.get(table),
+                                                0,
+                                                0,
+                                                key,
+                                                0,
+                                                fileId,
+                                                position++,
+                                                rowId,
+                                                table.equals("transfer")
+                                                        ? row.getLong("sourceid", 0)
+                                                        : 0,
+                                                table.equals("transfer")
+                                                        ? row.getLong("targetid", 0)
+                                                        : 0,
+                                                0)
+                                        .withWorkUnitId(
+                                                1
+                                                        + baselineRows++
+                                                                / IndexOperationTrace
+                                                                        .BLOCK_RECORDS));
                     }
                 }
                 if (position != file.get("rows").getAsLong())
@@ -191,8 +202,14 @@ public final class IndexTraceCompiler {
         long pendingXid = 0;
         boolean transactionOpen = false;
         List<Map<String, Object>> files = new ArrayList<>();
+        Map<String, Long> requestUnits = new LinkedHashMap<>();
+        Set<Long> emittedUnits = new HashSet<>();
         try (var reader = Files.newBufferedReader(raw);
-                var operations = new IndexOperationTrace.Writer(output.resolve("workload.ops"))) {
+                var operations = new IndexOperationTrace.Writer(output.resolve("workload.ops"));
+                var units =
+                        Files.newBufferedWriter(
+                                output.resolve("work-units.jsonl"),
+                                StandardOpenOption.CREATE_NEW)) {
             String line;
             while ((line = reader.readLine()) != null) {
                 event++;
@@ -202,6 +219,20 @@ public final class IndexTraceCompiler {
                 else if (pid != expectedPid)
                     throw new IOException("Single-session projection only");
                 String type = e.get("event").getAsString();
+                String application = e.get("application").getAsString();
+                if (type.equals("executor_start")) {
+                    if (requestUnits.containsKey(application))
+                        throw new IOException("Duplicate source request identity");
+                    long id = requestUnits.size() + 1L;
+                    requestUnits.put(application, id);
+                    JsonObject identity = new JsonObject();
+                    identity.addProperty("work_unit_id", id);
+                    identity.addProperty("application", application);
+                    identity.addProperty("pid", pid);
+                    identity.addProperty("source_event", event);
+                    units.write(identity.toString());
+                    units.newLine();
+                }
                 if (type.equals("executor_start")
                         || type.equals("scan_rescan")
                         || type.equals("row_change")
@@ -233,7 +264,8 @@ public final class IndexTraceCompiler {
                                     table,
                                     indexId,
                                     version,
-                                    pendingMutations);
+                                    pendingMutations,
+                                    requireWorkUnit(requestUnits, application));
                     if (scans.put(id, search) != null)
                         throw new IOException("Repeated live scan identity");
                     pending.add(search.captured);
@@ -251,6 +283,7 @@ public final class IndexTraceCompiler {
                         throw new IOException("Interleaved transactions unsupported");
                     pendingXid = xid;
                     e.addProperty("source_event", event);
+                    e.addProperty("work_unit_id", requireWorkUnit(requestUnits, application));
                     pending.add(e);
                     rawMutations++;
                     pendingMutations++;
@@ -272,13 +305,15 @@ public final class IndexTraceCompiler {
                         }
                         operations.append(
                                 IndexOperationTrace.search(
-                                        item.get("source_event").getAsLong(),
-                                        item.get("table").getAsInt(),
-                                        item.get("index").getAsInt(),
-                                        item.get("key").getAsLong(),
-                                        item.get("read_timestamp").getAsLong(),
-                                        item.get("count").getAsLong(),
-                                        0));
+                                                item.get("source_event").getAsLong(),
+                                                item.get("table").getAsInt(),
+                                                item.get("index").getAsInt(),
+                                                item.get("key").getAsLong(),
+                                                item.get("read_timestamp").getAsLong(),
+                                                item.get("count").getAsLong(),
+                                                0)
+                                        .withWorkUnitId(item.get("work_unit_id").getAsLong()));
+                        emittedUnits.add(item.get("work_unit_id").getAsLong());
                         searches++;
                     }
                     pending.clear();
@@ -301,22 +336,26 @@ public final class IndexTraceCompiler {
                                     version,
                                     0));
                     for (JsonObject change : pending) {
+                        long workUnitId = change.get("work_unit_id").getAsLong();
+                        emittedUnits.add(workUnitId);
                         if (change.get("event").getAsString().equals("search")) {
                             long preceding = change.get("preceding_mutations").getAsLong();
                             boolean local = preceding != 0;
                             operations.append(
                                     IndexOperationTrace.transactionSearch(
-                                            change.get("source_event").getAsLong(),
-                                            change.get("table").getAsInt(),
-                                            change.get("index").getAsInt(),
-                                            change.get("key").getAsLong(),
-                                            local
-                                                    ? version
-                                                    : change.get("read_timestamp").getAsLong(),
-                                            change.get("count").getAsLong(),
-                                            transactionId,
-                                            preceding,
-                                            local));
+                                                    change.get("source_event").getAsLong(),
+                                                    change.get("table").getAsInt(),
+                                                    change.get("index").getAsInt(),
+                                                    change.get("key").getAsLong(),
+                                                    local
+                                                            ? version
+                                                            : change.get("read_timestamp")
+                                                                    .getAsLong(),
+                                                    change.get("count").getAsLong(),
+                                                    transactionId,
+                                                    preceding,
+                                                    local)
+                                            .withWorkUnitId(workUnitId));
                             searches++;
                             if (local) localSearches++;
                             continue;
@@ -335,21 +374,22 @@ public final class IndexTraceCompiler {
                                 throw new IOException("Repeated deletion of absent account");
                             operations.append(
                                     new Operation(
-                                            change.get("source_event").getAsLong(),
-                                            IndexOperationTrace.LOGICAL_DELETE,
-                                            TABLE_IDS.get(table),
-                                            0,
-                                            0,
-                                            key,
-                                            version,
-                                            0,
-                                            0,
-                                            rowIdOffsets.get(table) + key,
-                                            0,
-                                            0,
-                                            0,
-                                            transactionId,
-                                            ordinal));
+                                                    change.get("source_event").getAsLong(),
+                                                    IndexOperationTrace.LOGICAL_DELETE,
+                                                    TABLE_IDS.get(table),
+                                                    0,
+                                                    0,
+                                                    key,
+                                                    version,
+                                                    0,
+                                                    0,
+                                                    rowIdOffsets.get(table) + key,
+                                                    0,
+                                                    0,
+                                                    0,
+                                                    transactionId,
+                                                    ordinal)
+                                            .withWorkUnitId(workUnitId));
                             deletes++;
                             mutations++;
                             continue;
@@ -383,27 +423,28 @@ public final class IndexTraceCompiler {
                         long file = table.equals("savingaccount") ? accountFile : transferFile;
                         operations.appendRow(
                                 new Operation(
-                                        change.get("source_event").getAsLong(),
-                                        IndexOperationTrace.UPSERT,
-                                        TABLE_IDS.get(table),
-                                        0,
-                                        operation.equals("insert")
-                                                ? IndexOperationTrace.BUSINESS_INSERT
-                                                : IndexOperationTrace.BUSINESS_UPDATE,
-                                        key,
-                                        version,
-                                        file,
-                                        destination.rows++,
-                                        rowId,
-                                        table.equals("transfer")
-                                                ? value.get("sourceid").getAsLong()
-                                                : 0,
-                                        table.equals("transfer")
-                                                ? value.get("targetid").getAsLong()
-                                                : 0,
-                                        0,
-                                        transactionId,
-                                        ordinal));
+                                                change.get("source_event").getAsLong(),
+                                                IndexOperationTrace.UPSERT,
+                                                TABLE_IDS.get(table),
+                                                0,
+                                                operation.equals("insert")
+                                                        ? IndexOperationTrace.BUSINESS_INSERT
+                                                        : IndexOperationTrace.BUSINESS_UPDATE,
+                                                key,
+                                                version,
+                                                file,
+                                                destination.rows++,
+                                                rowId,
+                                                table.equals("transfer")
+                                                        ? value.get("sourceid").getAsLong()
+                                                        : 0,
+                                                table.equals("transfer")
+                                                        ? value.get("targetid").getAsLong()
+                                                        : 0,
+                                                0,
+                                                transactionId,
+                                                ordinal)
+                                        .withWorkUnitId(workUnitId));
                         if (destination.writer.write(row))
                             throw new IOException(
                                     "PoC incremental file reached rollover limit; extend compiler"
@@ -483,6 +524,20 @@ public final class IndexTraceCompiler {
                         Map.of("table", "transfer", "index_id", 2, "column", "targetid")));
         report.put("baseline_operations", baselineCount);
         report.put("baseline_rows", verification.get("rows").getAsLong());
+        report.put(
+                "baseline_work_units",
+                (baselineRows + IndexOperationTrace.BLOCK_RECORDS - 1)
+                        / IndexOperationTrace.BLOCK_RECORDS);
+        report.put(
+                "baseline_work_unit_rule",
+                "consecutive batches of 4096 source rows; index expansion shares a unit");
+        report.put("source_work_units", requestUnits.size());
+        report.put("workload_work_units", emittedUnits.size());
+        report.put(
+                "work_unit_rule",
+                "one audited source SQL request, numbered before abort/secondary filtering");
+        report.put(
+                "work_units_sha256", BaselineGenerator.sha256(output.resolve("work-units.jsonl")));
         report.put("workload_operations", operationsCount);
         report.put("searches", searches);
         report.put("logical_row_version_writes", mutations);
@@ -526,8 +581,8 @@ public final class IndexTraceCompiler {
         report.put(
                 "read_timestamp_rule",
                 "pre-write searches use the preceding commit; transaction-local searches use their"
-                    + " source commit version and preceding mutation position; single-session"
-                    + " only");
+                        + " source commit version and preceding mutation position; single-session"
+                        + " only");
         report.put("snapshot_searches", 0);
         report.put(
                 "limitations",
@@ -535,7 +590,7 @@ public final class IndexTraceCompiler {
                         "Not PG physical-index equivalence",
                         "No concurrent snapshot projection or inferred cross-session ordering",
                         "Searches occupy native scan-start positions; candidates finalized at scan"
-                            + " end",
+                                + " end",
                         "No historical lookup or Rewrite events in this native trace",
                         "Fixed-width codec; composite and variable-length keys unsupported"));
         Files.writeString(
@@ -543,5 +598,13 @@ public final class IndexTraceCompiler {
                 new GsonBuilder().setPrettyPrinting().create().toJson(report),
                 StandardOpenOption.CREATE_NEW);
         Files.delete(output.resolve("INCOMPLETE"));
+    }
+
+    private static long requireWorkUnit(Map<String, Long> units, String application)
+            throws IOException {
+        Long id = units.get(application);
+        if (id == null)
+            throw new IOException("Index operation without source SQL request identity");
+        return id;
     }
 }

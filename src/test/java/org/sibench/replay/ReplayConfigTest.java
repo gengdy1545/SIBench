@@ -14,6 +14,17 @@ public class ReplayConfigTest {
         Path root = Path.of("").toAbsolutePath();
         var simple = ReplayConfig.read(root, Path.of("config/index_replay.yaml"));
         assertTrue(simple.secondaryIndexes());
+        assertEquals(1, simple.clientCount());
+        assertEquals(4096, simple.maxInFlight());
+        assertEquals(60, simple.requestTimeoutSeconds());
+        assertEquals(
+                64,
+                ReplayConfig.read(root, Path.of("config/index_replay_64clients.yaml"))
+                        .clientCount());
+        assertEquals(
+                128,
+                ReplayConfig.read(root, Path.of("config/index_replay_128clients.yaml"))
+                        .clientCount());
         assertEquals("operation", simple.dispatchMode());
         assertEquals(
                 "transaction",
@@ -38,6 +49,7 @@ public class ReplayConfigTest {
         assertEquals(0, simple.requiredOperations());
         var longRun = ReplayConfig.read(root, Path.of("config/long_replay.yaml"));
         assertEquals(666000000, longRun.requiredOperations());
+        assertEquals(128, longRun.clientCount());
         assertEquals(2, new ReplayConfig(false, "none", 1, 1, 0, 1).requiredOperations());
         assertEquals(120, new ReplayConfig(false, "none", 1, 100, 0, 20).requiredOperations());
         assertThrows(
@@ -57,11 +69,15 @@ public class ReplayConfigTest {
                     text.replace("single_pass", "single_pass\n  repeat: 2"),
                     text.replace("enabled: true", "enabled: 'false'"),
                     text.replace("dispatch_mode: operation", "dispatch_mode: parallel"),
+                    text.replace("client_count: 1", "client_count: 0"),
+                    text.replace("max_in_flight: 4096", "max_in_flight: 0"),
+                    text.replace("request_timeout_seconds: 60", "request_timeout_seconds: 86401"),
+                    text.replace("client_count: 1", "client_count: 1\n  routing: index_key"),
                     text.replace(
                             "secondary_indexes:",
                             "transaction_writes:\n"
-                                + "    coalesce_same_key: true\n"
-                                + "  secondary_indexes:"),
+                                    + "    coalesce_same_key: true\n"
+                                    + "  secondary_indexes:"),
                     text.replace("owner: none", "owner: immediate"),
                     text.replace("gc:\n", "gc:\n    send_delete: false\n")
                 }) {

@@ -58,7 +58,7 @@ AT1–AT6：`27/10/15/14/7/1`；IQ1–IQ6：`4/4/4/4/0/7`。**IQ5 已启用，�
 | loanapps | 600,000 | 600,012 | 32 | 32 |
 | loantrans | 600,000 | 600,007 | 33 | 18 |
 
-`CapturePoc pack` 保存全量 PG 原始 JSON 及 CRC32C 的 64 字节 access 记录。文件名排序只保证各文件内顺序，不代表全局事务排序。**这不是完整 HTAP KV 回放**：并发快照、跨会话顺序、范围/变长键及残余过滤的规范转换仍待实现，HTAP 输入被单会话编译器显式拒绝。当前 v5 已支持单会话已提交事务内写后查询，不据此放宽 HTAP 的并发限制，见 [发送验证](committed-change-delivery.md)。
+`CapturePoc pack` 保存全量 PG 原始 JSON 及 CRC32C 的 64 字节 access 记录。文件名排序只保证各文件内顺序，不代表全局事务排序。**这不是完整 HTAP KV 回放**：并发快照、跨会话顺序、范围/变长键及残余过滤的规范转换仍待实现，HTAP 输入被单会话编译器显式拒绝。当前 v6 已支持单会话已提交事务内写后查询和工作单元多 client 路由，不据此放宽 HTAP 的并发限制，见 [发送验证](committed-change-delivery.md)。
 
 打包验证通过：51,111,329 条原始事件、12,479 个 CRC32C 块；`access.bin` 为 3,271,274,820 字节，完整 `payload.jsonl` 为 16,832,115,136 字节。事件计数与状态审计完全一致，解码数量与 CRC 全部通过；SHA256 分别为 `5492eccc988b072caa2945ab6cd9bc1b6cc1fb23f71dd406e6de2847cd041a14`、`c0a8faef1f28464d31b465dde9f62bed11f6e768ae5737eee8d1831a5fba72a8`。
 
@@ -86,7 +86,7 @@ java -Xmx3g -cp "$ROOT/build/sibench/sibench.jar" \
   org.sibench.capture.CapturePoc pack "$ROOT" config/hybench_sf1.yaml "$ROOT/results/poc/hybench-htap-sf1/trace-check"
 ```
 
-`ROOT` 指向仓库绝对路径，`run` 在含 `Data_1x` 的目录执行。报告必须为新文件，打包目录必须不存在。旧 TP 子集采用 [hybench_tp_subset_sf1.yaml](../../config/hybench_tp_subset_sf1.yaml)，当前编译输出 v5，旧 v4 产物只读兼容。
+`ROOT` 指向仓库绝对路径，`run` 在含 `Data_1x` 的目录执行。报告必须为新文件，打包目录必须不存在。旧 TP 子集采用 [hybench_tp_subset_sf1.yaml](../../config/hybench_tp_subset_sf1.yaml)，当前编译输出 v6，旧 v4/v5 产物只读单 client 兼容。
 
 ## 证据与修复
 

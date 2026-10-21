@@ -9,17 +9,15 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/**
- * Validates source groups, then dispatches synchronously without reordering or transaction RPCs.
- */
-public final class ReplayProjection implements IndexOperationTrace.Consumer {
+/** Validates committed source groups, then serializes local sends without waiting for execution. */
+public final class ReplayProjection implements IndexOperationTrace.Consumer, AutoCloseable {
     public static final int MAX_TRANSACTION_OPERATIONS = 1_000_000;
     private final boolean secondaryIndexes, sourceTransactions;
     private final String dispatchMode;
-    private final ReplayTarget target;
+    private final ReplayDispatcher dispatcher;
     private final List<Operation> pending = new ArrayList<>();
     private final Map<String, Long> kinds = new LinkedHashMap<>();
-    private long source, dispatched, primary, secondary, filtered, transactions, controls, requests;
+    private long source, dispatched, primary, secondary, filtered, transactions, controls, groups;
     private long activeTransaction, activeVersion, lastVersion, lastOrdinal, lastTransactionId;
     private long lastSourceEvent;
     private int lastIndex, transactionOperations;
@@ -33,14 +31,20 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
 
     public ReplayProjection(
             ReplayConfig config, boolean sourceTransactions, IndexOperationTrace.Consumer target) {
-        this(config, sourceTransactions, ReplayTarget.ordered(target));
+        this(config, sourceTransactions, ReplayTarget.immediate(target));
     }
 
-    public ReplayProjection(ReplayConfig config, boolean sourceTransactions, ReplayTarget target) {
+    public static ReplayProjection withClients(
+            ReplayConfig config, boolean sourceTransactions, ReplayTarget.Factory target) {
+        return new ReplayProjection(config, sourceTransactions, target);
+    }
+
+    private ReplayProjection(
+            ReplayConfig config, boolean sourceTransactions, ReplayTarget.Factory target) {
         this.secondaryIndexes = config.secondaryIndexes();
         this.sourceTransactions = sourceTransactions;
         this.dispatchMode = config.dispatchMode();
-        this.target = target;
+        this.dispatcher = new ReplayDispatcher(config, target);
     }
 
     public boolean includes(Operation operation) {
@@ -71,6 +75,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
             return;
         }
         source++;
+        dispatcher.route(operation);
         if (operation.index() == 0) primary++;
         else secondary++;
         if (activeTransaction != 0 && ++transactionOperations > MAX_TRANSACTION_OPERATIONS)
@@ -130,8 +135,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
     }
 
     private void sendOperation(Operation operation) throws IOException {
-        target.accept(operation);
-        requests++;
+        dispatcher.send(operation);
         countDispatch(operation);
     }
 
@@ -157,6 +161,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
                     || o.file() != lastMutation.file()
                     || o.position() != lastMutation.position()
                     || o.sourceEvent() != lastMutation.sourceEvent()
+                    || o.workUnitId() != lastMutation.workUnitId()
                     || o.flags() != lastMutation.flags()
                     || o.secondarySource() != lastMutation.secondarySource()
                     || o.secondaryTarget() != lastMutation.secondaryTarget())
@@ -203,11 +208,8 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
                     || o.expectedCount() != lastOrdinal)
                 throw new IOException("Source commit or mutation count mismatch");
             requireCompleteExpansion();
-            if (dispatchMode.equals("transaction") && !pending.isEmpty()) {
-                target.acceptGroup(List.copyOf(pending));
-                requests++;
-                for (Operation operation : pending) countDispatch(operation);
-            } else for (Operation operation : pending) sendOperation(operation);
+            if (dispatchMode.equals("transaction") && !pending.isEmpty()) groups++;
+            for (Operation operation : pending) sendOperation(operation);
             pending.clear();
             lastVersion = activeVersion;
             lastTransactionId = activeTransaction;
@@ -220,6 +222,16 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
         checkThread();
         if (activeTransaction != 0)
             throw new IOException("Truncated source transaction without commit");
+        dispatcher.drain();
+    }
+
+    public void requireClientCoverage() throws IOException {
+        dispatcher.requireClientCoverage();
+    }
+
+    @Override
+    public void close() throws IOException {
+        dispatcher.close();
     }
 
     public long dispatched() {
@@ -237,9 +249,10 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer {
         report.put("change_delivery", sourceTransactions ? "committed_only" : "baseline_or_legacy");
         report.put("transaction_control_records", controls);
         report.put("dispatch_mode", dispatchMode);
-        report.put("target_calls", requests);
+        report.put("source_dispatch_groups", groups);
+        report.putAll(dispatcher.describe());
         report.put("sending_threads", 1);
-        report.put("ordering", "source_transaction_and_operation_order");
+        report.put("ordering", "source_transaction_and_operation_local_send_order");
         report.put("downstream_transaction_api_required", false);
         report.put("dispatched_by_kind", new LinkedHashMap<>(kinds));
         return report;

@@ -38,7 +38,7 @@ public final class SnapshotLookupValidation {
                 workload = directory.resolve("workload.ops");
         if (IndexOperationTrace.formatVersion(workload) < 3)
             throw new IOException(
-                    "Snapshot validation requires captured transaction commit versions (v3-v5)");
+                    "Snapshot validation requires captured transaction commit versions (v3-v6)");
         var preflight = ReferenceReplay.check(directory, config);
         Map<Key, List<Operation>> changes = new TreeMap<>();
         Map<Key, Operation> pending = new LinkedHashMap<>();
@@ -49,7 +49,7 @@ public final class SnapshotLookupValidation {
                     if (o.kind() == IndexOperationTrace.RELOCATE)
                         throw new IOException(
                                 "Derived source-row oracle requires a workload without relocation"
-                                    + " events");
+                                        + " events");
                     if (IndexOperationTrace.isMutation(o) && o.index() == 0)
                         pending.put(new Key(o.table(), o.key()), o);
                     else if (o.kind() == IndexOperationTrace.TRANSACTION_COMMIT) {
@@ -90,91 +90,96 @@ public final class SnapshotLookupValidation {
         List<Map<String, Object>> modes = new ArrayList<>();
         for (boolean rowIds : new boolean[] {false, true}) {
             var model = new IndexReferenceReplay(rowIds, config.secondaryIndexes());
-            var load = new ReplayProjection(config.secondaryIndexes(), model::accept);
-            var runtime = new ReplayProjection(config, true, model::accept);
-            IndexOperationTrace.readExpanded(baseline, load);
-            IndexOperationTrace.readExpanded(workload, runtime);
-            runtime.finish();
-            long primaryProbes = 0, secondaryProbes = 0, items = 0;
-            long initialQueries = model.queries();
-            for (var entry : changes.entrySet()) {
-                Key key = entry.getKey();
-                var times = new TreeSet<Long>(List.of(0L, published[0]));
-                for (Operation o : entry.getValue()) {
-                    times.add(o.version() - 1);
-                    times.add(o.version());
-                }
-                for (long time : times) {
-                    LookupResult expected = expected(key, oracle.get(key), time, rowIds);
-                    LookupResult actual =
-                            model.lookupPrimary(key.table(), Math.toIntExact(key.key()), time);
-                    if (!Objects.equals(expected, actual))
-                        throw new IOException(
-                                "Historical primary result mismatch: " + key + " at " + time);
-                    model.accept(probe(key.table(), 0, key.key(), time, expected == null ? 0 : 1));
-                    primaryProbes++;
-                    if (expected != null) items++;
-                }
-            }
-            for (var indexEntry : predicates.entrySet()) {
-                int index = indexEntry.getKey();
-                for (long predicate : indexEntry.getValue()) {
-                    Map<Key, ExpectedRow> bucket = new TreeMap<>();
-                    long firstChange = Long.MAX_VALUE;
-                    for (var entry : oracle.entrySet()) {
-                        if (entry.getKey().table() != 5) continue;
-                        ExpectedRow row = entry.getValue();
-                        boolean matches =
-                                row.baseline() != null
-                                        && indexed(row.baseline(), index) == predicate;
-                        for (Operation o : row.commits())
-                            if (indexed(o, index) == predicate) {
-                                matches = true;
-                                firstChange = Math.min(firstChange, o.version());
-                            }
-                        if (matches) bucket.put(entry.getKey(), row);
-                    }
+            try (var load = new ReplayProjection(config, false, model::accept);
+                    var runtime = new ReplayProjection(config, true, model::accept)) {
+                IndexOperationTrace.readExpanded(baseline, load);
+                load.finish();
+                IndexOperationTrace.readExpanded(workload, runtime);
+                runtime.finish();
+                long primaryProbes = 0, secondaryProbes = 0, items = 0;
+                long initialQueries = model.queries();
+                for (var entry : changes.entrySet()) {
+                    Key key = entry.getKey();
                     var times = new TreeSet<Long>(List.of(0L, published[0]));
-                    if (firstChange != Long.MAX_VALUE) {
-                        times.add(firstChange - 1);
-                        times.add(firstChange);
+                    for (Operation o : entry.getValue()) {
+                        times.add(o.version() - 1);
+                        times.add(o.version());
                     }
                     for (long time : times) {
-                        Set<LookupResult> expected = new HashSet<>();
-                        for (var entry : bucket.entrySet()) {
-                            Operation selected = select(entry.getValue(), time);
-                            if (selected != null && indexed(selected, index) == predicate) {
-                                LookupResult value =
-                                        expected(entry.getKey(), entry.getValue(), time, rowIds);
-                                if (value != null) expected.add(value);
-                            }
-                        }
-                        var actual = model.lookupSecondary(index, Math.toIntExact(predicate), time);
-                        if (actual.size() != expected.size()
-                                || !new HashSet<>(actual).equals(expected))
+                        LookupResult expected = expected(key, oracle.get(key), time, rowIds);
+                        LookupResult actual =
+                                model.lookupPrimary(key.table(), Math.toIntExact(key.key()), time);
+                        if (!Objects.equals(expected, actual))
                             throw new IOException(
-                                    "Historical secondary result mismatch: index "
-                                            + index
-                                            + ", predicate "
-                                            + predicate
-                                            + " at "
-                                            + time);
-                        model.accept(probe(5, index, predicate, time, expected.size()));
-                        secondaryProbes++;
-                        items += expected.size();
+                                    "Historical primary result mismatch: " + key + " at " + time);
+                        model.accept(
+                                probe(key.table(), 0, key.key(), time, expected == null ? 0 : 1));
+                        primaryProbes++;
+                        if (expected != null) items++;
                     }
                 }
+                for (var indexEntry : predicates.entrySet()) {
+                    int index = indexEntry.getKey();
+                    for (long predicate : indexEntry.getValue()) {
+                        Map<Key, ExpectedRow> bucket = new TreeMap<>();
+                        long firstChange = Long.MAX_VALUE;
+                        for (var entry : oracle.entrySet()) {
+                            if (entry.getKey().table() != 5) continue;
+                            ExpectedRow row = entry.getValue();
+                            boolean matches =
+                                    row.baseline() != null
+                                            && indexed(row.baseline(), index) == predicate;
+                            for (Operation o : row.commits())
+                                if (indexed(o, index) == predicate) {
+                                    matches = true;
+                                    firstChange = Math.min(firstChange, o.version());
+                                }
+                            if (matches) bucket.put(entry.getKey(), row);
+                        }
+                        var times = new TreeSet<Long>(List.of(0L, published[0]));
+                        if (firstChange != Long.MAX_VALUE) {
+                            times.add(firstChange - 1);
+                            times.add(firstChange);
+                        }
+                        for (long time : times) {
+                            Set<LookupResult> expected = new HashSet<>();
+                            for (var entry : bucket.entrySet()) {
+                                Operation selected = select(entry.getValue(), time);
+                                if (selected != null && indexed(selected, index) == predicate) {
+                                    LookupResult value =
+                                            expected(
+                                                    entry.getKey(), entry.getValue(), time, rowIds);
+                                    if (value != null) expected.add(value);
+                                }
+                            }
+                            var actual =
+                                    model.lookupSecondary(index, Math.toIntExact(predicate), time);
+                            if (actual.size() != expected.size()
+                                    || !new HashSet<>(actual).equals(expected))
+                                throw new IOException(
+                                        "Historical secondary result mismatch: index "
+                                                + index
+                                                + ", predicate "
+                                                + predicate
+                                                + " at "
+                                                + time);
+                            model.accept(probe(5, index, predicate, time, expected.size()));
+                            secondaryProbes++;
+                            items += expected.size();
+                        }
+                    }
+                }
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("mode", rowIds ? "rowid" : "locator");
+                result.put("native_queries", initialQueries);
+                result.put("derived_primary_probes", primaryProbes);
+                result.put("derived_secondary_probes", secondaryProbes);
+                result.put("derived_checked_result_items", items);
+                result.put("selected_version_checksum", model.selectedVersionChecksum());
+                result.put("retained_index_versions", model.retainedVersions());
+                result.put("workload_dispatch", runtime.describe());
+                modes.add(result);
             }
-            Map<String, Object> result = new LinkedHashMap<>();
-            result.put("mode", rowIds ? "rowid" : "locator");
-            result.put("native_queries", initialQueries);
-            result.put("derived_primary_probes", primaryProbes);
-            result.put("derived_secondary_probes", secondaryProbes);
-            result.put("derived_checked_result_items", items);
-            result.put("selected_version_checksum", model.selectedVersionChecksum());
-            result.put("retained_index_versions", model.retainedVersions());
-            result.put("workload_dispatch", runtime.describe());
-            modes.add(result);
         }
         Map<String, Object> output = new LinkedHashMap<>();
         output.put("status", "passed");

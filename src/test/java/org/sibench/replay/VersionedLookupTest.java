@@ -205,6 +205,7 @@ public class VersionedLookupTest {
                 writer.append(snapshot(5, 2, 20, 0, 1));
                 writer.append(snapshot(5, 0, 1, 110, 0));
             }
+            Files.writeString(directory.resolve("work-units.jsonl"), "");
             Files.writeString(
                     directory.resolve("manifest.json"),
                     new Gson()
@@ -217,7 +218,10 @@ public class VersionedLookupTest {
                                             "baseline_trace_sha256",
                                             BaselineGenerator.sha256(baseline),
                                             "workload_trace_sha256",
-                                            BaselineGenerator.sha256(workload))));
+                                            BaselineGenerator.sha256(workload),
+                                            "work_units_sha256",
+                                            BaselineGenerator.sha256(
+                                                    directory.resolve("work-units.jsonl")))));
             for (boolean secondary : new boolean[] {false, true}) {
                 List<?> previous = null;
                 for (String dispatchMode : new String[] {"operation", "transaction"}) {

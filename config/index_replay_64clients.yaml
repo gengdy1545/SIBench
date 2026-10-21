@@ -1,0 +1,14 @@
+schema_version: 1
+purpose: index_replay
+target:
+  secondary_indexes:
+    enabled: true
+replay:
+  strategy: single_pass
+  dispatch_mode: operation
+  client_count: 64
+  max_in_flight: 4096
+  request_timeout_seconds: 60
+versions:
+  gc:
+    owner: none

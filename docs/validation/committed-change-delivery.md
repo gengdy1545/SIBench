@@ -1,8 +1,10 @@
 # 已提交变更发送验证
 
-更新：2026-10-20。默认只向下游发送已提交变更，不限定 Index Service 场景。当前单会话 v5 编译在源 commit 后生成该事务的有序查询与修改组，在 abort 时排除修改及修改后的查询；原始 Trace 保留全部事实，不生成反向补偿或回撤开关。
+更新：2026-10-20。默认只向下游发送已提交变更，不限定 Index Service 场景。当前单会话 v6 编译在源 commit 后生成该事务的有序查询与修改组，在 abort 时排除修改及修改后的查询；原始 Trace 保留全部事实，不生成反向补偿或回撤开关。
 
-`operation` 默认逐项发送，`transaction` 按源事务分组；两者均同一线程同步执行，不合并修改或重排查询。源 BEGIN/COMMIT 仅由驱动校验，不发送给索引。参考索引逐项应用版本写入，按 ReadTimestamp 查找，不暂存事务或实现事务 API。
+`operation` 默认以操作组织输入，`transaction` 以源事务组织输入；两者最终均逐项路由发送，不合并修改或重排查询。一个经过审计的源 SQL 请求对应一个 `workUnitId`，按 `(workUnitId - 1) % client_count` 路由，同请求的索引展开共用 client，同事务允许跨 client。默认 1 client，支持 64/128 及更多，不按索引键或事务绑定，不提供其他路由策略。
+
+一个全局线程保证本地发送顺序，当前 `sent` 完成后发下一项，不等待当前 `response` 或跨 client 可见。响应可乱序完成；驱动提供在途上限、超时、排空和失败清理，不以屏障或补偿修复可见性。Index Service 自行实现跨 client 读取和同版本有序覆盖；仅携带 timestamp 不自动保证此语义。源 BEGIN/COMMIT 仅由驱动校验，不发送给索引。参考 client 立即执行、共享索引状态，不代表网络服务已具备跨 client 可见性。
 
 ## 受控验证
 
@@ -19,8 +21,16 @@
 | 修改后查询，随后回滚 | 修改与修改后查询均不发送；查询排除量独立统计，原始事实保留 |
 | 查询、UPDATE、查询、再次 UPDATE、查询，最终 commit | 查询依次看到基线、第一次更新位置、第二次更新位置；修改不合并 |
 | INSERT transfer 后查 sourceid，再 DELETE account 后查主键，最终 commit | 插入后查询得到新条目，删除后查询为空；二级展开连续且查询不插入其中 |
-| 相同输入重复编译 | 两份 Trace、两个增量 Parquet 和 manifest 字节一致 |
+| 相同输入重复编译 | 两份 Trace、两个增量 Parquet、工作单元身份清单和同 JVM manifest 字节一致 |
 | 二级开/关 × operation/transaction | Locator 和 RowID 的查询与修改顺序均通过 |
+| 一个已提交源事务包含九次 SQL 请求 | 编译身份按 1–9 编号，transfer 展开共用请求身份；三 client 两模式保持相同操作序列且事务跨 client |
+| 回滚后继续请求 | 请求身份在回滚过滤前分配，不因删除回滚修改而重新编号 |
+| 多 client 异步发送 | 等待完整本地发送，但不等待响应；乱序响应不改变路由或发送序列 |
+| 在途上限为 1 | 未完成响应触发背压，不改变后续操作顺序 |
+| 本地发送或服务响应失败、超时、中断 | 停止发送，保持中断标志，关闭已开 client、取消未完成 future；过期后才完成的响应不能绕过超时 |
+| 二级过滤后部分 client 无操作 | 预检拒绝，不用来源工作单元总数替代实际覆盖、不重编号填充 |
+| 128 / 256 client | 足量工作单元可覆盖所有 client，128 无硬上限；缺失身份或覆盖不足拒绝 |
+| 身份清单被改动 | manifest 摘要不匹配，拒绝消费 |
 
 主回滚用例统计为：原始行修改 5、回滚排除 3、已提交行修改 2、展开索引写入 4、SEARCH 4、commit 2、abort 3，规范记录共 12。PG 索引插入尝试单独统计，不等同于下游版本写入。
 
@@ -28,41 +38,49 @@
 
 `RequestCaptureAuditTest` 和 `CaptureRunTest` 核对单会话及 HTAP 的 rollback/abort 请求身份，接受配对业务回滚和关闭 abort；拒绝未完成请求、缺失事务结束、错误回滚身份、异常与文件改动。
 
-`ReplayProjectionTest` 验证源 COMMIT 前不发送任何组内操作、目标不接收控制记录、两种模式操作序列相同、跨线程调用拒绝、无效版本/事务/查询位置和展开顺序拒绝、空过滤组不调用目标、超过 1,000,000 项的源组拒绝，以及目标失败后停止后续发送。`IndexOperationTraceTest` 覆盖 v5 写后查询位置往返和旧格式只读兼容。配置测试验证默认 operation、transaction 配置和未知选项拒绝。
+`ReplayProjectionTest` 验证源 COMMIT 前不发送任何组内操作、目标不接收控制记录、两种模式操作序列相同、跨线程调用拒绝、无效版本/事务/查询位置和展开顺序拒绝、空过滤组不调用目标、超过 1,000,000 项的源组拒绝，以及目标失败后停止后续发送。`ReplayDispatcherTest` 验证异步本地发送/响应、工作单元路由、在途上限、覆盖、超时及资源清理。`IndexOperationTraceTest` 覆盖 v6 工作单元及查询位置往返、身份校验和 v1–v5 只读兼容。配置测试验证默认 1 client、64/128 配置、未知策略与非法上限拒绝。
 
 ## SF1 离线回归
 
-2026 年 10 月 20 日，使用既有原生 TP 子集采集 `results/poc/hybench-sf1/raw/pg-1475807.jsonl` 及其配对 JDBC 日志，重新执行请求审计、v5 编译、两种发送模式回放和独立历史 oracle 验证。不重新执行 SQL 或启动 PG，不修改原生负载。
+2026 年 10 月 20 日，使用既有原生 TP 子集采集 `results/poc/hybench-sf1/raw/pg-1475807.jsonl` 及其配对 JDBC 日志，重新执行请求审计、两次独立 JVM v6 编译、1/64/128 client × operation/transaction × 二级开/关参考回放和独立历史 oracle 验证。不重新执行 SQL 或启动 PG，不修改原生负载。原生采集仍是单会话；下游 client 数与上游采集会话数独立。
 
 | 项目 | 结果 |
 | --- | ---: |
 | 配对请求 / 未关联服务端事件 | 150,463 / 0 |
+| 来源 SQL 工作单元 / 有效运行期工作单元，二级开启 | 150,463 / 150,463 |
+| 二级关闭后的有效运行期工作单元 | 128,354 |
+| Baseline 加载工作单元 | 2,126 |
 | 原始行修改 / 已提交行修改 | 76,881 / 76,881 |
 | commit / abort / 回滚排除行修改 | 73,582 / 0 / 0 |
 | Baseline 索引记录 | 20,706,000 |
 | 规范运行期记录，含事务控制 | 422,244 |
 | SEARCH / 索引版本写入 | 146,945 / 128,135 |
 | 事务内修改后查询 | 25,627 |
-| 两种模式发送量，排除控制 | 均为 275,080 |
-| 两种模式的 Locator / RowID 参考回放 | 均通过 |
+| 二级开启发送量，排除控制 | 275,080 |
+| 二级关闭发送量 / 过滤量 | 179,608 / 95,472 |
+| 12 组配置 × Locator / RowID 参考回放 | 均通过 |
 | 修改主键数 | 72,870 |
 | 每种 value 的派生主键 / 二级探针 | 299,500 / 512 |
 
-| 发送模式 | 运行期索引操作 | adapter 调用数 | 结果、最终状态、历史版本 |
-| --- | ---: | ---: | --- |
-| operation | 275,080 | 275,080 | 通过 |
-| transaction | 275,080 | 73,582 | 通过且与 operation 一致 |
+| 输入模式 | 运行期索引操作 | adapter 调用数 | 非空源输入组 | 结果、最终状态、历史版本 |
+| --- | ---: | ---: | ---: | --- |
+| operation | 275,080 | 275,080 | 0 | 通过 |
+| transaction | 275,080 | 275,080 | 73,582 | 通过且与 operation 一致 |
 
-以上使用二级开启配置；adapter 调用数不是网络请求数。每种 value 核对 992,036 个查询结果项、保留 20,834,134 个索引版本。相同 value 在两种发送模式下的查询结果、选中版本和最终主键状态摘要一致。25,627 个原生扫描处于此前已有行修改的事务内位置，因此使用 TRANSACTION_LOCAL_SEARCH；这不等于 25,627 次都读取同一事务刚修改的同一个键。
+以上分组表使用二级开启配置；adapter 调用数不是网络请求数。每种 value 核对 992,036 个查询结果项、保留 20,834,134 个索引版本。相同二级配置、相同 value 在三种 client 数和两种输入模式下的查询结果、选中版本、最终主键状态及发送序列摘要一致。25,627 个原生扫描处于此前已有行修改的事务内位置，因此使用 TRANSACTION_LOCAL_SEARCH；这不等于 25,627 次都读取同一事务刚修改的同一个键。
 
-增量 Parquet 与历史 v4 产物摘要一致：account 为 `8d7769279fd27cf847b97bd3c312a6d95cdb7200ef3f5ea3de247d573a699b38`，transfer 为 `04a2f9535d8a9c54469999830adebcf06f6c04d0bdc45a778c6b464f261acbb5`。新 Trace 使用 v5 及组内查询位置，不能要求与旧二进制摘要一致。旧 v4 产物使用当前 operation 配置的 Locator/RowID 回放也通过。
+128 client 的运行期每 client 操作数：二级开启为 2,081–2,225，关闭为 1,347–1,458；两种输入模式一致，所有 client 均有实际操作。二级关闭后每种 value 核对 102,727 个查询结果项、保留 8,782,880 个索引版本。所有组合逐 client 操作、查询、写入及工作单元统计与汇总一致，响应排空后 pending=0。
 
-两次独立 JVM 编译的 baseline/workload Trace 与两个增量 Parquet 均 SHA256 一致；manifest 的所有字段和值一致，但 Map 的 JSON 字段输出顺序不同，因此 manifest 文件摘要不同。此处验证数据和 Trace 字节确定性，不声称跨 JVM 的 manifest 文本排序确定性。
+增量 Parquet 与历史产物摘要一致：account 为 `8d7769279fd27cf847b97bd3c312a6d95cdb7200ef3f5ea3de247d573a699b38`，transfer 为 `04a2f9535d8a9c54469999830adebcf06f6c04d0bdc45a778c6b464f261acbb5`。v6 新增工作单元字段，不要求与旧二进制摘要一致。历史 v5 单 client 回放通过，多 client 因缺失身份在报告创建前拒绝；短 SF1 输入仍拒绝 666,000,000 个有效操作的长时预算。
 
-当前产物位于 `results/validation/hybench-sf1-ordered-replay-20261020/`：`request-audit.json`、`normalized/`、`normalized-repeat/`、`replay-operation.json`、`replay-transaction.json`、两份 snapshots 报告及 `legacy-v4-replay.json`。此前 `results/validation/hybench-sf1-committed-changes-20261020/` 和其他历史日志、manifest、失败产物均保留原记录，不作为当前配置说明。
+两次独立 JVM 编译的 baseline/workload Trace、工作单元身份清单与两个增量 Parquet 均 SHA256 一致；manifest 的所有字段和值一致，不声称跨 JVM 的 Map JSON 文本排序确定性。
 
-JDK 17 离线 `mvn -o -q package` 和 74 项测试通过。上述 SF1 输入无回滚，证明已有提交路径无回归；写入后回滚由受控测试验证。既有原生 HTAP 的 13 次业务回滚发生在写入前，详见 [HTAP SF1 报告](hybench-sf1-htap.md)。本次不重新运行完整 HTAP。
+当前产物位于 `results/validation/hybench-sf1-multiclient-20261020/`：`request-audit.json`、`normalized/`、`normalized-repeat/`、12 份 replay、12 份 snapshots、每组实际 YAML 配置、`matrix-summary.json` 及 `legacy-v5-single-client.json`。`ValidateSf1.java` 是该实验本地编排记录，调用项目 Java CLI，不重复实现回放语义。历史目录和日志、manifest、失败产物均保留原记录，不作为当前配置说明。
+
+上述 SF1 输入无回滚，证明已有提交路径无回归；写入后回滚由受控测试验证。既有原生 HTAP 的 13 次业务回滚发生在写入前，详见 [HTAP SF1 报告](hybench-sf1-htap.md)。本次不重新运行完整 HTAP。
+
+JDK 17 离线 `mvn -o -q package` 包含全套 86 项测试；在途异步行为单独受控验证，SF1 参考 client 的响应立即完成，不能把其在途峰值或进程内速率作为网络性能指标。
 
 ## 支持边界
 
-已实现的是单会话已提交源事务内的保序写后查询，以及两种不要求索引事务 API 的发送模式。完整 HTAP 仍只保存无损原始 Trace 并审计八表状态，不能使用单会话编译器；并发快照、跨会话全局顺序、范围或变长键、多表索引维护、来源预期 SQL 错误与重试转换仍待实现。真实 Index Service adapter 尚未接入，单线程参考模型不证明网络服务吞吐、持久化或大规模状态能力。发送规则见 [Trace 契约](../contracts/trace.md)，剩余任务见 [计划](../../plan.md)。
+已实现的是单会话已提交源事务内的保序写后查询、源 SQL 工作单元路由和多 client 驱动。SF1 验证了 128 个有效 client 的路由与序列，不等于真实网络建立了 128 条连接；异步行为由受控 future/latch 测试验证，不代表服务端可见性或吞吐。完整 HTAP 仍只保存无损原始 Trace 并审计八表状态，不能使用单会话编译器；并发快照、跨会话全局顺序、范围或变长键、多表索引维护、来源预期 SQL 错误与重试转换仍待实现。真实 Index Service adapter 尚未接入，参考模型及工作单元集合不证明 SF1000 有界状态、网络服务吞吐或持久化。发送规则见 [Trace 契约](../contracts/trace.md)，剩余任务见 [计划](../../plan.md)。

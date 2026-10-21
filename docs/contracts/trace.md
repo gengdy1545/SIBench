@@ -4,7 +4,7 @@
 
 原始层保存一次实际执行的请求、参数、结果、索引候选、行变更和提交/回滚。规范层只转换已声明支持的索引操作，保留源事件关联，不重执行 SQL 推测结果。PG 页分裂、HOT、VACUUM 等内部实现不转换为下游 KV 算法。
 
-默认原生执行为 HyBench `runHTAP`，保存 AP/TP/并发 AT-IQ 的多会话采集，行变化触发器覆盖八表。当前 v5 **规范投影**仍限于显式单会话 TP 子集：8 表主键加载、savingaccount 主键查询/修改、transfer 两个 sourceid/targetid 二级索引；支持已提交事务内的写后查询。HTAP 不套用单会话提交顺序，未支持的事件或可见性拒绝转换。覆盖见 [HTAP 验证](../validation/hybench-sf1-htap.md)、[TP 子集验证](../validation/hybench-sf1-poc.md) 和 [保序发送验证](../validation/committed-change-delivery.md)。
+默认原生执行为 HyBench `runHTAP`，保存 AP/TP/并发 AT-IQ 的多会话采集，行变化触发器覆盖八表。当前 v6 **规范投影**仍限于显式单会话 TP 子集：8 表主键加载、savingaccount 主键查询/修改、transfer 两个 sourceid/targetid 二级索引；支持已提交事务内的写后查询和多 client 路由。HTAP 不套用单会话提交顺序，未支持的事件或可见性拒绝转换。覆盖见 [HTAP 验证](../validation/hybench-sf1-htap.md)、[TP 子集验证](../validation/hybench-sf1-poc.md) 和 [保序发送验证](../validation/committed-change-delivery.md)。
 
 `CapturePoc pack` 将 HTAP PG 原始事件写入 64 字节 access 记录及无损 `payload.jsonl`；块使用 CRC32C，输入及输出保存 SHA256。事件码 1–15 不变，16 为 `executor_run_end`，记录执行器返回的事实；`executor_end` 是清理生命周期事件，关闭连接时可能没有该事件。按文件名排序保留各会话内部顺序，不声明全局提交顺序或 KV 回放语义。
 
@@ -22,14 +22,24 @@ LogicalValue = RowID
 - 回滚不推进 CommitVersion，不分配 RowID，不改变已提交索引状态，也不写入增量 Parquet。后续事务从最近的已提交状态继续。
 - transactionId 是源提交事件序号。修改的 mutationOrdinal 是事务内行修改序号，二级展开共享序号；组内查询携带同一 transactionId，mutationOrdinal 表示查询前已发生的行修改数。两者只用于来源关联和顺序校验，不作为 KV 版本后缀，不要求索引维护事务状态。
 - ReadTimestamp 表示查询可见的提交上界，在 T 选择同键最大版本 `<=T`。没有版本或选中删除版本时不存在，不能跳过删除标记返回旧值。
-- 单会话事务首次修改前的查询使用前一次提交的 ReadTimestamp；修改后的查询使用本源事务的 CommitVersion，并标记 TRANSACTION_LOCAL_SEARCH。必须按原始位置发送：先完成前面的修改，再查询，最后执行后续修改。因此查询能看到此前写入，不能看到同事务尚未发送的修改。事务结束后同键同版本只保留最后效果。
+- 单会话事务首次修改前的查询使用前一次提交的 ReadTimestamp；修改后的查询使用本源事务的 CommitVersion，并标记 TRANSACTION_LOCAL_SEARCH。必须按原始位置发送：此前修改 → 查询 → 后续修改。期望结果对应查询位置的此前写入，不包括后续修改；驱动不等待跨 client 执行或可见性。Index Service 必须实现其声明的有序覆盖与读取语义，否则结果核对失败。仅有时间戳不自动保证同版本中间结果或跨连接可见。事务结束后同键同版本只保留最后效果。
 - 上述读己之写转换仅对单会话保序输入成立；不得推广为并发事务都读取自身 CommitVersion。并发快照尚无完整映射，不能把原始 xmin/xmax/xip 当作通用提交版本。显式历史查询选择可用历史点，未来读点拒绝。
 - UPDATE 保留 RowID；DELETE 后重插入分配新 RowID。Rewrite 不改变逻辑版本或 RowID。
 - FileID 从 1 分配且不复用；文件内行号从 0 开始。数据集隔离，int64 无损解析。
 
+## 工作单元与路由
+
+`workUnitId` 是请求工作单元身份，与索引键、transactionId、CommitVersion、PID 和物理节点身份独立。当前编译器把一个经过 JDBC/PG 配对审计的源 SQL 请求作为一个工作单元，在 `executor_start` 处按源请求顺序从 1 编号，先编号再进行回滚或二级过滤。同请求的多个扫描、行修改及其主键/二级展开共用身份，不把一个请求人为拆成多个工作单元。
+
+`work-units.jsonl` 按编号记录 `work_unit_id`、原始 `application`、`pid` 和请求开始的 `source_event`，其 SHA256 写入 manifest；二进制操作保留 `sourceEvent` 和 `workUnitId`。没有有效索引操作的请求仍在身份清单中，不占用运行期发送量。单个 SQL 工作单元是明确的执行任务近似，不声称恢复了真实 serverless task DAG 或数据节点拓扑。
+
+回放使用固定的 `clientId = (workUnitId - 1) % client_count`，不保存固定 clientId、不按索引键 hash、不绑定源事务、不提供替代路由策略。相同工作单元始终使用一个 client；同一事务的多个工作单元允许跨 client。改变 client 数只改变发送连接，不改变 Trace、版本、Parquet 或操作序列。Baseline 使用连续每 4096 行一个加载工作单元，每行索引展开共用身份；加载身份与运行期 SQL 身份分别统计，Baseline 覆盖不能代替运行期覆盖。
+
+`client_count` 默认 1，64 和 128 为实验配置而非硬上限。预检在二级过滤后检查实际操作覆盖全部配置 client，而不只判断 distinct 工作单元数。覆盖不足在真实加载/发送前拒绝，应延长原生采集，不重复 Trace 或伪造单位填满 client。报告包含 configured/used clients 及各 client 操作、查询、写入和工作单元数；覆盖不等于负载均衡或连接并行吞吐。
+
 ## 当前二进制格式
 
-v5 使用 112 字节记录、每块 4096 条、little-endian 和 CRC32C。字段由 `IndexOperationTrace` 编解码，组边界、查询位置和展开顺序由 `ReplayProjection` 校验。
+v6 使用 120 字节记录、每块 4096 条、little-endian 和 CRC32C；在原 112 字节字段后追加 int64 `workUnitId`。控制记录使用 0，编译生成的运行期/加载操作使用正数。字段由 `IndexOperationTrace` 编解码，组边界、查询位置和展开顺序由 `ReplayProjection` 校验。
 
 | 操作 | 语义 |
 | --- | --- |
@@ -44,7 +54,7 @@ v5 使用 112 字节记录、每块 4096 条、little-endian 和 CRC32C。字段
 
 规范 Trace 保留已提交源事务内查询与修改的原始相对顺序，查询占据原生扫描开始的位置，候选数在扫描结束时补齐。transfer 的一次行修改连续展开为主键、sourceid、targetid 三项，查询不得插在展开中间。增量 Parquet 保留每次修改，行含 `_sib_timestamp` 和 `_sib_mutation_ordinal`。同键同版本按序覆盖，中间效果服务于原始事务内查询，不产生额外提交版本；后续源事务只能看到最终提交效果。
 
-读兼容：v4 同为 112 字节但没有组内写后查询契约；v3 为 104 字节，旧 SEARCH.version 映射为 ReadTimestamp；v1/v2 为 88 字节，仅支持最新状态兼容，不具备可信事务版本。v1 的 transfer 行写入在读取时展开，其他格式已显式展开。旧文件不改写，新编译输出 v5；只保留旧格式读取，不保留旧发送策略。
+读兼容：v4/v5 为 112 字节，v5 包含组内写后查询契约；v3 为 104 字节，旧 SEARCH.version 映射为 ReadTimestamp；v1/v2 为 88 字节，仅支持最新状态兼容，不具备可信事务版本。v1 的 transfer 行写入在读取时展开，其他格式已显式展开。旧格式没有工作单元身份，读取为 0，仅允许单 client，不猜测补齐身份。旧文件不改写，新编译输出 v6；只保留历史格式读取，不保留废弃发送策略。测试或派生探针允许身份 0，但不能据此进行多 client 原生回放。
 
 ## 发送选择
 
@@ -61,20 +71,27 @@ target:
 replay:
   strategy: single_pass
   dispatch_mode: operation
+  client_count: 1
+  max_in_flight: 4096
+  request_timeout_seconds: 60
 ```
 
 二级开关过滤所有 IndexID>0 的加载、查询、写入、逻辑失效和搬迁，不改变主键身份、源顺序、版本、依赖或 Parquet，不替换被过滤查询。
 
-| dispatch_mode | 发送单位 | 顺序与完成契约 |
+| dispatch_mode | 驱动输入单位 | 发送契约 |
 | --- | --- | --- |
-| operation（默认） | 每次一个索引操作 | 同一线程逐项发送，当前操作执行完成后才发送下一项 |
-| transaction | 一个已提交源事务的有序操作列表，含查询 | 同一线程调用一次分组接口，组内逐项完成，整组完成后才发送下一组 |
+| operation（默认） | 一个索引操作 | 完整源组校验后，逐项路由及本地发送 |
+| transaction | 一个已提交源事务的有序操作列表，含查询 | 按源组组织输入，组内仍逐项路由及本地发送，可跨 client |
 
-两种模式执行相同操作，不合并同键修改，不移动查询，不跨事务重排。`transaction` 仅决定分组调用，不要求原子执行、BEGIN/COMMIT RPC、回滚或事务缓存。`ReplayTarget` 的返回表示操作或整组已经执行完成；异步 adapter 必须等待完成，不能仅入队后返回。组失败后驱动停止，不自动重试或补偿。
+两种模式发送完全相同的操作序列，不合并同键修改，不移动查询，不跨事务重排。`transaction` 不是一组一个 client 或一次组 RPC，不要求原子执行、BEGIN/COMMIT RPC、回滚或索引事务缓存；分组统计属于驱动，不是 adapter 调用数。
 
-驱动先缓冲并校验完整源组，确认尾部 COMMIT 后才发送；目标索引收到的是独立版本写入与带 ReadTimestamp 的查询，没有控制记录。每组最多 1,000,000 个展开操作（含被过滤操作），编译器也限制待处理源操作数量；这是输入保护，不是大规模可落盘状态方案。发送端只用一个线程，保持规范输入的事务顺序和事务内顺序；多会话原生 benchmark 的全局顺序尚未捕获，不能据此声称完整 HTAP 保序回放已完成。
+一个全局发送线程按 Trace 顺序调用 client，等待当前操作的 `sent` 确认后才发送下一项。`ReplayTarget.SendHandle.sent` 表示完整本地传输完成，不能只是提交到会被重排的客户端异步队列；`response` 表示 adapter 已关联、核对该请求的服务响应，错误或结果不符应异常完成。response 可以乱序完成；不同连接的远端到达、执行及可见顺序不是此本地发送契约。Index Service 自行处理跨 client 语义，benchmark 不增加可见性屏障、反向操作或自动重试。
 
-报告区分落盘记录（含控制）、来源索引操作、二级过滤、实际发送、源事务及各操作类型。`target_calls` 是驱动对 adapter 的调用数，不是网络请求数；`sending_threads=1`、`downstream_transaction_api_required=false` 明确发送契约。RowID 搬迁无索引写入。历史主键和 transfer 等值查询已实现；历史范围、完整并发和 GC 未实现。
+全局 `max_in_flight` 限制未完成响应数量，默认 4096；达到上限等待响应腾出额度，结束时排空。超时从调用 send 前开始，覆盖本地发送和响应等待；`request_timeout_seconds` 默认 60，允许 1–86400。adapter 的 send 调用必须及时返回句柄，不能无界阻塞；真实 transport 超时与 close 取消资源由 adapter 实现。失败后停止后续发送并关闭已打开 client、取消未完成 future，不自动续接。初始加载完成并排空后才进入运行期，这是加载边界，不是运行期跨 client 可见性屏障。
+
+驱动先缓冲并校验完整源组，确认尾部 COMMIT 后才发送；目标索引收到的是独立版本写入与带 ReadTimestamp 的查询，没有控制记录。每组最多 1,000,000 个展开操作（含被过滤操作），编译器也限制待处理源操作数量；这是输入保护，不是大规模可落盘状态方案。多会话原生 benchmark 的全局顺序尚未捕获，不能据此声称完整 HTAP 保序回放已完成。
+
+报告区分落盘记录（含控制）、来源索引操作、二级过滤、实际发送、源事务及各操作类型。`target_calls` 在两种模式下均是逐操作 adapter 调用数，不是网络请求数；`source_dispatch_groups` 仅表示 transaction 模式的非空源组数。报告还包含不受 client 数影响的 `operation_order_checksum`、completed/pending responses、peak in-flight 和背压等待时间；`sending_threads=1`、`service_visibility_owner=index_service`、`downstream_transaction_api_required=false` 明确责任。参考 adapter 立即执行并共享模型状态，只验证路由及操作/结果，不模拟网络并发可见性。RowID 搬迁无索引写入。历史范围、完整并发和 GC 未实现。
 
 ## 完成与失败
 
@@ -96,4 +113,4 @@ JDBC 异常即使被原生方法捕获也会使当前运行失败；记录或清
 
 预算按二级过滤后的有效运行期操作计算，两种发送模式预算相同，排除 Baseline、控制和派生探针：预热操作 + ceil(速率 × 测量秒数 × (1 + 余量))。`long_replay.yaml` 为 18,000,000 + 300,000 × 1,800 × 1.2 = 666,000,000。不足在加载/发送前拒绝；当前预检只证明数量，不证明持续调度。
 
-`check-replay` 校验 manifest、摘要、格式、记录数、CRC 和预算；`replay` 执行两种 value 的状态与查询核对。`validate-snapshots` 要求完整 v3–v5 且无 relocation，以独立行历史 oracle 比较 key/version/value：全部修改主键的基线、每个提交前/提交点和最终点；每个二级索引最多 64 个修改谓词的基线、首次修改前/修改点和最终点。探针独立报告，不写入 Trace 或计入原生负载。
+`check-replay` 校验 manifest、摘要、工作单元清单摘要、格式、记录数、CRC、过滤后的 client 覆盖和预算，不调用真实 adapter；`replay` 执行两种 value 的状态与查询核对。`validate-snapshots` 要求完整 v3–v6 且无 relocation，以独立行历史 oracle 比较 key/version/value：全部修改主键的基线、每个提交前/提交点和最终点；每个二级索引最多 64 个修改谓词的基线、首次修改前/修改点和最终点。探针独立报告，不写入 Trace 或计入原生负载。
