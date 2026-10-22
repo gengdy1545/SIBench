@@ -1,5 +1,7 @@
 package org.sibench.capture;
 
+import org.sibench.trace.IndexKey;
+
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.EOFException;
@@ -7,8 +9,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
-import java.nio.charset.CodingErrorAction;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.zip.CRC32C;
@@ -20,8 +20,17 @@ public final class IndexOperationTrace {
     public static final int BUSINESS_INSERT = 1, BUSINESS_UPDATE = 2;
     public static final int SNAPSHOT_SEARCH = 1, DERIVED_SEARCH = 2;
     public static final int TRANSACTION_LOCAL_SEARCH = 4;
-    public static final int RECORD_BYTES = 132, BLOCK_RECORDS = 4096;
-    public static final int VERSION = 7;
+    public static final int LOWER_INCLUSIVE = 8, UPPER_INCLUSIVE = 16, DESCENDING = 32;
+    public static final int SEARCH_FLAGS =
+            SNAPSHOT_SEARCH
+                    | DERIVED_SEARCH
+                    | TRANSACTION_LOCAL_SEARCH
+                    | LOWER_INCLUSIVE
+                    | UPPER_INCLUSIVE
+                    | DESCENDING;
+    public static final int RECORD_BYTES = 128, BLOCK_RECORDS = 4096;
+    public static final int VERSION = 8;
+    public static final int MAX_TABLE = 65535, MAX_INDEX = 1024;
     private static final int MAGIC = 0x53494f50;
 
     private IndexOperationTrace() {}
@@ -39,74 +48,83 @@ public final class IndexOperationTrace {
         };
     }
 
+    /**
+     * The searched interval of one index component: the PK for index 0, the indexed value
+     * otherwise. A null bound is unbounded. Matches are visited in ascending (value, PK) order, or
+     * descending; a positive limit stops after that many visible matches.
+     */
+    public record Range(
+            IndexKey lower,
+            boolean lowerInclusive,
+            IndexKey upper,
+            boolean upperInclusive,
+            boolean descending,
+            long limit) {
+        public static Range equal(IndexKey value) {
+            return new Range(value, true, value, true, false, 0);
+        }
+
+        public boolean contains(IndexKey value) {
+            if (lower != null) {
+                int order = value.compareTo(lower);
+                if (order < 0 || order == 0 && !lowerInclusive) return false;
+            }
+            if (upper != null) {
+                int order = value.compareTo(upper);
+                if (order > 0 || order == 0 && !upperInclusive) return false;
+            }
+            return true;
+        }
+
+        public boolean point() {
+            return lower != null && lower.equals(upper) && lowerInclusive && upperInclusive;
+        }
+
+        int flags() {
+            return (lowerInclusive ? LOWER_INCLUSIVE : 0)
+                    | (upperInclusive ? UPPER_INCLUSIVE : 0)
+                    | (descending ? DESCENDING : 0);
+        }
+    }
+
+    /**
+     * Writes carry the encoded PK in {@code key} and, for a secondary index, the encoded indexed
+     * value; searches carry a {@link Range} in lower/upper/flags/limit instead.
+     */
     public record Operation(
             long sourceEvent,
             int kind,
             int table,
             int index,
             int flags,
-            long key,
+            IndexKey key,
+            IndexKey indexedValue,
             long version,
             long file,
             long position,
             long rowId,
-            long secondarySource,
-            long secondaryTarget,
             long expectedCount,
             long transactionId,
             long mutationOrdinal,
             long readTimestamp,
             long workUnitId,
-            String indexedValue,
             int expansionPosition,
-            int expansionSize) {
-        public Operation(
-                long sourceEvent,
-                int kind,
-                int table,
-                int index,
-                int flags,
-                long key,
-                long version,
-                long file,
-                long position,
-                long rowId,
-                long secondarySource,
-                long secondaryTarget,
-                long expectedCount,
-                long transactionId,
-                long mutationOrdinal,
-                long readTimestamp,
-                long workUnitId) {
-            this(
-                    sourceEvent,
-                    kind,
-                    table,
-                    index,
-                    flags,
-                    key,
-                    version,
-                    file,
-                    position,
-                    rowId,
-                    secondarySource,
-                    secondaryTarget,
-                    expectedCount,
-                    transactionId,
-                    mutationOrdinal,
-                    readTimestamp,
-                    workUnitId,
-                    index == 0
-                            ? null
-                            : Long.toString(
-                                    kind == SEARCH
-                                            ? key
-                                            : index == 1 ? secondarySource : secondaryTarget),
-                    0,
-                    0);
+            int expansionSize,
+            IndexKey lower,
+            IndexKey upper,
+            long limit) {
+
+        public Range range() {
+            return new Range(
+                    lower,
+                    (flags & LOWER_INCLUSIVE) != 0,
+                    upper,
+                    (flags & UPPER_INCLUSIVE) != 0,
+                    (flags & DESCENDING) != 0,
+                    limit);
         }
 
-        public Operation withIndex(int id, String value, int operationKind) {
+        public Operation withIndex(int id, IndexKey value, int operationKind) {
             return new Operation(
                     sourceEvent,
                     operationKind,
@@ -114,20 +132,21 @@ public final class IndexOperationTrace {
                     id,
                     flags,
                     key,
+                    value,
                     version,
                     operationKind == LOGICAL_DELETE ? 0 : file,
                     operationKind == LOGICAL_DELETE ? 0 : position,
                     rowId,
-                    secondarySource,
-                    secondaryTarget,
                     expectedCount,
                     transactionId,
                     mutationOrdinal,
                     readTimestamp,
                     workUnitId,
-                    value,
                     expansionPosition,
-                    expansionSize);
+                    expansionSize,
+                    lower,
+                    upper,
+                    limit);
         }
 
         public Operation withExpansion(int ordinal, int count) {
@@ -138,81 +157,21 @@ public final class IndexOperationTrace {
                     index,
                     flags,
                     key,
-                    version,
-                    file,
-                    position,
-                    rowId,
-                    secondarySource,
-                    secondaryTarget,
-                    expectedCount,
-                    transactionId,
-                    mutationOrdinal,
-                    readTimestamp,
-                    workUnitId,
                     indexedValue,
-                    ordinal,
-                    count);
-        }
-
-        public Operation withIndexedValue(String value) {
-            return new Operation(
-                    sourceEvent,
-                    kind,
-                    table,
-                    index,
-                    flags,
-                    key,
                     version,
                     file,
                     position,
                     rowId,
-                    secondarySource,
-                    secondaryTarget,
                     expectedCount,
                     transactionId,
                     mutationOrdinal,
                     readTimestamp,
                     workUnitId,
-                    value,
-                    expansionPosition,
-                    expansionSize);
-        }
-
-        public Operation(
-                long sourceEvent,
-                int kind,
-                int table,
-                int index,
-                int flags,
-                long key,
-                long version,
-                long file,
-                long position,
-                long rowId,
-                long secondarySource,
-                long secondaryTarget,
-                long expectedCount,
-                long transactionId,
-                long mutationOrdinal,
-                long readTimestamp) {
-            this(
-                    sourceEvent,
-                    kind,
-                    table,
-                    index,
-                    flags,
-                    key,
-                    version,
-                    file,
-                    position,
-                    rowId,
-                    secondarySource,
-                    secondaryTarget,
-                    expectedCount,
-                    transactionId,
-                    mutationOrdinal,
-                    readTimestamp,
-                    0);
+                    ordinal,
+                    count,
+                    lower,
+                    upper,
+                    limit);
         }
 
         public Operation withWorkUnitId(long id) {
@@ -223,95 +182,70 @@ public final class IndexOperationTrace {
                     index,
                     flags,
                     key,
+                    indexedValue,
                     version,
                     file,
                     position,
                     rowId,
-                    secondarySource,
-                    secondaryTarget,
                     expectedCount,
                     transactionId,
                     mutationOrdinal,
                     readTimestamp,
                     id,
-                    indexedValue,
                     expansionPosition,
-                    expansionSize);
+                    expansionSize,
+                    lower,
+                    upper,
+                    limit);
         }
 
-        public Operation(
-                long sourceEvent,
-                int kind,
-                int table,
-                int index,
-                int flags,
-                long key,
-                long version,
-                long file,
-                long position,
-                long rowId,
-                long secondarySource,
-                long secondaryTarget,
-                long expectedCount,
-                long transactionId,
-                long mutationOrdinal) {
-            this(
+        public Operation withTransaction(long id, long ordinal) {
+            return new Operation(
                     sourceEvent,
                     kind,
                     table,
                     index,
                     flags,
                     key,
-                    kind == SEARCH ? 0 : version,
-                    file,
-                    position,
-                    rowId,
-                    secondarySource,
-                    secondaryTarget,
-                    expectedCount,
-                    transactionId,
-                    mutationOrdinal,
-                    kind == SEARCH ? version : -1);
-        }
-
-        public Operation(
-                long sourceEvent,
-                int kind,
-                int table,
-                int index,
-                int flags,
-                long key,
-                long version,
-                long file,
-                long position,
-                long rowId,
-                long secondarySource,
-                long secondaryTarget,
-                long expectedCount) {
-            this(
-                    sourceEvent,
-                    kind,
-                    table,
-                    index,
-                    flags,
-                    key,
+                    indexedValue,
                     version,
                     file,
                     position,
                     rowId,
-                    secondarySource,
-                    secondaryTarget,
                     expectedCount,
-                    0,
-                    0);
+                    id,
+                    ordinal,
+                    readTimestamp,
+                    workUnitId,
+                    expansionPosition,
+                    expansionSize,
+                    lower,
+                    upper,
+                    limit);
         }
+    }
+
+    /** A primary-key write; {@link IndexMutation} expands it to the secondary indexes. */
+    public static Operation write(
+            long source,
+            int kind,
+            int table,
+            int flags,
+            IndexKey key,
+            long version,
+            long file,
+            long position,
+            long rowId) {
+        return new Operation(
+                source, kind, table, 0, flags, key, null, version, file, position, rowId, 0, 0, 0,
+                -1, 0, 0, 0, null, null, 0);
     }
 
     public static Operation search(
             long source,
             int table,
             int index,
-            long key,
+            Range range,
             long readTimestamp,
             long count,
             int flags) {
@@ -320,10 +254,9 @@ public final class IndexOperationTrace {
                 SEARCH,
                 table,
                 index,
-                flags,
-                key,
-                0,
-                0,
+                flags | range.flags(),
+                null,
+                null,
                 0,
                 0,
                 0,
@@ -331,48 +264,82 @@ public final class IndexOperationTrace {
                 count,
                 0,
                 0,
-                readTimestamp);
-    }
-
-    public static boolean isMutation(Operation o) {
-        return o.kind() == UPSERT || o.kind() == LOGICAL_DELETE;
+                readTimestamp,
+                0,
+                0,
+                0,
+                range.lower(),
+                range.upper(),
+                range.limit());
     }
 
     public static Operation transactionSearch(
             long source,
             int table,
             int index,
-            long key,
+            Range range,
             long readTimestamp,
             long count,
             long transactionId,
             long precedingMutations,
             boolean local) {
+        return search(
+                        source,
+                        table,
+                        index,
+                        range,
+                        readTimestamp,
+                        count,
+                        local ? TRANSACTION_LOCAL_SEARCH : 0)
+                .withTransaction(transactionId, precedingMutations);
+    }
+
+    public static Operation transaction(long source, int kind, long id, long version, long rows) {
         return new Operation(
-                source,
-                SEARCH,
-                table,
-                index,
-                local ? TRANSACTION_LOCAL_SEARCH : 0,
-                key,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                count,
-                transactionId,
-                precedingMutations,
-                readTimestamp);
+                source, kind, 0, 0, 0, null, null, version, 0, 0, 0, rows, id, 0, -1, 0, 0, 0,
+                null, null, 0);
+    }
+
+    public static boolean isMutation(Operation o) {
+        return o.kind() == UPSERT || o.kind() == LOGICAL_DELETE;
     }
 
     public static boolean isControl(Operation o) {
         return o.kind() == TRANSACTION_BEGIN || o.kind() == TRANSACTION_COMMIT;
     }
 
-    public static Operation transaction(long source, int kind, long id, long version, long rows) {
-        return new Operation(source, kind, 0, 0, 0, 0, version, 0, 0, 0, 0, 0, rows, id, 0);
+    /** Format-level invariants checked on both write and read. */
+    static void validate(Operation o) throws IOException {
+        boolean control = isControl(o), search = o.kind() == SEARCH;
+        boolean valid =
+                o.kind() >= INSERT
+                        && o.kind() <= TRANSACTION_COMMIT
+                        && (control ? o.table() == 0 : o.table() >= 1 && o.table() <= MAX_TABLE)
+                        && o.index() >= 0
+                        && o.index() <= MAX_INDEX
+                        && o.workUnitId() >= 0
+                        && (!control || o.workUnitId() == 0 && o.index() == 0)
+                        && (search
+                                ? o.version() == 0
+                                        && o.readTimestamp() >= 0
+                                        && o.key() == null
+                                        && o.indexedValue() == null
+                                        && (o.flags() & ~SEARCH_FLAGS) == 0
+                                        && (o.lower() != null || (o.flags() & LOWER_INCLUSIVE) == 0)
+                                        && (o.upper() != null || (o.flags() & UPPER_INCLUSIVE) == 0)
+                                        && o.limit() >= 0
+                                        && o.expectedCount() >= 0
+                                        && (o.limit() == 0 || o.expectedCount() == o.limit())
+                                : o.readTimestamp() == -1
+                                        && o.lower() == null
+                                        && o.upper() == null
+                                        && o.limit() == 0
+                                        && (control
+                                                ? o.key() == null && o.indexedValue() == null
+                                                : o.key() != null
+                                                        && (o.index() == 0)
+                                                                == (o.indexedValue() == null)));
+        if (!valid) throw new IOException("Invalid normalized operation");
     }
 
     public interface Consumer {
@@ -393,42 +360,43 @@ public final class IndexOperationTrace {
         }
 
         public void append(Operation o) throws IOException {
-            if ((o.kind() == SEARCH && (o.version() != 0 || o.readTimestamp() < 0))
-                    || (o.kind() != SEARCH && o.readTimestamp() != -1)
-                    || o.workUnitId() < 0
-                    || isControl(o) && o.workUnitId() != 0)
-                throw new IOException("Invalid CommitVersion/ReadTimestamp fields");
-            byte[] value =
-                    o.indexedValue == null ? null : o.indexedValue.getBytes(StandardCharsets.UTF_8);
-            if (value != null && value.length > 32768)
-                throw new IOException("Indexed value exceeds supported encoded key width");
+            validate(o);
             ByteBuffer record =
-                    ByteBuffer.allocate(RECORD_BYTES + (value == null ? 0 : value.length))
+                    ByteBuffer.allocate(
+                                    RECORD_BYTES
+                                            + length(o.key())
+                                            + length(o.indexedValue())
+                                            + length(o.lower())
+                                            + length(o.upper()))
                             .order(ByteOrder.LITTLE_ENDIAN);
-            record.putLong(o.sourceEvent)
-                    .putInt(o.kind)
-                    .putInt(o.table)
-                    .putInt(o.index)
-                    .putInt(o.flags)
-                    .putLong(o.key)
-                    .putLong(o.version)
-                    .putLong(o.file)
-                    .putLong(o.position)
-                    .putLong(o.rowId)
-                    .putLong(o.secondarySource)
-                    .putLong(o.secondaryTarget)
-                    .putLong(o.expectedCount)
-                    .putLong(o.transactionId)
-                    .putLong(o.mutationOrdinal)
-                    .putLong(o.readTimestamp)
-                    .putLong(o.workUnitId)
-                    .putInt(o.expansionPosition)
-                    .putInt(o.expansionSize)
-                    .putInt(value == null ? -1 : value.length);
-            if (value != null) record.put(value);
+            record.putLong(o.sourceEvent())
+                    .putInt(o.kind())
+                    .putInt(o.table())
+                    .putInt(o.index())
+                    .putInt(o.flags())
+                    .putLong(o.version())
+                    .putLong(o.file())
+                    .putLong(o.position())
+                    .putLong(o.rowId())
+                    .putLong(o.expectedCount())
+                    .putLong(o.transactionId())
+                    .putLong(o.mutationOrdinal())
+                    .putLong(o.readTimestamp())
+                    .putLong(o.workUnitId())
+                    .putLong(o.limit())
+                    .putInt(o.expansionPosition())
+                    .putInt(o.expansionSize());
+            for (IndexKey part : new IndexKey[] {o.key(), o.indexedValue(), o.lower(), o.upper()})
+                record.putInt(part == null ? -1 : part.length());
+            for (IndexKey part : new IndexKey[] {o.key(), o.indexedValue(), o.lower(), o.upper()})
+                if (part != null) part.writeTo(record);
             block.writeBytes(record.array());
             count++;
             if (count % BLOCK_RECORDS == 0) flush();
+        }
+
+        private static int length(IndexKey key) {
+            return key == null ? 0 : key.length();
         }
 
         public long count() {
@@ -478,10 +446,10 @@ public final class IndexOperationTrace {
                 fill(channel, header);
                 header.flip();
                 int bytes = header.getInt(), records = header.getInt(), checksum = header.getInt();
-                // Records carry a variable-length indexed value, so only a lower bound is fixed.
+                // Records carry variable-length keys, so only a lower bound is fixed.
                 if (bytes <= 0
-                        || bytes > 256 * 1024 * 1024
                         || records < 1
+                        || bytes > (long) records * (RECORD_BYTES + 4L * IndexKey.MAX_BYTES)
                         || records > BLOCK_RECORDS
                         || bytes < (long) records * RECORD_BYTES)
                     throw new IOException("Invalid normalized block length");
@@ -498,29 +466,28 @@ public final class IndexOperationTrace {
                     long sourceEvent = block.getLong();
                     int kind = block.getInt(), table = block.getInt(), index = block.getInt();
                     int flags = block.getInt();
-                    long key = block.getLong(), version = block.getLong(), file1 = block.getLong();
+                    long version = block.getLong(), file1 = block.getLong();
                     long position = block.getLong(), rowId = block.getLong();
-                    long secondarySource = block.getLong(), secondaryTarget = block.getLong();
                     long expectedCount = block.getLong(), transactionId = block.getLong();
                     long mutationOrdinal = block.getLong(), readTimestamp = block.getLong();
-                    long workUnitId = block.getLong();
+                    long workUnitId = block.getLong(), limit = block.getLong();
                     int expansionPosition = block.getInt(), expansionSize = block.getInt();
-                    int length = block.getInt();
-                    if (length < -1
-                            || length > 32768
-                            || length > block.remaining() - (records - i - 1) * RECORD_BYTES)
-                        throw new IOException("Invalid indexed value length");
-                    String indexedValue = null;
-                    if (length >= 0) {
-                        byte[] value = new byte[length];
+                    int[] lengths = new int[4];
+                    long variable = 0;
+                    for (int part = 0; part < 4; part++) {
+                        lengths[part] = block.getInt();
+                        if (lengths[part] < -1 || lengths[part] > IndexKey.MAX_BYTES)
+                            throw new IOException("Invalid key length");
+                        variable += Math.max(0, lengths[part]);
+                    }
+                    if (variable > block.remaining() - (long) (records - i - 1) * RECORD_BYTES)
+                        throw new IOException("Invalid key length");
+                    IndexKey[] parts = new IndexKey[4];
+                    for (int part = 0; part < 4; part++) {
+                        if (lengths[part] < 0) continue;
+                        byte[] value = new byte[lengths[part]];
                         block.get(value);
-                        indexedValue =
-                                StandardCharsets.UTF_8
-                                        .newDecoder()
-                                        .onMalformedInput(CodingErrorAction.REPORT)
-                                        .onUnmappableCharacter(CodingErrorAction.REPORT)
-                                        .decode(ByteBuffer.wrap(value))
-                                        .toString();
+                        parts[part] = IndexKey.decode(value);
                     }
                     Operation o =
                             new Operation(
@@ -529,30 +496,23 @@ public final class IndexOperationTrace {
                                     table,
                                     index,
                                     flags,
-                                    key,
+                                    parts[0],
+                                    parts[1],
                                     version,
                                     file1,
                                     position,
                                     rowId,
-                                    secondarySource,
-                                    secondaryTarget,
                                     expectedCount,
                                     transactionId,
                                     mutationOrdinal,
                                     readTimestamp,
                                     workUnitId,
-                                    indexedValue,
                                     expansionPosition,
-                                    expansionSize);
-                    if (o.kind < INSERT
-                            || o.kind > TRANSACTION_COMMIT
-                            || o.table < (isControl(o) ? 0 : 1)
-                            || o.table > (isControl(o) ? 0 : 8)
-                            || o.index < 0
-                            || o.index > 1024
-                            || o.workUnitId() < 0
-                            || isControl(o) && o.workUnitId() != 0)
-                        throw new IOException("Invalid normalized operation");
+                                    expansionSize,
+                                    parts[2],
+                                    parts[3],
+                                    limit);
+                    validate(o);
                     consumer.accept(o);
                     count++;
                 }

@@ -324,11 +324,21 @@ public class RowStateAuditTest {
                             "jdbc_file",
                             jdbc.getFileName().toString(),
                             "jdbc_sha256",
-                            BaselineGenerator.sha256(jdbc)));
+                            BaselineGenerator.sha256(jdbc),
+                            "bindings",
+                            false));
         }
         Files.writeString(
                 raw.resolve("capture-run.json"),
-                new Gson().toJson(Map.of("status", "complete", "sessions", sessions)));
+                new Gson()
+                        .toJson(
+                                Map.of(
+                                        "status",
+                                        "complete",
+                                        "session_order",
+                                        "concurrent",
+                                        "sessions",
+                                        sessions)));
         Path report = RowStateAudit.defaultReport(raw);
         var result =
                 RowStateAudit.audit(

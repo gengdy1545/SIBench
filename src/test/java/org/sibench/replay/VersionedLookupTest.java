@@ -1,11 +1,14 @@
 package org.sibench.replay;
 
+import org.sibench.capture.IndexOperationTrace.Range;
+import org.sibench.trace.IndexKey;
 import static org.junit.Assert.*;
 
 import com.google.gson.Gson;
 
 import org.junit.Test;
 import org.sibench.capture.IndexOperationTrace;
+import org.sibench.capture.TestOps;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexReferenceReplay;
 import org.sibench.generation.BaselineGenerator;
@@ -20,7 +23,7 @@ import java.util.Map;
 public class VersionedLookupTest {
     private static Operation row(
             int table, long key, long version, long position, long rowId, int kind, long ordinal) {
-        return new Operation(
+        return TestOps.op(
                 ordinal,
                 kind,
                 table,
@@ -50,7 +53,7 @@ public class VersionedLookupTest {
                 1000,
                 table,
                 index,
-                key,
+                Range.equal(IndexKey.ofInt(key)),
                 timestamp,
                 count,
                 IndexOperationTrace.SNAPSHOT_SEARCH | IndexOperationTrace.DERIVED_SEARCH);
@@ -67,7 +70,7 @@ public class VersionedLookupTest {
                                 new ReplayConfig(false, "none", 0, 0, 0, 0, dispatchMode),
                                 true,
                                 model::accept);
-                model.accept(new Operation(0, 1, 3, 0, 0, 2, 0, 3, 0, 52, 0, 0, 0));
+                model.accept(TestOps.op(0, 1, 3, 0, 0, 2, 0, 3, 0, 52, 0, 0, 0));
                 commit(replay, 100, row(3, 1, 100, 0, 50, 3, 1));
                 commit(replay, 110, row(3, 1, 110, 1, 50, 3, 1));
                 commit(replay, 120, row(3, 1, 120, 2, 50, 3, 1), row(3, 1, 120, 3, 50, 3, 2));
@@ -76,25 +79,25 @@ public class VersionedLookupTest {
                 replay.accept(snapshot(3, 0, 1, 105, 1));
                 replay.accept(snapshot(3, 0, 1, 110, 1));
                 replay.accept(snapshot(3, 0, 1, 130, 1));
-                assertNull(model.lookupPrimary(3, 1, 90));
-                assertEquals(100, model.lookupPrimary(3, 1, 105).commitVersion());
-                assertEquals(110, model.lookupPrimary(3, 1, 110).commitVersion());
-                assertEquals(120, model.lookupPrimary(3, 1, 130).commitVersion());
+                assertNull(model.lookupPrimary(3, TestOps.key(1), 90));
+                assertEquals(100, model.lookupPrimary(3, TestOps.key(1), 105).commitVersion());
+                assertEquals(110, model.lookupPrimary(3, TestOps.key(1), 110).commitVersion());
+                assertEquals(120, model.lookupPrimary(3, TestOps.key(1), 130).commitVersion());
                 assertEquals(
                         rowIds ? 50 : IndexReferenceReplay.locator(9, 3),
-                        model.lookupPrimary(3, 1, 120).value());
-                assertEquals(0, model.lookupPrimary(3, 2, 90).commitVersion());
+                        model.lookupPrimary(3, TestOps.key(1), 120).value());
+                assertEquals(0, model.lookupPrimary(3, TestOps.key(2), 90).commitVersion());
                 assertEquals(4, model.retainedVersions());
                 assertEquals(4, model.snapshotQueries());
                 commit(replay, 140, row(3, 1, 140, 0, 50, 5, 1));
-                assertNull(model.lookupPrimary(3, 1, 140));
-                assertEquals(120, model.lookupPrimary(3, 1, 139).commitVersion());
+                assertNull(model.lookupPrimary(3, TestOps.key(1), 140));
+                assertEquals(120, model.lookupPrimary(3, TestOps.key(1), 139).commitVersion());
                 commit(replay, 150, row(3, 1, 150, 4, 51, 3, 1));
-                assertNull(model.lookupPrimary(3, 1, 149));
-                assertEquals(150, model.lookupPrimary(3, 1, 150).commitVersion());
+                assertNull(model.lookupPrimary(3, TestOps.key(1), 149));
+                assertEquals(150, model.lookupPrimary(3, TestOps.key(1), 150).commitVersion());
                 assertEquals(
                         rowIds ? 51 : IndexReferenceReplay.locator(9, 4),
-                        model.lookupPrimary(3, 1, 150).value());
+                        model.lookupPrimary(3, TestOps.key(1), 150).value());
                 assertEquals(6, model.retainedVersions());
                 replay.finish();
             }
@@ -109,49 +112,49 @@ public class VersionedLookupTest {
             var model = new IndexReferenceReplay(rowIds, true);
             var replay = new ReplayProjection(ReplayConfig.defaults(), true, model::accept);
             org.sibench.capture.TransferIndexFixtures.expandRow(
-                    new Operation(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0), model::accept);
+                    TestOps.op(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0), model::accept);
             commit(replay, 100, row(5, 1, 100, 1, 50, 3, 1), row(5, 2, 100, 2, 51, 3, 2));
             commit(replay, 110, row(5, 1, 110, 0, 50, 5, 1));
             commit(replay, 130);
-            assertEquals(1, model.lookupSecondary(1, 10, 0).size());
-            assertEquals(2, model.lookupSecondary(1, 10, 105).size());
+            assertEquals(1, model.lookupSecondary(5, 1, TestOps.key(10), 0).size());
+            assertEquals(2, model.lookupSecondary(5, 1, TestOps.key(10), 105).size());
             assertEquals(
-                    List.of(2L),
-                    model.lookupSecondary(1, 10, 130).stream()
+                    List.of(TestOps.key(2)),
+                    model.lookupSecondary(5, 1, TestOps.key(10), 130).stream()
                             .map(IndexReferenceReplay.LookupResult::key)
                             .toList());
             replay.accept(snapshot(5, 1, 10, 105, 2));
             replay.accept(snapshot(5, 2, 20, 0, 1));
             org.sibench.capture.TransferIndexFixtures.expandRow(
-                    new Operation(200, 4, 5, 0, 0, 1, 100, 11, 7, 50, 10, 20, 0), model::accept);
+                    TestOps.op(200, 4, 5, 0, 0, 1, 100, 11, 7, 50, 10, 20, 0), model::accept);
             assertEquals(rowIds ? 0 : 3, model.relocationWrites());
             assertEquals(
                     rowIds ? 50 : IndexReferenceReplay.locator(11, 7),
-                    model.lookupPrimary(5, 1, 105).value());
+                    model.lookupPrimary(5, TestOps.key(1), 105).value());
             assertEquals(
                     rowIds ? 50 : IndexReferenceReplay.locator(11, 7),
-                    model.lookupSecondary(1, 10, 105).stream()
-                            .filter(o -> o.key() == 1)
+                    model.lookupSecondary(5, 1, TestOps.key(10), 105).stream()
+                            .filter(o -> o.key().equals(TestOps.key(1)))
                             .findFirst()
                             .orElseThrow()
                             .value());
-            assertNull(model.lookupPrimary(5, 1, 130));
+            assertNull(model.lookupPrimary(5, TestOps.key(1), 130));
             assertThrows(
                     IOException.class,
                     () ->
                             model.accept(
-                                    new Operation(201, 4, 5, 0, 0, 1, 110, 11, 8, 50, 10, 20, 0)));
+                                    TestOps.op(201, 4, 5, 0, 0, 1, 110, 11, 8, 50, 10, 20, 0)));
             assertThrows(
                     IOException.class,
                     () ->
                             model.accept(
-                                    new Operation(201, 4, 5, 0, 0, 1, 99, 11, 8, 50, 10, 20, 0)));
+                                    TestOps.op(201, 4, 5, 0, 0, 1, 99, 11, 8, 50, 10, 20, 0)));
             if (rowIds)
                 assertThrows(
                         IOException.class,
                         () ->
                                 model.accept(
-                                        new Operation(
+                                        TestOps.op(
                                                 201, 4, 5, 0, 0, 1, 100, 11, 8, 99, 10, 20, 0)));
         }
     }
@@ -161,7 +164,7 @@ public class VersionedLookupTest {
         for (Operation invalid :
                 List.of(
                         snapshot(5, 1, 10, 101, 0),
-                        IndexOperationTrace.search(0, 5, 1, 10, 99, 0, 0),
+                        IndexOperationTrace.search(0, 5, 1, Range.equal(IndexKey.ofInt(10)), 99, 0, 0),
                         snapshot(5, 1, 10, -1, 0))) {
             var rejected =
                     new ReplayProjection(
@@ -173,10 +176,10 @@ public class VersionedLookupTest {
                 new ReplayProjection(new ReplayConfig(false, "none", 0, 0, 0, 0), true, o -> {});
         commit(replay, 100);
         replay.accept(snapshot(5, 1, 10, 99, 0));
-        replay.accept(IndexOperationTrace.search(0, 3, 0, 1, 100, 0, 0));
+        replay.accept(IndexOperationTrace.search(0, 3, 0, Range.equal(IndexKey.ofInt(1)), 100, 0, 0));
         assertEquals(1, replay.dispatched());
         var model = new IndexReferenceReplay(true, false);
-        assertNull(model.lookupPrimary(3, 1, 1));
+        assertNull(model.lookupPrimary(3, TestOps.key(1), 1));
     }
 
     @Test
@@ -188,7 +191,7 @@ public class VersionedLookupTest {
                     workload = directory.resolve("workload.ops");
             try (var writer = new IndexOperationTrace.Writer(baseline)) {
                 org.sibench.capture.TransferIndexFixtures.appendRow(
-                        writer, new Operation(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0));
+                        writer, TestOps.op(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0));
             }
             try (var writer = new IndexOperationTrace.Writer(workload)) {
                 writer.append(IndexOperationTrace.transaction(100, 6, 100, 100, 0));

@@ -1,6 +1,6 @@
 # HyBench SF1 原生 HTAP 验证
 
-日期：2026-10-20。默认负载改为原生 `runHTAP`；此报告与 [历史 TP 子集 v4 报告](hybench-sf1-poc.md) 分开，不用旧子集回放结论替代 HTAP 验证。
+日期：2026-10-20。原生 `runHTAP` 的多会话采集、请求配对、八表状态审计与原始事件打包。该采集早于请求序号、`query_id` 与当前运行清单格式，当前代码不再读取其原始追踪；并发快照投影实现后按当前插桩重新采集。单会话 v8 Trace 见 [TP 子集 v8 验证](hybench-sf1-tp-trace.md)。
 
 ## 环境与运行
 
@@ -58,7 +58,7 @@ AT1–AT6：`27/10/15/14/7/1`；IQ1–IQ6：`4/4/4/4/0/7`。**IQ5 已启用，�
 | loanapps | 600,000 | 600,012 | 32 | 32 |
 | loantrans | 600,000 | 600,007 | 33 | 18 |
 
-`CapturePoc pack` 保存全量 PG 原始 JSON 及 CRC32C 的 64 字节 access 记录。文件名排序只保证各文件内顺序，不代表全局事务排序。**这不是完整 HTAP KV 回放**：并发快照、跨会话顺序、范围/变长键及残余过滤的规范转换仍待实现，HTAP 输入被单会话编译器显式拒绝。当前 v6 已支持单会话已提交事务内写后查询和工作单元多 client 路由，不据此放宽 HTAP 的并发限制，见 [发送验证](committed-change-delivery.md)。
+`CapturePoc pack` 保存全量 PG 原始 JSON 及 CRC32C 的 64 字节 access 记录。文件名排序只保证各文件内顺序，不代表全局事务排序。**这不是 HTAP KV 回放**：并发快照与跨会话顺序尚未实现，编译器拒绝并发会话。
 
 打包验证通过：51,111,329 条原始事件、12,479 个 CRC32C 块；`access.bin` 为 3,271,274,820 字节，完整 `payload.jsonl` 为 16,832,115,136 字节。事件计数与状态审计完全一致，解码数量与 CRC 全部通过；SHA256 分别为 `5492eccc988b072caa2945ab6cd9bc1b6cc1fb23f71dd406e6de2847cd041a14`、`c0a8faef1f28464d31b465dde9f62bed11f6e768ae5737eee8d1831a5fba72a8`。
 
@@ -86,9 +86,9 @@ java -Xmx3g -cp "$ROOT/build/sibench/sibench.jar" \
   org.sibench.capture.CapturePoc pack "$ROOT" config/hybench_sf1.yaml "$ROOT/results/poc/hybench-htap-sf1/trace-check"
 ```
 
-`ROOT` 指向仓库绝对路径，`run` 在含 `Data_1x` 的目录执行。报告必须为新文件，打包目录必须不存在。旧 TP 子集采用 [hybench_tp_subset_sf1.yaml](../../config/hybench_tp_subset_sf1.yaml)，当前编译输出 v6，旧 v4/v5 产物只读单 client 兼容。
+`ROOT` 指向仓库绝对路径，`run` 在含 `Data_1x` 的目录执行。报告必须为新文件，打包目录必须不存在。
 
-## 证据与修复
+## 证据
 
 本轮证据保存在 `results/poc/hybench-htap-sf1/`：
 
@@ -98,9 +98,5 @@ java -Xmx3g -cp "$ROOT/build/sibench/sibench.jar" \
 - `native/sibench-audit.jar`：增加完整清单和精确事务身份检查的离线审计 JAR。
 - `state-audit.json`：严格输入复核、按阶段访问索引、事件计数和八表逐行状态核对通过。
 - `trace/manifest.json`、`trace/access.bin`、`trace/payload.jsonl`：全部原始事件打包、摘要与 CRC 验证通过。
-
-保留两次失败运行的原始 manifest、日志、属性及数据库：`raw-failed-completion-20261020` 对应 AP 关闭时缺少 executor_end，新增执行器返回事件修复；`raw-failed-result-identity-20261020` 对应原生 TP 交错读取旧 ResultSet 时误关联最新请求，改为结果集固定原始请求身份，并补齐普通 Statement 路径。不改失败 manifest、不拼接前缀。中断的 Baseline 导出保留于 `baseline-interrupted-20261020`，之后以不可变 JAR 重导出并独立核验。
-
-JDK 17 离线 Maven 构建和 59 项测试通过，涵盖多会话、跨线程异常、延迟 ResultSet、普通 Statement、回滚身份、类型规范化、行变化链和新事件打包，以及旧 TP 编译/回放回归。全局事件丢失与插桩成本未证明。
 
 验证结束后停止本次启动的专用 PG，恢复原先停止状态；所有数据库和本地证据保留。重新执行 `audit` 前需启动该服务，`check` 和已完成产物的离线检查不需要 PG。

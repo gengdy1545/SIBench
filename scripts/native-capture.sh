@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Orchestrates one small native capture of YCSB or sysbench against the instrumented PG 14.24.
+# Orchestrates one native capture of YCSB or sysbench against the instrumented PG 14.24, through
+# the canonical index trace.
 # All semantics live in the Java CLI; this script only starts and stops the local service and
 # chains the stages. It refuses to reuse a database, baseline or raw directory.
 #
@@ -36,8 +37,9 @@ if "$PG/runtime/bin/pg_isready" -q -h 127.0.0.1 -p "$SIBENCH_PORT"; then
   echo "a PostgreSQL server already listens on port $SIBENCH_PORT; stop it first" >&2
   exit 1
 fi
+# Templates in the access ledger are PostgreSQL query identifiers; computing them changes no plan.
 SIBENCH_CAPTURE_DIR=$SIBENCH_RAW "$PG/runtime/bin/pg_ctl" -D "$PG/data" \
-  -o "-c config_file=$PG/data/sibench.conf" -l "$PG/server.log" -w start >/dev/null
+  -o "-c config_file=$PG/data/sibench.conf -c compute_query_id=on" -l "$PG/server.log" -w start >/dev/null
 trap '"$PG/runtime/bin/pg_ctl" -D "$PG/data" -m fast stop >/dev/null' EXIT
 
 stage() { "$JAVA" $HEAP -cp "$JAR" org.sibench.capture.NativeCapture "$1" "$ROOT" "$PROFILE"; }
@@ -50,4 +52,5 @@ stage run > "$SIBENCH_ARTIFACTS/run-summary.json"
 "$JAVA" $HEAP -jar "$JAR" audit-rows "$PROFILE" "$SIBENCH_ARTIFACTS/baseline" "$SIBENCH_RAW" \
   --jdbc "$URL" --user postgres > "$SIBENCH_ARTIFACTS/row-state-audit-summary.json"
 "$JAVA" $HEAP -jar "$JAR" access-ledger "$PROFILE" "$SIBENCH_RAW" > "$SIBENCH_ARTIFACTS/access-ledger-summary.json"
+"$JAVA" $HEAP -jar "$JAR" compile-trace "$PROFILE" "$SIBENCH_ARTIFACTS/trace" > "$SIBENCH_ARTIFACTS/trace-summary.json"
 echo "native capture complete: $SIBENCH_ARTIFACTS"

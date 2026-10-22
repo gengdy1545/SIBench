@@ -22,11 +22,11 @@ java -jar build/sibench/sibench.jar prepare --dry-run config/sysbench_large.yaml
 
 ## 增量适配边界
 
-来源 catalog 按配置表数覆盖 id 主键及全部 k 二级索引；源布局固定 `secondary=false`、`create-secondary=true`，支持 `auto-inc=true/false`，与下游二级发送开关独立。已提供独立只读 PG 预检，见 [来源 Schema 契约](../contracts/source-schema.md)；原生采集入口接入仍待实现。
+来源 catalog 按配置表数覆盖 id 主键及全部 k 二级索引；源布局固定 `secondary=false`、`create-secondary=true`，支持 `auto-inc=true/false`，与下游二级发送开关独立。采集与导出前执行只读 PG 预检，见 [来源 Schema 契约](../contracts/source-schema.md)。
 
 原生 oltp_read_write 的 event 包含多条查询和修改，event 数不等于索引操作数。范围为 BETWEEN 闭区间，可能超出已有键范围；聚合与排序不能计入索引查询时间。index update 修改 k，non-index update 修改 c；两者必须保留来源标签。delete-insert 删除后重新插入同键，需要保留顺序及身份规则。
 
-数据生成目前仅实现派生 Baseline；该来源产物与容量尚未验证。已有 8 表 × 1,088,250 行（共 8,706,000 行）、oltp_read_write / update_index / update_non_index / delete / insert / point_select 的单会话原生采集，通过服务端对账、Baseline 核验、行状态审计和访问账本，见 [原生采集验证](../validation/ycsb-sysbench-native-capture.md)；规范 Trace 编译、范围查询投影、原生增量 Parquet 与索引回放尚未实现。标准脚本不按 `k` 查询，二级索引只有维护写。
+数据生成目前仅实现派生 Baseline；该来源产物与容量尚未验证。已有 8 表 × 1,088,250 行（共 8,706,000 行）、oltp_read_write / update_index / update_non_index / delete / insert / point_select 的单会话原生采集，通过服务端对账、Baseline 核验、行状态审计和访问账本。v8 规范 Trace 中点查与 DELETE / UPDATE 的定位为主键点查，`BETWEEN`（含 `sum`、`ORDER BY c`、`DISTINCT`）为主键闭区间，返回行与可见行分别保留；`k` 索引列 UPDATE、`c` 普通列 UPDATE、DELETE / 重插入展开为完整维护，见 [原生 Trace 验证](../validation/ycsb-sysbench-native-trace.md)。标准脚本不按 `k` 查询，二级索引只有维护写。
 
 ## 源码入口
 

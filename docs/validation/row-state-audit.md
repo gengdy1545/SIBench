@@ -38,7 +38,7 @@ JDK17 根 Maven 构建通过 110 项测试，零失败、零错误、零跳过�
 
 `maintenance.json` 复用该 HTAP 报告和已审计变化通过：31,212,000 个基线索引条目、34 次真实二级索引值改写（loanapps 15、loantrans 19）、36,020 次 Locator / RowID 可见性探针。未重新匹配源行 before-image。
 
-原生 TP 子集的 `tp-subset-jdk17.json` 全量对账通过：8,706,000 基线行、8,731,627 最终行、76,881 次提交行修改、72,870 个修改主键；八表包含未修改的基线行均核对。`normalized/` 使用该报告重新编译，`baseline.ops`、`workload.ops`、`work-units.jsonl` 和两个增量 Parquet 的 SHA256 与既有 `hybench-sf1-secondary-indexes-20261021/normalized-jdk17/` 全部相同；manifest 除新增并核实的 `row_state_audit_sha256` 外结构化一致。`check-replay.log` 的 128-client 目录级预检通过，基线 31,212,000 条、运行期 499,125 条规范记录。
+原生 TP 子集的 `tp-subset-jdk17.json` 全量对账通过：8,706,000 基线行、8,731,627 最终行、76,881 次提交行修改、72,870 个修改主键；八表包含未修改的基线行均核对。当前 v8 TP 子集的审计见 [TP 子集 v8 验证](hybench-sf1-tp-trace.md)。
 
 `RowStateAuditTest` 使用真实 Parquet 与独立 JDBC 行结果 fixture，覆盖三来源全部配置表 / 字段、字符串主键、非连续 int64 主键、DELETE / 重插入、低于和位于基线键之间的新插入、回滚排除、普通列旧值错误、最终值错误、双会话同键因果链及其持久化顺序、摘要复用及损坏变化文件。`IndexTraceCompilerTest` 验证一次审计后维护诊断、重复编译及各回放变体复用报告，并核对缺失报告与 PK 改写的拒绝边界。
 
@@ -53,10 +53,8 @@ mvn -o -Dtest=RowStateAuditIntegrationIT \
   -Dsibench.row.evidence=results/validation/row-state-audit-check test
 ```
 
-`SIBENCH_ROW_TEST_USER` 默认 postgres，密码使用 `PGPASSWORD`。测试创建并自动删除自身的临时库；原始采集、基线、审计和拒绝诊断保留在证据目录。首次受控运行 `controlled/` 因测试使用字面量索引查询键被请求审计拒绝；改为绑定参数后通过，失败证据未覆盖。
+`SIBENCH_ROW_TEST_USER` 默认 postgres，密码使用 `PGPASSWORD`。测试创建并自动删除自身的临时库；原始采集、基线、审计和拒绝诊断保留在证据目录。
 
 验证结束确认无残留测试库，隔离 PG 已恢复停止状态。停止 PG 后，HTAP / TP 各自再次调用 `audit-rows` 均成功，`htap-reuse-offline.json` / `tp-reuse-offline.json` 中的报告内容与原成功报告一致，证明复用路径不依赖数据库。前者标准输出含 JVM 性能计数器警告，原始输出保留，JSON 内容从首个对象开始解析。
 
-初次长任务使用系统 Java 23，TP 因 Parquet 运行环境不兼容失败，HTAP 因运行中构建替换 JAR 导致延迟类加载失败；`tp-subset.log` / `htap.log` 保留诊断，未产生成功报告。最终通过证据均来自 JDK17 及上述不可变 JAR。
-
-受控 SQL 不代表 YCSB / sysbench 原生客户端执行，它们的原生入口仍未实现。多会话行因果链不证明全局事件无丢失或查询快照等价；审计仍缓存修改集合，未验收 SF1000 有界状态。
+受控 SQL 不代表原生客户端执行；三来源的原生采集审计见各自的 Trace 验证文档。多会话行因果链不证明全局事件无丢失或查询快照等价；审计仍缓存修改集合，未验收 SF1000 有界状态。

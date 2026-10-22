@@ -259,7 +259,7 @@ public class RowStateAuditIntegrationIT {
                             .findFirst()
                             .orElseThrow();
         }
-        RequestCaptureAudit.audit(client, raw);
+        RequestCaptureAudit.audit(client, raw, true);
         Files.writeString(
                 directory.resolve("capture-run.json"),
                 json.toJson(

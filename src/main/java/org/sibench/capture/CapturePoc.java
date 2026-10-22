@@ -70,7 +70,8 @@ public final class CapturePoc {
                     throw new IllegalArgumentException(
                             "compile requires PG_TRACE OUTPUT [ROW_AUDIT]");
                 IndexTraceCompiler.compile(
-                        config,
+                        SourceSchema.read(config.root(), config.document()),
+                        config.layout(),
                         Path.of(args[3]),
                         Path.of(args[4]),
                         args.length == 6

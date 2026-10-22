@@ -9,13 +9,14 @@ import org.apache.parquet.schema.MessageType;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.generation.*;
 import org.sibench.replay.*;
+import org.sibench.trace.IndexKey;
 
 import java.nio.file.*;
 import java.util.*;
 
 /** Manifest-driven, forced latest-only relocation; not natural rewrite, retention or GC. */
 public final class RelocationCheck {
-    private record Key(int table, long key) {}
+    private record Key(int table, IndexKey key) {}
 
     private record Retained(Group row, long file, long position) {}
 
@@ -23,12 +24,13 @@ public final class RelocationCheck {
 
     public static void main(String[] args) throws Exception {
         if (args.length != 4)
-            throw new IllegalArgumentException("RelocationCheck ROOT CONFIG NORMALIZED OUTPUT");
-        var capture = CaptureConfig.read(Path.of(args[0]), Path.of(args[1]));
-        validate(capture, Path.of(args[2]), Path.of(args[3]));
+            throw new IllegalArgumentException("RelocationCheck ROOT PROFILE NORMALIZED OUTPUT");
+        var capture = CaptureProfile.read(Path.of(args[0]), Path.of(args[1]));
+        validate(capture.layout(), Path.of(args[2]), Path.of(args[3]));
     }
 
-    public static void validate(CaptureConfig capture, Path input, Path output) throws Exception {
+    /** {@code layout} sets the Parquet layout of the retained-row files. */
+    public static void validate(GenerationConfig layout, Path input, Path output) throws Exception {
         ReferenceReplay.check(input, ReplayConfig.defaults());
         JsonObject manifest =
                 JsonParser.parseString(Files.readString(input.resolve("manifest.json")))
@@ -46,21 +48,18 @@ public final class RelocationCheck {
                     if (IndexOperationTrace.isMutation(o) && o.index() == 0)
                         latest.put(new Key(o.table(), o.key()), o);
                 });
-        Map<Integer, SortedMap<Long, Group>> rows = new TreeMap<>();
+        Map<Integer, SortedMap<IndexKey, Group>> rows = new TreeMap<>();
         for (var item : manifest.getAsJsonArray("incremental_files")) {
             JsonObject file = item.getAsJsonObject();
             Path path = input.resolve(file.get("path").getAsString());
             if (!BaselineGenerator.sha256(path).equals(file.get("sha256").getAsString()))
                 throw new java.io.IOException("Incremental checksum mismatch");
-            int table = IndexCatalog.tableId(file.get("table").getAsString());
+            int table = catalog.tableId(file.get("table").getAsString());
             long fileId = file.get("file_id").getAsLong(), position = 0;
             try (var reader = reader(path)) {
                 Group row;
                 while ((row = reader.read()) != null) {
-                    long key =
-                            row.getLong(
-                                    PgBaselineExport.TABLES.get(file.get("table").getAsString()),
-                                    0);
+                    IndexKey key = catalog.primaryKey(file.get("table").getAsString(), row);
                     Operation operation = latest.get(new Key(table, key));
                     if (operation != null
                             && operation.kind() != IndexOperationTrace.LOGICAL_DELETE
@@ -106,28 +105,24 @@ public final class RelocationCheck {
                                         table,
                                         tableRows.getValue().size(),
                                         0,
-                                        PgBaselineExport.TABLES.get(table),
+                                        catalog.primary(tableRows.getKey()).column(),
                                         schema,
                                         null),
-                                capture.layout(),
+                                layout,
                                 Map.of("sibench.control", "forced-layout-only"))) {
                     for (var rowEntry : tableRows.getValue().entrySet()) {
                         Group row = rowEntry.getValue();
                         Operation primary =
-                                new Operation(
+                                IndexOperationTrace.write(
                                         0,
                                         IndexOperationTrace.RELOCATE,
                                         tableRows.getKey(),
-                                        0,
                                         0,
                                         rowEntry.getKey(),
                                         row.getLong("_sib_timestamp", 0),
                                         fileId,
                                         position,
-                                        row.getLong("_sib_row_id", 0),
-                                        0,
-                                        0,
-                                        0);
+                                        row.getLong("_sib_row_id", 0));
                         IndexMutation.emit(
                                 primary, Map.of(), catalog.keys(table, row), trace::append);
                         indexEntries += 1 + catalog.secondary(tableRows.getKey()).size();
@@ -187,7 +182,7 @@ public final class RelocationCheck {
                                     .findFirst()
                                     .orElseThrow()
                                     .table();
-                    var indexed = new LinkedHashMap<>(catalog.keys(table, row.row()));
+                    var indexed = new LinkedHashMap<Integer, IndexKey>(catalog.keys(table, row.row()));
                     indexed.put(0, null);
                     for (var index : indexed.entrySet()) {
                         var actual =

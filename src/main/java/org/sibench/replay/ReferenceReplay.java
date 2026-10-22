@@ -146,7 +146,7 @@ public final class ReferenceReplay {
                         }
                         if (primary[0] == null
                                 || operation.table() != primary[0].table()
-                                || operation.key() != primary[0].key()
+                                || !operation.key().equals(primary[0].key())
                                 || operation.expansionSize() != primary[0].expansionSize()
                                 || operation.expansionPosition() != position[0]++
                                 || operation.rowId() != primary[0].rowId()
@@ -312,10 +312,10 @@ public final class ReferenceReplay {
                 "scope",
                 "single-sender multi-client in-process correctness reference; clients share"
                     + " reference service state; not a network or cross-client visibility"
-                    + " implementation; v7 committed-source version history and timestamp"
-                    + " lookup over the complete declared source indexes; no RPC, persistence,"
-                    + " concurrent PG MVCC, range query, physical GC, rate scheduling or"
-                    + " sustained-duration proof");
+                    + " implementation; v8 committed-source version history and timestamp"
+                    + " lookup, ordered point/range/limited scans over order-preserving keys of"
+                    + " the complete declared source indexes; no RPC, persistence, concurrent PG"
+                    + " MVCC, physical GC, rate scheduling or sustained-duration proof");
         Files.writeString(
                 report,
                 new GsonBuilder().setPrettyPrinting().create().toJson(output),

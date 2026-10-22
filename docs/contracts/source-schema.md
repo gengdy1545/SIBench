@@ -12,7 +12,7 @@
 
 YCSB 固定使用 `JdbcDBCreateTable`，不是普通字段为 VARCHAR 的 SQL 模板。`fieldcount` 默认配置为 10，可按配置解析，当前最多 1024。sysbench 固定 `secondary=false`、`create-secondary=true`，`auto-inc` 默认 true，也允许 false；Redshift、主键替换模式和自定义建表选项拒绝。这些是源布局约束，不是下游二级发送开关。
 
-只有单列主键自身的唯一性需要支持；额外 UNIQUE、复合、表达式、partial、INCLUDE、自定义 operator class / collation / 排序及其它索引访问方法不在这三种目标布局内，明确拒绝。运行期动态 DDL 不在范围内。固定标准负载不改写已有行的主键值：PK 值 UPDATE 明确拒绝，包括随后回滚的尝试，不作为待实现功能，也不补造此类负载。这不排除普通列 / 二级索引列 UPDATE、新版本主键索引写入或同主键 DELETE / 重插入。Schema catalog 和公共行审计支持不意味着 YCSB / sysbench 的原生采集、字符串主键 Trace 或范围投影已完成。
+只有单列主键自身的唯一性需要支持；额外 UNIQUE、复合、表达式、partial、INCLUDE、自定义 operator class / collation / 排序及其它索引访问方法不在这三种目标布局内，明确拒绝。运行期动态 DDL 不在范围内。固定标准负载不改写已有行的主键值：PK 值 UPDATE 明确拒绝，包括随后回滚的尝试，不作为待实现功能，也不补造此类负载。这不排除普通列 / 二级索引列 UPDATE、新版本主键索引写入或同主键 DELETE / 重插入。Schema catalog 和公共行审计只说明布局与行状态；三来源的规范 Trace 由同一 schema 驱动编译，覆盖范围见 [Trace 契约](trace.md) 的访问投影。
 
 ## 核对与失败
 
@@ -29,7 +29,7 @@ YCSB 固定使用 `JdbcDBCreateTable`，不是普通字段为 VARCHAR 的 SQL �
 
 HyBench `CapturePoc check` 连接 PG 并执行预检。Baseline export 在创建输出目录前检查，保存 `schema-preflight.json`；原生 run 在打开记录 JDBC 会话和调用 benchmark 方法前检查，在 `capture-run.json` 保存结果。失败 run 保留诊断，但没有业务采集会话。
 
-YCSB / sysbench 的单会话原生采集入口（`NativeCapture`，见 [原生采集验证](../validation/ycsb-sysbench-native-capture.md)）在采集前调用相同检查并保存结果；独立预检通过不替代采集验收。构建副本中参与执行的上游源码须与固定子模块逐字节一致，否则在建库前拒绝。
+YCSB / sysbench 的原生采集入口（`NativeCapture`，见 [原生 Trace 验证](../validation/ycsb-sysbench-native-trace.md)）在采集前调用相同检查并保存结果；独立预检通过不替代采集验收。构建副本中参与执行的上游源码须与固定子模块逐字节一致，否则在建库前拒绝。
 
 ## 使用
 

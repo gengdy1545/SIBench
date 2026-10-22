@@ -129,7 +129,7 @@ public final class ReplayDispatcher implements AutoCloseable {
             orderChecksum =
                     Long.rotateLeft(orderChecksum, 7)
                             ^ operation.sourceEvent()
-                            ^ Long.rotateLeft(operation.key(), 13)
+                            ^ Long.rotateLeft(java.util.Objects.hashCode(operation.key()), 13)
                             ^ operation.kind()
                             ^ ((long) operation.table() << 48)
                             ^ ((long) operation.index() << 40)
@@ -140,8 +140,11 @@ public final class ReplayDispatcher implements AutoCloseable {
                             ^ Long.rotateLeft(operation.file(), 37)
                             ^ Long.rotateLeft(operation.position(), 41)
                             ^ Long.rotateLeft(operation.rowId(), 43)
-                            ^ Long.rotateLeft(operation.secondarySource(), 47)
-                            ^ Long.rotateLeft(operation.secondaryTarget(), 53)
+                            ^ Long.rotateLeft(java.util.Objects.hashCode(operation.indexedValue()), 47)
+                            ^ Long.rotateLeft(
+                                    java.util.Objects.hash(
+                                            operation.lower(), operation.upper(), operation.limit()),
+                                    53)
                             ^ Long.rotateLeft(operation.expectedCount(), 59)
                             ^ Long.rotateLeft(operation.transactionId(), 61)
                             ^ Long.rotateLeft(operation.flags(), 3);

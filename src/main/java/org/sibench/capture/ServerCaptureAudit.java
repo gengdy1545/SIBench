@@ -99,8 +99,10 @@ public final class ServerCaptureAudit {
                         if (running && ranToEnd) checkResult(sql, returned, processed, lastRequest, zeroRowModifications);
                         running = false;
                     }
-                    case "scan_rescan", "scan_next", "heap_visibility", "bitmap_candidate",
-                            "bitmap_end", "scan_end", "plan_scan", "index_insert_attempt" ->
+                    case "scan_rescan", "scan_next", "heap_visibility", "vm_visible",
+                            "bitmap_candidate", "bitmap_end", "bitmap_heap_candidate",
+                            "bitmap_heap_lossy", "plan_bitmap_heap", "scan_end", "plan_scan",
+                            "index_insert_attempt" ->
                             indexEvents++;
                     case "row_change", "index_build_start", "index_build_end" -> {}
                     default -> throw new IOException("Unclassified raw event: " + type);

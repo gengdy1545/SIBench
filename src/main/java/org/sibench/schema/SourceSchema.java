@@ -44,9 +44,14 @@ public final class SourceSchema {
     private final List<Table> tables;
     private final Map<String, String> fingerprints;
     private final List<Index> secondaryOrder;
+    private final Map<String, Object> nativeConfig;
 
     private SourceSchema(
-            String benchmark, Path source, List<Table> tables, Map<String, String> fingerprints) {
+            String benchmark,
+            Path source,
+            List<Table> tables,
+            Map<String, String> fingerprints,
+            Map<String, Object> nativeConfig) {
         this(
                 benchmark,
                 source,
@@ -55,7 +60,8 @@ public final class SourceSchema {
                 tables.stream()
                         .flatMap(t -> t.indexes().stream())
                         .filter(i -> !i.primary())
-                        .toList());
+                        .toList(),
+                nativeConfig);
     }
 
     private SourceSchema(
@@ -63,12 +69,18 @@ public final class SourceSchema {
             Path source,
             List<Table> tables,
             Map<String, String> fingerprints,
-            List<Index> secondaryOrder) {
+            List<Index> secondaryOrder,
+            Map<String, Object> nativeConfig) {
         this.benchmark = benchmark;
         this.source = source;
         this.tables = List.copyOf(tables);
-        this.fingerprints = Map.copyOf(fingerprints);
+        // Insertion order is kept so that recorded provenance is byte-stable across runs.
+        this.fingerprints = Collections.unmodifiableMap(new LinkedHashMap<>(fingerprints));
         this.secondaryOrder = List.copyOf(secondaryOrder);
+        this.nativeConfig =
+                nativeConfig == null
+                        ? null
+                        : Collections.unmodifiableMap(new LinkedHashMap<>(nativeConfig));
     }
 
     public static SourceSchema read(Path root, Map<String, Object> config)
@@ -88,15 +100,24 @@ public final class SourceSchema {
         require(
                 git(source, "status", "--porcelain=v1", "--untracked-files=all").isEmpty(),
                 "Source worktree must be clean");
+        return of(benchmark, source, benchmark.equals("hybench") ? null : object(config, "native"));
+    }
+
+    /**
+     * The layout of an already verified source checkout; {@code nativeConfig} is the native client
+     * configuration that shapes YCSB and sysbench tables and is null for HyBench.
+     */
+    public static SourceSchema of(String benchmark, Path source, Map<String, Object> nativeConfig)
+            throws IOException {
         return switch (benchmark) {
             case "hybench" -> hybench(source);
-            case "ycsb" -> ycsb(source, object(config, "native"));
-            case "sysbench" -> sysbench(source, object(config, "native"));
+            case "ycsb" -> ycsb(source, nativeConfig);
+            case "sysbench" -> sysbench(source, nativeConfig);
             default -> throw new IllegalArgumentException("Unsupported benchmark");
         };
     }
 
-    /** Also used by legacy manifests, which pin the actual DDL bytes independently. */
+    /** HyBench at a verified checkout: its layout comes from the DDL files alone. */
     public static SourceSchema hybench(Path source) throws IOException {
         var layout =
                 SimpleDdl.read(
@@ -107,7 +128,8 @@ public final class SourceSchema {
                 source,
                 layout.tables(),
                 hashes(source, "conf/ddl_pg.sql", "conf/create_index_pg.sql"),
-                layout.secondaryOrder());
+                layout.secondaryOrder(),
+                null);
     }
 
     private static SourceSchema ycsb(Path source, Map<String, Object> nativeConfig)
@@ -137,7 +159,8 @@ public final class SourceSchema {
                 hashes(
                         source,
                         "jdbc/src/main/java/site/ycsb/db/JdbcDBCreateTable.java",
-                        "jdbc/src/main/java/site/ycsb/db/flavors/DefaultDBFlavor.java"));
+                        "jdbc/src/main/java/site/ycsb/db/flavors/DefaultDBFlavor.java"),
+                nativeConfig);
     }
 
     private static SourceSchema sysbench(Path source, Map<String, Object> nativeConfig)
@@ -194,7 +217,7 @@ public final class SourceSchema {
                                     new Index("k_" + i, "k", false))));
         }
         return new SourceSchema(
-                "sysbench", source, tables, hashes(source, "src/lua/oltp_common.lua"));
+                "sysbench", source, tables, hashes(source, "src/lua/oltp_common.lua"), nativeConfig);
     }
 
     private static String git(Path source, String... args)
@@ -236,5 +259,10 @@ public final class SourceSchema {
 
     public List<Index> secondaryOrder() {
         return secondaryOrder;
+    }
+
+    /** Null for HyBench, whose layout comes from its DDL files alone. */
+    public Map<String, Object> nativeConfig() {
+        return nativeConfig;
     }
 }

@@ -28,6 +28,7 @@ public final class HybenchNativeRun {
         boolean htap = config.mode().equals("runhtap");
         try (CaptureRun run = CaptureRun.begin(Path.of(args[3]), htap)) {
             try {
+                CaptureRun.requireQueryIdentity(config.jdbc(), config.user());
                 run.schemaPreflight(CapturePoc.checkServer(config));
                 Files.createDirectories(Path.of(args[0]).getParent());
                 try (var output =

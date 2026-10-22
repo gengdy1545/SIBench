@@ -23,11 +23,11 @@ java -jar build/sibench/sibench.jar prepare --dry-run config/ycsb_large.yaml
 
 ## 增量适配边界
 
-来源 catalog 固定采用上游 `JdbcDBCreateTable`：`YCSB_KEY VARCHAR PRIMARY KEY`，配置数量的 FIELD 列为 TEXT，无二级索引；不使用 FIELD 为 VARCHAR 的 SQL 模板。已提供独立只读 PG 预检，见 [来源 Schema 契约](../contracts/source-schema.md)；原生采集入口接入仍待实现。
+来源 catalog 固定采用上游 `JdbcDBCreateTable`：`YCSB_KEY VARCHAR PRIMARY KEY`，配置数量的 FIELD 列为 TEXT，无二级索引；不使用 FIELD 为 VARCHAR 的 SQL 模板。采集与导出前执行只读 PG 预检，见 [来源 Schema 契约](../contracts/source-schema.md)。
 
 原生 A–F 的 read、update、insert、scan、read-modify-write 比例及分布需要在增量实现中保留或明确标为派生负载。标准 A–F 不产生 delete。scan 使用起始键与数量上限，不能将结束键推导为数值起点加数量。read-modify-write 是多个 API 调用，不能默认具有事务原子性。
 
-数据生成目前仅实现派生 Baseline；使用 binary 字段和固定随机流替代 ThreadLocalRandom，不增加全量 hashed key 去重。该来源产物与容量尚未验证。已有 8,706,000 行、workload A/B/C/F/D/E 的单会话原生 JDBC 采集，通过请求配对、Baseline 核验、行状态审计和访问账本，见 [原生采集验证](../validation/ycsb-sysbench-native-capture.md)；规范 Trace 编译（字符串主键、保序编码）、原生增量 Parquet 与索引回放尚未实现。固定 JDBC binding 在 `readallfields=true` 时 scan 结果为空并使 workload E 除零退出，采集对 E 使用文档化的 `readallfields=false`。
+数据生成目前仅实现派生 Baseline；使用 binary 字段和固定随机流替代 ThreadLocalRandom，不增加全量 hashed key 去重。该来源产物与容量尚未验证。已有 8,706,000 行、workload A/B/C/F/D/E 的单会话原生 JDBC 采集，通过请求配对、Baseline 核验、行状态审计和访问账本。字符串主键以保序编码进入 v8 规范 Trace：read / update 为主键点查，scan 为带 limit 的主键有序区间（读到表尾时无 limit），insert 维护主键；各 workload 依次运行、按顺序会话编译，见 [原生 Trace 验证](../validation/ycsb-sysbench-native-trace.md)。固定 JDBC binding 在 `readallfields=true` 时 scan 结果为空并使 workload E 除零退出，采集对 E 使用文档化的 `readallfields=false`。
 
 ## 源码入口
 

@@ -19,6 +19,8 @@
 
 extern char *application_name;
 extern IndexScanDesc sibench_bitmap_scan;
+/* The bitmap heap scan node whose page heapam is checking, while it checks it. */
+extern void *sibench_bitmap_heap_node;
 /*
  * Per-backend request identity, shared by every translation unit that includes this header.
  * sibench_request counts top-level executions (the first executor_start outside any executor);
@@ -137,6 +139,17 @@ sib_scan(const char *event, IndexScanDesc scan, ScanKey keys, int nkeys,
     appendStringInfoChar(&out, ']');
     sib_emit(event, scan->indexRelation, out.data);
     pfree(out.data);
+}
+
+/* Heap visibility of one bitmap candidate TID, for every index scan that contributed it. */
+static void
+sib_bitmap_verdict(Relation heap, void *node, ItemPointer tid, bool found)
+{
+    char detail[160];
+    if (!sib_relation(heap)) return;
+    snprintf(detail, sizeof(detail), "\"heap\":\"%p\",\"tid\":\"(%u,%u)\",\"found\":%s", node,
+             ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid), found ? "true" : "false");
+    sib_emit("bitmap_heap_candidate", heap, detail);
 }
 
 /* Binds a live index scan descriptor to its plan node; emitted when the descriptor is created. */

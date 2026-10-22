@@ -1,6 +1,7 @@
 package org.sibench.capture;
 
 import org.sibench.capture.IndexOperationTrace.Operation;
+import org.sibench.trace.IndexKey;
 
 import java.io.IOException;
 import java.util.*;
@@ -11,8 +12,8 @@ public final class IndexMutation {
 
     public static void emit(
             Operation primary,
-            Map<Integer, String> before,
-            Map<Integer, String> after,
+            Map<Integer, IndexKey> before,
+            Map<Integer, IndexKey> after,
             IndexOperationTrace.Consumer consumer)
             throws IOException {
         if (primary.index() != 0

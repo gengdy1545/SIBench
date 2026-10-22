@@ -1,5 +1,7 @@
 package org.sibench.replay;
 
+import org.sibench.capture.IndexOperationTrace.Range;
+import org.sibench.trace.IndexKey;
 import static org.junit.Assert.*;
 
 import org.junit.Test;
@@ -17,7 +19,7 @@ public class ReplayDispatcherTest {
     }
 
     private static Operation search(long unit) {
-        return IndexOperationTrace.search(unit, 3, 0, 1, 0, 0, 0).withWorkUnitId(unit);
+        return IndexOperationTrace.search(unit, 3, 0, Range.equal(IndexKey.ofInt(1)), 0, 0, 0).withWorkUnitId(unit);
     }
 
     @Test
@@ -223,7 +225,7 @@ public class ReplayDispatcherTest {
         var operations =
                 List.of(
                         search(1),
-                        IndexOperationTrace.search(2, 5, 1, 10, 0, 0, 0).withWorkUnitId(2),
+                        IndexOperationTrace.search(2, 5, 1, Range.equal(IndexKey.ofInt(10)), 0, 0, 0).withWorkUnitId(2),
                         search(3));
         for (boolean secondary : new boolean[] {false, true}) {
             List<Integer> routes = new ArrayList<>();

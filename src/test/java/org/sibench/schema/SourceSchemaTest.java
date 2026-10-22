@@ -44,14 +44,8 @@ public class SourceSchemaTest {
         IndexCatalog catalog = IndexCatalog.fromSchema(schema);
         assertEquals("idx_loanapps_1", catalog.definitions().get(8).name());
         assertEquals("idx_ca_1", catalog.definitions().get(20).name());
-        // Existing v7 manifest IDs/order must survive replacing the old DDL parser.
-        Path manifest =
-                Path.of(
-                        "results/validation/hybench-sf1-secondary-indexes-20261021/normalized-jdk17/manifest.json");
-        if (Files.exists(manifest)) {
-            var doc = JsonParser.parseString(Files.readString(manifest)).getAsJsonObject();
-            assertEquals(catalog.describe(), IndexCatalog.fromManifest(doc).describe());
-        }
+        var provenance = new com.google.gson.Gson().toJsonTree(catalog.provenance()).getAsJsonObject();
+        assertEquals(catalog.describe(), IndexCatalog.fromManifest(provenance).describe());
     }
 
     @Test
@@ -67,7 +61,9 @@ public class SourceSchemaTest {
         assertTrue(table.columns().get(1).nullable());
         assertEquals(1, table.indexes().size());
         IndexCatalog catalog = IndexCatalog.fromSchema(schema);
-        assertEquals("user010 ", catalog.named("usertable_pkey").normalize("user010 "));
+        assertEquals(
+                org.sibench.trace.IndexKey.ofText("user010 "),
+                catalog.named("usertable_pkey").encode("user010 "));
         assertTrue(catalog.secondary(1).isEmpty());
         var config = config("config/ycsb_large.yaml");
         var nativeConfig = ConfigValues.object(config, "native");
@@ -86,7 +82,9 @@ public class SourceSchemaTest {
         assertEquals(
                 new SourceSchema.DefaultValue("sequence", "sbtest100_id_seq"),
                 schema.tables().get(99).columns().get(0).defaultValue());
-        assertEquals("10", IndexCatalog.fromSchema(schema).named("k_100").normalize("010"));
+        assertEquals(
+                org.sibench.trace.IndexKey.ofInt(10),
+                IndexCatalog.fromSchema(schema).named("k_100").encode("010"));
         var config = config("config/sysbench_large.yaml");
         var nativeConfig = ConfigValues.object(config, "native");
         nativeConfig.put("tables", 2);

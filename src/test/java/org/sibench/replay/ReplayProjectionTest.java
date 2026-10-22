@@ -1,9 +1,12 @@
 package org.sibench.replay;
 
+import org.sibench.capture.IndexOperationTrace.Range;
+import org.sibench.trace.IndexKey;
 import static org.junit.Assert.*;
 
 import org.junit.Test;
 import org.sibench.capture.IndexOperationTrace;
+import org.sibench.capture.TestOps;
 import org.sibench.capture.IndexOperationTrace.Operation;
 
 import java.io.IOException;
@@ -13,22 +16,23 @@ import java.util.List;
 public class ReplayProjectionTest {
     private static Operation mutation(
             int table, long key, long version, long tx, long ordinal, int kind) {
-        return new Operation(
-                ordinal,
-                kind,
-                table,
-                0,
-                0,
-                key,
-                version,
-                kind == 5 ? 0 : 9,
-                ordinal,
-                key + 100,
-                10,
-                20,
-                0,
-                tx,
-                ordinal);
+        return TestOps.unit(
+                TestOps.op(
+                        ordinal,
+                        kind,
+                        table,
+                        0,
+                        0,
+                        key,
+                        version,
+                        kind == 5 ? 0 : 9,
+                        ordinal,
+                        key + 100,
+                        10,
+                        20,
+                        0,
+                        tx,
+                        ordinal));
     }
 
     @Test
@@ -54,9 +58,9 @@ public class ReplayProjectionTest {
                 var writes = received.stream().filter(IndexOperationTrace::isMutation).toList();
                 int transferWidth = secondary ? 3 : 1;
                 assertEquals(transferWidth * 3 + 2, writes.size());
-                assertEquals(1, writes.get(0).key());
-                assertEquals(2, writes.get(transferWidth).key());
-                assertEquals(1, writes.get(transferWidth * 2).key());
+                assertEquals(TestOps.key(1), writes.get(0).key());
+                assertEquals(TestOps.key(2), writes.get(transferWidth).key());
+                assertEquals(TestOps.key(1), writes.get(transferWidth * 2).key());
                 assertTrue(received.stream().noneMatch(IndexOperationTrace::isControl));
                 assertEquals((long) writes.size(), projection.describe().get("target_calls"));
                 projection.accept(IndexOperationTrace.transaction(11, 6, 11, 2, 0));
@@ -81,7 +85,7 @@ public class ReplayProjectionTest {
         valid.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
         assertThrows(
                 IOException.class,
-                () -> valid.accept(new Operation(2, 2, 3, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1)));
+                () -> valid.accept(TestOps.op(2, 2, 3, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1)));
     }
 
     @Test
@@ -101,7 +105,7 @@ public class ReplayProjectionTest {
                             new ReplayConfig(false, "none", 0, 0, 0, 0, mode), true, target);
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
             Operation write = mutation(3, 1, 1, 10, 1, 3);
-            Operation search = IndexOperationTrace.transactionSearch(2, 3, 0, 1, 1, 1, 10, 1, true);
+            Operation search = IndexOperationTrace.transactionSearch(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, 10, 1, true);
             replay.accept(write);
             replay.accept(search);
             assertTrue(received.isEmpty());
@@ -116,7 +120,7 @@ public class ReplayProjectionTest {
                     new Thread(
                             () -> {
                                 try {
-                                    replay.accept(IndexOperationTrace.search(3, 3, 0, 1, 1, 1, 0));
+                                    replay.accept(IndexOperationTrace.search(3, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, 0));
                                 } catch (Throwable e) {
                                     error.set(e);
                                 }
@@ -150,16 +154,16 @@ public class ReplayProjectionTest {
                 () ->
                         replay.accept(
                                 IndexOperationTrace.transactionSearch(
-                                        0, 3, 0, 1, 1, 1, 10, 1, true)));
+                                        0, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, 10, 1, true)));
     }
 
     @Test
     public void rejectsWrongLocalReadPointsAndIncompleteFilteredIndexExpansion() throws Exception {
         for (Operation invalid :
                 List.of(
-                        IndexOperationTrace.transactionSearch(2, 3, 0, 1, 0, 1, 10, 1, true),
-                        IndexOperationTrace.transactionSearch(2, 3, 0, 1, 1, 1, 11, 1, true),
-                        IndexOperationTrace.transactionSearch(2, 3, 0, 1, 1, 1, 10, 2, true))) {
+                        IndexOperationTrace.transactionSearch(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 0, 1, 10, 1, true),
+                        IndexOperationTrace.transactionSearch(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, 11, 1, true),
+                        IndexOperationTrace.transactionSearch(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, 10, 2, true))) {
             var replay = new ReplayProjection(ReplayConfig.defaults(), true, operation -> fail());
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
             replay.accept(mutation(3, 1, 1, 10, 1, 3));
@@ -169,13 +173,14 @@ public class ReplayProjectionTest {
                 new ReplayProjection(
                         new ReplayConfig(false, "none", 0, 0, 0, 0), true, operation -> fail());
         replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
-        replay.accept(mutation(5, 1, 1, 10, 1, 3));
+        // The unit declares three index writes; filtering secondaries must not hide the gap.
+        replay.accept(mutation(5, 1, 1, 10, 1, 3).withExpansion(0, 3));
         assertThrows(
                 IOException.class,
                 () ->
                         replay.accept(
                                 IndexOperationTrace.transactionSearch(
-                                        2, 5, 1, 10, 1, 1, 10, 1, true)));
+                                        2, 5, 1, Range.equal(IndexKey.ofInt(10)), 1, 1, 10, 1, true)));
     }
 
     @Test
@@ -213,9 +218,9 @@ public class ReplayProjectionTest {
                         true,
                         operation -> fail());
         replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
-        replay.accept(IndexOperationTrace.transactionSearch(1, 5, 1, 10, 0, 0, 10, 0, false));
+        replay.accept(IndexOperationTrace.transactionSearch(1, 5, 1, Range.equal(IndexKey.ofInt(10)), 0, 0, 10, 0, false));
         replay.accept(IndexOperationTrace.transaction(10, 7, 10, 1, 0));
-        replay.accept(IndexOperationTrace.search(20, 5, 1, 10, 1, 0, 0));
+        replay.accept(IndexOperationTrace.search(20, 5, 1, Range.equal(IndexKey.ofInt(10)), 1, 0, 0));
         replay.finish();
         assertEquals(1L, replay.describe().get("committed_transactions"));
         assertEquals(0L, replay.describe().get("target_calls"));
@@ -252,7 +257,7 @@ public class ReplayProjectionTest {
                 new ReplayProjection(
                         new ReplayConfig(false, "none", 0, 0, 0, 0), true, operation -> fail());
         replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
-        Operation query = IndexOperationTrace.transactionSearch(1, 5, 1, 10, 0, 0, 10, 0, false);
+        Operation query = IndexOperationTrace.transactionSearch(1, 5, 1, Range.equal(IndexKey.ofInt(10)), 0, 0, 10, 0, false);
         for (int i = 0; i < ReplayProjection.MAX_TRANSACTION_OPERATIONS; i++) replay.accept(query);
         assertThrows(IOException.class, () -> replay.accept(query));
         assertEquals(0, replay.dispatched());

@@ -3,6 +3,7 @@ package org.sibench.cli;
 import com.google.gson.GsonBuilder;
 
 import org.sibench.capture.AccessLedger;
+import org.sibench.capture.IndexTraceCompiler;
 import org.sibench.capture.RowStateAudit;
 import org.sibench.config.ConfigValues;
 import org.sibench.generation.BaselineGenerator;
@@ -42,7 +43,8 @@ public final class Sibench {
                             "validate-snapshots",
                             "check-schema",
                             "audit-rows",
-                            "access-ledger")
+                            "access-ledger",
+                            "compile-trace")
                     .contains(args[0])) {
                 throw new IllegalArgumentException("Unknown command: " + args[0]);
             }
@@ -113,6 +115,34 @@ public final class Sibench {
                                         ? root.resolve(profiles.get(2))
                                         : AccessLedger.defaultReport(raw));
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(report));
+                return 0;
+            }
+            if (args[0].equals("compile-trace")) {
+                if (profiles.size() != 2 && profiles.size() != 3)
+                    throw new IllegalArgumentException(
+                            "compile-trace requires PROFILE OUTPUT [ROW_AUDIT]");
+                var report =
+                        IndexTraceCompiler.compileProfile(
+                                root,
+                                Path.of(profiles.get(0)),
+                                root.resolve(profiles.get(1)),
+                                profiles.size() == 3 ? root.resolve(profiles.get(2)) : null);
+                var summary = new LinkedHashMap<String, Object>();
+                for (String key :
+                        List.of(
+                                "status",
+                                "benchmark",
+                                "session_order",
+                                "baseline_operations",
+                                "workload_operations",
+                                "searches",
+                                "searches_by_shape",
+                                "excluded_access_units",
+                                "committed_transactions",
+                                "utility_only_transactions",
+                                "business_changes"))
+                    summary.put(key, report.get(key));
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(summary));
                 return 0;
             }
             if (args[0].equals("check-schema")) {
@@ -217,6 +247,12 @@ public final class Sibench {
                         + " PROFILE RAW [REPORT]");
         out.println(
                 "access-ledger partitions raw PG index events into access units; it never touches PG.");
+        out.println(
+                "       java -jar build/sibench/sibench.jar compile-trace [--root PATH]"
+                        + " PROFILE OUTPUT [ROW_AUDIT]");
+        out.println(
+                "compile-trace turns a completed capture into baseline/workload traces; any access"
+                        + " it cannot project fails the compilation.");
         out.println(
                 "check-schema reads the live PG catalog; it never creates or repairs"
                         + " tables/indexes.");

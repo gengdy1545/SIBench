@@ -35,7 +35,11 @@ public final class PgTraceBlocks {
                     Map.entry("executor_end", 14),
                     Map.entry("result_row", 15),
                     Map.entry("executor_run_end", 16),
-                    Map.entry("plan_scan", 17));
+                    Map.entry("plan_scan", 17),
+                    Map.entry("vm_visible", 18),
+                    Map.entry("bitmap_heap_candidate", 19),
+                    Map.entry("bitmap_heap_lossy", 20),
+                    Map.entry("plan_bitmap_heap", 21));
 
     private static final int MAX_TYPE =
             TYPES.values().stream().mapToInt(Integer::intValue).max().orElseThrow();

@@ -49,27 +49,29 @@ public class RequestCaptureAuditTest {
         String pg =
                 """
                 {"event":"executor_start","pid":42,"application":"a","sql":"SELECT 1"}
+                {"event":"executor_run_end","pid":42,"application":"a"}
                 {"event":"executor_end","pid":42,"application":"a"}
                 {"event":"transaction_abort","pid":42,"application":"a"}
                 {"event":"executor_start","pid":42,"application":"b","sql":"SELECT 2"}
+                {"event":"executor_run_end","pid":42,"application":"b"}
                 {"event":"executor_end","pid":42,"application":"b"}
                 """;
         Files.writeString(
                 server,
                 pg + "{\"event\":\"transaction_abort\",\"pid\":42,\"application\":\"b\"}\n");
-        var audit = RequestCaptureAudit.audit(client, server);
+        var audit = RequestCaptureAudit.audit(client, server, true);
         assertEquals("passed", audit.get("status"));
         assertEquals(1L, audit.get("explicit_rollbacks"));
         assertEquals(1L, audit.get("close_aborts"));
         Files.writeString(server, pg);
-        assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server));
+        assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
         Files.writeString(
                 server,
                 pg.replace(
                                 "\"event\":\"transaction_abort\",\"pid\":42,\"application\":\"a\"",
                                 "\"event\":\"transaction_abort\",\"pid\":42,\"application\":\"b\"")
                         + "{\"event\":\"transaction_abort\",\"pid\":42,\"application\":\"b\"}\n");
-        assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server));
+        assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
     }
 
     @Test
@@ -87,7 +89,7 @@ public class RequestCaptureAuditTest {
                 {"event":"close","application":"a"}
                 """);
         Files.writeString(server, "");
-        assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server));
+        assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
     }
 
     private static final String AUTOCOMMIT_CLIENT =
@@ -142,13 +144,13 @@ public class RequestCaptureAuditTest {
         Files.writeString(server, server(2, scan("3", "0", "\"7\"")));
         assertThrows(
                 java.io.IOException.class,
-                () -> RequestCaptureAudit.audit(client, server, true, true));
+                () -> RequestCaptureAudit.audit(client, server, true));
         assertEquals(
-                "passed", RequestCaptureAudit.audit(client, server, true, false).get("status"));
+                "passed", RequestCaptureAudit.audit(client, server, false).get("status"));
         Files.writeString(server, server(2, scan("3", "0", "\"5\"")));
-        assertEquals("passed", RequestCaptureAudit.audit(client, server, true, true).get("status"));
+        assertEquals("passed", RequestCaptureAudit.audit(client, server, true).get("status"));
         // Planner endpoint probes (IS NOT NULL, no bound value) are not search predicates.
         Files.writeString(server, server(2, scan("0", "129", "null")));
-        assertEquals("passed", RequestCaptureAudit.audit(client, server, true, true).get("status"));
+        assertEquals("passed", RequestCaptureAudit.audit(client, server, true).get("status"));
     }
 }

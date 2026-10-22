@@ -98,6 +98,7 @@ public final class NativeCapture {
         boolean ycsb = config.benchmark().equals("ycsb");
         try (CaptureRun run = CaptureRun.beginExternal(config.raw(), config.benchmark())) {
             try {
+                CaptureRun.requireQueryIdentity(config.jdbc(), config.user());
                 run.schemaPreflight(
                         PgSchemaCheck.check(
                                 config.root(), config.document(), config.jdbc(), config.user()));

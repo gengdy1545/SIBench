@@ -1,91 +1,131 @@
 package org.sibench.capture;
 
 import org.sibench.capture.IndexOperationTrace.Operation;
+import org.sibench.capture.IndexOperationTrace.Range;
+import org.sibench.trace.IndexKey;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.*;
 
-/** Compact baseline slots and sparse full-key histories; not a PG MVCC or storage engine. */
+/**
+ * An ordered-key reference service, not a PG MVCC or storage engine. Each (table, index) holds
+ * entries keyed by the concatenated encoded components (indexed value, PK), which sort as the
+ * tuple: an immutable sorted baseline run plus sorted per-key version histories.
+ */
 public final class IndexReferenceReplay {
-    private record Namespace(int table, int index) {}
+    public record LookupResult(IndexKey key, long commitVersion, long value) {}
 
-    private record Entry(int table, int index, long key, String indexedValue) {}
+    private record Namespace(int table, int index) {}
 
     private record StoredVersion(long version, long value, boolean present) {}
 
     private record WritePosition(long version, long transaction, long ordinal) {}
 
-    public record LookupResult(long key, long commitVersion, long value) {}
+    /** Encoded (value, PK) bytes; {@code split} is where the PK starts. */
+    private record Composite(byte[] bytes, int split) implements Comparable<Composite> {
+        static Composite of(IndexKey value, IndexKey key) {
+            byte[] pk = key.bytes();
+            if (value == null) return new Composite(pk, 0);
+            byte[] prefix = value.bytes(), bytes = Arrays.copyOf(prefix, prefix.length + pk.length);
+            System.arraycopy(pk, 0, bytes, prefix.length, pk.length);
+            return new Composite(bytes, prefix.length);
+        }
 
-    private static final int SLOT_BITS = 12, SLOT_COUNT = 1 << SLOT_BITS;
+        IndexKey key() throws IOException {
+            return IndexKey.decode(Arrays.copyOfRange(bytes, split, bytes.length));
+        }
 
-    private static final class Slots {
-        final long[] values = new long[SLOT_COUNT];
-        final int[] buckets = new int[SLOT_COUNT];
-        final long[] next = new long[SLOT_COUNT];
-        final BitSet present = new BitSet(SLOT_COUNT);
+        @Override
+        public int compareTo(Composite other) {
+            return Arrays.compareUnsigned(bytes, other.bytes);
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof Composite c && Arrays.equals(bytes, c.bytes);
+        }
+
+        @Override
+        public int hashCode() {
+            return Arrays.hashCode(bytes);
+        }
     }
 
     private static final class Store {
-        final NavigableMap<Long, Slots> pages = new TreeMap<>();
-        final Map<String, Integer> bucketIds = new HashMap<>();
-        final List<Long> heads = new ArrayList<>(List.of(0L));
-        final Map<String, Set<Long>> added = new HashMap<>();
+        byte[][] keys = new byte[1024][];
+        int[] splits = new int[1024];
+        long[] values = new long[1024];
+        int size;
+        boolean sealed;
+        final TreeMap<Composite, NavigableMap<Long, StoredVersion>> history = new TreeMap<>();
 
-        Slots page(long key, boolean create) {
-            long page = key >>> SLOT_BITS;
-            return create ? pages.computeIfAbsent(page, ignored -> new Slots()) : pages.get(page);
-        }
-
-        void baseline(long key, String indexedValue, long value, boolean secondary)
-                throws IOException {
-            Slots slots = page(key, true);
-            int offset = (int) (key & (SLOT_COUNT - 1));
-            if (slots.present.get(offset)) throw new IOException("Duplicate baseline index key");
-            slots.present.set(offset);
-            slots.values[offset] = value;
-            if (secondary) {
-                int bucket =
-                        bucketIds.computeIfAbsent(
-                                indexedValue,
-                                ignored -> {
-                                    heads.add(0L);
-                                    return heads.size() - 1;
-                                });
-                slots.buckets[offset] = bucket;
-                slots.next[offset] = heads.get(bucket);
-                heads.set(bucket, key);
+        void add(Composite entry, long value) throws IOException {
+            if (sealed) throw new IOException("Baseline insertion after runtime writes or reads");
+            if (size == keys.length) {
+                int capacity = Math.multiplyExact(size, 2);
+                keys = Arrays.copyOf(keys, capacity);
+                splits = Arrays.copyOf(splits, capacity);
+                values = Arrays.copyOf(values, capacity);
             }
+            keys[size] = entry.bytes();
+            splits[size] = entry.split();
+            values[size++] = value;
         }
 
-        StoredVersion baseline(Entry entry) {
-            Slots slots = page(entry.key(), false);
-            if (slots == null) return null;
-            int offset = (int) (entry.key() & (SLOT_COUNT - 1));
-            if (!slots.present.get(offset)) return null;
-            if (entry.index() > 0
-                    && !Objects.equals(bucketIds.get(entry.indexedValue()), slots.buckets[offset]))
-                return null;
-            return new StoredVersion(0, slots.values[offset], true);
-        }
-
-        void candidates(String predicate, Set<Long> output) {
-            Integer bucket = bucketIds.get(predicate);
-            if (bucket != null)
-                for (long key = heads.get(bucket); key != 0; ) {
-                    output.add(key);
-                    Slots slots = page(key, false);
-                    key = slots.next[(int) (key & (SLOT_COUNT - 1))];
+        /** Baseline rows arrive in PK order, so secondary runs are the only ones to sort. */
+        void seal() throws IOException {
+            if (sealed) return;
+            sealed = true;
+            boolean ordered = true;
+            for (int i = 1; i < size && ordered; i++)
+                ordered = Arrays.compareUnsigned(keys[i - 1], keys[i]) < 0;
+            if (!ordered) {
+                Integer[] order = new Integer[size];
+                for (int i = 0; i < size; i++) order[i] = i;
+                Arrays.parallelSort(order, (a, b) -> Arrays.compareUnsigned(keys[a], keys[b]));
+                byte[][] sortedKeys = new byte[size][];
+                int[] sortedSplits = new int[size];
+                long[] sortedValues = new long[size];
+                for (int i = 0; i < size; i++) {
+                    sortedKeys[i] = keys[order[i]];
+                    sortedSplits[i] = splits[order[i]];
+                    sortedValues[i] = values[order[i]];
                 }
-            output.addAll(added.getOrDefault(predicate, Set.of()));
+                keys = sortedKeys;
+                splits = sortedSplits;
+                values = sortedValues;
+            }
+            for (int i = 1; i < size; i++)
+                if (Arrays.compareUnsigned(keys[i - 1], keys[i]) == 0)
+                    throw new IOException("Duplicate baseline index key");
+        }
+
+        /** First baseline position whose key is not below {@code bound}. */
+        int lowerBound(byte[] bound) {
+            int low = 0, high = size;
+            while (low < high) {
+                int middle = (low + high) >>> 1;
+                if (Arrays.compareUnsigned(keys[middle], bound) < 0) low = middle + 1;
+                else high = middle;
+            }
+            return low;
+        }
+
+        int find(Composite entry) {
+            int position = lowerBound(entry.bytes());
+            return position < size && Arrays.equals(keys[position], entry.bytes()) ? position : -1;
+        }
+
+        StoredVersion baseline(Composite entry) {
+            int position = find(entry);
+            return position < 0 ? null : new StoredVersion(0, values[position], true);
         }
     }
 
     private final boolean rowIds, secondaryIndexes;
     private final Map<Namespace, Store> stores = new LinkedHashMap<>();
-    private final Map<Entry, NavigableMap<Long, StoredVersion>> history = new HashMap<>();
-    private final Map<Entry, WritePosition> writePositions = new HashMap<>();
+    private final Map<Composite, WritePosition> writePositions = new HashMap<>();
     private long relocationWrites, queries, checkedResults, checksum;
     private long selectedVersionChecksum, snapshotQueries, retainedVersions, lastAppliedVersion;
 
@@ -98,17 +138,8 @@ public final class IndexReferenceReplay {
         this.secondaryIndexes = secondaryIndexes;
     }
 
-    private static Entry identity(Operation operation) {
-        return new Entry(
-                operation.table(),
-                operation.index(),
-                operation.key(),
-                operation.index() == 0 ? null : operation.indexedValue());
-    }
-
-    private Store store(Entry entry) {
-        return stores.computeIfAbsent(
-                new Namespace(entry.table(), entry.index()), ignored -> new Store());
+    private Store store(int table, int index) {
+        return stores.computeIfAbsent(new Namespace(table, index), ignored -> new Store());
     }
 
     public void accept(Operation operation) throws IOException {
@@ -120,19 +151,12 @@ public final class IndexReferenceReplay {
             throw new IOException("Invalid or disabled index identity");
         if (operation.kind() == IndexOperationTrace.SEARCH) {
             validateSearch(operation);
-            List<LookupResult> results;
-            if (operation.index() == 0) {
-                LookupResult result =
-                        lookupPrimary(
-                                operation.table(), operation.key(), operation.readTimestamp());
-                results = result == null ? List.of() : List.of(result);
-            } else
-                results =
-                        lookupSecondary(
-                                operation.table(),
-                                operation.index(),
-                                operation.indexedValue(),
-                                operation.readTimestamp());
+            List<LookupResult> results =
+                    search(
+                            operation.table(),
+                            operation.index(),
+                            operation.range(),
+                            operation.readTimestamp());
             if (results.size() != operation.expectedCount())
                 throw new IOException(
                         "Search count mismatch at source event "
@@ -147,29 +171,32 @@ public final class IndexReferenceReplay {
             if ((operation.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0) snapshotQueries++;
             return;
         }
-        if (operation.key() < 1 || operation.version() < 0 || operation.rowId() < 1)
+        if (operation.key() == null || operation.version() < 0 || operation.rowId() < 1)
             throw new IOException("Invalid index key/version");
-        Entry entry = identity(operation);
+        Store store = store(operation.table(), operation.index());
+        Composite entry =
+                Composite.of(
+                        operation.index() == 0 ? null : operation.indexedValue(), operation.key());
         long value =
                 operation.kind() == IndexOperationTrace.LOGICAL_DELETE
                         ? 0
                         : rowIds
                                 ? operation.rowId()
                                 : locator(operation.file(), operation.position());
-        if (operation.kind() == IndexOperationTrace.RELOCATE) {
-            relocate(operation, entry, value);
+        if (operation.kind() == IndexOperationTrace.INSERT) {
+            if (operation.version() != 0) throw new IOException("Invalid baseline insertion");
+            store.add(entry, value);
+            retainedVersions++;
             return;
         }
-        if (operation.kind() == IndexOperationTrace.INSERT) {
-            if (operation.version() != 0 || current(entry) != null)
-                throw new IOException("Invalid baseline insertion");
-            store(entry).baseline(entry.key(), entry.indexedValue(), value, entry.index() > 0);
-            retainedVersions++;
+        store.seal();
+        if (operation.kind() == IndexOperationTrace.RELOCATE) {
+            relocate(operation, store, entry, value);
             return;
         }
         if (!IndexOperationTrace.isMutation(operation) || operation.version() == 0)
             throw new IOException("Unsupported index write");
-        StoredVersion previous = current(entry);
+        StoredVersion previous = current(store, entry);
         if (operation.kind() == IndexOperationTrace.LOGICAL_DELETE
                 && (previous == null || !previous.present()))
             throw new IOException("Deletion of absent index entry");
@@ -178,7 +205,7 @@ public final class IndexReferenceReplay {
                         || (operation.version() == previous.version()
                                 && !orderedOverwrite(operation, entry))))
             throw new IOException("Non-increasing index version");
-        var chain = history.computeIfAbsent(entry, ignored -> new TreeMap<>());
+        var chain = store.history.computeIfAbsent(entry, ignored -> new TreeMap<>());
         if (previous != null) chain.putIfAbsent(previous.version(), previous);
         if (chain.put(
                         operation.version(),
@@ -187,12 +214,6 @@ public final class IndexReferenceReplay {
                                 value,
                                 operation.kind() != IndexOperationTrace.LOGICAL_DELETE))
                 == null) retainedVersions++;
-        if (entry.index() > 0)
-            store(entry)
-                    .added
-                    .computeIfAbsent(entry.indexedValue(), ignored -> new HashSet<>())
-                    .add(entry.key());
-        else store(entry);
         writePositions.put(
                 entry,
                 new WritePosition(
@@ -202,7 +223,7 @@ public final class IndexReferenceReplay {
         lastAppliedVersion = Math.max(lastAppliedVersion, operation.version());
     }
 
-    private boolean orderedOverwrite(Operation operation, Entry entry) {
+    private boolean orderedOverwrite(Operation operation, Composite entry) {
         WritePosition previous = writePositions.get(entry);
         return previous != null
                 && operation.transactionId() > 0
@@ -211,75 +232,132 @@ public final class IndexReferenceReplay {
                 && operation.mutationOrdinal() > previous.ordinal();
     }
 
-    private StoredVersion current(Entry entry) {
-        var chain = history.get(entry);
+    private static StoredVersion current(Store store, Composite entry) {
+        var chain = store.history.get(entry);
         if (chain != null && !chain.isEmpty()) return chain.lastEntry().getValue();
-        Store store = stores.get(new Namespace(entry.table(), entry.index()));
-        return store == null ? null : store.baseline(entry);
+        return store.baseline(entry);
     }
 
-    private StoredVersion visible(Entry entry, long timestamp) {
-        var chain = history.get(entry);
+    private static StoredVersion visible(Store store, Composite entry, long timestamp) {
+        var chain = store.history.get(entry);
         if (chain != null) {
             var selected = chain.floorEntry(timestamp);
-            if (selected != null) return selected.getValue();
+            // A history holds the baseline version once the key has been written.
+            return selected == null ? null : selected.getValue();
         }
-        Store store = stores.get(new Namespace(entry.table(), entry.index()));
-        return store == null ? null : store.baseline(entry);
+        return store.baseline(entry);
     }
 
-    public LookupResult lookupPrimary(int table, long key, long timestamp) throws IOException {
-        if (table < 1 || key < 1 || timestamp < 0) throw new IOException("Invalid primary lookup");
-        StoredVersion selected = visible(new Entry(table, 0, key, null), timestamp);
+    private StoredVersion visible(int table, int index, Composite entry, long timestamp)
+            throws IOException {
+        Store store = stores.get(new Namespace(table, index));
+        if (store == null) return null;
+        store.seal();
+        return visible(store, entry, timestamp);
+    }
+
+    public LookupResult lookupPrimary(int table, IndexKey key, long timestamp) throws IOException {
+        if (table < 1 || key == null || timestamp < 0)
+            throw new IOException("Invalid primary lookup");
+        StoredVersion selected = visible(table, 0, Composite.of(null, key), timestamp);
         return selected == null || !selected.present()
                 ? null
                 : new LookupResult(key, selected.version(), selected.value());
     }
 
     public LookupResult lookupEntry(
-            int table, int index, long key, String indexedValue, long timestamp)
+            int table, int index, IndexKey key, IndexKey indexedValue, long timestamp)
             throws IOException {
-        if (table < 1 || index < 0 || key < 1 || timestamp < 0 || (index > 0 && !secondaryIndexes))
+        if (table < 1
+                || index < 0
+                || key == null
+                || timestamp < 0
+                || (index > 0 && (!secondaryIndexes || indexedValue == null)))
             throw new IOException("Invalid full index identity lookup");
         StoredVersion selected =
-                visible(new Entry(table, index, key, index == 0 ? null : indexedValue), timestamp);
+                visible(table, index, Composite.of(index == 0 ? null : indexedValue, key), timestamp);
         return selected == null || !selected.present()
                 ? null
                 : new LookupResult(key, selected.version(), selected.value());
     }
 
     public List<LookupResult> lookupSecondary(
-            int table, int index, String predicate, long timestamp) throws IOException {
-        if (!secondaryIndexes || table < 1 || index < 1 || timestamp < 0)
-            throw new IOException("Invalid secondary lookup");
-        Store store = stores.get(new Namespace(table, index));
-        if (store == null) return List.of();
-        Set<Long> candidates = new TreeSet<>();
-        store.candidates(predicate, candidates);
+            int table, int index, IndexKey predicate, long timestamp) throws IOException {
+        if (!secondaryIndexes || index < 1) throw new IOException("Invalid secondary lookup");
+        return search(table, index, Range.equal(predicate), timestamp);
+    }
+
+    /**
+     * Visible entries of one index whose leading component lies in {@code range}, in key order,
+     * stopping at the range limit. Returned keys are PKs.
+     */
+    public List<LookupResult> search(int table, int index, Range range, long timestamp)
+            throws IOException {
+        if (table < 1 || index < 0 || timestamp < 0 || (index > 0 && !secondaryIndexes))
+            throw new IOException("Invalid index search");
         var results = new ArrayList<LookupResult>();
-        for (long key : candidates) {
-            StoredVersion selected = visible(new Entry(table, index, key, predicate), timestamp);
+        Store store = stores.get(new Namespace(table, index));
+        if (store == null) return results;
+        store.seal();
+        byte[] start =
+                range.lower() == null
+                        ? new byte[0]
+                        : range.lowerInclusive()
+                                ? range.lower().bytes()
+                                : range.lower().prefixSuccessor();
+        byte[] end =
+                range.upper() == null
+                        ? null
+                        : range.upperInclusive()
+                                ? range.upper().prefixSuccessor()
+                                : range.upper().bytes();
+        if (end != null && Arrays.compareUnsigned(start, end) >= 0) return results;
+        int first = store.lowerBound(start), last = end == null ? store.size : store.lowerBound(end);
+        NavigableMap<Composite, NavigableMap<Long, StoredVersion>> changed =
+                end == null
+                        ? store.history.tailMap(new Composite(start, 0), true)
+                        : store.history.subMap(
+                                new Composite(start, 0), true, new Composite(end, 0), false);
+        if (range.descending()) changed = changed.descendingMap();
+        var overlay = changed.entrySet().iterator();
+        var pending = overlay.hasNext() ? overlay.next() : null;
+        int step = range.descending() ? -1 : 1;
+        int position = range.descending() ? last - 1 : first;
+        while (range.limit() == 0 || results.size() < range.limit()) {
+            boolean baselineLeft = position >= first && position < last;
+            if (!baselineLeft && pending == null) break;
+            int order =
+                    !baselineLeft
+                            ? 1
+                            : pending == null
+                                    ? -1
+                                    : step
+                                            * Arrays.compareUnsigned(
+                                                    store.keys[position], pending.getKey().bytes());
+            StoredVersion selected;
+            Composite entry;
+            if (order < 0) {
+                entry = new Composite(store.keys[position], store.splits[position]);
+                selected = new StoredVersion(0, store.values[position], true);
+                position += step;
+            } else {
+                entry = pending.getKey();
+                var floor = pending.getValue().floorEntry(timestamp);
+                selected = floor == null ? null : floor.getValue();
+                if (order == 0) position += step;
+                pending = overlay.hasNext() ? overlay.next() : null;
+            }
             if (selected != null && selected.present())
-                results.add(new LookupResult(key, selected.version(), selected.value()));
+                results.add(new LookupResult(entry.key(), selected.version(), selected.value()));
         }
         return results;
     }
 
-    /** Numeric transfer lookup for historical trace callers. */
-    public List<LookupResult> lookupSecondary(int index, int key, long timestamp)
-            throws IOException {
-        return lookupSecondary(5, index, Long.toString(key), timestamp);
-    }
-
     private void validateSearch(Operation operation) throws IOException {
-        int allowed =
-                IndexOperationTrace.SNAPSHOT_SEARCH
-                        | IndexOperationTrace.DERIVED_SEARCH
-                        | IndexOperationTrace.TRANSACTION_LOCAL_SEARCH;
         if (operation.version() != 0
                 || operation.readTimestamp() < 0
                 || operation.expectedCount() < 0
-                || (operation.flags() & ~allowed) != 0)
+                || (operation.flags() & ~IndexOperationTrace.SEARCH_FLAGS) != 0)
             throw new IOException("Invalid search metadata");
         if ((operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0
                 && (operation.transactionId() <= 0
@@ -293,59 +371,59 @@ public final class IndexReferenceReplay {
         selectedVersionChecksum =
                 Long.rotateLeft(selectedVersionChecksum, 1)
                         ^ result.commitVersion()
-                        ^ Long.rotateLeft(result.key(), 17)
+                        ^ Long.rotateLeft(result.key().hashCode(), 17)
                         ^ ((long) operation.table() << 48)
                         ^ ((long) operation.index() << 40);
     }
 
-    private void relocate(Operation operation, Entry entry, long value) throws IOException {
-        StoredVersion selected = visible(entry, operation.version());
+    private void relocate(Operation operation, Store store, Composite entry, long value)
+            throws IOException {
+        StoredVersion selected = visible(store, entry, operation.version());
         if (selected == null || !selected.present() || selected.version() != operation.version())
             throw new IOException("Relocation requires an existing exact version");
         if (rowIds) {
             if (selected.value() != value) throw new IOException("Relocation changed RowID");
             return;
         }
+        var chain = store.history.get(entry);
         if (operation.version() == 0) {
-            Slots slots = store(entry).page(entry.key(), false);
-            slots.values[(int) (entry.key() & (SLOT_COUNT - 1))] = value;
-            var chain = history.get(entry);
+            int position = store.find(entry);
+            if (position >= 0) store.values[position] = value;
             if (chain != null) chain.put(0L, new StoredVersion(0, value, true));
-        } else
-            history.get(entry)
-                    .put(operation.version(), new StoredVersion(operation.version(), value, true));
+        } else chain.put(operation.version(), new StoredVersion(operation.version(), value, true));
         relocationWrites++;
     }
 
-    public long value(int table, int key) {
-        StoredVersion selected = current(new Entry(table, 0, key, null));
+    /** The current value of a primary key, or 0 when it has none. */
+    public long value(int table, IndexKey key) throws IOException {
+        Store store = stores.get(new Namespace(table, 0));
+        if (store == null) return 0;
+        store.seal();
+        StoredVersion selected = current(store, Composite.of(null, key));
         return selected == null ? 0 : selected.value();
     }
 
-    public long stateChecksum() {
+    /** Current primary state of every table, independent of history layout. */
+    public long stateChecksum() throws IOException {
         long result = 0;
         for (var namespace : stores.entrySet()) {
             if (namespace.getKey().index() != 0) continue;
             int table = namespace.getKey().table();
-            for (var page : namespace.getValue().pages.entrySet())
-                for (int offset = page.getValue().present.nextSetBit(0);
-                        offset >= 0;
-                        offset = page.getValue().present.nextSetBit(offset + 1)) {
-                    long key = (page.getKey() << SLOT_BITS) + offset;
-                    StoredVersion current = current(new Entry(table, 0, key, null));
-                    result ^= stateHash(table, key, current);
-                }
-            for (Entry entry : history.keySet())
-                if (entry.table() == table
-                        && entry.index() == 0
-                        && namespace.getValue().baseline(entry) == null)
-                    result ^= stateHash(table, entry.key(), current(entry));
+            Store store = namespace.getValue();
+            store.seal();
+            for (int i = 0; i < store.size; i++) {
+                Composite entry = new Composite(store.keys[i], 0);
+                result ^= stateHash(table, entry, current(store, entry));
+            }
+            for (var entry : store.history.keySet())
+                if (store.baseline(entry) == null)
+                    result ^= stateHash(table, entry, current(store, entry));
         }
         return result;
     }
 
-    private static long stateHash(int table, long key, StoredVersion version) {
-        return Long.rotateLeft(key, 17)
+    private static long stateHash(int table, Composite key, StoredVersion version) {
+        return Long.rotateLeft(key.hashCode(), 17)
                 ^ Long.rotateLeft(version.value(), 31)
                 ^ version.version()
                 ^ ((long) table << 48)

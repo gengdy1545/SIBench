@@ -10,32 +10,11 @@ import java.util.*;
 public final class RequestCaptureAudit {
     private RequestCaptureAudit() {}
 
-    public static void main(String[] args) throws Exception {
-        if (args.length != 3)
-            throw new IllegalArgumentException("RequestCaptureAudit JDBC_JSONL PG_JSONL REPORT");
-        Files.writeString(
-                Path.of(args[2]),
-                new GsonBuilder()
-                        .setPrettyPrinting()
-                        .create()
-                        .toJson(audit(Path.of(args[0]), Path.of(args[1]))),
-                StandardOpenOption.CREATE_NEW);
-    }
-
-    static Map<String, Object> audit(Path jdbc, Path pg) throws Exception {
-        return audit(jdbc, pg, false);
-    }
-
-    static Map<String, Object> audit(Path jdbc, Path pg, boolean htap) throws Exception {
-        return audit(jdbc, pg, htap, !htap);
-    }
-
     /**
      * {@code bindings} additionally requires every runtime equality key to be a value bound by
      * the client: true for point-access workloads, false for joins whose keys come from rows.
      */
-    static Map<String, Object> audit(Path jdbc, Path pg, boolean htap, boolean bindings)
-            throws Exception {
+    static Map<String, Object> audit(Path jdbc, Path pg, boolean bindings) throws Exception {
         Map<String, JsonObject> requests = new LinkedHashMap<>();
         Set<String> returned = new HashSet<>();
         Map<String, List<JsonObject>> consumed = new HashMap<>();
@@ -193,7 +172,7 @@ public final class RequestCaptureAudit {
         }
         if (unmatched != 0
                 || !started.equals(requests.keySet())
-                || !(htap ? executed : finished).equals(requests.keySet())
+                || !executed.equals(requests.keySet())
                 || commits != clientCommits
                 || serverTransactionOpen
                 || aborts < clientRollbacks
@@ -227,7 +206,7 @@ public final class RequestCaptureAudit {
                     JsonElement expected = server.get(i).get(j),
                             actual = client.get(Integer.toString(j + 1));
                     boolean same = Objects.equals(expected, actual);
-                    if (!same && htap && client.has("column_types"))
+                    if (!same)
                         same =
                                 equalResult(
                                         expected,
@@ -235,22 +214,6 @@ public final class RequestCaptureAudit {
                                         client.getAsJsonObject("column_types")
                                                 .get(Integer.toString(j + 1))
                                                 .getAsInt());
-                    String sql = normalize(requests.get(request.getKey()).get("sql").getAsString());
-                    if (!same
-                            && j == 0
-                            && (sql.startsWith("select balance from savingaccount")
-                                    || htap
-                                            && (sql.startsWith(
-                                                            "select balance from checkingaccount")
-                                                    || sql.startsWith("select loan_balance from")))
-                            && !expected.isJsonNull()
-                            && actual != null
-                            && !actual.isJsonNull()) {
-                        same =
-                                Float.floatToIntBits(Float.parseFloat(expected.getAsString()))
-                                        == Float.floatToIntBits(
-                                                Float.parseFloat(actual.getAsString()));
-                    }
                     if (!same)
                         throw new IOException(
                                 "Client result differs from same-execution server result: "
@@ -281,19 +244,13 @@ public final class RequestCaptureAudit {
                         "unmatched_server_events",
                         unmatched,
                         "scope",
-                        htap
-                                ? "native HTAP session; same-execution SQL, results, commits and"
-                                      + " rollback/close"
-                                : "single-session TP3/TP5/TP9 known templates; same-execution SQL"
-                                      + " identity, runtime scan bindings, consumed results and"
-                                      + " rollback/close"));
+                        "one JDBC session; same-execution SQL, results, commits and rollback/close"
+                                + (bindings ? "; runtime scan keys are client-bound values" : "")));
         report.put("explicit_rollbacks", clientRollbacks);
         report.put("server_aborts", aborts);
         report.put("close_aborts", aborts - clientRollbacks);
-        if (htap) {
-            report.put("executor_returns", executed.size());
-            report.put("executor_cleanup_events", finished.size());
-        }
+        report.put("executor_returns", executed.size());
+        report.put("executor_cleanup_events", finished.size());
         return report;
     }
 

@@ -266,6 +266,8 @@ final class RowAuditTestSupport {
                 event.addProperty("application", app);
                 server.add(JSON.toJson(event));
             }
+            server.add(
+                    JSON.toJson(Map.of("event", "executor_run_end", "application", app, "pid", 1)));
             server.add(JSON.toJson(Map.of("event", "executor_end", "application", app, "pid", 1)));
             client.add(
                     JSON.toJson(
@@ -297,7 +299,7 @@ final class RowAuditTestSupport {
                                 "fixture-" + (transactions.size() - 1))));
         Path jdbc = directory.resolve("jdbc-fixture.jsonl");
         Files.write(jdbc, client);
-        Path raw = directory.resolve("runtime.jsonl");
+        Path raw = directory.resolve("pg-1.jsonl");
         Files.write(raw, server);
         complete(directory, jdbc, raw);
         return raw;
@@ -309,12 +311,22 @@ final class RowAuditTestSupport {
                 directory.resolve("capture-run.json"),
                 JSON.toJson(
                         Map.of(
-                                "status", "complete",
-                                "pg_file", server.getFileName().toString(),
-                                "pg_sha256", org.sibench.generation.BaselineGenerator.sha256(server),
-                                "jdbc_file", client.getFileName().toString(),
-                                "jdbc_sha256",
-                                        org.sibench.generation.BaselineGenerator.sha256(client))));
+                                "status",
+                                "complete",
+                                "session_order",
+                                "single",
+                                "sessions",
+                                List.of(
+                                        Map.of(
+                                                "pg_file", server.getFileName().toString(),
+                                                "pg_sha256",
+                                                        org.sibench.generation.BaselineGenerator
+                                                                .sha256(server),
+                                                "jdbc_file", client.getFileName().toString(),
+                                                "jdbc_sha256",
+                                                        org.sibench.generation.BaselineGenerator
+                                                                .sha256(client),
+                                                "bindings", true)))));
     }
 
     static JsonObject change(String table, String operation, JsonObject before, JsonObject after) {

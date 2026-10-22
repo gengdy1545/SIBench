@@ -12,6 +12,7 @@ import org.junit.rules.TemporaryFolder;
 import org.sibench.generation.*;
 import org.sibench.replay.*;
 import org.sibench.schema.SourceSchema;
+import org.sibench.trace.IndexKey;
 
 import java.nio.file.*;
 import java.util.*;
@@ -44,12 +45,8 @@ public class IndexTraceCompilerTest {
                         1);
         var files = new ArrayList<Map<String, Object>>();
         var hashes = new ArrayList<Map<String, Object>>();
-        for (var table : PgBaselineExport.TABLES.entrySet()) {
-            var sourceTable =
-                    SourceSchema.hybench(original.source()).tables().stream()
-                            .filter(t -> t.name().equals(table.getKey()))
-                            .findFirst()
-                            .orElseThrow();
+        for (var sourceTable : SourceSchema.hybench(original.source()).tables()) {
+            var table = Map.entry(sourceTable.name(), sourceTable.indexes().get(0).column());
             var columns = new LinkedHashMap<String, String>();
             for (var column : sourceTable.columns())
                 columns.put(
@@ -81,7 +78,7 @@ public class IndexTraceCompilerTest {
                                     ? "2024-01-01 00:00:00"
                                     : "initial");
             }
-            int id = IndexCatalog.tableId(table.getKey());
+            int id = IndexCatalog.fromSchema(org.sibench.schema.SourceSchema.hybench(original.source())).tableId(table.getKey());
             row.add("_sib_row_id", (long) id);
             row.add("_sib_timestamp", 0L);
             Path file = baseline.resolve(table.getKey() + ".parquet");
@@ -113,6 +110,9 @@ public class IndexTraceCompilerTest {
         }
         Files.write(
                 baseline.resolve("files.jsonl"), files.stream().map(new Gson()::toJson).toList());
+        Files.writeString(
+                baseline.resolve("schema-preflight.json"),
+                "{\"status\":\"schema_verified\",\"environment\":{\"lc_collate\":\"C\"}}");
         Files.writeString(baseline.resolve("locators.tsv"), "");
         Files.writeString(
                 baseline.resolve("verified-manifest.json"),
@@ -173,6 +173,12 @@ public class IndexTraceCompilerTest {
                                             application,
                                             "pid",
                                             1,
+                                            "req",
+                                            i + 1,
+                                            "depth",
+                                            1,
+                                            "query_id",
+                                            42,
                                             "sql",
                                             "SELECT 1")));
             String boundary = null;
@@ -180,6 +186,8 @@ public class IndexTraceCompilerTest {
                 JsonObject event = JsonParser.parseString(line).getAsJsonObject();
                 event.addProperty("pid", 1);
                 event.addProperty("application", application);
+                event.addProperty("req", i + 1);
+                event.addProperty("depth", event.get("event").getAsString().startsWith("transaction_") ? 0 : 1);
                 String kind = event.get("event").getAsString();
                 if (kind.startsWith("transaction_")) {
                     boundary = event.toString();
@@ -200,10 +208,30 @@ public class IndexTraceCompilerTest {
                             .toJson(
                                     Map.of(
                                             "event",
+                                            "executor_run_end",
+                                            "application",
+                                            application,
+                                            "pid",
+                                            1,
+                                            "req",
+                                            i + 1,
+                                            "depth",
+                                            1,
+                                            "processed",
+                                            0)));
+            server.add(
+                    new Gson()
+                            .toJson(
+                                    Map.of(
+                                            "event",
                                             "executor_end",
                                             "application",
                                             application,
                                             "pid",
+                                            1,
+                                            "req",
+                                            i + 1,
+                                            "depth",
                                             1)));
             if (boundary != null) server.add(boundary);
         }
@@ -217,7 +245,7 @@ public class IndexTraceCompilerTest {
                                         "fixture-" + (transactions.size() - 1))));
         Path jdbc = directory.resolve("jdbc-fixture.jsonl");
         Files.write(jdbc, client);
-        Path raw = directory.resolve("runtime.jsonl");
+        Path raw = directory.resolve("pg-1.jsonl");
         Files.write(raw, server);
         RowAuditTestSupport.complete(directory, jdbc, raw);
         return raw;
@@ -255,23 +283,50 @@ public class IndexTraceCompilerTest {
     }
 
     private static String search(String scan, int found) {
-        // Modern captures bind each scan descriptor to its plan node before the first rescan; the
-        // compiler must accept that event without changing the operations it emits.
+        return search(scan, found, 3, 0);
+    }
+
+    /** One bound, fetched-to-the-end index scan of idx_loantrans_2 with one scan key. */
+    private static String search(String scan, int found, int strategy, int flags) {
+        String next =
+                "{\"event\":\"scan_next\",\"scan\":\""
+                        + scan
+                        + "\",\"direction\":1,\"recheck\":false,\"found\":";
         return "{\"event\":\"plan_scan\",\"scan\":\""
                 + scan
                 + "\",\"relation\":\"idx_loantrans_2\",\"plan_node\":1,\"kind\":\"index\"}\n"
                 + "{\"event\":\"scan_rescan\",\"scan\":\""
                 + scan
-                + "\",\"relation\":\"idx_loantrans_2\",\"keys\":[{\"strategy\":3,\"flags\":0,"
-                + "\"value\":\"2024-01-02 00:00:00\"}]}\n"
+                + "\",\"relation\":\"idx_loantrans_2\",\"keys\":[{\"attribute\":1,\"strategy\":"
+                + strategy
+                + ",\"flags\":"
+                + flags
+                + ",\"type_oid\":1114,\"value\":\"2024-01-02 00:00:00\"}]}\n"
                 + (found == 1
-                        ? "{\"event\":\"heap_visibility\",\"scan\":\""
+                        ? next
+                                + "true}\n{\"event\":\"heap_visibility\",\"scan\":\""
                                 + scan
                                 + "\",\"found\":true}\n"
                         : "")
+                + next
+                + "false}\n"
                 + "{\"event\":\"scan_end\",\"scan\":\""
                 + scan
                 + "\"}\n";
+    }
+
+    private static Map<String, Object> compile(CaptureConfig config, Path raw, Path output)
+            throws Exception {
+        return IndexTraceCompiler.compile(
+                SourceSchema.hybench(config.source()),
+                config.layout(),
+                raw,
+                output,
+                RowStateAudit.defaultReport(raw));
+    }
+
+    private static IndexKey timestamp(String value) throws java.io.IOException {
+        return IndexKey.parse("timestamp", value);
     }
 
     @Test
@@ -302,7 +357,7 @@ public class IndexTraceCompilerTest {
         String auditHash = BaselineGenerator.sha256(sourceAudit);
         var maintenance =
                 IndexMaintenanceValidation.validate(
-                        IndexCatalog.read(config.source()),
+                        IndexCatalog.fromSchema(org.sibench.schema.SourceSchema.hybench(config.source())),
                         SourceSchema.hybench(config.source()),
                         config.layout().output(),
                         raw,
@@ -311,12 +366,13 @@ public class IndexTraceCompilerTest {
         assertEquals("passed", maintenance.get("status"));
         assertEquals(auditHash, maintenance.get("row_state_audit_sha256"));
         assertEquals(auditHash, BaselineGenerator.sha256(sourceAudit));
-        IndexTraceCompiler.compile(config, raw, output);
-        IndexTraceCompiler.compile(config, raw, repeat);
+        compile(config, raw, output);
+        compile(config, raw, repeat);
         var manifest =
                 JsonParser.parseString(Files.readString(output.resolve("manifest.json")))
                         .getAsJsonObject();
-        assertEquals(7, manifest.get("operation_trace_version").getAsInt());
+        assertEquals(8, manifest.get("operation_trace_version").getAsInt());
+        assertEquals("hybench", manifest.get("benchmark").getAsString());
         assertEquals(21, manifest.get("baseline_operations").getAsLong());
         assertEquals(21, manifest.getAsJsonArray("index_definitions").size());
         assertEquals(1, manifest.get("discarded_aborted_row_changes").getAsLong());
@@ -356,23 +412,26 @@ public class IndexTraceCompilerTest {
                         IndexOperationTrace.read(output.resolve("workload.ops"), runtime);
                         runtime.finish();
                     }
-                    assertNotNull(model.lookupPrimary(8, 1, 1));
-                    assertNull(model.lookupPrimary(8, 1, 2));
-                    assertEquals(3, model.lookupPrimary(8, 1, 3).commitVersion());
+                    IndexKey one = IndexKey.ofInt(1);
+                    IndexKey before = timestamp("2024-01-01 00:00:00");
+                    IndexKey after = timestamp("2024-01-02 00:00:00");
+                    assertNotNull(model.lookupPrimary(8, one, 1));
+                    assertNull(model.lookupPrimary(8, one, 2));
+                    assertEquals(3, model.lookupPrimary(8, one, 3).commitVersion());
                     if (rowIds) {
-                        assertEquals(8, model.lookupPrimary(8, 1, 1).value());
-                        assertEquals(9, model.lookupPrimary(8, 1, 3).value());
+                        assertEquals(8, model.lookupPrimary(8, one, 1).value());
+                        assertEquals(9, model.lookupPrimary(8, one, 3).value());
                     }
                     if (secondary) {
-                        assertEquals(1, model.lookupSecondary(8, 2, "2024-01-01T00:00", 0).size());
-                        assertEquals(1, model.lookupSecondary(8, 2, "2024-01-01T00:00", 1).size());
-                        assertTrue(model.lookupSecondary(8, 2, "2024-01-02T00:00", 1).isEmpty());
-                        assertTrue(model.lookupSecondary(8, 2, "2024-01-01T00:00", 3).isEmpty());
-                        assertEquals(1, model.lookupSecondary(8, 2, "2024-01-02T00:00", 3).size());
+                        assertEquals(1, model.lookupSecondary(8, 2, before, 0).size());
+                        assertEquals(1, model.lookupSecondary(8, 2, before, 1).size());
+                        assertTrue(model.lookupSecondary(8, 2, after, 1).isEmpty());
+                        assertTrue(model.lookupSecondary(8, 2, before, 3).isEmpty());
+                        assertEquals(1, model.lookupSecondary(8, 2, after, 3).size());
                     }
                 }
             }
-        RelocationCheck.validate(config, output, fixture.resolve("relocated"));
+        RelocationCheck.validate(config.layout(), output, fixture.resolve("relocated"));
         var relocated =
                 JsonParser.parseString(Files.readString(fixture.resolve("relocated/report.json")))
                         .getAsJsonObject();
@@ -407,8 +466,8 @@ public class IndexTraceCompilerTest {
                             + "\"new\":"
                                 + row("2024-01-02 00:00:00")
                                 + "}\n",
-                        "{\"event\":\"scan_rescan\",\"scan\":\"s\",\"relation\":\"idx_loantrans_2\",\"keys\":[{\"strategy\":4,\"flags\":0,\"value\":\"2024-01-02"
-                            + " 00:00:00\"}]}\n")) {
+                        // An array key (= ANY) is not one interval.
+                        search("s", 1, 3, AccessUnits.SK_SEARCHARRAY))) {
             Path fixture = temporary.newFolder().toPath();
             var config = baseline(fixture);
             Path raw =
@@ -422,9 +481,49 @@ public class IndexTraceCompilerTest {
                         () -> audit(config, raw, row("2024-01-02 00:00:00")));
             assertThrows(
                     java.io.IOException.class,
-                    () -> IndexTraceCompiler.compile(config, raw, fixture.resolve("compiled")));
+                    () -> compile(config, raw, fixture.resolve("compiled")));
             assertFalse(Files.exists(fixture.resolve("compiled/manifest.json")));
         }
+    }
+
+    @Test
+    public void rangeScansCompileToOrderedSearchesThatReplay() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        var config = baseline(fixture);
+        String first = row("2024-01-01 00:00:00");
+        // timestamp <= '2024-01-02' finds the baseline row; > '2024-01-02' finds nothing.
+        Path raw =
+                capture(
+                        fixture,
+                        List.of(
+                                search("le", 1, 2, 0)
+                                        + search("gt", 0, 5, 0)
+                                        + "{\"event\":\"transaction_commit\",\"xid\":0}\n"));
+        audit(config, raw, first);
+        Path output = fixture.resolve("compiled");
+        var manifest = compile(config, raw, output);
+        assertEquals(Map.of("range", 2L), manifest.get("searches_by_shape"));
+        var searches = new ArrayList<IndexOperationTrace.Operation>();
+        IndexOperationTrace.read(
+                output.resolve("workload.ops"),
+                o -> {
+                    if (o.kind() == IndexOperationTrace.SEARCH) searches.add(o);
+                });
+        var atMost = searches.get(0).range();
+        assertNull(atMost.lower());
+        assertEquals(timestamp("2024-01-02 00:00:00"), atMost.upper());
+        assertTrue(atMost.upperInclusive());
+        var above = searches.get(1).range();
+        assertEquals(timestamp("2024-01-02 00:00:00"), above.lower());
+        assertFalse(above.lowerInclusive());
+        // A comparison never matches NULL, which sorts after every value.
+        assertEquals(IndexKey.NULL, above.upper());
+        assertFalse(above.upperInclusive());
+        assertEquals(List.of(1L, 0L), searches.stream().map(o -> o.expectedCount()).toList());
+        assertEquals(
+                "passed",
+                ReferenceReplay.run(output, ReplayConfig.defaults(), fixture.resolve("replay.json"))
+                        .get("status"));
     }
 
     @Test
@@ -449,7 +548,7 @@ public class IndexTraceCompilerTest {
                                         + "{\"event\":\"transaction_commit\",\"xid\":9}\n"));
         Path output = fixture.resolve("compiled");
         audit(config, raw, second);
-        IndexTraceCompiler.compile(config, raw, output);
+        compile(config, raw, output);
         JsonObject manifest =
                 JsonParser.parseString(Files.readString(output.resolve("manifest.json")))
                         .getAsJsonObject();
@@ -487,7 +586,7 @@ public class IndexTraceCompilerTest {
             Path raw = capture(fixture, List.of(request));
             assertThrows(
                     Exception.class,
-                    () -> IndexTraceCompiler.compile(config, raw, fixture.resolve("compiled")));
+                    () -> compile(config, raw, fixture.resolve("compiled")));
             assertFalse(Files.exists(fixture.resolve("compiled/manifest.json")));
         }
     }
@@ -508,7 +607,7 @@ public class IndexTraceCompilerTest {
         assertTrue(
                 assertThrows(
                                 java.io.IOException.class,
-                                () -> IndexTraceCompiler.compile(config, raw, output))
+                                () -> compile(config, raw, output))
                         .getMessage()
                         .contains("row audit required"));
         assertFalse(Files.exists(output));

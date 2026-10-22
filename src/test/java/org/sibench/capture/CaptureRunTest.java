@@ -114,6 +114,7 @@ public class CaptureRunTest {
             Files.writeString(
                     pg,
                     event("executor_start", application, ",\"sql\":\"SELECT 1\"")
+                            + event("executor_run_end", application, "")
                             + event("executor_end", application, "")
                             + event("transaction_commit", application, ""));
             run.complete(new long[19]);
@@ -137,12 +138,12 @@ public class CaptureRunTest {
             Files.writeString(raw, "{}\n");
             assertThrows(
                     IOException.class,
-                    () -> IndexTraceCompiler.compile(null, raw, directory.resolve("output")));
+                    () -> IndexTraceCompiler.compile(null, null, raw, directory.resolve("output"), null));
             assertFalse(Files.exists(directory.resolve("output")));
             run.fail(new SQLException("broken", "08006"), Map.of("operation", "commit"));
             assertThrows(
                     IOException.class,
-                    () -> IndexTraceCompiler.compile(null, raw, directory.resolve("output")));
+                    () -> IndexTraceCompiler.compile(null, null, raw, directory.resolve("output"), null));
         }
     }
 
@@ -221,7 +222,7 @@ public class CaptureRunTest {
         assertEquals(2, manifest(directory).getAsJsonArray("sessions").size());
         CaptureRun.verifyInput(directory);
         Path output = directory.resolve("normalized");
-        assertThrows(IOException.class, () -> IndexTraceCompiler.compile(null, directory, output));
+        assertThrows(IOException.class, () -> IndexTraceCompiler.compile(null, null, directory, output, null));
         assertFalse(Files.exists(output));
         Path extra = directory.resolve("pg-unregistered.jsonl");
         Files.writeString(extra, "{}\n");

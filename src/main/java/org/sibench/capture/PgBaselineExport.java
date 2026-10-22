@@ -20,19 +20,6 @@ import java.util.*;
  * Export committed PG values in primary-key order, then read every Parquet row for verification.
  */
 public final class PgBaselineExport {
-    public static final Map<String, String> TABLES = new LinkedHashMap<>();
-
-    static {
-        TABLES.put("customer", "custid");
-        TABLES.put("company", "companyid");
-        TABLES.put("savingaccount", "accountid");
-        TABLES.put("checkingaccount", "accountid");
-        TABLES.put("transfer", "id");
-        TABLES.put("checking", "id");
-        TABLES.put("loanapps", "id");
-        TABLES.put("loantrans", "id");
-    }
-
     private PgBaselineExport() {}
 
     public static void main(String[] args) throws Exception {

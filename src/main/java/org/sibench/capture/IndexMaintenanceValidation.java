@@ -8,6 +8,7 @@ import org.apache.parquet.hadoop.example.GroupReadSupport;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.generation.BaselineGenerator;
 import org.sibench.schema.SourceSchema;
+import org.sibench.trace.IndexKey;
 
 import java.io.IOException;
 import java.nio.file.*;
@@ -15,24 +16,22 @@ import java.util.*;
 
 /** Checks index maintenance from audited transitions, without re-auditing source row state. */
 public final class IndexMaintenanceValidation {
-    private record Key(String table, long key) {}
+    private record Key(String table, IndexKey key) {}
 
     private IndexMaintenanceValidation() {}
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 5 && args.length != 6)
+        if (args.length != 3 && args.length != 4)
             throw new IllegalArgumentException(
-                    "IndexMaintenanceValidation ROOT CONFIG BASELINE RAW REPORT [ROW_AUDIT]");
-        CaptureConfig config = CaptureConfig.read(Path.of(args[0]), Path.of(args[1]));
+                    "IndexMaintenanceValidation ROOT PROFILE REPORT [ROW_AUDIT]");
+        var capture = CaptureProfile.read(Path.of(args[0]), Path.of(args[1]));
         validate(
-                IndexCatalog.read(config.source()),
-                SourceSchema.hybench(config.source()),
+                IndexCatalog.fromSchema(capture.schema()),
+                capture.schema(),
+                capture.baseline(),
+                capture.raw(),
                 Path.of(args[2]),
-                Path.of(args[3]),
-                Path.of(args[4]),
-                args.length == 6
-                        ? Path.of(args[5])
-                        : RowStateAudit.defaultReport(Path.of(args[3])));
+                args.length == 4 ? Path.of(args[3]) : RowStateAudit.defaultReport(capture.raw()));
     }
 
     public static Map<String, Object> validate(
@@ -58,7 +57,7 @@ public final class IndexMaintenanceValidation {
                         change.get("new").isJsonNull()
                                 ? change.getAsJsonObject("old")
                                 : change.getAsJsonObject("new");
-                Key key = new Key(table, row.get(PgBaselineExport.TABLES.get(table)).getAsLong());
+                Key key = new Key(table, catalog.primaryKey(table, row));
                 changes.computeIfAbsent(key, ignored -> new ArrayList<>()).add(change);
             }
         }
@@ -77,13 +76,13 @@ public final class IndexMaintenanceValidation {
                             .build()) {
                 Group row;
                 while ((row = reader.read()) != null) {
-                    Map<Integer, String> indexed = catalog.keys(table, row);
+                    Map<Integer, IndexKey> indexed = catalog.keys(table, row);
                     baselineRows++;
                     baselineIndexEntries += 1 + indexed.size();
                     counts.merge(table + "/0", 1L, Long::sum);
                     for (int index : indexed.keySet())
                         counts.merge(table + "/" + index, 1L, Long::sum);
-                    Key key = new Key(table, row.getLong(PgBaselineExport.TABLES.get(table), 0));
+                    Key key = new Key(table, catalog.primaryKey(table, row));
                     if (changes.containsKey(key)) initial.put(key, SourceRow.json(row));
                 }
             }
@@ -94,38 +93,34 @@ public final class IndexMaintenanceValidation {
             Key key = entry.getKey();
             JsonObject state = initial.get(key);
             var models = List.of(new IndexReferenceReplay(false), new IndexReferenceReplay(true));
-            Map<Integer, String> initialKeys =
+            Map<Integer, IndexKey> initialKeys =
                     state == null ? Map.of() : catalog.keys(key.table(), state);
             long rowId = 1, version = 0;
             if (state != null) {
                 Operation primary =
-                        new Operation(
+                        IndexOperationTrace.write(
                                 0,
-                                1,
-                                IndexCatalog.tableId(key.table()),
-                                0,
+                                IndexOperationTrace.INSERT,
+                                catalog.tableId(key.table()),
                                 0,
                                 key.key(),
                                 0,
                                 1,
                                 0,
-                                rowId,
-                                0,
-                                0,
-                                0);
+                                rowId);
                 for (var model : models)
                     IndexMutation.emit(primary, Map.of(), initialKeys, model::accept);
             }
-            var predicates = new LinkedHashMap<Integer, Set<String>>();
-            for (var definition : catalog.secondary(IndexCatalog.tableId(key.table())))
+            var predicates = new LinkedHashMap<Integer, Set<IndexKey>>();
+            for (var definition : catalog.secondary(catalog.tableId(key.table())))
                 predicates.put(definition.indexId(), new HashSet<>());
             initialKeys.forEach((index, value) -> predicates.get(index).add(value));
             for (JsonObject matched : entry.getValue()) {
                 JsonObject next =
                         matched.get("new").isJsonNull() ? null : matched.getAsJsonObject("new");
-                Map<Integer, String> before =
+                Map<Integer, IndexKey> before =
                         state == null ? Map.of() : catalog.keys(key.table(), state);
-                Map<Integer, String> after =
+                Map<Integer, IndexKey> after =
                         next == null ? Map.of() : catalog.keys(key.table(), next);
                 for (int index : before.keySet())
                     if (after.containsKey(index)
@@ -137,27 +132,26 @@ public final class IndexMaintenanceValidation {
                 version++;
                 if (state == null) rowId++;
                 Operation primary =
-                        new Operation(
-                                version,
-                                next == null ? 5 : 3,
-                                IndexCatalog.tableId(key.table()),
-                                0,
-                                state == null ? 1 : 2,
-                                key.key(),
-                                version,
-                                next == null ? 0 : 2,
-                                version,
-                                rowId,
-                                0,
-                                0,
-                                0,
-                                version,
-                                1);
+                        IndexOperationTrace.write(
+                                        version,
+                                        next == null
+                                                ? IndexOperationTrace.LOGICAL_DELETE
+                                                : IndexOperationTrace.UPSERT,
+                                        catalog.tableId(key.table()),
+                                        state == null
+                                                ? IndexOperationTrace.BUSINESS_INSERT
+                                                : IndexOperationTrace.BUSINESS_UPDATE,
+                                        key.key(),
+                                        version,
+                                        next == null ? 0 : 2,
+                                        next == null ? 0 : version,
+                                        rowId)
+                                .withTransaction(version, 1);
                 for (int mode = 0; mode < models.size(); mode++) {
                     var model = models.get(mode);
                     IndexMutation.emit(primary, before, after, model::accept);
                     for (var predicate : predicates.entrySet())
-                        for (String value : predicate.getValue()) {
+                        for (IndexKey value : predicate.getValue()) {
                             var historical =
                                     model.lookupSecondary(
                                             primary.table(),

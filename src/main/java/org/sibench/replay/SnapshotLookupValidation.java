@@ -9,6 +9,7 @@ import org.sibench.capture.*;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexReferenceReplay.LookupResult;
 import org.sibench.generation.BaselineGenerator;
+import org.sibench.trace.IndexKey;
 
 import java.io.IOException;
 import java.nio.file.*;
@@ -18,12 +19,12 @@ import java.util.*;
 public final class SnapshotLookupValidation {
     private static final int SECONDARY_PREDICATES = 64;
 
-    private record Key(int table, long key) {}
+    private record Key(int table, IndexKey key) {}
 
-    private record Predicate(int table, int index, String value) {}
+    private record Predicate(int table, int index, IndexKey value) {}
 
-    private record Row(long version, long rowId, long locator, Map<Integer, String> indexes) {
-        LookupResult result(long key, boolean rowIds) {
+    private record Row(long version, long rowId, long locator, Map<Integer, IndexKey> indexes) {
+        LookupResult result(IndexKey key, boolean rowIds) {
             return new LookupResult(key, version, rowIds ? rowId : locator);
         }
     }
@@ -31,7 +32,7 @@ public final class SnapshotLookupValidation {
     private static final class History {
         Row baseline;
         final NavigableMap<Long, Row> commits = new TreeMap<>();
-        final Map<Integer, Set<String>> indexedValues = new LinkedHashMap<>();
+        final Map<Integer, Set<IndexKey>> indexedValues = new LinkedHashMap<>();
 
         void remember(Row row) {
             if (row != null)
@@ -49,53 +50,39 @@ public final class SnapshotLookupValidation {
         }
     }
 
+    /** Baseline PKs of one predicate, appended in baseline (PK) order. */
     private static final class Keys {
-        final List<long[]> chunks = new ArrayList<>();
+        final List<IndexKey> keys = new ArrayList<>();
         int size;
 
-        void add(long key) throws IOException {
-            if (size > 0 && get(size - 1) >= key)
+        void add(IndexKey key) throws IOException {
+            if (size > 0 && keys.get(size - 1).compareTo(key) >= 0)
                 throw new IOException("Baseline predicate keys must be strictly ordered");
-            if (size % 4096 == 0) chunks.add(new long[4096]);
-            chunks.get(size / 4096)[size++ % 4096] = key;
+            keys.add(key);
+            size++;
         }
 
-        long get(int index) {
-            return chunks.get(index / 4096)[index % 4096];
-        }
-
-        boolean contains(long key) {
-            int low = 0, high = size - 1;
-            while (low <= high) {
-                int middle = (low + high) >>> 1;
-                long value = get(middle);
-                if (value == key) return true;
-                if (value < key) low = middle + 1;
-                else high = middle - 1;
-            }
-            return false;
+        boolean contains(IndexKey key) {
+            return Collections.binarySearch(keys, key) >= 0;
         }
     }
 
     private static final class Locations {
-        private final Map<Key, long[][]> pages = new HashMap<>();
+        private final Map<Key, long[]> rows = new HashMap<>();
 
-        void add(int table, long key, long rowId, long locator) {
-            long[][] page =
-                    pages.computeIfAbsent(new Key(table, key >>> 12), ignored -> new long[2][4096]);
-            page[0][(int) (key & 4095)] = rowId;
-            page[1][(int) (key & 4095)] = locator;
+        void add(int table, IndexKey key, long rowId, long locator) {
+            rows.put(new Key(table, key), new long[] {rowId, locator});
         }
 
-        LookupResult get(int table, long key, boolean rowIds) {
-            long[][] page = pages.get(new Key(table, key >>> 12));
-            return new LookupResult(key, 0, page[rowIds ? 0 : 1][(int) (key & 4095)]);
+        LookupResult get(int table, IndexKey key, boolean rowIds) {
+            long[] row = rows.get(new Key(table, key));
+            return new LookupResult(key, 0, row[rowIds ? 0 : 1]);
         }
     }
 
     @FunctionalInterface
     private interface RowConsumer {
-        void accept(int table, long key, Row row) throws IOException;
+        void accept(int table, IndexKey key, Row row) throws IOException;
     }
 
     private SnapshotLookupValidation() {}
@@ -170,7 +157,7 @@ public final class SnapshotLookupValidation {
                         Operation operation = payloadOperations.get(identity);
                         if (operation == null
                                 || operation.table() != table
-                                || operation.key() != key
+                                || !operation.key().equals(key)
                                 || operation.version() != row.version()
                                 || operation.rowId() != row.rowId())
                             throw new IOException(
@@ -206,14 +193,13 @@ public final class SnapshotLookupValidation {
                         pending.clear();
                     }
                 });
-        Map<String, SortedSet<String>> changedValues = new TreeMap<>(),
+        Map<String, SortedSet<IndexKey>> changedValues = new TreeMap<>(),
                 baselineValues = new TreeMap<>();
-        Comparator<String> values = Comparator.nullsFirst(Comparator.naturalOrder());
         for (var definition : catalog.definitions())
             if (definition.indexId() > 0) {
                 String id = definition.tableId() + "/" + definition.indexId();
-                changedValues.put(id, new TreeSet<>(values));
-                baselineValues.put(id, new TreeSet<>(values));
+                changedValues.put(id, new TreeSet<>());
+                baselineValues.put(id, new TreeSet<>());
             }
         for (var entry : histories.entrySet())
             entry.getValue()
@@ -247,7 +233,7 @@ public final class SnapshotLookupValidation {
                         row.indexes()
                                 .forEach(
                                         (index, value) -> {
-                                            SortedSet<String> sample =
+                                            SortedSet<IndexKey> sample =
                                                     baselineValues.get(table + "/" + index);
                                             sample.add(value);
                                             if (sample.size() > SECONDARY_PREDICATES)
@@ -260,12 +246,12 @@ public final class SnapshotLookupValidation {
             for (var definition : catalog.definitions()) {
                 if (definition.indexId() == 0) continue;
                 String id = definition.tableId() + "/" + definition.indexId();
-                var selected = new LinkedHashSet<String>();
+                var selected = new LinkedHashSet<IndexKey>();
                 changedValues.get(id).stream().limit(SECONDARY_PREDICATES).forEach(selected::add);
                 baselineValues.get(id).stream()
                         .limit(SECONDARY_PREDICATES - selected.size())
                         .forEach(selected::add);
-                for (String value : selected)
+                for (IndexKey value : selected)
                     buckets.put(
                             new Predicate(definition.tableId(), definition.indexId(), value),
                             new Keys());
@@ -315,7 +301,7 @@ public final class SnapshotLookupValidation {
                         if (expected != null) items++;
                         if (config.secondaryIndexes())
                             for (var index : indexedValues.entrySet())
-                                for (String value : index.getValue()) {
+                                for (IndexKey value : index.getValue()) {
                                     LookupResult expectedEntry =
                                             row != null
                                                             && Objects.equals(
@@ -345,7 +331,7 @@ public final class SnapshotLookupValidation {
                 for (var entry : buckets.entrySet()) {
                     Predicate predicate = entry.getKey();
                     Keys keys = entry.getValue();
-                    var relevant = new LinkedHashMap<Long, History>();
+                    var relevant = new LinkedHashMap<IndexKey, History>();
                     var times = new TreeSet<Long>(List.of(0L, lastCommit[0]));
                     long first = Long.MAX_VALUE;
                     for (var change : histories.entrySet())
@@ -376,9 +362,9 @@ public final class SnapshotLookupValidation {
                                             + predicate
                                             + " at "
                                             + time);
-                        long previous = 0;
+                        IndexKey previous = null;
                         for (LookupResult result : actual) {
-                            if (result.key() <= previous)
+                            if (previous != null && result.key().compareTo(previous) <= 0)
                                 throw new IOException("Duplicate/unordered secondary results");
                             previous = result.key();
                             History history =
@@ -439,7 +425,7 @@ public final class SnapshotLookupValidation {
                     + " every source index at baseline, before/at first relevant change and final."
                     + " Exact key/version/Locator/RowID comparison against independently decoded"
                     + " baseline and incremental Parquet, including old/new values; not full HTAP"
-                    + " snapshots, range queries, relocation/GC or performance.");
+                    + " snapshots, derived range probes, relocation/GC or performance.");
         Files.writeString(
                 report,
                 new GsonBuilder().setPrettyPrinting().create().toJson(output),
@@ -502,8 +488,8 @@ public final class SnapshotLookupValidation {
                         throw new IOException("Incremental mutation position mismatch");
                 }
                 consumer.accept(
-                        IndexCatalog.tableId(table),
-                        group.getLong(PgBaselineExport.TABLES.get(table), 0),
+                        catalog.tableId(table),
+                        catalog.primaryKey(table, group),
                         new Row(
                                 group.getLong("_sib_timestamp", 0), group.getLong("_sib_row_id", 0),
                                 IndexReferenceReplay.locator(fileId, position++),

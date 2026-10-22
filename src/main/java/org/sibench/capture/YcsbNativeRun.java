@@ -189,6 +189,9 @@ final class YcsbNativeRun {
                                 + " sessions");
             var report = new LinkedHashMap<String, Object>();
             report.put("workload", workload);
+            report.put(
+                    "sessions",
+                    List.of(Map.of("pg_file", "pg-" + CaptureRun.connectionPid(added.get(0)) + ".jsonl")));
             report.put("recordcount_at_start", records);
             report.put("operationcount", operations);
             report.put("statement_operations", executed);
