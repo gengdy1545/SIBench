@@ -27,9 +27,7 @@ YCSB 固定使用 `JdbcDBCreateTable`，不是普通字段为 VARCHAR 的 SQL �
 
 成功报告为 `schema_verified`，差异为 `schema_mismatch`，包含期望与实际定义、环境、源码摘要和具体差异。检查是采集前的时点事实，不是整个运行期 DDL 漂移检测；实验环境应禁止外部 DDL，不宣称持有跨运行发布屏障。
 
-HyBench `CapturePoc check` 连接 PG 并执行预检。Baseline export 在创建输出目录前检查，保存 `schema-preflight.json`；原生 run 在打开记录 JDBC 会话和调用 benchmark 方法前检查，在 `capture-run.json` 保存结果。失败 run 保留诊断，但没有业务采集会话。
-
-YCSB / sysbench 的原生采集入口（`NativeCapture`，见 [原生 Trace 验证](../validation/ycsb-sysbench-native-trace.md)）在采集前调用相同检查并保存结果；独立预检通过不替代采集验收。构建副本中参与执行的上游源码须与固定子模块逐字节一致，否则在建库前拒绝。
+三来源的采集入口 `NativeCapture`（由 `scripts/native-capture.sh` 调用）在 `check` 阶段执行预检；Baseline export 在创建输出目录前检查，保存 `schema-preflight.json`；原生 run 在打开记录 JDBC 会话和调用 benchmark 方法前再次检查，在 `capture-run.json` 保存结果。失败 run 保留诊断，但没有业务采集会话；独立预检通过不替代采集验收。构建副本中参与执行的上游源码须与固定子模块逐字节一致，否则在建库前拒绝。
 
 ## 使用
 

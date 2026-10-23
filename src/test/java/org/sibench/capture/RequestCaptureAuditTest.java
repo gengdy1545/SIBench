@@ -9,6 +9,7 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.nio.file.Files;
+import java.util.Map;
 import java.sql.Types;
 
 public class RequestCaptureAuditTest {
@@ -152,5 +153,52 @@ public class RequestCaptureAuditTest {
         // Planner endpoint probes (IS NOT NULL, no bound value) are not search predicates.
         Files.writeString(server, server(2, scan("0", "129", "null")));
         assertEquals("passed", RequestCaptureAudit.audit(client, server, true).get("status"));
+    }
+
+    /**
+     * A commit the client issues after its transaction already ended writes no server commit: the
+     * transaction closed in an abort and the request changed no row, so nothing is lost. The audit
+     * records it; the same request with row changes is still a lost commit and fails.
+     */
+    @Test
+    public void aCommitAfterTheTransactionAlreadyEndedIsRecordedNotToleratedAway() throws Exception {
+        var directory = temporary.newFolder().toPath();
+        var client = directory.resolve("client.jsonl");
+        var server = directory.resolve("server.jsonl");
+        Files.writeString(client, COMMIT_AFTER_ROLLBACK_CLIENT);
+        Files.writeString(server, server(0, "") + abortEvent());
+        var report = RequestCaptureAudit.audit(client, server, true);
+        assertEquals("passed", report.get("status"));
+        assertEquals(1L, ((Map<?, ?>) report.get("client_commits_ended_by_server_abort")).get("a"));
+    }
+
+    private static final String COMMIT_AFTER_ROLLBACK_CLIENT =
+            """
+            {"event":"connection","pid":42}
+            {"event":"request_start","application":"a","sql":"SELECT c FROM t WHERE id = ?","parameters":{"1":"5"}}
+            {"event":"request_return","application":"a"}
+            {"event":"rollback","application":"a"}
+            {"event":"commit","application":"a"}
+            {"event":"close","application":"a"}
+            """;
+
+    @Test
+    public void aCommitThatChangedRowsButNeverCommittedFails() throws Exception {
+        var directory = temporary.newFolder().toPath();
+        var client = directory.resolve("client.jsonl");
+        var server = directory.resolve("server.jsonl");
+        Files.writeString(client, COMMIT_AFTER_ROLLBACK_CLIENT);
+        Files.writeString(
+                server,
+                server(0, "")
+                        + abortEvent()
+                        + "{\"event\":\"row_change\",\"pid\":42,\"application\":\"a\","
+                        + "\"relation\":\"t\",\"operation\":\"update\"}\n");
+        assertThrows(
+                java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
+    }
+
+    private static String abortEvent() {
+        return "{\"event\":\"transaction_abort\",\"pid\":42,\"application\":\"a\"}\n";
     }
 }

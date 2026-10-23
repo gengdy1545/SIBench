@@ -1,11 +1,16 @@
 package org.sibench.capture;
 
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Groups one backend's raw PG index events into access units: one unit per index rescan of one
@@ -13,6 +18,9 @@ import java.util.Map;
  * trigger queries belong to the request that runs them. Every index event of a scan is attributed
  * to its current unit, which settles exactly once: when the scan is rescanned, ends, is abandoned
  * by an abort, or is still open when the connection closes during its request.
+ *
+ * <p>The index scans of one BitmapAnd that ran in the same cycle form a {@link BitmapGroup}: the
+ * heap checks only their intersection, so the group, not a single scan, carries the visible count.
  */
 final class AccessUnits {
     static final int SK_ISNULL = 0x01, SK_SEARCHARRAY = 0x20;
@@ -38,7 +46,40 @@ final class AccessUnits {
         default void unitStarted(Unit unit, JsonObject event) throws IOException {}
 
         default void unitSettled(Unit unit) throws IOException {}
+
+        /**
+         * Units that started before their bitmap heap node bound them now form its first group:
+         * PostgreSQL passes constant scan keys to the index while the plan is initialized, before
+         * the heap node above it exists.
+         */
+        default void groupFormed(BitmapGroup group) throws IOException {}
+
+        /** Every member of a BitmapAnd group has settled and no member can join it any more. */
+        default void groupSettled(BitmapGroup group) throws IOException {}
     }
+
+    /**
+     * How the index scans feeding one bitmap heap node combine: a single scan, a flat BitmapOr, a
+     * flat BitmapAnd, or a nesting of the two that has no flat projection.
+     */
+    enum Combination {
+        SINGLE,
+        OR,
+        AND,
+        NESTED
+    }
+
+    /** The scans of one BitmapAnd that ran in one cycle, with the heap's verdict on their result. */
+    static final class BitmapGroup {
+        final List<Unit> members = new ArrayList<>();
+        final Set<Scan> scans = new HashSet<>();
+        long visible;
+        int settled;
+        boolean sealed, lossy, verdictOutsideIntersection, reported;
+    }
+
+    /** One run of equal indexed values among the rows a scan made visible, in scan order. */
+    record Run(JsonElement value, long rows) {}
 
     static final class Request {
         final long ordinal;
@@ -84,6 +125,28 @@ final class AccessUnits {
         /** Bitmap candidate TIDs still waiting for their heap visibility verdict. */
         final java.util.Set<String> unresolved = new java.util.HashSet<>();
         boolean bitmapEnded, bitmapLossy, lastFound, forward, backward;
+        /**
+         * The MVCC snapshot the scan runs under: PostgreSQL's transaction completion counter as
+         * GetSnapshotData() saw it, plus the running XIDs it reported. Absent (-1) for snapshots
+         * that are not MVCC, such as the planner's endpoint probes.
+         */
+        long snapshotCsn = -1, snapshotXmin = -1, snapshotXmax = -1;
+        long[] snapshotXip;
+        boolean snapshotSuboverflowed;
+        /** The bitmap combination this scan feeds, and its BitmapAnd group when it has one. */
+        Combination combination = Combination.SINGLE;
+        BitmapGroup group;
+        /**
+         * The identities of the visible rows, in scan order, kept as runs of equal indexed values:
+         * completed runs (only for array keys, whose elements each need their own count), the
+         * number of rows before the last run, and the last run's value and primary keys. A row
+         * made visible without its identity (an all-visible index-only row) leaves them unusable.
+         */
+        final List<Run> runs = new ArrayList<>();
+        long rowsBeforeLastRun;
+        JsonElement lastValue;
+        final List<JsonElement> lastPks = new ArrayList<>();
+        boolean identityMissing;
 
         Unit(Scan scan, Source source, JsonArray keys, Request request, int depth) {
             this.scan = scan;
@@ -115,12 +178,37 @@ final class AccessUnits {
         boolean exhausted() {
             return calls > 0 && !lastFound;
         }
+
+        boolean arrayKeys() {
+            for (JsonElement key : keys)
+                if (key.getAsJsonObject().has("array")) return true;
+            return false;
+        }
+
+        /** One visible row, in scan order: extends the last run or starts the next. */
+        void row(JsonElement value, JsonElement pk) {
+            if (lastValue != null && !lastValue.equals(value)) {
+                if (arrayKeys()) runs.add(new Run(lastValue, lastPks.size()));
+                rowsBeforeLastRun += lastPks.size();
+                lastPks.clear();
+            }
+            lastValue = value;
+            lastPks.add(pk);
+        }
+    }
+
+    /** One bitmap heap node: the scans it checks, how they combine, and its current group. */
+    private static final class BitmapHeap {
+        final List<String> inputs = new ArrayList<>();
+        Combination combination;
+        BitmapGroup current;
     }
 
     private static final class Session {
         final Map<String, Scan> scans = new HashMap<>();
-        /** Bitmap heap node to the index scans whose candidates it checks. */
-        final Map<String, java.util.List<String>> bitmapInputs = new HashMap<>();
+        final Map<String, BitmapHeap> heaps = new HashMap<>();
+        /** Scan identity to the bitmap heap node it feeds, as of the latest plan binding. */
+        final Map<String, BitmapHeap> feeds = new HashMap<>();
         Request current;
         boolean currentEnded;
         long pendingProbes;
@@ -183,6 +271,8 @@ final class AccessUnits {
                 String id = e.get("scan").getAsString();
                 if (state.scans.containsKey(id))
                     throw new IOException("Repeated live scan identity: " + id);
+                // A reused scan identity starts unbound until its bitmap heap node binds it again.
+                state.feeds.remove(id);
                 Scan scan = new Scan(e.get("relation").getAsString());
                 scan.kind = e.get("kind").getAsString();
                 scan.planNode = e.get("plan_node").getAsInt();
@@ -198,20 +288,34 @@ final class AccessUnits {
                             .append(scan.index);
             }
             case "plan_bitmap_heap" -> {
-                var inputs = new java.util.ArrayList<String>();
-                for (var scan : e.getAsJsonArray("scans")) inputs.add(scan.getAsString());
-                state.bitmapInputs.put(e.get("heap").getAsString(), inputs);
+                if (!e.has("tree"))
+                    throw new IOException(
+                            "Bitmap heap binding lacks its combination tree; recapture with the"
+                                    + " current instrumentation");
+                var heap = new BitmapHeap();
+                for (var scan : e.getAsJsonArray("scans")) heap.inputs.add(scan.getAsString());
+                heap.combination = combination(e.get("tree"));
+                state.heaps.put(e.get("heap").getAsString(), heap);
+                for (String id : heap.inputs) state.feeds.put(id, heap);
+                bindStarted(heap);
             }
             case "bitmap_heap_candidate" -> verdict(e);
             case "bitmap_heap_lossy" -> {
-                for (Unit unit : bitmapUnits(e)) unit.bitmapLossy = true;
+                BitmapHeap heap = heap(e);
+                if (heap.combination == Combination.AND && heap.current != null)
+                    heap.current.lossy = true;
+                for (Unit unit : bitmapUnits(heap)) unit.bitmapLossy = true;
             }
             case "scan_rescan" -> rescan(e, depth);
             case "scan_next", "heap_visibility", "vm_visible", "bitmap_candidate", "bitmap_end" ->
                     fetch(e, type);
             case "scan_end" -> {
-                Scan scan = state.scans.remove(e.get("scan").getAsString());
+                String id = e.get("scan").getAsString();
+                Scan scan = state.scans.remove(id);
                 if (scan == null) throw new IOException("Scan end without a live scan identity");
+                // An ended scan never joins another cycle of its BitmapAnd.
+                BitmapHeap heap = state.feeds.get(id);
+                if (heap != null && heap.current != null) heap.current.sealed = true;
                 if (scan.current != null) settle(scan.current);
             }
             default -> {
@@ -224,6 +328,7 @@ final class AccessUnits {
     /** Scans can stay open only while the last request is still executing at connection close. */
     void endSession() throws IOException {
         Session state = session;
+        sealGroups();
         for (Scan scan : state.scans.values()) {
             Unit unit = scan.current;
             if (unit == null) continue;
@@ -244,6 +349,7 @@ final class AccessUnits {
      */
     private void abandonFailedScans() throws IOException {
         Session state = session;
+        sealGroups();
         for (var iterator = state.scans.values().iterator(); iterator.hasNext(); ) {
             Scan scan = iterator.next();
             Unit unit = scan.current;
@@ -258,6 +364,46 @@ final class AccessUnits {
             settle(unit);
             iterator.remove();
         }
+    }
+
+    /** The inputs' units that already started belong to the node's first cycle. */
+    private void bindStarted(BitmapHeap heap) throws IOException {
+        BitmapGroup group = null;
+        for (String id : heap.inputs) {
+            Scan scan = session.scans.get(id);
+            if (scan == null || scan.current == null || scan.current.source == Source.PLANNER_PROBE)
+                continue;
+            Unit unit = scan.current;
+            if (unit.group != null || unit.events > 1)
+                throw new IOException("Bitmap input ran before its heap node bound it: " + id);
+            unit.combination = heap.combination;
+            if (heap.combination != Combination.AND) continue;
+            if (group == null) group = new BitmapGroup();
+            group.members.add(unit);
+            group.scans.add(scan);
+            unit.group = group;
+        }
+        if (group == null) return;
+        heap.current = group;
+        listener.groupFormed(group);
+    }
+
+    /** No scan runs again after an abort or at connection close, so no group can grow. */
+    private void sealGroups() {
+        for (BitmapHeap heap : session.heaps.values())
+            if (heap.current != null) heap.current.sealed = true;
+    }
+
+    /** The combination a bitmap heap node's tree describes; nesting has no flat projection. */
+    static Combination combination(JsonElement tree) throws IOException {
+        if (tree.isJsonPrimitive()) return Combination.SINGLE;
+        JsonObject node = tree.getAsJsonObject();
+        if (node.size() != 1 || !(node.has("and") || node.has("or")))
+            throw new IOException("Invalid bitmap combination tree: " + tree);
+        boolean and = node.has("and");
+        for (JsonElement child : node.getAsJsonArray(and ? "and" : "or"))
+            if (!child.isJsonPrimitive()) return Combination.NESTED;
+        return and ? Combination.AND : Combination.OR;
     }
 
     private void startRequest(JsonObject e) throws IOException {
@@ -297,6 +443,12 @@ final class AccessUnits {
             if (state.current == null)
                 throw new IOException("Index scan without a started request: " + index);
         }
+        // A BitmapAnd input that runs again starts the next cycle; PostgreSQL skips the remaining
+        // inputs once the intersection is empty, so a cycle holds the inputs that actually ran.
+        BitmapHeap heap = source == Source.PLANNER_PROBE ? null : state.feeds.get(id);
+        if (heap != null && heap.combination == Combination.AND
+                && heap.current != null && heap.current.scans.contains(scan))
+            heap.current.sealed = true;
         if (scan.current != null) settle(scan.current);
         Unit unit =
                 new Unit(
@@ -306,7 +458,27 @@ final class AccessUnits {
                         source == Source.PLANNER_PROBE ? null : state.current,
                         depth);
         scan.current = unit;
+        if (heap != null) {
+            unit.combination = heap.combination;
+            if (heap.combination == Combination.AND) {
+                if (heap.current == null || heap.current.sealed) heap.current = new BitmapGroup();
+                heap.current.members.add(unit);
+                heap.current.scans.add(scan);
+                unit.group = heap.current;
+            }
+        }
         if (source == Source.PLANNER_PROBE) state.pendingProbes++;
+        // A copied or imported snapshot leaves the counter at zero, which is not a position.
+        if (e.has("csn") && e.get("csn").getAsLong() > 0) {
+            unit.snapshotCsn = e.get("csn").getAsLong();
+            unit.snapshotXmin = e.get("xmin").getAsLong();
+            unit.snapshotXmax = e.get("xmax").getAsLong();
+            unit.snapshotSuboverflowed =
+                    e.has("suboverflowed") && e.get("suboverflowed").getAsBoolean();
+            var running = e.getAsJsonArray("xip");
+            unit.snapshotXip = new long[running.size()];
+            for (int i = 0; i < running.size(); i++) unit.snapshotXip[i] = running.get(i).getAsLong();
+        }
         listener.unitStarted(unit, e);
     }
 
@@ -337,9 +509,16 @@ final class AccessUnits {
             }
             case "heap_visibility" -> {
                 unit.heapFetches++;
-                if (found) unit.heapVisible++;
+                if (found) {
+                    unit.heapVisible++;
+                    identity(unit, e);
+                }
             }
-            case "vm_visible" -> unit.vmVisible++;
+            case "vm_visible" -> {
+                // An all-visible index-only row is returned without reading the heap: no identity.
+                unit.vmVisible++;
+                unit.identityMissing = true;
+            }
             case "bitmap_candidate" -> {
                 unit.bitmapTids++;
                 unit.unresolved.add(e.get("tid").getAsString());
@@ -348,12 +527,32 @@ final class AccessUnits {
         }
     }
 
+    /** The identity of one visible heap row: the scanning index's value and the table's PK. */
+    private static void identity(Unit unit, JsonObject e) throws IOException {
+        if (!e.has("row"))
+            throw new IOException(
+                    "Visible heap row without its identity; recapture with the current"
+                            + " instrumentation");
+        JsonObject row = e.getAsJsonObject("row");
+        JsonArray indexed = row.getAsJsonArray("indexed"), pk = row.getAsJsonArray("pk");
+        // The source layouts index one column and key one column; anything else has no identity.
+        if (indexed.size() != 1 || pk.size() != 1) {
+            unit.identityMissing = true;
+            return;
+        }
+        unit.row(indexed.get(0), pk.get(0));
+    }
+
+    private BitmapHeap heap(JsonObject e) throws IOException {
+        BitmapHeap heap = session.heaps.get(e.get("heap").getAsString());
+        if (heap == null) throw new IOException("Bitmap heap event without a plan binding");
+        return heap;
+    }
+
     /** Current units of the index scans feeding one bitmap heap node. */
-    private java.util.List<Unit> bitmapUnits(JsonObject e) throws IOException {
-        var inputs = session.bitmapInputs.get(e.get("heap").getAsString());
-        if (inputs == null) throw new IOException("Bitmap heap event without a plan binding");
-        var result = new java.util.ArrayList<Unit>();
-        for (String id : inputs) {
+    private List<Unit> bitmapUnits(BitmapHeap heap) {
+        var result = new ArrayList<Unit>();
+        for (String id : heap.inputs) {
             Scan scan = session.scans.get(id);
             if (scan != null && scan.current != null) result.add(scan.current);
         }
@@ -363,16 +562,28 @@ final class AccessUnits {
     /**
      * PostgreSQL's heap verdict for one candidate TID of an exact bitmap page. Every index scan
      * that produced the TID (both sides of a BitmapOr, say) gets it, so each index counts its own
-     * visible matches.
+     * visible matches. A BitmapAnd checks only the intersection of its group's inputs: every
+     * input of the cycle must have produced the TID, and the group counts it once.
      */
     private void verdict(JsonObject e) throws IOException {
+        BitmapHeap heap = heap(e);
         String tid = e.get("tid").getAsString();
         boolean found = e.get("found").getAsBoolean(), claimed = false;
-        for (Unit unit : bitmapUnits(e))
-            if (unit.unresolved.remove(tid)) {
-                claimed = true;
-                if (found) unit.bitmapHeapVisible++;
-            }
+        if (heap.combination == Combination.AND) {
+            BitmapGroup group = heap.current;
+            if (group == null) throw new IOException("BitmapAnd verdict without a cycle: " + tid);
+            for (Unit unit : group.members)
+                if (unit.unresolved.remove(tid)) {
+                    claimed = true;
+                    if (found) unit.bitmapHeapVisible++;
+                } else group.verdictOutsideIntersection = true;
+            if (found) group.visible++;
+        } else
+            for (Unit unit : bitmapUnits(heap))
+                if (unit.unresolved.remove(tid)) {
+                    claimed = true;
+                    if (found) unit.bitmapHeapVisible++;
+                }
         if (!claimed) throw new IOException("Bitmap heap verdict without its candidate: " + tid);
     }
 
@@ -385,6 +596,14 @@ final class AccessUnits {
         }
         unit.scan.current = null;
         listener.unitSettled(unit);
+        BitmapGroup group = unit.group;
+        if (group != null) {
+            group.settled++;
+            if (group.sealed && group.settled == group.members.size() && !group.reported) {
+                group.reported = true;
+                listener.groupSettled(group);
+            }
+        }
     }
 
     /** Called once all scans of the request have ended: before the next request or at EOF. */

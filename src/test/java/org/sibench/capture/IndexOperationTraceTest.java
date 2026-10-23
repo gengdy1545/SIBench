@@ -192,6 +192,58 @@ public class IndexOperationTraceTest {
         }
     }
 
+    /** Pinned searches and group members round-trip; malformed combinations never get written. */
+    @Test
+    public void pinnedSearchesAndGroupsRoundTripAndMalformedOnesFail() throws Exception {
+        Path file = Files.createTempFile("sibench-groups-", ".ops");
+        Files.delete(file);
+        Range point = Range.equal(IndexKey.ofInt(6));
+        Range interval = new Range(IndexKey.ofInt(1), true, IndexKey.ofInt(4), false, false, 0);
+        int intersect = IndexOperationTrace.INTERSECT_GROUP, union = IndexOperationTrace.UNION_GROUP;
+        try {
+            var written =
+                    List.of(
+                            IndexOperationTrace.search(1, 5, 1, point, IndexKey.ofInt(9), 3, 1, 0, 0, 0),
+                            IndexOperationTrace.search(2, 5, 1, interval, null, 3, 4, intersect, 0, 2),
+                            IndexOperationTrace.search(2, 5, 2, point, null, 3, 4, intersect, 1, 2),
+                            IndexOperationTrace.search(3, 5, 1, point, null, 3, 2, union, 0, 2),
+                            IndexOperationTrace.search(3, 5, 1, Range.equal(IndexKey.ofInt(8)), null, 3, 2, union, 1, 2));
+            try (var writer = new IndexOperationTrace.Writer(file)) {
+                for (Operation operation : written) writer.append(operation);
+            }
+            var decoded = new ArrayList<Operation>();
+            IndexOperationTrace.read(file, decoded::add);
+            assertEquals(written, decoded);
+            assertTrue(decoded.get(1).grouped());
+            assertFalse(decoded.get(0).grouped());
+        } finally {
+            Files.deleteIfExists(file);
+        }
+        for (Operation invalid :
+                List.of(
+                        // A pinned search names one secondary entry: a point, count 1, no PK index.
+                        IndexOperationTrace.search(1, 5, 1, interval, IndexKey.ofInt(9), 3, 1, 0, 0, 0),
+                        IndexOperationTrace.search(1, 5, 1, point, IndexKey.ofInt(9), 3, 2, 0, 0, 0),
+                        IndexOperationTrace.search(1, 5, 0, point, IndexKey.ofInt(9), 3, 1, 0, 0, 0),
+                        // A group has at least two members, a valid position, no limit or pin.
+                        IndexOperationTrace.search(2, 5, 1, interval, null, 3, 4, intersect, 0, 1),
+                        IndexOperationTrace.search(2, 5, 1, interval, null, 3, 4, intersect, 2, 2),
+                        IndexOperationTrace.search(2, 5, 1, interval, null, 3, 4, intersect | union, 0, 2),
+                        IndexOperationTrace.search(2, 5, 1, point, IndexKey.ofInt(9), 3, 1, union, 0, 2),
+                        IndexOperationTrace.search(
+                                2, 5, 1, new Range(null, false, null, false, false, 4), null, 3, 4, union, 0, 2),
+                        // Only group members carry positions.
+                        IndexOperationTrace.search(2, 5, 1, interval, null, 3, 4, 0, 0, 2))) {
+            Path target = Files.createTempFile("sibench-invalid-", ".ops");
+            Files.delete(target);
+            try (var writer = new IndexOperationTrace.Writer(target)) {
+                assertThrows(IOException.class, () -> writer.append(invalid));
+            } finally {
+                Files.deleteIfExists(target);
+            }
+        }
+    }
+
     @Test
     public void rejectsEveryFormatVersionExceptTheCurrentOne() throws Exception {
         Path file = Files.createTempFile("sibench-format-", ".ops");
@@ -203,7 +255,7 @@ public class IndexOperationTraceTest {
                                 1, 3, 0, Range.equal(IndexKey.ofInt(1)), 5, 1, 0));
             }
             byte[] bytes = Files.readAllBytes(file);
-            for (int version : new int[] {1, 3, 6, 7, 9}) {
+            for (int version : new int[] {1, 3, 6, 7, 8, 10}) {
                 java.nio.ByteBuffer.wrap(bytes)
                         .order(java.nio.ByteOrder.LITTLE_ENDIAN)
                         .putInt(4, version);

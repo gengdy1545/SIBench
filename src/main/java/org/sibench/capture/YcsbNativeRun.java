@@ -2,6 +2,8 @@ package org.sibench.capture;
 
 import static org.sibench.config.ConfigValues.*;
 
+import org.sibench.schema.SourceSchema;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -10,6 +12,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.regex.Pattern;
 
 /**
@@ -126,6 +129,7 @@ final class YcsbNativeRun {
         Path libraries = libraries(config);
         var nativeConfig = config.nativeConfig();
         Path self = NativeProcess.self();
+        var schema = SourceSchema.read(config.root(), config.document());
         long records = positive(nativeConfig, "recordcount"), requests = 0;
         var reports = new ArrayList<Map<String, Object>>();
         for (var entry : object(nativeConfig, "workloads").entrySet()) {
@@ -135,6 +139,7 @@ final class YcsbNativeRun {
             Map<String, Object> overrides =
                     entryConfig.containsKey("properties") ? object(entryConfig, "properties") : Map.of();
             var before = jdbcTraces(config);
+            var serversBefore = serverTraces(config);
             var command =
                     NativeProcess.java(
                             libraries,
@@ -165,14 +170,18 @@ final class YcsbNativeRun {
                 if (counts == null) continue;
                 for (var count : counts.entrySet()) {
                     if (!count.getKey().startsWith("Return=")) continue;
-                    returns.put(operation + "." + count.getKey().substring("Return=".length()), count.getValue());
-                    if (!count.getKey().equals("Return=OK"))
-                        throw new IOException(
-                                workload + ": " + operation + " returned " + count.getKey() + " x" + count.getValue());
+                    String status = count.getKey().substring("Return=".length());
+                    returns.put(operation + "." + status, count.getValue());
                 }
                 executed += counts.getOrDefault("Operations", 0L);
                 if (operation.equals("INSERT")) inserted = counts.getOrDefault("Return=OK", 0L);
             }
+            var failures = classifyReturns(workload, measured);
+            if (failures.invalidatesCapture())
+                throw new IOException(
+                        workload
+                                + ": YCSB reported a return status no pinned source behaviour explains: "
+                                + failures.report().get("occurrences"));
             var added = new ArrayList<>(jdbcTraces(config));
             added.removeAll(before);
             long clientRequests = 0;
@@ -187,6 +196,18 @@ final class YcsbNativeRun {
                                 + " requests in "
                                 + added.size()
                                 + " sessions");
+            var addedServers = new ArrayList<>(serverTraces(config));
+            addedServers.removeAll(serversBefore);
+            var declaration = declaration(config, workload);
+            var observed = observed(measured);
+            requireDeclared(workload, declaration, observed);
+            if (observed.get("total") != operations)
+                throw new IOException(
+                        workload
+                                + ": the run asked for "
+                                + operations
+                                + " operations but the client measured "
+                                + observed.get("total"));
             var report = new LinkedHashMap<String, Object>();
             report.put("workload", workload);
             report.put(
@@ -197,9 +218,17 @@ final class YcsbNativeRun {
             report.put("statement_operations", executed);
             report.put("jdbc_requests", clientRequests);
             report.put("returns", returns);
+            // Counts per category in the returns map the workload report already builds.
+            @SuppressWarnings("unchecked")
+            var categoryCounts = (Map<String, Object>) failures.report().get("counts");
+            for (var category : categoryCounts.entrySet())
+                returns.put("source_failures." + category.getKey(), category.getValue());
+            report.put("declared", declaration);
+            report.put("observed", observed);
+            report.put("read_modify_write", observed.get("read_modify_write"));
             if (!overrides.isEmpty()) report.put("native_property_overrides", overrides);
-            var composite = measured.get("READ-MODIFY-WRITE");
-            if (composite != null) report.put("read_modify_write", composite.getOrDefault("Operations", 0L));
+            report.put("source_failures", failures.report());
+            report.put("change_kinds", ChangeKinds.countTraces(schema, addedServers).describe());
             reports.add(report);
             requests += clientRequests;
             // Later workloads continue on the grown table: inserted keys are existing records.
@@ -229,10 +258,164 @@ final class YcsbNativeRun {
         return result;
     }
 
+    /**
+     * Records every return status the client did not report as OK. The client summary carries no
+     * SQLSTATE, so a status the pinned client does not define as an ordinary outcome stays
+     * unclassified and ends the capture.
+     */
+    static SourceFailurePolicy.Tally classifyReturns(
+            String workload, Map<String, Map<String, Long>> measured) {
+        var failures = new SourceFailurePolicy.Tally();
+        for (String operation : OPERATIONS) {
+            var counts = measured.get(operation);
+            if (counts == null) continue;
+            for (var count : counts.entrySet()) {
+                if (!count.getKey().startsWith("Return=")) continue;
+                String status = count.getKey().substring("Return=".length());
+                if (status.equals("OK")) continue;
+                long total = count.getValue();
+                for (long attempt = 1; attempt <= total; attempt++)
+                    failures.record(
+                            new SourceFailurePolicy.Evidence(
+                                    null,
+                                    null,
+                                    status,
+                                    null,
+                                    false,
+                                    false,
+                                    workload + ":" + operation,
+                                    null,
+                                    Math.toIntExact(attempt),
+                                    Math.toIntExact(total)));
+            }
+        }
+        return failures;
+    }
+
+    /**
+     * What the pinned workload file declares, so the artefact says which proportions, field updates
+     * and scan bound the client was asked for. Defaults are the ones {@code CoreWorkload} uses.
+     */
+    static Map<String, Object> declaration(NativeCaptureConfig config, String workload)
+            throws IOException {
+        return declaration(
+                config.source().resolve("workloads"),
+                positive(config.nativeConfig(), "fieldcount"),
+                workload);
+    }
+
+    static Map<String, Object> declaration(Path workloads, long fields, String workload)
+            throws IOException {
+        Path directory = workloads.toAbsolutePath().normalize();
+        Path file = directory.resolve(workload).normalize();
+        if (!file.startsWith(directory) || !Files.isRegularFile(file))
+            throw new IOException("Unknown YCSB workload: " + workload);
+        var properties = new Properties();
+        try (var input = Files.newBufferedReader(file)) {
+            properties.load(input);
+        }
+        var proportions = new LinkedHashMap<String, Double>();
+        for (String operation : List.of("read", "update", "insert", "scan", "read_modify_write"))
+            proportions.put(
+                    operation,
+                    Double.parseDouble(
+                            properties.getProperty(
+                                    operation.equals("read_modify_write")
+                                            ? "readmodifywriteproportion"
+                                            : operation + "proportion",
+                                    operation.equals("read") ? "0.95" : operation.equals("update") ? "0.05" : "0.0")));
+        boolean writeAllFields = Boolean.parseBoolean(properties.getProperty("writeallfields", "false"));
+        boolean readAllFields = Boolean.parseBoolean(properties.getProperty("readallfields", "true"));
+        var result = new LinkedHashMap<String, Object>();
+        result.put("workload_file", directory.relativize(file).toString());
+        result.put("workload_class", properties.getProperty("workload", "site.ycsb.workloads.CoreWorkload"));
+        result.put("proportions", proportions);
+        result.put("request_distribution", properties.getProperty("requestdistribution", "uniform"));
+        result.put("max_scan_length", Long.parseLong(properties.getProperty("maxscanlength", "1000")));
+        result.put("scan_length_distribution", properties.getProperty("scanlengthdistribution", "uniform"));
+        result.put("fields_per_record", fields);
+        result.put("read_all_fields", readAllFields);
+        result.put("fields_written_per_update", writeAllFields ? fields : 1L);
+        // CoreWorkload.doTransactionReadModifyWrite issues a separate read and update with no
+        // surrounding transaction, so a concurrent writer may sit between them.
+        result.put("read_modify_write_atomic", false);
+        return result;
+    }
+
+    /**
+     * The operations the client chose, as the pinned measurement names them. {@code DBWrapper}
+     * measures every db.read / db.update, so a READ-MODIFY-WRITE appears once under its own name
+     * and again under READ and UPDATE.
+     */
+    static Map<String, Long> observed(Map<String, Map<String, Long>> measured) {
+        long modify = measured.getOrDefault("READ-MODIFY-WRITE", Map.of()).getOrDefault("Operations", 0L);
+        long read = measured.getOrDefault("READ", Map.of()).getOrDefault("Operations", 0L) - modify;
+        long update = measured.getOrDefault("UPDATE", Map.of()).getOrDefault("Operations", 0L) - modify;
+        long insert = measured.getOrDefault("INSERT", Map.of()).getOrDefault("Operations", 0L);
+        long scan = measured.getOrDefault("SCAN", Map.of()).getOrDefault("Operations", 0L);
+        var result = new LinkedHashMap<String, Long>();
+        result.put("read", read);
+        result.put("update", update);
+        result.put("insert", insert);
+        result.put("scan", scan);
+        result.put("read_modify_write", modify);
+        result.put("total", read + update + insert + scan + modify);
+        return result;
+    }
+
+    /**
+     * The pinned {@code DiscreteGenerator} samples proportions, so observed counts are compared
+     * against the declared ones with a sampling tolerance; a declared zero must stay zero.
+     */
+    static void requireDeclared(
+            String workload, Map<String, Object> declaration, Map<String, Long> observed)
+            throws IOException {
+        @SuppressWarnings("unchecked")
+        var proportions = (Map<String, Double>) declaration.get("proportions");
+        long total = observed.get("total");
+        if (total == 0) throw new IOException(workload + ": the client performed no operation");
+        for (var entry : proportions.entrySet()) {
+            double declared = entry.getValue();
+            double actual = observed.get(entry.getKey()) / (double) total;
+            if (declared == 0.0) {
+                if (observed.get(entry.getKey()) != 0L)
+                    throw new IOException(
+                            workload
+                                    + ": declares no "
+                                    + entry.getKey()
+                                    + " but the client performed "
+                                    + observed.get(entry.getKey()));
+                continue;
+            }
+            double tolerance = Math.max(0.02, 8 * Math.sqrt(declared * (1 - declared) / total));
+            if (Math.abs(actual - declared) > tolerance)
+                throw new IOException(
+                        workload
+                                + ": declares a "
+                                + entry.getKey()
+                                + " proportion of "
+                                + declared
+                                + " but the client performed "
+                                + observed.get(entry.getKey())
+                                + " of "
+                                + total
+                                + " operations ("
+                                + actual
+                                + ")");
+        }
+    }
+
     private static List<Path> jdbcTraces(NativeCaptureConfig config) throws IOException {
         if (!Files.isDirectory(config.raw())) return List.of();
         try (var paths = Files.list(config.raw())) {
             return paths.filter(p -> p.getFileName().toString().startsWith("jdbc-")).sorted().toList();
+        }
+    }
+
+    private static List<Path> serverTraces(NativeCaptureConfig config) throws IOException {
+        if (!Files.isDirectory(config.raw())) return List.of();
+        try (var paths = Files.list(config.raw())) {
+            return paths.filter(p -> p.getFileName().toString().startsWith("pg-")).sorted().toList();
         }
     }
 

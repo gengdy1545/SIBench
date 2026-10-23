@@ -23,6 +23,8 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     private int transactionOperations;
     private Operation lastMutation;
     private final List<Operation> expansion = new ArrayList<>();
+    /** The members of the open search group, sent or filtered together once complete. */
+    private final List<Operation> searchGroup = new ArrayList<>();
     private Thread owner;
     private boolean failed;
 
@@ -95,16 +97,64 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         else if (operation.kind() != IndexOperationTrace.SEARCH
                 && (operation.transactionId() != 0 || operation.mutationOrdinal() != 0))
             throw new IOException("Unexpected source transaction metadata");
+        if (!searchGroup.isEmpty() && !operation.grouped())
+            throw new IOException("Search group interrupted before its last member");
         if (operation.kind() == IndexOperationTrace.SEARCH) validateSearch(operation);
         else if (operation.readTimestamp() != -1)
             throw new IOException("ReadTimestamp is only valid on searches");
+        if (operation.grouped()) {
+            groupMember(operation);
+            return;
+        }
         if (!includes(operation)) {
             filtered++;
             return;
         }
+        deliver(operation);
+    }
+
+    private void deliver(Operation operation) throws IOException {
         if (activeTransaction != 0) pending.add(operation);
         else sendOperation(operation);
     }
+
+    /**
+     * A group is one source access: its members arrive consecutively with one source event, read
+     * point and count, and the group is sent whole or, when a member's index is filtered, not at
+     * all, so a filtered secondary never leaves a partial intersection behind.
+     */
+    private void groupMember(Operation o) throws IOException {
+        if (o.expansionPosition() != searchGroup.size())
+            throw new IOException("Search group member out of order");
+        if (!searchGroup.isEmpty()) {
+            Operation first = searchGroup.get(0);
+            if (o.sourceEvent() != first.sourceEvent()
+                    || o.table() != first.table()
+                    || o.workUnitId() != first.workUnitId()
+                    || o.readTimestamp() != first.readTimestamp()
+                    || o.expectedCount() != first.expectedCount()
+                    || o.expansionSize() != first.expansionSize()
+                    || o.transactionId() != first.transactionId()
+                    || o.mutationOrdinal() != first.mutationOrdinal()
+                    || (o.flags() & GROUP_SHARED) != (first.flags() & GROUP_SHARED))
+                throw new IOException("Inconsistent search group member");
+        }
+        searchGroup.add(o);
+        if (searchGroup.size() < o.expansionSize()) return;
+        boolean included = true;
+        for (Operation member : searchGroup) included &= includes(member);
+        for (Operation member : searchGroup) {
+            if (included) deliver(member);
+            else filtered++;
+        }
+        searchGroup.clear();
+    }
+
+    private static final int GROUP_SHARED =
+            IndexOperationTrace.INTERSECT_GROUP
+                    | IndexOperationTrace.UNION_GROUP
+                    | IndexOperationTrace.SNAPSHOT_SEARCH
+                    | IndexOperationTrace.TRANSACTION_LOCAL_SEARCH;
 
     private void validateSearch(Operation o) throws IOException {
         boolean local = (o.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0;
@@ -122,10 +172,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         if (local) {
             if (lastOrdinal == 0
                     || o.readTimestamp() != activeVersion
-                    || (o.flags()
-                                    & (IndexOperationTrace.SNAPSHOT_SEARCH
-                                            | IndexOperationTrace.DERIVED_SEARCH))
-                            != 0)
+                    || (o.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0)
                 throw new IOException("Invalid transaction-local read point");
         } else if (sourceTransactions
                 && (o.readTimestamp() > lastVersion
@@ -229,6 +276,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
                     || o.expectedCount() != lastOrdinal)
                 throw new IOException("Source commit or mutation count mismatch");
             requireCompleteExpansion();
+            if (!searchGroup.isEmpty()) throw new IOException("Search group crosses its commit");
             if (dispatchMode.equals("transaction") && !pending.isEmpty()) groups++;
             for (Operation operation : pending) sendOperation(operation);
             pending.clear();
@@ -241,6 +289,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
 
     public void finish() throws IOException {
         checkThread();
+        if (!searchGroup.isEmpty()) throw new IOException("Truncated search group");
         if (activeTransaction != 0)
             throw new IOException("Truncated source transaction without commit");
         dispatcher.drain();

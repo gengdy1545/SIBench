@@ -99,7 +99,8 @@ public final class RequestCaptureAudit {
             throw new IOException("Missing client request completion");
         Set<String> started = new HashSet<>(),
                 finished = new HashSet<>(),
-                executed = new HashSet<>();
+                executed = new HashSet<>(),
+                writeRequests = new HashSet<>();
         Map<String, List<JsonArray>> serverResults = new HashMap<>();
         long commits = 0, aborts = 0, indexEvents = 0, unmatched = 0;
         boolean serverTransactionOpen = false;
@@ -146,6 +147,9 @@ public final class RequestCaptureAudit {
                     commits++;
                     serverCommitRequests.merge(app, 1L, Long::sum);
                     serverTransactionOpen = false;
+                } else if (event.equals("row_change")
+                        || event.equals("index_insert_attempt")) {
+                    writeRequests.add(app);
                 } else if (event.equals("transaction_abort")) {
                     aborts++;
                     abortRequests.merge(app, 1L, Long::sum);
@@ -170,15 +174,42 @@ public final class RequestCaptureAudit {
                         || event.equals("index_insert_attempt")) indexEvents++;
             }
         }
+        // A request that is still running when a connection closes has no ExecutorEnd: the
+        // executor cleanup event is missing, while the execution itself returned. Reported, not
+        // tolerated away, and it never excuses a request whose execution did not return.
+        var withoutExecutorEnd = new ArrayList<String>(started);
+        withoutExecutorEnd.removeAll(finished);
+        withoutExecutorEnd.sort(null);
+        // A read-only transaction the client commits can end at the server as an abort instead:
+        // PostgreSQL never assigned it an XID, so nothing is written and the abort discards
+        // nothing. Anything else - a request that changed rows, or one whose transaction ended
+        // neither in a commit nor in an abort - is a lost server commit and fails the audit.
+        var abortedCommits = new LinkedHashMap<String, Long>();
+        for (var entry : clientCommitRequests.entrySet()) {
+            long server = serverCommitRequests.getOrDefault(entry.getKey(), 0L);
+            if (server >= entry.getValue()) continue;
+            if (writeRequests.contains(entry.getKey())
+                    || abortRequests.getOrDefault(entry.getKey(), 0L) == 0)
+                throw new IOException(
+                        "Client commit has no server commit, and the request neither changed rows"
+                                + " nor ended in a server abort: "
+                                + entry.getKey());
+            abortedCommits.put(entry.getKey(), entry.getValue() - server);
+        }
+        long noop = abortedCommits.values().stream().mapToLong(Long::longValue).sum();
         if (unmatched != 0
                 || !started.equals(requests.keySet())
                 || !executed.equals(requests.keySet())
-                || commits != clientCommits
+                || commits + noop != clientCommits
                 || serverTransactionOpen
                 || aborts < clientRollbacks
                 || aborts > clientRollbacks + 1)
             throw new IOException("Incomplete client/server event association");
-        if (!clientCommitRequests.equals(serverCommitRequests))
+        var expectedCommits = new LinkedHashMap<>(clientCommitRequests);
+        for (var entry : abortedCommits.entrySet())
+            expectedCommits.merge(entry.getKey(), -entry.getValue(), Long::sum);
+        expectedCommits.values().removeIf(v -> v == 0);
+        if (!expectedCommits.equals(serverCommitRequests))
             throw new IOException("Commit request identities differ");
         Map<String, Long> remainingAborts = new HashMap<>(abortRequests);
         for (var rollback : rollbackRequests.entrySet()) {
@@ -229,6 +260,9 @@ public final class RequestCaptureAudit {
             }
         }
         var report = new LinkedHashMap<String, Object>();
+        // The two tolerances, named so a run's report shows them instead of hiding them.
+        report.put("requests_without_executor_end", withoutExecutorEnd);
+        report.put("client_commits_ended_by_server_abort", abortedCommits);
         report.putAll(
                 Map.of(
                         "status",

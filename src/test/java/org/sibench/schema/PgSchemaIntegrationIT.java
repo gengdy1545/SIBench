@@ -6,7 +6,6 @@ import com.google.gson.JsonParser;
 
 import org.junit.Test;
 import org.sibench.capture.CaptureConfig;
-import org.sibench.capture.HybenchNativeRun;
 import org.sibench.capture.PgBaselineExport;
 import org.sibench.cli.Sibench;
 import org.sibench.config.ConfigValues;
@@ -334,7 +333,9 @@ public class PgSchemaIntegrationIT {
         assertFalse("Preflight must precede baseline directory creation", Files.exists(output));
         assertThrows(
                 PgSchemaCheck.Mismatch.class,
-                () -> HybenchNativeRun.main(new String[] {root.toString(), profile.toString()}));
+                () ->
+                        org.sibench.capture.NativeCapture.main(
+                                new String[] {"run", root.toString(), profile.toString()}));
         var manifest =
                 JsonParser.parseString(Files.readString(resolved.raw().resolve("capture-run.json")))
                         .getAsJsonObject();

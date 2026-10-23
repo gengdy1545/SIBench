@@ -10,6 +10,8 @@ native:
   secondary: false
   create-secondary: true
   auto-inc: true
+  # Runtime switch the pinned scripts guard begin()/commit() with.
+  skip-trx: false
   rand-seed: 20261019
   rand-type: uniform
   threads: 1

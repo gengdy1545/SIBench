@@ -12,13 +12,6 @@ import java.util.*;
 public final class ReplayMatrixValidation {
     private ReplayMatrixValidation() {}
 
-    public static void main(String[] args) throws Exception {
-        if (args.length != 2)
-            throw new IllegalArgumentException(
-                    "ReplayMatrixValidation NORMALIZED REPORT_DIRECTORY");
-        validate(Path.of(args[0]), Path.of(args[1]));
-    }
-
     public static void validate(Path normalized, Path output) throws IOException {
         Files.createDirectory(output);
         Files.writeString(output.resolve("INCOMPLETE"), "Replay matrix not verified\n");

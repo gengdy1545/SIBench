@@ -71,6 +71,112 @@ public class NativeClientParsingTest {
     }
 
     @Test
+    public void readsTheWorkloadThePinnedFileDeclares() throws Exception {
+        Path workloads = Path.of("benchmark/YCSB/workloads");
+        var a = YcsbNativeRun.declaration(workloads, 10, "workloada");
+        assertEquals("workloada", a.get("workload_file"));
+        @SuppressWarnings("unchecked")
+        var proportions = (Map<String, Double>) a.get("proportions");
+        assertEquals(0.5, proportions.get("read"), 0.0);
+        assertEquals(0.5, proportions.get("update"), 0.0);
+        assertEquals(0.0, proportions.get("insert"), 0.0);
+        assertEquals(0.0, proportions.get("scan"), 0.0);
+        assertEquals(0.0, proportions.get("read_modify_write"), 0.0);
+        assertEquals("zipfian", a.get("request_distribution"));
+        assertEquals(10L, a.get("fields_per_record"));
+        assertEquals(1L, a.get("fields_written_per_update"));
+        assertEquals(Boolean.TRUE, a.get("read_all_fields"));
+        // The scan bound of workload E, and the non-atomic read-modify-write of workload F.
+        var e = YcsbNativeRun.declaration(workloads, 10, "workloade");
+        assertEquals(100L, e.get("max_scan_length"));
+        assertEquals("uniform", e.get("scan_length_distribution"));
+        assertEquals(0.95, ((Map<String, Double>) e.get("proportions")).get("scan"), 0.0);
+        assertEquals(0.05, ((Map<String, Double>) e.get("proportions")).get("insert"), 0.0);
+        var f = YcsbNativeRun.declaration(workloads, 10, "workloadf");
+        assertEquals(Boolean.FALSE, f.get("read_modify_write_atomic"));
+        assertEquals(0.5, ((Map<String, Double>) f.get("proportions")).get("read_modify_write"), 0.0);
+        assertEquals("latest", YcsbNativeRun.declaration(workloads, 10, "workloadd")
+                .get("request_distribution"));
+        assertTrue(
+                assertThrows(
+                                IOException.class,
+                                () -> YcsbNativeRun.declaration(workloads, 10, "workloadz"))
+                        .getMessage()
+                        .contains("Unknown YCSB workload"));
+        assertTrue(
+                assertThrows(
+                                IOException.class,
+                                () -> YcsbNativeRun.declaration(workloads, 10, "../workloada"))
+                        .getMessage()
+                        .contains("Unknown YCSB workload"));
+    }
+
+    @Test
+    public void observedOperationsSeparateTheReadAndUpdateOfAReadModifyWrite() {
+        // DBWrapper measures every db.read / db.update, so workload F counts each RMW twice.
+        var observed =
+                YcsbNativeRun.observed(
+                        YcsbNativeRun.parse(
+                                """
+                                [READ], Operations, 150
+                                [UPDATE], Operations, 50
+                                [READ-MODIFY-WRITE], Operations, 50
+                                """));
+        assertEquals(100L, (long) observed.get("read"));
+        assertEquals(0L, (long) observed.get("update"));
+        assertEquals(50L, (long) observed.get("read_modify_write"));
+        assertEquals(150L, (long) observed.get("total"));
+        assertEquals(
+                200L,
+                (long)
+                        YcsbNativeRun.observed(
+                                        YcsbNativeRun.parse(
+                                                """
+                                                [SCAN], Operations, 190
+                                                [INSERT], Operations, 10
+                                                """))
+                                .get("total"));
+    }
+
+    @Test
+    public void theDeclaredProportionsAreCrossCheckedAgainstTheServerObservedOnes() throws Exception {
+        Path workloads = Path.of("benchmark/YCSB/workloads");
+        var declared = YcsbNativeRun.declaration(workloads, 10, "workloada");
+        YcsbNativeRun.requireDeclared(
+                "workloada",
+                declared,
+                Map.of("read", 300L, "update", 300L, "insert", 0L, "scan", 0L,
+                        "read_modify_write", 0L, "total", 600L));
+        // Workload C reads only: an update would contradict the pinned file.
+        var c = YcsbNativeRun.declaration(workloads, 10, "workloadc");
+        assertTrue(
+                assertThrows(
+                                IOException.class,
+                                () ->
+                                        YcsbNativeRun.requireDeclared(
+                                                "workloadc",
+                                                c,
+                                                Map.of("read", 999L, "update", 1L, "insert", 0L,
+                                                        "scan", 0L, "read_modify_write", 0L,
+                                                        "total", 1000L)))
+                        .getMessage()
+                        .contains("declares no update"));
+        // Sampling is loose, but not this loose.
+        assertTrue(
+                assertThrows(
+                                IOException.class,
+                                () ->
+                                        YcsbNativeRun.requireDeclared(
+                                                "workloada",
+                                                declared,
+                                                Map.of("read", 550L, "update", 50L, "insert", 0L,
+                                                        "scan", 0L, "read_modify_write", 0L,
+                                                        "total", 600L)))
+                        .getMessage()
+                        .contains("declares a read proportion"));
+    }
+
+    @Test
     public void buildCopyMustMatchThePinnedSourceByteForByte() throws Exception {
         Path pinned = folder.newFolder("pinned").toPath(), build = folder.newFolder("build").toPath();
         Files.createDirectories(pinned.resolve("src/lua"));

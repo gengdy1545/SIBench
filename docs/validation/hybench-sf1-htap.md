@@ -1,8 +1,10 @@
 # HyBench SF1 原生 HTAP 验证
 
-日期：2026-10-20。原生 `runHTAP` 的多会话采集、请求配对、八表状态审计与原始事件打包。该采集早于请求序号、`query_id` 与当前运行清单格式，当前代码不再读取其原始追踪；并发快照投影实现后按当前插桩重新采集。单会话 v8 Trace 见 [TP 子集 v8 验证](hybench-sf1-tp-trace.md)。
+原生 `runHTAP`（AP → TP → 并发 AT/IQ）的多会话采集，按 PostgreSQL 事务完成位置编译为 v9 规范 Trace，参考回放与独立 oracle 通过。这是正确性与可复现性验证，不是性能结论。
 
-## 环境与运行
+## 采集
+
+日期：2026-10-23。准备步骤（克隆静止库 `sibench_sf1_baseline_check`、安装上游二级索引与行变化触发器）由 `scripts/native-capture.sh` 统一编排，产物在 `results/poc/hybench-htap-sf1/`。
 
 | 项目 | 生效值 |
 | --- | --- |
@@ -11,92 +13,67 @@
 | 模式 | 原生 runAP() → runTP() → runXP(0)，不调用 freshness 路径 |
 | 客户端 | AP=1、TP=1；XP 的 AT=1 与 IQ=1 并发 |
 | 时长 | AP 1 分钟、TP 2 分钟、XP 1 分钟；原生计时器与退出规则 |
-| 比例 | 上游 pg.props 的 AT 比例、TPClient 的默认 TP 比例；未设置 TP 子集权重 |
-| 数据库 | 127.0.0.1:55433 / sibench_htap_sf1_capture |
+| 比例 | 上游 pg.props 的 AT 比例、TPClient 的默认 TP 比例，不覆盖 |
 | 隔离 | Read Committed；UTC；禁用 PG 并行查询、并行建索引、autovacuum |
 | 行变化触发器 | customer/company/savingaccount/checkingaccount/transfer/checking/loanapps/loantrans |
-| 文件布局 | 256 MiB 目标；行组最多 1,048,576 行；Zstd level 3 |
 
-Baseline 复用原生 SF1 CSV 输入，在独立、静止的原生 PG Load 上核对全部 8,706,000 行和身份。本轮数据库由该静止数据库 `sibench_sf1_baseline_check` 克隆，安装完整上游 `create_index_pg.sql` 的 13 个二级索引、8 个已有主键及 4 个自增序列。AP/TP/XP 之间不重载数据；XP 查询同一数据库上的 TP 和 AT 更新。
+AP 按完整查询轮结束，实际耗时可能超过配置时间；TP / XP 使用原生退出规则。INSERT / UPDATE / 预期业务回滚完全由原生事务选择，未手工填齐覆盖；`runHTAP` 不调用 freshness DELETE 路径，不宣称 DELETE 覆盖。
 
-AP 按完整查询轮结束，因此实际耗时可能超过配置时间。TP/XP 使用原生退出规则，当前方法返回和连接清理也会延长耗时。INSERT/UPDATE/预期业务回滚完全由原生事务选择，未手工填齐覆盖。`runHTAP` 不调用已被注释的 freshness DELETE 路径，不宣称 DELETE 或指定历史点 SQL 覆盖。
+| 阶段 | 耗时 |
+| --- | ---: |
+| prepare（克隆 8,706,000 行库、13 个二级索引、触发器） | 24 s |
+| export（Baseline 导出与独立核验） | 401 s |
+| run（AP 75 s → TP 121 s → 并发 AT/IQ 72 s） | 616 s |
+| audit-rows | 721 s |
+| access-ledger | 320 s |
+| compile-trace | 308 s |
 
-## 本轮采集
+| 结果 | 数值 |
+| --- | ---: |
+| 会话 | 4（AP、TP、XP-AT、XP-IQ），`session_order=concurrent` |
+| 请求 / 已提交事务 / 回滚 | 17,728 / 425 / 24 |
+| 业务变更 | INSERT 5,565、UPDATE 11,390 |
+| 访问单元投影 | 0 拒绝；带 limit 的主键等值 3,198,843、等值 12,667、二级提前停止 21、BitmapAnd 交集组 13、数组并集 3 |
+| 查询（访问 / 记录） | 3,211,564 / 3,211,610 |
+| 快照交叉验证 | 3,211,577 个单元全部校验，0 个快照不可用，0 个冲突 |
+| 按快照读较早版本的查询 | 601,609 |
+| 事务内写后查询 | 11,065 |
 
-原生开始：2026-10-20 15:24:38 +08:00。执行阶段总计 258.28 秒；包括完成审计在内于 15:32:54 发布 `complete`。
-
-| 阶段 | 实际耗时（秒） | 方法调用 | SQL 请求 | 结果消费行 | 提交 / 显式回滚 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| AP | 66.102 | AP 39，13 种各 3 次 | 42 | 3 | 0 / 0 |
-| TP | 123.645 | TP 156，18 种均非零 | 5,474 | 1,822 | 156 / 0 |
-| XP-AT | XP 合计 68.536 | AT 74，6 种均非零 | 298 | 160 | 61 / 13 |
-| XP-IQ | 与 AT 并发 | IQ 23，5 种非零 | 23 | 0 | 0 / 0 |
-| 总计 | 258.282 | 不混合不同方法口径 | 5,837 | 1,985 | 217 / 13 |
-
-TP1–TP18 调用数：`5/5/4/11/8/3/5/3/12/11/10/12/5/8/13/7/13/21`。
-
-AT1–AT6：`27/10/15/14/7/1`；IQ1–IQ6：`4/4/4/4/0/7`。**IQ5 已启用，但本次短跑没有被原生随机抽中**；因此不宣称全部 IQ 方法已实跑验证。保留真实随机结果，不补造调用或拼接其他运行。
-
-四会话配对审计通过，未关联服务端事件 0，索引相关事件 35,759,735。13 次显式业务回滚与服务端 abort 对应；AP/IQ 连接关闭各产生一次只读 abort。5,837 个请求均有服务端 `executor_run_end`，其中 5,835 个有 `executor_end`：后者是执行器清理事件，原生 AP/IQ 的最后请求在关闭连接时没有此事件，不改变原生提交行为。
-
-## 验证边界
-
-同次请求核对包括 SQL 身份、客户端实际消费行、执行器返回、提交及回滚/关闭身份，不为观察补跑查询。多会话输入的完整清单及每对 JDBC/PG 文件 SHA256 在消费前复核。`REAL`、timestamp、CHAR 等按实际 JDBC 类型规范化比较，不引入任意数值容差。
-
-八表状态核验使用已验证 Baseline 和提交后的 before/after 行变化链，丢弃 abort 的修改，逐行比较最终 PG 状态。按键的变化因果链不推定跨会话全局提交顺序。本次原生序列生成的新增 ID 位于基线 ID 之后；统一审计也支持新增键与基线交错，当前契约与重验见 [统一行状态审计](row-state-audit.md)。
-
-八表全量核验通过，最终 8,707,767 行；共 5,408 次提交行修改、3,706 个修改主键，未修改的基线行也全部核对。13 次业务回滚在写入前发生，本轮丢弃的回滚行修改数为 0。
+八表状态审计（Baseline 与 PG 最终状态逐行对账）：
 
 | 表 | 基线行数 | 最终行数 | 提交行修改 | 修改主键数 |
 | --- | ---: | ---: | ---: | ---: |
-| customer | 300,000 | 300,000 | 12 | 12 |
-| company | 2,000 | 2,000 | 1 | 1 |
-| savingaccount | 302,000 | 302,000 | 3,507 | 1,820 |
-| checkingaccount | 302,000 | 302,000 | 75 | 75 |
-| transfer | 6,000,000 | 6,001,728 | 1,728 | 1,728 |
-| checking | 600,000 | 600,020 | 20 | 20 |
-| loanapps | 600,000 | 600,012 | 32 | 32 |
-| loantrans | 600,000 | 600,007 | 33 | 18 |
+| customer | 300,000 | 300,000 | 23 | 23 |
+| company | 2,000 | 2,000 | 6 | 6 |
+| savingaccount | 302,000 | 302,000 | 11,088 | 5,688 |
+| checkingaccount | 302,000 | 302,000 | 185 | 185 |
+| transfer | 6,000,000 | 6,005,482 | 5,482 | 5,482 |
+| checking | 600,000 | 600,051 | 51 | 51 |
+| loanapps | 600,000 | 600,020 | 56 | 56 |
+| loantrans | 600,000 | 600,012 | 64 | 45 |
 
-`CapturePoc pack` 保存全量 PG 原始 JSON 及 CRC32C 的 64 字节 access 记录。文件名排序只保证各文件内顺序，不代表全局事务排序。**这不是 HTAP KV 回放**：并发快照与跨会话顺序尚未实现，编译器拒绝并发会话。
+三种访问组形态都在原生负载里出现并通过：二级索引被提前停止的扫描（`order by timestamp desc limit` 一类与关联查询的半连接）投影为已读完的前段区间加边界值上被返回行的钉住点查；transfer 上的 BitmapAnd 投影为交集组，组期望数是堆判定可见的交集行；`= ANY` 数组投影为并集组。
 
-打包验证通过：51,111,329 条原始事件、12,479 个 CRC32C 块；`access.bin` 为 3,271,274,820 字节，完整 `payload.jsonl` 为 16,832,115,136 字节。事件计数与状态审计完全一致，解码数量与 CRC 全部通过；SHA256 分别为 `5492eccc988b072caa2945ab6cd9bc1b6cc1fb23f71dd406e6de2847cd041a14`、`c0a8faef1f28464d31b465dde9f62bed11f6e768ae5737eee8d1831a5fba72a8`。
+客户端 / 服务端关联审计记录了两类原生现象，均不改变提交结果：AP 与 IQ 会话最后一个请求在关闭连接时没有 `executor_end`；XP-AT 会话有 2 次客户端 commit 发生在事务已以 abort 结束之后、且该请求未改动任何行（`client_commits_ended_by_server_abort`）。
 
-原始量、短跑时间和解码速度均不是 Index Service 性能指标；本次未接入真实 Backend，也未做 SF1000、自然 Rewrite/GC 或长时回放。
+| 回放 / oracle | 结果 |
+| --- | --- |
+| 参考回放 1 / 64 / 128 client、transaction 输入模式，locator 与 RowID 两种 value | 全部 passed；每种 value 校验 3,211,585 个查询，其中 601,611 个按快照读较早版本；发送 3,256,723 个操作（编译 3,257,573 减 425 个事务的 850 条控制记录） |
+| 独立 Parquet oracle | passed |
+| 同一输入重复编译 | 全部产物逐字节一致，记录见 `results/poc/native-trace-20261022/recompile-20261023.log` |
 
-## 入口
-
-配置：[hybench_sf1.yaml](../../config/hybench_sf1.yaml)。PG/数据必须预先准备，`export`/`run` 不自动启动服务。新采集需新数据库和新 artifacts/raw 目录，不覆盖或续写失败运行。
+复现（需要静止的已验证 SF1 库 `sibench_sf1_baseline_check` 和原生 `Data_1x`，路径见 [hybench_sf1.yaml](../../config/hybench_sf1.yaml)）：
 
 ```bash
-export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+make -C src/main/native/postgres install extension   # 头文件结构变化后先 make -C build/benchmarks/postgresql-14.24 clean
 mvn package
-make -C src/main/native/postgres install extension
-java -cp build/sibench/sibench.jar org.sibench.capture.CapturePoc check "$PWD" config/hybench_sf1.yaml
+scripts/native-capture.sh config/hybench_sf1.yaml
+java -Xmx24g -jar build/sibench/sibench.jar replay config/index_replay_128clients.yaml results/poc/hybench-htap-sf1/trace REPORT
+java -Xmx24g -jar build/sibench/sibench.jar validate-snapshots config/index_replay.yaml results/poc/hybench-htap-sf1/trace REPORT
 ```
 
-PG 启动时指定与配置相同的 `SIBENCH_CAPTURE_DIR`；安装 `install-row-capture.sql` 时通过 psql `capture_library` 指向 `build/services/postgresql-capture/row_capture.so`。`Data_1x` 必须包含原生 CSV 和风控辅助序列化文件；本次工作目录为 `results/poc/hybench-htap-sf1/native/`，其中数据指向既有原生 SF1 输入。运行中的 JAR 使用不可变副本，不覆盖它进行重新构建。
+边界：短跑负载（AP 1 分钟、TP 2 分钟、XP 1 分钟），不是容量或性能结论；oracle 的二级谓词仍为每索引最多 64 个等值抽样；全局丢事件仍由客户端 / 服务端配对审计与 `check-capture-completeness` 旁证，未做故障注入。
 
-```bash
-java -Xmx3g -cp "$ROOT/build/sibench/sibench.jar:$ROOT/build/benchmarks/HyBench-2024/target/classes:$ROOT/build/benchmarks/HyBench-2024/lib/*" \
-  org.sibench.capture.CapturePoc run "$ROOT" config/hybench_sf1.yaml
-java -Xmx3g -cp "$ROOT/build/sibench/sibench.jar" \
-  org.sibench.capture.CapturePoc audit "$ROOT" config/hybench_sf1.yaml "$ROOT/results/poc/hybench-htap-sf1/state-audit-check.json"
-java -Xmx3g -cp "$ROOT/build/sibench/sibench.jar" \
-  org.sibench.capture.CapturePoc pack "$ROOT" config/hybench_sf1.yaml "$ROOT/results/poc/hybench-htap-sf1/trace-check"
-```
+## 产物迁移记录
 
-`ROOT` 指向仓库绝对路径，`run` 在含 `Data_1x` 的目录执行。报告必须为新文件，打包目录必须不存在。
-
-## 证据
-
-本轮证据保存在 `results/poc/hybench-htap-sf1/`：
-
-- `baseline/verified-manifest.json`：八表独立基线核对及摘要。
-- `native/capture-resolved.props`、`native/sibench-htap-runner.jar`：本轮属性和不可变运行 JAR。
-- `raw/capture-run.json`：阶段方法计数、四会话配对审计及文件 SHA256；PG/JDBC 原始文件同目录。
-- `native/sibench-audit.jar`：增加完整清单和精确事务身份检查的离线审计 JAR。
-- `state-audit.json`：严格输入复核、按阶段访问索引、事件计数和八表逐行状态核对通过。
-- `trace/manifest.json`、`trace/access.bin`、`trace/payload.jsonl`：全部原始事件打包、摘要与 CRC 验证通过。
-
-验证结束后停止本次启动的专用 PG，恢复原先停止状态；所有数据库和本地证据保留。重新执行 `audit` 前需启动该服务，`check` 和已完成产物的离线检查不需要 PG。
+- 2026-10-22：为按当前插桩重新采集让出目录名，`results/poc/hybench-htap-sf1`（2026-10-20）移为 `results/poc/native-trace-20261022/superseded/hybench-htap-sf1-20261020`。同日未完成运行分别移为 `.../hybench-htap-sf1-20261022-nocounter`（abort 记录缺少完成计数器）、`.../hybench-htap-sf1-20261022-audit`（客户端/服务端关联审计失败）、`.../hybench-htap-sf1-20261022-stalebinary`（PG 未重建）和 `.../hybench-htap-sf1-20261022-v8`（v8 投影止步于 50 个拒绝单元）。2026-10-23 的 `.../hybench-htap-sf1-20261023-racycounter` 用锁外读取的计数器采集，写事务位置可能有竞态，已作废。仅改名，内容未改写。

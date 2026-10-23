@@ -10,7 +10,7 @@ import java.nio.file.Path;
 import java.util.Map;
 import java.util.Set;
 
-/** Configuration of a small native capture of a client that is not HyBench (YCSB, sysbench). */
+/** Configuration of a native capture whose client is a separate process (YCSB, sysbench). */
 public record NativeCaptureConfig(
         Path root,
         String benchmark,
@@ -34,7 +34,16 @@ public record NativeCaptureConfig(
         // Verifies the pinned source commit and a clean worktree.
         SourceSchema.read(root, doc);
         var nativeConfig = object(doc, "native");
-        require(positive(nativeConfig, "threads") == 1, "Only single-session capture is implemented");
+        require(
+                positive(nativeConfig, "threads") == 1,
+                "Native clients run one session each: their completion audit pairs one client"
+                        + " process with one backend, and several threads need concurrent"
+                        + " session orchestration first");
+        // sysbench decides BEGIN / COMMIT at run time through --skip-trx; the run must state it.
+        if (nativeConfig.containsKey("skip-trx"))
+            require(
+                    nativeConfig.get("skip-trx") instanceof Boolean,
+                    "skip-trx must be a boolean: the control-statement count is derived from it");
         // Loading is not captured, so it may use more threads than the captured run.
         for (String key : new String[] {"load_threads", "prepare_threads"})
             if (nativeConfig.containsKey(key))

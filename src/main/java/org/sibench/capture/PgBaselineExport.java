@@ -22,13 +22,6 @@ import java.util.*;
 public final class PgBaselineExport {
     private PgBaselineExport() {}
 
-    public static void main(String[] args) throws Exception {
-        if (args.length != 3 || !args[0].equals("--config"))
-            throw new IllegalArgumentException("PgBaselineExport --config ROOT CONFIG");
-        CaptureConfig config = CaptureConfig.read(Path.of(args[1]), Path.of(args[2]));
-        export(config.jdbc(), config.layout().output(), config.layout());
-    }
-
     public static void export(String jdbc, Path output, GenerationConfig config) throws Exception {
         Map<String, Object> document = config.document();
         var source = SourceSchema.read(config.root(), document);

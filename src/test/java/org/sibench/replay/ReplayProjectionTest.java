@@ -14,6 +14,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class ReplayProjectionTest {
+    /** A search of one source transaction, at its position after the preceding mutations. */
+    private static Operation local(Operation search, long transaction, long preceding) {
+        return search.withTransaction(transaction, preceding);
+    }
+
     private static Operation mutation(
             int table, long key, long version, long tx, long ordinal, int kind) {
         return TestOps.unit(
@@ -105,7 +110,7 @@ public class ReplayProjectionTest {
                             new ReplayConfig(false, "none", 0, 0, 0, 0, mode), true, target);
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
             Operation write = mutation(3, 1, 1, 10, 1, 3);
-            Operation search = IndexOperationTrace.transactionSearch(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, 10, 1, true);
+            Operation search = local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 1);
             replay.accept(write);
             replay.accept(search);
             assertTrue(received.isEmpty());
@@ -153,17 +158,16 @@ public class ReplayProjectionTest {
                 IOException.class,
                 () ->
                         replay.accept(
-                                IndexOperationTrace.transactionSearch(
-                                        0, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, 10, 1, true)));
+                                local(IndexOperationTrace.search(0, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 1)));
     }
 
     @Test
     public void rejectsWrongLocalReadPointsAndIncompleteFilteredIndexExpansion() throws Exception {
         for (Operation invalid :
                 List.of(
-                        IndexOperationTrace.transactionSearch(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 0, 1, 10, 1, true),
-                        IndexOperationTrace.transactionSearch(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, 11, 1, true),
-                        IndexOperationTrace.transactionSearch(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, 10, 2, true))) {
+                        local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 0, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 1),
+                        local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 11, 1),
+                        local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 2))) {
             var replay = new ReplayProjection(ReplayConfig.defaults(), true, operation -> fail());
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
             replay.accept(mutation(3, 1, 1, 10, 1, 3));
@@ -179,8 +183,7 @@ public class ReplayProjectionTest {
                 IOException.class,
                 () ->
                         replay.accept(
-                                IndexOperationTrace.transactionSearch(
-                                        2, 5, 1, Range.equal(IndexKey.ofInt(10)), 1, 1, 10, 1, true)));
+                                local(IndexOperationTrace.search(2, 5, 1, Range.equal(IndexKey.ofInt(10)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 1)));
     }
 
     @Test
@@ -218,7 +221,7 @@ public class ReplayProjectionTest {
                         true,
                         operation -> fail());
         replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
-        replay.accept(IndexOperationTrace.transactionSearch(1, 5, 1, Range.equal(IndexKey.ofInt(10)), 0, 0, 10, 0, false));
+        replay.accept(local(IndexOperationTrace.search(1, 5, 1, Range.equal(IndexKey.ofInt(10)), 0, 0, 0), 10, 0));
         replay.accept(IndexOperationTrace.transaction(10, 7, 10, 1, 0));
         replay.accept(IndexOperationTrace.search(20, 5, 1, Range.equal(IndexKey.ofInt(10)), 1, 0, 0));
         replay.finish();
@@ -257,7 +260,7 @@ public class ReplayProjectionTest {
                 new ReplayProjection(
                         new ReplayConfig(false, "none", 0, 0, 0, 0), true, operation -> fail());
         replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
-        Operation query = IndexOperationTrace.transactionSearch(1, 5, 1, Range.equal(IndexKey.ofInt(10)), 0, 0, 10, 0, false);
+        Operation query = local(IndexOperationTrace.search(1, 5, 1, Range.equal(IndexKey.ofInt(10)), 0, 0, 0), 10, 0);
         for (int i = 0; i < ReplayProjection.MAX_TRANSACTION_OPERATIONS; i++) replay.accept(query);
         assertThrows(IOException.class, () -> replay.accept(query));
         assertEquals(0, replay.dispatched());

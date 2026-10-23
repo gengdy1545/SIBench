@@ -22,7 +22,7 @@ public class IndexTraceCompilerTest {
 
     private CaptureConfig baseline(Path fixture) throws Exception {
         Path root = Path.of("").toAbsolutePath();
-        var original = CaptureConfig.read(root, Path.of("config/hybench_tp_subset_sf1.yaml"));
+        var original = CaptureConfig.read(root, Path.of("config/hybench_sf1.yaml"));
         Path baseline = Files.createDirectory(fixture.resolve("baseline"));
         var c = original.layout();
         var layout =
@@ -138,7 +138,6 @@ public class IndexTraceCompilerTest {
                 original.user(),
                 original.seconds(),
                 1,
-                original.percentages(),
                 layout,
                 original.document());
     }
@@ -306,13 +305,208 @@ public class IndexTraceCompilerTest {
                         ? next
                                 + "true}\n{\"event\":\"heap_visibility\",\"scan\":\""
                                 + scan
-                                + "\",\"found\":true}\n"
+                                + "\",\"found\":true,\"row\":{\"indexed\":[\"2024-01-02 00:00:00\"],"
+                                + "\"pk\":[\"1\"]}}\n"
                         : "")
                 + next
                 + "false}\n"
                 + "{\"event\":\"scan_end\",\"scan\":\""
                 + scan
                 + "\"}\n";
+    }
+
+    /** One request of a backend trace: its executor start, the given events and its return. */
+    private static List<String> request(int pid, long ordinal, String sql, List<String> events) {
+        var result = new ArrayList<String>();
+        result.add(
+                new Gson()
+                        .toJson(
+                                Map.<String, Object>of(
+                                        "event", "executor_start",
+                                        "pid", pid,
+                                        "req", ordinal,
+                                        "depth", 1,
+                                        "application", "sibench:fixture",
+                                        "sql", sql,
+                                        "query_id", 42)));
+        for (String line : events) {
+            var event = JsonParser.parseString(line).getAsJsonObject();
+            event.addProperty("pid", pid);
+            event.addProperty("req", ordinal);
+            event.addProperty("depth", 1);
+            result.add(event.toString());
+        }
+        result.add(
+                new Gson()
+                        .toJson(
+                                Map.<String, Object>of(
+                                        "event", "executor_run_end",
+                                        "pid", pid,
+                                        "req", ordinal,
+                                        "depth", 1,
+                                        "processed", 0)));
+        result.add(
+                new Gson()
+                        .toJson(
+                                Map.<String, Object>of(
+                                        "event", "executor_end",
+                                        "pid", pid,
+                                        "req", ordinal,
+                                        "depth", 1)));
+        return result;
+    }
+
+    /** The commit record of one transaction, carrying PostgreSQL's completion counter. */
+    private static String commit(int pid, long ordinal, long xid, long csn) {
+        // The merge detects transaction records by their leading event name, as the capture writes
+        // it, so the order of members matters here.
+        var record = new LinkedHashMap<String, Object>();
+        record.put("event", "transaction_commit");
+        record.put("pid", pid);
+        record.put("xid", xid);
+        record.put("cid", 0);
+        record.put("req", ordinal);
+        record.put("depth", 0);
+        record.put("csn", csn);
+        return new Gson().toJson(record);
+    }
+
+    /** A fetched-to-the-end scan whose rescan carries the snapshot PostgreSQL took for it. */
+    private static List<String> snapshotSearch(
+            String scan, String value, long csn, String xip, long xmax, boolean suboverflowed) {
+        var lines = new ArrayList<String>();
+        for (String line : search(scan, 1, 3, 0).lines().toList()) {
+            var event = JsonParser.parseString(line).getAsJsonObject();
+            if (event.get("event").getAsString().equals("scan_rescan")) {
+                event.getAsJsonArray("keys").get(0).getAsJsonObject().addProperty("value", value);
+                event.addProperty("csn", csn);
+                event.addProperty("xmin", xmax - 1);
+                event.addProperty("xmax", xmax);
+                event.addProperty("suboverflowed", suboverflowed);
+                event.add("xip", JsonParser.parseString(xip).getAsJsonArray());
+            }
+            lines.add(event.toString());
+        }
+        return lines;
+    }
+
+    private static String rowChange(long xid, String before, String after) {
+        return "{\"event\":\"row_change\",\"xid\":"
+                + xid
+                + ",\"relation\":\"loantrans\",\"operation\":\"update\",\"old\":"
+                + before
+                + ",\"new\":"
+                + after
+                + "}";
+    }
+
+    private Path concurrentCapture(Path directory, List<List<String>> sessions) throws Exception {
+        var servers = new ArrayList<Path>();
+        for (int i = 0; i < sessions.size(); i++) {
+            Path server = directory.resolve("pg-" + (101 + i) + ".jsonl");
+            Files.write(server, sessions.get(i));
+            servers.add(server);
+        }
+        RowAuditTestSupport.completeConcurrent(directory, servers);
+        return directory;
+    }
+
+    /**
+     * Two sessions that overlap: the second reads after the first updated, but its snapshot was
+     * taken while that update was still running, so it must read the version before the update.
+     */
+    private List<List<String>> overlappingSessions(String before, String after, long updateCounter)
+            throws Exception {
+        var writer = new ArrayList<String>();
+        writer.addAll(
+                request(101, 1, "SELECT 1", snapshotSearch("a1", "2024-01-01 00:00:00", 100, "[]", 51, false)));
+        writer.add(commit(101, 1, 0, 100));
+        writer.addAll(request(101, 2, "UPDATE loantrans SET timestamp = ?", List.of(rowChange(50, before, after))));
+        writer.add(commit(101, 2, 50, updateCounter));
+        var reader = new ArrayList<String>();
+        reader.addAll(
+                request(102, 1, "SELECT 1", snapshotSearch("b1", "2024-01-01 00:00:00", 150, "[50]", 51, false)));
+        reader.add(commit(102, 1, 0, 250));
+        return List.of(writer, reader);
+    }
+
+    @Test
+    public void concurrentSessionsReadTheCommitTheirSnapshotSaw() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        CaptureConfig config = baseline(fixture);
+        String before = row("2024-01-01 00:00:00"), after = row("2024-01-02 00:00:00");
+        Path raw =
+                concurrentCapture(fixture, overlappingSessions(before, after, 200));
+        audit(config, raw, after);
+        Path output = fixture.resolve("compiled");
+        compile(config, raw, output);
+        var manifest =
+                JsonParser.parseString(Files.readString(output.resolve("manifest.json")))
+                        .getAsJsonObject();
+        assertEquals("concurrent", manifest.get("session_order").getAsString());
+        assertEquals(3, manifest.get("committed_transactions").getAsLong());
+        assertEquals(2, manifest.get("search_operations").getAsLong());
+        // The reader's snapshot never saw the update, so it reads behind the commit before it.
+        assertEquals(1, manifest.get("snapshot_searches").getAsLong());
+        var crosscheck = manifest.getAsJsonObject("snapshot_crosscheck");
+        assertEquals(2, crosscheck.get("searches_checked").getAsLong());
+        assertEquals(0, crosscheck.get("searches_without_usable_snapshot").getAsLong());
+        assertEquals(
+                "passed",
+                ReferenceReplay.run(
+                                output,
+                                new ReplayConfig(true, "none", 0, 0, 0, 0, "operation"),
+                                fixture.resolve("replay.json"))
+                        .get("status"));
+        assertEquals(
+                "passed",
+                SnapshotLookupValidation.run(
+                                output,
+                                new ReplayConfig(true, "none", 0, 0, 0, 0, "operation"),
+                                fixture.resolve("snapshots.json"))
+                        .get("status"));
+    }
+
+    @Test
+    public void concurrentCompilationRejectsACounterThatDisagreesWithItsSnapshot()
+            throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        CaptureConfig config = baseline(fixture);
+        String before = row("2024-01-01 00:00:00"), after = row("2024-01-02 00:00:00");
+        // The update commits at counter 120, before the reader's snapshot at 150, yet the reader's
+        // snapshot still lists XID 50 as running: no single read timestamp can express it.
+        Path raw = concurrentCapture(fixture, overlappingSessions(before, after, 120));
+        audit(config, raw, after);
+        Path output = fixture.resolve("compiled");
+        var failure = assertThrows(java.io.IOException.class, () -> compile(config, raw, output));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("one read timestamp"));
+        assertTrue(Files.exists(output.resolve("INCOMPLETE")));
+    }
+
+    @Test
+    public void concurrentCompilationSkipsSnapshotsItCannotCrossCheck() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        CaptureConfig config = baseline(fixture);
+        String before = row("2024-01-01 00:00:00"), after = row("2024-01-02 00:00:00");
+        var sessions = overlappingSessions(before, after, 200);
+        var reader = new ArrayList<String>();
+        reader.addAll(
+                request(
+                        102,
+                        1,
+                        "SELECT 1",
+                        snapshotSearch("b1", "2024-01-01 00:00:00", 150, "[50]", 51, true)));
+        reader.add(commit(102, 1, 0, 250));
+        Path raw = concurrentCapture(fixture, List.of(sessions.get(0), reader));
+        audit(config, raw, after);
+        Path output = fixture.resolve("compiled");
+        compile(config, raw, output);
+        var crosscheck =
+                JsonParser.parseString(Files.readString(output.resolve("manifest.json")))
+                        .getAsJsonObject()
+                        .getAsJsonObject("snapshot_crosscheck");
+        assertEquals(1, crosscheck.get("searches_checked").getAsLong());
+        assertEquals(1, crosscheck.get("searches_without_usable_snapshot").getAsLong());
     }
 
     private static Map<String, Object> compile(CaptureConfig config, Path raw, Path output)
@@ -355,23 +549,14 @@ public class IndexTraceCompilerTest {
         audit(config, raw, second);
         Path sourceAudit = RowStateAudit.defaultReport(raw);
         String auditHash = BaselineGenerator.sha256(sourceAudit);
-        var maintenance =
-                IndexMaintenanceValidation.validate(
-                        IndexCatalog.fromSchema(org.sibench.schema.SourceSchema.hybench(config.source())),
-                        SourceSchema.hybench(config.source()),
-                        config.layout().output(),
-                        raw,
-                        fixture.resolve("maintenance.json"),
-                        sourceAudit);
-        assertEquals("passed", maintenance.get("status"));
-        assertEquals(auditHash, maintenance.get("row_state_audit_sha256"));
-        assertEquals(auditHash, BaselineGenerator.sha256(sourceAudit));
         compile(config, raw, output);
+        // Compilation reuses the audit report and never rewrites it.
+        assertEquals(auditHash, BaselineGenerator.sha256(sourceAudit));
         compile(config, raw, repeat);
         var manifest =
                 JsonParser.parseString(Files.readString(output.resolve("manifest.json")))
                         .getAsJsonObject();
-        assertEquals(8, manifest.get("operation_trace_version").getAsInt());
+        assertEquals(9, manifest.get("operation_trace_version").getAsInt());
         assertEquals("hybench", manifest.get("benchmark").getAsString());
         assertEquals(21, manifest.get("baseline_operations").getAsLong());
         assertEquals(21, manifest.getAsJsonArray("index_definitions").size());
@@ -466,7 +651,7 @@ public class IndexTraceCompilerTest {
                             + "\"new\":"
                                 + row("2024-01-02 00:00:00")
                                 + "}\n",
-                        // An array key (= ANY) is not one interval.
+                        // An array key (= ANY) whose elements were not captured.
                         search("s", 1, 3, AccessUnits.SK_SEARCHARRAY))) {
             Path fixture = temporary.newFolder().toPath();
             var config = baseline(fixture);
@@ -502,7 +687,7 @@ public class IndexTraceCompilerTest {
         audit(config, raw, first);
         Path output = fixture.resolve("compiled");
         var manifest = compile(config, raw, output);
-        assertEquals(Map.of("range", 2L), manifest.get("searches_by_shape"));
+        assertEquals(Map.of("range", 2L), manifest.get("searched_accesses_by_shape"));
         var searches = new ArrayList<IndexOperationTrace.Operation>();
         IndexOperationTrace.read(
                 output.resolve("workload.ops"),
@@ -524,6 +709,157 @@ public class IndexTraceCompilerTest {
                 "passed",
                 ReferenceReplay.run(output, ReplayConfig.defaults(), fixture.resolve("replay.json"))
                         .get("status"));
+    }
+
+    private static String event(String type, String detail) {
+        return "{\"event\":\"" + type + "\"," + detail + "}\n";
+    }
+
+    private static String timestampKey(String value) {
+        return "{\"attribute\":1,\"strategy\":3,\"flags\":0,\"type_oid\":1114,\"value\":\""
+                + value
+                + "\"}";
+    }
+
+    private static final String APPLICANT_KEY =
+            "{\"attribute\":1,\"strategy\":3,\"flags\":0,\"type_oid\":23,\"value\":\"1\"}";
+
+    /** An index scan of idx_loantrans_2 that returned one row and was never asked for more. */
+    private static String stoppedSecondary(String scan, String value, String pk) {
+        return event("plan_scan", "\"scan\":\"" + scan + "\",\"relation\":\"idx_loantrans_2\",\"plan_node\":1,\"kind\":\"index\"")
+                + event("scan_rescan", "\"scan\":\"" + scan + "\",\"relation\":\"idx_loantrans_2\",\"keys\":[" + timestampKey(value) + "]")
+                + event("scan_next", "\"scan\":\"" + scan + "\",\"relation\":\"idx_loantrans_2\",\"direction\":1,\"found\":true,\"recheck\":false")
+                + event("heap_visibility", "\"scan\":\"" + scan + "\",\"relation\":\"idx_loantrans_2\",\"found\":true,\"row\":{\"indexed\":[\"" + value + "\"],\"pk\":[\"" + pk + "\"]}")
+                + event("scan_end", "\"scan\":\"" + scan + "\",\"relation\":\"idx_loantrans_2\"");
+    }
+
+    private static String bitmap(String scan, String index, int node) {
+        return event("plan_scan", "\"scan\":\"" + scan + "\",\"relation\":\"" + index + "\",\"plan_node\":" + node + ",\"kind\":\"bitmap\"");
+    }
+
+    private static String rescan(String scan, String index, String keys) {
+        return event("scan_rescan", "\"scan\":\"" + scan + "\",\"relation\":\"" + index + "\",\"keys\":[" + keys + "]");
+    }
+
+    private static String candidates(String scan, String index, String tid) {
+        return event("bitmap_candidate", "\"scan\":\"" + scan + "\",\"relation\":\"" + index + "\",\"found\":true,\"tid\":\"" + tid + "\"")
+                + event("bitmap_end", "\"scan\":\"" + scan + "\",\"relation\":\"" + index + "\",\"found\":false");
+    }
+
+    /**
+     * applicantid = 1 AND timestamp = value, intersected by a BitmapAnd, in PostgreSQL's order:
+     * constant keys reach the index while the plan is initialized, before the heap node binds it.
+     */
+    private static String bitmapAnd(String value) {
+        return bitmap("a", "idx_loantrans_1", 2)
+                + rescan("a", "idx_loantrans_1", APPLICANT_KEY)
+                + bitmap("b", "idx_loantrans_2", 3)
+                + rescan("b", "idx_loantrans_2", timestampKey(value))
+                + event("plan_bitmap_heap", "\"heap\":\"h\",\"relation\":\"loantrans\",\"plan_node\":4,\"tree\":{\"and\":[\"a\",\"b\"]},\"scans\":[\"a\",\"b\"]")
+                + candidates("a", "idx_loantrans_1", "(0,1)")
+                + candidates("b", "idx_loantrans_2", "(0,1)")
+                + event("bitmap_heap_candidate", "\"heap\":\"h\",\"relation\":\"loantrans\",\"tid\":\"(0,1)\",\"found\":true")
+                + event("scan_end", "\"scan\":\"a\",\"relation\":\"idx_loantrans_1\"")
+                + event("scan_end", "\"scan\":\"b\",\"relation\":\"idx_loantrans_2\"");
+    }
+
+    /** applicantid = ANY('{7,1,NULL}') through one bitmap scan. */
+    private static String bitmapArray() {
+        String key =
+                "{\"attribute\":1,\"strategy\":3,\"flags\":32,\"type_oid\":23,\"value\":null,"
+                        + "\"array_type_oid\":23,\"array\":[\"7\",\"1\",null]}";
+        return bitmap("c", "idx_loantrans_1", 5)
+                + rescan("c", "idx_loantrans_1", key)
+                + event("plan_bitmap_heap", "\"heap\":\"g\",\"relation\":\"loantrans\",\"plan_node\":6,\"tree\":\"c\",\"scans\":[\"c\"]")
+                + candidates("c", "idx_loantrans_1", "(0,1)")
+                + event("bitmap_heap_candidate", "\"heap\":\"g\",\"relation\":\"loantrans\",\"tid\":\"(0,1)\",\"found\":true")
+                + event("scan_end", "\"scan\":\"c\",\"relation\":\"idx_loantrans_1\"");
+    }
+
+    private Path nonPrefixCapture(Path fixture, CaptureConfig config, String pinnedPk) throws Exception {
+        String first = row("2024-01-01 00:00:00"), second = row("2024-01-02 00:00:00");
+        String commit = "{\"event\":\"transaction_commit\",\"xid\":0}\n";
+        Path raw =
+                capture(
+                        fixture,
+                        List.of(
+                                change("update", first, second)
+                                        + "{\"event\":\"transaction_commit\",\"xid\":9}\n",
+                                stoppedSecondary("s", "2024-01-02 00:00:00", pinnedPk) + commit,
+                                bitmapAnd("2024-01-02 00:00:00") + commit,
+                                bitmapArray() + commit));
+        audit(config, raw, second);
+        return raw;
+    }
+
+    /**
+     * The three accesses whose native result is not a KV-ordered prefix of one interval: a
+     * secondary scan stopped among equal values, a BitmapAnd and an = ANY array. Each compiles to
+     * searches whose counts are native facts, and the reference replay checks them.
+     */
+    @Test
+    public void nonPrefixAccessesCompileToSearchesThatReplay() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        var config = baseline(fixture);
+        Path raw = nonPrefixCapture(fixture, config, "1");
+        Path output = fixture.resolve("compiled");
+        var manifest = compile(config, raw, output);
+        assertEquals(
+                Map.of("stopped_equality", 1L, "intersection", 1L, "union", 1L),
+                manifest.get("searched_accesses_by_shape"));
+        var searches = new ArrayList<IndexOperationTrace.Operation>();
+        IndexOperationTrace.read(
+                output.resolve("workload.ops"),
+                o -> {
+                    if (o.kind() == IndexOperationTrace.SEARCH) searches.add(o);
+                });
+        assertEquals(5, searches.size());
+        // The stopped scan: no fully consumed prefix, one pinned (value, PK) search.
+        var pinned = searches.get(0);
+        assertEquals(IndexKey.ofInt(1), pinned.key());
+        assertEquals(timestamp("2024-01-02 00:00:00"), pinned.range().lower());
+        assertTrue(pinned.range().point());
+        assertEquals(1, pinned.expectedCount());
+        // The BitmapAnd: two indexes, one group whose count is the intersection's.
+        var intersection = searches.subList(1, 3);
+        assertEquals(List.of(1, 2), intersection.stream().map(o -> o.index()).toList());
+        for (var member : intersection) {
+            assertTrue((member.flags() & IndexOperationTrace.INTERSECT_GROUP) != 0);
+            assertEquals(2, member.expansionSize());
+            assertEquals(1, member.expectedCount());
+        }
+        // The array: its two distinct non-null elements in KV order, one union group.
+        var union = searches.subList(3, 5);
+        assertEquals(
+                List.of(IndexKey.ofInt(1), IndexKey.ofInt(7)),
+                union.stream().map(o -> o.range().lower()).toList());
+        for (var member : union) assertTrue((member.flags() & IndexOperationTrace.UNION_GROUP) != 0);
+        for (boolean secondary : new boolean[] {true, false})
+            for (String mode : List.of("operation", "transaction"))
+                assertEquals(
+                        "passed",
+                        ReferenceReplay.run(
+                                        output,
+                                        new ReplayConfig(secondary, "none", 0, 0, 0, 0, mode),
+                                        fixture.resolve("replay-" + secondary + "-" + mode + ".json"))
+                                .get("status"));
+    }
+
+    /** A pinned search names one entry; a row the scan never returned is a replay failure. */
+    @Test
+    public void aPinnedSearchForARowThatDoesNotExistFailsReplay() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        var config = baseline(fixture);
+        Path raw = nonPrefixCapture(fixture, config, "2");
+        Path output = fixture.resolve("compiled");
+        compile(config, raw, output);
+        var failure =
+                assertThrows(
+                        java.io.IOException.class,
+                        () ->
+                                ReferenceReplay.run(
+                                        output, ReplayConfig.defaults(), fixture.resolve("replay.json")));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("Search count mismatch"));
     }
 
     @Test
@@ -554,7 +890,7 @@ public class IndexTraceCompilerTest {
                         .getAsJsonObject();
         assertEquals(2, manifest.get("discarded_aborted_row_changes").getAsLong());
         assertEquals(1, manifest.get("discarded_aborted_transaction_local_searches").getAsLong());
-        assertEquals(2, manifest.get("searches").getAsLong());
+        assertEquals(2, manifest.get("search_operations").getAsLong());
         var writes = new ArrayList<IndexOperationTrace.Operation>();
         IndexOperationTrace.read(output.resolve("workload.ops"), writes::add);
         var insertion =

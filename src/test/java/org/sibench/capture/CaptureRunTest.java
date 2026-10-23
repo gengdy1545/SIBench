@@ -117,7 +117,7 @@ public class CaptureRunTest {
                             + event("executor_run_end", application, "")
                             + event("executor_end", application, "")
                             + event("transaction_commit", application, ""));
-            run.complete(new long[19]);
+            run.complete();
         }
         assertEquals("complete", manifest(directory).get("status").getAsString());
         CaptureRun.verifyInput(pg);
@@ -155,7 +155,7 @@ public class CaptureRunTest {
                 connection.prepareStatement("SELECT 1").executeQuery();
                 connection.commit();
             }
-            assertThrows(IOException.class, () -> run.complete(new long[19]));
+            assertThrows(IOException.class, () -> run.complete());
         }
         assertEquals("failed", manifest(directory).get("status").getAsString());
     }
@@ -197,7 +197,7 @@ public class CaptureRunTest {
     @Test
     public void htapAuditsAllSessionsAndAcceptsMatchedBusinessRollback() throws Exception {
         Path directory = temporary.newFolder().toPath();
-        try (CaptureRun run = CaptureRun.begin(directory, true)) {
+        try (CaptureRun run = CaptureRun.begin(directory)) {
             run.phase("xp", null);
             for (int pid : new int[] {123, 124}) {
                 Path jdbc = directory.resolve("jdbc-" + pid + ".jsonl");
@@ -217,13 +217,14 @@ public class CaptureRunTest {
                         """.formatted(pid, pid, pid, pid, pid, pid, pid, pid));
                 CaptureRun.sessionClosed(jdbc);
             }
-            run.complete(new long[19]);
+            run.complete();
         }
         assertEquals(2, manifest(directory).getAsJsonArray("sessions").size());
         CaptureRun.verifyInput(directory);
-        Path output = directory.resolve("normalized");
-        assertThrows(IOException.class, () -> IndexTraceCompiler.compile(null, null, directory, output, null));
-        assertFalse(Files.exists(output));
+        // Concurrent sessions are no longer rejected outright; they are ordered by PostgreSQL's
+        // transaction completion counter, which these fixture traces do not carry.
+        assertEquals("concurrent", IndexTraceCompiler.sessions(directory).order());
+        assertEquals(2, IndexTraceCompiler.sessions(directory).files().size());
         Path extra = directory.resolve("pg-unregistered.jsonl");
         Files.writeString(extra, "{}\n");
         assertThrows(IOException.class, () -> CaptureRun.verifyInput(directory));
@@ -253,7 +254,7 @@ public class CaptureRunTest {
                 });
             return m.invoke(actual, a);
         });
-        try (CaptureRun run = CaptureRun.begin(directory, true);
+        try (CaptureRun run = CaptureRun.begin(directory);
                 Connection connection = CaptureDriver.wrap(delayed, directory)) {
             PreparedStatement first = connection.prepareStatement("SELECT 42");
             ResultSet rows = first.executeQuery();
@@ -279,7 +280,7 @@ public class CaptureRunTest {
     @Test
     public void ordinaryStatementsUseSameRequestCaptureAsPreparedStatements() throws Exception {
         Path directory = temporary.newFolder().toPath();
-        try (CaptureRun run = CaptureRun.begin(directory, true);
+        try (CaptureRun run = CaptureRun.begin(directory);
                 Connection connection =
                         CaptureDriver.wrap(actual("", null, new boolean[1]), directory)) {
             connection.createStatement().executeQuery("SELECT 1");
@@ -360,7 +361,7 @@ public class CaptureRunTest {
                                     m.getName().equals("getAutoCommit")
                                             ? (Object) autocommit
                                             : m.invoke(base, a));
-            try (CaptureRun run = CaptureRun.begin(directory, true);
+            try (CaptureRun run = CaptureRun.begin(directory);
                     Connection wrapped = CaptureDriver.wrap(connection, directory)) {
                 wrapped.prepareStatement("SELECT 1").executeQuery();
             }

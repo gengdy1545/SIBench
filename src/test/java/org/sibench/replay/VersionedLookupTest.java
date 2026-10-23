@@ -56,7 +56,7 @@ public class VersionedLookupTest {
                 Range.equal(IndexKey.ofInt(key)),
                 timestamp,
                 count,
-                IndexOperationTrace.SNAPSHOT_SEARCH | IndexOperationTrace.DERIVED_SEARCH);
+                IndexOperationTrace.SNAPSHOT_SEARCH);
     }
 
     @Test

@@ -22,13 +22,6 @@ public final class RelocationCheck {
 
     private RelocationCheck() {}
 
-    public static void main(String[] args) throws Exception {
-        if (args.length != 4)
-            throw new IllegalArgumentException("RelocationCheck ROOT PROFILE NORMALIZED OUTPUT");
-        var capture = CaptureProfile.read(Path.of(args[0]), Path.of(args[1]));
-        validate(capture.layout(), Path.of(args[2]), Path.of(args[3]));
-    }
-
     /** {@code layout} sets the Parquet layout of the retained-row files. */
     public static void validate(GenerationConfig layout, Path input, Path output) throws Exception {
         ReferenceReplay.check(input, ReplayConfig.defaults());

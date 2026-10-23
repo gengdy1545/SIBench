@@ -81,8 +81,24 @@ public class AccessLedgerTest {
             return event("scan_next", index, "\"scan\":\"" + scan + "\",\"direction\":1,\"found\":" + found + ",\"recheck\":" + recheck);
         }
 
+        int rows;
+
+        /** A heap verdict; a visible row carries its identity (indexed value 5, a fresh PK). */
         Trace visible(String scan, String index, boolean found) {
-            return event("heap_visibility", index, "\"scan\":\"" + scan + "\",\"found\":" + found + ",\"recheck\":false");
+            return found ? visible(scan, index, "5", Integer.toString(++rows)) : event("heap_visibility", index, "\"scan\":\"" + scan + "\",\"found\":false,\"recheck\":false");
+        }
+
+        Trace visible(String scan, String index, String value, String pk) {
+            return event(
+                    "heap_visibility",
+                    index,
+                    "\"scan\":\""
+                            + scan
+                            + "\",\"found\":true,\"recheck\":false,\"row\":{\"indexed\":[\""
+                            + value
+                            + "\"],\"pk\":[\""
+                            + pk
+                            + "\"]}");
         }
 
         int tids;
@@ -99,8 +115,15 @@ public class AccessLedgerTest {
             return event("bitmap_end", index, "\"scan\":\"" + scan + "\",\"found\":false,\"recheck\":false");
         }
 
+        /** A bitmap heap node over one scan, or a flat BitmapOr of several. */
         Trace bitmapHeap(String heap, String... scans) {
-            return event("plan_bitmap_heap", "sbtest1", "\"heap\":\"" + heap + "\",\"plan_node\":9,\"scans\":[\"" + String.join("\",\"", scans) + "\"]");
+            return combined(heap, "or", scans);
+        }
+
+        Trace combined(String heap, String combination, String... scans) {
+            String list = "\"" + String.join("\",\"", scans) + "\"";
+            String tree = scans.length == 1 ? list : "{\"" + combination + "\":[" + list + "]}";
+            return event("plan_bitmap_heap", "sbtest1", "\"heap\":\"" + heap + "\",\"plan_node\":9,\"tree\":" + tree + ",\"scans\":[" + list + "]");
         }
 
         Trace verdict(String heap, String tid, boolean visible) {
@@ -188,7 +211,7 @@ public class AccessLedgerTest {
         t.commit();
 
         var report = analyze(t, "pg-7.jsonl");
-        assertEquals(2, report.get("schema_version"));
+        assertEquals(3, report.get("schema_version"));
         assertEquals((long) t.lines.size(), ((Number) map(report.get("partition")).get("sum")).longValue());
         var units = map(report.get("access_units"));
         assertEquals(8L, units.get("total"));
@@ -244,7 +267,7 @@ public class AccessLedgerTest {
         exhausted.accept(PK, "[" + KEY.formatted(1, 3, 1, "null") + "]");
         exhausted.accept(PK, "[" + KEY.formatted(1, 3, 0x20, "null").replace("}", ",\"unsupported_key\":true}") + "]");
         exhausted.accept(PK, "[{\"attribute\":1,\"strategy\":3,\"flags\":0,\"type_oid\":25,\"value\":\"x\"}]");
-        // Consumers that stop early: allowed for the primary key, not for a secondary.
+        // Consumers that stop early: a limit on the primary key, the returned rows on a secondary.
         t.plan("lp", PK, 20, "index").rescan("lp", PK, RANGE).next("lp", PK, true, false).visible("lp", PK, true).scanEnd("lp", PK);
         t.plan("ls", K, 21, "index").rescan("ls", K, EQUALITY).next("ls", K, true, false).visible("ls", K, true).scanEnd("ls", K);
         // A BitmapOr: one TID is on both sides, so each index gets its verdict.
@@ -262,19 +285,107 @@ public class AccessLedgerTest {
         var projection = map(analyze(t, "pg-12.jsonl").get("projection"));
         assertEquals("has_rejected_units", projection.get("status"));
         assertEquals(
-                Map.of("equality", 5L, "range", 3L, "full_scan", 1L, "limited_range", 1L),
+                Map.of(
+                        "equality", 5L,
+                        "range", 3L,
+                        "full_scan", 1L,
+                        "limited_range", 1L,
+                        "stopped_equality", 1L),
                 projection.get("projected"));
         assertEquals(
                 Map.of(
                         "composite_key", 1L,
                         "null_comparison", 1L,
-                        "array_or_row_comparison", 1L,
+                        "row_comparison", 1L,
                         "unsupported_key_type", 1L,
-                        "limited_secondary_scan_tie_order", 1L,
-                        "bitmap_heap_unresolved_candidates", 1L,
+                        "bitmap_heap_stopped_early", 1L,
                         "bitmap_heap_lossy_page", 1L),
                 projection.get("rejected"));
         assertEquals(Map.of("rescan_without_fetch", 1L), projection.get("excluded"));
+    }
+
+    /**
+     * The rows a secondary scan returned before its consumer stopped: the values before the last
+     * one are a fully consumed prefix, the last value's rows are pinned by their primary keys.
+     */
+    @Test
+    public void stoppedSecondaryScansKeepTheirReturnedRows() throws Exception {
+        var t = new Trace().start("SELECT 1");
+        String atLeastFive = "[" + KEY.formatted(1, 4, 0, "\"5\"") + "]";
+        t.plan("s", K, 1, "index").rescan("s", K, atLeastFive);
+        // k = 5 twice, then k = 6 once; k = 6 has more rows the consumer never asked for.
+        t.next("s", K, true, false).visible("s", K, "5", "11");
+        t.next("s", K, true, false).visible("s", K, "5", "3");
+        t.next("s", K, true, false).visible("s", K, "6", "9").scanEnd("s", K);
+        // An index-only scan returns all-visible rows without reading the heap: no identity.
+        t.plan("i", K, 2, "index_only").rescan("i", K, atLeastFive);
+        t.next("i", K, true, false).event("vm_visible", K, "\"scan\":\"i\",\"found\":true").scanEnd("i", K);
+        t.end(0);
+        var projection = map(analyze(t, "pg-16.jsonl").get("projection"));
+        assertEquals(Map.of("stopped_range", 1L), projection.get("projected"));
+        assertEquals(Map.of("stopped_scan_without_row_identity", 1L), projection.get("rejected"));
+        // One prefix [5, 6) and one pinned (6, 9).
+        assertEquals(2L, projection.get("search_operations"));
+    }
+
+    /**
+     * A BitmapAnd's inputs of one cycle are one group. PostgreSQL skips the remaining inputs once
+     * the intersection is empty, so a later cycle may hold fewer inputs than the plan has.
+     */
+    @Test
+    public void bitmapAndInputsFormOneGroupPerCycle() throws Exception {
+        var t = new Trace().start("SELECT 1");
+        // Cycle 1 in PostgreSQL's order: constant keys reach both indexes while the plan is
+        // initialized, before the heap node binds them; (2,2) is only on one side.
+        t.plan("x", K, 1, "bitmap").rescan("x", K, EQUALITY);
+        t.plan("y", PK, 2, "bitmap").rescan("y", PK, RANGE).combined("h", "and", "x", "y");
+        t.tid("x", K, "(2,1)").tid("x", K, "(2,2)").bitmapEnd("x", K);
+        t.tid("y", PK, "(2,1)").bitmapEnd("y", PK);
+        t.verdict("h", "(2,1)", true);
+        // Cycle 2: x is empty, so y never runs.
+        t.rescan("x", K, EQUALITY).bitmapEnd("x", K);
+        // Cycle 3: both again; the heap stops before checking the shared TID.
+        t.rescan("x", K, EQUALITY).tid("x", K, "(3,1)").bitmapEnd("x", K);
+        t.rescan("y", PK, RANGE).tid("y", PK, "(3,1)").bitmapEnd("y", PK);
+        t.scanEnd("x", K).scanEnd("y", PK);
+        // A nested combination has no flat projection.
+        t.plan("p", K, 3, "bitmap").plan("q", PK, 4, "bitmap").plan("r", K, 5, "bitmap");
+        t.event(
+                "plan_bitmap_heap",
+                "sbtest1",
+                "\"heap\":\"n\",\"plan_node\":6,\"tree\":{\"and\":[\"p\",{\"or\":[\"q\",\"r\"]}]},\"scans\":[\"p\",\"q\",\"r\"]");
+        t.rescan("p", K, EQUALITY).bitmapEnd("p", K).scanEnd("p", K);
+        t.end(0);
+        var report = analyze(t, "pg-17.jsonl");
+        var projection = map(report.get("projection"));
+        // Two inputs of cycle 1 as one intersection, x alone in cycle 2.
+        assertEquals(Map.of("intersection", 2L, "equality", 1L), projection.get("projected"));
+        assertEquals(
+                Map.of("bitmap_heap_stopped_early", 2L, "nested_bitmap_combination", 1L),
+                projection.get("rejected"));
+        assertEquals(Map.of("intersection_groups", 2L, "rejected_groups", 1L), projection.get("bitmap_and_groups"));
+    }
+
+    /** An = ANY array is one point per distinct non-null element, as one union. */
+    @Test
+    public void arrayKeysAreUnionsOfTheirElements() throws Exception {
+        var t = new Trace().start("SELECT 1");
+        String array =
+                "[{\"attribute\":1,\"strategy\":3,\"flags\":32,\"type_oid\":23,\"value\":null,"
+                        + "\"array_type_oid\":23,\"array\":[\"9\",\"4\",null,\"9\"]}]";
+        t.plan("a", K, 1, "bitmap").bitmapHeap("h", "a").rescan("a", K, array);
+        t.tid("a", K, "(1,1)").bitmapEnd("a", K).verdict("h", "(1,1)", true).scanEnd("a", K);
+        // Both null: = ANY of an array holding only nulls never matches, so PG does not search.
+        String nulls =
+                "[{\"attribute\":1,\"strategy\":3,\"flags\":32,\"type_oid\":23,\"value\":null,"
+                        + "\"array_type_oid\":23,\"array\":[null]}]";
+        t.plan("b", K, 2, "index").rescan("b", K, nulls).next("b", K, false, false).scanEnd("b", K);
+        t.end(0);
+        var projection = map(analyze(t, "pg-18.jsonl").get("projection"));
+        assertEquals(Map.of("union", 1L), projection.get("projected"));
+        assertEquals(2L, projection.get("search_operations"));
+        assertEquals(
+                Map.of("contradictory_scan_keys", 1L), projection.get("excluded"));
     }
 
     @Test

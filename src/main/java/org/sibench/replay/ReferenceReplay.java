@@ -6,6 +6,7 @@ import com.google.gson.JsonParser;
 import org.sibench.capture.IndexCatalog;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexReferenceReplay;
+import org.sibench.capture.RunTiming;
 import org.sibench.generation.BaselineGenerator;
 
 import java.io.IOException;
@@ -94,8 +95,8 @@ public final class ReferenceReplay {
             java.util.Set<Integer> seen = new java.util.HashSet<>();
             IndexOperationTrace.Operation[] primary = {null};
             IndexOperationTrace.Operation[] previous = {null};
-            int[] position = {0};
-            long[] rows = {0};
+            int[] position = {0}, group = {0};
+            long[] rows = {0}, groupEvent = {0};
             java.util.Set<Integer> loadedTables = new java.util.HashSet<>();
             IndexOperationTrace.read(
                     directory.resolve(name + ".ops"),
@@ -113,16 +114,30 @@ public final class ReferenceReplay {
                                 || IndexOperationTrace.isControl(operation)) {
                             if (primary[0] != null)
                                 throw new IOException("Interrupted index maintenance unit");
-                            if (operation.expansionSize() != 0
-                                    || operation.expansionPosition() != 0)
+                            if (!operation.grouped()
+                                    && (operation.expansionSize() != 0
+                                            || operation.expansionPosition() != 0))
                                 throw new IOException("Unexpected search/control expansion");
+                            if (group[0] > 0 && !operation.grouped())
+                                throw new IOException("Interrupted search group");
                         }
                         if (operation.kind() == IndexOperationTrace.SEARCH) {
                             if (!catalog.getOrDefault(operation.table(), java.util.Set.of())
                                     .contains(operation.index()))
                                 throw new IOException("Search outside source catalog");
+                            // Group members are consecutive: positions 0..size-1, one source access.
+                            if (operation.grouped()) {
+                                if (operation.expansionPosition() != group[0]
+                                        || group[0] > 0 && operation.sourceEvent() != groupEvent[0])
+                                    throw new IOException("Search group out of order");
+                                groupEvent[0] = operation.sourceEvent();
+                                group[0] = operation.expansionPosition() + 1 == operation.expansionSize()
+                                        ? 0
+                                        : group[0] + 1;
+                            }
                             return;
                         }
+                        if (group[0] > 0) throw new IOException("Interrupted search group");
                         if (IndexOperationTrace.isControl(operation)) return;
                         if (operation.expansionSize() < 1)
                             throw new IOException(
@@ -199,6 +214,7 @@ public final class ReferenceReplay {
                         }
                     });
             if (primary[0] != null) throw new IOException("Unfinished index maintenance unit");
+            if (group[0] > 0) throw new IOException("Unfinished search group");
             if (name.equals("baseline")
                     && manifest.has("baseline_rows")
                     && (manifest.get("baseline_rows").getAsLong() != rows[0]
@@ -212,8 +228,10 @@ public final class ReferenceReplay {
         config.requireReferenceCapabilities();
         try (var load = new ReplayProjection(config, false, operation -> {});
                 var runtime = new ReplayProjection(config, true, operation -> {})) {
+            RunTiming.current().phase("load");
             long loadRecords = IndexOperationTrace.read(baseline, load);
             load.finish();
+            RunTiming.current().phase("runtime");
             long runtimeRecords = IndexOperationTrace.read(workload, runtime);
             runtime.finish();
             runtime.requireClientCoverage();
@@ -275,10 +293,12 @@ public final class ReferenceReplay {
             var index = new IndexReferenceReplay(rowId, config.secondaryIndexes());
             try (var load = new ReplayProjection(config, false, index::accept);
                     var runtime = new ReplayProjection(config, true, index::accept)) {
+                RunTiming.current().phase("load");
                 long start = System.nanoTime();
                 IndexOperationTrace.read(baseline, load);
                 load.finish();
                 double loadSeconds = (System.nanoTime() - start) / 1e9;
+                RunTiming.current().phase("runtime");
                 start = System.nanoTime();
                 IndexOperationTrace.read(workload, runtime);
                 runtime.finish();
@@ -312,9 +332,10 @@ public final class ReferenceReplay {
                 "scope",
                 "single-sender multi-client in-process correctness reference; clients share"
                     + " reference service state; not a network or cross-client visibility"
-                    + " implementation; v8 committed-source version history and timestamp"
-                    + " lookup, ordered point/range/limited scans over order-preserving keys of"
-                    + " the complete declared source indexes; no RPC, persistence, concurrent PG"
+                    + " implementation; committed-source version history and timestamp lookup,"
+                    + " ordered point/range/limited scans, pinned entries and intersection/union"
+                    + " search groups over order-preserving keys of the complete declared source"
+                    + " indexes; no RPC, persistence, concurrent PG"
                     + " MVCC, physical GC, rate scheduling or sustained-duration proof");
         Files.writeString(
                 report,

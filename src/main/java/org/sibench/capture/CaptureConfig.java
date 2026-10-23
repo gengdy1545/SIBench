@@ -7,7 +7,10 @@ import org.sibench.generation.GenerationConfig;
 import java.nio.file.*;
 import java.util.*;
 
-/** Configuration contract for native SF1 capture and the explicitly selected TP diagnostic. */
+/**
+ * Configuration contract for native SF1 runHTAP capture. Transaction ratios are the upstream
+ * ones: the profile sets client counts and phase durations, never workload weights.
+ */
 public record CaptureConfig(
         Path root,
         Path source,
@@ -17,7 +20,6 @@ public record CaptureConfig(
         String user,
         int seconds,
         int clients,
-        Map<Integer, Integer> percentages,
         GenerationConfig layout,
         Map<String, Object> document) {
     public static CaptureConfig read(Path root, Path path) throws Exception {
@@ -40,42 +42,16 @@ public record CaptureConfig(
         var nativeConfig = object(doc, "native");
         require(string(nativeConfig, "sf").equals("1x"), "Capture currently requires native SF1");
         int clients = Math.toIntExact(positive(nativeConfig, "clients"));
-        String mode = nativeConfig.containsKey("mode") ? string(nativeConfig, "mode") : "runhtap";
-        require(Set.of("runhtap", "tp_subset").contains(mode), "Unsupported native mode: " + mode);
-        require(mode.equals("runhtap") || clients == 1,
-                "Only single-session TP subset normalization is implemented");
         int seconds =
                 Math.toIntExact(Math.multiplyExact(positive(nativeConfig, "duration_minutes"), 60));
-        Map<Integer, Integer> percentages = new LinkedHashMap<>();
-        int total = 0;
-        Map<String, Object> configuredPercentages = nativeConfig.containsKey("transaction_percentages")
-                ? object(nativeConfig, "transaction_percentages") : Map.of();
-        for (var entry : configuredPercentages.entrySet()) {
-            require(
-                    mode.equals("runhtap") ? entry.getKey().matches("tp([1-9]|1[0-8])")
-                            : Set.of("tp3", "tp5", "tp9").contains(entry.getKey()),
-                    "Unsupported transaction: " + entry.getKey());
-            int percent =
-                    Math.toIntExact(
-                            integer(
-                                    object(nativeConfig, "transaction_percentages"),
-                                    entry.getKey()));
-            require(percent >= 0 && percent <= 100, "Invalid transaction percentage");
-            total += percent;
-            percentages.put(Integer.parseInt(entry.getKey().substring(2)), percent);
-        }
-        require(mode.equals("runhtap") ? configuredPercentages.isEmpty() || total == 100 : total == 100,
-                "Transaction percentages must sum to 100");
-        if (mode.equals("runhtap")) {
-            for (String field : List.of("ap_clients", "xp_transaction_clients", "xp_query_clients"))
-                require(positive(nativeConfig, field) <= 256, "Invalid client count: " + field);
-            require(clients <= 256, "Invalid TP client count");
-            if (nativeConfig.containsKey("phase_duration_minutes")) {
-                var durations = object(nativeConfig, "phase_duration_minutes");
-                for (String phase : durations.keySet()) {
-                    require(Set.of("ap", "tp", "xp").contains(phase), "Unknown phase: " + phase);
-                    require(positive(durations, phase) <= 1440, "Invalid phase duration");
-                }
+        for (String field : List.of("ap_clients", "xp_transaction_clients", "xp_query_clients"))
+            require(positive(nativeConfig, field) <= 256, "Invalid client count: " + field);
+        require(clients <= 256, "Invalid TP client count");
+        if (nativeConfig.containsKey("phase_duration_minutes")) {
+            var durations = object(nativeConfig, "phase_duration_minutes");
+            for (String phase : durations.keySet()) {
+                require(Set.of("ap", "tp", "xp").contains(phase), "Unknown phase: " + phase);
+                require(positive(durations, phase) <= 1440, "Invalid phase duration");
             }
         }
         var pg = object(doc, "postgres");
@@ -141,7 +117,6 @@ public record CaptureConfig(
                 user,
                 seconds,
                 clients,
-                Map.copyOf(percentages),
                 layout,
                 doc);
     }
@@ -174,49 +149,56 @@ public record CaptureConfig(
 
     public Properties nativeProperties() {
         Properties p = new Properties();
-        if (mode().equals("runhtap")) {
-            try (var input = Files.newInputStream(source.resolve("conf/pg.props"))) {
-                p.load(input);
-            } catch (java.io.IOException error) {
-                throw new java.io.UncheckedIOException(error);
-            }
+        try (var input = Files.newInputStream(source.resolve("conf/pg.props"))) {
+            p.load(input);
+        } catch (java.io.IOException error) {
+            throw new java.io.UncheckedIOException(error);
         }
         p.setProperty("sf", "1x");
         p.setProperty("db", "postgreSQL");
         p.setProperty("tpclient", Integer.toString(clients));
-        if (mode().equals("tp_subset")) {
-            p.setProperty("contention_num", "100");
-            p.setProperty("risk_rate", "0.1");
-        }
         p.setProperty("username", user);
         p.setProperty("password", "");
         p.setProperty("url", jdbc.replace("jdbc:postgresql:", "jdbc:sibench:"));
         p.setProperty("classname", CaptureDriver.class.getName());
-        if (mode().equals("runhtap")) {
-            p.setProperty("url_ap", p.getProperty("url"));
-            p.setProperty("username_ap", user);
-            p.setProperty("password_ap", "");
-            p.setProperty("classname_ap", CaptureDriver.class.getName());
-            var nativeConfig = object(document, "native");
-            p.setProperty("apclient", Long.toString(positive(nativeConfig, "ap_clients")));
-            p.setProperty("xtpclient", Long.toString(positive(nativeConfig, "xp_transaction_clients")));
-            p.setProperty("xapclient", Long.toString(positive(nativeConfig, "xp_query_clients")));
-            for (String name : List.of("apRunMins", "tpRunMins", "xpRunMins"))
-                p.setProperty(name, Integer.toString(seconds / 60));
-            if (nativeConfig.containsKey("phase_duration_minutes")) {
-                var durations = object(nativeConfig, "phase_duration_minutes");
-                for (String phase : durations.keySet())
-                    p.setProperty(phase + "RunMins", Long.toString(positive(durations, phase)));
-            }
+        p.setProperty("url_ap", p.getProperty("url"));
+        p.setProperty("username_ap", user);
+        p.setProperty("password_ap", "");
+        p.setProperty("classname_ap", CaptureDriver.class.getName());
+        var nativeConfig = object(document, "native");
+        p.setProperty("apclient", Long.toString(positive(nativeConfig, "ap_clients")));
+        p.setProperty("xtpclient", Long.toString(positive(nativeConfig, "xp_transaction_clients")));
+        p.setProperty("xapclient", Long.toString(positive(nativeConfig, "xp_query_clients")));
+        for (String name : List.of("apRunMins", "tpRunMins", "xpRunMins"))
+            p.setProperty(name, Integer.toString(seconds / 60));
+        if (nativeConfig.containsKey("phase_duration_minutes")) {
+            var durations = object(nativeConfig, "phase_duration_minutes");
+            for (String phase : durations.keySet())
+                p.setProperty(phase + "RunMins", Long.toString(positive(durations, phase)));
         }
-        if (!percentages.isEmpty() || mode().equals("tp_subset"))
-            for (int i = 1; i <= 18; i++)
-                p.setProperty("tp" + i + "_percent", Integer.toString(percentages.getOrDefault(i, 0)));
         return p;
     }
 
-    public String mode() {
+    /** The database a native run reads; the capture database is cloned from a verified one. */
+    public String database() {
+        return string(object(document, "postgres"), "database");
+    }
+
+    /** The still database the capture database is cloned from. */
+    public String cloneFrom() {
+        return string(object(document, "postgres"), "clone_from");
+    }
+
+    /** The directory HyBench resolves its native {@code Data_1x} input from. */
+    public Path workDir() {
         var nativeConfig = object(document, "native");
-        return nativeConfig.containsKey("mode") ? string(nativeConfig, "mode") : "runhtap";
+        return nativeConfig.containsKey("work_dir")
+                ? root.resolve(string(nativeConfig, "work_dir"))
+                : artifacts.resolve("native");
+    }
+
+    public String adminJdbc() {
+        int port = Math.toIntExact(positive(object(document, "postgres"), "port"));
+        return "jdbc:postgresql://127.0.0.1:" + port + "/postgres";
     }
 }

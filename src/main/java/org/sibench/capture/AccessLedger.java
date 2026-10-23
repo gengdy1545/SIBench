@@ -25,7 +25,7 @@ import java.util.*;
  * per SQL template (PostgreSQL's query identifier) and per access path within it.
  */
 public final class AccessLedger {
-    public static final int VERSION = 2;
+    public static final int VERSION = 3;
 
     private static final class Tally {
         long units, candidates, visible, heapFetches, recheck;
@@ -80,6 +80,8 @@ public final class AccessLedger {
     private final Map<String, Long> rejected = new TreeMap<>();
     private final Map<String, Long> excluded = new TreeMap<>();
     private final Map<String, Long> writes = new TreeMap<>();
+    private final Map<String, Long> groups = new TreeMap<>();
+    private long searchOperations;
     private final Map<String, Tally> byIndex = new TreeMap<>();
     private final Map<Long, Template> templates = new TreeMap<>();
     private final Tally total = new Tally();
@@ -98,6 +100,12 @@ public final class AccessLedger {
                             @Override
                             public void unitSettled(Unit unit) throws IOException {
                                 settle(unit);
+                            }
+
+                            @Override
+                            public void groupSettled(AccessUnits.BitmapGroup group)
+                                    throws IOException {
+                                settleGroup(group);
                             }
 
                             @Override
@@ -191,6 +199,7 @@ public final class AccessLedger {
                 JsonObject e = JsonParser.parseString(line).getAsJsonObject();
                 sessionEvents++;
                 events++;
+                RunTiming.current().advance(1);
                 int eventPid = e.get("pid").getAsInt();
                 if (pid == 0) pid = eventPid;
                 else if (pid != eventPid)
@@ -249,17 +258,28 @@ public final class AccessLedger {
         byIndex.computeIfAbsent(unit.scan.index, ignored -> new Tally()).add(unit);
         bySource.merge(unit.source.label, 1L, Long::sum);
         byKind.merge(unit.kind(), 1L, Long::sum);
+        if (unit.request != null) requestUnits.computeIfAbsent(unit.request, ignored -> new ArrayList<>()).add(unit);
         Decision decision = AccessProjection.decide(unit, catalog, cCollation);
+        // A BitmapAnd input is labelled by its group's decision once the whole group settled.
+        if (decision.grouped()) return;
+        record(unit, decision);
+    }
+
+    private void settleGroup(AccessUnits.BitmapGroup group) throws IOException {
+        Decision decision = AccessProjection.decideGroup(group, catalog, cCollation);
+        groups.merge(decision.projected() ? "intersection_groups" : "rejected_groups", 1L, Long::sum);
+        for (Unit unit : group.members) record(unit, decision);
+    }
+
+    private void record(Unit unit, Decision decision) {
         String label =
                 decision.projected()
                         ? decision.shape()
                         : (decision.excluded() ? "excluded:" : "rejected:") + decision.reason();
         (decision.projected() ? projected : decision.excluded() ? excluded : rejected)
                 .merge(decision.projected() ? decision.shape() : decision.reason(), 1L, Long::sum);
-        if (unit.request != null) {
-            requestUnits.computeIfAbsent(unit.request, ignored -> new ArrayList<>()).add(unit);
-            decisions.put(unit, label);
-        }
+        if (decision.projected()) searchOperations += decision.parts().size();
+        if (unit.request != null) decisions.put(unit, label);
     }
 
     private void finish(Request request) throws IOException {
@@ -358,6 +378,8 @@ public final class AccessLedger {
         projection.put("projected", projected);
         projection.put("rejected", rejected);
         projection.put("excluded", excluded);
+        projection.put("bitmap_and_groups", groups);
+        projection.put("search_operations", searchOperations);
         result.put("projection", projection);
         var indexReports = new ArrayList<Map<String, Object>>();
         var names = new TreeSet<String>(byIndex.keySet());
@@ -439,7 +461,9 @@ public final class AccessLedger {
                             + " plan node, scan kind and index of one request.",
                         "Planner endpoint probes and rescans never fetched from are excluded and"
                             + " reported separately.",
-                        "Write maintenance (index_insert_attempt) is not a search."));
+                        "Write maintenance (index_insert_attempt) is not a search.",
+                        "A BitmapAnd's inputs from one cycle are one group: the heap checks their"
+                            + " intersection, so each input carries the group's decision."));
         result.put(
                 "limitations",
                 List.of(
@@ -447,8 +471,9 @@ public final class AccessLedger {
                             + " index result.",
                         "Seq scans produce no index event; zero access units is an observed fact, not"
                             + " a plan inference.",
-                        "Lossy bitmap pages carry no candidate TIDs and are rejected; so are bitmap"
-                            + " candidates the heap never checked (BitmapAnd, early stop)."));
+                        "Rejected only where a fact is missing: lossy bitmap pages carry no candidate"
+                            + " TIDs, a bitmap heap scan stopped early never checked some candidates,"
+                            + " and an all-visible index-only row carries no primary key."));
         return result;
     }
 }

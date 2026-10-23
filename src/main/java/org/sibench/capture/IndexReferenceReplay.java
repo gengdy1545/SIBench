@@ -5,7 +5,6 @@ import org.sibench.capture.IndexOperationTrace.Range;
 import org.sibench.trace.IndexKey;
 
 import java.io.IOException;
-import java.nio.file.Path;
 import java.util.*;
 
 /**
@@ -143,6 +142,8 @@ public final class IndexReferenceReplay {
     }
 
     public void accept(Operation operation) throws IOException {
+        if (!groupMembers.isEmpty() && !operation.grouped())
+            throw new IOException("Search group interrupted before its last member");
         if (IndexOperationTrace.isControl(operation))
             throw new IOException("Source controls must not reach the index");
         if (operation.table() < 1
@@ -151,20 +152,12 @@ public final class IndexReferenceReplay {
             throw new IOException("Invalid or disabled index identity");
         if (operation.kind() == IndexOperationTrace.SEARCH) {
             validateSearch(operation);
-            List<LookupResult> results =
-                    search(
-                            operation.table(),
-                            operation.index(),
-                            operation.range(),
-                            operation.readTimestamp());
-            if (results.size() != operation.expectedCount())
-                throw new IOException(
-                        "Search count mismatch at source event "
-                                + operation.sourceEvent()
-                                + ": expected "
-                                + operation.expectedCount()
-                                + ", found "
-                                + results.size());
+            List<LookupResult> results = results(operation);
+            if (operation.grouped()) {
+                group(operation, results);
+                return;
+            }
+            expect(operation, results.size());
             for (LookupResult result : results) checked(operation, result);
             checkedResults += results.size();
             queries++;
@@ -353,6 +346,90 @@ public final class IndexReferenceReplay {
         return results;
     }
 
+    /** The entries one search names: a range, or the single entry a pinned search names. */
+    private List<LookupResult> results(Operation operation) throws IOException {
+        if (operation.key() == null)
+            return search(
+                    operation.table(), operation.index(), operation.range(), operation.readTimestamp());
+        LookupResult entry =
+                lookupEntry(
+                        operation.table(),
+                        operation.index(),
+                        operation.key(),
+                        operation.range().lower(),
+                        operation.readTimestamp());
+        return entry == null ? List.of() : List.of(entry);
+    }
+
+    private static void expect(Operation operation, long found) throws IOException {
+        if (found != operation.expectedCount())
+            throw new IOException(
+                    "Search count mismatch at source event "
+                            + operation.sourceEvent()
+                            + ": expected "
+                            + operation.expectedCount()
+                            + ", found "
+                            + found);
+    }
+
+    /** The members of the open search group, with each member's results. */
+    private final List<Operation> groupMembers = new ArrayList<>();
+    private final List<List<LookupResult>> groupResults = new ArrayList<>();
+
+    /**
+     * Collects one group member; the last member combines the members' results by primary key and
+     * checks the group's count. An intersection's members may search different indexes of one
+     * table; a union's members are points of one index.
+     */
+    private void group(Operation operation, List<LookupResult> results) throws IOException {
+        if (operation.expansionPosition() != groupMembers.size())
+            throw new IOException("Search group member out of order");
+        if (!groupMembers.isEmpty()) {
+            Operation first = groupMembers.get(0);
+            if (operation.sourceEvent() != first.sourceEvent()
+                    || operation.table() != first.table()
+                    || groupFlags(operation) != groupFlags(first)
+                    || operation.readTimestamp() != first.readTimestamp()
+                    || operation.expectedCount() != first.expectedCount()
+                    || operation.expansionSize() != first.expansionSize()
+                    || operation.transactionId() != first.transactionId()
+                    || operation.mutationOrdinal() != first.mutationOrdinal()
+                    || operation.workUnitId() != first.workUnitId()
+                    || (operation.flags() & IndexOperationTrace.UNION_GROUP) != 0
+                            && operation.index() != first.index())
+                throw new IOException("Inconsistent search group member");
+        }
+        groupMembers.add(operation);
+        groupResults.add(results);
+        if (groupMembers.size() < operation.expansionSize()) return;
+        boolean intersect = (operation.flags() & IndexOperationTrace.INTERSECT_GROUP) != 0;
+        Map<IndexKey, LookupResult> combined = new LinkedHashMap<>();
+        for (LookupResult result : groupResults.get(0)) combined.put(result.key(), result);
+        for (int i = 1; i < groupResults.size(); i++) {
+            var keys = new HashSet<IndexKey>();
+            for (LookupResult result : groupResults.get(i)) {
+                keys.add(result.key());
+                if (!intersect) combined.putIfAbsent(result.key(), result);
+            }
+            if (intersect) combined.keySet().retainAll(keys);
+        }
+        groupMembers.clear();
+        groupResults.clear();
+        expect(operation, combined.size());
+        for (LookupResult result : combined.values()) checked(operation, result);
+        checkedResults += combined.size();
+        queries++;
+        if ((operation.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0) snapshotQueries++;
+    }
+
+    /** The flags every member of a group shares; range flags belong to each member. */
+    private static int groupFlags(Operation operation) {
+        return operation.flags()
+                & ~(IndexOperationTrace.LOWER_INCLUSIVE
+                        | IndexOperationTrace.UPPER_INCLUSIVE
+                        | IndexOperationTrace.DESCENDING);
+    }
+
     private void validateSearch(Operation operation) throws IOException {
         if (operation.version() != 0
                 || operation.readTimestamp() < 0
@@ -464,14 +541,4 @@ public final class IndexReferenceReplay {
         return (file << 32) | position;
     }
 
-    public static void main(String[] args) throws Exception {
-        if (args.length != 3)
-            throw new IllegalArgumentException(
-                    "IndexReferenceReplay BASELINE_OPS WORKLOAD_OPS REPORT");
-        org.sibench.replay.ReferenceReplay.runFiles(
-                Path.of(args[0]),
-                Path.of(args[1]),
-                org.sibench.replay.ReplayConfig.defaults(),
-                Path.of(args[2]));
-    }
 }

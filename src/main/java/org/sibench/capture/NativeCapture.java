@@ -13,8 +13,9 @@ import java.sql.Statement;
 import java.util.LinkedHashMap;
 
 /**
- * Small native captures of YCSB and sysbench. Stages are explicit: nothing starts PG, and a stage
- * never reuses a database, baseline or raw directory left by an earlier one.
+ * The stages of one native capture of HyBench, YCSB or sysbench. Stages are explicit: nothing
+ * starts PG, and a stage never reuses a database, baseline or raw directory left by an earlier
+ * one.
  */
 public final class NativeCapture {
     private static final String LIBRARY = "build/services/postgresql-capture/row_capture.so";
@@ -22,10 +23,33 @@ public final class NativeCapture {
     private NativeCapture() {}
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 3)
+        if (args.length != 3 && args.length != 4)
             throw new IllegalArgumentException(
-                    "NativeCapture paths|prepare|check|export|run ROOT CONFIG");
-        var config = NativeCaptureConfig.read(Path.of(args[1]), Path.of(args[2]));
+                    "NativeCapture paths|prepare|check|export|run ROOT CONFIG [TIMING]");
+        var timing = RunTiming.open(args.length == 4 ? Path.of(args[3]).toAbsolutePath() : null);
+        try {
+            timing.phase(args[0]);
+            stage(args, timing);
+        } finally {
+            timing.close();
+        }
+    }
+
+    private static void stage(String[] args, RunTiming timing) throws Exception {
+        Path root = Path.of(args[1]);
+        String benchmark =
+                org.sibench.config.ConfigValues.string(
+                        org.sibench.config.ConfigValues.parse(
+                                java.nio.file.Files.readString(root.resolve(args[2]))),
+                        "benchmark");
+        if (benchmark.equals("hybench")) {
+            var config = CaptureConfig.read(root, Path.of(args[2]));
+            timing.note("benchmark", "hybench").note("database", config.database());
+            hybench(args[0], root, args[2], config);
+            return;
+        }
+        var config = NativeCaptureConfig.read(root, Path.of(args[2]));
+        timing.note("benchmark", config.benchmark()).note("database", config.database());
         switch (args[0]) {
             case "paths" -> {
                 System.out.println("SIBENCH_RAW='" + config.raw() + "'");
@@ -52,6 +76,45 @@ public final class NativeCapture {
             }
             case "run" -> run(config);
             default -> throw new IllegalArgumentException("Unknown stage: " + args[0]);
+        }
+    }
+
+    /** HyBench stages: the same contract, against the cloned still database. */
+    private static void hybench(String stage, Path root, String profile, CaptureConfig config)
+            throws Exception {
+        switch (stage) {
+            case "paths" -> {
+                System.out.println("SIBENCH_RAW='" + config.raw() + "'");
+                System.out.println(
+                        "SIBENCH_PORT="
+                                + org.sibench.config.ConfigValues.positive(
+                                        org.sibench.config.ConfigValues.object(
+                                                config.document(), "postgres"),
+                                        "port"));
+                System.out.println("SIBENCH_DATABASE='" + config.database() + "'");
+                System.out.println("SIBENCH_ARTIFACTS='" + config.artifacts() + "'");
+                System.out.println("SIBENCH_WORKDIR='" + config.workDir() + "'");
+            }
+            case "prepare" -> HybenchNativePrepare.prepare(root, config);
+            case "check" ->
+                    System.out.println(
+                            org.sibench.schema.PgSchemaCheck.json(
+                                    org.sibench.schema.PgSchemaCheck.check(
+                                            root, config.document(), config.jdbc(), config.user())));
+            case "export" -> {
+                org.sibench.capture.PgBaselineExport.export(
+                        config.jdbc(), config.layout().output(), config.layout());
+                org.sibench.capture.PgBaselineVerify.verify(
+                        config.jdbc(),
+                        config.user(),
+                        org.sibench.schema.SourceSchema.hybench(config.source()),
+                        config.layout().output());
+            }
+            case "run" -> {
+                java.nio.file.Files.createDirectories(config.artifacts().resolve("native"));
+                HybenchNativeRun.run(root, Path.of(profile));
+            }
+            default -> throw new IllegalArgumentException("Unknown stage: " + stage);
         }
     }
 

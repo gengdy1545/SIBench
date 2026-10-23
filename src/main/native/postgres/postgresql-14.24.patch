@@ -1,3 +1,46 @@
+--- a/src/backend/access/heap/heapam_handler.c
++++ b/src/backend/access/heap/heapam_handler.c
+@@ -18,6 +18,7 @@
+  *-------------------------------------------------------------------------
+  */
+ #include "postgres.h"
++#include "sibench_capture.h"
+ 
+ #include "access/genam.h"
+ #include "access/heapam.h"
+@@ -2175,14 +2176,30 @@
+ 			ItemPointerData tid;
+ 			HeapTupleData heapTuple;
+ 
++			ItemPointerData candidate;
++			bool		found;
++
+ 			ItemPointerSet(&tid, page, offnum);
+-			if (heap_hot_search_buffer(&tid, scan->rs_rd, buffer, snapshot,
+-									   &heapTuple, NULL, true))
++			candidate = tid;
++			found = heap_hot_search_buffer(&tid, scan->rs_rd, buffer, snapshot,
++										   &heapTuple, NULL, true);
++			if (found)
+ 				hscan->rs_vistuples[ntup++] = ItemPointerGetOffsetNumber(&tid);
++			/* The verdict is for the index's TID, the root of any HOT chain. */
++			if (sibench_bitmap_heap_node)
++				sib_bitmap_verdict(scan->rs_rd, sibench_bitmap_heap_node, &candidate, found);
+ 		}
+ 	}
+ 	else
+ 	{
++		/* A lossy page has no candidate TIDs to attribute to an index. */
++		if (sibench_bitmap_heap_node && sib_relation(scan->rs_rd))
++		{
++			char		detail[64];
++
++			snprintf(detail, sizeof(detail), "\"heap\":\"%p\"", sibench_bitmap_heap_node);
++			sib_emit("bitmap_heap_lossy", scan->rs_rd, detail);
++		}
+ 		/*
+ 		 * Bitmap is lossy, so we must examine each line pointer on the page.
+ 		 * But we can ignore HOT chains, since we'll check each tuple anyway.
 --- a/src/backend/access/index/indexam.c
 +++ b/src/backend/access/index/indexam.c
 @@ -42,6 +42,9 @@
@@ -46,7 +89,7 @@
  									scan->xs_snapshot, slot,
  									&scan->xs_heap_continue, &all_dead);
  
-+	sib_scan("heap_visibility", scan, NULL, 0, found ? &slot->tts_tid : &scan->xs_heaptid, 0, found);
++	sib_heap_visibility(scan, slot, found);
  	if (found)
  		pgstat_count_heap_fetch(scan->indexRelation);
  
@@ -69,54 +112,39 @@
  
  	pgstat_count_index_tuples(scan->indexRelation, ntids);
  
---- a/src/backend/executor/execMain.c
-+++ b/src/backend/executor/execMain.c
-@@ -36,6 +36,8 @@
-  *-------------------------------------------------------------------------
+--- a/src/backend/access/transam/xact.c
++++ b/src/backend/access/transam/xact.c
+@@ -16,6 +16,7 @@
   */
+ 
  #include "postgres.h"
 +#include "sibench_capture.h"
-+#include "sibench_receiver.h"
  
- #include "access/heapam.h"
- #include "access/htup_details.h"
-@@ -149,6 +151,15 @@
- 	EState	   *estate;
- 	MemoryContext oldcontext;
- 
-+	if (sib_enabled())
-+	{
-+		StringInfoData detail;
-+		initStringInfo(&detail);
-+		appendStringInfoString(&detail, "\"sql\":");
-+		escape_json(&detail, queryDesc->sourceText ? queryDesc->sourceText : "");
-+		sib_emit("executor_start", NULL, detail.data);
-+		pfree(detail.data);
-+	}
- 	/* sanity checks: queryDesc must not be started already */
- 	Assert(queryDesc != NULL);
- 	Assert(queryDesc->estate == NULL);
-@@ -340,6 +351,7 @@
+ #include <time.h>
+ #include <unistd.h>
+@@ -2239,6 +2240,11 @@
+ 	 * state.
  	 */
- 	operation = queryDesc->operation;
- 	dest = queryDesc->dest;
-+	if (sib_enabled()) dest = sib_wrap_receiver(dest);
  
- 	/*
- 	 * startup tuple receiver, if we will be emitting tuples
-@@ -463,6 +475,12 @@
- {
- 	EState	   *estate;
- 	MemoryContext oldcontext;
-+	if (sib_enabled())
 +	{
-+		char detail[128];
-+		snprintf(detail, sizeof(detail), "\"processed\":%llu", (unsigned long long) queryDesc->estate->es_processed);
-+		sib_emit("executor_end", NULL, detail);
++		char sib_detail[64];
++		snprintf(sib_detail, sizeof(sib_detail), "\"csn\":%llu", (unsigned long long) sib_completion());
++		sib_emit("transaction_commit", NULL, sib_detail);
 +	}
+ 	CallXactCallbacks(is_parallel_worker ? XACT_EVENT_PARALLEL_COMMIT
+ 					  : XACT_EVENT_COMMIT);
  
- 	/* sanity checks */
- 	Assert(queryDesc != NULL);
+@@ -2777,7 +2783,9 @@
+ 			CallXactCallbacks(XACT_EVENT_PARALLEL_ABORT);
+ 		else
+ 		{
+-			sib_emit("transaction_abort", NULL, NULL);
++			char sib_detail[64];
++			snprintf(sib_detail, sizeof(sib_detail), "\"csn\":%llu", (unsigned long long) sib_completion());
++			sib_emit("transaction_abort", NULL, sib_detail);
+ 			CallXactCallbacks(XACT_EVENT_ABORT);
+ 		}
+ 
 --- a/src/backend/catalog/index.c
 +++ b/src/backend/catalog/index.c
 @@ -20,6 +20,7 @@
@@ -144,35 +172,292 @@
  
  	/*
  	 * If this is an unlogged index, we may need to write out an init fork for
---- a/src/backend/access/transam/xact.c
-+++ b/src/backend/access/transam/xact.c
-@@ -16,6 +16,7 @@
+--- a/src/backend/executor/execMain.c
++++ b/src/backend/executor/execMain.c
+@@ -36,6 +36,8 @@
+  *-------------------------------------------------------------------------
   */
+ #include "postgres.h"
++#include "sibench_capture.h"
++#include "sibench_receiver.h"
  
+ #include "access/heapam.h"
+ #include "access/htup_details.h"
+@@ -149,6 +151,18 @@
+ 	EState	   *estate;
+ 	MemoryContext oldcontext;
+ 
++	if (sib_enabled())
++	{
++		StringInfoData detail;
++		initStringInfo(&detail);
++		appendStringInfoString(&detail, "\"sql\":");
++		escape_json(&detail, queryDesc->sourceText ? queryDesc->sourceText : "");
++		/* Core query jumbling (compute_query_id = on): constants do not change the identity. */
++		appendStringInfo(&detail, ",\"query_id\":%lld",
++						 (long long) queryDesc->plannedstmt->queryId);
++		sib_emit("executor_start", NULL, detail.data);
++		pfree(detail.data);
++	}
+ 	/* sanity checks: queryDesc must not be started already */
+ 	Assert(queryDesc != NULL);
+ 	Assert(queryDesc->estate == NULL);
+@@ -340,6 +354,7 @@
+ 	 */
+ 	operation = queryDesc->operation;
+ 	dest = queryDesc->dest;
++	if (sib_enabled()) dest = sib_wrap_receiver(dest);
+ 
+ 	/*
+ 	 * startup tuple receiver, if we will be emitting tuples
+@@ -372,6 +387,14 @@
+ 	if (queryDesc->totaltime)
+ 		InstrStopNode(queryDesc->totaltime, estate->es_processed);
+ 
++	if (sib_enabled())
++	{
++		char detail[128];
++		snprintf(detail, sizeof(detail), "\"processed\":%llu",
++				 (unsigned long long) estate->es_processed);
++		sib_emit("executor_run_end", NULL, detail);
++	}
++
+ 	MemoryContextSwitchTo(oldcontext);
+ }
+ 
+@@ -463,6 +486,12 @@
+ {
+ 	EState	   *estate;
+ 	MemoryContext oldcontext;
++	if (sib_enabled())
++	{
++		char detail[128];
++		snprintf(detail, sizeof(detail), "\"processed\":%llu", (unsigned long long) queryDesc->estate->es_processed);
++		sib_emit("executor_end", NULL, detail);
++	}
+ 
+ 	/* sanity checks */
+ 	Assert(queryDesc != NULL);
+--- a/src/backend/executor/nodeBitmapHeapscan.c
++++ b/src/backend/executor/nodeBitmapHeapscan.c
+@@ -34,6 +34,7 @@
+  *		ExecEndBitmapHeapScan		releases all storage.
+  */
  #include "postgres.h"
 +#include "sibench_capture.h"
  
- #include <time.h>
- #include <unistd.h>
-@@ -2239,6 +2240,7 @@
- 	 * state.
- 	 */
+ #include <math.h>
  
-+	sib_emit("transaction_commit", NULL, NULL);
- 	CallXactCallbacks(is_parallel_worker ? XACT_EVENT_PARALLEL_COMMIT
- 					  : XACT_EVENT_COMMIT);
+@@ -61,6 +62,95 @@
+ 								  TableScanDesc scan);
+ static bool BitmapShouldInitializeSharedState(ParallelBitmapHeapState *pstate);
  
-@@ -2776,7 +2778,10 @@
- 		if (is_parallel_worker)
- 			CallXactCallbacks(XACT_EVENT_PARALLEL_ABORT);
- 		else
-+		{
-+			sib_emit("transaction_abort", NULL, NULL);
- 			CallXactCallbacks(XACT_EVENT_ABORT);
-+		}
++/* The bitmap heap node whose page is being fetched; heapam reports per-TID visibility for it. */
++void	   *sibench_bitmap_heap_node = NULL;
++
++/* Collects the index scans that feed a bitmap: one BitmapIndexScan, or BitmapAnd/Or inputs. */
++static void
++sib_bitmap_inputs(PlanState *input, StringInfo out)
++{
++	int			i;
++
++	if (IsA(input, BitmapIndexScanState))
++		appendStringInfo(out, "%s\"%p\"", out->data[out->len - 1] == '[' ? "" : ",",
++						 (void *) ((BitmapIndexScanState *) input)->biss_ScanDesc);
++	else if (IsA(input, BitmapOrState))
++		for (i = 0; i < ((BitmapOrState *) input)->nplans; i++)
++			sib_bitmap_inputs(((BitmapOrState *) input)->bitmapplans[i], out);
++	else if (IsA(input, BitmapAndState))
++		for (i = 0; i < ((BitmapAndState *) input)->nplans; i++)
++			sib_bitmap_inputs(((BitmapAndState *) input)->bitmapplans[i], out);
++}
++
++/*
++ * The combination of the index scans as a tree: a scan identity, or {"and":[...]} / {"or":[...]}
++ * over subtrees. A flat input list cannot tell an intersection of a union from a union of scans.
++ */
++static void
++sib_bitmap_tree(PlanState *input, StringInfo out)
++{
++	int			i,
++				count;
++	PlanState **plans;
++
++	if (IsA(input, BitmapIndexScanState))
++	{
++		appendStringInfo(out, "\"%p\"", (void *) ((BitmapIndexScanState *) input)->biss_ScanDesc);
++		return;
++	}
++	if (IsA(input, BitmapOrState))
++	{
++		appendStringInfoString(out, "{\"or\":[");
++		count = ((BitmapOrState *) input)->nplans;
++		plans = ((BitmapOrState *) input)->bitmapplans;
++	}
++	else
++	{
++		appendStringInfoString(out, "{\"and\":[");
++		count = ((BitmapAndState *) input)->nplans;
++		plans = ((BitmapAndState *) input)->bitmapplans;
++	}
++	for (i = 0; i < count; i++)
++	{
++		if (i)
++			appendStringInfoChar(out, ',');
++		sib_bitmap_tree(plans[i], out);
++	}
++	appendStringInfoString(out, "]}");
++}
++
++/* Binds a bitmap heap node to the index scans whose candidates it checks. */
++static void
++sib_bitmap_binding(BitmapHeapScanState *node)
++{
++	StringInfoData out;
++
++	if (!sib_relation(node->ss.ss_currentRelation))
++		return;
++	initStringInfo(&out);
++	appendStringInfo(&out, "\"heap\":\"%p\",\"plan_node\":%d,\"tree\":",
++					 (void *) node, node->ss.ps.plan->plan_node_id);
++	sib_bitmap_tree(outerPlanState(node), &out);
++	appendStringInfoString(&out, ",\"scans\":[");
++	sib_bitmap_inputs(outerPlanState(node), &out);
++	appendStringInfoChar(&out, ']');
++	sib_emit("plan_bitmap_heap", node->ss.ss_currentRelation, out.data);
++	pfree(out.data);
++}
++
++/* All-visible pages are not fetched; every exact candidate on them is visible. */
++static void
++sib_bitmap_skipped(BitmapHeapScanState *node, TBMIterateResult *tbmres)
++{
++	int			i;
++	ItemPointerData tid;
++
++	for (i = 0; i < tbmres->ntuples; i++)
++	{
++		ItemPointerSet(&tid, tbmres->blockno, tbmres->offsets[i]);
++		sib_bitmap_verdict(node->ss.ss_currentRelation, node, &tid, true);
++	}
++}
  
- 		ResourceOwnerRelease(TopTransactionResourceOwner,
- 							 RESOURCE_RELEASE_BEFORE_LOCKS,
+ /* ----------------------------------------------------------------
+  *		BitmapHeapNext
+@@ -236,11 +326,27 @@
+ 				 * node->return_empty_tuples.
+ 				 */
+ 				node->return_empty_tuples = tbmres->ntuples;
++				sib_bitmap_skipped(node, tbmres);
+ 			}
+-			else if (!table_scan_bitmap_next_block(scan, tbmres))
++			else
+ 			{
+-				/* AM doesn't think this block is valid, skip */
+-				continue;
++				volatile bool valid = false;
++
++				sibench_bitmap_heap_node = node;
++				PG_TRY();
++				{
++					valid = table_scan_bitmap_next_block(scan, tbmres);
++				}
++				PG_FINALLY();
++				{
++					sibench_bitmap_heap_node = NULL;
++				}
++				PG_END_TRY();
++				if (!valid)
++				{
++					/* AM doesn't think this block is valid, skip */
++					continue;
++				}
+ 			}
+ 
+ 			/* Adjust the prefetch target */
+@@ -813,6 +919,8 @@
+ 		get_tablespace_io_concurrency(currentRelation->rd_rel->reltablespace);
+ 
+ 	scanstate->ss.ss_currentRelation = currentRelation;
++	/* The binding names the heap relation, so it follows the assignment above. */
++	sib_bitmap_binding(scanstate);
+ 
+ 	scanstate->ss.ss_currentScanDesc = table_beginscan_bm(currentRelation,
+ 														  estate->es_snapshot,
+--- a/src/backend/executor/nodeBitmapIndexscan.c
++++ b/src/backend/executor/nodeBitmapIndexscan.c
+@@ -20,6 +20,7 @@
+  *		ExecEndBitmapIndexScan		releases all storage.
+  */
+ #include "postgres.h"
++#include "sibench_capture.h"
+ 
+ #include "access/genam.h"
+ #include "executor/execdebug.h"
+@@ -312,6 +313,7 @@
+ 		index_beginscan_bitmap(indexstate->biss_RelationDesc,
+ 							   estate->es_snapshot,
+ 							   indexstate->biss_NumScanKeys);
++	sib_plan_scan("bitmap", node->scan.plan.plan_node_id, indexstate->biss_ScanDesc);
+ 
+ 	/*
+ 	 * If no run-time keys to calculate, go ahead and pass the scankeys to the
+--- a/src/backend/executor/nodeIndexonlyscan.c
++++ b/src/backend/executor/nodeIndexonlyscan.c
+@@ -29,6 +29,7 @@
+  *		ExecIndexOnlyScanInitializeWorker attach to DSM info in parallel worker
+  */
+ #include "postgres.h"
++#include "sibench_capture.h"
+ 
+ #include "access/genam.h"
+ #include "access/htup_details.h"
+@@ -100,6 +101,7 @@
+ 								   node->ioss_NumOrderByKeys);
+ 
+ 		node->ioss_ScanDesc = scandesc;
++		sib_plan_scan("index_only", node->ss.ps.plan->plan_node_id, scandesc);
+ 
+ 
+ 		/* Set it up for index-only scan */
+@@ -192,6 +194,8 @@
+ 
+ 			tuple_from_heap = true;
+ 		}
++		else
++			sib_scan("vm_visible", scandesc, NULL, 0, tid, 0, true);
+ 
+ 		/* Fill the scan tuple slot with data from the index */
+ 		StoreIndexTuple(node, slot, scandesc);
+--- a/src/backend/executor/nodeIndexscan.c
++++ b/src/backend/executor/nodeIndexscan.c
+@@ -28,6 +28,10 @@
+  *		ExecIndexScanInitializeWorker attach to DSM info in parallel worker
+  */
+ #include "postgres.h"
++#include "sibench_capture.h"
++
++int sibench_depth = 0;
++uint64 sibench_request = 0;
+ 
+ #include "access/nbtree.h"
+ #include "access/relscan.h"
+@@ -116,6 +120,7 @@
+ 								   node->iss_NumOrderByKeys);
+ 
+ 		node->iss_ScanDesc = scandesc;
++		sib_plan_scan("index", node->ss.ps.plan->plan_node_id, scandesc);
+ 
+ 		/*
+ 		 * If no run-time keys to calculate or they are ready, go ahead and
+@@ -211,6 +216,7 @@
+ 								   node->iss_NumOrderByKeys);
+ 
+ 		node->iss_ScanDesc = scandesc;
++		sib_plan_scan("index", node->ss.ps.plan->plan_node_id, scandesc);
+ 
+ 		/*
+ 		 * If no run-time keys to calculate or they are ready, go ahead and
 --- a/src/backend/nodes/tidbitmap.c
 +++ b/src/backend/nodes/tidbitmap.c
 @@ -37,6 +37,7 @@
@@ -193,3 +478,50 @@
  	Assert(tbm->iterating == TBM_NOT_ITERATING);
  	for (i = 0; i < ntids; i++)
  	{
+--- a/src/backend/storage/ipc/procarray.c
++++ b/src/backend/storage/ipc/procarray.c
+@@ -44,6 +44,9 @@
+  *-------------------------------------------------------------------------
+  */
+ #include "postgres.h"
++#include "sibench_capture.h"
++/* The completion counter of the last snapshot this backend built. */
++uint64 sibench_snapshot_csn = 0;
+ 
+ #include <signal.h>
+ 
+@@ -787,6 +790,8 @@
+ 
+ 	/* Same with xactCompletionCount  */
+ 	ShmemVariableCache->xactCompletionCount++;
++	/* The exact position at which this transaction stopped counting as running. */
++	proc->sibenchCompletion = ShmemVariableCache->xactCompletionCount;
+ }
+ 
+ /*
+@@ -2586,6 +2591,9 @@
+ 	snapshot->subxcnt = subcount;
+ 	snapshot->suboverflowed = suboverflowed;
+ 	snapshot->snapXactCompletionCount = curXactCompletionCount;
++	/* A copied or imported snapshot loses that field, so keep the counter here too: under
++	 * read committed every statement builds a fresh snapshot before it runs. */
++	sibench_snapshot_csn = curXactCompletionCount;
+ 
+ 	snapshot->curcid = GetCurrentCommandId(false);
+ 
+--- a/src/include/storage/proc.h
++++ b/src/include/storage/proc.h
+@@ -265,6 +265,13 @@
+ 	PGPROC	   *lockGroupLeader;	/* lock group leader, if I'm a member */
+ 	dlist_head	lockGroupMembers;	/* list of members, if I'm a leader */
+ 	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
++
++	/*
++	 * SIBench: the transaction completion count this process's last transaction with an XID
++	 * reached, set under ProcArrayLock where it is incremented. Group XID clearing increments it
++	 * in the group leader on a member's behalf, so it lives on the PGPROC, not in the backend.
++	 */
++	uint64		sibenchCompletion;
+ };
+ 
+ /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */

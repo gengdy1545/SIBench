@@ -1,22 +1,32 @@
 package org.sibench.cli;
 
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 import org.sibench.capture.AccessLedger;
+import org.sibench.capture.CaptureCompleteness;
+import org.sibench.capture.CaptureProfile;
 import org.sibench.capture.IndexTraceCompiler;
+import org.sibench.capture.LedgerComparison;
+import org.sibench.capture.RelocationCheck;
 import org.sibench.capture.RowStateAudit;
+import org.sibench.capture.RunTiming;
 import org.sibench.config.ConfigValues;
 import org.sibench.generation.BaselineGenerator;
 import org.sibench.replay.ReferenceReplay;
 import org.sibench.replay.ReplayConfig;
+import org.sibench.replay.ReplayMatrixValidation;
 import org.sibench.replay.SnapshotLookupValidation;
 import org.sibench.schema.PgSchemaCheck;
 import org.sibench.schema.SourceSchema;
 import org.sibench.workloads.ScaleInspector;
 
+import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -26,7 +36,10 @@ public final class Sibench {
     private Sibench() {}
 
     public static void main(String[] args) {
-        System.exit(run(args, System.out, System.err));
+        // Close before exiting: System.exit() never returns, so a finally block would not run.
+        int status = run(args, System.out, System.err);
+        RunTiming.current().close();
+        System.exit(status);
     }
 
     public static int run(String[] args, PrintStream out, PrintStream err) {
@@ -44,7 +57,12 @@ public final class Sibench {
                             "check-schema",
                             "audit-rows",
                             "access-ledger",
-                            "compile-trace")
+                            "compare-ledgers",
+                            "snapshot-index-counters",
+                            "check-capture-completeness",
+                            "compile-trace",
+                            "validate-replay-matrix",
+                            "check-relocation")
                     .contains(args[0])) {
                 throw new IllegalArgumentException("Unknown command: " + args[0]);
             }
@@ -58,12 +76,14 @@ public final class Sibench {
                     return 0;
                 } else if (args[i].equals("--dry-run") && args[0].equals("prepare")) {
                     dryRun = true;
-                } else if (List.of("check-schema", "audit-rows").contains(args[0])
+                } else if (List.of("check-schema", "audit-rows", "snapshot-index-counters")
+                                .contains(args[0])
                         && args[i].equals("--jdbc")) {
                     if (++i == args.length)
                         throw new IllegalArgumentException("--jdbc requires a URL");
                     jdbc = args[i];
-                } else if (List.of("check-schema", "audit-rows").contains(args[0])
+                } else if (List.of("check-schema", "audit-rows", "snapshot-index-counters")
+                                .contains(args[0])
                         && args[i].equals("--user")) {
                     if (++i == args.length)
                         throw new IllegalArgumentException("--user requires a role");
@@ -73,6 +93,10 @@ public final class Sibench {
                         throw new IllegalArgumentException("--root requires a path");
                     }
                     root = Path.of(args[i]).toAbsolutePath();
+                } else if (args[i].equals("--timing")) {
+                    if (++i == args.length)
+                        throw new IllegalArgumentException("--timing requires a path");
+                    RunTiming.open(Path.of(args[i]).toAbsolutePath()).phase(args[0]);
                 } else if (args[i].startsWith("-")) {
                     throw new IllegalArgumentException("Unknown option: " + args[i]);
                 } else {
@@ -117,6 +141,84 @@ public final class Sibench {
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(report));
                 return 0;
             }
+            if (args[0].equals("compare-ledgers")) {
+                if (profiles.size() != 2 && profiles.size() != 3)
+                    throw new IllegalArgumentException(
+                            "compare-ledgers requires REPORT_A REPORT_B [OUTPUT]");
+                var report =
+                        LedgerComparison.compare(
+                                json(root.resolve(profiles.get(0))),
+                                json(root.resolve(profiles.get(1))));
+                if (profiles.size() == 2) {
+                    out.println(new GsonBuilder().setPrettyPrinting().create().toJson(report));
+                    return 0;
+                }
+                Path output = root.resolve(profiles.get(2));
+                if (Files.exists(output))
+                    throw new IOException("Ledger comparison already exists: " + output);
+                Files.writeString(
+                        output,
+                        new GsonBuilder().setPrettyPrinting().create().toJson(report),
+                        StandardOpenOption.CREATE_NEW);
+                return 0;
+            }
+            if (args[0].equals("snapshot-index-counters")) {
+                if (profiles.size() != 2 || jdbc == null || user == null)
+                    throw new IllegalArgumentException(
+                            "snapshot-index-counters requires PROFILE OUTPUT --jdbc URL --user"
+                                + " ROLE");
+                if (!jdbc.startsWith("jdbc:postgresql:"))
+                    throw new IllegalArgumentException(
+                            "snapshot-index-counters requires a PostgreSQL JDBC URL");
+                if (!Files.exists(root.resolve(profiles.get(0))))
+                    throw new IOException("Unknown capture profile: " + profiles.get(0));
+                var report =
+                        CaptureCompleteness.snapshot(
+                                jdbc, user, root.resolve(profiles.get(1)), profiles.get(0));
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(report));
+                return 0;
+            }
+            if (args[0].equals("check-capture-completeness")) {
+                if (profiles.size() != 4)
+                    throw new IllegalArgumentException(
+                            "check-capture-completeness requires PROFILE LEDGER BEFORE AFTER");
+                if (!Files.exists(root.resolve(profiles.get(0))))
+                    throw new IOException("Unknown capture profile: " + profiles.get(0));
+                var report =
+                        CaptureCompleteness.compare(
+                                json(root.resolve(profiles.get(1))),
+                                json(root.resolve(profiles.get(2))),
+                                json(root.resolve(profiles.get(3))));
+                out.println(
+                        new GsonBuilder()
+                                .serializeNulls()
+                                .setPrettyPrinting()
+                                .disableHtmlEscaping()
+                                .create()
+                                .toJson(report));
+                return 0;
+            }
+            if (args[0].equals("validate-replay-matrix")) {
+                if (profiles.size() != 2)
+                    throw new IllegalArgumentException(
+                            "validate-replay-matrix requires NORMALIZED_DIRECTORY OUTPUT_DIRECTORY");
+                ReplayMatrixValidation.validate(
+                        root.resolve(profiles.get(0)), root.resolve(profiles.get(1)));
+                out.println(Files.readString(root.resolve(profiles.get(1)).resolve("matrix.json")));
+                return 0;
+            }
+            if (args[0].equals("check-relocation")) {
+                if (profiles.size() != 3)
+                    throw new IllegalArgumentException(
+                            "check-relocation requires PROFILE NORMALIZED_DIRECTORY OUTPUT_DIRECTORY");
+                Path output = root.resolve(profiles.get(2));
+                RelocationCheck.validate(
+                        CaptureProfile.read(root, Path.of(profiles.get(0))).layout(),
+                        root.resolve(profiles.get(1)),
+                        output);
+                out.println(Files.readString(output.resolve("report.json")));
+                return 0;
+            }
             if (args[0].equals("compile-trace")) {
                 if (profiles.size() != 2 && profiles.size() != 3)
                     throw new IllegalArgumentException(
@@ -135,8 +237,9 @@ public final class Sibench {
                                 "session_order",
                                 "baseline_operations",
                                 "workload_operations",
-                                "searches",
-                                "searches_by_shape",
+                                "searched_accesses",
+                                "search_operations",
+                                "searched_accesses_by_shape",
                                 "excluded_access_units",
                                 "committed_transactions",
                                 "utility_only_transactions",
@@ -229,11 +332,19 @@ public final class Sibench {
         }
     }
 
+    private static JsonObject json(Path path) throws IOException {
+        return JsonParser.parseString(Files.readString(path)).getAsJsonObject();
+    }
+
     private static void printHelp(PrintStream out) {
         out.println(
                 "Usage: java -jar build/sibench/sibench.jar inspect-scale [--root PATH] [PROFILE"
                         + " ...]");
         out.println("Root defaults to the working directory. Profiles are relative to root.");
+        out.println(
+                "Every command accepts --timing FILE: its phase wall clock, event count and the"
+                    + " facts noted by the command are appended to that one file, so a whole run"
+                    + " leaves a single timing artifact.");
         out.println(
                 "       java -jar build/sibench/sibench.jar check-schema [--root PATH]"
                         + " PROFILE --jdbc URL --user ROLE");
@@ -248,11 +359,38 @@ public final class Sibench {
         out.println(
                 "access-ledger partitions raw PG index events into access units; it never touches PG.");
         out.println(
+                "       java -jar build/sibench/sibench.jar compare-ledgers [--root PATH]"
+                        + " REPORT_A REPORT_B [OUTPUT]");
+        out.println(
+                "compare-ledgers aligns two access-ledger reports by query_id and reports plan and"
+                    + " access-path drift.");
+        out.println(
+                "       java -jar build/sibench/sibench.jar snapshot-index-counters [--root PATH]"
+                        + " PROFILE OUTPUT --jdbc URL --user ROLE");
+        out.println(
+                "       java -jar build/sibench/sibench.jar check-capture-completeness [--root PATH]"
+                        + " PROFILE LEDGER BEFORE AFTER");
+        out.println(
+                "check-capture-completeness cross-checks a ledger against the PG index counter"
+                    + " deltas of two snapshots; it never touches PG.");
+        out.println(
                 "       java -jar build/sibench/sibench.jar compile-trace [--root PATH]"
                         + " PROFILE OUTPUT [ROW_AUDIT]");
         out.println(
                 "compile-trace turns a completed capture into baseline/workload traces; any access"
                         + " it cannot project fails the compilation.");
+        out.println(
+                "       java -jar build/sibench/sibench.jar validate-replay-matrix [--root PATH]"
+                        + " NORMALIZED_DIRECTORY OUTPUT_DIRECTORY");
+        out.println(
+                "validate-replay-matrix replays 1/64/128 clients x both dispatch modes x secondary"
+                    + " indexes on/off and requires identical operation order, state and results.");
+        out.println(
+                "       java -jar build/sibench/sibench.jar check-relocation [--root PATH]"
+                        + " PROFILE NORMALIZED_DIRECTORY OUTPUT_DIRECTORY");
+        out.println(
+                "check-relocation rewrites the latest live rows of modified tables and checks exact"
+                    + " Locator relocation with RowIDs unchanged.");
         out.println(
                 "check-schema reads the live PG catalog; it never creates or repairs"
                         + " tables/indexes.");

@@ -28,7 +28,7 @@ final class RowAuditTestSupport {
             throws Exception {
         Path directory = Files.createDirectory(fixture.resolve("baseline"));
         var original =
-                CaptureConfig.read(Path.of(""), Path.of("config/hybench_tp_subset_sf1.yaml"))
+                CaptureConfig.read(Path.of(""), Path.of("config/hybench_sf1.yaml"))
                         .layout();
         var config =
                 new GenerationConfig(
@@ -314,7 +314,7 @@ final class RowAuditTestSupport {
                                 "status",
                                 "complete",
                                 "session_order",
-                                "single",
+                                "sequential",
                                 "sessions",
                                 List.of(
                                         Map.of(
@@ -327,6 +327,31 @@ final class RowAuditTestSupport {
                                                         org.sibench.generation.BaselineGenerator
                                                                 .sha256(client),
                                                 "bindings", true)))));
+    }
+
+    /**
+     * Publishes the manifest a concurrent capture writes: several backend traces, no JDBC pair, so
+     * each session is audited on its own server events.
+     */
+    static void completeConcurrent(Path directory, List<Path> servers) throws java.io.IOException {
+        var sessions = new ArrayList<Map<String, Object>>();
+        for (Path server : servers)
+            sessions.add(
+                    Map.of(
+                            "pg_file",
+                            server.getFileName().toString(),
+                            "pg_sha256",
+                            org.sibench.generation.BaselineGenerator.sha256(server)));
+        Files.writeString(
+                directory.resolve("capture-run.json"),
+                JSON.toJson(
+                        Map.of(
+                                "status",
+                                "complete",
+                                "session_order",
+                                "concurrent",
+                                "sessions",
+                                sessions)));
     }
 
     static JsonObject change(String table, String operation, JsonObject before, JsonObject after) {

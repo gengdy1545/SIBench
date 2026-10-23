@@ -27,20 +27,12 @@ final class CaptureRun implements AutoCloseable {
     private final Path directory;
     private final Map<String, Object> manifest = new LinkedHashMap<>();
     private volatile Throwable failure;
-    private Path jdbc;
-    private int backendPid;
     private final Map<Path, Integer> sessions = new LinkedHashMap<>();
     private final Map<String, Object> phases = new LinkedHashMap<>();
     private volatile String phase;
     private final java.util.Set<Path> closed = new java.util.HashSet<>();
-    private final boolean nativeHtap;
 
-    private CaptureRun(Path directory, boolean nativeHtap) throws IOException {
-        this(directory, nativeHtap, nativeHtap ? "runhtap" : "tp_subset");
-    }
-
-    private CaptureRun(Path directory, boolean nativeHtap, String mode) throws IOException {
-        this.nativeHtap = nativeHtap;
+    private CaptureRun(Path directory, String mode) throws IOException {
         this.directory = directory.toAbsolutePath().normalize();
         Files.createDirectories(this.directory);
         try (var paths = Files.list(this.directory)) {
@@ -55,13 +47,10 @@ final class CaptureRun implements AutoCloseable {
         Files.writeString(this.directory.resolve(MANIFEST), json(), StandardOpenOption.CREATE_NEW);
     }
 
+    /** A run whose sessions are JDBC connections of this process (HyBench runHTAP). */
     static synchronized CaptureRun begin(Path directory) throws IOException {
-        return begin(directory, false);
-    }
-
-    static synchronized CaptureRun begin(Path directory, boolean nativeHtap) throws IOException {
         if (active != null) throw new IOException("A capture is already active");
-        CaptureRun run = new CaptureRun(directory, nativeHtap);
+        CaptureRun run = new CaptureRun(directory, "runhtap");
         active = run;
         return run;
     }
@@ -72,7 +61,7 @@ final class CaptureRun implements AutoCloseable {
      */
     static synchronized CaptureRun beginExternal(Path directory, String mode) throws IOException {
         if (active != null) throw new IOException("A capture is already active");
-        CaptureRun run = new CaptureRun(directory, true, mode);
+        CaptureRun run = new CaptureRun(directory, mode);
         active = run;
         return run;
     }
@@ -81,13 +70,9 @@ final class CaptureRun implements AutoCloseable {
         CaptureRun run = active;
         if (run == null) return;
         synchronized (run) {
-            if (run.jdbc != null && !run.nativeHtap)
-                throw new IOException("Only one capture connection is supported");
             if (Files.exists(run.directory.resolve("pg-" + pid + ".jsonl"))
                     || run.sessions.containsValue(pid) || run.sessions.containsKey(jdbc))
                 throw new IOException("Backend trace already exists; restart in a fresh run directory");
-            run.jdbc = jdbc;
-            run.backendPid = pid;
             run.sessions.put(jdbc, pid);
         }
     }
@@ -128,6 +113,11 @@ final class CaptureRun implements AutoCloseable {
         }
     }
 
+    /** Nothing, or the identity the recording driver stated; never the text "null". */
+    private static String text(Object value) {
+        return value == null ? null : String.valueOf(value);
+    }
+
     synchronized void fail(Throwable error, Map<String, ?> context) {
         if (failure != null) return;
         failure = error;
@@ -139,6 +129,19 @@ final class CaptureRun implements AutoCloseable {
         if (error instanceof SQLException sql) {
             details.put("sqlstate", sql.getSQLState());
             details.put("error_code", sql.getErrorCode());
+            // Enough identity for a later classification to consume: the SQLSTATE, the driver error
+            // code and the request / transaction the recording driver was executing. The policy
+            // decides only what kind of failure this is; it does NOT relax the rule below, which
+            // keeps every JDBC exception fatal until the taxonomy has real-run evidence
+            // (plan.md: 完成分类和实跑验证前，当前 JDBC 异常使采集失败的策略不放宽).
+            var classification =
+                    SourceFailurePolicy.classify(
+                            SourceFailurePolicy.evidence(
+                                    sql,
+                                    text(details.get("request")),
+                                    text(details.get("transaction"))));
+            details.put("source_failure_category", classification.category().name());
+            details.put("source_failure_basis", classification.basis());
         }
         StringWriter stack = new StringWriter();
         error.printStackTrace(new PrintWriter(stack));
@@ -148,29 +151,6 @@ final class CaptureRun implements AutoCloseable {
             publish();
         } catch (IOException logging) {
             error.addSuppressed(logging);
-        }
-    }
-
-    void complete(long[] counts) throws Exception {
-        if (nativeHtap) {
-            completeHtap();
-            return;
-        }
-        try {
-            checkFailure();
-            if (jdbc == null) throw new IOException("Capture has no JDBC connection");
-            Path pg = directory.resolve("pg-" + backendPid + ".jsonl");
-            verifyInventory(
-                    directory, Set.of(jdbc.getFileName().toString(), pg.getFileName().toString()));
-            manifest.put("session_order", "single");
-            manifest.put("sessions", List.of(session(jdbc, pg, true)));
-            manifest.put("transaction_counts", counts);
-            manifest.put("completed_at", Instant.now().toString());
-            manifest.put("status", "complete");
-            publish();
-        } catch (Exception | Error error) {
-            fail(error, Map.of("operation", "complete_capture"));
-            throw error;
         }
     }
 
@@ -331,7 +311,8 @@ final class CaptureRun implements AutoCloseable {
         }
     }
 
-    private void completeHtap() throws Exception {
+    /** Audits every JDBC/PG session pair of the run once its workers have closed them. */
+    void complete() throws Exception {
         try {
             checkFailure();
             drainSessions();

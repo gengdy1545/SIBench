@@ -5,8 +5,9 @@ source:
   path: benchmark/HyBench-2024
   commit: eaad91b52956fddd3d48ce49f792928056b7b360
 native:
-  mode: runhtap
   sf: 1x
+  # HyBench resolves its native Data_1x input relative to this directory.
+  work_dir: results/poc/hybench-sf1/native
   clients: 1
   ap_clients: 1
   xp_transaction_clients: 1
@@ -19,6 +20,8 @@ postgres:
   version: '14.24'
   port: 55433
   database: sibench_htap_sf1_capture
+  # The still, verified SF1 load the capture database is cloned from; never measured directly.
+  clone_from: sibench_sf1_baseline_check
   user: postgres
   isolation: read_committed
   max_parallel_workers_per_gather: 0

@@ -5,7 +5,6 @@ import com.google.gson.*;
 import org.apache.parquet.example.data.Group;
 import org.apache.parquet.hadoop.ParquetReader;
 import org.apache.parquet.hadoop.example.GroupReadSupport;
-import org.sibench.config.ConfigValues;
 import org.sibench.generation.BaselineGenerator;
 import org.sibench.schema.SourceSchema;
 
@@ -18,17 +17,6 @@ import java.util.*;
 /** Independently compare every baseline file with an unchanged source database. */
 public final class PgBaselineVerify {
     private PgBaselineVerify() {}
-
-    public static void main(String[] args) throws Exception {
-        if (args.length != 6 || !args[0].equals("--config"))
-            throw new IllegalArgumentException(
-                    "PgBaselineVerify --config ROOT PROFILE JDBC_URL USER BASELINE_DIR");
-        Path root = Path.of(args[1]);
-        SourceSchema schema =
-                SourceSchema.read(
-                        root, ConfigValues.parse(Files.readString(root.resolve(args[2]))));
-        verify(args[3], args[4], schema, Path.of(args[5]));
-    }
 
     static void verify(String jdbc, String user, SourceSchema schema, Path directory)
             throws Exception {

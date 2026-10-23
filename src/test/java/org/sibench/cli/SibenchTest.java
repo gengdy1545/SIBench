@@ -78,7 +78,11 @@ public class SibenchTest {
                 "--user",
                 "postgres"
             },
-            {"inspect-scale", "config/ycsb_large.yaml", "missing.yaml"}
+            {"inspect-scale", "config/ycsb_large.yaml", "missing.yaml"},
+            {"compare-ledgers"},
+            {"compare-ledgers", "config/ycsb_large.yaml"},
+            {"snapshot-index-counters", "config/ycsb_large.yaml"},
+            {"check-capture-completeness", "config/ycsb_large.yaml"}
         };
         for (String[] args : invalid) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();

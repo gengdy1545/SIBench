@@ -18,18 +18,25 @@ public final class IndexOperationTrace {
     public static final int INSERT = 1, SEARCH = 2, UPSERT = 3, RELOCATE = 4, LOGICAL_DELETE = 5;
     public static final int TRANSACTION_BEGIN = 6, TRANSACTION_COMMIT = 7;
     public static final int BUSINESS_INSERT = 1, BUSINESS_UPDATE = 2;
-    public static final int SNAPSHOT_SEARCH = 1, DERIVED_SEARCH = 2;
+    public static final int SNAPSHOT_SEARCH = 1;
     public static final int TRANSACTION_LOCAL_SEARCH = 4;
     public static final int LOWER_INCLUSIVE = 8, UPPER_INCLUSIVE = 16, DESCENDING = 32;
+    /**
+     * A search group: consecutive searches of one source access whose expected count is the size
+     * of the intersection (a BitmapAnd) or union (an = ANY array) of their results by primary key.
+     * Every member carries the group's count; a member's own count is not a source fact.
+     */
+    public static final int INTERSECT_GROUP = 64, UNION_GROUP = 128;
     public static final int SEARCH_FLAGS =
             SNAPSHOT_SEARCH
-                    | DERIVED_SEARCH
                     | TRANSACTION_LOCAL_SEARCH
                     | LOWER_INCLUSIVE
                     | UPPER_INCLUSIVE
-                    | DESCENDING;
+                    | DESCENDING
+                    | INTERSECT_GROUP
+                    | UNION_GROUP;
     public static final int RECORD_BYTES = 128, BLOCK_RECORDS = 4096;
-    public static final int VERSION = 8;
+    public static final int VERSION = 9;
     public static final int MAX_TABLE = 65535, MAX_INDEX = 1024;
     private static final int MAGIC = 0x53494f50;
 
@@ -89,7 +96,9 @@ public final class IndexOperationTrace {
 
     /**
      * Writes carry the encoded PK in {@code key} and, for a secondary index, the encoded indexed
-     * value; searches carry a {@link Range} in lower/upper/flags/limit instead.
+     * value; searches carry a {@link Range} in lower/upper/flags/limit instead. A secondary point
+     * search may also carry a PK in {@code key}: it then names exactly one index entry, the row a
+     * scan its consumer stopped early returned among equal indexed values.
      */
     public record Operation(
             long sourceEvent,
@@ -199,6 +208,10 @@ public final class IndexOperationTrace {
                     limit);
         }
 
+        public boolean grouped() {
+            return (flags & (INTERSECT_GROUP | UNION_GROUP)) != 0;
+        }
+
         public Operation withTransaction(long id, long ordinal) {
             return new Operation(
                     sourceEvent,
@@ -241,21 +254,28 @@ public final class IndexOperationTrace {
                 -1, 0, 0, 0, null, null, 0);
     }
 
+    /**
+     * One search. {@code pinned} is the PK of the single secondary entry a pinned point search
+     * names, or null; {@code groupFlags} and the group position mark a member of a search group.
+     */
     public static Operation search(
             long source,
             int table,
             int index,
             Range range,
+            IndexKey pinned,
             long readTimestamp,
             long count,
-            int flags) {
+            int flags,
+            int groupPosition,
+            int groupSize) {
         return new Operation(
                 source,
                 SEARCH,
                 table,
                 index,
                 flags | range.flags(),
-                null,
+                pinned,
                 null,
                 0,
                 0,
@@ -266,32 +286,16 @@ public final class IndexOperationTrace {
                 0,
                 readTimestamp,
                 0,
-                0,
-                0,
+                groupPosition,
+                groupSize,
                 range.lower(),
                 range.upper(),
                 range.limit());
     }
 
-    public static Operation transactionSearch(
-            long source,
-            int table,
-            int index,
-            Range range,
-            long readTimestamp,
-            long count,
-            long transactionId,
-            long precedingMutations,
-            boolean local) {
-        return search(
-                        source,
-                        table,
-                        index,
-                        range,
-                        readTimestamp,
-                        count,
-                        local ? TRANSACTION_LOCAL_SEARCH : 0)
-                .withTransaction(transactionId, precedingMutations);
+    public static Operation search(
+            long source, int table, int index, Range range, long readTimestamp, long count, int flags) {
+        return search(source, table, index, range, null, readTimestamp, count, flags, 0, 0);
     }
 
     public static Operation transaction(long source, int kind, long id, long version, long rows) {
@@ -320,16 +324,7 @@ public final class IndexOperationTrace {
                         && o.workUnitId() >= 0
                         && (!control || o.workUnitId() == 0 && o.index() == 0)
                         && (search
-                                ? o.version() == 0
-                                        && o.readTimestamp() >= 0
-                                        && o.key() == null
-                                        && o.indexedValue() == null
-                                        && (o.flags() & ~SEARCH_FLAGS) == 0
-                                        && (o.lower() != null || (o.flags() & LOWER_INCLUSIVE) == 0)
-                                        && (o.upper() != null || (o.flags() & UPPER_INCLUSIVE) == 0)
-                                        && o.limit() >= 0
-                                        && o.expectedCount() >= 0
-                                        && (o.limit() == 0 || o.expectedCount() == o.limit())
+                                ? validSearch(o)
                                 : o.readTimestamp() == -1
                                         && o.lower() == null
                                         && o.upper() == null
@@ -340,6 +335,33 @@ public final class IndexOperationTrace {
                                                         && (o.index() == 0)
                                                                 == (o.indexedValue() == null)));
         if (!valid) throw new IOException("Invalid normalized operation");
+    }
+
+    private static boolean validSearch(Operation o) {
+        int group = o.flags() & (INTERSECT_GROUP | UNION_GROUP);
+        boolean pinned = o.key() != null;
+        return o.version() == 0
+                && o.readTimestamp() >= 0
+                && o.indexedValue() == null
+                && (o.flags() & ~SEARCH_FLAGS) == 0
+                && (o.lower() != null || (o.flags() & LOWER_INCLUSIVE) == 0)
+                && (o.upper() != null || (o.flags() & UPPER_INCLUSIVE) == 0)
+                && o.limit() >= 0
+                && o.expectedCount() >= 0
+                && (o.limit() == 0 || o.expectedCount() == o.limit())
+                && group != (INTERSECT_GROUP | UNION_GROUP)
+                && (group == 0
+                        ? o.expansionPosition() == 0 && o.expansionSize() == 0
+                        : o.expansionSize() >= 2
+                                && o.expansionPosition() >= 0
+                                && o.expansionPosition() < o.expansionSize()
+                                && o.limit() == 0
+                                && !pinned)
+                && (!pinned
+                        || o.index() > 0
+                                && o.range().point()
+                                && o.limit() == 0
+                                && o.expectedCount() == 1);
     }
 
     public interface Consumer {
