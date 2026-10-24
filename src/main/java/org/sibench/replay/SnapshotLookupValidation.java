@@ -7,6 +7,7 @@ import org.apache.parquet.hadoop.ParquetReader;
 import org.apache.parquet.hadoop.example.GroupReadSupport;
 import org.sibench.capture.*;
 import org.sibench.capture.IndexOperationTrace.Operation;
+import org.sibench.capture.IndexOperationTrace.Range;
 import org.sibench.capture.IndexReferenceReplay.LookupResult;
 import org.sibench.generation.BaselineGenerator;
 import org.sibench.trace.IndexKey;
@@ -18,18 +19,27 @@ import java.util.*;
 /** Independent Parquet row oracle; derived probes are not native workload or timed performance. */
 public final class SnapshotLookupValidation {
     private static final int SECONDARY_PREDICATES = 64;
+    /** Baseline rows sampled per table, evenly in PK order, to describe each index's domain. */
+    private static final int VALUE_SAMPLE = 1024;
+    /** Range boundaries per index: the domain's minimum, evenly spaced sample values, maximum. */
+    private static final int RANGE_POINTS = 9;
+    /** Changed values per index that also anchor a range, so baseline and overlay entries mix. */
+    private static final int RANGE_ANCHORS = 4;
+    private static final int RANGE_LIMIT = 32;
 
     private record Key(int table, IndexKey key) {}
 
     private record Predicate(int table, int index, IndexKey value) {}
 
-    private record Row(long version, long rowId, long locator, Map<Integer, IndexKey> indexes) {
+    record Row(long version, long rowId, long file, long position, Map<Integer, IndexKey> indexes) {
         LookupResult result(IndexKey key, boolean rowIds) {
-            return new LookupResult(key, version, rowIds ? rowId : locator);
+            return rowIds
+                    ? new LookupResult(key, version, rowId)
+                    : new LookupResult(key, version, file, position);
         }
     }
 
-    private static final class History {
+    static final class History {
         Row baseline;
         final NavigableMap<Long, Row> commits = new TreeMap<>();
         final Map<Integer, Set<IndexKey>> indexedValues = new LinkedHashMap<>();
@@ -70,14 +80,151 @@ public final class SnapshotLookupValidation {
     private static final class Locations {
         private final Map<Key, long[]> rows = new HashMap<>();
 
-        void add(int table, IndexKey key, long rowId, long locator) {
-            rows.put(new Key(table, key), new long[] {rowId, locator});
+        void add(int table, IndexKey key, long rowId, long file, long position) {
+            rows.put(new Key(table, key), new long[] {rowId, file, position});
         }
 
         LookupResult get(int table, IndexKey key, boolean rowIds) {
             long[] row = rows.get(new Key(table, key));
-            return new LookupResult(key, 0, row[rowIds ? 0 : 1]);
+            return rowIds
+                    ? new LookupResult(key, 0, row[0])
+                    : new LookupResult(key, 0, row[1], row[2]);
         }
+    }
+
+    /** One baseline index entry; ranges order entries by indexed value, then PK. */
+    record Entry(IndexKey value, IndexKey key, long rowId, long file, long position) {
+        LookupResult result(boolean rowIds) {
+            return rowIds
+                    ? new LookupResult(key, 0, rowId)
+                    : new LookupResult(key, 0, file, position);
+        }
+    }
+
+    private static final Comparator<Entry> ENTRY_ORDER =
+            Comparator.comparing(Entry::value).thenComparing(Entry::key);
+
+    /** The values of one index over the whole baseline: its extremes and an even sample. */
+    private static final class Domain {
+        final List<IndexKey> sample = new ArrayList<>();
+        IndexKey min, max;
+
+        void observe(IndexKey value, boolean sampled) {
+            if (min == null || value.compareTo(min) < 0) min = value;
+            if (max == null || value.compareTo(max) > 0) max = value;
+            if (sampled) sample.add(value);
+        }
+
+        List<IndexKey> sorted() {
+            var values = new TreeSet<>(sample);
+            if (min != null) {
+                values.add(min);
+                values.add(max);
+            }
+            return new ArrayList<>(values);
+        }
+    }
+
+    /**
+     * One derived range search. Unchanged baseline entries never change, so only the first
+     * {@code limit} of them in the search's direction can ever be returned; changed rows are
+     * evaluated from their history at each probed time.
+     */
+    static final class RangeProbe {
+        final int table, index;
+        final Range range;
+        final TreeSet<Entry> unchanged;
+        final Map<IndexKey, History> changed = new LinkedHashMap<>();
+        final SortedSet<Long> times = new TreeSet<>();
+
+        RangeProbe(int table, int index, Range range) {
+            this.table = table;
+            this.index = index;
+            this.range = range;
+            this.unchanged = new TreeSet<>(range.descending() ? ENTRY_ORDER.reversed() : ENTRY_ORDER);
+        }
+
+        void offer(Entry entry) {
+            if (!range.contains(entry.value())) return;
+            unchanged.add(entry);
+            if (unchanged.size() > range.limit()) unchanged.pollLast();
+        }
+
+        IndexKey value(IndexKey key, Row row) {
+            return index == 0 ? key : row.indexes().get(index);
+        }
+
+        /** Whether the row's entry in this index lies in the range; a deleted row has none. */
+        boolean contains(IndexKey key, Row row) {
+            if (row == null) return false;
+            IndexKey value = value(key, row);
+            return value != null && range.contains(value);
+        }
+
+        boolean ever(IndexKey key, History history) {
+            if (contains(key, history.baseline)) return true;
+            for (Row row : history.commits.values()) if (contains(key, row)) return true;
+            return false;
+        }
+
+        List<LookupResult> expected(long time, boolean rowIds) {
+            var candidates = new TreeMap<Entry, LookupResult>(unchanged.comparator());
+            for (Entry entry : unchanged) candidates.put(entry, entry.result(rowIds));
+            for (var change : changed.entrySet()) {
+                Row row = change.getValue().at(time);
+                if (contains(change.getKey(), row))
+                    candidates.put(
+                            new Entry(value(change.getKey(), row), change.getKey(), 0, 0, 0),
+                            row.result(change.getKey(), rowIds));
+            }
+            return candidates.values().stream().limit(range.limit()).toList();
+        }
+
+        @Override
+        public String toString() {
+            return "table "
+                    + table
+                    + " index "
+                    + index
+                    + (range.lowerInclusive() ? " [" : " (")
+                    + range.lower()
+                    + ", "
+                    + range.upper()
+                    + (range.upperInclusive() ? "]" : ")")
+                    + (range.descending() ? " desc" : " asc")
+                    + " limit "
+                    + range.limit();
+        }
+    }
+
+    /** {@code count} values evenly spaced over a sorted list, including both ends. */
+    static List<IndexKey> spread(List<IndexKey> sorted, int count) {
+        if (count <= 0 || sorted.isEmpty()) return List.of();
+        if (sorted.size() <= count) return sorted;
+        var result = new ArrayList<IndexKey>();
+        for (int i = 0; i < count; i++)
+            result.add(
+                    sorted.get(count == 1 ? 0 : (int) ((long) i * (sorted.size() - 1) / (count - 1))));
+        return result;
+    }
+
+    /** Both ends of each boundary pair are tested inclusive and exclusive from their own side. */
+    static List<Range> ranges(List<IndexKey> points, Collection<IndexKey> anchors) {
+        var ranges = new ArrayList<Range>();
+        ranges.add(new Range(null, false, null, false, false, RANGE_LIMIT));
+        ranges.add(new Range(null, false, null, false, true, RANGE_LIMIT));
+        for (int i = 1; i < points.size(); i++) {
+            IndexKey lower = points.get(i - 1), upper = points.get(i);
+            ranges.add(new Range(lower, true, upper, true, false, RANGE_LIMIT));
+            ranges.add(new Range(lower, false, upper, true, false, RANGE_LIMIT));
+            ranges.add(new Range(lower, true, upper, true, true, RANGE_LIMIT));
+            ranges.add(new Range(lower, true, upper, false, true, RANGE_LIMIT));
+        }
+        for (IndexKey anchor : anchors) {
+            ranges.add(new Range(anchor, true, null, false, false, RANGE_LIMIT));
+            ranges.add(new Range(null, false, anchor, true, true, RANGE_LIMIT));
+        }
+        return ranges;
     }
 
     @FunctionalInterface
@@ -193,14 +340,14 @@ public final class SnapshotLookupValidation {
                         pending.clear();
                     }
                 });
-        Map<String, SortedSet<IndexKey>> changedValues = new TreeMap<>(),
-                baselineValues = new TreeMap<>();
-        for (var definition : catalog.definitions())
-            if (definition.indexId() > 0) {
-                String id = definition.tableId() + "/" + definition.indexId();
-                changedValues.put(id, new TreeSet<>());
-                baselineValues.put(id, new TreeSet<>());
-            }
+        Map<String, SortedSet<IndexKey>> changedValues = new TreeMap<>();
+        Map<String, Domain> domains = new TreeMap<>();
+        for (var definition : catalog.definitions()) {
+            String id = definition.tableId() + "/" + definition.indexId();
+            changedValues.put(id, new TreeSet<>());
+            domains.put(id, new Domain());
+        }
+        for (Key key : histories.keySet()) changedValues.get(key.table() + "/0").add(key.key());
         for (var entry : histories.entrySet())
             entry.getValue()
                     .indexedValues
@@ -213,12 +360,28 @@ public final class SnapshotLookupValidation {
                 Files.readAllLines(sourceBaseline.resolve("files.jsonl")).stream()
                         .map(line -> JsonParser.parseString(line).getAsJsonObject())
                         .toList();
+        Map<Integer, Long> tableRows = new HashMap<>();
+        for (JsonObject file : sourceFiles)
+            tableRows.merge(
+                    catalog.tableId(file.get("table").getAsString()),
+                    file.get("rows").getAsLong(),
+                    Long::sum);
+        Map<Integer, long[]> seen = new HashMap<>();
         for (JsonObject file : sourceFiles)
             readFile(
                     sourceBaseline,
                     file,
                     catalog,
                     (table, key, row) -> {
+                        long position = seen.computeIfAbsent(table, ignored -> new long[1])[0]++;
+                        boolean sampled =
+                                position % Math.max(1, tableRows.get(table) / VALUE_SAMPLE) == 0;
+                        domains.get(table + "/0").observe(key, sampled);
+                        row.indexes()
+                                .forEach(
+                                        (index, value) ->
+                                                domains.get(table + "/" + index)
+                                                        .observe(value, sampled));
                         History history = histories.get(new Key(table, key));
                         if (history != null) {
                             history.baseline = row;
@@ -230,15 +393,6 @@ public final class SnapshotLookupValidation {
                                                             .get(table + "/" + index)
                                                             .add(value));
                         }
-                        row.indexes()
-                                .forEach(
-                                        (index, value) -> {
-                                            SortedSet<IndexKey> sample =
-                                                    baselineValues.get(table + "/" + index);
-                                            sample.add(value);
-                                            if (sample.size() > SECONDARY_PREDICATES)
-                                                sample.remove(sample.last());
-                                        });
                     },
                     null);
         Map<Predicate, Keys> buckets = new LinkedHashMap<>();
@@ -246,16 +400,33 @@ public final class SnapshotLookupValidation {
             for (var definition : catalog.definitions()) {
                 if (definition.indexId() == 0) continue;
                 String id = definition.tableId() + "/" + definition.indexId();
-                var selected = new LinkedHashSet<IndexKey>();
-                changedValues.get(id).stream().limit(SECONDARY_PREDICATES).forEach(selected::add);
-                baselineValues.get(id).stream()
-                        .limit(SECONDARY_PREDICATES - selected.size())
-                        .forEach(selected::add);
+                // Half changed values, the rest spread over the baseline domain, ends included.
+                var selected =
+                        new LinkedHashSet<IndexKey>(
+                                spread(
+                                        new ArrayList<>(changedValues.get(id)),
+                                        SECONDARY_PREDICATES / 2));
+                selected.addAll(
+                        spread(domains.get(id).sorted(), SECONDARY_PREDICATES - selected.size()));
                 for (IndexKey value : selected)
                     buckets.put(
                             new Predicate(definition.tableId(), definition.indexId(), value),
                             new Keys());
             }
+        List<RangeProbe> probes = new ArrayList<>();
+        Map<String, List<RangeProbe>> indexProbes = new HashMap<>();
+        for (var definition : catalog.definitions()) {
+            if (definition.indexId() > 0 && !config.secondaryIndexes()) continue;
+            String id = definition.tableId() + "/" + definition.indexId();
+            List<IndexKey> points = spread(domains.get(id).sorted(), RANGE_POINTS);
+            if (points.isEmpty() && changedValues.get(id).isEmpty()) continue;
+            for (Range range :
+                    ranges(points, spread(new ArrayList<>(changedValues.get(id)), RANGE_ANCHORS))) {
+                var probe = new RangeProbe(definition.tableId(), definition.indexId(), range);
+                probes.add(probe);
+                indexProbes.computeIfAbsent(id, ignored -> new ArrayList<>()).add(probe);
+            }
+        }
         Locations locations = new Locations();
         for (JsonObject file : sourceFiles)
             readFile(
@@ -263,6 +434,22 @@ public final class SnapshotLookupValidation {
                     file,
                     catalog,
                     (table, key, row) -> {
+                        if (!histories.containsKey(new Key(table, key))) {
+                            for (RangeProbe probe : indexProbes.getOrDefault(table + "/0", List.of()))
+                                probe.offer(
+                                        new Entry(key, key, row.rowId(), row.file(), row.position()));
+                            for (var indexed : row.indexes().entrySet())
+                                for (RangeProbe probe :
+                                        indexProbes.getOrDefault(
+                                                table + "/" + indexed.getKey(), List.of()))
+                                    probe.offer(
+                                            new Entry(
+                                                    indexed.getValue(),
+                                                    key,
+                                                    row.rowId(),
+                                                    row.file(),
+                                                    row.position()));
+                        }
                         boolean retained = false;
                         for (var indexed : row.indexes().entrySet()) {
                             Keys keys =
@@ -274,13 +461,27 @@ public final class SnapshotLookupValidation {
                                 retained = true;
                             }
                         }
-                        if (retained) locations.add(table, key, row.rowId(), row.locator());
+                        if (retained) locations.add(table, key, row.rowId(), row.file(), row.position());
                     },
                     null);
+        for (RangeProbe probe : probes) {
+            probe.times.addAll(List.of(0L, lastCommit[0]));
+            long first = Long.MAX_VALUE;
+            for (var change : histories.entrySet())
+                if (change.getKey().table() == probe.table) {
+                    probe.changed.put(change.getKey().key(), change.getValue());
+                    if (probe.ever(change.getKey().key(), change.getValue()))
+                        first = Math.min(first, change.getValue().commits.firstKey());
+                }
+            if (first != Long.MAX_VALUE) {
+                probe.times.add(first - 1);
+                probe.times.add(first);
+            }
+        }
         List<Map<String, Object>> modes = new ArrayList<>();
         for (boolean rowIds : new boolean[] {false, true}) {
-            var model = new IndexReferenceReplay(rowIds, config.secondaryIndexes());
-            try (var load = new ReplayProjection(config, false, model::accept);
+            try (var model = new IndexReferenceReplay(rowIds, config.secondaryIndexes());
+                    var load = new ReplayProjection(config, false, model::accept);
                     var runtime = new ReplayProjection(config, true, model::accept)) {
                 IndexOperationTrace.read(baseline, load);
                 load.finish();
@@ -387,6 +588,16 @@ public final class SnapshotLookupValidation {
                         items += actual.size();
                     }
                 }
+                long rangeProbes = 0;
+                for (RangeProbe probe : probes)
+                    for (long time : probe.times) {
+                        var actual = model.search(probe.table, probe.index, probe.range, time);
+                        if (!probe.expected(time, rowIds).equals(actual))
+                            throw new IOException(
+                                    "Derived range mismatch: " + probe + " at " + time);
+                        rangeProbes++;
+                        items += actual.size();
+                    }
                 modes.add(
                         Map.of(
                                 "mode",
@@ -397,6 +608,8 @@ public final class SnapshotLookupValidation {
                                 primaryProbes,
                                 "derived_secondary_probes",
                                 secondaryProbes,
+                                "derived_range_probes",
+                                rangeProbes,
                                 "derived_checked_result_items",
                                 items,
                                 "retained_index_versions",
@@ -416,16 +629,26 @@ public final class SnapshotLookupValidation {
         output.put("changed_primary_keys", histories.size());
         output.put("secondary_predicate_sample_limit_per_index", SECONDARY_PREDICATES);
         output.put("sampled_secondary_predicates", buckets.size());
+        output.put("value_sample_rows_per_table", VALUE_SAMPLE);
+        output.put("range_points_per_index", RANGE_POINTS);
+        output.put("range_anchors_per_index", RANGE_ANCHORS);
+        output.put("range_probe_limit", RANGE_LIMIT);
+        output.put("range_probes", probes.size());
         output.put("last_published_commit_version", lastCommit[0]);
         output.put("results", modes);
         output.put(
                 "scope",
                 "All changed primary keys and full secondary identities at baseline, before/at"
-                    + " every per-key commit and final; sampled nonunique equality predicates for"
-                    + " every source index at baseline, before/at first relevant change and final."
-                    + " Exact key/version/Locator/RowID comparison against independently decoded"
-                    + " baseline and incremental Parquet, including old/new values; not full HTAP"
-                    + " snapshots, derived range probes, relocation/GC or performance.");
+                    + " every per-key commit and final; nonunique equality predicates for every"
+                    + " source index, half changed values and half spread over the baseline"
+                    + " domain; limited range probes on every primary and source index between"
+                    + " domain quantiles (both ends inclusive and exclusive, ascending and"
+                    + " descending), unbounded, and anchored at changed values; predicates and"
+                    + " ranges at baseline, before/at first relevant change and final. Exact"
+                    + " key/version/Locator/RowID and result order against independently decoded"
+                    + " baseline and incremental Parquet, including old/new values; search groups"
+                    + " only through their member searches; not full HTAP snapshots,"
+                    + " relocation/GC or performance.");
         Files.writeString(
                 report,
                 new GsonBuilder().setPrettyPrinting().create().toJson(output),
@@ -491,9 +714,11 @@ public final class SnapshotLookupValidation {
                         catalog.tableId(table),
                         catalog.primaryKey(table, group),
                         new Row(
-                                group.getLong("_sib_timestamp", 0), group.getLong("_sib_row_id", 0),
-                                IndexReferenceReplay.locator(fileId, position++),
-                                        catalog.keys(table, group)));
+                                group.getLong("_sib_timestamp", 0),
+                                group.getLong("_sib_row_id", 0),
+                                fileId,
+                                position++,
+                                catalog.keys(table, group)));
             }
         }
         if (position != file.get("rows").getAsLong())

@@ -196,6 +196,12 @@ public final class Sibench {
                                 .disableHtmlEscaping()
                                 .create()
                                 .toJson(report));
+                if (!"consistent".equals(report.get("status"))) {
+                    err.println(
+                            "Index counters disagree with the access ledger: "
+                                    + report.get("inconsistent_indexes"));
+                    return 1;
+                }
                 return 0;
             }
             if (args[0].equals("validate-replay-matrix")) {
@@ -328,6 +334,7 @@ public final class Sibench {
             return 1;
         } catch (Exception error) {
             err.println("SIBench failed: " + error.getMessage());
+            if (System.getProperty("sibench.trace") != null) error.printStackTrace(err);
             return 1;
         }
     }
@@ -368,11 +375,14 @@ public final class Sibench {
                 "       java -jar build/sibench/sibench.jar snapshot-index-counters [--root PATH]"
                         + " PROFILE OUTPUT --jdbc URL --user ROLE");
         out.println(
+                "snapshot-index-counters waits for other sessions to leave and the counters to"
+                    + " settle before reading them.");
+        out.println(
                 "       java -jar build/sibench/sibench.jar check-capture-completeness [--root PATH]"
                         + " PROFILE LEDGER BEFORE AFTER");
         out.println(
                 "check-capture-completeness cross-checks a ledger against the PG index counter"
-                    + " deltas of two snapshots; it never touches PG.");
+                    + " deltas of two snapshots; it never touches PG and exits 1 when they disagree.");
         out.println(
                 "       java -jar build/sibench/sibench.jar compile-trace [--root PATH]"
                         + " PROFILE OUTPUT [ROW_AUDIT]");

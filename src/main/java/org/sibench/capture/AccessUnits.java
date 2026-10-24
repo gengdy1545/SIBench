@@ -179,6 +179,37 @@ final class AccessUnits {
             return calls > 0 && !lastFound;
         }
 
+        /**
+         * Passes over the index: a bitmap fills once; a tuple scan starts a pass on its first call
+         * and on the first call after reporting the end ({@code btgettuple} finds no valid
+         * position), so the passes are the end reports plus an unfinished last pass.
+         */
+        long passes() {
+            if (bitmap()) return bitmapEnded ? 1 : 0;
+            return calls == 0 ? 0 : calls - found + (lastFound ? 1 : 0);
+        }
+
+        /**
+         * Tree descents ({@code _bt_first}, PG14's {@code idx_scan}) this unit can have made. A
+         * scan without array keys descends exactly once per pass. Array keys descend once per
+         * element combination, never for an unsatisfiable array, and fewer when the consumer
+         * stops early, so they only bound the count.
+         */
+        long descentsMin() {
+            return arrayKeys() ? 0 : passes();
+        }
+
+        long descentsMax() {
+            if (!arrayKeys()) return passes();
+            long combinations = 1;
+            for (JsonElement key : keys) {
+                JsonElement array = key.getAsJsonObject().get("array");
+                if (array != null && array.isJsonArray())
+                    combinations = Math.multiplyExact(combinations, array.getAsJsonArray().size());
+            }
+            return Math.multiplyExact(passes(), combinations);
+        }
+
         boolean arrayKeys() {
             for (JsonElement key : keys)
                 if (key.getAsJsonObject().has("array")) return true;

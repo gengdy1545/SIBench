@@ -21,6 +21,11 @@ public class IndexTraceCompilerTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     private CaptureConfig baseline(Path fixture) throws Exception {
+        return baseline(fixture, -1, -1);
+    }
+
+    /** A target size and row-group limit below zero keep the profile's own. */
+    private CaptureConfig baseline(Path fixture, long targetBytes, long maxRows) throws Exception {
         Path root = Path.of("").toAbsolutePath();
         var original = CaptureConfig.read(root, Path.of("config/hybench_sf1.yaml"));
         Path baseline = Files.createDirectory(fixture.resolve("baseline"));
@@ -31,8 +36,8 @@ public class IndexTraceCompilerTest {
                         c.document(),
                         c.benchmark(),
                         c.seed(),
-                        c.targetBytes(),
-                        c.maxRows(),
+                        targetBytes < 0 ? c.targetBytes() : targetBytes,
+                        maxRows < 0 ? c.maxRows() : maxRows,
                         c.groupBytes(),
                         c.pageBytes(),
                         c.dictionaryBytes(),
@@ -507,6 +512,115 @@ public class IndexTraceCompilerTest {
                         .getAsJsonObject("snapshot_crosscheck");
         assertEquals(1, crosscheck.get("searches_checked").getAsLong());
         assertEquals(1, crosscheck.get("searches_without_usable_snapshot").getAsLong());
+    }
+
+    @Test
+    public void incrementalFilesRollOverWithUniqueInt64FileIds() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        // Every second row closes a row group, and any closed group reaches the target size.
+        CaptureConfig config = baseline(fixture, 1, 2);
+        String[] days = {"01", "02", "03", "04", "05", "06"};
+        var transactions = new ArrayList<String>();
+        for (int i = 0; i + 1 < days.length; i++)
+            transactions.add(
+                    change("update", row("2024-01-" + days[i] + " 00:00:00"), row("2024-01-" + days[i + 1] + " 00:00:00"))
+                            + "{\"event\":\"transaction_commit\",\"xid\":9}\n");
+        Path raw = capture(fixture, transactions);
+        audit(config, raw, row("2024-01-06 00:00:00"));
+        Path output = fixture.resolve("compiled");
+        var manifest = compile(config, raw, output);
+        var files = (List<?>) manifest.get("incremental_files");
+        assertEquals(3, files.size());
+        var ids = new HashSet<Long>();
+        var rows = new ArrayList<Long>();
+        var names = new ArrayList<String>();
+        for (Object item : files) {
+            var file = (Map<?, ?>) item;
+            assertEquals("loantrans", file.get("table"));
+            ids.add((Long) file.get("file_id"));
+            rows.add((Long) file.get("rows"));
+            names.add((String) file.get("path"));
+            assertTrue(Files.exists(output.resolve((String) file.get("path"))));
+            assertEquals(
+                    BaselineGenerator.sha256(output.resolve((String) file.get("path"))),
+                    file.get("sha256"));
+        }
+        assertEquals(List.of(2L, 2L, 1L), rows);
+        assertEquals(
+                List.of(
+                        "loantrans-versions.parquet",
+                        "loantrans-versions-000002.parquet",
+                        "loantrans-versions-000003.parquet"),
+                names);
+        assertEquals(3, ids.size());
+        // The first file keeps its FileID (baseline's last plus the table id); loantrans is the
+        // last table, so the rollover files continue right after it.
+        long firstId = (Long) ((Map<?, ?>) files.get(0)).get("file_id");
+        assertEquals(firstId + 1, ((Map<?, ?>) files.get(1)).get("file_id"));
+        assertEquals(firstId + 2, ((Map<?, ?>) files.get(2)).get("file_id"));
+        for (boolean secondary : new boolean[] {true, false}) {
+            var replay = new ReplayConfig(secondary, "none", 0, 0, 0, 0, "operation");
+            assertEquals(
+                    "passed",
+                    ReferenceReplay.run(output, replay, fixture.resolve("replay-" + secondary + ".json"))
+                            .get("status"));
+            assertEquals(
+                    "passed",
+                    SnapshotLookupValidation.run(
+                                    output, replay, fixture.resolve("snapshots-" + secondary + ".json"))
+                            .get("status"));
+        }
+        RelocationCheck.validate(config.layout(), output, fixture.resolve("relocated"));
+    }
+
+    @Test
+    public void spillingRowIdentitiesChangeNothingInTheCompiledTrace() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        CaptureConfig config = baseline(fixture);
+        String first = row("2024-01-01 00:00:00"), second = row("2024-01-02 00:00:00");
+        // An update, a delete, a reinsert of the same key and an insert, over four transactions.
+        Path raw =
+                capture(
+                        fixture,
+                        List.of(
+                                change("update", first, second)
+                                        + "{\"event\":\"transaction_commit\",\"xid\":9}\n",
+                                change("delete", second, "null")
+                                        + "{\"event\":\"transaction_commit\",\"xid\":9}\n",
+                                change("insert", "null", first)
+                                        + "{\"event\":\"transaction_commit\",\"xid\":9}\n",
+                                change("update", first, second)
+                                        + "{\"event\":\"transaction_commit\",\"xid\":9}\n"));
+        audit(config, raw, second);
+        Path reference = fixture.resolve("reference"), spilled = fixture.resolve("spilled");
+        compile(config, raw, reference);
+        IndexTraceCompiler.compile(
+                SourceSchema.hybench(config.source()),
+                config.layout(),
+                raw,
+                spilled,
+                RowStateAudit.defaultReport(raw),
+                1,
+                1_000);
+        try (var files = Files.list(reference)) {
+            for (Path file : files.toList()) {
+                String name = file.getFileName().toString();
+                if (name.equals("manifest.json")) continue;
+                assertEquals(name, -1, Files.mismatch(file, spilled.resolve(name)));
+            }
+        }
+        // The manifest records the configured limits; everything else in it must agree.
+        var expected = JsonParser.parseString(Files.readString(reference.resolve("manifest.json"))).getAsJsonObject();
+        var actual = JsonParser.parseString(Files.readString(spilled.resolve("manifest.json"))).getAsJsonObject();
+        assertEquals(4_000_000, expected.getAsJsonObject("snapshot_crosscheck").getAsJsonObject("commit_window").get("limit").getAsInt());
+        assertEquals(1_000, actual.getAsJsonObject("snapshot_crosscheck").getAsJsonObject("commit_window").get("limit").getAsInt());
+        expected.getAsJsonObject("snapshot_crosscheck").remove("commit_window");
+        actual.getAsJsonObject("snapshot_crosscheck").remove("commit_window");
+        assertEquals(expected, actual);
+        try (var names = Files.list(spilled)) {
+            assertEquals(Files.list(reference).count(), names.count());
+        }
+        assertFalse(Files.exists(spilled.resolve("state")));
     }
 
     private static Map<String, Object> compile(CaptureConfig config, Path raw, Path output)

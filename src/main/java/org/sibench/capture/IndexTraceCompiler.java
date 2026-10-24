@@ -13,6 +13,7 @@ import org.sibench.capture.AccessUnits.Unit;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.generation.*;
 import org.sibench.schema.SourceSchema;
+import org.sibench.state.RowIdentities;
 import org.sibench.trace.IndexKey;
 
 import java.io.*;
@@ -26,6 +27,12 @@ import java.util.*;
  * maintenance unit; aborts stay in the raw trace.
  */
 public final class IndexTraceCompiler {
+    /** In-memory entries of the row-identity store before it spills a sorted run to disk. */
+    static final int IDENTITY_MEMORY_ENTRIES = 1_000_000;
+
+    /** Committed writers kept in order to place a snapshot among them. */
+    static final int COMMIT_WINDOW = 4_000_000;
+
     private IndexTraceCompiler() {}
 
     /**
@@ -122,6 +129,29 @@ public final class IndexTraceCompiler {
             Path output,
             Path auditReport)
             throws Exception {
+        return compile(
+                sourceSchema,
+                layout,
+                raw,
+                output,
+                auditReport,
+                IDENTITY_MEMORY_ENTRIES,
+                COMMIT_WINDOW);
+    }
+
+    /**
+     * {@code identityMemory} bounds the in-memory entries of the row-identity store and {@code
+     * commitWindow} the committed writers kept to place snapshots.
+     */
+    static Map<String, Object> compile(
+            SourceSchema sourceSchema,
+            GenerationConfig layout,
+            Path raw,
+            Path output,
+            Path auditReport,
+            int identityMemory,
+            int commitWindow)
+            throws Exception {
         Sessions sessions = sessions(raw);
         boolean concurrent = sessions.order().equals("concurrent");
         Path baseline = layout.output();
@@ -140,7 +170,8 @@ public final class IndexTraceCompiler {
                 "Compilation not committed\n",
                 StandardOpenOption.CREATE_NEW);
         Map<String, MessageType> schemas = new HashMap<>();
-        var identities = new IndexReferenceReplay(true, false);
+        // Row identities spill to disk beyond a bounded number of in-memory entries.
+        var identities = new RowIdentities(output.resolve("state"), identityMemory, 4);
         long maximumRowId = 0, maximumFileId = 0, baselineCount, baselineRows = 0;
         RunTiming.current().phase("baseline");
         try (var operations = new IndexOperationTrace.Writer(output.resolve("baseline.ops"))) {
@@ -151,7 +182,8 @@ public final class IndexTraceCompiler {
                 long fileId = file.get("file_id").getAsLong();
                 maximumFileId = Math.max(maximumFileId, fileId);
                 long position = 0;
-                try (ParquetReader<Group> reader = reader(baseline.resolve(file.get("path").getAsString()))) {
+                try (ParquetReader<Group> reader = reader(baseline.resolve(file.get("path").getAsString()));
+                        var identity = identities.baseline(tableId)) {
                     Group row;
                     while ((row = reader.read()) != null) {
                         schemas.putIfAbsent(
@@ -171,10 +203,11 @@ public final class IndexTraceCompiler {
                                                 rowId)
                                         .withWorkUnitId(
                                                 1 + baselineRows++ / IndexOperationTrace.BLOCK_RECORDS);
-                        identities.accept(primary);
+                        identity.add(primary.key(), rowId);
                         IndexMutation.emit(
                                 primary, Map.of(), catalog.keys(table, row), operations::append);
                     }
+                    identity.finish();
                 }
                 if (position != file.get("rows").getAsLong())
                     throw new IOException("Baseline manifest row mismatch");
@@ -183,6 +216,7 @@ public final class IndexTraceCompiler {
         }
         var state = new Compilation(catalog, cCollation, identities, schemas, layout, output);
         state.concurrent = concurrent;
+        state.commitWindow = new CommitWindow(commitWindow);
         state.maximumRowId = maximumRowId;
         state.firstIncrementalFile = maximumFileId;
         var sessionReports = new ArrayList<Map<String, Object>>();
@@ -199,7 +233,10 @@ public final class IndexTraceCompiler {
             state.finishFiles();
         } finally {
             for (Output writer : state.writers.values()) writer.close();
+            identities.close();
         }
+        // The spill files are working state, not an artifact: a finished trace has none.
+        deleteTree(output.resolve("state"));
         RunTiming.current()
                 .phase("report")
                 .note("session_order", sessions.order())
@@ -229,7 +266,7 @@ public final class IndexTraceCompiler {
         report.put("session_order", sessions.order());
         report.put("sessions", sessionReports);
         report.put("source_work_units", state.requestUnits);
-        report.put("workload_work_units", state.emittedUnits.size());
+        report.put("workload_work_units", state.emittedUnits);
         report.put(
                 "work_unit_rule",
                 "one audited top-level source SQL execution, numbered in source order before"
@@ -309,6 +346,10 @@ public final class IndexTraceCompiler {
                 "every transaction the completion counter calls visible to a snapshot must not"
                         + " appear as running in that snapshot's own xip list; a disagreement"
                         + " fails the compilation because one read timestamp cannot express it");
+        var window = new LinkedHashMap<String, Object>();
+        window.put("limit", commitWindow);
+        window.put("evicted_commits", state.commitWindow.evicted());
+        crosscheck.put("commit_window", window);
         report.put("snapshot_crosscheck", crosscheck);
         report.put(
                 "search_rule",
@@ -341,6 +382,14 @@ public final class IndexTraceCompiler {
         return report;
     }
 
+    private static void deleteTree(Path directory) throws IOException {
+        if (!Files.exists(directory)) return;
+        try (var paths = Files.walk(directory)) {
+            for (Path path : paths.sorted(Comparator.reverseOrder()).toList())
+                Files.delete(path);
+        }
+    }
+
     private static ParquetReader<Group> reader(Path path) throws IOException {
         return ParquetReader.builder(
                         new GroupReadSupport(), new org.apache.hadoop.fs.Path(path.toUri()))
@@ -351,15 +400,19 @@ public final class IndexTraceCompiler {
     private static final class Compilation implements AccessUnits.Listener {
         final IndexCatalog catalog;
         final boolean cCollation;
-        final IndexReferenceReplay identities;
+        final RowIdentities identities;
         final Map<String, MessageType> schemas;
         final GenerationConfig layout;
         final Path output;
+        /** The open incremental file of each table; a finished one leaves this map. */
         final Map<String, Output> writers = new LinkedHashMap<>();
+        final Map<String, Integer> fileSequence = new HashMap<>();
+        long nextRolloverFile;
         final Map<Unit, Search> live = new IdentityHashMap<>();
         final Map<AccessUnits.BitmapGroup, Search> liveGroups = new IdentityHashMap<>();
         final List<Object> pending = new ArrayList<>();
-        final Set<Long> emittedUnits = new HashSet<>();
+        /** Work units that carried an operation; ids only grow, so the last one suffices. */
+        long emittedUnits, lastEmittedUnit;
         final Map<String, Long> shapes = new TreeMap<>(), excluded = new TreeMap<>();
         final List<Map<String, Object>> files = new ArrayList<>();
         IndexOperationTrace.Writer operations;
@@ -372,22 +425,15 @@ public final class IndexTraceCompiler {
         long snapshotSearches, crossChecked, crossCheckUnverifiable, partSearches;
         boolean transactionRequest, transactionOpen;
         boolean concurrent;
-        /**
-         * Committed writers (transactions with an XID) in completion-counter order: the counter,
-         * the version the compiler gave it and its PostgreSQL XID. A search reads the version of the last commit
-         * whose counter is at or before its snapshot's counter, so the arrays stay sorted by
-         * counter and the lookup is a binary search.
-         */
-        long[] commitCsns = new long[1024], commitVersions = new long[1024], commitXids = new long[1024];
-        int commitCount;
-        final Map<Long, Long> commitCounterByXid = new HashMap<>();
+        /** The latest committed writers by completion counter; see {@link CommitWindow}. */
+        CommitWindow commitWindow;
         int pid;
         String sessionFile;
 
         Compilation(
                 IndexCatalog catalog,
                 boolean cCollation,
-                IndexReferenceReplay identities,
+                RowIdentities identities,
                 Map<String, MessageType> schemas,
                 GenerationConfig layout,
                 Path output) {
@@ -537,29 +583,11 @@ public final class IndexTraceCompiler {
                                 + unit.request.ordinal
                                 + ": "
                                 + unit.request.sql);
-            int low = 0, high = commitCount - 1, best = -1;
-            while (low <= high) {
-                int middle = (low + high) >>> 1;
-                if (commitCsns[middle] <= unit.snapshotCsn) {
-                    best = middle;
-                    low = middle + 1;
-                } else high = middle - 1;
-            }
-            return best < 0 ? 0 : commitVersions[best];
+            return commitWindow.versionAt(unit.snapshotCsn);
         }
 
         private void recordCommit(long csn, long xid, long commitVersion) {
-            if (commitCount == commitCsns.length) {
-                int size = commitCount * 2;
-                commitCsns = java.util.Arrays.copyOf(commitCsns, size);
-                commitVersions = java.util.Arrays.copyOf(commitVersions, size);
-                commitXids = java.util.Arrays.copyOf(commitXids, size);
-            }
-            commitCsns[commitCount] = csn;
-            commitVersions[commitCount] = commitVersion;
-            commitXids[commitCount] = xid;
-            commitCount++;
-            if (xid != 0) commitCounterByXid.put(xid, csn);
+            commitWindow.add(csn, xid, commitVersion);
         }
 
         /**
@@ -577,7 +605,7 @@ public final class IndexTraceCompiler {
             }
             crossChecked++;
             for (long xid : unit.snapshotXip) {
-                Long csn = commitCounterByXid.get(xid);
+                Long csn = commitWindow.counterOf(xid);
                 if (csn != null && csn <= unit.snapshotCsn)
                     throw new IOException(
                             "Snapshot counter "
@@ -589,27 +617,15 @@ public final class IndexTraceCompiler {
                                     + csn
                                     + "); one read timestamp cannot express this snapshot");
             }
-            int last = lastCommitAtOrBefore(unit.snapshotCsn);
-            if (last >= 0 && commitXids[last] != 0 && commitXids[last] >= unit.snapshotXmax)
+            long last = commitWindow.xidAt(unit.snapshotCsn);
+            if (last != 0 && last >= unit.snapshotXmax)
                 throw new IOException(
                         "Snapshot counter "
                                 + unit.snapshotCsn
                                 + " calls XID "
-                                + commitXids[last]
+                                + last
                                 + " visible, but that XID is at or after the snapshot's xmax "
                                 + unit.snapshotXmax);
-        }
-
-        private int lastCommitAtOrBefore(long csn) {
-            int low = 0, high = commitCount - 1, best = -1;
-            while (low <= high) {
-                int middle = (low + high) >>> 1;
-                if (commitCsns[middle] <= csn) {
-                    best = middle;
-                    low = middle + 1;
-                } else high = middle - 1;
-            }
-            return best;
         }
 
         @Override
@@ -718,7 +734,7 @@ public final class IndexTraceCompiler {
                 boolean behind = search.readTimestamp < previousVersion;
                 emit(search, search.readTimestamp, behind ? IndexOperationTrace.SNAPSHOT_SEARCH : 0, 0, 0);
                 if (behind) snapshotSearches++;
-                emittedUnits.add(search.workUnitId);
+                emitted(search.workUnitId);
                 searches++;
             }
             reset();
@@ -759,14 +775,14 @@ public final class IndexTraceCompiler {
                                     : behind ? IndexOperationTrace.SNAPSHOT_SEARCH : 0,
                             transactionId,
                             search.precedingMutations);
-                    emittedUnits.add(search.workUnitId);
+                    emitted(search.workUnitId);
                     searches++;
                     if (local) localSearches++;
                     else if (behind) snapshotSearches++;
                     continue;
                 }
                 Change change = (Change) item;
-                emittedUnits.add(change.workUnitId());
+                emitted(change.workUnitId());
                 write(change, transactionId, ++ordinal);
             }
             append(
@@ -814,6 +830,19 @@ public final class IndexTraceCompiler {
             }
         }
 
+        /**
+         * Counts a work unit once. Units are numbered as their requests start, and a request lies
+         * inside one transaction that is compiled whole, so the ids arrive in order.
+         */
+        private void emitted(long unit) throws IOException {
+            if (unit < lastEmittedUnit)
+                throw new IOException("Work units were emitted out of order: " + unit);
+            if (unit > lastEmittedUnit) {
+                emittedUnits++;
+                lastEmittedUnit = unit;
+            }
+        }
+
         private void append(Operation operation) throws IOException {
             operations.append(operation);
             operationsCount++;
@@ -834,8 +863,8 @@ public final class IndexTraceCompiler {
                     operation.equals("insert") ? Map.of() : catalog.keys(table, oldValue);
             if (operation.equals("delete")) {
                 IndexKey key = catalog.primaryKey(table, oldValue);
-                var previous = identities.lookupPrimary(tableId, key, version);
-                if (previous == null) throw new IOException("Deletion of absent row");
+                long previous = identities.rowId(tableId, key);
+                if (previous == 0) throw new IOException("Deletion of absent row");
                 Operation primary =
                         IndexOperationTrace.write(
                                         item.event(),
@@ -846,10 +875,10 @@ public final class IndexTraceCompiler {
                                         version,
                                         0,
                                         0,
-                                        previous.value())
+                                        previous)
                                 .withTransaction(transactionId, ordinal)
                                 .withWorkUnitId(item.workUnitId());
-                identities.accept(primary);
+                identities.delete(tableId, key);
                 IndexMutation.emit(primary, before, Map.of(), this::append);
                 deletes++;
                 mutations++;
@@ -859,28 +888,19 @@ public final class IndexTraceCompiler {
                 throw new IOException("Unsupported change kind");
             JsonObject value = change.getAsJsonObject("new");
             IndexKey key = catalog.primaryKey(table, value);
-            var previous = identities.lookupPrimary(tableId, key, version);
+            long previous = identities.rowId(tableId, key);
             if (operation.equals("update")
-                    && (previous == null || !catalog.primaryKey(table, oldValue).equals(key)))
+                    && (previous == 0 || !catalog.primaryKey(table, oldValue).equals(key)))
                 throw new IOException("Update requires an existing unchanged primary key");
-            if (operation.equals("insert") && previous != null)
+            if (operation.equals("insert") && previous != 0)
                 throw new IOException("Insertion of existing primary key");
             long rowId =
                     operation.equals("update")
-                            ? previous.value()
+                            ? previous
                             : (maximumRowId = Math.incrementExact(maximumRowId));
             Output destination = writers.get(table);
             if (destination == null) {
-                if (!schemas.containsKey(table))
-                    throw new IOException("Missing baseline table schema");
-                destination =
-                        new Output(
-                                output.resolve(table + "-versions.parquet"),
-                                schemas.get(table),
-                                layout,
-                                table,
-                                catalog.primary(tableId).column(),
-                                firstIncrementalFile + tableId);
+                destination = open(table, tableId);
                 writers.put(table, destination);
             }
             Group row = new SimpleGroupFactory(destination.schema).newGroup();
@@ -913,37 +933,75 @@ public final class IndexTraceCompiler {
                                     rowId)
                             .withTransaction(transactionId, ordinal)
                             .withWorkUnitId(item.workUnitId());
-            identities.accept(primary);
+            identities.put(tableId, key, rowId);
             IndexMutation.emit(primary, before, catalog.keys(table, value), this::append);
-            if (destination.writer.write(row))
-                throw new IOException(
-                        "Incremental file reached rollover limit; extend compiler before larger run");
+            // A file that reached its target size is closed; the table's next row opens another.
+            if (destination.writer.write(row)) {
+                writers.remove(table);
+                finish(table, destination);
+            }
             mutations++;
             if (operation.equals("insert")) inserts++;
             else updates++;
         }
 
-        void finishFiles() throws IOException {
-            for (var entry : writers.entrySet()) {
-                Output writer = entry.getValue();
-                var footer = writer.writer.finish();
-                writer.close();
-                long decoded = 0;
-                try (ParquetReader<Group> check = reader(writer.path)) {
-                    while (check.read() != null) decoded++;
-                }
-                if (decoded != writer.rows) throw new IOException("Incremental Parquet row mismatch");
-                var file = new LinkedHashMap<String, Object>();
-                file.put("table", entry.getKey());
-                file.put("file_id", writer.fileId);
-                file.put("path", writer.path.getFileName().toString());
-                file.put("rows", writer.rows);
-                file.put("sha256", BaselineGenerator.sha256(writer.path));
-                file.put(
-                        "row_groups",
-                        footer.getBlocks().stream().map(b -> b.getRowCount()).toList());
-                files.add(file);
+        /**
+         * The table's next incremental file. The first keeps the name and FileID it has always had
+         * (the baseline's last FileID plus the table's id); rollover files take the FileIDs after
+         * the last table's, in the order they are opened, so every FileID is unique and int64.
+         */
+        private Output open(String table, int tableId) throws IOException {
+            if (!schemas.containsKey(table)) throw new IOException("Missing baseline table schema");
+            int sequence = fileSequence.merge(table, 1, Integer::sum);
+            long fileId;
+            String name;
+            if (sequence == 1) {
+                fileId = Math.addExact(firstIncrementalFile, tableId);
+                name = table + "-versions.parquet";
+            } else {
+                if (nextRolloverFile == 0)
+                    nextRolloverFile =
+                            Math.addExact(
+                                    firstIncrementalFile,
+                                    catalog.definitions().stream()
+                                                    .mapToInt(IndexCatalog.Definition::tableId)
+                                                    .max()
+                                                    .orElse(0)
+                                            + 1L);
+                fileId = nextRolloverFile++;
+                name = "%s-versions-%06d.parquet".formatted(table, sequence);
             }
+            return new Output(
+                    output.resolve(name),
+                    schemas.get(table),
+                    layout,
+                    table,
+                    catalog.primary(tableId).column(),
+                    fileId);
+        }
+
+        private void finish(String table, Output writer) throws IOException {
+            var footer = writer.writer.finish();
+            writer.close();
+            long decoded = 0;
+            try (ParquetReader<Group> check = reader(writer.path)) {
+                while (check.read() != null) decoded++;
+            }
+            if (decoded != writer.rows) throw new IOException("Incremental Parquet row mismatch");
+            var file = new LinkedHashMap<String, Object>();
+            file.put("table", table);
+            file.put("file_id", writer.fileId);
+            file.put("path", writer.path.getFileName().toString());
+            file.put("rows", writer.rows);
+            file.put("sha256", BaselineGenerator.sha256(writer.path));
+            file.put(
+                    "row_groups", footer.getBlocks().stream().map(b -> b.getRowCount()).toList());
+            files.add(file);
+        }
+
+        void finishFiles() throws IOException {
+            for (var entry : writers.entrySet()) finish(entry.getKey(), entry.getValue());
+            writers.clear();
         }
     }
 }

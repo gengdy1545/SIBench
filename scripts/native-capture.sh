@@ -68,11 +68,22 @@ URL=jdbc:postgresql://127.0.0.1:$SIBENCH_PORT/$SIBENCH_DATABASE
 stage prepare
 stage check > "$SIBENCH_ARTIFACTS/schema-preflight.json"
 stage export > "$SIBENCH_ARTIFACTS/baseline.log"
+# PG's own index counters bracket only the native run: an independent check that the ledger saw
+# every index access, including ones the instrumentation might never have emitted.
+counters() {
+  "$JAVA" -cp "$HYBENCH_CP" org.sibench.cli.Sibench snapshot-index-counters "$PROFILE" "$1" \
+    --jdbc "$URL" --user postgres > /dev/null
+}
+counters "$SIBENCH_ARTIFACTS/index-counters-before.json"
 stage run > "$SIBENCH_ARTIFACTS/run-summary.json"
+counters "$SIBENCH_ARTIFACTS/index-counters-after.json"
 "$JAVA" $HEAP -cp "$HYBENCH_CP" org.sibench.cli.Sibench audit-rows "$PROFILE" "$SIBENCH_ARTIFACTS/baseline" "$SIBENCH_RAW" \
   --jdbc "$URL" --user postgres --timing "$TIMING" > "$SIBENCH_ARTIFACTS/row-state-audit-summary.json"
 "$JAVA" $HEAP -cp "$HYBENCH_CP" org.sibench.cli.Sibench access-ledger "$PROFILE" "$SIBENCH_RAW" --timing "$TIMING" \
   > "$SIBENCH_ARTIFACTS/access-ledger-summary.json"
+"$JAVA" -cp "$HYBENCH_CP" org.sibench.cli.Sibench check-capture-completeness "$PROFILE" \
+  "$SIBENCH_RAW/access-ledger.json" "$SIBENCH_ARTIFACTS/index-counters-before.json" \
+  "$SIBENCH_ARTIFACTS/index-counters-after.json" > "$SIBENCH_ARTIFACTS/capture-completeness.json"
 "$JAVA" $HEAP -cp "$HYBENCH_CP" org.sibench.cli.Sibench compile-trace "$PROFILE" "$SIBENCH_ARTIFACTS/trace" --timing "$TIMING" \
   > "$SIBENCH_ARTIFACTS/trace-summary.json"
 echo "native capture complete: $SIBENCH_ARTIFACTS; timing: $TIMING"

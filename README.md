@@ -40,7 +40,7 @@ java -jar build/sibench/sibench.jar snapshot-index-counters PROFILE OUTPUT --jdb
 java -jar build/sibench/sibench.jar check-capture-completeness PROFILE LEDGER BEFORE AFTER
 ```
 
-脚本以 `compute_query_id = on` 启停本地 PG，依次执行建库加载、预检、Baseline 导出、原生执行、行状态审计、访问账本和 `compile-trace`（输出 `<产物目录>/trace`）；已有数据库或输出目录会被拒绝。每个阶段把墙钟、事件数和本次运行的关键事实追加到 `<产物目录>/run-timing.json`，长阶段按秒输出速率，便于比较两次运行并定位热点。任何命令都可用 `--timing FILE` 追加到同一份计时产物。`access-ledger` 按 PG 追踪把索引事件划分为访问单元并给出每个单元的投影决定，模板为 PG `query_id`，不连接 PG，REPORT 必须是新文件；`compile-trace` 对任一不能投影的访问失败。`config/*_small.yaml` 是约 15 秒的冒烟配置。证据见 [HTAP 验证](docs/validation/hybench-sf1-htap.md) 与 [原生 Trace 验证](docs/validation/ycsb-sysbench-native-trace.md)。
+脚本以 `compute_query_id = on` 启停本地 PG，依次执行建库加载、预检、Baseline 导出、原生执行、行状态审计、访问账本、采集完整性对照和 `compile-trace`（输出 `<产物目录>/trace`）；原生执行前后各取一次 PG 索引计数器快照（等其它会话退出、两次相隔一个统计周期的读数一致后才记录），`check-capture-completeness` 按 PG14 计数位置核对账本：`idx_tup_read` 等于候选数，`idx_tup_fetch` 等于经堆判定可见的行（不含 bitmap 与全可见 index-only），`idx_scan` 落在账本推出的树下降上下界内，不一致则脚本失败。已有数据库或输出目录会被拒绝。每个阶段把墙钟、事件数和本次运行的关键事实追加到 `<产物目录>/run-timing.json`，长阶段按秒输出速率，便于比较两次运行并定位热点。任何命令都可用 `--timing FILE` 追加到同一份计时产物。`access-ledger` 按 PG 追踪把索引事件划分为访问单元并给出每个单元的投影决定，模板为 PG `query_id`，不连接 PG，REPORT 必须是新文件；`compile-trace` 对任一不能投影的访问失败。`config/*_small.yaml` 是约 15 秒的冒烟配置。证据见 [HTAP 验证](docs/validation/hybench-sf1-htap.md) 与 [原生 Trace 验证](docs/validation/ycsb-sysbench-native-trace.md)。
 
 并发 HTAP 按 PostgreSQL 事务完成计数器编译：写事务在持锁自增时记录精确位置，只读事务排在同位置写事务之后，事务大小的片段据此 k 路归并；查询读取其语句快照所见的最后一个写事务，并用快照自己的 xip 逐条交叉验证，计数器或快照缺失、冲突时拒绝，不按 PID、XID 大小、文件顺序或墙钟推断。
 
@@ -48,7 +48,7 @@ java -jar build/sibench/sibench.jar check-capture-completeness PROFILE LEDGER BE
 
 三来源通用入口为 `audit-rows PROFILE BASELINE RAW [REPORT] --jdbc URL --user ROLE`；指定自定义报告时，`compile-trace PROFILE OUTPUT ROW_AUDIT` 显式引用它。审计前业务库必须处于原采集结束的静止状态；历史报告不改写，详情见 [统一行状态审计](docs/validation/row-state-audit.md)。
 
-[index_replay.yaml](config/index_replay.yaml) 控制下游发送。以下回放规范 Trace，不执行 SQL、不连接 PG：
+[index_replay.yaml](config/index_replay.yaml) 控制下游发送。参考模型的内存有界：基线条目超过预算时外部排序为磁盘 run，版本历史落入可落盘的有序 map；可用 `-Dsibench.reference.baseline_entries=N`（默认 64,000,000）、`-Dsibench.reference.overlay_entries=N`（默认 500,000）、`-Dsibench.reference.sort_bytes=N`、`-Dsibench.reference.directory=DIR`（每个模型在其下建独占的子目录，关闭时删除）调整，结果与预算无关。`-Dsibench.trace=1` 在失败时打印堆栈。以下回放规范 Trace，不执行 SQL、不连接 PG：
 
 ```bash
 T=results/poc/hybench-htap-sf1/trace

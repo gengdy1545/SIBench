@@ -165,6 +165,13 @@ public class AccessLedgerTest {
         return (Map<String, Object>) value;
     }
 
+    private static Map<String, Map<String, Object>> indexes(Map<String, Object> report) {
+        var result = new java.util.TreeMap<String, Map<String, Object>>();
+        for (Object item : (List<?>) report.get("indexes"))
+            result.put(map(item).get("index").toString(), map(item));
+        return result;
+    }
+
     private Map<String, Object> analyze(Trace trace, String name) throws Exception {
         return AccessLedger.analyze(schema(), trace.write(folder.getRoot().toPath(), name), true);
     }
@@ -211,7 +218,7 @@ public class AccessLedgerTest {
         t.commit();
 
         var report = analyze(t, "pg-7.jsonl");
-        assertEquals(3, report.get("schema_version"));
+        assertEquals(AccessLedger.VERSION, report.get("schema_version"));
         assertEquals((long) t.lines.size(), ((Number) map(report.get("partition")).get("sum")).longValue());
         var units = map(report.get("access_units"));
         assertEquals(8L, units.get("total"));
@@ -246,6 +253,44 @@ public class AccessLedgerTest {
         assertEquals(2L, write.get("index_insert_attempts"));
         assertEquals(1L, write.get("row_changes"));
         assertEquals(1L, write.get("access_units"));
+        // Per index, the facts PG's own counters are compared with: every source index is listed.
+        var indexes = indexes(report);
+        assertEquals(java.util.Set.of(PK, K), indexes.keySet());
+        var primary = indexes.get(PK);
+        // Probe, equality, range, three nested-loop rescans and the write lookup: one pass each.
+        assertEquals(7L, primary.get("tree_descents_min"));
+        assertEquals(7L, primary.get("tree_descents_max"));
+        assertEquals(9L, primary.get("candidates"));
+        assertEquals(8L, primary.get("heap_fetch_visible"));
+        var secondary = indexes.get(K);
+        assertEquals(1L, secondary.get("tree_descents_min"));
+        assertEquals(4L, secondary.get("candidates"));
+        // Bitmap candidates reach the heap without index_fetch_heap.
+        assertEquals(3L, secondary.get("visible_rows"));
+        assertEquals(0L, secondary.get("heap_fetch_visible"));
+    }
+
+    @Test
+    public void treeDescentsFollowPassesAndArrayElements() throws Exception {
+        var t = new Trace().start("SELECT 1");
+        // A scan the consumer stopped early, and one that was rescanned without fetching.
+        t.plan("a", PK, 0, "index").rescan("a", PK, EQUALITY).next("a", PK, true, false);
+        t.visible("a", PK, true).scanEnd("a", PK);
+        t.plan("b", PK, 1, "index").rescan("b", PK, EQUALITY).scanEnd("b", PK);
+        // A scan asked again after reporting its end descends again.
+        t.plan("c", PK, 2, "index").rescan("c", PK, RANGE).next("c", PK, false, false);
+        t.next("c", PK, false, false).scanEnd("c", PK);
+        // Three array elements: zero to three descents in one pass.
+        String array =
+                "[{\"attribute\":1,\"strategy\":3,\"flags\":32,\"type_oid\":23,\"value\":null,"
+                        + "\"array_type_oid\":23,\"array\":[\"1\",\"2\",\"3\"]}]";
+        t.plan("d", K, 3, "index").rescan("d", K, array).next("d", K, false, false).scanEnd("d", K);
+        t.end(0).commit();
+        var indexes = indexes(analyze(t, "pg-7.jsonl"));
+        assertEquals(3L, indexes.get(PK).get("tree_descents_min"));
+        assertEquals(3L, indexes.get(PK).get("tree_descents_max"));
+        assertEquals(0L, indexes.get(K).get("tree_descents_min"));
+        assertEquals(3L, indexes.get(K).get("tree_descents_max"));
     }
 
     @Test

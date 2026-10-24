@@ -290,8 +290,8 @@ public final class ReferenceReplay {
             throws IOException {
         List<Map<String, Object>> results = new ArrayList<>();
         for (boolean rowId : new boolean[] {false, true}) {
-            var index = new IndexReferenceReplay(rowId, config.secondaryIndexes());
-            try (var load = new ReplayProjection(config, false, index::accept);
+            try (var index = new IndexReferenceReplay(rowId, config.secondaryIndexes());
+                    var load = new ReplayProjection(config, false, index::accept);
                     var runtime = new ReplayProjection(config, true, index::accept)) {
                 RunTiming.current().phase("load");
                 long start = System.nanoTime();

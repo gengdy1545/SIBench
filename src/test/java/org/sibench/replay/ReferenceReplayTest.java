@@ -160,12 +160,12 @@ public class ReferenceReplayTest {
                     IOException.class,
                     () -> model.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0)));
             model.accept(TestOps.op(1, 3, 3, 0, 2, 1, 1, 9, 0, 50, 0, 0, 0, 10, 1));
-            assertEquals(
-                    rowId ? 50 : IndexReferenceReplay.locator(9, 0),
-                    model.lookupPrimary(3, TestOps.key(1), 1).value());
+            assertEquals(rowId ? 50 : 9, model.lookupPrimary(3, TestOps.key(1), 1).value());
+            assertEquals(0, model.lookupPrimary(3, TestOps.key(1), 1).position());
             model.accept(TestOps.op(2, 3, 3, 0, 2, 1, 1, 9, 1, 50, 0, 0, 0, 10, 2));
             assertEquals(0, model.lookupPrimary(3, TestOps.key(1), 0).commitVersion());
-            assertEquals(rowId ? 50 : IndexReferenceReplay.locator(9, 1), model.value(3, TestOps.key(1)));
+            assertEquals(rowId ? 50 : 9, model.value(3, TestOps.key(1)));
+            assertEquals(rowId ? 0 : 1, model.position(3, TestOps.key(1)));
             assertEquals(old, model.lookupPrimary(3, TestOps.key(1), 0).value());
             assertEquals(1, model.lookupPrimary(3, TestOps.key(1), 1).commitVersion());
             assertEquals(2, model.retainedVersions());

@@ -152,8 +152,8 @@ public final class RelocationCheck {
         }
         var results = new ArrayList<Map<String, Object>>();
         for (boolean rowIds : new boolean[] {false, true}) {
-            var model = new IndexReferenceReplay(rowIds);
-            try (var load = new ReplayProjection(ReplayConfig.defaults(), false, model::accept);
+            try (var model = new IndexReferenceReplay(rowIds);
+                    var load = new ReplayProjection(ReplayConfig.defaults(), false, model::accept);
                     var runtime =
                             new ReplayProjection(ReplayConfig.defaults(), true, model::accept)) {
                 IndexOperationTrace.read(input.resolve("baseline.ops"), load);
@@ -165,10 +165,8 @@ public final class RelocationCheck {
                     Retained row = entry.getValue();
                     Key key = entry.getKey();
                     long version = row.row().getLong("_sib_timestamp", 0);
-                    long expected =
-                            rowIds
-                                    ? row.row().getLong("_sib_row_id", 0)
-                                    : IndexReferenceReplay.locator(row.file(), row.position());
+                    long expected = rowIds ? row.row().getLong("_sib_row_id", 0) : row.file();
+                    long expectedPosition = rowIds ? 0 : row.position();
                     String table =
                             catalog.definitions().stream()
                                     .filter(d -> d.tableId() == key.table())
@@ -187,6 +185,7 @@ public final class RelocationCheck {
                                         version);
                         if (actual == null
                                 || actual.value() != expected
+                                || actual.position() != expectedPosition
                                 || actual.commitVersion() != version)
                             throw new java.io.IOException("Relocated index value/version mismatch");
                     }

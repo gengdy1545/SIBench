@@ -25,17 +25,21 @@ import java.util.*;
  * per SQL template (PostgreSQL's query identifier) and per access path within it.
  */
 public final class AccessLedger {
-    public static final int VERSION = 3;
+    public static final int VERSION = 4;
 
     private static final class Tally {
-        long units, candidates, visible, heapFetches, recheck;
+        long units, candidates, visible, heapFetches, heapVisible, recheck;
+        long descentsMin, descentsMax;
 
         void add(Unit unit) {
             units++;
             candidates += unit.candidates();
             visible += unit.visible();
             heapFetches += unit.heapFetches;
+            heapVisible += unit.heapVisible;
             recheck += unit.recheck;
+            descentsMin += unit.descentsMin();
+            descentsMax += unit.descentsMax();
         }
 
         Map<String, Object> describe() {
@@ -44,7 +48,10 @@ public final class AccessLedger {
             result.put("candidates", candidates);
             result.put("visible_rows", visible);
             result.put("heap_fetches", heapFetches);
+            result.put("heap_fetch_visible", heapVisible);
             result.put("recheck_flagged_candidates", recheck);
+            result.put("tree_descents_min", descentsMin);
+            result.put("tree_descents_max", descentsMax);
             return result;
         }
     }
@@ -382,8 +389,10 @@ public final class AccessLedger {
         projection.put("search_operations", searchOperations);
         result.put("projection", projection);
         var indexReports = new ArrayList<Map<String, Object>>();
+        // Every source index, accessed or not, so a counter on an untouched index is comparable.
         var names = new TreeSet<String>(byIndex.keySet());
         names.addAll(writes.keySet());
+        for (var definition : catalog.definitions()) names.add(definition.name());
         for (String name : names) {
             var item = new LinkedHashMap<String, Object>();
             item.put("index", name);
@@ -462,6 +471,10 @@ public final class AccessLedger {
                         "Planner endpoint probes and rescans never fetched from are excluded and"
                             + " reported separately.",
                         "Write maintenance (index_insert_attempt) is not a search.",
+                        "heap_fetch_visible counts only rows a plain or index-only scan fetched"
+                            + " from the heap and found visible; tree descents are bounded per"
+                            + " unit: exact per pass without array keys, 0 to one per element"
+                            + " combination per pass with them.",
                         "A BitmapAnd's inputs from one cycle are one group: the heap checks their"
                             + " intersection, so each input carries the group's decision."));
         result.put(

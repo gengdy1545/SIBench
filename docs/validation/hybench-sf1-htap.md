@@ -72,7 +72,7 @@ java -Xmx24g -jar build/sibench/sibench.jar replay config/index_replay_128client
 java -Xmx24g -jar build/sibench/sibench.jar validate-snapshots config/index_replay.yaml results/poc/hybench-htap-sf1/trace REPORT
 ```
 
-边界：短跑负载（AP 1 分钟、TP 2 分钟、XP 1 分钟），不是容量或性能结论；oracle 的二级谓词仍为每索引最多 64 个等值抽样；全局丢事件仍由客户端 / 服务端配对审计与 `check-capture-completeness` 旁证，未做故障注入。
+边界：短跑负载（AP 1 分钟、TP 2 分钟、XP 1 分钟），不是容量或性能结论；oracle 的二级谓词仍为每索引最多 64 个等值抽样；全局丢事件的独立旁证与区间 oracle 见 [采集完整性与有界状态验证](capture-completeness.md)（本页数字为 2026-10-23 中午的采集，后者为同日重新采集的结果）；未做故障注入。
 
 ## 产物迁移记录
 

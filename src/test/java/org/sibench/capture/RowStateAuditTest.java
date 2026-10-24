@@ -397,4 +397,152 @@ public class RowStateAuditTest {
         Files.writeString(Path.of(report + ".changes.jsonl"), "\n", StandardOpenOption.APPEND);
         assertThrows(IOException.class, () -> RowStateAudit.reuse(schema, baseline, raw, report));
     }
+
+    /** Many keys in shuffled order, chains, deletes, reinserts and keys below/above the baseline. */
+    private record Scenario(Path baseline, Path raw, Map<String, List<JsonObject>> finalRows) {}
+
+    private Scenario scenario(String benchmark, Path fixture) throws Exception {
+        var schema = schema(benchmark, 3);
+        var table = schema.tables().get(0);
+        var primary = SourceRow.primary(table);
+        boolean numeric = primary.type().equals("integer");
+        var column =
+                table.columns().stream()
+                        .filter(c -> !c.name().equals(primary.name()))
+                        .findFirst()
+                        .orElseThrow();
+        java.util.function.Function<Integer, String> name =
+                i -> numeric ? Integer.toString(i * 3) : "user" + (i * 7) % 1000;
+        var state = new TreeMap<String, JsonObject>(RowStateAuditTest::byKey);
+        var baselineRows = new ArrayList<JsonObject>();
+        for (int i = 1; i <= 40; i++) {
+            JsonObject r = row(table, name.apply(i));
+            state.put(name.apply(i), r);
+        }
+        baselineRows.addAll(state.values());
+        var transactions = new ArrayList<List<JsonObject>>();
+        var random = new Random(9);
+        java.util.function.BiConsumer<String, Integer> update =
+                (key, version) -> {
+                    JsonObject before = state.get(key), after = before.deepCopy();
+                    after.addProperty(
+                            column.name(),
+                            column.type().equals("integer") ? version.toString() : "v" + version);
+                    state.put(key, after);
+                    transactions.add(
+                            List.of(RowAuditTestSupport.change(table.name(), "update", before, after)));
+                };
+        for (int round = 0; round < 3; round++) {
+            var keys = new ArrayList<>(baselineRows.stream().map(r -> r.get(primary.name()).getAsString()).toList());
+            Collections.shuffle(keys, random);
+            for (String key : keys.subList(0, 25)) update.accept(key, round * 100 + random.nextInt(90) + 1);
+        }
+        String gone = name.apply(10);
+        JsonObject removed = state.remove(gone);
+        transactions.add(List.of(RowAuditTestSupport.change(table.name(), "delete", removed, null)));
+        JsonObject again = removed.deepCopy();
+        again.addProperty(column.name(), column.type().equals("integer") ? "777" : "again");
+        state.put(gone, again);
+        transactions.add(List.of(RowAuditTestSupport.change(table.name(), "insert", null, again)));
+        for (String key : numeric ? List.of("-5", "1000000", "2") : List.of("aaa", "user9", "zzz")) {
+            JsonObject added = row(table, key);
+            state.put(key, added);
+            transactions.add(List.of(RowAuditTestSupport.change(table.name(), "insert", null, added)));
+        }
+        Path baseline = baseline(fixture, schema, Map.of(table.name(), baselineRows));
+        Path raw = RowAuditTestSupport.capture(fixture, transactions, Set.of());
+        var finalRows = new LinkedHashMap<String, List<JsonObject>>();
+        finalRows.put(table.name(), new ArrayList<>(state.values()));
+        return new Scenario(baseline, raw, finalRows);
+    }
+
+    private static int byKey(String a, String b) {
+        try {
+            return Long.compare(Long.parseLong(a), Long.parseLong(b));
+        } catch (NumberFormatException text) {
+            return Arrays.compareUnsigned(
+                    a.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                    b.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void auditingOutOfCoreChangesTheReportNeitherInContentNorOrder() throws Exception {
+        for (String benchmark : List.of("sysbench", "ycsb")) {
+            var schema = schema(benchmark, 3);
+            Scenario memory = scenario(benchmark, temporary.newFolder().toPath());
+            Scenario spilled = scenario(benchmark, temporary.newFolder().toPath());
+            Path memoryReport = RowStateAudit.defaultReport(memory.raw());
+            Path spilledReport = RowStateAudit.defaultReport(spilled.raw());
+            var inMemory =
+                    RowStateAudit.audit(
+                            RowAuditTestSupport.connection(schema, memory.finalRows(), new int[1]),
+                            schema,
+                            memory.baseline(),
+                            memory.raw(),
+                            memoryReport);
+            var outOfCore =
+                    RowStateAudit.audit(
+                            RowAuditTestSupport.connection(schema, spilled.finalRows(), new int[1]),
+                            schema,
+                            spilled.baseline(),
+                            spilled.raw(),
+                            spilledReport,
+                            1);
+            assertEquals(benchmark, 25L * 3 + 1 + 1 + 3, inMemory.get("committed_row_changes"));
+            assertEquals(benchmark, inMemory.get("committed_row_changes"), outOfCore.get("committed_row_changes"));
+            assertEquals(benchmark, inMemory.get("changes_sha256"), outOfCore.get("changes_sha256"));
+            assertEquals(benchmark, inMemory.get("tables"), outOfCore.get("tables"));
+            assertEquals(
+                    Files.readAllLines(Path.of(memoryReport + ".changes.jsonl")),
+                    Files.readAllLines(Path.of(spilledReport + ".changes.jsonl")));
+            // No working files remain beside the report.
+            try (var siblings = Files.list(spilledReport.getParent())) {
+                assertTrue(siblings.noneMatch(p -> p.getFileName().toString().contains(".work")
+                        || p.getFileName().toString().endsWith(".partial")));
+            }
+            // The transitions are grouped by key in key order, each key's chain in order.
+            var keys = new ArrayList<String>();
+            for (String line : Files.readAllLines(Path.of(spilledReport + ".changes.jsonl"))) {
+                var event = JsonParser.parseString(line).getAsJsonObject();
+                var image = event.get("new").isJsonNull() ? event.getAsJsonObject("old") : event.getAsJsonObject("new");
+                String key = image.get(SourceRow.primary(schema.tables().get(0)).name()).getAsString();
+                if (keys.isEmpty() || !keys.get(keys.size() - 1).equals(key)) keys.add(key);
+            }
+            var sorted = new ArrayList<>(keys);
+            sorted.sort(RowStateAuditTest::byKey);
+            assertEquals(sorted, keys);
+            assertEquals(new LinkedHashSet<>(keys).size(), keys.size());
+        }
+    }
+
+    @Test
+    public void aMismatchIsStillFoundWhenChangesAreSortedOutOfCore() throws Exception {
+        var schema = schema("sysbench", 3);
+        Scenario scenario = scenario("sysbench", temporary.newFolder().toPath());
+        var wrong = new LinkedHashMap<String, List<JsonObject>>();
+        for (var entry : scenario.finalRows().entrySet()) {
+            var rows = new ArrayList<JsonObject>();
+            for (JsonObject row : entry.getValue()) rows.add(row.deepCopy());
+            rows.get(rows.size() / 2).addProperty("k", 123456);
+            wrong.put(entry.getKey(), rows);
+        }
+        Path report = RowStateAudit.defaultReport(scenario.raw());
+        var error =
+                assertThrows(
+                        IOException.class,
+                        () ->
+                                RowStateAudit.audit(
+                                        RowAuditTestSupport.connection(schema, wrong, new int[1]),
+                                        schema,
+                                        scenario.baseline(),
+                                        scenario.raw(),
+                                        report,
+                                        1));
+        assertTrue(error.getMessage(), error.getMessage().contains("Final source row mismatch"));
+        assertFalse(Files.exists(report));
+        assertFalse(Files.exists(Path.of(report + ".changes.jsonl")));
+        assertFalse(Files.exists(Path.of(report + ".changes.jsonl.partial")));
+        assertFalse(Files.exists(Path.of(report + ".work")));
+    }
 }

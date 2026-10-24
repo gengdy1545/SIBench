@@ -83,9 +83,8 @@ public class VersionedLookupTest {
                 assertEquals(100, model.lookupPrimary(3, TestOps.key(1), 105).commitVersion());
                 assertEquals(110, model.lookupPrimary(3, TestOps.key(1), 110).commitVersion());
                 assertEquals(120, model.lookupPrimary(3, TestOps.key(1), 130).commitVersion());
-                assertEquals(
-                        rowIds ? 50 : IndexReferenceReplay.locator(9, 3),
-                        model.lookupPrimary(3, TestOps.key(1), 120).value());
+                assertEquals(rowIds ? 50 : 9, model.lookupPrimary(3, TestOps.key(1), 120).value());
+                assertEquals(rowIds ? 0 : 3, model.lookupPrimary(3, TestOps.key(1), 120).position());
                 assertEquals(0, model.lookupPrimary(3, TestOps.key(2), 90).commitVersion());
                 assertEquals(4, model.retainedVersions());
                 assertEquals(4, model.snapshotQueries());
@@ -95,13 +94,52 @@ public class VersionedLookupTest {
                 commit(replay, 150, row(3, 1, 150, 4, 51, 3, 1));
                 assertNull(model.lookupPrimary(3, TestOps.key(1), 149));
                 assertEquals(150, model.lookupPrimary(3, TestOps.key(1), 150).commitVersion());
-                assertEquals(
-                        rowIds ? 51 : IndexReferenceReplay.locator(9, 4),
-                        model.lookupPrimary(3, TestOps.key(1), 150).value());
+                assertEquals(rowIds ? 51 : 9, model.lookupPrimary(3, TestOps.key(1), 150).value());
+                assertEquals(rowIds ? 0 : 4, model.lookupPrimary(3, TestOps.key(1), 150).position());
                 assertEquals(6, model.retainedVersions());
                 replay.finish();
             }
         }
+    }
+
+    @Test
+    public void locatorsKeepBothInt64WordsBeyondTheOldPackedWidth() throws Exception {
+        long wideFile = 5_000_000_000L, widePosition = 9_000_000_000L;
+        var model = new IndexReferenceReplay(false, false);
+        model.accept(TestOps.op(0, 1, 3, 0, 0, 1, 0, wideFile, widePosition, 50, 0, 0, 0));
+        // Same words except the low bit of the position: a packed encoding would collide here.
+        model.accept(TestOps.op(0, 1, 3, 0, 0, 2, 0, wideFile, widePosition + (1L << 32), 51, 0, 0, 0));
+        var first = model.lookupPrimary(3, TestOps.key(1), 0);
+        var second = model.lookupPrimary(3, TestOps.key(2), 0);
+        assertEquals(wideFile, first.value());
+        assertEquals(widePosition, first.position());
+        assertEquals(wideFile, second.value());
+        assertEquals(widePosition + (1L << 32), second.position());
+        assertNotEquals(first.position(), second.position());
+
+        model.accept(
+                TestOps.op(1, 3, 3, 0, 2, 1, 7, Long.MAX_VALUE, Long.MAX_VALUE, 50, 0, 0, 0, 7, 1));
+        var updated = model.lookupPrimary(3, TestOps.key(1), 7);
+        assertEquals(Long.MAX_VALUE, updated.value());
+        assertEquals(Long.MAX_VALUE, updated.position());
+        assertEquals(widePosition, model.lookupPrimary(3, TestOps.key(1), 6).position());
+        assertEquals(Long.MAX_VALUE, model.value(3, TestOps.key(1)));
+        assertEquals(Long.MAX_VALUE, model.position(3, TestOps.key(1)));
+
+        // Relocating the exact version changes the position and keeps the version.
+        model.accept(TestOps.op(2, 4, 3, 0, 0, 1, 7, Long.MAX_VALUE - 1, 3, 50, 0, 0, 0));
+        var relocated = model.lookupPrimary(3, TestOps.key(1), 7);
+        assertEquals(Long.MAX_VALUE - 1, relocated.value());
+        assertEquals(3, relocated.position());
+        assertEquals(7, relocated.commitVersion());
+
+        // A Locator needs a positive FileID and a non-negative position.
+        assertThrows(
+                IOException.class,
+                () -> model.accept(TestOps.op(3, 1, 3, 0, 0, 9, 0, 0, 0, 52, 0, 0, 0)));
+        assertThrows(
+                IOException.class,
+                () -> model.accept(TestOps.op(3, 1, 3, 0, 0, 9, 0, 1, -1, 52, 0, 0, 0)));
     }
 
     @Test
@@ -128,16 +166,15 @@ public class VersionedLookupTest {
             org.sibench.capture.TransferIndexFixtures.expandRow(
                     TestOps.op(200, 4, 5, 0, 0, 1, 100, 11, 7, 50, 10, 20, 0), model::accept);
             assertEquals(rowIds ? 0 : 3, model.relocationWrites());
-            assertEquals(
-                    rowIds ? 50 : IndexReferenceReplay.locator(11, 7),
-                    model.lookupPrimary(5, TestOps.key(1), 105).value());
-            assertEquals(
-                    rowIds ? 50 : IndexReferenceReplay.locator(11, 7),
+            assertEquals(rowIds ? 50 : 11, model.lookupPrimary(5, TestOps.key(1), 105).value());
+            assertEquals(rowIds ? 0 : 7, model.lookupPrimary(5, TestOps.key(1), 105).position());
+            var relocated =
                     model.lookupSecondary(5, 1, TestOps.key(10), 105).stream()
                             .filter(o -> o.key().equals(TestOps.key(1)))
                             .findFirst()
-                            .orElseThrow()
-                            .value());
+                            .orElseThrow();
+            assertEquals(rowIds ? 50 : 11, relocated.value());
+            assertEquals(rowIds ? 0 : 7, relocated.position());
             assertNull(model.lookupPrimary(5, TestOps.key(1), 130));
             assertThrows(
                     IOException.class,
