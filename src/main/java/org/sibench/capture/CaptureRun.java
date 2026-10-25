@@ -17,7 +17,6 @@ import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /** A capture is usable only after the same-execution client/server audit succeeds. */
 final class CaptureRun implements AutoCloseable {

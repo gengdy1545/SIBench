@@ -16,7 +16,7 @@
 
 ## 访问账本
 
-`access-ledger`（报告 v4）读取原始 PG 追踪，不连接 PG。一次索引重扫是一个访问单元；嵌套循环内表的每次重扫各算一个。每个原始事件恰好归入访问单元、写维护（`index_insert_attempt`）、执行器生命周期、事务边界、结果行、行变化、索引构建或计划绑定之一，各类之和必须等于输入事件数，否则失败。候选条目、可见行、SQL 返回行是同一访问的三个属性，不相加：bitmap 候选是可见性判断前的 TID，可见行是堆检查可见、可见性图全可见的索引行，或堆判定可见的 bitmap 候选；一个候选 TID 的判定计入产生它的每个索引扫描，所以 BitmapOr 两侧各得自身的可见匹配数；BitmapAnd 的堆只检查交集，同一轮执行的输入组成一个组，组计一次可见数。PG 在交集变空时跳过后续输入，所以一轮只包含实际执行了的输入。堆判定事件（逐 TID 或聚合）单列为 `bitmap_heap_verdicts`，不重复计入访问单元；`scan_summary` 计入它所属的访问单元，`capture_start` 单列为 `capture_header`。每个输入文件报告其 `detail`。
+账本（报告 v4）读取原始 PG 追踪，不连接 PG。编译器在编译的同一遍里构建它，写入 Trace 目录的 `access-ledger.json`；独立的 `access-ledger` 命令得到相同报告（输入按文件名排序，模板显示文本取字典序第一个），用于编译因拒绝而失败时列出全部拒绝。一次索引重扫是一个访问单元；嵌套循环内表的每次重扫各算一个。每个原始事件恰好归入访问单元、写维护（`index_insert_attempt`）、执行器生命周期、事务边界、结果行、行变化、索引构建或计划绑定之一，各类之和必须等于输入事件数，否则失败。候选条目、可见行、SQL 返回行是同一访问的三个属性，不相加：bitmap 候选是可见性判断前的 TID，可见行是堆检查可见、可见性图全可见的索引行，或堆判定可见的 bitmap 候选；一个候选 TID 的判定计入产生它的每个索引扫描，所以 BitmapOr 两侧各得自身的可见匹配数；BitmapAnd 的堆只检查交集，同一轮执行的输入组成一个组，组计一次可见数。PG 在交集变空时跳过后续输入，所以一轮只包含实际执行了的输入。堆判定事件（逐 TID 或聚合）单列为 `bitmap_heap_verdicts`，不重复计入访问单元；`scan_summary` 计入它所属的访问单元，`capture_start` 单列为 `capture_header`。每个输入文件报告其 `detail`。
 
 每个访问单元带有编译器使用的同一投影决定（下节）：`projection` 汇总投影形态、拒绝原因和排除原因，存在拒绝时状态为 `has_rejected_units`。模板身份是 PG `query_id`（以字符串输出，避免 JSON 工具丢失 int64 精度），去字面量 SQL 只作显示；同一 query_id 出现多种文本时标注 `text_variants`。每个模板列出计划序列（请求绑定的 plan node、扫描类型、索引）及其请求数，多于一种时 `plan_variants > 1`；再按（来源、plan node、索引、扫描类型、决定）列出访问路径的单元、候选和可见行。零个访问单元是观察结果（例如该请求走了 seq scan），不是计划推断。
 
@@ -50,7 +50,9 @@
 
 默认产物为 raw 目录的 `row-state-audit.json` 和 `row-state-audit.json.changes.jsonl`，报告摘要绑定 schema、原始输入、已验证 Baseline 和已审计变化。同一报告路径重复调用只复核摘要，不重新查询 PG 或核验行链；输入改变则拒绝。报告最后原子发布，失败残留不视为成功，使用新的报告路径重试。重新审计必须使用原采集结束时的最终数据库状态或其准确恢复副本。
 
-编译器要求匹配报告，并检查转换所需的字段、身份及支持范围。转换产物验收负责源事件到 Parquet / 完整索引展开的映射，独立 Parquet oracle 负责当前 / 历史键、版本和值，Backend 回放负责目标返回结果；这些检查不重新证明源行状态。换 client 数、发送开关或 Backend 复用来源审计结论，并复核文件摘要。
+编译器要求匹配报告或匹配的认证，并检查转换所需的字段、身份及支持范围。
+
+证明方法的检查只做一次。`capture.verification: full` 的采集做行状态审计，编译（带 PG 计数器核对）通过后 `certify-capture` 写出 `certification.json`：构建（运行用 jar、PG 二进制、触发器库的 SHA256，见 `capture-run.json` 的 `build`）、来源提交与 schema 摘要、索引定义、采集格式（`capture_detail`），以及覆盖范围：账本中的全部访问路径（来源、索引、扫描种类、投影决定）和 Trace manifest 中的提交变化类别（表、操作）。`certified` 的采集以 `--certification` 代替行状态审计：编译前要求构建与来源相同，编译后要求格式、访问路径与变化类别全部在认证覆盖范围内，否则编译失败、Trace 保持未完成。认证采集仍做会话审计、账本划分、PG 计数器核对与编译检查；manifest 的 `verification.mode` 为 `row_audit` 或 `certified`。转换产物验收负责源事件到 Parquet / 完整索引展开的映射，独立 Parquet oracle 负责当前 / 历史键、版本和值，Backend 回放负责目标返回结果；这些检查不重新证明源行状态。换 client 数、发送开关或 Backend 复用来源审计结论，并复核文件摘要。
 
 三来源 PK 值 UPDATE 固定为范围外负载，提交及回滚尝试均拒绝；同主键普通列 / 二级索引列 UPDATE、DELETE / 重插入仍支持。CHAR 只忽略尾部 ASCII 空格，VARCHAR / TEXT 保留原文，REAL 按源单精度比较，date / timestamp 按类型比较。
 
@@ -155,7 +157,9 @@ replay:
 
 - `running`：未完成，不能编译。
 - `failed`：保留首个错误、SQLSTATE、请求/事务上下文及堆栈；不能编译或续接。
-- `complete`：连接正常关闭，同次请求、结果和提交关联审计通过。清单统一记录 `sessions`（每个 PG 追踪及配对 JDBC 追踪的 SHA256、是否要求扫描键为客户端绑定值、审计结果）和 `session_order`：`single`、`sequential`（原生客户端逐 workload 运行）或 `concurrent`（HTAP，另存 phases）。消费前复核全部会话文件、摘要、清单与审计；缺少会话清单的运行拒绝，需重新采集。
+- `complete`：连接正常关闭，同次请求、结果和提交关联审计通过（各会话并行审计）。清单统一记录 `sessions`（每个 PG 追踪及配对 JDBC 追踪的 SHA256、是否要求扫描键为客户端绑定值、审计结果）、`session_order`（`single`、`sequential` 或 `concurrent`，HTAP 另存 phases）和 `build`。消费前复核全部会话文件、摘要与清单，并要求每个会话记录了通过的审计；审计本身不重复，摘要未变即沿用其结论。缺少会话清单的运行拒绝，需重新采集。
+
+规范编译带 `--counters` 时，在提交 manifest 前按 PG14 计数位置核对同遍构建的账本（`capture-completeness.json`），不一致即失败、保留 `INCOMPLETE`；manifest 记录 `access_ledger_sha256`、`capture_completeness`（`consistent` 或 `not_checked`）与 `business_changes_by_table`。Trace 文件的 SHA256 在写入时计算。
 
 JDBC 异常即使被原生方法捕获也会使当前运行失败；记录或清理异常不覆盖原始原因。审计不等于全局丢事件证明。
 

@@ -27,6 +27,8 @@ patch:
 # tracking, so an in-place rebuild after a header change needs `make -C $(PG_SRC) clean` first.
 build: patch
 	cd "$(PG_SRC)" && ./configure --prefix="$(PREFIX)" --without-readline --without-zlib
+	# Generated headers first: at high parallelism src/common can otherwise compile before them.
+	$(MAKE) -C "$(PG_SRC)/src/backend" generated-headers
 	$(MAKE) -C "$(PG_SRC)" -j$(JOBS)
 
 install: build

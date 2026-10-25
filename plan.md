@@ -1,6 +1,6 @@
 # SIBench 实施计划
 
-更新：2026-10-24。
+更新：2026-10-25。
 
 ## 目标
 
@@ -8,7 +8,7 @@
 
 主流程：原生数据生成与 PostgreSQL 加载 → 静止边界导出及验证 Baseline → 原生负载采集与审计 → 规范 Trace / 增量 Parquet 编译 → 索引回放与测量。
 
-**当前阶段**：三来源（含并发的完整 HyBench HTAP）已从原生执行端到端得到 v9 规范 Trace，全部访问投影，参考回放与独立 oracle 通过。三来源已按设计并发（8 线程 / 8 client）在 SF1 规模短跑通过全部审计、投影、回放与 oracle，并发暴露的三个管线问题已修复；原始采集按访问汇总并写成 zstd 流；通用 Index Service 协议与 RocksDB 参照实现已回放真实 Trace 并逐查询核对原生期望数。下一步：HyBench SF10 与同量级 YCSB / sysbench 的大规模采集，按写入比例校准回放量；SF1000 受上游 `int` ID 限制暂不做。
+**当前阶段**：三来源（含并发的完整 HyBench HTAP）已从原生执行端到端得到 v9 规范 Trace，全部访问投影，参考回放与独立 oracle 通过。三来源已按设计并发（8 线程 / 8 client）在 SF1 规模短跑通过全部审计、投影、回放与 oracle，并发暴露的三个管线问题已修复；原始采集按访问汇总并写成 zstd 流；通用 Index Service 协议与 RocksDB 参照实现已回放真实 Trace 并逐查询核对原生期望数。HyBench SF10 已在开发机完成 5% 写入比例采集与两种 value 的参考回放；编译同遍构建账本并核对 PG 计数器，认证采集可跳过行审计。下一步（后续工作第 1 节）：在 HyBench SF10 与同量级 YCSB / sysbench 上完成时间与空间优化，并按各阶段随数据量、事件数与写入量的增长关系建立扩展模型，据此保证 SF1000 量级能在合理时间与空间内生成 Trace；SF100 及以上暂不做完整测试。采集改在三台远程机上并行运行，开发机负责开发、回归与协调。
 
 ## 固定约定
 
@@ -16,7 +16,8 @@
 | --- | --- |
 | 来源真实性 | 固定上游提交、PG 环境和一次采集事实；保留原生选择器、比例、业务分支、计时及 SQL。不重跑 SQL 补结果，不模拟业务，不猜测修复 PG 内部实现。派生 Baseline 单独标识，不替代原生执行。 |
 | 审计与失败 | 原始事实与规范操作分层保存，转换可追溯；不支持的语义显式拒绝。来源失败按固定源码分类为业务回滚、预期 SQL 失败、预期 API 失败、原生重试与非预期，只有非预期使采集无效：保留诊断，修复后从明确初始状态换新目录重跑，不拼接失败前缀。分类未经真实失败检验前，JDBC 异常仍使采集失败。最终状态正确不能替代访问负载审计。 |
-| 核验职责 | 证明方法的检查做一次，证明单次运行的检查每次做。完整核验（`capture.verification: full`）由 `RowStateAudit` 核对源行修改链和最终 PG 状态，编译后 `certify-capture` 写出认证：构建（jar、PG 二进制、触发器库）、来源与索引定义、采集格式，以及本次覆盖的访问路径（来源、索引、扫描种类、投影决定）和提交变化类别（表、操作）。认证采集（`certified`）跳过行审计，仍做会话审计、账本划分、PG 计数器核对与编译检查，构建或来源不同、出现认证未覆盖的路径或类别即编译失败；认证采集可以就是短时校准采集。同一阶段内不重复上游已核验的结论：运行时的会话审计记入运行清单，之后只核对文件摘要。编译与维护诊断验证摘要并复用来源结论；转换产物验收只核对源事件到 Parquet / 索引操作的映射，Backend 回放只验证目标结果，不重复核验源行修改链。 |
+| 核验职责 | 证明方法的检查做一次，证明单次运行的检查每次做。完整核验（`capture.verification: full`）由 `RowStateAudit` 核对源行修改链和最终 PG 状态，编译后 `certify-capture` 写出认证：构建（jar、PG 二进制、触发器库）、来源与索引定义、采集格式，以及本次覆盖的访问路径（来源、索引、扫描种类、投影决定）和提交变化类别（表、操作）。认证采集（`certified`）跳过行审计，仍做会话审计、账本划分、PG 计数器核对与编译检查，构建或来源不同、出现认证未覆盖的路径或类别即编译失败；认证采集可以就是短时校准采集。同一阶段内不重复上游已核验的结论：运行时的会话审计记入运行清单，之后只核对文件摘要。参考回放与快照 oracle 证明编译器的产物能被正确的索引精确重现，属方法层面，只在认证采集上运行；正式采集的 Trace 在真实索引回放中仍逐查询核对原生期望数，不一致时再以参考回放区分索引与 Trace。编译与维护诊断验证摘要并复用来源结论；转换产物验收只核对源事件到 Parquet / 索引操作的映射，Backend 回放只验证目标结果，不重复核验源行修改链。 |
+| 产物与保留 | 最终产物只保留用不同 index 重复实验所必需的内容：规范负载 Trace、Locator 指向的数据文件（基线按静止库共享一份）与 manifest；能由它们推出的内容（Baseline 索引加载操作）不落盘，只为检查服务的内容（原始采集、行审计变化、导出核验用定位表、工作单元来源目录、各类报告）不进入产物，报告单独作为证据保存。原始采集在 Trace 通过全部检查后删除；编译器仍在改动的阶段，保留每个来源认证采集的原始数据作编译回归输入。采集用的克隆库在采集结束后删除，只保留静止库。 |
 | 提交与查询 | 默认只发送已提交变更；原始 Trace 保留修改尝试和回滚，不生成反向补偿或回撤开关。转换排除回滚修改及修改后的查询，保留修改前的受支持查询；已提交事务保留写后查询及原始操作位置，不合并修改。 |
 | 时间戳与发送 | 同源事务一个 `CommitVersion`，查询携带独立 `ReadTimestamp` 和此前修改位置。`operation` / `transaction` 只决定驱动输入单位，最终均逐项发送；源控制记录不发送给索引，不要求下游事务 API。 |
 | client 路由 | 默认 1 client，按源 SQL 请求工作单元确定性轮询，不按索引键或事务绑定；同请求的展开共用 client，同事务允许跨 client。同一 Trace 支持 1/64/128 及更多 client，过滤后必须覆盖全部配置 client，不伪造身份或重复负载填充。 |
@@ -60,24 +61,55 @@
 | 汇总采集格式与 Index Service | 三来源各以 rows 采集一次，账本逐条核对汇总与逐行事件相等（sysbench 181,000、YCSB 346,138、HyBench 并发 HTAP 3,412,523 次访问，均 0 拒绝、PG 计数器一致）；删去逐行事件的副本编出的 Trace 与逐行格式除原始行号外逐字段相同（HyBench 含 402,417 次快照读与全部快照交叉验证）；独立 summary 采集 sysbench 原始体积 3.7 GB → 484 MB、原生执行 215 s → 72 s，HyBench 原始体积 38 GB → 3.1 GB，见 [采集完整性验证](docs/validation/capture-completeness.md)。sysbench Trace 经进程内 RocksDB、单 client 与 64 client gRPC（服务端按发送序号执行）回放，181,000 个查询期望数全部吻合、结果校验和与参考回放相同；不排序的服务在 64 client 下出现期望 100 返回 99。 | RocksDB 性能结论（参照实现未调优，按序号执行即串行）；持久化与恢复。 |
 | 按设计并发的原生采集 | SF1 规模短跑，三来源均 0 拒绝、PG 计数器一致、128 client 两种 value 的参考回放与 oracle 通过：sysbench 8 线程（48 会话、181,000 次访问、161,070 次快照读）、YCSB 8 线程（48 会话、346,048 次访问、333,492 次快照读）、HyBench TP 8 / AT 8 / IQ 8 client（25 会话、51,202 个提交事务、38,565,046 次访问、37,246,996 次快照读、877,592 次写后查询，核对 10.5 亿个结果项）；sysbench 与 YCSB 经进程内 RocksDB 回放与参考校验和相同；修复后的编译重编 sysbench / YCSB 两份并发采集 Trace 逐字节相同，见 [并发采集验证](docs/validation/concurrent-native-capture.md)。 | 更高并发或更热分布下的来源失败（本轮无死锁、无重试）；SF10 及以上规模。 |
 | 实际 PG schema 预检 | PG14.24 上三来源布局、完整表 / 列 / 默认值 / 索引差异、quoted 名称与 search_path 的集成检查通过，差异在导出与采集前拒绝并保留诊断，见 [预检验证](docs/validation/source-schema-preflight.md)。 | 运行期外部 DDL 漂移检测。 |
+| HyBench SF10 与采集性能 | 开发机 SF10 5% 采集（4,135,983 次已提交行写入，`row_write_ratio` 0.0475，191,117,060 次访问 0 拒绝、PG 计数器一致）两种 value 的 128 client 参考回放通过，核对 44,507,577,021 个结果项；快照 oracle 因自身内存问题未完成，见 [并发采集验证](docs/validation/concurrent-native-capture.md)。同遍账本在三来源并发采集上与独立账本相同、Trace 逐字节不变（[采集完整性验证](docs/validation/capture-completeness.md)）；远程机 SF10 对照得出调优配置与插桩开销（[采集性能](docs/validation/capture-performance.md)）。 | 远程机上的端到端耗时与认证流程（待实测）；SF10 的 oracle。 |
 | 受控语义测试 | 完整构建单元测试零失败，覆盖访问组投影（前段加钉住点查、BitmapAnd 交集与短路周期、数组并集、嵌套组合拒绝）、v9 格式、计数器归并与快照交叉验证、三来源 schema 与行审计、失败分类与控制语句对账、回滚改键、写后查询、DELETE / 重插入、版本搬迁、展开完整性及异步发送边界；三来源实际 PG 行审计检查见 [统一审计验证](docs/validation/row-state-audit.md)。 | 受控 SQL 是原生客户端执行；原生负载实际覆盖全部受控操作。 |
 
-默认采集使用 `config/hybench_sf1.yaml`、`config/ycsb_8m.yaml`、`config/sysbench_8m.yaml`。实验数量、摘要、命令和历史记录保留在验证文档及产物中；本计划仅记录当前验收依据与能力边界。
+当前阶段的采集配置为 `config/hybench_sf10.yaml`、`config/ycsb_87m.yaml`、`config/sysbench_87m.yaml`（在远程机运行），`*_8m.yaml` 与 `hybench_sf1.yaml` 用于较小规模。实验数量、摘要、命令和历史记录保留在验证文档及产物中；本计划仅记录当前验收依据与能力边界。
 
 ## 执行资源
 
-| 机器 | 资源 | 用途 |
+| 机器 | 资源 | 职责 |
 | --- | --- | --- |
-| 当前开发机（Ubuntu 22.04） | 32 线程、62 GB、`/mnt/disk1` 985 GB 云盘（顺序约 270 / 330 MB/s 写 / 读，8 KiB 随机读 0.44 ms） | 开发、已有采集与回放产物 |
-| `sibench_1` / `sibench_2` / `sibench_3`（SSH 别名，TencentOS 3.2，glibc 2.28） | Kubernetes pod：cgroup 限 32 CPU、64 GB 内存（含页缓存），宿主 96 核并有其他负载；`/data` 500 GB xfs 云盘（顺序约 80–90 / 130–160 MB/s，8 KiB 随机读 0.8–2 ms）；根分区 50 GB overlay；无 JDK，有 gcc / make / dnf 与外网 | 并行的独立流程：不同来源或规模的采集、采集与编译流水线、参考回放与 oracle、同机对照测试 |
+| 开发机（Ubuntu 22.04） | 32 线程、62 GB、`/mnt/disk1` 985 GB 云盘（顺序约 270 / 330 MB/s 写 / 读，8 KiB 随机读 0.44 ms） | 协调与发布；编译、空间与回放优化的开发，用保留的四份产物做回归；真实索引回放的开发。不再运行采集（CPU 比远程机慢 2.5–3 倍，PG 构建与远程不同） |
+| `sibench_1`（SSH 别名，下同） | 三台相同：TencentOS 3.2（glibc 2.28），Kubernetes pod，cgroup 限 32 CPU、64 GB 内存（含页缓存），宿主 96 核并有其他负载；`/data` 500 GB xfs 云盘（顺序约 80–90 / 130–160 MB/s，8 KiB 随机读 0.8–2 ms）；根分区 50 GB overlay | HyBench SF10 采集；保留 SF10 静止库 `sibench_sf10_base` |
+| `sibench_2` | 同上 | YCSB 同量级采集 |
+| `sibench_3` | 同上 | sysbench 同量级采集 |
 
-一次采集是一条全局提交顺序，不能拆到多台机器，也不用分布式 PG（全局完成计数器、快照与插桩都以单实例为前提）。PG 与 postgres 二进制在 TencentOS 上单独构建，三台远程机共用同一份构建，认证按构建区分。写入比例按同一机器、同一配置校准。远程机磁盘随机读比开发机慢 2–4 倍，SF10 级数据需靠内存缓存；SF100 级数据（约 150 GB 以上）放不进 64 GB，500 GB 也放不下 SF10 产物十倍的体积，需先减小 Trace 体积或换更大内存与磁盘。`/codev` 等已有数据的分区不使用。
+一次采集是一条全局提交顺序，不能拆到多台机器，也不用分布式 PG（全局完成计数器、快照与插桩都以单实例为前提）；多台机器只并行互相独立的流程。远程机 HyBench SF10 吞吐约为开发机的 2.5–3 倍（CPU 受限），见 [采集性能](docs/validation/capture-performance.md)。`/codev` 等已有数据的分区不使用。
+
+远程环境位于 `/data/sibench`，结构与仓库相同，以非 root 用户 `sibench` 运行（PG 拒绝 root）：dnf 安装 `java-17-openjdk-devel libzstd-devel gcc make rsync perl jq`；PG 14.24 由官方源码包（核对 SHA256）在 `sibench_1` 上经 `make -C src/main/native/postgres install extension` 构建，二进制复制到另两台，三台 postgres 与 jar 的 SHA256 相同，认证按此构建区分；集群 `initdb -U postgres --locale=C -E UTF8 --auth=trust`，`data/sibench.conf` 为采集配置；`benchmark/` 子模块需连同 `.git` 复制（采集核对上游提交与工作区干净）；运行脚本时设 `SIBENCH_JAVA_HOME` 为 TencentOS 的 JDK 目录。YCSB 为 Java 可直接复制；sysbench 是原生程序，需在 TencentOS 上重新构建。
+
+## 开发流程
+
+1. 开发机修改代码，`mvn test` 全部通过。
+2. 回归：开发机保留 `results/poc/` 下四份完整产物（`hybench-htap-sf10-w5`、`hybench-htap-sf1-c8-20261024`、`sysbench-8m-c8-20261024`、`ycsb-8m-c8b-20261024`）。编译改动用其原始采集重编，Trace 数据文件须逐字节相同（不同须给出原因）；回放或格式改动用其 Trace 回放，结果校验和须与已有参考回放报告相同（SF10：`replay-128.json`，每种 value 191,117,063 个查询、44,507,577,021 个结果项）。
+3. 发布：`mvn package` 生成 jar（有采集或回放正在使用 `build/sibench/sibench.jar` 时，在独立副本中打包）；同一个 jar 复制到三台远程机，PG 或插桩改动时在 `sibench_1` 重建并复制。
+4. 远程运行：各机按分工运行 `scripts/native-capture.sh`；先以短时校准采集完成完整核验与认证，再做正式采集，换代码、PG 构建或改变计划的配置后重新认证。
+5. 回收：只取报告与摘要写入 `docs/validation/` 与本计划；产物按「产物与保留」清理。
 
 ## 后续工作
 
 以下只列剩余工作，按主线依赖关系组织。部分实现和固定特例的扩展任务归入对应领域，不以通用类名或 SF1 测试代替完整验收。
 
-### 1. 接入真实服务与测量
+### 1. SF10 量级的时间、空间与扩展模型（当前重点）
+
+目标：HyBench SF10 与同量级 YCSB / sysbench 上的优化与实测，足以推断 SF1000 量级的时间与空间。各阶段按增长关系归类：随数据量增长的（静止库、导出、基线核对与加载操作、认证的终态比对）每个静止库只做一次且可并行；随原生事件数增长的（会话审计、编译、回放）须快于原生执行并能与之重叠；原生执行时长 = 目标写入 ÷ 写入吞吐，由 benchmark 自身的并发参数决定。HyBench SF10 5% 采集原为 7.3 h（开发机：原生 1.8 h、会话审计 0.8 h、行审计 1.8 h、账本 0.9 h、编译 1.6 h）；认证采集、会话并行审计、账本同遍构建与远程机调优配置之后估算约 1.6 h（原生约 36 min、编译约 42 min、导出约 13 min），待实测。
+
+- [ ] 采集 PG 配置收进仓库：采用远程机对照中的 B1（不改变计划的参数：`shared_buffers` 16 GB、`max_wal_size` 32 GB、`min_wal_size` 4 GB、`checkpoint_timeout` 30 min、`checkpoint_completion_target` 0.9、`wal_buffers` 64 MB、`synchronous_commit` off、`maintenance_work_mem` 2 GB），TP / AT 吞吐提高 30–36%、IQ 约 10%；改变计划的参数无收益，不采用。配置文件由采集脚本使用，代替各机数据目录中手写的 `sibench.conf`；实际生效的非默认参数记入运行清单，改变计划的参数纳入认证身份。
+- [ ] 远程机实测：三来源各做校准兼认证、5% 正式采集（写入比例按同机同配置重新校准），各阶段耗时、体积写入验证文档；sysbench 在 TencentOS 上重新构建。
+- [ ] 并发扩展：大规模下按 benchmark 自身的并发参数提高并发（不改负载逻辑与比例），以正确性与来源失败处理为前提。先在 SF10 以 8 / 16 / 32 client 短跑，测吞吐扩展与暴露的失败类型。
+- [ ] 扩展模型：以 SF1 与 SF10 的实测拟合各阶段系数，推出 SF1000 量级的时间与空间，并列出仍不满足的阶段。
+- [ ] 编译并行解析：编译单线程逐行解析 JSON（约 6–13 万事件 / 秒），改为在各会话读取线程中并行解析，归并器只接收已解析事件；以 SF10 原始采集测速，Trace 逐字节不变。
+- [ ] 导出：同一静止库的导出结果相同，按静止库只做一次并共享（SF10 1,146 s）；导出与核验按表或主键区间并行（YCSB 约 920 s / 870 万行）。保持核验强度不变。
+- [ ] 最终产物：按静止库共享的数据目录（基线 Parquet 与 manifest）、每次采集的产物目录（manifest、负载 Trace、增量 Parquet）、证据目录（报告）与临时目录（原始采集等，验证后删除）分开。`baseline.ops`（SF10 42 GB）不落盘，回放时由基线 Parquet 与索引定义生成；`workload.ops`（SF10 28 GB）按块压缩（格式升级）；回放的工作单元校验改用操作中的编号，`work-units.jsonl` 与 `locators.tsv`（3.3 GB）不进入产物；行审计变化文件只在认证时生成、审计后删除；采集结束删除克隆库。以保留产物的回放校验和验收。SF10 每次采集估计从约 85 GB 降到 4–6 GB。
+- [ ] 快照 oracle 的内存：每个区间探针各复制一份该表全部变化键的历史，SF10 上 40 GB 堆内存溢出；改为每表一份共享映射，并让变化历史可落盘，在远程机认证采集上验证。参考回放与 oracle 只在认证采集上运行。
+- [ ] 有界状态的容量验收：行审计按（表、主键、完成计数器、会话、位置）外部排序后与基线、PG 终态三路归并；编译的行身份在预算内存之上落盘，提交位置为有界窗口（窗口外的快照明确报错），工作单元只计数；参考模型的基线超出预算时外部排序为不可变磁盘 run，版本历史落入有序可落盘 map；增量 Parquet 达目标大小即 rollover，FileID 为 int64 且互不相同；Locator 为（FileID, 行位置）两个 int64。已有单测与真实 sysbench trace 上的内存 / 落盘对比（结果与状态校验和逐项相同）；待在远超内存的输入上验证容量与耗时，落盘约为内存的 2.4 倍。
+- [ ] 连续事务边界分段、确定性续编译、Checkpoint 及恢复，使编译与原生执行重叠：`SpillingMap` 已能由 checkpoint 的文件清单恢复，编译与回放尚未接入分段与恢复。
+- [ ] 来源失败处理：负载按 benchmark 设计并发运行，并发写暴露的失败按原生行为修复处理管线，而不是缩减负载形态。先以设计并发做短跑暴露真实失败，再按实际 SQLSTATE 与固定源码行为放行预期失败：`CaptureDriver` 只记录不判废，YCSB `Return=ERROR` 与带 SQLSTATE 的请求错误对账，HyBench catch 不回滚造成的 25P02 连锁只在前一失败已分类时接受；请求审计、行审计与编译按回滚语义接受失败语句。
+- [ ] 采集编排推广：按目标负载推广当前 PG / 角色 / codec / 输出目录限制；为失败后遗留的数据库给出明确清理步骤。
+- [ ] 规模边界：SF100 / 10 亿行及以上暂不做完整测试，待扩展模型表明可行后再定，届时数据超出远程机 64 GB 内存与 500 GB 磁盘，需另行评估资源。SF1000 另受上游工作负载客户端与 DDL 的 `int` ID 限制（`intValue()`、`setInt`、`getRandomint`），不改上游客户端；同等规模的 YCSB / sysbench 不受此限。
+
+### 2. 接入真实服务与测量
 
 - [ ] 其它 KV 存储（rocksdb-cloud 等）按同一协议接入；adapter 只做协议转换，不改变 Trace 语义。
 - [ ] 传输侧：批处理（当前每请求一个消息、单 client gRPC 约 6k ops/s）、断连与写入结果未知时的诊断。
@@ -85,24 +117,10 @@
 - [ ] 保序限速、预热及测量流程，保持一个发送线程，不以并发调度改变原生顺序。
 - [ ] 正确性、持久化、恢复及后台排空验证；记录延迟、吞吐、索引字节、物理 I/O、放大和资源指标，不以进程内立即响应、裸解码速率或 Trace 上传代替服务验收。
 
-### 2. 补齐版本与文件生命周期
+### 3. 补齐版本与文件生命周期
 
 - [ ] 固定保留窗口、过期与快照保护规则，实现物理 GC。
 - [ ] 按当前版本与受保护历史集合实现自然 Rewrite、确定性装箱、发布屏障及旧文件回收；独立最新版本搬迁控制不替代生命周期实现，并在 v9 产物上重新核验搬迁控制。
-
-### 3. 支持大规模连续输入
-
-- [ ] 继续采集耗时优化。HyBench SF10 5% 采集原为 7.3 h（原生 1.8 h、会话审计 0.8 h、行审计 1.8 h、账本 0.9 h、编译 1.6 h）；按认证采集、会话并行审计与账本同遍构建估算约 3.4 h，其中原生执行约一半、编译约三分之一，待下一次完整采集实测。剩余按收益排序：
-  - 采集 PG 的配置：当前 `shared_buffers` 256 MB、`max_wal_size` 1 GB、`checkpoint_timeout` 5 min、`synchronous_commit` on，其余默认；SF1 → SF10 时 TP 吞吐从 332 降到 38.6 事务 / 秒（client 相同），像是缓冲与磁盘受限。写入比例固定时原生时长 = 目标写入 ÷ 写入吞吐，PG 提速直接缩短原生阶段。先在同一台空闲机器上以 SF10 2+2 分钟对照：当前配置、调优配置、调优配置下的原版 PG（得到插桩自身开销）。不改变计划的参数（缓冲、WAL / checkpoint、`synchronous_commit`、`maintenance_work_mem`）直接采用；改变计划的参数（`effective_cache_size`、`work_mem`、`random_page_cost`）固定写入配置，实际生效的 PG 配置记入运行清单并纳入认证身份。
-  - 编译单线程逐行解析 JSON（约 6–13 万事件 / 秒）：在各会话读取线程中并行解析，归并器只接收已解析事件。
-  - 同一 base 的导出结果相同，可按 base 复用（SF10 1,146 s）；`baseline.ops`（SF10 42 GB）可由基线 Parquet 推出，可按 base 共享或回放时生成；`workload.ops` 未压缩（28 GB）。
-  - YCSB 导出约 920 s / 870 万行，1 亿行级需先处理。保持核验强度不变。
-- [ ] 有界状态的容量验收：行审计按（表、主键、完成计数器、会话、位置）外部排序后与基线、PG 终态三路归并；编译的行身份在预算内存之上落盘，提交位置为有界窗口（窗口外的快照明确报错），工作单元只计数；参考模型的基线超出预算时外部排序为不可变磁盘 run，版本历史落入有序可落盘 map；增量 Parquet 达目标大小即 rollover，FileID 为 int64 且互不相同；Locator 为（FileID, 行位置）两个 int64。已有单测与真实 sysbench trace 上的内存 / 落盘对比（结果与状态校验和逐项相同）；待在远超内存的输入上验证容量与耗时，落盘约为内存的 2.4 倍。
-- [ ] 连续事务边界分段、确定性续编译、Checkpoint 及恢复：`SpillingMap` 已能由 checkpoint 的文件清单恢复，编译与回放尚未接入分段与恢复。
-- [ ] 采集编排推广：按目标负载推广当前 PG / 角色 / codec / 输出目录限制；为失败后遗留的数据库给出明确清理步骤，仍不自动删除证据。
-- [ ] 回放量按"已提交行写入 ÷ 基线行数"校准（目标 5%，可调）：HyBench SF10 已按校准推出的 TP / XP 各 53 分钟采集，实际 0.0475；sysbench / YCSB 的 1 亿行级校准待导出与审计提速后进行。
-- [ ] 来源失败处理：负载按 benchmark 设计并发运行，并发写暴露的失败按原生行为修复处理管线，而不是缩减负载形态。先以设计并发做短跑暴露真实失败，再按实际 SQLSTATE 与固定源码行为放行预期失败：`CaptureDriver` 只记录不判废，YCSB `Return=ERROR` 与带 SQLSTATE 的请求错误对账，HyBench catch 不回滚造成的 25P02 连锁只在前一失败已分类时接受；请求审计、行审计与编译按回滚语义接受失败语句。
-- [ ] 规模：HyBench SF10（87,060,000 行）5% 写入比例采集已通过审计、投影与编译（参考回放与 oracle 进行中）；YCSB / sysbench 同量级（`config/ycsb_87m.yaml`、`config/sysbench_87m.yaml`）待采集；之后到 SF100 / 10 亿行量级。SF1000 暂不做：上游工作负载客户端与 DDL 的 ID 为 `int`（`intValue()`、`setInt`、`getRandomint`），超过 2,147,483,647 无法表达，不改上游客户端。
 
 ### 4. 校准并开展正式实验
 
@@ -128,7 +146,8 @@
 - [能力矩阵](docs/benchmarks/capability-matrix.md)：各来源当前覆盖。
 - [Trace 契约](docs/contracts/trace.md)、[存储契约](docs/contracts/storage.md)：详细语义与责任边界。
 - [来源 Schema 契约](docs/contracts/source-schema.md)：三来源实际布局、PG 预检及验收边界。
-- [按设计并发的原生采集](docs/validation/concurrent-native-capture.md)：三来源 8 线程 / 8 client 短跑与并发暴露的管线修复。
+- [按设计并发的原生采集](docs/validation/concurrent-native-capture.md)：三来源 8 线程 / 8 client 短跑、HyBench SF10 校准与 5% 采集、产物清理。
+- [采集性能](docs/validation/capture-performance.md)：远程机与开发机、PG 配置对照与插桩开销。
 - [采集完整性与有界状态验证](docs/validation/capture-completeness.md)：三来源 PG 计数器对照、区间 oracle、重编译与落盘回归。
 - [HTAP SF1 验证](docs/validation/hybench-sf1-htap.md)、[YCSB / sysbench 原生 Trace 验证](docs/validation/ycsb-sysbench-native-trace.md)：当前 v9 证据与历史记录。
 - [来源 Schema 预检验证](docs/validation/source-schema-preflight.md)、[统一行状态审计](docs/validation/row-state-audit.md)：预检与行审计的测试和集成证据。

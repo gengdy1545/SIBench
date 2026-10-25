@@ -15,7 +15,7 @@ java -jar build/sibench/sibench.jar inspect-scale
 
 ## 原生采集与回放
 
-流程：原生数据生成与 PG Load/建索引 → 静止边界导出并独立验证 Baseline → 原生采集 → 同次请求/结果核对、最终状态审计 → 访问账本 → 规范 Trace 编译。三来源同一入口 `scripts/native-capture.sh`；HyBench 的 AP/TP/XP 阶段之间不重新加载或恢复数据。
+流程：原生数据生成与 PG Load/建索引 → 静止边界导出并独立验证 Baseline → 原生采集与同次请求/结果核对 → 最终状态审计（完整核验时）→ 规范 Trace 编译（同遍构建访问账本并核对 PG 索引计数器）→ 认证（完整核验时）。三来源同一入口 `scripts/native-capture.sh`；HyBench 的 AP/TP/XP 阶段之间不重新加载或恢复数据。
 
 [hybench_sf1.yaml](config/hybench_sf1.yaml) 是默认 HTAP 配置：从 `postgres.clone_from` 声明的静止库克隆采集库，安装上游二级索引、序列与行变化触发器并 `VACUUM (ANALYZE)`；HyBench 在 `native.work_dir`（含原生 `Data_<sf>`）下运行。静止库由脚本的 `base` 阶段按上游 README 建立（原生 gendata、`ddl_pg.sql`、`load_data_pg.sql`），已存在时核对行数后复用，见 [HyBench 来源](docs/benchmarks/hybench.md)。并发度取原生参数：HyBench 的 `clients` / `xp_transaction_clients` / `xp_query_clients`，YCSB / sysbench 的 `threads`；每个线程一个后端会话，有重叠会话时整次采集按 PostgreSQL 事务完成计数器归并。完整步骤与证据见 [HTAP SF1 验证](docs/validation/hybench-sf1-htap.md)。
 
@@ -33,8 +33,9 @@ make -C src/main/native/postgres install extension   # 补丁改了 PGPROC，源
 scripts/native-capture.sh config/hybench_sf1.yaml    # 约 50 分钟，并发 HTAP
 scripts/native-capture.sh config/ycsb_8m.yaml        # 约 60 分钟
 scripts/native-capture.sh config/sysbench_8m.yaml    # 约 15 分钟
-java -jar build/sibench/sibench.jar access-ledger PROFILE RAW REPORT
-java -jar build/sibench/sibench.jar compile-trace PROFILE OUTPUT
+java -jar build/sibench/sibench.jar compile-trace PROFILE OUTPUT [ROW_AUDIT] [--certification CERT] [--counters BEFORE AFTER]
+java -jar build/sibench/sibench.jar certify-capture PROFILE
+java -jar build/sibench/sibench.jar access-ledger PROFILE RAW REPORT     # 编译失败时诊断全部拒绝
 java -jar build/sibench/sibench.jar compare-ledgers REPORT_A REPORT_B [OUTPUT]
 java -jar build/sibench/sibench.jar snapshot-index-counters PROFILE OUTPUT --jdbc URL --user ROLE
 java -jar build/sibench/sibench.jar check-capture-completeness PROFILE LEDGER BEFORE AFTER
@@ -42,18 +43,18 @@ java -jar build/sibench/sibench.jar check-capture-completeness PROFILE LEDGER BE
 
 后端追踪默认写成 zstd 流（`capture.compression: zstd`，`pg-<pid>.jsonl.zst`，需要 `libzstd-dev` 构建 PG；`none` 写明文），所有读取方透明解压。插桩默认按访问记录汇总（`capture.detail: summary`）：每个索引访问结束时一条 `scan_summary`，bitmap 堆判定按输入集合聚合，结果行记为哈希。`capture.detail: rows` 另保留全部逐行事件，账本逐条核对汇总与逐行事件相等，用于在同一次原生执行上验收汇总格式；两种格式编出的 Trace 除原始文件行号外完全相同，见 [采集完整性验证](docs/validation/capture-completeness.md)。
 
-脚本以 `compute_query_id = on` 启停本地 PG，依次执行建库加载、预检、Baseline 导出、原生执行、行状态审计、访问账本、采集完整性对照和 `compile-trace`（输出 `<产物目录>/trace`）；原生执行前后各取一次 PG 索引计数器快照（等其它会话退出、两次相隔一个统计周期的读数一致后才记录），`check-capture-completeness` 按 PG14 计数位置核对账本：`idx_tup_read` 等于候选数，`idx_tup_fetch` 等于经堆判定可见的行（不含 bitmap 与全可见 index-only），`idx_scan` 落在账本推出的树下降上下界内，不一致则脚本失败。已有数据库或输出目录会被拒绝。每个阶段把墙钟、事件数和本次运行的关键事实追加到 `<产物目录>/run-timing.json`，长阶段按秒输出速率，便于比较两次运行并定位热点。任何命令都可用 `--timing FILE` 追加到同一份计时产物。`access-ledger` 按 PG 追踪把索引事件划分为访问单元并给出每个单元的投影决定，模板为 PG `query_id`，不连接 PG，REPORT 必须是新文件；`compile-trace` 对任一不能投影的访问失败。`config/*_small.yaml` 是约 15 秒的冒烟配置。回放量以“已提交行写入 ÷ 基线行数”衡量，每个 Trace 的 manifest 给出 `row_write_ratio`；`plan-write-ratio PROFILE CALIBRATION_TRACE RATIO` 由同来源、同规模的一次校准采集，按同一倍数换算 sysbench 的 `events`、YCSB 的 `operationcount` 或 HyBench 的 TP / XP 阶段时长，实际比例以按计划采集的 Trace 为准。证据见 [HTAP 验证](docs/validation/hybench-sf1-htap.md) 与 [原生 Trace 验证](docs/validation/ycsb-sysbench-native-trace.md)。
+脚本以 `compute_query_id = on` 启停本地 PG，依次执行建库加载、预检、Baseline 导出、原生执行（结束后并行审计全部会话）、行状态审计与认证（仅完整核验）和 `compile-trace`（输出 `<产物目录>/trace`，内含 `access-ledger.json` 与 `capture-completeness.json`）。核验方式由 `capture.verification` 决定：`full`（默认）做行状态审计，编译后 `certify-capture` 写出 `<产物目录>/certification.json`，记录构建（jar、PG 二进制、触发器库）、来源与索引定义、采集格式及覆盖的访问路径与提交变化类别；`certified` 以 `capture.certification` 指定的认证代替行状态审计，构建或来源不同、出现认证未覆盖的路径或类别即编译失败，见 [Trace 契约](docs/contracts/trace.md)。原生执行前后各取一次 PG 索引计数器快照（等其它会话退出、两次相隔一个统计周期的读数一致后才记录），编译（`--counters`）按 PG14 计数位置核对同遍构建的账本，一致才提交 Trace：`idx_tup_read` 等于候选数，`idx_tup_fetch` 等于经堆判定可见的行（不含 bitmap 与全可见 index-only），`idx_scan` 落在账本推出的树下降上下界内，不一致则编译失败、Trace 保持未完成；`check-capture-completeness` 可对已有账本单独核对。已有数据库或输出目录会被拒绝。每个阶段把墙钟、事件数和本次运行的关键事实追加到 `<产物目录>/run-timing.json`，长阶段按秒输出速率，便于比较两次运行并定位热点。任何命令都可用 `--timing FILE` 追加到同一份计时产物。账本按 PG 追踪把索引事件划分为访问单元并给出每个单元的投影决定，模板为 PG `query_id`，不连接 PG；`compile-trace` 对任一不能投影的访问失败，此时独立的 `access-ledger`（REPORT 必须是新文件）给出全部拒绝。`config/*_small.yaml` 是约 15 秒的冒烟配置。回放量以“已提交行写入 ÷ 基线行数”衡量，每个 Trace 的 manifest 给出 `row_write_ratio`；`plan-write-ratio PROFILE CALIBRATION_TRACE RATIO` 由同来源、同规模的一次校准采集，按同一倍数换算 sysbench 的 `events`、YCSB 的 `operationcount` 或 HyBench 的 TP / XP 阶段时长，实际比例以按计划采集的 Trace 为准。证据见 [HTAP 验证](docs/validation/hybench-sf1-htap.md) 与 [原生 Trace 验证](docs/validation/ycsb-sysbench-native-trace.md)。
 
 并发 HTAP 按 PostgreSQL 事务完成计数器编译：写事务在持锁自增时记录精确位置，只读事务排在同位置写事务之后，事务大小的片段据此 k 路归并；查询读取其语句快照所见的最后一个写事务，并用快照自己的 xip 逐条交叉验证，计数器或快照缺失、冲突时拒绝，不按 PID、XID 大小、文件顺序或墙钟推断。
 
-源行核验统一由 `RowStateAudit` 完成：完整旧 / 新行和最终 PG 状态在同一次审计中核对。默认在 raw 目录保存 `row-state-audit.json` 及已审计变化；相同报告与输入重复调用只复核摘要，不重查 PG。编译必须先有匹配报告。三来源 PK 值 UPDATE（包括回滚尝试）固定拒绝，不影响普通列 / 二级索引列 UPDATE 或同主键删除重插入。
+源行核验统一由 `RowStateAudit` 完成：完整旧 / 新行和最终 PG 状态在同一次审计中核对。默认在 raw 目录保存 `row-state-audit.json` 及已审计变化；相同报告与输入重复调用只复核摘要，不重查 PG。编译必须先有匹配报告或匹配的认证。三来源 PK 值 UPDATE（包括回滚尝试）固定拒绝，不影响普通列 / 二级索引列 UPDATE 或同主键删除重插入。
 
 三来源通用入口为 `audit-rows PROFILE BASELINE RAW [REPORT] --jdbc URL --user ROLE`；指定自定义报告时，`compile-trace PROFILE OUTPUT ROW_AUDIT` 显式引用它。审计前业务库必须处于原采集结束的静止状态；历史报告不改写，详情见 [统一行状态审计](docs/validation/row-state-audit.md)。
 
 [index_replay.yaml](config/index_replay.yaml) 控制下游发送。参考模型的内存有界：基线条目超过预算时外部排序为磁盘 run，版本历史落入可落盘的有序 map；可用 `-Dsibench.reference.baseline_entries=N`（默认 64,000,000）、`-Dsibench.reference.overlay_entries=N`（默认 500,000）、`-Dsibench.reference.sort_bytes=N`、`-Dsibench.reference.directory=DIR`（每个模型在其下建独占的子目录，关闭时删除）调整，结果与预算无关。`-Dsibench.trace=1` 在失败时打印堆栈。以下回放规范 Trace，不执行 SQL、不连接 PG：
 
 ```bash
-T=results/poc/hybench-htap-sf1/trace
+T=results/poc/hybench-htap-sf1-c8-20261024/trace
 java -Xmx24g -jar build/sibench/sibench.jar check-replay config/index_replay_128clients.yaml $T
 java -Xmx24g -jar build/sibench/sibench.jar replay config/index_replay_128clients.yaml $T REPORT
 java -Xmx24g -jar build/sibench/sibench.jar validate-snapshots config/index_replay.yaml $T REPORT
@@ -76,7 +77,7 @@ java -Xmx24g -jar build/sibench/sibench.jar check-relocation PROFILE $T OUTPUT_D
 驱动通过 [Index Service 协议](docs/contracts/index-service.md)（`src/main/proto/index_service.proto`）把规范 Trace 发给 KV 索引服务：每个 client 一条有序 gRPC 流，查询组整体发送，每个查询的返回条数必须等于原生期望数。`--reference` 给出同一 Trace 的参考回放报告时，查询数、结果项数和结果校验和也必须相同。
 
 ```bash
-T=results/poc/sysbench-8m/trace
+T=results/poc/sysbench-8m-c8-20261024/trace
 java -jar build/sibench/sibench.jar index-server config/index_service_rocksdb.yaml &      # RocksDB 服务，端口 50551
 java -jar build/sibench/sibench.jar replay-service config/service_replay_grpc.yaml $T REPORT --reference REFERENCE
 java -jar build/sibench/sibench.jar replay-service config/service_replay_rocksdb.yaml $T REPORT  # 进程内 RocksDB，无网络
@@ -120,6 +121,7 @@ dry-run 只校验源码指纹、配置和 schema，不创建数据。去掉 `--d
 - [Index Service 协议契约](docs/contracts/index-service.md)：gRPC 协议、驱动侧核对与 RocksDB 参照实现。
 - [来源 Schema 契约](docs/contracts/source-schema.md)：三来源布局、PG 预检及失败边界。
 - [YCSB / sysbench 原生 Trace](docs/validation/ycsb-sysbench-native-trace.md)：完整访问投影、v9 Trace、回放与 oracle。
+- [按设计并发的原生采集](docs/validation/concurrent-native-capture.md)、[采集性能](docs/validation/capture-performance.md)：并发采集、HyBench SF10 与远程机 PG 配置对照。
 - [存储契约](docs/contracts/storage.md)：布局、Rewrite、GC 和测量边界。
 - [能力矩阵](docs/benchmarks/capability-matrix.md)：各来源当前覆盖。
 - 来源差异：[HyBench](docs/benchmarks/hybench.md)、[YCSB](docs/benchmarks/ycsb.md)、[sysbench](docs/benchmarks/sysbench.md)。
