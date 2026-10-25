@@ -1,0 +1,19 @@
+schema_version: 1
+purpose: index_replay
+target:
+  secondary_indexes:
+    enabled: true
+  # A fresh RocksDB index in the driver process: the index without protocol or network.
+  service:
+    adapter: rocksdb
+    path: build/services/index/rocksdb-inprocess
+    value: locator
+replay:
+  strategy: single_pass
+  dispatch_mode: operation
+  client_count: 1
+  max_in_flight: 4096
+  request_timeout_seconds: 60
+versions:
+  gc:
+    owner: none

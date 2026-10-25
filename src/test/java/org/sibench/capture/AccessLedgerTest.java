@@ -146,6 +146,38 @@ public class AccessLedgerTest {
             return event("transaction_commit", null, null);
         }
 
+        /** The first line of a capture that records summaries ("summary") or both ("rows"). */
+        Trace header(String detail) {
+            return event("capture_start", null, "\"format\":2,\"detail\":\"" + detail + "\"");
+        }
+
+        /** An execution's return with the rows it sent, as summaries record it. */
+        Trace returned(long processed, long returned) {
+            event("executor_run_end", null, "\"processed\":" + processed + ",\"returned\":" + returned + ",\"row_hashes\":[]");
+            event("executor_end", null, "\"processed\":" + processed);
+            depth--;
+            return this;
+        }
+
+        /** A unit's summary; {@code extra} holds the fields that differ from an empty unit. */
+        Trace summary(String scan, String index, String extra) {
+            String fields =
+                    "\"calls\":0,\"found\":0,\"last_found\":false,\"forward\":false,\"backward\":false,"
+                            + "\"recheck\":0,\"heap_fetches\":0,\"heap_visible\":0,\"vm_visible\":0,"
+                            + "\"bitmap_tids\":0,\"bitmap_distinct\":0,\"bitmap_unresolved\":0,"
+                            + "\"bitmap_ended\":false,\"identity_missing\":false";
+            var merged = JsonParser.parseString("{" + fields + "}").getAsJsonObject();
+            if (extra != null) JsonParser.parseString("{" + extra + "}").getAsJsonObject().entrySet()
+                    .forEach(entry -> merged.add(entry.getKey(), entry.getValue()));
+            String body = merged.toString();
+            return event("scan_summary", index, "\"scan\":\"" + scan + "\"," + body.substring(1, body.length() - 1));
+        }
+
+        /** Verdicts of one heap node, each as {inputs, visible, invisible}. */
+        Trace verdicts(String heap, long lossy, String sets) {
+            return event("bitmap_verdicts", "sbtest1", "\"heap\":\"" + heap + "\",\"lossy_pages\":" + lossy + ",\"verdicts\":[" + sets + "]");
+        }
+
         /** PG forgets every active executor when a transaction aborts. */
         Trace abort() {
             event("transaction_abort", null, null);
@@ -454,6 +486,105 @@ public class AccessLedgerTest {
         var unordered = map(AccessLedger.analyze(schema, file, false).get("projection"));
         assertEquals(Map.of("equality", 1L), unordered.get("projected"));
         assertEquals(Map.of("text_interval_requires_c_collation", 1L), unordered.get("rejected"));
+    }
+
+    /**
+     * The same execution recorded per row and as summaries projects to the same searches, counts
+     * and per-index facts: summaries replace the rows, not the rules.
+     */
+    @Test
+    public void summariesProjectLikeTheRowsTheyReplace() throws Exception {
+        String atLeastFive = "[" + KEY.formatted(1, 4, 0, "\"5\"") + "]";
+        String array =
+                "[{\"attribute\":1,\"strategy\":3,\"flags\":32,\"type_oid\":23,\"value\":null,"
+                        + "\"array_type_oid\":23,\"array\":[\"9\",\"4\"]}]";
+        var rows = new Trace();
+        var summary = new Trace().header("summary");
+        // A range with one dead candidate, read to its end.
+        rows.start("SELECT c FROM sbtest1 WHERE id BETWEEN $1 AND $2").plan("a", PK, 0, "index").rescan("a", PK, RANGE);
+        rows.next("a", PK, true, false).visible("a", PK, true).row();
+        rows.next("a", PK, true, false).visible("a", PK, false).next("a", PK, false, false).end(1).scanEnd("a", PK);
+        summary.start("SELECT c FROM sbtest1 WHERE id BETWEEN $1 AND $2").plan("a", PK, 0, "index").rescan("a", PK, RANGE);
+        summary.returned(1, 1).summary("a", PK, "\"calls\":3,\"found\":2,\"forward\":true,\"heap_fetches\":2,\"heap_visible\":1").scanEnd("a", PK);
+        // A secondary scan stopped on its second value: a prefix and pinned (6, 9).
+        rows.start("SELECT 1").plan("s", K, 1, "index").rescan("s", K, atLeastFive);
+        rows.next("s", K, true, false).visible("s", K, "5", "11");
+        rows.next("s", K, true, false).visible("s", K, "6", "9").end(0).scanEnd("s", K);
+        summary.start("SELECT 1").plan("s", K, 1, "index").rescan("s", K, atLeastFive);
+        summary.returned(0, 0).summary("s", K, "\"calls\":2,\"found\":2,\"last_found\":true,\"forward\":true,"
+                + "\"heap_fetches\":2,\"heap_visible\":2,\"rows_before_last_run\":1,\"runs\":[],"
+                + "\"last_value\":\"6\",\"last_pks\":[\"9\"]").scanEnd("s", K);
+        // A bitmap union of array points; one of three candidates is dead.
+        rows.start("SELECT 2").plan("u", K, 2, "bitmap").bitmapHeap("hu", "u").rescan("u", K, array);
+        rows.tid("u", K, "(1,1)").tid("u", K, "(1,2)").tid("u", K, "(1,3)").bitmapEnd("u", K);
+        rows.verdict("hu", "(1,1)", true).verdict("hu", "(1,2)", false).verdict("hu", "(1,3)", true).end(0).scanEnd("u", K);
+        summary.start("SELECT 2").plan("u", K, 2, "bitmap").bitmapHeap("hu", "u").rescan("u", K, array);
+        summary.returned(0, 0).verdicts("hu", 0, "{\"inputs\":[0],\"visible\":2,\"invisible\":1}");
+        summary.summary("u", K, "\"bitmap_tids\":3,\"bitmap_distinct\":3,\"bitmap_ended\":true").scanEnd("u", K);
+        // A BitmapAnd: (2,1) is in both inputs, (2,2) only in x; the heap finds (2,1) visible.
+        rows.start("SELECT 3").plan("x", K, 3, "bitmap").rescan("x", K, EQUALITY);
+        rows.plan("y", PK, 4, "bitmap").rescan("y", PK, RANGE).combined("ha", "and", "x", "y");
+        rows.tid("x", K, "(2,1)").tid("x", K, "(2,2)").bitmapEnd("x", K).tid("y", PK, "(2,1)").bitmapEnd("y", PK);
+        rows.verdict("ha", "(2,1)", true).end(0).scanEnd("x", K).scanEnd("y", PK);
+        summary.start("SELECT 3").plan("x", K, 3, "bitmap").rescan("x", K, EQUALITY);
+        summary.plan("y", PK, 4, "bitmap").rescan("y", PK, RANGE).combined("ha", "and", "x", "y");
+        summary.returned(0, 0).verdicts("ha", 0, "{\"inputs\":[0,1],\"visible\":1,\"invisible\":0}");
+        summary.summary("x", K, "\"bitmap_tids\":2,\"bitmap_distinct\":2,\"bitmap_unresolved\":1,\"bitmap_ended\":true,"
+                + "\"group_unresolved_intersection\":false").scanEnd("x", K);
+        summary.summary("y", PK, "\"bitmap_tids\":1,\"bitmap_distinct\":1,\"bitmap_ended\":true").scanEnd("y", PK);
+        // A statement that fails mid-scan: its unit ends with the abort.
+        rows.start("UPDATE sbtest1 SET k = 1 WHERE id = $1").plan("f", PK, 0, "index").rescan("f", PK, EQUALITY);
+        rows.next("f", PK, true, false).abort();
+        summary.start("UPDATE sbtest1 SET k = 1 WHERE id = $1").plan("f", PK, 0, "index").rescan("f", PK, EQUALITY);
+        summary.summary("f", PK, "\"calls\":1,\"found\":1,\"last_found\":true,\"forward\":true").abort();
+
+        var fromRows = analyze(rows, "pg-21.jsonl");
+        var fromSummary = analyze(summary, "pg-22.jsonl");
+        assertEquals(fromRows.get("projection"), fromSummary.get("projection"));
+        assertEquals(fromRows.get("indexes"), fromSummary.get("indexes"));
+        assertEquals(fromRows.get("templates"), fromSummary.get("templates"));
+        var units = new java.util.HashMap<>(map(fromRows.get("access_units")));
+        assertEquals(units, map(fromSummary.get("access_units")));
+        assertEquals(
+                Map.of("stopped_range", 1L, "range", 1L, "union", 1L, "intersection", 2L),
+                map(fromSummary.get("projection")).get("projected"));
+        assertEquals(
+                Map.of("stopped_without_visible_row", 1L),
+                map(fromSummary.get("projection")).get("rejected"));
+        assertEquals("summary", map(((List<?>) fromSummary.get("inputs")).get(0)).get("detail"));
+    }
+
+    /** A capture with both records fails on the first summary its rows do not add up to. */
+    @Test
+    public void rowsCaptureRejectsSummariesTheirRowsContradict() throws Exception {
+        var agreeing = new Trace().header("rows");
+        agreeing.start("SELECT c FROM sbtest1 WHERE id = $1").plan("a", PK, 0, "index").rescan("a", PK, EQUALITY);
+        agreeing.next("a", PK, true, false).visible("a", PK, true).row().next("a", PK, false, false).returned(1, 1);
+        agreeing.summary("a", PK, "\"calls\":2,\"found\":1,\"forward\":true,\"heap_fetches\":1,\"heap_visible\":1").scanEnd("a", PK);
+        assertEquals("rows", map(((List<?>) analyze(agreeing, "pg-23.jsonl").get("inputs")).get(0)).get("detail"));
+
+        var contradicted = new Trace().header("rows");
+        contradicted.start("SELECT c FROM sbtest1 WHERE id = $1").plan("a", PK, 0, "index").rescan("a", PK, EQUALITY);
+        contradicted.next("a", PK, true, false).visible("a", PK, true).row().next("a", PK, false, false).returned(1, 1);
+        contradicted.summary("a", PK, "\"calls\":2,\"found\":2,\"forward\":true,\"heap_fetches\":1,\"heap_visible\":1").scanEnd("a", PK);
+        assertTrue(failure(contradicted, "pg-24.jsonl").contains("Scan summary differs from per-row events"));
+
+        var miscounted = new Trace().header("rows");
+        miscounted.start("SELECT c FROM t").row().row().returned(2, 1);
+        assertTrue(failure(miscounted, "pg-25.jsonl").contains("Result row count differs"));
+
+        var verdicts = new Trace().header("rows");
+        verdicts.start("SELECT 1").plan("u", K, 2, "bitmap").bitmapHeap("h", "u").rescan("u", K, EQUALITY);
+        verdicts.tid("u", K, "(1,1)").bitmapEnd("u", K).verdict("h", "(1,1)", true).returned(0, 0);
+        verdicts.verdicts("h", 0, "{\"inputs\":[0],\"visible\":0,\"invisible\":1}");
+        assertTrue(failure(verdicts, "pg-26.jsonl").contains("Bitmap verdict summary differs"));
+
+        var rowInSummary = new Trace().header("summary");
+        rowInSummary.start("SELECT c FROM t").row();
+        assertTrue(failure(rowInSummary, "pg-27.jsonl").contains("Per-row event in a summary capture"));
+
+        var late = new Trace().start("SELECT 1").header("rows");
+        assertTrue(failure(late, "pg-28.jsonl").contains("not the first event"));
     }
 
     @Test

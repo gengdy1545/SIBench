@@ -1,3 +1,15 @@
+--- a/src/backend/Makefile
++++ b/src/backend/Makefile
+@@ -50,6 +50,9 @@
+ # The backend doesn't need everything that's in LIBS, however
+ LIBS := $(filter-out -lz -lreadline -ledit -ltermcap -lncurses -lcurses, $(LIBS))
+ 
++# SIBench capture traces can be written as zstd streams (access/index/sibench_capture.c).
++LIBS += -lzstd
++
+ ifeq ($(with_systemd),yes)
+ LIBS += -lsystemd
+ endif
 --- a/src/backend/access/heap/heapam_handler.c
 +++ b/src/backend/access/heap/heapam_handler.c
 @@ -18,6 +18,7 @@
@@ -8,7 +20,7 @@
  
  #include "access/genam.h"
  #include "access/heapam.h"
-@@ -2175,14 +2176,30 @@
+@@ -2175,10 +2176,18 @@
  			ItemPointerData tid;
  			HeapTupleData heapTuple;
  
@@ -29,31 +41,39 @@
  		}
  	}
  	else
- 	{
+@@ -2191,6 +2200,10 @@
+ 		OffsetNumber maxoff = PageGetMaxOffsetNumber(dp);
+ 		OffsetNumber offnum;
+ 
 +		/* A lossy page has no candidate TIDs to attribute to an index. */
-+		if (sibench_bitmap_heap_node && sib_relation(scan->rs_rd))
-+		{
-+			char		detail[64];
++		if (sibench_bitmap_heap_node)
++			sib_bitmap_lossy(scan->rs_rd, sibench_bitmap_heap_node);
 +
-+			snprintf(detail, sizeof(detail), "\"heap\":\"%p\"", sibench_bitmap_heap_node);
-+			sib_emit("bitmap_heap_lossy", scan->rs_rd, detail);
-+		}
- 		/*
- 		 * Bitmap is lossy, so we must examine each line pointer on the page.
- 		 * But we can ignore HOT chains, since we'll check each tuple anyway.
+ 		for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum = OffsetNumberNext(offnum))
+ 		{
+ 			ItemId		lp;
+--- a/src/backend/access/index/Makefile
++++ b/src/backend/access/index/Makefile
+@@ -16,6 +16,7 @@
+ 	amapi.o \
+ 	amvalidate.o \
+ 	genam.o \
+-	indexam.o
++	indexam.o \
++	sibench_capture.o
+ 
+ include $(top_srcdir)/src/backend/common.mk
 --- a/src/backend/access/index/indexam.c
 +++ b/src/backend/access/index/indexam.c
-@@ -42,6 +42,9 @@
+@@ -42,6 +42,7 @@
   */
  
  #include "postgres.h"
 +#include "sibench_capture.h"
-+
-+IndexScanDesc sibench_bitmap_scan = NULL;
  
  #include "access/amapi.h"
  #include "access/heapam.h"
-@@ -232,6 +235,7 @@
+@@ -232,6 +233,7 @@
  									   (ItemPointer) NULL,
  									   InvalidBlockNumber);
  
@@ -61,31 +81,31 @@
  	return indexRelation->rd_indam->aminsert(indexRelation, values, isnull,
  											 heap_t_ctid, heapRelation,
  											 checkUnique, indexUnchanged,
-@@ -342,6 +346,7 @@
+@@ -342,6 +344,7 @@
  {
  	SCAN_CHECKS;
  	CHECK_SCAN_PROCEDURE(amrescan);
-+	sib_scan("scan_rescan", scan, keys ? keys : scan->keyData, keys ? nkeys : scan->numberOfKeys, NULL, 0, false);
++	sib_index_rescan(scan, keys ? keys : scan->keyData, keys ? nkeys : scan->numberOfKeys);
  
  	Assert(nkeys == scan->numberOfKeys);
  	Assert(norderbys == scan->numberOfOrderBys);
-@@ -366,6 +371,7 @@
+@@ -366,6 +369,7 @@
  {
  	SCAN_CHECKS;
  	CHECK_SCAN_PROCEDURE(amendscan);
-+	sib_scan("scan_end", scan, NULL, 0, NULL, 0, false);
++	sib_index_end(scan);
  
  	/* Release resources (like buffer pins) from table accesses */
  	if (scan->xs_heapfetch)
-@@ -573,6 +579,7 @@
+@@ -573,6 +577,7 @@
  	 * pay no attention to those fields here.
  	 */
  	found = scan->indexRelation->rd_indam->amgettuple(scan, direction);
-+	sib_scan("scan_next", scan, NULL, 0, found ? &scan->xs_heaptid : NULL, direction, found);
++	sib_index_next(scan, direction, found);
  
  	/* Reset kill flag immediately for safety */
  	scan->kill_prior_tuple = false;
-@@ -623,6 +630,7 @@
+@@ -623,6 +628,7 @@
  									scan->xs_snapshot, slot,
  									&scan->xs_heap_continue, &all_dead);
  
@@ -93,7 +113,7 @@
  	if (found)
  		pgstat_count_heap_fetch(scan->indexRelation);
  
-@@ -713,7 +721,17 @@
+@@ -713,7 +719,17 @@
  	/*
  	 * have the am's getbitmap proc do all the work.
  	 */
@@ -108,7 +128,7 @@
 +		sibench_bitmap_scan = NULL;
 +	}
 +	PG_END_TRY();
-+	sib_scan("bitmap_end", scan, NULL, 0, NULL, 0, false);
++	sib_bitmap_end(scan);
  
  	pgstat_count_index_tuples(scan->indexRelation, ntids);
  
@@ -122,29 +142,25 @@
  
  #include <time.h>
  #include <unistd.h>
-@@ -2239,6 +2240,11 @@
+@@ -2239,6 +2240,7 @@
  	 * state.
  	 */
  
-+	{
-+		char sib_detail[64];
-+		snprintf(sib_detail, sizeof(sib_detail), "\"csn\":%llu", (unsigned long long) sib_completion());
-+		sib_emit("transaction_commit", NULL, sib_detail);
-+	}
++	sib_transaction_commit();
  	CallXactCallbacks(is_parallel_worker ? XACT_EVENT_PARALLEL_COMMIT
  					  : XACT_EVENT_COMMIT);
  
-@@ -2777,7 +2783,9 @@
+@@ -2776,7 +2778,10 @@
+ 		if (is_parallel_worker)
  			CallXactCallbacks(XACT_EVENT_PARALLEL_ABORT);
  		else
- 		{
--			sib_emit("transaction_abort", NULL, NULL);
-+			char sib_detail[64];
-+			snprintf(sib_detail, sizeof(sib_detail), "\"csn\":%llu", (unsigned long long) sib_completion());
-+			sib_emit("transaction_abort", NULL, sib_detail);
++		{
++			sib_transaction_abort();
  			CallXactCallbacks(XACT_EVENT_ABORT);
- 		}
++		}
  
+ 		ResourceOwnerRelease(TopTransactionResourceOwner,
+ 							 RESOURCE_RELEASE_BEFORE_LOCKS,
 --- a/src/backend/catalog/index.c
 +++ b/src/backend/catalog/index.c
 @@ -20,6 +20,7 @@
@@ -155,89 +171,62 @@
  
  #include <unistd.h>
  
-@@ -3042,9 +3043,16 @@
+@@ -3042,9 +3043,11 @@
  	/*
  	 * Call the access method's build procedure
  	 */
-+	if (sib_relation(indexRelation)) sib_emit("index_build_start", indexRelation, NULL);
++	sib_index_build_start(indexRelation);
  	stats = indexRelation->rd_indam->ambuild(heapRelation, indexRelation,
  											 indexInfo);
  	Assert(PointerIsValid(stats));
-+	if (sib_relation(indexRelation))
-+	{
-+		char detail[160];
-+		snprintf(detail, sizeof(detail), "\"heap_rows\":%.0f,\"index_rows\":%.0f", stats->heap_tuples, stats->index_tuples);
-+		sib_emit("index_build_end", indexRelation, detail);
-+	}
++	sib_index_build_end(indexRelation, stats->heap_tuples, stats->index_tuples);
  
  	/*
  	 * If this is an unlogged index, we may need to write out an init fork for
 --- a/src/backend/executor/execMain.c
 +++ b/src/backend/executor/execMain.c
-@@ -36,6 +36,8 @@
+@@ -36,6 +36,7 @@
   *-------------------------------------------------------------------------
   */
  #include "postgres.h"
 +#include "sibench_capture.h"
-+#include "sibench_receiver.h"
  
  #include "access/heapam.h"
  #include "access/htup_details.h"
-@@ -149,6 +151,18 @@
+@@ -149,6 +150,7 @@
  	EState	   *estate;
  	MemoryContext oldcontext;
  
-+	if (sib_enabled())
-+	{
-+		StringInfoData detail;
-+		initStringInfo(&detail);
-+		appendStringInfoString(&detail, "\"sql\":");
-+		escape_json(&detail, queryDesc->sourceText ? queryDesc->sourceText : "");
-+		/* Core query jumbling (compute_query_id = on): constants do not change the identity. */
-+		appendStringInfo(&detail, ",\"query_id\":%lld",
-+						 (long long) queryDesc->plannedstmt->queryId);
-+		sib_emit("executor_start", NULL, detail.data);
-+		pfree(detail.data);
-+	}
++	sib_executor_start(queryDesc);
  	/* sanity checks: queryDesc must not be started already */
  	Assert(queryDesc != NULL);
  	Assert(queryDesc->estate == NULL);
-@@ -340,6 +354,7 @@
+@@ -340,6 +342,7 @@
  	 */
  	operation = queryDesc->operation;
  	dest = queryDesc->dest;
-+	if (sib_enabled()) dest = sib_wrap_receiver(dest);
++	dest = sib_wrap_receiver(dest);
  
  	/*
  	 * startup tuple receiver, if we will be emitting tuples
-@@ -372,6 +387,14 @@
+@@ -372,6 +375,8 @@
  	if (queryDesc->totaltime)
  		InstrStopNode(queryDesc->totaltime, estate->es_processed);
  
-+	if (sib_enabled())
-+	{
-+		char detail[128];
-+		snprintf(detail, sizeof(detail), "\"processed\":%llu",
-+				 (unsigned long long) estate->es_processed);
-+		sib_emit("executor_run_end", NULL, detail);
-+	}
++	sib_executor_run_end(dest, estate->es_processed);
 +
  	MemoryContextSwitchTo(oldcontext);
  }
  
-@@ -463,6 +486,12 @@
- {
+@@ -464,6 +469,8 @@
  	EState	   *estate;
  	MemoryContext oldcontext;
-+	if (sib_enabled())
-+	{
-+		char detail[128];
-+		snprintf(detail, sizeof(detail), "\"processed\":%llu", (unsigned long long) queryDesc->estate->es_processed);
-+		sib_emit("executor_end", NULL, detail);
-+	}
  
++	sib_executor_end(queryDesc->estate->es_processed);
++
  	/* sanity checks */
  	Assert(queryDesc != NULL);
+ 
 --- a/src/backend/executor/nodeBitmapHeapscan.c
 +++ b/src/backend/executor/nodeBitmapHeapscan.c
 @@ -34,6 +34,7 @@
@@ -248,103 +237,7 @@
  
  #include <math.h>
  
-@@ -61,6 +62,95 @@
- 								  TableScanDesc scan);
- static bool BitmapShouldInitializeSharedState(ParallelBitmapHeapState *pstate);
- 
-+/* The bitmap heap node whose page is being fetched; heapam reports per-TID visibility for it. */
-+void	   *sibench_bitmap_heap_node = NULL;
-+
-+/* Collects the index scans that feed a bitmap: one BitmapIndexScan, or BitmapAnd/Or inputs. */
-+static void
-+sib_bitmap_inputs(PlanState *input, StringInfo out)
-+{
-+	int			i;
-+
-+	if (IsA(input, BitmapIndexScanState))
-+		appendStringInfo(out, "%s\"%p\"", out->data[out->len - 1] == '[' ? "" : ",",
-+						 (void *) ((BitmapIndexScanState *) input)->biss_ScanDesc);
-+	else if (IsA(input, BitmapOrState))
-+		for (i = 0; i < ((BitmapOrState *) input)->nplans; i++)
-+			sib_bitmap_inputs(((BitmapOrState *) input)->bitmapplans[i], out);
-+	else if (IsA(input, BitmapAndState))
-+		for (i = 0; i < ((BitmapAndState *) input)->nplans; i++)
-+			sib_bitmap_inputs(((BitmapAndState *) input)->bitmapplans[i], out);
-+}
-+
-+/*
-+ * The combination of the index scans as a tree: a scan identity, or {"and":[...]} / {"or":[...]}
-+ * over subtrees. A flat input list cannot tell an intersection of a union from a union of scans.
-+ */
-+static void
-+sib_bitmap_tree(PlanState *input, StringInfo out)
-+{
-+	int			i,
-+				count;
-+	PlanState **plans;
-+
-+	if (IsA(input, BitmapIndexScanState))
-+	{
-+		appendStringInfo(out, "\"%p\"", (void *) ((BitmapIndexScanState *) input)->biss_ScanDesc);
-+		return;
-+	}
-+	if (IsA(input, BitmapOrState))
-+	{
-+		appendStringInfoString(out, "{\"or\":[");
-+		count = ((BitmapOrState *) input)->nplans;
-+		plans = ((BitmapOrState *) input)->bitmapplans;
-+	}
-+	else
-+	{
-+		appendStringInfoString(out, "{\"and\":[");
-+		count = ((BitmapAndState *) input)->nplans;
-+		plans = ((BitmapAndState *) input)->bitmapplans;
-+	}
-+	for (i = 0; i < count; i++)
-+	{
-+		if (i)
-+			appendStringInfoChar(out, ',');
-+		sib_bitmap_tree(plans[i], out);
-+	}
-+	appendStringInfoString(out, "]}");
-+}
-+
-+/* Binds a bitmap heap node to the index scans whose candidates it checks. */
-+static void
-+sib_bitmap_binding(BitmapHeapScanState *node)
-+{
-+	StringInfoData out;
-+
-+	if (!sib_relation(node->ss.ss_currentRelation))
-+		return;
-+	initStringInfo(&out);
-+	appendStringInfo(&out, "\"heap\":\"%p\",\"plan_node\":%d,\"tree\":",
-+					 (void *) node, node->ss.ps.plan->plan_node_id);
-+	sib_bitmap_tree(outerPlanState(node), &out);
-+	appendStringInfoString(&out, ",\"scans\":[");
-+	sib_bitmap_inputs(outerPlanState(node), &out);
-+	appendStringInfoChar(&out, ']');
-+	sib_emit("plan_bitmap_heap", node->ss.ss_currentRelation, out.data);
-+	pfree(out.data);
-+}
-+
-+/* All-visible pages are not fetched; every exact candidate on them is visible. */
-+static void
-+sib_bitmap_skipped(BitmapHeapScanState *node, TBMIterateResult *tbmres)
-+{
-+	int			i;
-+	ItemPointerData tid;
-+
-+	for (i = 0; i < tbmres->ntuples; i++)
-+	{
-+		ItemPointerSet(&tid, tbmres->blockno, tbmres->offsets[i]);
-+		sib_bitmap_verdict(node->ss.ss_currentRelation, node, &tid, true);
-+	}
-+}
- 
- /* ----------------------------------------------------------------
-  *		BitmapHeapNext
-@@ -236,11 +326,27 @@
+@@ -236,11 +237,27 @@
  				 * node->return_empty_tuples.
  				 */
  				node->return_empty_tuples = tbmres->ntuples;
@@ -375,7 +268,7 @@
  			}
  
  			/* Adjust the prefetch target */
-@@ -813,6 +919,8 @@
+@@ -813,6 +830,8 @@
  		get_tablespace_io_concurrency(currentRelation->rd_rel->reltablespace);
  
  	scanstate->ss.ss_currentRelation = currentRelation;
@@ -425,24 +318,21 @@
  			tuple_from_heap = true;
  		}
 +		else
-+			sib_scan("vm_visible", scandesc, NULL, 0, tid, 0, true);
++			sib_vm_visible(scandesc, tid);
  
  		/* Fill the scan tuple slot with data from the index */
  		StoreIndexTuple(node, slot, scandesc);
 --- a/src/backend/executor/nodeIndexscan.c
 +++ b/src/backend/executor/nodeIndexscan.c
-@@ -28,6 +28,10 @@
+@@ -28,6 +28,7 @@
   *		ExecIndexScanInitializeWorker attach to DSM info in parallel worker
   */
  #include "postgres.h"
 +#include "sibench_capture.h"
-+
-+int sibench_depth = 0;
-+uint64 sibench_request = 0;
  
  #include "access/nbtree.h"
  #include "access/relscan.h"
-@@ -116,6 +120,7 @@
+@@ -116,6 +117,7 @@
  								   node->iss_NumOrderByKeys);
  
  		node->iss_ScanDesc = scandesc;
@@ -450,7 +340,7 @@
  
  		/*
  		 * If no run-time keys to calculate or they are ready, go ahead and
-@@ -211,6 +216,7 @@
+@@ -211,6 +213,7 @@
  								   node->iss_NumOrderByKeys);
  
  		node->iss_ScanDesc = scandesc;
@@ -468,29 +358,26 @@
  
  #include <limits.h>
  
-@@ -380,6 +381,9 @@
+@@ -380,6 +381,8 @@
  	PagetableEntry *page = NULL;	/* only valid when currblk is valid */
  	int			i;
  
 +	if (sibench_bitmap_scan)
-+		for (i = 0; i < ntids; i++)
-+			sib_scan("bitmap_candidate", sibench_bitmap_scan, NULL, 0, (ItemPointer) (tids+i), 0, true);
++		sib_bitmap_candidates(sibench_bitmap_scan, tids, ntids);
  	Assert(tbm->iterating == TBM_NOT_ITERATING);
  	for (i = 0; i < ntids; i++)
  	{
 --- a/src/backend/storage/ipc/procarray.c
 +++ b/src/backend/storage/ipc/procarray.c
-@@ -44,6 +44,9 @@
+@@ -44,6 +44,7 @@
   *-------------------------------------------------------------------------
   */
  #include "postgres.h"
 +#include "sibench_capture.h"
-+/* The completion counter of the last snapshot this backend built. */
-+uint64 sibench_snapshot_csn = 0;
  
  #include <signal.h>
  
-@@ -787,6 +790,8 @@
+@@ -787,6 +788,8 @@
  
  	/* Same with xactCompletionCount  */
  	ShmemVariableCache->xactCompletionCount++;
@@ -499,7 +386,7 @@
  }
  
  /*
-@@ -2586,6 +2591,9 @@
+@@ -2586,6 +2589,9 @@
  	snapshot->subxcnt = subcount;
  	snapshot->suboverflowed = suboverflowed;
  	snapshot->snapXactCompletionCount = curXactCompletionCount;

@@ -26,10 +26,12 @@ public final class ServerCaptureAudit {
         long[] zeroRowModifications = {0};
         long lastRequest = 0, returned = 0, processed = -1, failed = 0;
         boolean running = false, ranToEnd = false, executorEnded = true, transaction = false;
+        // Captures before summaries, and ROWS captures, have every result row as an event.
+        boolean perRowResults = true;
         String sql = "";
         int pid = 0;
         var statements = new TreeMap<String, Long>();
-        try (var input = Files.newBufferedReader(server)) {
+        try (var input = ServerTrace.open(server)) {
             String line;
             while ((line = input.readLine()) != null) {
                 JsonObject e = JsonParser.parseString(line).getAsJsonObject();
@@ -70,6 +72,11 @@ public final class ServerCaptureAudit {
                         if (depth <= 1) {
                             ranToEnd = true;
                             processed = e.get("processed").getAsLong();
+                            // A summary capture counts the rows at the return, not one by one.
+                            if (e.has("returned") && !perRowResults) {
+                                returned += e.get("returned").getAsLong();
+                                resultRows += e.get("returned").getAsLong();
+                            }
                         }
                     }
                     case "executor_end" -> {
@@ -102,8 +109,9 @@ public final class ServerCaptureAudit {
                     case "scan_rescan", "scan_next", "heap_visibility", "vm_visible",
                             "bitmap_candidate", "bitmap_end", "bitmap_heap_candidate",
                             "bitmap_heap_lossy", "plan_bitmap_heap", "scan_end", "plan_scan",
-                            "index_insert_attempt" ->
+                            "index_insert_attempt", "scan_summary", "bitmap_verdicts" ->
                             indexEvents++;
+                    case "capture_start" -> perRowResults = e.get("detail").getAsString().equals("rows");
                     case "row_change", "index_build_start", "index_build_end" -> {}
                     default -> throw new IOException("Unclassified raw event: " + type);
                 }

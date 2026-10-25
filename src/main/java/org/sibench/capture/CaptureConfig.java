@@ -40,7 +40,7 @@ public record CaptureConfig(
                 runGit(directory, "status", "--porcelain=v1", "--untracked-files=all").isEmpty(),
                 "Source worktree must be clean");
         var nativeConfig = object(doc, "native");
-        require(string(nativeConfig, "sf").equals("1x"), "Capture currently requires native SF1");
+        require(string(nativeConfig, "sf").matches("[1-9][0-9]*x"), "sf must be a native HyBench scale such as 1x or 10x");
         int clients = Math.toIntExact(positive(nativeConfig, "clients"));
         int seconds =
                 Math.toIntExact(Math.multiplyExact(positive(nativeConfig, "duration_minutes"), 60));
@@ -154,7 +154,7 @@ public record CaptureConfig(
         } catch (java.io.IOException error) {
             throw new java.io.UncheckedIOException(error);
         }
-        p.setProperty("sf", "1x");
+        p.setProperty("sf", scaleFactor());
         p.setProperty("db", "postgreSQL");
         p.setProperty("tpclient", Integer.toString(clients));
         p.setProperty("username", user);
@@ -189,7 +189,16 @@ public record CaptureConfig(
         return string(object(document, "postgres"), "clone_from");
     }
 
-    /** The directory HyBench resolves its native {@code Data_1x} input from. */
+    /** HyBench's scale factor as its configuration names it, e.g. {@code 10x}. */
+    public String scaleFactor() {
+        return string(object(document, "native"), "sf");
+    }
+
+    public String sourceCommit() {
+        return string(object(document, "source"), "commit");
+    }
+
+    /** The directory HyBench resolves its native {@code Data_<sf>} input from. */
     public Path workDir() {
         var nativeConfig = object(document, "native");
         return nativeConfig.containsKey("work_dir")

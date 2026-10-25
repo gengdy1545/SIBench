@@ -1,0 +1,12 @@
+schema_version: 1
+purpose: index_service
+# One fresh RocksDB index served over the SIBench index protocol (src/main/proto); the path must
+# not exist yet: an index is loaded from a trace's baseline once and never reused.
+service:
+  backend: rocksdb
+  path: build/services/index/rocksdb
+  port: 50551
+  value: locator
+  # Execute requests in the driver's send order across client streams (Request.sequence), so a
+  # replay may use several clients; false executes each stream as it arrives (one client only).
+  ordered: true

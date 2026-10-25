@@ -23,20 +23,30 @@ import java.util.PriorityQueue;
  * without an XID changes no snapshot and increments nothing; it records the counter it observed,
  * so it sorts after every writer at or below it. Ties are therefore a writer first, then readers,
  * which keep their session order. Within one backend a writer's position exceeds everything before
- * it, and a reader's is at least the previous one, so one buffered chunk per session suffices.
+ * it, and a reader's is at least the previous one, so one pending chunk per session suffices.
+ *
+ * <p>Memory stays bounded however large a transaction is (an analytical session can be one
+ * multi-gigabyte chunk): each session has a scanner that reads ahead only to the next commit or
+ * abort record and keeps its line count and counter, and a second sequential reader that streams a
+ * chunk's lines when the chunk is taken. Each file is read twice instead of buffered.
  */
 final class SessionMerge implements AutoCloseable {
     /**
      * One transaction-sized run of events, keyed by the completion counter of its final record;
-     * {@code writer} is a transaction that held an XID and so incremented the counter.
+     * {@code writer} is a transaction that held an XID and so incremented the counter, {@code
+     * committed} whether that record is a commit. Both are known before the chunk's lines are read.
      */
-    record Chunk(int session, long csn, boolean writer, List<String> lines) {}
+    record Chunk(int session, long csn, boolean writer, boolean committed, long lineCount) {}
 
     private static final String COMMIT = "{\"event\":\"transaction_commit\"";
     private static final String ABORT = "{\"event\":\"transaction_abort\"";
 
     private final List<Path> files;
-    private final List<BufferedReader> readers = new ArrayList<>();
+    /** Per session: the scanner that finds chunk ends, and the reader that streams chunk lines. */
+    private final List<BufferedReader> scanners = new ArrayList<>(), contents = new ArrayList<>();
+    /** The chunk handed out by next() and the lines of it not yet streamed. */
+    private Chunk current;
+    private long remaining;
     private final PriorityQueue<Chunk> heads =
             new PriorityQueue<>(
                     (a, b) ->
@@ -57,7 +67,10 @@ final class SessionMerge implements AutoCloseable {
     static SessionMerge open(List<Path> files) throws IOException {
         var merge = new SessionMerge(files);
         try {
-            for (Path file : files) merge.readers.add(Files.newBufferedReader(file));
+            for (Path file : files) {
+                merge.scanners.add(ServerTrace.open(file));
+                merge.contents.add(ServerTrace.open(file));
+            }
             for (int session = 0; session < files.size(); session++) merge.fill(session);
         } catch (IOException | RuntimeException error) {
             merge.close();
@@ -70,12 +83,27 @@ final class SessionMerge implements AutoCloseable {
         return !heads.isEmpty();
     }
 
-    /** The chunk with the smallest completion counter; sessions break ties in manifest order. */
+    /**
+     * The chunk with the smallest completion counter; sessions break ties in manifest order. Its
+     * lines are streamed by {@link #line()}, all of them before the next chunk is taken.
+     */
     Chunk next() throws IOException {
+        if (remaining != 0) throw new IOException("Previous chunk was not read to its end");
         Chunk chunk = heads.poll();
         if (chunk == null) throw new IOException("Merged session stream is exhausted");
         fill(chunk.session());
+        current = chunk;
+        remaining = chunk.lineCount();
         return chunk;
+    }
+
+    /** The next line of the current chunk, or null after its last line. */
+    String line() throws IOException {
+        if (remaining == 0) return null;
+        String line = contents.get(current.session()).readLine();
+        if (line == null) throw new IOException("Session trace changed while it was merged");
+        remaining--;
+        return line;
     }
 
     private void fill(int session) throws IOException {
@@ -84,10 +112,10 @@ final class SessionMerge implements AutoCloseable {
     }
 
     private Chunk read(int session) throws IOException {
-        var lines = new ArrayList<String>();
+        long lines = 0;
         String line;
-        while ((line = readers.get(session).readLine()) != null) {
-            lines.add(line);
+        while ((line = scanners.get(session).readLine()) != null) {
+            lines++;
             if (line.startsWith(COMMIT) || line.startsWith(ABORT)) {
                 JsonObject event = JsonParser.parseString(line).getAsJsonObject();
                 if (!event.has("csn"))
@@ -109,10 +137,10 @@ final class SessionMerge implements AutoCloseable {
                 if (writer && !writerPositions.add(csn))
                     throw new IOException("Two writers share completion position " + csn);
                 lastCsn[session] = csn;
-                return new Chunk(session, csn, writer, lines);
+                return new Chunk(session, csn, writer, line.startsWith(COMMIT), lines);
             }
         }
-        if (lines.isEmpty()) return null;
+        if (lines == 0) return null;
         throw new IOException(
                 "Session trace ends without a commit or abort: "
                         + files.get(session).getFileName());
@@ -120,7 +148,13 @@ final class SessionMerge implements AutoCloseable {
 
     @Override
     public void close() {
-        for (BufferedReader reader : readers)
+        for (BufferedReader reader : scanners)
+            try {
+                reader.close();
+            } catch (IOException ignored) {
+                // Closing after a failure must not mask the original error.
+            }
+        for (BufferedReader reader : contents)
             try {
                 reader.close();
             } catch (IOException ignored) {

@@ -4,7 +4,11 @@
 
 ## 原生路径
 
-[hybench_sf1.yaml](../../config/hybench_sf1.yaml) 运行原生 `runHTAP`：从静止已验证的 SF1 库（`postgres.clone_from`）克隆采集库，安装上游二级索引与行变化触发器后，SIBench 调用未修改的 `HyBench.runAP()`、`runTP()`、`runXP(0)`，使用原生 SQL、随机选择、计时器和客户端；阶段之间只等待连接排空，不恢复数据。流程见 [HTAP SF1 验证](../validation/hybench-sf1-htap.md)。
+[hybench_sf1.yaml](../../config/hybench_sf1.yaml) 运行原生 `runHTAP`：从静止已验证的库（`postgres.clone_from`）克隆采集库，安装上游二级索引、序列与行变化触发器并 `VACUUM (ANALYZE)` 后，SIBench 调用未修改的 `HyBench.runAP()`、`runTP()`、`runXP(0)`，使用原生 SQL、随机选择、计时器和客户端；阶段之间只等待连接排空，不恢复数据。流程见 [HTAP SF1 验证](../validation/hybench-sf1-htap.md)。
+
+静止库由采集脚本的 `base` 阶段按上游 README 建立：在 `native.work_dir` 运行原生 gendata 生成 `Data_<sf>`（`native.sf`，如 `1x`、`10x`），执行上游 `ddl_pg.sql`，再按上游 `load_data_pg.sql` 逐表 `COPY`（只把脚本里写死的 `Data_1x` 换成对应规模的目录）。上游生成器使用未设种子的随机源，所以一次生成就是该规模所有采集共用的事实：已有 `Data_<sf>` 不重新生成，`base-<库名>.json` 记录每个文件的 SHA256 与装载行数；库已存在时只核对行数与清单一致后复用。
+
+采集集群关闭了 autovacuum，准备阶段对克隆库执行一次 `VACUUM (ANALYZE)`，与 YCSB / sysbench 的准备一致：已加载的 benchmark 库在测量时本应有提示位、可见性图和规划器统计。2026-10-24 之前的 HyBench 采集没有这一步，克隆库没有统计信息，`loantrans` / `loanapps` 上 `applicantid = ? order by timestamp desc limit 1` 一类查询因此沿 timestamp 索引倒扫并过滤 applicantid（每次约 44 万条目）。
 
 | 阶段 | 原生负载 | 默认选择 |
 | --- | --- | --- |

@@ -4,7 +4,6 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
-import org.sibench.generation.BaselineGenerator;
 
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -70,7 +69,7 @@ final class CaptureRun implements AutoCloseable {
         CaptureRun run = active;
         if (run == null) return;
         synchronized (run) {
-            if (Files.exists(run.directory.resolve("pg-" + pid + ".jsonl"))
+            if (Files.exists(ServerTrace.locate(run.directory, pid))
                     || run.sessions.containsValue(pid) || run.sessions.containsKey(jdbc))
                 throw new IOException("Backend trace already exists; restart in a fresh run directory");
             run.sessions.put(jdbc, pid);
@@ -179,10 +178,8 @@ final class CaptureRun implements AutoCloseable {
                         int pid = connectionPid(path);
                         if (clients.put(pid, path) != null)
                             throw new IOException("Several JDBC traces for backend " + pid);
-                    } else if (name.startsWith("pg-") && name.endsWith(".jsonl")) {
-                        servers.put(
-                                Integer.parseInt(name.substring(3, name.length() - ".jsonl".length())),
-                                path);
+                    } else if (ServerTrace.isServerTrace(name)) {
+                        servers.put(ServerTrace.pid(name), path);
                     }
                 }
             }
@@ -195,7 +192,7 @@ final class CaptureRun implements AutoCloseable {
                 var workload = (Map<?, ?>) item;
                 for (Object session : (java.util.List<?>) workload.get("sessions")) {
                     String name = (String) ((Map<?, ?>) session).get("pg_file");
-                    int pid = Integer.parseInt(name.substring(3, name.length() - ".jsonl".length()));
+                    int pid = ServerTrace.pid(name);
                     order.add(pid);
                     workloads.put(
                             pid, workload.containsKey("workload") ? workload.get("workload") : workload.get("script"));
@@ -203,38 +200,31 @@ final class CaptureRun implements AutoCloseable {
             }
             if (!new java.util.HashSet<>(order).equals(servers.keySet()) || order.size() != servers.size())
                 throw new IOException("Server traces differ from the sessions the native client ran");
-            var records = new java.util.ArrayList<Map<String, Object>>();
-            for (int pid : order) {
-                Path server = servers.get(pid), jdbcTrace = clients.remove(pid);
-                var record = new LinkedHashMap<String, Object>();
-                if (jdbcTrace != null) {
-                    record.put("jdbc_file", jdbcTrace.getFileName().toString());
-                    record.put("jdbc_sha256", BaselineGenerator.sha256(jdbcTrace));
-                }
-                record.put("workload", workloads.get(pid));
-                record.put("pg_file", server.getFileName().toString());
-                record.put("pg_sha256", BaselineGenerator.sha256(server));
-                record.put("bindings", bindings);
-                record.put(
-                        "audit",
-                        jdbcTrace != null
-                                ? RequestCaptureAudit.audit(jdbcTrace, server, bindings)
-                                : ServerCaptureAudit.audit(server));
-                records.add(record);
-            }
+            var pairs = new java.util.ArrayList<Pair>();
+            for (int pid : order)
+                pairs.add(new Pair(clients.remove(pid), servers.get(pid), bindings, true, workloads.get(pid)));
             if (!clients.isEmpty())
                 throw new IOException("JDBC traces without a server trace: " + clients.values());
+            var records = audit(pairs);
             var inventory = new java.util.HashSet<String>();
             for (var record : records) {
                 inventory.add((String) record.get("pg_file"));
                 if (record.containsKey("jdbc_file")) inventory.add((String) record.get("jdbc_file"));
             }
             verifyInventory(directory, inventory);
-            manifest.put("session_order", "sequential");
+            // Workloads never overlap; the threads of one workload do, and then every session is
+            // merged by PostgreSQL's transaction completion counter.
+            boolean overlapping = false;
+            for (Object item : (java.util.List<?>) client.get("workloads"))
+                overlapping |= ((java.util.List<?>) ((Map<?, ?>) item).get("sessions")).size() > 1;
+            manifest.put("session_order", overlapping ? "concurrent" : "sequential");
             manifest.put(
                     "session_order_evidence",
-                    "one native client process per workload; each exited and no capture backend"
-                            + " remained before the next started");
+                    overlapping
+                            ? "several client threads per workload, one backend each, overlapping;"
+                                    + " merged by the transaction completion counter"
+                            : "one native client process per workload; each exited and no capture"
+                                    + " backend remained before the next started");
             manifest.put("sessions", records);
             manifest.put("client", client);
             manifest.put("completed_at", Instant.now().toString());
@@ -243,6 +233,34 @@ final class CaptureRun implements AutoCloseable {
         } catch (Exception | Error error) {
             fail(error, Map.of("operation", "complete_capture"));
             throw error;
+        }
+    }
+
+    /**
+     * Waits until a local backend process has exited, so its exit hooks have finished its trace.
+     * The capture server runs on this host; a backend that outlives its closed connection by
+     * minutes means the capture cannot be read.
+     */
+    static void awaitBackendExit(int pid) throws IOException {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MINUTES.toNanos(2);
+        while (isBackend(pid)) {
+            if (System.nanoTime() > deadline)
+                throw new IOException("Backend " + pid + " did not exit after its connection closed");
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for backend " + pid, interrupted);
+            }
+        }
+    }
+
+    /** A live PostgreSQL process with this pid; any other process that reuses it is not one. */
+    private static boolean isBackend(int pid) {
+        try {
+            return Files.readString(Path.of("/proc", Integer.toString(pid), "comm")).strip().equals("postgres");
+        } catch (IOException gone) {
+            return false;
         }
     }
 
@@ -287,6 +305,12 @@ final class CaptureRun implements AutoCloseable {
         publish();
     }
 
+    /** The code the run executes; see {@link CaptureBuild}. */
+    synchronized void build(Map<String, Object> identity) throws IOException {
+        manifest.put("build", identity);
+        publish();
+    }
+
     static String phase() {
         CaptureRun run = active;
         return run == null ? null : run.phase;
@@ -317,17 +341,20 @@ final class CaptureRun implements AutoCloseable {
             checkFailure();
             drainSessions();
             if (sessions.isEmpty()) throw new IOException("Capture has no JDBC connections");
-            var records = new java.util.ArrayList<Map<String, Object>>();
+            var pairs = new java.util.ArrayList<Pair>();
             var inventory = new java.util.HashSet<String>();
             for (var session : sessions.entrySet()) {
                 Path client = session.getKey();
-                Path server = directory.resolve("pg-" + session.getValue() + ".jsonl");
+                // A backend ends its trace (a zstd frame) on exit, after its connection closed.
+                awaitBackendExit(session.getValue());
+                Path server = ServerTrace.locate(directory, session.getValue());
                 inventory.add(client.getFileName().toString());
                 inventory.add(server.getFileName().toString());
                 // HTAP joins take keys from rows, so scan keys need not be client-bound.
-                records.add(session(client, server, false));
+                pairs.add(new Pair(client, server, false, false, null));
             }
             verifyInventory(directory, inventory);
+            var records = audit(pairs);
             manifest.put("session_order", "concurrent");
             manifest.put("sessions", records);
             manifest.put("completed_at", Instant.now().toString());
@@ -339,20 +366,90 @@ final class CaptureRun implements AutoCloseable {
         }
     }
 
-    /** One audited JDBC/PG session pair as the run manifest records it. */
-    private static Map<String, Object> session(Path client, Path server, boolean bindings)
-            throws Exception {
+    /**
+     * One session of a run: its JDBC trace (absent for a native client that runs no JDBC), its
+     * backend trace, and for a native client process the workload it belonged to.
+     */
+    private record Pair(Path client, Path server, boolean bindings, boolean external, Object workload) {}
+
+    /** Session audits running at once: they are independent, and each reads two whole files. */
+    private static final int AUDIT_THREADS = 8;
+
+    /**
+     * Audits every session, in parallel. Sessions are independent, so only the records' order is
+     * fixed: the run's session order. The longest backend traces start first; each audit holds
+     * its client's requests in memory, so audits also share a heap budget sized by their JDBC
+     * trace, and one that needs more than the budget runs alone.
+     */
+    private static List<Map<String, Object>> audit(List<Pair> pairs) throws Exception {
+        int threads = Math.max(1, Math.min(AUDIT_THREADS, Runtime.getRuntime().availableProcessors() / 2));
+        int budget = (int) Math.max(1, Math.min(Integer.MAX_VALUE, Runtime.getRuntime().maxMemory() * 6 / 10 >> 20));
+        var heap = new java.util.concurrent.Semaphore(budget, true);
+        var order = new java.util.ArrayList<Integer>();
+        var sizes = new long[pairs.size()];
+        for (int i = 0; i < pairs.size(); i++) {
+            order.add(i);
+            sizes[i] = Files.size(pairs.get(i).server());
+        }
+        order.sort((a, b) -> Long.compare(sizes[b], sizes[a]));
+        var executor = java.util.concurrent.Executors.newFixedThreadPool(threads);
+        try {
+            var results = new java.util.ArrayList<java.util.concurrent.Future<Map<String, Object>>>();
+            for (int i = 0; i < pairs.size(); i++) results.add(null);
+            for (int i : order) {
+                Pair pair = pairs.get(i);
+                // About eight heap bytes per JDBC trace byte, measured on HyBench TP sessions.
+                long client = pair.client() == null ? 0 : Files.size(pair.client());
+                int cost = (int) Math.min(budget, 64 + (client * 8 >> 20));
+                results.set(i, executor.submit(() -> {
+                    heap.acquire(cost);
+                    try {
+                        return audited(pair);
+                    } finally {
+                        heap.release(cost);
+                    }
+                }));
+            }
+            var records = new java.util.ArrayList<Map<String, Object>>();
+            for (var result : results) {
+                try {
+                    records.add(result.get());
+                } catch (java.util.concurrent.ExecutionException failed) {
+                    if (failed.getCause() instanceof Exception error) throw error;
+                    if (failed.getCause() instanceof Error error) throw error;
+                    throw failed;
+                }
+            }
+            return records;
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    /** One audited session as the run manifest records it. */
+    private static Map<String, Object> audited(Pair pair) throws Exception {
         var record = new LinkedHashMap<String, Object>();
-        record.put("jdbc_file", client.getFileName().toString());
-        record.put("jdbc_sha256", BaselineGenerator.sha256(client));
-        record.put("pg_file", server.getFileName().toString());
-        record.put("pg_sha256", BaselineGenerator.sha256(server));
-        record.put("bindings", bindings);
-        record.put("audit", RequestCaptureAudit.audit(client, server, bindings));
+        if (pair.client() != null) {
+            record.put("jdbc_file", pair.client().getFileName().toString());
+            record.put("jdbc_sha256", FileDigests.sha256(pair.client()));
+        }
+        if (pair.external()) record.put("workload", pair.workload());
+        record.put("pg_file", pair.server().getFileName().toString());
+        record.put("pg_sha256", FileDigests.sha256(pair.server()));
+        record.put("bindings", pair.bindings());
+        record.put(
+                "audit",
+                pair.client() != null
+                        ? RequestCaptureAudit.audit(pair.client(), pair.server(), pair.bindings())
+                        : ServerCaptureAudit.audit(pair.server()));
         return record;
     }
 
-    /** Re-checks a completed run: every registered session file, its digest and its audit. */
+    /**
+     * Re-checks a completed run: every registered session file, its digest and the audit the run
+     * recorded for it. The audit itself is not repeated: it ran on these exact bytes when the run
+     * completed, and an unchanged digest means its verdict still holds.
+     */
     static void verifyInput(Path raw) throws Exception {
         Path input = raw.toAbsolutePath().normalize();
         Path directory = Files.isDirectory(input) ? input : input.getParent();
@@ -378,16 +475,15 @@ final class CaptureRun implements AutoCloseable {
         for (var item : doc.getAsJsonArray("sessions")) {
             var session = item.getAsJsonObject();
             Path server = checkedPath(directory, session.get("pg_file").getAsString());
-            if (!BaselineGenerator.sha256(server).equals(session.get("pg_sha256").getAsString()))
+            if (!FileDigests.sha256(server).equals(session.get("pg_sha256").getAsString()))
                 throw new IOException("Capture changed after completion");
-            if (!session.has("jdbc_file")) {
-                ServerCaptureAudit.audit(server);
-                continue;
-            }
+            if (!session.has("audit")
+                    || !session.getAsJsonObject("audit").get("status").getAsString().equals("passed"))
+                throw new IOException("Capture session lacks a passed audit: " + server.getFileName());
+            if (!session.has("jdbc_file")) continue;
             Path client = checkedPath(directory, session.get("jdbc_file").getAsString());
-            if (!BaselineGenerator.sha256(client).equals(session.get("jdbc_sha256").getAsString()))
+            if (!FileDigests.sha256(client).equals(session.get("jdbc_sha256").getAsString()))
                 throw new IOException("Capture changed after completion");
-            RequestCaptureAudit.audit(client, server, session.get("bindings").getAsBoolean());
         }
         if (!input.equals(directory)
                 && doc.getAsJsonArray("sessions").asList().stream()

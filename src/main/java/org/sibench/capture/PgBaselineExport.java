@@ -17,7 +17,8 @@ import java.sql.*;
 import java.util.*;
 
 /**
- * Export committed PG values in primary-key order, then read every Parquet row for verification.
+ * Export committed PG values in primary-key order. {@link PgBaselineVerify} then compares every
+ * Parquet value with PG.
  */
 public final class PgBaselineExport {
     private PgBaselineExport() {}
@@ -196,36 +197,18 @@ public final class PgBaselineExport {
                         } finally {
                             if (writer != null) writer.close();
                         }
+                        // Every written value is compared with PG by PgBaselineVerify, which the
+                        // export stage always runs next; reading the files back here as well only
+                        // repeated a weaker check.
                         String expected = HexFormat.of().formatHex(digest.digest());
-                        MessageDigest readDigest = MessageDigest.getInstance("SHA-256");
-                        long readCount = 0;
-                        for (Path file : tableFiles) {
-                            try (var reader =
-                                    org.apache.parquet.hadoop.ParquetReader.builder(
-                                                    new org.apache.parquet.hadoop.example
-                                                            .GroupReadSupport(),
-                                                    new org.apache.hadoop.fs.Path(file.toUri()))
-                                            .build()) {
-                                Group group;
-                                while ((group = reader.read()) != null) {
-                                    updateDigest(readDigest, group, schema);
-                                    readCount++;
-                                }
-                            }
-                        }
-                        if (readCount != count
-                                || !expected.equals(HexFormat.of().formatHex(readDigest.digest())))
-                            throw new IllegalStateException("PG/Parquet mismatch: " + name);
                         tables.add(
                                 Map.of(
                                         "table",
                                         name,
                                         "rows",
                                         count,
-                                        "sha256",
+                                        "written_sha256",
                                         expected,
-                                        "verified",
-                                        true,
                                         "schema",
                                         schema.toString()));
                         System.out.println(name + " verified rows=" + count);

@@ -326,7 +326,9 @@ public class RowStateAuditTest {
                             "jdbc_sha256",
                             BaselineGenerator.sha256(jdbc),
                             "bindings",
-                            false));
+                            false,
+                            "audit",
+                            RequestCaptureAudit.audit(jdbc, pg, false)));
         }
         Files.writeString(
                 raw.resolve("capture-run.json"),

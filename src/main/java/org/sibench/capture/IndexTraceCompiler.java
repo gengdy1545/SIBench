@@ -90,16 +90,35 @@ public final class IndexTraceCompiler {
         }
     }
 
-    /** Resolves a HyBench or native-client capture profile; a null audit uses the default. */
-    public static Map<String, Object> compileProfile(
-            Path root, Path profile, Path output, Path auditReport) throws Exception {
+    /**
+     * What vouches for a capture beyond the compilation's own checks. The row changes: either the
+     * capture's row-state audit ({@code rowAudit}) or a certification from a fully verified
+     * capture of the same build ({@code certification}, see {@link Certification}). The index
+     * accesses: PostgreSQL's index counters before and after the native run, which the ledger
+     * built in the same pass must match; without them the completeness check is left to a
+     * separate {@code check-capture-completeness}.
+     */
+    public record Checks(Path rowAudit, Path certification, Path countersBefore, Path countersAfter) {
+        public Checks {
+            if (rowAudit != null && certification != null)
+                throw new IllegalArgumentException("A capture is verified by its row audit or a certification, not both");
+            if ((countersBefore == null) != (countersAfter == null))
+                throw new IllegalArgumentException("Index counters come as a before and after pair");
+        }
+
+        public static Checks rowAudit(Path report) {
+            return new Checks(report, null, null, null);
+        }
+    }
+
+    /** Resolves a HyBench or native-client capture profile; a null row audit uses the default. */
+    public static Map<String, Object> compileProfile(Path root, Path profile, Path output, Checks checks)
+            throws Exception {
         var capture = CaptureProfile.read(root, profile);
-        return compile(
-                capture.schema(),
-                capture.layout(),
-                capture.raw(),
-                output,
-                auditReport == null ? RowStateAudit.defaultReport(capture.raw()) : auditReport);
+        if (checks.certification() == null && checks.rowAudit() == null)
+            checks = new Checks(
+                    RowStateAudit.defaultReport(capture.raw()), null, checks.countersBefore(), checks.countersAfter());
+        return compile(capture.schema(), capture.layout(), capture.raw(), output, checks);
     }
 
     /** The session traces of one capture and the order the capture recorded for them. */
@@ -129,14 +148,13 @@ public final class IndexTraceCompiler {
             Path output,
             Path auditReport)
             throws Exception {
-        return compile(
-                sourceSchema,
-                layout,
-                raw,
-                output,
-                auditReport,
-                IDENTITY_MEMORY_ENTRIES,
-                COMMIT_WINDOW);
+        return compile(sourceSchema, layout, raw, output, Checks.rowAudit(auditReport));
+    }
+
+    public static Map<String, Object> compile(
+            SourceSchema sourceSchema, GenerationConfig layout, Path raw, Path output, Checks checks)
+            throws Exception {
+        return compile(sourceSchema, layout, raw, output, checks, IDENTITY_MEMORY_ENTRIES, COMMIT_WINDOW);
     }
 
     /**
@@ -152,10 +170,30 @@ public final class IndexTraceCompiler {
             int identityMemory,
             int commitWindow)
             throws Exception {
+        return compile(sourceSchema, layout, raw, output, Checks.rowAudit(auditReport), identityMemory, commitWindow);
+    }
+
+    static Map<String, Object> compile(
+            SourceSchema sourceSchema,
+            GenerationConfig layout,
+            Path raw,
+            Path output,
+            Checks checks,
+            int identityMemory,
+            int commitWindow)
+            throws Exception {
         Sessions sessions = sessions(raw);
         boolean concurrent = sessions.order().equals("concurrent");
         Path baseline = layout.output();
-        RowStateAudit.reuse(sourceSchema, baseline, raw, auditReport);
+        Path auditReport = checks.rowAudit();
+        JsonObject certificate = null;
+        if (checks.certification() != null) {
+            // The certification vouches for the row changes; the baseline is still checked here.
+            certificate =
+                    Certification.require(
+                            checks.certification(), raw, IndexCatalog.fromSchema(sourceSchema).provenance());
+            PgBaselineVerify.verifyFiles(baseline);
+        } else RowStateAudit.reuse(sourceSchema, baseline, raw, auditReport);
         Path verified = baseline.resolve("verified-manifest.json");
         JsonObject verification =
                 JsonParser.parseString(Files.readString(verified)).getAsJsonObject();
@@ -173,8 +211,10 @@ public final class IndexTraceCompiler {
         // Row identities spill to disk beyond a bounded number of in-memory entries.
         var identities = new RowIdentities(output.resolve("state"), identityMemory, 4);
         long maximumRowId = 0, maximumFileId = 0, baselineCount, baselineRows = 0;
+        String baselineDigest, workloadDigest;
         RunTiming.current().phase("baseline");
-        try (var operations = new IndexOperationTrace.Writer(output.resolve("baseline.ops"))) {
+        var baselineOperations = new IndexOperationTrace.Writer(output.resolve("baseline.ops"));
+        try (var operations = baselineOperations) {
             for (String line : Files.readAllLines(baseline.resolve("files.jsonl"))) {
                 JsonObject file = JsonParser.parseString(line).getAsJsonObject();
                 String table = file.get("table").getAsString();
@@ -214,6 +254,7 @@ public final class IndexTraceCompiler {
             }
             baselineCount = operations.count();
         }
+        baselineDigest = baselineOperations.sha256();
         var state = new Compilation(catalog, cCollation, identities, schemas, layout, output);
         state.concurrent = concurrent;
         state.commitWindow = new CommitWindow(commitWindow);
@@ -221,7 +262,8 @@ public final class IndexTraceCompiler {
         state.firstIncrementalFile = maximumFileId;
         var sessionReports = new ArrayList<Map<String, Object>>();
         RunTiming.current().phase("workload");
-        try (var operations = new IndexOperationTrace.Writer(output.resolve("workload.ops"));
+        var workloadOperations = new IndexOperationTrace.Writer(output.resolve("workload.ops"));
+        try (var operations = workloadOperations;
                 var units =
                         Files.newBufferedWriter(
                                 output.resolve("work-units.jsonl"),
@@ -235,8 +277,33 @@ public final class IndexTraceCompiler {
             for (Output writer : state.writers.values()) writer.close();
             identities.close();
         }
+        workloadDigest = workloadOperations.sha256();
         // The spill files are working state, not an artifact: a finished trace has none.
         deleteTree(output.resolve("state"));
+        RunTiming.current().phase("ledger");
+        Map<String, Object> ledgerReport = state.ledger.report(sourceSchema);
+        Path ledgerFile = output.resolve("access-ledger.json");
+        AccessLedger.write(ledgerReport, ledgerFile);
+        JsonObject ledger = JsonParser.parseString(Files.readString(ledgerFile)).getAsJsonObject();
+        String completeness = "not_checked";
+        if (checks.countersBefore() != null) {
+            var result =
+                    CaptureCompleteness.compare(
+                            ledger,
+                            JsonParser.parseString(Files.readString(checks.countersBefore())).getAsJsonObject(),
+                            JsonParser.parseString(Files.readString(checks.countersAfter())).getAsJsonObject());
+            Files.writeString(
+                    output.resolve("capture-completeness.json"),
+                    new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(result),
+                    StandardOpenOption.CREATE_NEW);
+            completeness = (String) result.get("status");
+            if (!completeness.equals("consistent"))
+                throw new IOException(
+                        "PG index counters disagree with the access ledger on "
+                                + result.get("inconsistent_indexes")
+                                + "; see capture-completeness.json");
+        }
+        if (certificate != null) Certification.requireCovered(certificate, ledger, state.changesByTable);
         RunTiming.current()
                 .phase("report")
                 .note("session_order", sessions.order())
@@ -279,6 +346,8 @@ public final class IndexTraceCompiler {
         report.put("searched_accesses_by_shape", state.shapes);
         report.put("excluded_access_units", state.excluded);
         report.put("logical_row_version_writes", state.mutations);
+        // Committed row writes as a share of the baseline: the replay volume a capture delivers.
+        report.put("row_write_ratio", (double) state.mutations / verification.get("rows").getAsLong());
         report.put("change_delivery", "committed_only");
         report.put("raw_row_changes", state.rawMutations);
         report.put("discarded_aborted_row_changes", state.discardedMutations);
@@ -297,6 +366,7 @@ public final class IndexTraceCompiler {
         changes.put("update", state.updates);
         changes.put("delete", state.deletes);
         report.put("business_changes", changes);
+        report.put("business_changes_by_table", state.changesByTable);
         report.put("committed_transactions", state.commits);
         report.put("transaction_control_records", state.commits * 2);
         report.put("workload_index_operations", state.operationsCount - state.commits * 2);
@@ -308,11 +378,21 @@ public final class IndexTraceCompiler {
         report.put("incremental_files", state.files);
         report.put("baseline_verified_manifest_sha256", BaselineGenerator.sha256(verified));
         report.put("baseline_schema_preflight_sha256", BaselineGenerator.sha256(preflightFile));
-        report.put("row_state_audit_sha256", BaselineGenerator.sha256(auditReport));
-        report.put(
-                "baseline_trace_sha256", BaselineGenerator.sha256(output.resolve("baseline.ops")));
-        report.put(
-                "workload_trace_sha256", BaselineGenerator.sha256(output.resolve("workload.ops")));
+        var verificationReport = new LinkedHashMap<String, Object>();
+        if (certificate != null) {
+            verificationReport.put("mode", "certified");
+            verificationReport.put("certification", checks.certification().toAbsolutePath().toString());
+            verificationReport.put("certification_sha256", BaselineGenerator.sha256(checks.certification()));
+        } else {
+            verificationReport.put("mode", "row_audit");
+            verificationReport.put("row_state_audit_sha256", BaselineGenerator.sha256(auditReport));
+            report.put("row_state_audit_sha256", verificationReport.get("row_state_audit_sha256"));
+        }
+        report.put("verification", verificationReport);
+        report.put("access_ledger_sha256", BaselineGenerator.sha256(ledgerFile));
+        report.put("capture_completeness", completeness);
+        report.put("baseline_trace_sha256", baselineDigest);
+        report.put("workload_trace_sha256", workloadDigest);
         report.put(
                 "scope",
                 (concurrent ? "concurrent-session" : "sequential-session")
@@ -410,11 +490,28 @@ public final class IndexTraceCompiler {
         long nextRolloverFile;
         final Map<Unit, Search> live = new IdentityHashMap<>();
         final Map<AccessUnits.BitmapGroup, Search> liveGroups = new IdentityHashMap<>();
-        final List<Object> pending = new ArrayList<>();
+        /** The open transaction's searches and changes, in source order; see {@link #drain()}. */
+        final java.util.ArrayDeque<Object> pending = new java.util.ArrayDeque<>();
+        /**
+         * Set when the open transaction's outcome is known before its events are read (the
+         * concurrent merge reads ahead to its final record): whether it commits, and that record's
+         * event ordinal, which is the transaction's identity. Its operations are then written as
+         * soon as they and everything before them are settled, instead of at the final record, so
+         * a transaction of millions of searches never has to be held.
+         */
+        Boolean knownCommit;
+        long knownEvent;
+        /** Of a known commit: its BEGIN was written, and the change ordinal reached so far. */
+        boolean beginWritten;
+        long streamedOrdinal;
         /** Work units that carried an operation; ids only grow, so the last one suffices. */
         long emittedUnits, lastEmittedUnit;
         final Map<String, Long> shapes = new TreeMap<>(), excluded = new TreeMap<>();
+        /** The capture's access ledger, built from the same events in the same pass. */
+        final AccessLedger ledger;
         final List<Map<String, Object>> files = new ArrayList<>();
+        /** Committed changes per table and operation: the change classes a capture exercised. */
+        final Map<String, Map<String, Long>> changesByTable = new TreeMap<>();
         IndexOperationTrace.Writer operations;
         BufferedWriter units;
         long maximumRowId, firstIncrementalFile, event, version, operationsCount;
@@ -436,9 +533,11 @@ public final class IndexTraceCompiler {
                 RowIdentities identities,
                 Map<String, MessageType> schemas,
                 GenerationConfig layout,
-                Path output) {
+                Path output)
+                throws IOException {
             this.catalog = catalog;
             this.cCollation = cCollation;
+            this.ledger = new AccessLedger(catalog.schema(), cCollation);
             this.identities = identities;
             this.schemas = schemas;
             this.layout = layout;
@@ -447,17 +546,20 @@ public final class IndexTraceCompiler {
 
         /** One backend trace of a sequential-session capture. */
         Map<String, Object> session(Path file) throws IOException {
-            long firstEvent = event + 1, sessionRequests = requestUnits;
+            long firstEvent = event + 1, sessionRequests = requestUnits, unitsBefore = ledger.settled();
             pid = 0;
             sessionFile = file.getFileName().toString();
             var tracker = new AccessUnits(this);
             tracker.beginSession();
-            try (var reader = Files.newBufferedReader(file)) {
+            try (var reader = ServerTrace.open(file)) {
                 String line;
                 while ((line = reader.readLine()) != null) line(line, tracker);
             }
+            AccessUnits.Detail detail = tracker.detail();
             tracker.endSession();
+            ledger.absorb(tracker);
             finishSession();
+            ledger.input(file, pid, detail, event - firstEvent + 1, ledger.settled() - unitsBefore);
             var report = report(file, pid, event - firstEvent + 1, requestUnits - sessionRequests);
             report.put("first_source_event", firstEvent);
             return report;
@@ -473,25 +575,39 @@ public final class IndexTraceCompiler {
             var events = new long[files.size()];
             var requests = new long[files.size()];
             var backends = new int[files.size()];
+            var accessUnits = new long[files.size()];
+            // Each file's first part names its capture format; later parts inherit it.
+            var details = new AccessUnits.Detail[files.size()];
             try (SessionMerge merge = SessionMerge.open(files)) {
                 while (merge.hasNext()) {
                     var chunk = merge.next();
-                    long firstEvent = event + 1, sessionRequests = requestUnits;
+                    long firstEvent = event + 1, sessionRequests = requestUnits, unitsBefore = ledger.settled();
                     pid = 0;
                     sessionFile = files.get(chunk.session()).getFileName().toString();
                     var tracker = new AccessUnits(this);
-                    tracker.beginSession();
-                    for (String line : chunk.lines()) line(line, tracker);
+                    if (details[chunk.session()] == null) tracker.beginSession();
+                    else tracker.continueSession(details[chunk.session()]);
+                    // The final record is line lineCount, so its ordinal is known now.
+                    knownCommit = chunk.committed();
+                    knownEvent = event + chunk.lineCount();
+                    for (String line; (line = merge.line()) != null; ) line(line, tracker);
+                    details[chunk.session()] = tracker.detail();
                     tracker.endSession();
+                    ledger.absorb(tracker);
                     finishSession();
+                    accessUnits[chunk.session()] += ledger.settled() - unitsBefore;
                     events[chunk.session()] += event - firstEvent + 1;
                     requests[chunk.session()] += requestUnits - sessionRequests;
                     backends[chunk.session()] = pid;
                 }
             }
             var reports = new ArrayList<Map<String, Object>>();
-            for (int session = 0; session < files.size(); session++)
+            for (int session = 0; session < files.size(); session++) {
+                // A trace without events declared no format, as a tracker that read none reports.
+                var detail = details[session] == null ? AccessUnits.Detail.LEGACY : details[session];
+                ledger.input(files.get(session), backends[session], detail, events[session], accessUnits[session]);
                 reports.add(report(files.get(session), backends[session], events[session], requests[session]));
+            }
             return reports;
         }
 
@@ -504,7 +620,7 @@ public final class IndexTraceCompiler {
                 throws IOException {
             var report = new LinkedHashMap<String, Object>();
             report.put("pg_file", file.getFileName().toString());
-            report.put("sha256", BaselineGenerator.sha256(file));
+            report.put("sha256", FileDigests.sha256(file));
             report.put("pid", backend);
             report.put("source_events", events);
             report.put("source_requests", requests);
@@ -520,7 +636,7 @@ public final class IndexTraceCompiler {
             else if (pid != eventPid)
                 throw new IOException("One session trace must contain one backend");
             String type = e.get("event").getAsString();
-            tracker.accept(e);
+            ledger.event(e, tracker.accept(e));
             switch (type) {
                 case "executor_start" -> {
                     transactionOpen = true;
@@ -536,6 +652,7 @@ public final class IndexTraceCompiler {
                 rawInserts++;
                 pendingIndexInserts++;
             }
+            if (knownCommit != null && transactionOpen) drain();
             if (pending.size() > org.sibench.replay.ReplayProjection.MAX_TRANSACTION_OPERATIONS)
                 throw new IOException("Source transaction exceeds operation buffer limit");
         }
@@ -629,9 +746,16 @@ public final class IndexTraceCompiler {
         }
 
         @Override
+        public void requestFinished(Request request) throws IOException {
+            ledger.request(request);
+        }
+
+        @Override
         public void unitSettled(Unit unit) throws IOException {
+            ledger.unit(unit);
             if (unit.group != null) return;
             Decision decision = AccessProjection.decide(unit, catalog, cCollation);
+            ledger.record(unit, decision);
             Search search = live.remove(unit);
             if (decision.excluded()) {
                 excluded.merge(decision.reason(), 1L, Long::sum);
@@ -663,6 +787,7 @@ public final class IndexTraceCompiler {
         @Override
         public void groupSettled(AccessUnits.BitmapGroup group) throws IOException {
             Decision decision = AccessProjection.decideGroup(group, catalog, cCollation);
+            ledger.group(group, decision);
             Search search = liveGroups.remove(group);
             if (!decision.projected()) throw unsupported(decision, group.members.get(0));
             search.decision = decision;
@@ -707,8 +832,39 @@ public final class IndexTraceCompiler {
                 throw new IOException("Transaction boundary with unfinished scans");
         }
 
+        /**
+         * Writes the settled prefix of a transaction whose outcome is known, exactly as the final
+         * record would write it: an abort keeps the searches before its first change and drops the
+         * rest, a commit writes its BEGIN, searches and changes with its known identity.
+         */
+        private void drain() throws IOException {
+            while (!pending.isEmpty()) {
+                Object item = pending.peekFirst();
+                if (item instanceof Search search && search.decision == null) return;
+                if (!transactionRequest) throw new IOException("Index work outside any request");
+                pending.pollFirst();
+                if (knownCommit) {
+                    if (!beginWritten) {
+                        append(IndexOperationTrace.transaction(
+                                knownEvent, IndexOperationTrace.TRANSACTION_BEGIN, knownEvent,
+                                Math.addExact(version, 1), 0));
+                        beginWritten = true;
+                    }
+                    if (item instanceof Search search) emitCommitted(search, version, Math.addExact(version, 1), knownEvent);
+                    else {
+                        Change change = (Change) item;
+                        emitted(change.workUnitId());
+                        write(change, knownEvent, ++streamedOrdinal, Math.addExact(version, 1));
+                    }
+                } else if (item instanceof Search search) emitAborted(search, version);
+            }
+        }
+
         private void reset() {
             pending.clear();
+            knownCommit = null;
+            beginWritten = false;
+            streamedOrdinal = 0;
             pendingXid = 0;
             pendingIndexInserts = 0;
             pendingMutations = 0;
@@ -723,27 +879,53 @@ public final class IndexTraceCompiler {
             long previousVersion = version;
             if (!transactionRequest) utilityOnly++;
             else aborts++;
+            if (knownCommit != null && (knownCommit || knownEvent != event))
+                throw new IOException("Transaction outcome differs from the merge's read-ahead");
             discardedMutations += pendingMutations;
             discardedIndexInserts += pendingIndexInserts;
-            for (Object item : pending) {
-                if (!(item instanceof Search search)) continue;
-                if (search.precedingMutations != 0) {
-                    discardedSearches++;
-                    continue;
-                }
-                boolean behind = search.readTimestamp < previousVersion;
-                emit(search, search.readTimestamp, behind ? IndexOperationTrace.SNAPSHOT_SEARCH : 0, 0, 0);
-                if (behind) snapshotSearches++;
-                emitted(search.workUnitId);
-                searches++;
-            }
+            for (Object item : pending)
+                if (item instanceof Search search) emitAborted(search, previousVersion);
             reset();
+        }
+
+        /** A search of an aborted transaction: kept before its first change, dropped after. */
+        private void emitAborted(Search search, long previousVersion) throws IOException {
+            if (search.precedingMutations != 0) {
+                discardedSearches++;
+                return;
+            }
+            boolean behind = search.readTimestamp < previousVersion;
+            emit(search, search.readTimestamp, behind ? IndexOperationTrace.SNAPSHOT_SEARCH : 0, 0, 0);
+            if (behind) snapshotSearches++;
+            emitted(search.workUnitId);
+            searches++;
+        }
+
+        /** A search of a committed transaction; after a change it reads the transaction's own version. */
+        private void emitCommitted(Search search, long previousVersion, long commitVersion, long transactionId)
+                throws IOException {
+            boolean local = search.precedingMutations != 0;
+            boolean behind = !local && search.readTimestamp < previousVersion;
+            emit(
+                    search,
+                    local ? commitVersion : search.readTimestamp,
+                    local
+                            ? IndexOperationTrace.TRANSACTION_LOCAL_SEARCH
+                            : behind ? IndexOperationTrace.SNAPSHOT_SEARCH : 0,
+                    transactionId,
+                    search.precedingMutations);
+            emitted(search.workUnitId);
+            searches++;
+            if (local) localSearches++;
+            else if (behind) snapshotSearches++;
         }
 
         private void commit(JsonObject e) throws IOException {
             requireSettled();
             if (pendingMutations != 0 && pendingXid != e.get("xid").getAsLong())
                 throw new IOException("Commit XID mismatch");
+            if (knownCommit != null && (!knownCommit || knownEvent != event))
+                throw new IOException("Transaction outcome differs from the merge's read-ahead");
             if (!transactionRequest) {
                 // Connection setup and the capture's request labels run no executor.
                 if (!pending.isEmpty()) throw new IOException("Index work outside any request");
@@ -759,31 +941,19 @@ public final class IndexTraceCompiler {
             // overlap read the previous commit and need no positions.
             if (concurrent && e.get("xid").getAsLong() != 0)
                 recordCommit(e.get("csn").getAsLong(), e.get("xid").getAsLong(), version);
-            long transactionId = event, ordinal = 0;
-            append(
-                    IndexOperationTrace.transaction(
-                            event, IndexOperationTrace.TRANSACTION_BEGIN, transactionId, version, 0));
+            long transactionId = event, ordinal = streamedOrdinal;
+            if (!beginWritten)
+                append(
+                        IndexOperationTrace.transaction(
+                                event, IndexOperationTrace.TRANSACTION_BEGIN, transactionId, version, 0));
             for (Object item : pending) {
                 if (item instanceof Search search) {
-                    boolean local = search.precedingMutations != 0;
-                    boolean behind = !local && search.readTimestamp < previousVersion;
-                    emit(
-                            search,
-                            local ? version : search.readTimestamp,
-                            local
-                                    ? IndexOperationTrace.TRANSACTION_LOCAL_SEARCH
-                                    : behind ? IndexOperationTrace.SNAPSHOT_SEARCH : 0,
-                            transactionId,
-                            search.precedingMutations);
-                    emitted(search.workUnitId);
-                    searches++;
-                    if (local) localSearches++;
-                    else if (behind) snapshotSearches++;
+                    emitCommitted(search, previousVersion, version, transactionId);
                     continue;
                 }
                 Change change = (Change) item;
                 emitted(change.workUnitId());
-                write(change, transactionId, ++ordinal);
+                write(change, transactionId, ++ordinal, version);
             }
             append(
                     IndexOperationTrace.transaction(
@@ -848,7 +1018,7 @@ public final class IndexTraceCompiler {
             operationsCount++;
         }
 
-        private void write(Change item, long transactionId, long ordinal) throws IOException {
+        private void write(Change item, long transactionId, long ordinal, long commitVersion) throws IOException {
             JsonObject change = item.row();
             String table = change.get("relation").getAsString();
             int tableId = catalog.tableId(table);
@@ -872,7 +1042,7 @@ public final class IndexTraceCompiler {
                                         tableId,
                                         0,
                                         key,
-                                        version,
+                                        commitVersion,
                                         0,
                                         0,
                                         previous)
@@ -880,6 +1050,7 @@ public final class IndexTraceCompiler {
                                 .withWorkUnitId(item.workUnitId());
                 identities.delete(tableId, key);
                 IndexMutation.emit(primary, before, Map.of(), this::append);
+                changed(table, operation);
                 deletes++;
                 mutations++;
                 return;
@@ -916,7 +1087,7 @@ public final class IndexTraceCompiler {
                 }
             }
             row.add("_sib_row_id", rowId);
-            row.add("_sib_timestamp", version);
+            row.add("_sib_timestamp", commitVersion);
             row.add("_sib_mutation_ordinal", ordinal);
             Operation primary =
                     IndexOperationTrace.write(
@@ -927,7 +1098,7 @@ public final class IndexTraceCompiler {
                                             ? IndexOperationTrace.BUSINESS_INSERT
                                             : IndexOperationTrace.BUSINESS_UPDATE,
                                     key,
-                                    version,
+                                    commitVersion,
                                     destination.fileId,
                                     destination.rows++,
                                     rowId)
@@ -941,6 +1112,7 @@ public final class IndexTraceCompiler {
                 finish(table, destination);
             }
             mutations++;
+            changed(table, operation);
             if (operation.equals("insert")) inserts++;
             else updates++;
         }
@@ -978,6 +1150,10 @@ public final class IndexTraceCompiler {
                     table,
                     catalog.primary(tableId).column(),
                     fileId);
+        }
+
+        private void changed(String table, String operation) {
+            changesByTable.computeIfAbsent(table, ignored -> new TreeMap<>()).merge(operation, 1L, Long::sum);
         }
 
         private void finish(String table, Output writer) throws IOException {

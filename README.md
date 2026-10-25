@@ -1,6 +1,6 @@
 # SIBench
 
-通过原生 benchmark 执行、真实 Parquet 和确定性索引 Trace，评估 KV Index Service。HyBench 默认采用原生 `runHTAP`：AP → TP → 并发 AT/IQ，保留原生事务比例和业务分支。v9 规范 Trace 由来源 schema 驱动，使用保序键编码，把每个原生索引访问投影为一组能重现原生结果集的有序查询（区间、带 limit 的主键扫描、二级扫描的前段加钉住点查、BitmapAnd 交集组、`= ANY` 并集组），否则带原因拒绝。三来源（含并发的完整 HyBench HTAP）已在 8,706,000 行基线上端到端验证：0 拒绝，1/64/128 client 参考回放与独立 oracle 通过。真实 Backend 和 SF1000 正式实验尚未完成。
+通过原生 benchmark 执行、真实 Parquet 和确定性索引 Trace，评估 KV Index Service。HyBench 默认采用原生 `runHTAP`：AP → TP → 并发 AT/IQ，保留原生事务比例和业务分支。v9 规范 Trace 由来源 schema 驱动，使用保序键编码，把每个原生索引访问投影为一组能重现原生结果集的有序查询（区间、带 limit 的主键扫描、二级扫描的前段加钉住点查、BitmapAnd 交集组、`= ANY` 并集组），否则带原因拒绝。三来源（含并发的完整 HyBench HTAP）已在 8,706,000 行基线上端到端验证：0 拒绝，1/64/128 client 参考回放与独立 oracle 通过。通用 Index Service 协议（gRPC）与 RocksDB 参照实现已能回放真实 Trace 并逐查询核对原生期望数；正式实验尚未开始。
 
 ## 构建
 
@@ -17,7 +17,7 @@ java -jar build/sibench/sibench.jar inspect-scale
 
 流程：原生数据生成与 PG Load/建索引 → 静止边界导出并独立验证 Baseline → 原生采集 → 同次请求/结果核对、最终状态审计 → 访问账本 → 规范 Trace 编译。三来源同一入口 `scripts/native-capture.sh`；HyBench 的 AP/TP/XP 阶段之间不重新加载或恢复数据。
 
-[hybench_sf1.yaml](config/hybench_sf1.yaml) 是默认 HTAP 配置：从 `postgres.clone_from` 声明的静止已验证 SF1 库克隆采集库，安装上游二级索引与行变化触发器；HyBench 在 `native.work_dir`（含原生 `Data_1x`）下运行。完整步骤与证据见 [HTAP SF1 验证](docs/validation/hybench-sf1-htap.md)。
+[hybench_sf1.yaml](config/hybench_sf1.yaml) 是默认 HTAP 配置：从 `postgres.clone_from` 声明的静止库克隆采集库，安装上游二级索引、序列与行变化触发器并 `VACUUM (ANALYZE)`；HyBench 在 `native.work_dir`（含原生 `Data_<sf>`）下运行。静止库由脚本的 `base` 阶段按上游 README 建立（原生 gendata、`ddl_pg.sql`、`load_data_pg.sql`），已存在时核对行数后复用，见 [HyBench 来源](docs/benchmarks/hybench.md)。并发度取原生参数：HyBench 的 `clients` / `xp_transaction_clients` / `xp_query_clients`，YCSB / sysbench 的 `threads`；每个线程一个后端会话，有重叠会话时整次采集按 PostgreSQL 事务完成计数器归并。完整步骤与证据见 [HTAP SF1 验证](docs/validation/hybench-sf1-htap.md)。
 
 采集与 Baseline export 前自动核对实际 PG 表、完整列和全部索引与固定源码及配置一致；不一致拒绝，不自动补建。三来源可独立检查：
 
@@ -40,7 +40,9 @@ java -jar build/sibench/sibench.jar snapshot-index-counters PROFILE OUTPUT --jdb
 java -jar build/sibench/sibench.jar check-capture-completeness PROFILE LEDGER BEFORE AFTER
 ```
 
-脚本以 `compute_query_id = on` 启停本地 PG，依次执行建库加载、预检、Baseline 导出、原生执行、行状态审计、访问账本、采集完整性对照和 `compile-trace`（输出 `<产物目录>/trace`）；原生执行前后各取一次 PG 索引计数器快照（等其它会话退出、两次相隔一个统计周期的读数一致后才记录），`check-capture-completeness` 按 PG14 计数位置核对账本：`idx_tup_read` 等于候选数，`idx_tup_fetch` 等于经堆判定可见的行（不含 bitmap 与全可见 index-only），`idx_scan` 落在账本推出的树下降上下界内，不一致则脚本失败。已有数据库或输出目录会被拒绝。每个阶段把墙钟、事件数和本次运行的关键事实追加到 `<产物目录>/run-timing.json`，长阶段按秒输出速率，便于比较两次运行并定位热点。任何命令都可用 `--timing FILE` 追加到同一份计时产物。`access-ledger` 按 PG 追踪把索引事件划分为访问单元并给出每个单元的投影决定，模板为 PG `query_id`，不连接 PG，REPORT 必须是新文件；`compile-trace` 对任一不能投影的访问失败。`config/*_small.yaml` 是约 15 秒的冒烟配置。证据见 [HTAP 验证](docs/validation/hybench-sf1-htap.md) 与 [原生 Trace 验证](docs/validation/ycsb-sysbench-native-trace.md)。
+后端追踪默认写成 zstd 流（`capture.compression: zstd`，`pg-<pid>.jsonl.zst`，需要 `libzstd-dev` 构建 PG；`none` 写明文），所有读取方透明解压。插桩默认按访问记录汇总（`capture.detail: summary`）：每个索引访问结束时一条 `scan_summary`，bitmap 堆判定按输入集合聚合，结果行记为哈希。`capture.detail: rows` 另保留全部逐行事件，账本逐条核对汇总与逐行事件相等，用于在同一次原生执行上验收汇总格式；两种格式编出的 Trace 除原始文件行号外完全相同，见 [采集完整性验证](docs/validation/capture-completeness.md)。
+
+脚本以 `compute_query_id = on` 启停本地 PG，依次执行建库加载、预检、Baseline 导出、原生执行、行状态审计、访问账本、采集完整性对照和 `compile-trace`（输出 `<产物目录>/trace`）；原生执行前后各取一次 PG 索引计数器快照（等其它会话退出、两次相隔一个统计周期的读数一致后才记录），`check-capture-completeness` 按 PG14 计数位置核对账本：`idx_tup_read` 等于候选数，`idx_tup_fetch` 等于经堆判定可见的行（不含 bitmap 与全可见 index-only），`idx_scan` 落在账本推出的树下降上下界内，不一致则脚本失败。已有数据库或输出目录会被拒绝。每个阶段把墙钟、事件数和本次运行的关键事实追加到 `<产物目录>/run-timing.json`，长阶段按秒输出速率，便于比较两次运行并定位热点。任何命令都可用 `--timing FILE` 追加到同一份计时产物。`access-ledger` 按 PG 追踪把索引事件划分为访问单元并给出每个单元的投影决定，模板为 PG `query_id`，不连接 PG，REPORT 必须是新文件；`compile-trace` 对任一不能投影的访问失败。`config/*_small.yaml` 是约 15 秒的冒烟配置。回放量以“已提交行写入 ÷ 基线行数”衡量，每个 Trace 的 manifest 给出 `row_write_ratio`；`plan-write-ratio PROFILE CALIBRATION_TRACE RATIO` 由同来源、同规模的一次校准采集，按同一倍数换算 sysbench 的 `events`、YCSB 的 `operationcount` 或 HyBench 的 TP / XP 阶段时长，实际比例以按计划采集的 Trace 为准。证据见 [HTAP 验证](docs/validation/hybench-sf1-htap.md) 与 [原生 Trace 验证](docs/validation/ycsb-sysbench-native-trace.md)。
 
 并发 HTAP 按 PostgreSQL 事务完成计数器编译：写事务在持锁自增时记录精确位置，只读事务排在同位置写事务之后，事务大小的片段据此 k 路归并；查询读取其语句快照所见的最后一个写事务，并用快照自己的 xip 逐条交叉验证，计数器或快照缺失、冲突时拒绝，不按 PID、XID 大小、文件顺序或墙钟推断。
 
@@ -69,6 +71,19 @@ java -Xmx24g -jar build/sibench/sibench.jar check-relocation PROFILE $T OUTPUT_D
 - [long_replay.yaml](config/long_replay.yaml) 要求 single_pass、666,000,000 个有效操作；SF1 短输入会在预检失败。持续调度和分段供应尚未实现。
 - 异常运行保留诊断并拒绝编译；修复后从明确初始状态换新目录重跑。
 
+## Index Service 回放
+
+驱动通过 [Index Service 协议](docs/contracts/index-service.md)（`src/main/proto/index_service.proto`）把规范 Trace 发给 KV 索引服务：每个 client 一条有序 gRPC 流，查询组整体发送，每个查询的返回条数必须等于原生期望数。`--reference` 给出同一 Trace 的参考回放报告时，查询数、结果项数和结果校验和也必须相同。
+
+```bash
+T=results/poc/sysbench-8m/trace
+java -jar build/sibench/sibench.jar index-server config/index_service_rocksdb.yaml &      # RocksDB 服务，端口 50551
+java -jar build/sibench/sibench.jar replay-service config/service_replay_grpc.yaml $T REPORT --reference REFERENCE
+java -jar build/sibench/sibench.jar replay-service config/service_replay_rocksdb.yaml $T REPORT  # 进程内 RocksDB，无网络
+```
+
+索引目录已存在即拒绝；一个索引只由一份 Trace 的 Baseline 加载一次。
+
 ## Baseline 生成配置
 
 此入口使用 `deterministic_derived`，与原生采集分开。规模不是压缩文件大小，三套配置均待容量校准。
@@ -93,7 +108,8 @@ dry-run 只校验源码指纹、配置和 schema，不创建数据。去掉 `--d
 | --- | --- |
 | `benchmark/` | 固定上游子模块，不直接修改 |
 | `src/main/java/org/sibench/`、`src/test/java/org/sibench/` | Java 核心与测试，按职责组织 |
-| `src/main/native/postgres/` | PG 14.24 最小采集插桩，作用于隔离构建副本 |
+| `src/main/native/postgres/` | PG 14.24 采集插桩（`sibench_capture.c` 加调用点补丁），作用于隔离构建副本 |
+| `src/main/proto/` | Index Service 协议定义 |
 | `scripts/` | 串联已有 Java CLI 阶段的编排脚本，不含来源语义 |
 | `config/` | 平铺配置，工作负载命名 `<benchmark>_<scale>.yaml` |
 | `build/sibench/`、`build/benchmarks/`、`build/services/` | 核心构建、上游构建、本地服务状态 |
@@ -101,6 +117,7 @@ dry-run 只校验源码指纹、配置和 schema，不创建数据。去掉 `--d
 
 - [计划](plan.md)：当前实现、未完成项与验收。
 - [Trace 契约](docs/contracts/trace.md)：版本、操作、发送及完整性。
+- [Index Service 协议契约](docs/contracts/index-service.md)：gRPC 协议、驱动侧核对与 RocksDB 参照实现。
 - [来源 Schema 契约](docs/contracts/source-schema.md)：三来源布局、PG 预检及失败边界。
 - [YCSB / sysbench 原生 Trace](docs/validation/ycsb-sysbench-native-trace.md)：完整访问投影、v9 Trace、回放与 oracle。
 - [存储契约](docs/contracts/storage.md)：布局、Rewrite、GC 和测量边界。

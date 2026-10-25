@@ -27,6 +27,23 @@ public final class PgBaselineVerify {
         }
     }
 
+    /**
+     * The Parquet field of each table column, in table order. The file's own columns (all but the
+     * SIBench identity fields) must be exactly the table's.
+     */
+    private static int[] fields(SourceSchema.Table table, org.apache.parquet.schema.GroupType type)
+            throws IOException {
+        var own = new java.util.HashSet<String>();
+        for (var field : type.getFields())
+            if (!field.getName().startsWith("_sib_")) own.add(field.getName());
+        var names = new java.util.HashSet<String>();
+        for (var column : table.columns()) names.add(column.name());
+        if (!own.equals(names)) throw new IOException("Incomplete row image for " + table.name());
+        int[] fields = new int[table.columns().size()];
+        for (int i = 0; i < fields.length; i++) fields[i] = type.getFieldIndex(table.columns().get(i).name());
+        return fields;
+    }
+
     static void verify(Connection pg, SourceSchema schema, Path directory) throws Exception {
         if (Files.exists(directory.resolve("verified-manifest.json")))
             throw new IOException("Baseline verification already exists");
@@ -72,6 +89,8 @@ public final class PgBaselineVerify {
                             if (!file.get("table").getAsString().equals(table.name())) continue;
                             Path path = directory.resolve(file.get("path").getAsString());
                             long fileCount = 0;
+                            var columns = table.columns();
+                            int[] fields = null;
                             try (ParquetReader<Group> reader =
                                     ParquetReader.builder(
                                                     new GroupReadSupport(),
@@ -82,22 +101,30 @@ public final class PgBaselineVerify {
                                     if (!expected.next())
                                         throw new IllegalStateException(
                                                 "Extra parquet row: " + table.name());
-                                    JsonObject source = new JsonObject();
-                                    for (var column : table.columns()) {
-                                        String value = expected.getString(column.name());
-                                        if (value == null)
-                                            source.add(column.name(), JsonNull.INSTANCE);
-                                        else source.addProperty(column.name(), value);
+                                    // One schema per file: its columns must be the table's, once.
+                                    if (fields == null) fields = fields(table, actual.getType());
+                                    for (int i = 0; i < columns.size(); i++) {
+                                        var column = columns.get(i);
+                                        String source = expected.getString(column.name());
+                                        String value =
+                                                actual.getFieldRepetitionCount(fields[i]) == 0
+                                                        ? null
+                                                        : actual.getValueToString(fields[i], 0);
+                                        if ((source == null || value == null) && !column.nullable())
+                                            throw new IOException(
+                                                    "Null required column: "
+                                                            + table.name()
+                                                            + "."
+                                                            + column.name());
+                                        if (!java.util.Objects.equals(
+                                                SourceRow.normalize(column, source),
+                                                SourceRow.normalize(column, value)))
+                                            throw new IOException(
+                                                    "Baseline row mismatch: "
+                                                            + table.name()
+                                                            + "/"
+                                                            + count);
                                     }
-                                    if (!SourceRow.values(table, source)
-                                            .equals(
-                                                    SourceRow.values(
-                                                            table, SourceRow.json(actual))))
-                                        throw new IOException(
-                                                "Baseline row mismatch: "
-                                                        + table.name()
-                                                        + "/"
-                                                        + count);
                                     if (actual.getLong("_sib_row_id", 0) != rowId++
                                             || actual.getLong("_sib_timestamp", 0) != 0)
                                         throw new IllegalStateException(
@@ -181,17 +208,17 @@ public final class PgBaselineVerify {
                 JsonParser.parseString(Files.readString(verified)).getAsJsonObject();
         if (!verification.get("status").getAsString().equals("verified_complete"))
             throw new IOException("Baseline is not verified");
-        if (!BaselineGenerator.sha256(baseline.resolve("files.jsonl"))
+        if (!FileDigests.sha256(baseline.resolve("files.jsonl"))
                 .equals(verification.get("files_manifest_sha256").getAsString()))
             throw new IOException("Baseline file manifest changed");
-        if (!BaselineGenerator.sha256(baseline.resolve("locators.tsv"))
+        if (!FileDigests.sha256(baseline.resolve("locators.tsv"))
                 .equals(verification.get("locators_sha256").getAsString()))
             throw new IOException("Baseline locators changed");
         for (JsonElement item : verification.getAsJsonArray("files")) {
             JsonObject file = item.getAsJsonObject();
             Path data = baseline.resolve(file.get("path").getAsString()).normalize();
             if (!data.startsWith(baseline.normalize())
-                    || !BaselineGenerator.sha256(data).equals(file.get("sha256").getAsString()))
+                    || !FileDigests.sha256(data).equals(file.get("sha256").getAsString()))
                 throw new IOException("Baseline data changed");
         }
     }

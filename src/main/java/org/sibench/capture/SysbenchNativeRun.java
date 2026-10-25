@@ -42,8 +42,7 @@ final class SysbenchNativeRun {
 
     static List<String> command(
             NativeCaptureConfig config, String script, long events, String action) throws IOException {
-        // Only prepare may use several threads: it creates and fills different tables in parallel.
-        long threads = action.equals("prepare") ? config.prepareThreads() : positive(config.nativeConfig(), "threads");
+        long threads = action.equals("prepare") ? config.prepareThreads() : config.threads();
         var nativeConfig = config.nativeConfig();
         Path lua = config.source().resolve("src/lua").resolve(script + ".lua").normalize();
         if (!lua.startsWith(config.source().resolve("src/lua")) || !Files.isRegularFile(lua))
@@ -158,7 +157,8 @@ final class SysbenchNativeRun {
                                 + " statements as neither read nor write but the server saw "
                                 + zeroRows
                                 + " modifications that changed no row");
-            if (added.size() != 1 || serverRequests != expected || serverCommits != counts.get("transactions"))
+            // One backend per client thread; their statements and commits add up to the client's.
+            if (added.size() != config.threads() || serverRequests != expected || serverCommits != counts.get("transactions"))
                 throw new IOException(
                         script
                                 + ": sysbench issued "
@@ -194,7 +194,7 @@ final class SysbenchNativeRun {
             transactions += serverCommits;
         }
         var summary = new LinkedHashMap<String, Object>();
-        summary.put("client", "sysbench, pinned commit, Lua scripts unchanged, single thread");
+        summary.put("client", "sysbench, pinned commit, Lua scripts unchanged, " + config.threads() + " thread(s)");
         summary.put("workloads", reports);
         summary.put("server_executions", requests);
         summary.put("server_commits", transactions);

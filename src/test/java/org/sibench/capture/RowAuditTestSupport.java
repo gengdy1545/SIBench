@@ -288,7 +288,11 @@ final class RowAuditTestSupport {
                                     "pid",
                                     1,
                                     "xid",
-                                    i + 1)));
+                                    i + 1,
+                                    // PostgreSQL's completion counter: the position that orders
+                                    // a key's changes across sessions.
+                                    "csn",
+                                    (long) i + 1)));
         }
         client.add(
                 JSON.toJson(
@@ -305,14 +309,26 @@ final class RowAuditTestSupport {
         return raw;
     }
 
-    /** Publishes the completion manifest a real capture writes, binding one JDBC/PG trace pair. */
-    static void complete(Path directory, Path client, Path server) throws java.io.IOException {
+    /**
+     * Publishes the completion manifest a real capture writes, binding one JDBC/PG trace pair and
+     * the audit the run records for it.
+     */
+    static void complete(Path directory, Path client, Path server) throws Exception {
+        // A session the audit rejects fails its run, as a real capture does.
+        Map<String, Object> audit;
+        String status = "complete";
+        try {
+            audit = RequestCaptureAudit.audit(client, server, true);
+        } catch (java.io.IOException rejected) {
+            audit = Map.of("status", "failed", "message", String.valueOf(rejected.getMessage()));
+            status = "failed";
+        }
         Files.writeString(
                 directory.resolve("capture-run.json"),
                 JSON.toJson(
                         Map.of(
                                 "status",
-                                "complete",
+                                status,
                                 "session_order",
                                 "sequential",
                                 "sessions",
@@ -326,14 +342,15 @@ final class RowAuditTestSupport {
                                                 "jdbc_sha256",
                                                         org.sibench.generation.BaselineGenerator
                                                                 .sha256(client),
-                                                "bindings", true)))));
+                                                "bindings", true,
+                                                "audit", audit)))));
     }
 
     /**
      * Publishes the manifest a concurrent capture writes: several backend traces, no JDBC pair, so
      * each session is audited on its own server events.
      */
-    static void completeConcurrent(Path directory, List<Path> servers) throws java.io.IOException {
+    static void completeConcurrent(Path directory, List<Path> servers) throws Exception {
         var sessions = new ArrayList<Map<String, Object>>();
         for (Path server : servers)
             sessions.add(
@@ -341,7 +358,9 @@ final class RowAuditTestSupport {
                             "pg_file",
                             server.getFileName().toString(),
                             "pg_sha256",
-                            org.sibench.generation.BaselineGenerator.sha256(server)));
+                            org.sibench.generation.BaselineGenerator.sha256(server),
+                            "audit",
+                            ServerCaptureAudit.audit(server)));
         Files.writeString(
                 directory.resolve("capture-run.json"),
                 JSON.toJson(

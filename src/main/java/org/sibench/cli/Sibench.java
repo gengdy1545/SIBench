@@ -15,6 +15,10 @@ import org.sibench.capture.RunTiming;
 import org.sibench.config.ConfigValues;
 import org.sibench.generation.BaselineGenerator;
 import org.sibench.replay.ReferenceReplay;
+import org.sibench.adapters.IndexServer;
+import org.sibench.adapters.RocksDbBackend;
+import org.sibench.adapters.ServiceConfig;
+import org.sibench.adapters.ServiceReplay;
 import org.sibench.replay.ReplayConfig;
 import org.sibench.replay.ReplayMatrixValidation;
 import org.sibench.replay.SnapshotLookupValidation;
@@ -34,6 +38,19 @@ import java.util.Map;
 
 public final class Sibench {
     private Sibench() {}
+
+    private static void printServiceHelp(PrintStream out) {
+        out.println(
+                "       java -jar build/sibench/sibench.jar plan-write-ratio PROFILE CALIBRATION_TRACE"
+                        + " RATIO   (native parameters for committed row writes = RATIO x baseline)");
+        out.println(
+                "       java -jar build/sibench/sibench.jar index-server SERVICE_CONFIG"
+                        + "   (serves a fresh RocksDB index over the SIBench index protocol)");
+        out.println(
+                "       java -jar build/sibench/sibench.jar replay-service REPLAY_CONFIG"
+                        + " NORMALIZED_DIRECTORY REPORT [--reference REFERENCE_REPORT]"
+                        + "   (target.service: grpc endpoint or in-process rocksdb path)");
+    }
 
     public static void main(String[] args) {
         // Close before exiting: System.exit() never returns, so a finally block would not run.
@@ -61,15 +78,20 @@ public final class Sibench {
                             "snapshot-index-counters",
                             "check-capture-completeness",
                             "compile-trace",
+                            "certify-capture",
                             "validate-replay-matrix",
-                            "check-relocation")
+                            "check-relocation",
+                            "index-server",
+                            "replay-service",
+                            "plan-write-ratio")
                     .contains(args[0])) {
                 throw new IllegalArgumentException("Unknown command: " + args[0]);
             }
             Path root = Path.of("").toAbsolutePath();
             List<String> profiles = new ArrayList<>();
             boolean dryRun = false;
-            String jdbc = null, user = null;
+            String jdbc = null, user = null, reference = null, certification = null;
+            String countersBefore = null, countersAfter = null;
             for (int i = 1; i < args.length; i++) {
                 if (args[i].equals("--help") || args[i].equals("-h")) {
                     printHelp(out);
@@ -88,6 +110,19 @@ public final class Sibench {
                     if (++i == args.length)
                         throw new IllegalArgumentException("--user requires a role");
                     user = args[i];
+                } else if (args[0].equals("compile-trace") && args[i].equals("--certification")) {
+                    if (++i == args.length)
+                        throw new IllegalArgumentException("--certification requires a certificate");
+                    certification = args[i];
+                } else if (args[0].equals("compile-trace") && args[i].equals("--counters")) {
+                    if (i + 2 >= args.length)
+                        throw new IllegalArgumentException("--counters requires BEFORE AFTER snapshots");
+                    countersBefore = args[++i];
+                    countersAfter = args[++i];
+                } else if (args[0].equals("replay-service") && args[i].equals("--reference")) {
+                    if (++i == args.length)
+                        throw new IllegalArgumentException("--reference requires a report");
+                    reference = args[i];
                 } else if (args[i].equals("--root")) {
                     if (++i == args.length) {
                         throw new IllegalArgumentException("--root requires a path");
@@ -228,13 +263,17 @@ public final class Sibench {
             if (args[0].equals("compile-trace")) {
                 if (profiles.size() != 2 && profiles.size() != 3)
                     throw new IllegalArgumentException(
-                            "compile-trace requires PROFILE OUTPUT [ROW_AUDIT]");
+                            "compile-trace requires PROFILE OUTPUT [ROW_AUDIT] [--certification"
+                                + " CERTIFICATE] [--counters BEFORE AFTER]");
+                var checks =
+                        new IndexTraceCompiler.Checks(
+                                profiles.size() == 3 ? root.resolve(profiles.get(2)) : null,
+                                certification == null ? null : root.resolve(certification),
+                                countersBefore == null ? null : root.resolve(countersBefore),
+                                countersAfter == null ? null : root.resolve(countersAfter));
                 var report =
                         IndexTraceCompiler.compileProfile(
-                                root,
-                                Path.of(profiles.get(0)),
-                                root.resolve(profiles.get(1)),
-                                profiles.size() == 3 ? root.resolve(profiles.get(2)) : null);
+                                root, Path.of(profiles.get(0)), root.resolve(profiles.get(1)), checks);
                 var summary = new LinkedHashMap<String, Object>();
                 for (String key :
                         List.of(
@@ -248,9 +287,23 @@ public final class Sibench {
                                 "searched_accesses_by_shape",
                                 "excluded_access_units",
                                 "committed_transactions",
+                                "row_write_ratio",
                                 "utility_only_transactions",
-                                "business_changes"))
+                                "business_changes",
+                                "verification",
+                                "capture_completeness"))
                     summary.put(key, report.get(key));
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(summary));
+                return 0;
+            }
+            if (args[0].equals("certify-capture")) {
+                if (profiles.size() != 1)
+                    throw new IllegalArgumentException("certify-capture requires PROFILE");
+                var report =
+                        org.sibench.capture.Certification.certify(
+                                org.sibench.capture.CaptureProfile.read(root, Path.of(profiles.get(0))));
+                var summary = new LinkedHashMap<String, Object>(report);
+                summary.remove("coverage");
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(summary));
                 return 0;
             }
@@ -271,6 +324,50 @@ public final class Sibench {
                     err.println(mismatch.getMessage());
                     return 1;
                 }
+            }
+            if (args[0].equals("plan-write-ratio")) {
+                if (profiles.size() != 3)
+                    throw new IllegalArgumentException(
+                            "plan-write-ratio requires PROFILE CALIBRATION_TRACE RATIO");
+                var plan =
+                        org.sibench.capture.WriteRatioPlan.plan(
+                                root,
+                                Path.of(profiles.get(0)),
+                                root.resolve(profiles.get(1)),
+                                Double.parseDouble(profiles.get(2)));
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(plan));
+                return 0;
+            }
+            if (args[0].equals("index-server")) {
+                if (profiles.size() != 1)
+                    throw new IllegalArgumentException("index-server requires SERVICE_CONFIG");
+                var service = ServiceConfig.ofServer(root, Path.of(profiles.get(0)));
+                try (var backend = RocksDbBackend.create(service.path(), service.value());
+                        var server = IndexServer.start(service.port(), backend, service.ordered())) {
+                    out.println("index-server " + backend.describe().getName() + " on port " + server.port());
+                    out.flush();
+                    server.awaitTermination();
+                }
+                return 0;
+            }
+            if (args[0].equals("replay-service")) {
+                if (profiles.size() != 3)
+                    throw new IllegalArgumentException(
+                            "replay-service requires REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT [--reference REPORT]");
+                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
+                ReplayConfig config = ReplayConfig.from(document);
+                ServiceConfig service = ServiceConfig.ofReplay(root, document);
+                if (service == null)
+                    throw new IllegalArgumentException("replay-service needs target.service in its config");
+                var result =
+                        ServiceReplay.run(
+                                root.resolve(profiles.get(1)),
+                                config,
+                                service,
+                                reference == null ? null : root.resolve(reference),
+                                root.resolve(profiles.get(2)));
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result.get("result")));
+                return 0;
             }
             if (List.of("replay", "check-replay", "validate-snapshots").contains(args[0])) {
                 boolean check = args[0].equals("check-replay");
@@ -344,6 +441,7 @@ public final class Sibench {
     }
 
     private static void printHelp(PrintStream out) {
+        printServiceHelp(out);
         out.println(
                 "Usage: java -jar build/sibench/sibench.jar inspect-scale [--root PATH] [PROFILE"
                         + " ...]");
@@ -385,10 +483,18 @@ public final class Sibench {
                     + " deltas of two snapshots; it never touches PG and exits 1 when they disagree.");
         out.println(
                 "       java -jar build/sibench/sibench.jar compile-trace [--root PATH]"
-                        + " PROFILE OUTPUT [ROW_AUDIT]");
+                        + " PROFILE OUTPUT [ROW_AUDIT] [--certification CERTIFICATE]"
+                        + " [--counters BEFORE AFTER]");
         out.println(
-                "compile-trace turns a completed capture into baseline/workload traces; any access"
-                        + " it cannot project fails the compilation.");
+                "compile-trace turns a completed capture into baseline/workload traces and its access"
+                        + " ledger in one pass; any access it cannot project fails the compilation."
+                        + " --counters requires the ledger to match PG's index counters;"
+                        + " --certification replaces the row audit by a certified build's coverage.");
+        out.println(
+                "       java -jar build/sibench/sibench.jar certify-capture [--root PATH] PROFILE");
+        out.println(
+                "certify-capture writes ARTIFACTS/certification.json for a compiled capture whose row"
+                        + " audit and counter check passed.");
         out.println(
                 "       java -jar build/sibench/sibench.jar validate-replay-matrix [--root PATH]"
                         + " NORMALIZED_DIRECTORY OUTPUT_DIRECTORY");

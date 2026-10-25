@@ -26,14 +26,14 @@ import java.util.Random;
 public class IndexReferenceSpillTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
-    private static final int TABLE = 5, ROWS = 300, VALUES = 17;
+    public static final int TABLE = 5, ROWS = 300, VALUES = 17;
 
     private static IndexReferenceReplay.Settings tiny(Path directory) {
         return new IndexReferenceReplay.Settings(directory, 40, 3, 200);
     }
 
     /** Baseline rows in shuffled order (the secondary run is not in PK order), then versions. */
-    private static List<Operation> stream(boolean rowIds, long seed) throws Exception {
+    public static List<Operation> stream(boolean rowIds, long seed) throws Exception {
         var random = new Random(seed);
         var operations = new ArrayList<Operation>();
         var order = new ArrayList<Integer>();

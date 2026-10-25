@@ -57,7 +57,10 @@ public class SessionMergeTest {
                 var chunk = merge.next();
                 counters.add(chunk.csn());
                 sessions.add(chunk.session());
-                lines.add(chunk.lines().size());
+                int streamed = 0;
+                while (merge.line() != null) streamed++;
+                assertEquals(chunk.lineCount(), streamed);
+                lines.add(streamed);
             }
         }
         assertEquals(List.of(10L, 20L, 30L, 40L, 50L), counters);
@@ -79,11 +82,18 @@ public class SessionMergeTest {
         Files.write(file, lines);
         try (var merge = SessionMerge.open(List.of(file))) {
             assertTrue(merge.hasNext());
-            assertEquals(4, merge.next().lines().size());
+            assertEquals(4, merge.next().lineCount());
+            // The lines are streamed from the file, in order, and stop at the chunk's end.
+            for (int i = 0; i < 4; i++) assertEquals(lines.get(i), merge.line());
+            assertNull(merge.line());
             assertTrue(merge.hasNext());
             var aborted = merge.next();
             assertEquals(9, aborted.csn());
-            assertEquals(2, aborted.lines().size());
+            assertEquals(2, aborted.lineCount());
+            assertEquals(lines.get(4), merge.line());
+            // A chunk must be read to its end before the next one is taken.
+            assertThrows(IOException.class, merge::next);
+            assertEquals(lines.get(5), merge.line());
             assertFalse(merge.hasNext());
         }
     }
@@ -151,6 +161,7 @@ public class SessionMergeTest {
         try (var merge = SessionMerge.open(List.of(readers, writers))) {
             while (merge.hasNext()) {
                 var chunk = merge.next();
+                while (merge.line() != null) {}
                 order.add(chunk.csn() + (chunk.writer() ? "w" : "r"));
             }
         }
@@ -168,7 +179,10 @@ public class SessionMergeTest {
                         IOException.class,
                         () -> {
                             try (var merge = SessionMerge.open(List.of(first, second))) {
-                                while (merge.hasNext()) merge.next();
+                                while (merge.hasNext()) {
+                                    merge.next();
+                                    while (merge.line() != null) {}
+                                }
                             }
                         });
         assertTrue(failure.getMessage(), failure.getMessage().contains("share completion position"));
@@ -177,7 +191,10 @@ public class SessionMergeTest {
     /** Reads every chunk, so failures past the first one surface. */
     private static void drain(Path file) throws IOException {
         try (var merge = SessionMerge.open(List.of(file))) {
-            while (merge.hasNext()) merge.next();
+            while (merge.hasNext()) {
+                merge.next();
+                while (merge.line() != null) {}
+            }
         }
     }
 }

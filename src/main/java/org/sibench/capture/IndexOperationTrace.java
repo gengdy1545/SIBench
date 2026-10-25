@@ -11,6 +11,7 @@ import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.HexFormat;
 import java.util.zip.CRC32C;
 
 /** Versioned normalized operation blocks, separate from raw PG access facts. */
@@ -371,14 +372,33 @@ public final class IndexOperationTrace {
     public static final class Writer implements Closeable {
         private final FileChannel channel;
         private final ByteArrayOutputStream block = new ByteArrayOutputStream();
+        /** The file's SHA256, taken from the bytes as they are written instead of a reread. */
+        private final java.security.MessageDigest digest;
+        private String sha256;
         private long count;
 
         public Writer(Path file) throws IOException {
+            try {
+                digest = java.security.MessageDigest.getInstance("SHA-256");
+            } catch (java.security.NoSuchAlgorithmException error) {
+                throw new IllegalStateException(error);
+            }
             channel =
                     FileChannel.open(file, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
             ByteBuffer header = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
             header.putInt(MAGIC).putInt(VERSION).putInt(RECORD_BYTES).putInt(BLOCK_RECORDS).flip();
-            write(channel, header);
+            written(header);
+        }
+
+        private void written(ByteBuffer buffer) throws IOException {
+            digest.update(buffer.duplicate());
+            write(channel, buffer);
+        }
+
+        /** The SHA256 of the closed file. */
+        public String sha256() {
+            if (sha256 == null) throw new IllegalStateException("Trace writer is still open");
+            return sha256;
         }
 
         public void append(Operation o) throws IOException {
@@ -436,15 +456,17 @@ public final class IndexOperationTrace {
                     .putInt((int) ((count - 1) % BLOCK_RECORDS + 1))
                     .putInt((int) crc.getValue())
                     .flip();
-            write(channel, header);
-            write(channel, ByteBuffer.wrap(payload));
+            written(header);
+            written(ByteBuffer.wrap(payload));
             block.reset();
         }
 
         @Override
         public void close() throws IOException {
+            if (!channel.isOpen()) return;
             try {
                 flush();
+                sha256 = HexFormat.of().formatHex(digest.digest());
             } finally {
                 channel.close();
             }

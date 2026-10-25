@@ -26,7 +26,12 @@ CORE=$ROOT/build/sibench/sibench.jar
 
 cd "$ROOT"
 eval "$("$JAVA" -cp "$CORE" org.sibench.capture.NativeCapture paths "$ROOT" "$PROFILE")"
-WORKDIR=${SIBENCH_WORKDIR:-$ROOT}
+# PG and the native clients read the detail level and trace encoding from the environment.
+export SIBENCH_CAPTURE_DETAIL SIBENCH_CAPTURE_COMPRESS
+if [ "$SIBENCH_VERIFICATION" = certified ] && [ ! -f "$SIBENCH_CERTIFICATION" ]; then
+  echo "certification not found: $SIBENCH_CERTIFICATION" >&2
+  exit 1
+fi
 if [ -e "$SIBENCH_ARTIFACTS" ]; then
   echo "artifacts already exist: $SIBENCH_ARTIFACTS (move or archive them first)" >&2
   exit 1
@@ -43,7 +48,9 @@ sha256sum "$JAR" > "$JAR.sha256"
 HYBENCH_CLASSES=$HYBENCH/target/classes
 [ -d "$HYBENCH_CLASSES" ] || HYBENCH_CLASSES=
 HYBENCH_CP="$JAR:$HYBENCH_CLASSES:$HYBENCH/lib/*"
+# HyBench runs from its work directory, where its base stage generates Data_<sf> on first use.
 WORKDIR=${SIBENCH_WORKDIR:-$ROOT}
+mkdir -p "$WORKDIR"
 
 if "$PG/runtime/bin/pg_isready" -q -h 127.0.0.1 -p "$SIBENCH_PORT"; then
   echo "a PostgreSQL server already listens on port $SIBENCH_PORT; stop it first" >&2
@@ -65,6 +72,10 @@ stage() {
 }
 URL=jdbc:postgresql://127.0.0.1:$SIBENCH_PORT/$SIBENCH_DATABASE
 
+# HyBench builds, or verifies and reuses, the still database its captures clone.
+if [ -n "${SIBENCH_WORKDIR:-}" ]; then
+  stage base
+fi
 stage prepare
 stage check > "$SIBENCH_ARTIFACTS/schema-preflight.json"
 stage export > "$SIBENCH_ARTIFACTS/baseline.log"
@@ -77,13 +88,23 @@ counters() {
 counters "$SIBENCH_ARTIFACTS/index-counters-before.json"
 stage run > "$SIBENCH_ARTIFACTS/run-summary.json"
 counters "$SIBENCH_ARTIFACTS/index-counters-after.json"
-"$JAVA" $HEAP -cp "$HYBENCH_CP" org.sibench.cli.Sibench audit-rows "$PROFILE" "$SIBENCH_ARTIFACTS/baseline" "$SIBENCH_RAW" \
-  --jdbc "$URL" --user postgres --timing "$TIMING" > "$SIBENCH_ARTIFACTS/row-state-audit-summary.json"
-"$JAVA" $HEAP -cp "$HYBENCH_CP" org.sibench.cli.Sibench access-ledger "$PROFILE" "$SIBENCH_RAW" --timing "$TIMING" \
-  > "$SIBENCH_ARTIFACTS/access-ledger-summary.json"
-"$JAVA" -cp "$HYBENCH_CP" org.sibench.cli.Sibench check-capture-completeness "$PROFILE" \
-  "$SIBENCH_RAW/access-ledger.json" "$SIBENCH_ARTIFACTS/index-counters-before.json" \
-  "$SIBENCH_ARTIFACTS/index-counters-after.json" > "$SIBENCH_ARTIFACTS/capture-completeness.json"
-"$JAVA" $HEAP -cp "$HYBENCH_CP" org.sibench.cli.Sibench compile-trace "$PROFILE" "$SIBENCH_ARTIFACTS/trace" --timing "$TIMING" \
-  > "$SIBENCH_ARTIFACTS/trace-summary.json"
+# A full capture audits its row changes against the baseline and PG's final state, then certifies
+# its build and coverage; a certified capture relies on such a certificate instead.
+if [ "$SIBENCH_VERIFICATION" = full ]; then
+  "$JAVA" $HEAP -cp "$HYBENCH_CP" org.sibench.cli.Sibench audit-rows "$PROFILE" "$SIBENCH_ARTIFACTS/baseline" "$SIBENCH_RAW" \
+    --jdbc "$URL" --user postgres --timing "$TIMING" > "$SIBENCH_ARTIFACTS/row-state-audit-summary.json"
+  VERIFY=()
+else
+  VERIFY=(--certification "$SIBENCH_CERTIFICATION")
+fi
+# One pass compiles the trace and builds the access ledger; the trace is committed only when the
+# ledger matches PG's index counters (and, when certified, stays inside the certificate).
+"$JAVA" $HEAP -cp "$HYBENCH_CP" org.sibench.cli.Sibench compile-trace "$PROFILE" "$SIBENCH_ARTIFACTS/trace" \
+  "${VERIFY[@]}" --counters "$SIBENCH_ARTIFACTS/index-counters-before.json" "$SIBENCH_ARTIFACTS/index-counters-after.json" \
+  --timing "$TIMING" > "$SIBENCH_ARTIFACTS/trace-summary.json"
+cp "$SIBENCH_ARTIFACTS/trace/access-ledger.json" "$SIBENCH_ARTIFACTS/access-ledger-summary.json"
+cp "$SIBENCH_ARTIFACTS/trace/capture-completeness.json" "$SIBENCH_ARTIFACTS/capture-completeness.json"
+if [ "$SIBENCH_VERIFICATION" = full ]; then
+  "$JAVA" -cp "$HYBENCH_CP" org.sibench.cli.Sibench certify-capture "$PROFILE" > "$SIBENCH_ARTIFACTS/certification-summary.json"
+fi
 echo "native capture complete: $SIBENCH_ARTIFACTS; timing: $TIMING"

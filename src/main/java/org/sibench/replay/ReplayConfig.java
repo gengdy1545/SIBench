@@ -90,7 +90,7 @@ public record ReplayConfig(
                 string(document, "purpose").equals("index_replay"),
                 "Expected index_replay purpose");
         var target = object(document, "target");
-        keys(target, Set.of("secondary_indexes"));
+        keys(target, Set.of("secondary_indexes", "service"));
         var secondary = object(target, "secondary_indexes");
         keys(secondary, Set.of("enabled"));
         var replay = object(document, "replay");

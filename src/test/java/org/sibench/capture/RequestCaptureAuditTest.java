@@ -75,6 +75,48 @@ public class RequestCaptureAuditTest {
         assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
     }
 
+    /**
+     * A summary capture compares the client's row hashes with the server's; a row that kept its
+     * text is also hashed from it, so a stale hash cannot pass.
+     */
+    @Test
+    public void comparesConsumedRowsWithServerRowHashes() throws Exception {
+        var directory = temporary.newFolder().toPath();
+        var client = directory.resolve("client.jsonl");
+        var server = directory.resolve("server.jsonl");
+        String hash = ResultRowHash.of(java.util.List.of("2000.0"), java.util.List.of(Types.REAL));
+        String requests =
+                """
+                {"event":"connection","pid":42}
+                {"event":"request_start","application":"a","sql":"SELECT balance FROM t","parameters":{}}
+                {"event":"request_return","application":"a"}
+                %s
+                {"event":"commit","application":"a"}
+                {"event":"close","application":"a"}
+                """;
+        String pg =
+                """
+                {"event":"executor_start","pid":42,"application":"a","sql":"SELECT balance FROM t","depth":1}
+                {"event":"executor_run_end","pid":42,"application":"a","depth":1,"returned":1,"row_hashes":["%s"]}
+                {"event":"executor_end","pid":42,"application":"a","depth":1}
+                {"event":"transaction_commit","pid":42,"application":"a"}
+                """;
+        Files.writeString(server, pg.formatted(ResultRowHash.of(java.util.List.of("2000"), java.util.List.of(Types.REAL))));
+        Files.writeString(client, requests.formatted("{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"" + hash + "\"}"));
+        assertEquals(1L, RequestCaptureAudit.audit(client, server, false).get("client_consumed_rows_checked"));
+        // A row with its text: the hash must be the text's, and both must match the server.
+        String text = "{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"%s\",\"1\":\"2000.0\",\"column_types\":{\"1\":7}}";
+        Files.writeString(client, requests.formatted(text.formatted(hash)));
+        assertEquals(1L, RequestCaptureAudit.audit(client, server, false).get("client_consumed_rows_checked"));
+        Files.writeString(client, requests.formatted(text.formatted("0000000000000000")));
+        assertTrue(assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, false))
+                .getMessage().contains("hash differs from its values"));
+        Files.writeString(server, pg.formatted("0000000000000000"));
+        Files.writeString(client, requests.formatted("{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"" + hash + "\"}"));
+        assertTrue(assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, false))
+                .getMessage().contains("differs from same-execution server result"));
+    }
+
     @Test
     public void rejectsRollbackWithoutCompletedRequest() throws Exception {
         var directory = temporary.newFolder().toPath();

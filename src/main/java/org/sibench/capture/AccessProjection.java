@@ -92,7 +92,7 @@ final class AccessProjection {
             if (!unit.bitmapEnded) return Decision.exclude("rescan_without_fetch");
             if (unit.bitmapLossy) return Decision.reject("bitmap_heap_lossy_page");
             // A heap scan stopped early never checks some candidates.
-            if (!unit.unresolved.isEmpty()) return Decision.reject("bitmap_heap_stopped_early");
+            if (unit.unresolvedCount() > 0) return Decision.reject("bitmap_heap_stopped_early");
         } else if (kind.equals("index") || kind.equals("index_only")) {
             if (unit.calls == 0) return Decision.exclude("rescan_without_fetch");
             if (unit.forward && unit.backward) return Decision.reject("scan_direction_changed");
@@ -136,7 +136,7 @@ final class AccessProjection {
         if (group.verdictOutsideIntersection)
             return Decision.reject("bitmap_and_verdict_outside_intersection");
         // A candidate every input produced but the heap never checked: the heap stopped early.
-        if (unresolvedIntersection(group)) return Decision.reject("bitmap_heap_stopped_early");
+        if (group.unresolvedIntersection()) return Decision.reject("bitmap_heap_stopped_early");
         var parts = new ArrayList<Part>();
         for (Unit unit : group.members) {
             if (!unit.bitmapEnded) return Decision.reject("bitmap_and_input_without_bitmap");
@@ -162,24 +162,6 @@ final class AccessProjection {
                     null,
                     false);
         return new Decision(parts, Mode.INTERSECTION, group.visible, "intersection", null, false);
-    }
-
-    private static boolean unresolvedIntersection(BitmapGroup group) {
-        Unit smallest = null;
-        for (Unit unit : group.members)
-            if (smallest == null || unit.unresolved.size() < smallest.unresolved.size())
-                smallest = unit;
-        if (smallest == null) return false;
-        for (String tid : smallest.unresolved) {
-            boolean everywhere = true;
-            for (Unit unit : group.members)
-                if (unit != smallest && !unit.unresolved.contains(tid)) {
-                    everywhere = false;
-                    break;
-                }
-            if (everywhere) return true;
-        }
-        return false;
     }
 
     /** A scan read to its end: one search, or a union of the array's points. */

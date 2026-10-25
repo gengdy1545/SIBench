@@ -48,6 +48,11 @@ final class HybenchNativePrepare {
                         "CREATE TRIGGER sibench_row_capture AFTER INSERT OR UPDATE OR DELETE ON \""
                                 + table.name()
                                 + "\" FOR EACH ROW EXECUTE FUNCTION public.sibench_row_capture()");
+            // As for YCSB and sysbench: autovacuum is off in the capture cluster, but a loaded
+            // benchmark database has hint bits, a visibility map and planner statistics by the
+            // time it is measured. Without statistics PostgreSQL plans HyBench's point lookups as
+            // ordered scans of the timestamp index. VACUUM moves no live tuple and changes no value.
+            statement.execute("VACUUM (ANALYZE)");
         }
     }
 

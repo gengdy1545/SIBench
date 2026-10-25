@@ -62,7 +62,7 @@ final class YcsbNativeRun {
             throw new IOException("Unknown YCSB workload: " + workload);
         var arguments = new ArrayList<String>();
         arguments.addAll(List.of(load ? "-load" : "-t", "-db", "site.ycsb.db.JdbcDBClient"));
-        arguments.addAll(List.of("-P", file.toString(), "-threads", Long.toString(load ? config.loadThreads() : 1)));
+        arguments.addAll(List.of("-P", file.toString(), "-threads", Long.toString(load ? config.loadThreads() : config.threads())));
         // The driver class decides the client's SQL dialect; keep the PostgreSQL one.
         var properties =
                 new LinkedHashMap<String, String>(
@@ -110,19 +110,37 @@ final class YcsbNativeRun {
                 "YCSB table creation failed");
         String firstWorkload = object(nativeConfig, "workloads").keySet().iterator().next();
         long records = positive(nativeConfig, "recordcount");
+        // The JDBC binding's documented batched load (README: db.batchsize, jdbc.batchupdateapi,
+        // reWriteBatchedInserts). The load is not captured; the workload runs unbatched.
+        long batch = nativeConfig.containsKey("load_batch_size") ? positive(nativeConfig, "load_batch_size") : 0;
+        String url = config.jdbc() + (batch > 0 ? (config.jdbc().contains("?") ? "&" : "?") + "reWriteBatchedInserts=true" : "");
+        Map<String, Object> batching =
+                batch > 0 ? Map.of("db.batchsize", batch, "jdbc.batchupdateapi", true) : Map.of();
         var command =
                 NativeProcess.java(
                         libraries,
                         self,
                         concat(
                                 List.of("site.ycsb.Client"),
-                                arguments(config, firstWorkload, true, records, 0, config.jdbc())));
+                                arguments(config, firstWorkload, true, records, 0, url, batching)));
         var result = NativeProcess.run("load", command, Map.of(), config.root(), logs, config.timeout());
         require(result.exit() == 0, "YCSB load failed");
         var counts = parse(result.stdout());
+        var inserts = counts.getOrDefault("INSERT", Map.of());
+        // A batched insert reports BATCHED_OK until its batch is sent; every other code is a failure.
+        long loaded = inserts.getOrDefault("Return=OK", 0L) + inserts.getOrDefault("Return=BATCHED_OK", 0L);
         require(
-                counts.getOrDefault("INSERT", Map.of()).getOrDefault("Return=OK", 0L) == records,
+                loaded == records && inserts.keySet().stream().allMatch(code -> code.equals("Return=OK") || code.equals("Return=BATCHED_OK") || !code.startsWith("Return=")),
                 "YCSB load did not insert every record");
+        // The last batch is sent at client cleanup, after its inserts reported BATCHED_OK.
+        try (var connection =
+                        java.sql.DriverManager.getConnection(
+                                config.jdbc(), config.user(), System.getenv().getOrDefault("PGPASSWORD", ""));
+                var statement = connection.createStatement();
+                var count = statement.executeQuery(
+                        "SELECT count(*) FROM \"" + string(nativeConfig, "table").replace("\"", "\"\"") + "\"")) {
+            require(count.next() && count.getLong(1) == records, "YCSB load left a different row count in PG");
+        }
     }
 
     static Map<String, Object> run(NativeCaptureConfig config, Path logs) throws Exception {
@@ -186,7 +204,8 @@ final class YcsbNativeRun {
             added.removeAll(before);
             long clientRequests = 0;
             for (Path trace : added) clientRequests += countRequests(trace);
-            if (added.size() != 1 || clientRequests != executed)
+            // One JDBC connection per client thread.
+            if (added.size() != config.threads() || clientRequests != executed)
                 throw new IOException(
                         workload
                                 + ": client reported "
@@ -210,9 +229,10 @@ final class YcsbNativeRun {
                                 + observed.get("total"));
             var report = new LinkedHashMap<String, Object>();
             report.put("workload", workload);
-            report.put(
-                    "sessions",
-                    List.of(Map.of("pg_file", "pg-" + CaptureRun.connectionPid(added.get(0)) + ".jsonl")));
+            var sessions = new ArrayList<Map<String, Object>>();
+            for (Path trace : added)
+                sessions.add(Map.of("pg_file", ServerTrace.locate(config.raw(), CaptureRun.connectionPid(trace)).getFileName().toString()));
+            report.put("sessions", sessions);
             report.put("recordcount_at_start", records);
             report.put("operationcount", operations);
             report.put("statement_operations", executed);
@@ -235,7 +255,7 @@ final class YcsbNativeRun {
             records += inserted;
         }
         var summary = new LinkedHashMap<String, Object>();
-        summary.put("client", "YCSB JdbcDBClient, pinned commit, single thread");
+        summary.put("client", "YCSB JdbcDBClient, pinned commit, " + config.threads() + " thread(s)");
         summary.put("workloads", reports);
         summary.put("jdbc_requests", requests);
         summary.put("final_recordcount", records);

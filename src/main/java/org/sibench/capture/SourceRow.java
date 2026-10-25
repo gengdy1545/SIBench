@@ -17,13 +17,27 @@ import java.util.Map;
 final class SourceRow {
     private SourceRow() {}
 
+    /** Per table, computed once: every row of a baseline or audit asks for them. */
+    private record Shape(java.util.Set<String> columns, SourceSchema.Column primary) {}
+
+    private static final Map<SourceSchema.Table, Shape> SHAPES = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static Shape shape(SourceSchema.Table table) {
+        return SHAPES.computeIfAbsent(table, t -> {
+            String name = t.indexes().stream()
+                    .filter(SourceSchema.Index::primary)
+                    .findFirst()
+                    .orElseThrow()
+                    .column();
+            return new Shape(
+                    t.columns().stream().map(SourceSchema.Column::name).collect(java.util.stream.Collectors.toUnmodifiableSet()),
+                    t.columns().stream().filter(c -> c.name().equals(name)).findFirst().orElseThrow());
+        });
+    }
+
     static Map<String, String> values(SourceSchema.Table table, JsonObject row) throws IOException {
         if (row == null) return null;
-        if (!row.keySet()
-                .equals(
-                        table.columns().stream()
-                                .map(SourceSchema.Column::name)
-                                .collect(java.util.stream.Collectors.toSet())))
+        if (!row.keySet().equals(shape(table).columns()))
             throw new IOException("Incomplete row image for " + table.name());
         var values = new LinkedHashMap<String, String>();
         for (var column : table.columns()) {
@@ -38,8 +52,13 @@ final class SourceRow {
 
     static String normalize(SourceSchema.Column column, JsonElement value) throws IOException {
         if (value == null || value.isJsonNull()) return null;
+        return normalize(column, value.getAsString());
+    }
+
+    /** The comparable form of one column's text; null stays null. */
+    static String normalize(SourceSchema.Column column, String text) throws IOException {
+        if (text == null) return null;
         try {
-            String text = value.getAsString();
             return switch (column.type()) {
                 case "integer" -> Long.toString(Long.parseLong(text));
                 case "real" -> Integer.toString(Float.floatToIntBits(Float.parseFloat(text)));
@@ -61,16 +80,7 @@ final class SourceRow {
     }
 
     static SourceSchema.Column primary(SourceSchema.Table table) {
-        String name =
-                table.indexes().stream()
-                        .filter(SourceSchema.Index::primary)
-                        .findFirst()
-                        .orElseThrow()
-                        .column();
-        return table.columns().stream()
-                .filter(c -> c.name().equals(name))
-                .findFirst()
-                .orElseThrow();
+        return shape(table).primary();
     }
 
     static String key(SourceSchema.Table table, JsonObject row) throws IOException {

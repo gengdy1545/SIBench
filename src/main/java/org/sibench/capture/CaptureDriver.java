@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.sql.*;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -96,6 +97,9 @@ public final class CaptureDriver implements Driver {
             throw error.getCause();
         }
     }
+
+    /** Same switch as the PG instrumentation: keep every consumed row's text, not only its hash. */
+    static final boolean DETAIL_ROWS = "rows".equals(System.getenv("SIBENCH_CAPTURE_DETAIL"));
 
     private static final class Session {
         private final Connection connection;
@@ -329,14 +333,25 @@ public final class CaptureDriver implements Driver {
                                             && Boolean.TRUE.equals(result)) {
                                         Map<String, Object> values = new LinkedHashMap<>(identity);
                                         Map<String, Integer> types = new LinkedHashMap<>();
+                                        var texts = new ArrayList<String>();
+                                        var jdbcTypes = new ArrayList<Integer>();
                                         ResultSetMetaData metadata = rows.getMetaData();
                                         for (int i = 1;
                                                 i <= metadata.getColumnCount();
                                                 i++) {
-                                            values.put(Integer.toString(i), rows.getString(i));
-                                            types.put(Integer.toString(i), metadata.getColumnType(i));
+                                            texts.add(rows.getString(i));
+                                            jdbcTypes.add(metadata.getColumnType(i));
                                         }
-                                        values.put("column_types", types);
+                                        // The hash is what the server records; the text only
+                                        // when the capture keeps per-row detail.
+                                        values.put("row_hash", ResultRowHash.of(texts, jdbcTypes));
+                                        if (DETAIL_ROWS) {
+                                            for (int i = 0; i < texts.size(); i++) {
+                                                values.put(Integer.toString(i + 1), texts.get(i));
+                                                types.put(Integer.toString(i + 1), jdbcTypes.get(i));
+                                            }
+                                            values.put("column_types", types);
+                                        }
                                         emit("consumed_row", values);
                                     }
                                     return result;

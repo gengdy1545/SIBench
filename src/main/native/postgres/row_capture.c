@@ -6,7 +6,6 @@
 
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(sibench_row_capture);
-IndexScanDesc sibench_bitmap_scan = NULL;
 
 static void append_tuple(StringInfo output, Relation relation, HeapTuple tuple)
 {

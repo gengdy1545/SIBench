@@ -5,24 +5,23 @@ PREFIX ?= $(ROOT)/build/services/postgresql-capture/runtime
 JOBS ?= 8
 
 .PHONY: patch build install extension
-# One patch against pristine PostgreSQL 14.24; the marker keeps a patched tree from being patched
-# again, and the sentinel recognises a tree patched without it.
+# One patch against pristine PostgreSQL 14.24 hooks the backend into sibench_capture.c, which is
+# copied into the tree with its header. The marker keeps a patched tree from being patched again; a
+# tree with an earlier patch must be extracted afresh. The backend links libzstd (libzstd-dev).
 patch:
 	@test -f "$(PG_SRC)/configure" || (echo "Extract PostgreSQL 14.24 into PG_SRC first"; exit 1)
 	@grep -q 'PACKAGE_VERSION='\''14.24'\''' "$(PG_SRC)/configure"
-	@if ! test -f "$(PG_SRC)/.sibench-patched"; then \
-	  if ! grep -q 'sib_heap_visibility' "$(PG_SRC)/src/backend/access/index/indexam.c"; then \
-	    cd "$(PG_SRC)" && patch --batch --forward -p1 < "$(CURDIR)/postgresql-14.24.patch"; \
-	  fi && touch "$(PG_SRC)/.sibench-patched"; \
+	@if ! test -f "$(PG_SRC)/.sibench-patched-3"; then \
+	  test ! -f "$(PG_SRC)/.sibench-patched" -a ! -f "$(PG_SRC)/.sibench-patched-2" || \
+	    (echo "PG_SRC carries an older SIBench patch; extract a fresh PostgreSQL 14.24"; exit 1); \
+	  cd "$(PG_SRC)" && patch --batch --forward -p1 < "$(CURDIR)/postgresql-14.24.patch" && \
+	  touch "$(PG_SRC)/.sibench-patched-3"; \
 	fi
-	cp sibench_capture.h sibench_receiver.h "$(PG_SRC)/src/include/"
-	# The instrumentation lives in the copied headers, so every file including them rebuilds.
-	touch "$(PG_SRC)/src/backend/access/index/indexam.c" "$(PG_SRC)/src/backend/nodes/tidbitmap.c" \
-	  "$(PG_SRC)/src/backend/executor/execMain.c" "$(PG_SRC)/src/backend/catalog/index.c" \
-	  "$(PG_SRC)/src/backend/access/transam/xact.c" "$(PG_SRC)/src/backend/executor/nodeIndexscan.c" \
-	  "$(PG_SRC)/src/backend/executor/nodeIndexonlyscan.c" "$(PG_SRC)/src/backend/executor/nodeBitmapIndexscan.c" \
-	  "$(PG_SRC)/src/backend/executor/nodeBitmapHeapscan.c" "$(PG_SRC)/src/backend/access/heap/heapam_handler.c" \
-	  "$(PG_SRC)/src/backend/storage/ipc/procarray.c"
+	cp sibench_capture.h "$(PG_SRC)/src/include/"
+	cp sibench_capture.c "$(PG_SRC)/src/backend/access/index/"
+	# Every file including the copied header rebuilds; the patched files are the ones that do.
+	cd "$(PG_SRC)" && grep -l 'sibench_capture.h' $$(grep '^+++ b/' "$(CURDIR)/postgresql-14.24.patch" | sed 's|^+++ b/||') \
+	  src/backend/access/index/sibench_capture.c | xargs touch
 
 # The patch adds a field to PGPROC (storage/proc.h) and PostgreSQL builds without dependency
 # tracking, so an in-place rebuild after a header change needs `make -C $(PG_SRC) clean` first.

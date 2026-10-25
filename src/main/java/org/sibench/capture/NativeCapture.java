@@ -18,14 +18,74 @@ import java.util.LinkedHashMap;
  * one.
  */
 public final class NativeCapture {
-    private static final String LIBRARY = "build/services/postgresql-capture/row_capture.so";
+    private static final String LIBRARY = CaptureBuild.ROW_CAPTURE;
 
     private NativeCapture() {}
+
+    /**
+     * How the instrumented PG records index accesses: one summary per access ({@code summary}, the
+     * default), or also every row ({@code rows}), which the access ledger checks the summaries
+     * against. The script passes it to PG and the native clients as SIBENCH_CAPTURE_DETAIL.
+     */
+    /**
+     * How backend traces are encoded: {@code zstd} (the default) writes each as one zstd stream,
+     * {@code none} as plain JSON lines. The script passes it to PG as SIBENCH_CAPTURE_COMPRESS.
+     */
+    static String compression(java.util.Map<String, Object> document) {
+        var capture = org.sibench.config.ConfigValues.object(document, "capture");
+        if (!capture.containsKey("compression")) return "zstd";
+        String compression = org.sibench.config.ConfigValues.string(capture, "compression");
+        org.sibench.config.ConfigValues.require(
+                compression.equals("zstd") || compression.equals("none"),
+                "capture.compression must be zstd or none");
+        return compression;
+    }
+
+    static String detail(java.util.Map<String, Object> document) {
+        var capture = org.sibench.config.ConfigValues.object(document, "capture");
+        if (!capture.containsKey("detail")) return "summary";
+        String detail = org.sibench.config.ConfigValues.string(capture, "detail");
+        org.sibench.config.ConfigValues.require(
+                detail.equals("summary") || detail.equals("rows"),
+                "capture.detail must be summary or rows");
+        return detail;
+    }
+
+    /**
+     * How a capture's row changes are vouched for: {@code full} (the default) runs the row-state
+     * audit and certifies the capture; {@code certified} relies on {@code capture.certification},
+     * the certificate of a full capture of the same build, see {@link Certification}.
+     */
+    static String verification(java.util.Map<String, Object> document) {
+        var capture = org.sibench.config.ConfigValues.object(document, "capture");
+        String verification =
+                capture.containsKey("verification")
+                        ? org.sibench.config.ConfigValues.string(capture, "verification")
+                        : "full";
+        org.sibench.config.ConfigValues.require(
+                verification.equals("full") || verification.equals("certified"),
+                "capture.verification must be full or certified");
+        org.sibench.config.ConfigValues.require(
+                verification.equals("certified") == capture.containsKey("certification"),
+                "capture.certification is required by, and only by, capture.verification: certified");
+        return verification;
+    }
+
+    /** The paths and capture settings the script reads, as shell assignments. */
+    private static void paths(java.util.Map<String, Object> document) {
+        System.out.println("SIBENCH_CAPTURE_DETAIL=" + detail(document));
+        System.out.println("SIBENCH_CAPTURE_COMPRESS=" + compression(document));
+        System.out.println("SIBENCH_VERIFICATION=" + verification(document));
+        var capture = org.sibench.config.ConfigValues.object(document, "capture");
+        if (capture.containsKey("certification"))
+            System.out.println(
+                    "SIBENCH_CERTIFICATION='" + org.sibench.config.ConfigValues.string(capture, "certification") + "'");
+    }
 
     public static void main(String[] args) throws Exception {
         if (args.length != 3 && args.length != 4)
             throw new IllegalArgumentException(
-                    "NativeCapture paths|prepare|check|export|run ROOT CONFIG [TIMING]");
+                    "NativeCapture paths|base|prepare|check|export|run ROOT CONFIG [TIMING]");
         var timing = RunTiming.open(args.length == 4 ? Path.of(args[3]).toAbsolutePath() : null);
         try {
             timing.phase(args[0]);
@@ -44,18 +104,25 @@ public final class NativeCapture {
                         "benchmark");
         if (benchmark.equals("hybench")) {
             var config = CaptureConfig.read(root, Path.of(args[2]));
-            timing.note("benchmark", "hybench").note("database", config.database());
+            timing.note("benchmark", "hybench")
+                    .note("database", config.database())
+                    .note("capture_detail", detail(config.document()))
+                    .note("capture_compression", compression(config.document()));
             hybench(args[0], root, args[2], config);
             return;
         }
         var config = NativeCaptureConfig.read(root, Path.of(args[2]));
-        timing.note("benchmark", config.benchmark()).note("database", config.database());
+        timing.note("benchmark", config.benchmark())
+                .note("database", config.database())
+                .note("capture_detail", detail(config.document()))
+                .note("capture_compression", compression(config.document()));
         switch (args[0]) {
             case "paths" -> {
                 System.out.println("SIBENCH_RAW='" + config.raw() + "'");
                 System.out.println("SIBENCH_PORT=" + config.port());
                 System.out.println("SIBENCH_DATABASE='" + config.database() + "'");
                 System.out.println("SIBENCH_ARTIFACTS='" + config.artifacts() + "'");
+                paths(config.document());
             }
             case "prepare" -> prepare(config);
             case "check" ->
@@ -94,7 +161,9 @@ public final class NativeCapture {
                 System.out.println("SIBENCH_DATABASE='" + config.database() + "'");
                 System.out.println("SIBENCH_ARTIFACTS='" + config.artifacts() + "'");
                 System.out.println("SIBENCH_WORKDIR='" + config.workDir() + "'");
+                paths(config.document());
             }
+            case "base" -> HybenchNativeBase.build(config);
             case "prepare" -> HybenchNativePrepare.prepare(root, config);
             case "check" ->
                     System.out.println(
@@ -162,6 +231,7 @@ public final class NativeCapture {
         try (CaptureRun run = CaptureRun.beginExternal(config.raw(), config.benchmark())) {
             try {
                 CaptureRun.requireQueryIdentity(config.jdbc(), config.user());
+                run.build(CaptureBuild.identity(config.root()));
                 run.schemaPreflight(
                         PgSchemaCheck.check(
                                 config.root(), config.document(), config.jdbc(), config.user()));

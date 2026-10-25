@@ -85,7 +85,7 @@ public final class ChangeKinds {
         Objects.requireNonNull(schema, "schema");
         var counter = new Counter(schema);
         for (Path trace : traces) {
-            try (var lines = Files.newBufferedReader(trace)) {
+            try (var lines = ServerTrace.open(trace)) {
                 String line;
                 while ((line = lines.readLine()) != null)
                     counter.accept(JsonParser.parseString(line).getAsJsonObject());

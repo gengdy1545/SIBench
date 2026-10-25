@@ -7,7 +7,6 @@ import com.google.gson.JsonParser;
 import org.sibench.capture.AccessProjection.Decision;
 import org.sibench.capture.AccessUnits.Request;
 import org.sibench.capture.AccessUnits.Unit;
-import org.sibench.generation.BaselineGenerator;
 import org.sibench.schema.SourceSchema;
 
 import java.io.IOException;
@@ -60,7 +59,6 @@ public final class AccessLedger {
     private record AccessPath(String source, int planNode, String index, String kind, String decision) {}
 
     private static final class Template {
-        final String sql;
         final Set<String> texts = new TreeSet<>();
         final Map<String, Long> plans = new TreeMap<>();
         final Map<AccessPath, Tally> paths = new TreeMap<>(
@@ -71,10 +69,6 @@ public final class AccessLedger {
                         .thenComparing(AccessPath::decision));
         long requests, withoutIndex, units, candidates, visible, returned, writes, rowChanges;
         long rejected;
-
-        Template(String sql) {
-            this.sql = sql;
-        }
     }
 
     private final IndexCatalog catalog;
@@ -93,33 +87,22 @@ public final class AccessLedger {
     private final Map<Long, Template> templates = new TreeMap<>();
     private final Tally total = new Tally();
     private final List<Map<String, Object>> inputs = new ArrayList<>();
-    private final AccessUnits units;
     private final Map<Request, List<Unit>> requestUnits = new HashMap<>();
     private final Map<Unit, String> decisions = new IdentityHashMap<>();
     private long events, unitEvents, unitCounted, settled, withoutIndex, requests;
+    /** Tracker facts, summed over every tracker that fed this ledger. */
+    private long openAtClose, abortedOpen, nestedExecutors, nestedRows, probesAssigned;
+    private long probesUnassigned;
 
-    private AccessLedger(SourceSchema schema, boolean cCollation) throws IOException {
+    /**
+     * An empty ledger. Its events come from {@link #event} and its access units from {@link
+     * #unit}, {@link #group} and {@link #request}: either from {@link #analyze}, which reads the
+     * session traces itself, or from the trace compiler, which builds the same ledger in the
+     * pass that compiles the capture.
+     */
+    AccessLedger(SourceSchema schema, boolean cCollation) throws IOException {
         this.catalog = IndexCatalog.fromSchema(schema);
         this.cCollation = cCollation;
-        this.units =
-                new AccessUnits(
-                        new AccessUnits.Listener() {
-                            @Override
-                            public void unitSettled(Unit unit) throws IOException {
-                                settle(unit);
-                            }
-
-                            @Override
-                            public void groupSettled(AccessUnits.BitmapGroup group)
-                                    throws IOException {
-                                settleGroup(group);
-                            }
-
-                            @Override
-                            public void requestFinished(Request request) throws IOException {
-                                finish(request);
-                            }
-                        });
     }
 
     public static Path defaultReport(Path raw) {
@@ -134,7 +117,7 @@ public final class AccessLedger {
             return paths.filter(
                             p -> {
                                 String name = p.getFileName().toString();
-                                return name.startsWith("pg-") && name.endsWith(".jsonl");
+                                return ServerTrace.isServerTrace(name);
                             })
                     .sorted()
                     .toList();
@@ -172,7 +155,31 @@ public final class AccessLedger {
         List<Path> files = sessionFiles(raw);
         if (files.isEmpty()) throw new IOException("Access ledger requires at least one PG trace");
         var ledger = new AccessLedger(schema, cCollation);
-        for (Path file : files) ledger.session(file);
+        var units =
+                new AccessUnits(
+                        new AccessUnits.Listener() {
+                            @Override
+                            public void unitSettled(Unit unit) throws IOException {
+                                ledger.unit(unit);
+                                Decision decision = AccessProjection.decide(unit, ledger.catalog, cCollation);
+                                // A BitmapAnd input is labelled by its group's decision once the
+                                // whole group settled.
+                                if (!decision.grouped()) ledger.record(unit, decision);
+                            }
+
+                            @Override
+                            public void groupSettled(AccessUnits.BitmapGroup group)
+                                    throws IOException {
+                                ledger.group(group, AccessProjection.decideGroup(group, ledger.catalog, cCollation));
+                            }
+
+                            @Override
+                            public void requestFinished(Request request) throws IOException {
+                                ledger.request(request);
+                            }
+                        });
+        for (Path file : files) ledger.session(file, units);
+        ledger.absorb(units);
         return ledger.report(schema);
     }
 
@@ -180,85 +187,123 @@ public final class AccessLedger {
     public static Map<String, Object> audit(SourceSchema schema, Path raw, Path report)
             throws IOException {
         if (Files.exists(report)) throw new IOException("Access ledger report already exists");
+        var result = analyze(schema, raw);
+        write(result, report);
+        return result;
+    }
+
+    /** Publishes a report atomically; an existing report path is never overwritten. */
+    static void write(Map<String, Object> result, Path report) throws IOException {
+        if (Files.exists(report)) throw new IOException("Access ledger report already exists");
         Path partial = report.resolveSibling(report.getFileName() + ".partial");
         if (Files.exists(partial))
             throw new IOException("Unfinished access ledger output exists; use a fresh report");
-        var result = analyze(schema, raw);
         Files.writeString(
                 partial,
                 new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(result),
                 StandardOpenOption.CREATE_NEW);
         Files.move(partial, report, StandardCopyOption.ATOMIC_MOVE);
-        return result;
     }
 
     private void claim(String category) {
         partition.merge(category, 1L, Long::sum);
     }
 
-    private void session(Path file) throws IOException {
-        long sessionEvents = 0, sessionUnits = settled;
+    private void session(Path file, AccessUnits units) throws IOException {
+        long sessionEvents = events, sessionUnits = settled;
         int pid = 0;
         units.beginSession();
-        try (var input = Files.newBufferedReader(file)) {
+        try (var input = ServerTrace.open(file)) {
             String line;
             while ((line = input.readLine()) != null) {
                 JsonObject e = JsonParser.parseString(line).getAsJsonObject();
-                sessionEvents++;
-                events++;
                 RunTiming.current().advance(1);
                 int eventPid = e.get("pid").getAsInt();
                 if (pid == 0) pid = eventPid;
                 else if (pid != eventPid)
                     throw new IOException("One access ledger input must contain one backend");
-                String type = e.get("event").getAsString();
-                eventTypes.merge(type, 1L, Long::sum);
-                if (!e.has("req") || !e.has("depth"))
-                    throw new IOException("Trace lacks request ordinals and executor depth");
-                if (type.equals("executor_start")
-                        && e.get("depth").getAsInt() <= 1
-                        && (!e.has("query_id") || e.get("query_id").getAsLong() == 0))
-                    throw new IOException(
-                            "Trace lacks PostgreSQL query identifiers; capture with"
-                                    + " compute_query_id = on");
-                if (type.equals("index_insert_attempt")) {
-                    String index = e.get("relation").getAsString();
-                    catalog.named(index);
-                    writes.merge(index, 1L, Long::sum);
-                }
-                if (type.equals("scan_rescan")) catalog.named(e.get("relation").getAsString());
-                if (!units.accept(e)
-                        && !Set.of("transaction_commit", "index_build_start", "index_build_end")
-                                .contains(type))
-                    throw new IOException("Unclassified raw event: " + type);
-                switch (type) {
-                    case "executor_start", "executor_run_end", "executor_end" ->
-                            claim("executor_lifecycle");
-                    case "transaction_commit", "transaction_abort" -> claim("transaction_boundary");
-                    case "result_row" -> claim("result_rows");
-                    case "row_change" -> claim("row_changes");
-                    case "index_build_start", "index_build_end" -> claim("index_build");
-                    case "index_insert_attempt" -> claim("index_writes");
-                    case "plan_scan", "plan_bitmap_heap" -> claim("plan_bindings");
-                    case "bitmap_heap_candidate", "bitmap_heap_lossy" ->
-                            claim("bitmap_heap_verdicts");
-                    case "scan_end" -> claim("scan_end");
-                    default -> unitEvents++;
-                }
+                event(e, units.accept(e));
             }
         }
+        AccessUnits.Detail detail = units.detail();
         units.endSession();
+        input(file, pid, detail, events - sessionEvents, settled - sessionUnits);
+    }
+
+    /**
+     * Claims one raw event, once its tracker has seen it ({@code tracked}: the tracker routed it
+     * to a request or an access unit). Every event is claimed by exactly one category.
+     */
+    void event(JsonObject e, boolean tracked) throws IOException {
+        events++;
+        String type = e.get("event").getAsString();
+        eventTypes.merge(type, 1L, Long::sum);
+        if (!e.has("req") || !e.has("depth"))
+            throw new IOException("Trace lacks request ordinals and executor depth");
+        if (type.equals("executor_start")
+                && e.get("depth").getAsInt() <= 1
+                && (!e.has("query_id") || e.get("query_id").getAsLong() == 0))
+            throw new IOException(
+                    "Trace lacks PostgreSQL query identifiers; capture with"
+                            + " compute_query_id = on");
+        if (type.equals("index_insert_attempt")) {
+            String index = e.get("relation").getAsString();
+            catalog.named(index);
+            writes.merge(index, 1L, Long::sum);
+        }
+        if (type.equals("scan_rescan")) catalog.named(e.get("relation").getAsString());
+        if (!tracked
+                && !Set.of("transaction_commit", "index_build_start", "index_build_end")
+                        .contains(type))
+            throw new IOException("Unclassified raw event: " + type);
+        switch (type) {
+            case "executor_start", "executor_run_end", "executor_end" ->
+                    claim("executor_lifecycle");
+            case "transaction_commit", "transaction_abort" -> claim("transaction_boundary");
+            case "result_row" -> claim("result_rows");
+            case "row_change" -> claim("row_changes");
+            case "index_build_start", "index_build_end" -> claim("index_build");
+            case "index_insert_attempt" -> claim("index_writes");
+            case "plan_scan", "plan_bitmap_heap" -> claim("plan_bindings");
+            case "bitmap_heap_candidate", "bitmap_heap_lossy", "bitmap_verdicts" ->
+                    claim("bitmap_heap_verdicts");
+            case "capture_start" -> claim("capture_header");
+            case "scan_end" -> claim("scan_end");
+            default -> unitEvents++;
+        }
+    }
+
+    /** One session trace this ledger read: its digest, backend, format and counts. */
+    void input(Path file, int pid, AccessUnits.Detail detail, long sessionEvents, long sessionUnits)
+            throws IOException {
         var input = new LinkedHashMap<String, Object>();
         input.put("file", file.getFileName().toString());
-        input.put("sha256", BaselineGenerator.sha256(file));
+        input.put("sha256", FileDigests.sha256(file));
         input.put("pid", pid);
+        input.put("detail", detail.name().toLowerCase(Locale.ROOT));
         input.put("events", sessionEvents);
-        input.put("access_units", settled - sessionUnits);
+        input.put("access_units", sessionUnits);
         input.put("identity", "request_ordinal_executor_depth_and_query_id");
         inputs.add(input);
     }
 
-    private void settle(Unit unit) throws IOException {
+    /** Access units settled so far. */
+    long settled() {
+        return settled;
+    }
+
+    /** Adds the facts a finished tracker collected over the sessions or parts it tracked. */
+    void absorb(AccessUnits units) {
+        openAtClose += units.openAtClose();
+        abortedOpen += units.abortedOpen();
+        nestedExecutors += units.nestedExecutors();
+        nestedRows += units.nestedRows();
+        probesAssigned += units.probesAssigned();
+        probesUnassigned += units.probesUnassigned();
+    }
+
+    /** Tallies a settled unit; its decision follows with {@link #record} or {@link #group}. */
+    void unit(Unit unit) {
         settled++;
         unitCounted += unit.events;
         total.add(unit);
@@ -266,19 +311,16 @@ public final class AccessLedger {
         bySource.merge(unit.source.label, 1L, Long::sum);
         byKind.merge(unit.kind(), 1L, Long::sum);
         if (unit.request != null) requestUnits.computeIfAbsent(unit.request, ignored -> new ArrayList<>()).add(unit);
-        Decision decision = AccessProjection.decide(unit, catalog, cCollation);
-        // A BitmapAnd input is labelled by its group's decision once the whole group settled.
-        if (decision.grouped()) return;
-        record(unit, decision);
     }
 
-    private void settleGroup(AccessUnits.BitmapGroup group) throws IOException {
-        Decision decision = AccessProjection.decideGroup(group, catalog, cCollation);
+    /** A settled BitmapAnd group: every member carries the group's decision. */
+    void group(AccessUnits.BitmapGroup group, Decision decision) {
         groups.merge(decision.projected() ? "intersection_groups" : "rejected_groups", 1L, Long::sum);
         for (Unit unit : group.members) record(unit, decision);
     }
 
-    private void record(Unit unit, Decision decision) {
+    /** The decision of a unit outside any BitmapAnd group. */
+    void record(Unit unit, Decision decision) {
         String label =
                 decision.projected()
                         ? decision.shape()
@@ -289,7 +331,7 @@ public final class AccessLedger {
         if (unit.request != null) decisions.put(unit, label);
     }
 
-    private void finish(Request request) throws IOException {
+    void request(Request request) throws IOException {
         requests++;
         String sql = request.sql.strip().replaceAll("\\s+", " ").toLowerCase(Locale.ROOT);
         if (request.processed >= 0
@@ -303,7 +345,7 @@ public final class AccessLedger {
                             + " != "
                             + request.processed);
         String text = template(sql);
-        Template template = templates.computeIfAbsent(request.queryId, ignored -> new Template(text));
+        Template template = templates.computeIfAbsent(request.queryId, ignored -> new Template());
         template.texts.add(text);
         template.requests++;
         template.plans.merge(request.planSignature(), 1L, Long::sum);
@@ -343,7 +385,7 @@ public final class AccessLedger {
                 .replaceAll("(?<![\\w$.])-?\\d+(?:\\.\\d+)?(?![\\w])", "?");
     }
 
-    private Map<String, Object> report(SourceSchema schema) throws IOException {
+    Map<String, Object> report(SourceSchema schema) throws IOException {
         long claimed = partition.values().stream().mapToLong(Long::longValue).sum();
         if (unitCounted != unitEvents)
             throw new IOException(
@@ -361,6 +403,8 @@ public final class AccessLedger {
         result.put("schema_version", VERSION);
         result.put("status", "passed_event_partition");
         result.put("benchmark", schema.benchmark());
+        // One order however the inputs were read: the compiler reads them in the capture's order.
+        inputs.sort(Comparator.comparing(input -> (String) input.get("file")));
         result.put("inputs", inputs);
         var eventReport = new LinkedHashMap<String, Object>();
         eventReport.put("total", events);
@@ -374,8 +418,8 @@ public final class AccessLedger {
         unitReport.put("total", settled);
         unitReport.put("by_source", bySource);
         unitReport.put("by_kind", byKind);
-        unitReport.put("open_at_connection_close", units.openAtClose());
-        unitReport.put("open_when_statement_aborted", units.abortedOpen());
+        unitReport.put("open_at_connection_close", openAtClose);
+        unitReport.put("open_when_statement_aborted", abortedOpen);
         unitReport.putAll(total.describe());
         unitReport.remove("access_units");
         result.put("access_units", unitReport);
@@ -409,10 +453,10 @@ public final class AccessLedger {
         requestReport.put("total", requests);
         requestReport.put("without_index_access", withoutIndex);
         requestReport.put("with_index_access", requests - withoutIndex);
-        requestReport.put("nested_executors", units.nestedExecutors());
-        requestReport.put("nested_executor_result_rows", units.nestedRows());
-        requestReport.put("planner_endpoint_probes_assigned_to_next_request", units.probesAssigned());
-        requestReport.put("planner_endpoint_probes_without_request", units.probesUnassigned());
+        requestReport.put("nested_executors", nestedExecutors);
+        requestReport.put("nested_executor_result_rows", nestedRows);
+        requestReport.put("planner_endpoint_probes_assigned_to_next_request", probesAssigned);
+        requestReport.put("planner_endpoint_probes_without_request", probesUnassigned);
         result.put("requests", requestReport);
         var templateReports = new ArrayList<Map<String, Object>>();
         for (var entry : templates.entrySet()) {
@@ -420,7 +464,8 @@ public final class AccessLedger {
             var item = new LinkedHashMap<String, Object>();
             // A string: int64 identifiers do not survive JSON tools that read numbers as doubles.
             item.put("query_id", Long.toString(entry.getKey()));
-            item.put("sql", t.sql);
+            // The first text in order, so the report does not depend on the order sessions are read.
+            item.put("sql", t.texts.iterator().next());
             if (t.texts.size() > 1) item.put("text_variants", t.texts.size());
             item.put("requests", t.requests);
             item.put("requests_without_index_access", t.withoutIndex);

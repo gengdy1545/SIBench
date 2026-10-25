@@ -472,6 +472,96 @@ public class IndexTraceCompilerTest {
                         .get("status"));
     }
 
+    /**
+     * A backend trace as the summary capture writes it: a header, no per-row events, one summary
+     * per access right before the event that ends it, result rows counted at the return.
+     */
+    private static List<String> summarized(int pid, List<String> rows) {
+        var result = new ArrayList<String>();
+        result.add("{\"event\":\"capture_start\",\"pid\":" + pid + ",\"xid\":0,\"cid\":0,\"req\":0,\"depth\":0,"
+                + "\"application\":\"sibench:fixture\",\"format\":2,\"detail\":\"summary\"}");
+        var counts = new LinkedHashMap<String, long[]>();
+        for (String line : rows) {
+            var event = JsonParser.parseString(line).getAsJsonObject();
+            String type = event.get("event").getAsString();
+            switch (type) {
+                case "scan_next" -> {
+                    long[] c = counts.get(event.get("scan").getAsString());
+                    c[0]++;
+                    if (event.get("found").getAsBoolean()) c[1]++;
+                    c[2] = event.get("found").getAsBoolean() ? 1 : 0;
+                    continue;
+                }
+                case "heap_visibility" -> {
+                    long[] c = counts.get(event.get("scan").getAsString());
+                    c[3]++;
+                    if (event.get("found").getAsBoolean()) c[4]++;
+                    continue;
+                }
+                case "scan_end" -> {
+                    long[] c = counts.remove(event.get("scan").getAsString());
+                    var summary = JsonParser.parseString(event.toString()).getAsJsonObject();
+                    summary.addProperty("event", "scan_summary");
+                    summary.addProperty("calls", c[0]);
+                    summary.addProperty("found", c[1]);
+                    summary.addProperty("last_found", c[2] == 1);
+                    summary.addProperty("forward", c[0] > 0);
+                    summary.addProperty("backward", false);
+                    summary.addProperty("recheck", 0);
+                    summary.addProperty("heap_fetches", c[3]);
+                    summary.addProperty("heap_visible", c[4]);
+                    summary.addProperty("vm_visible", 0);
+                    summary.addProperty("bitmap_tids", 0);
+                    summary.addProperty("bitmap_distinct", 0);
+                    summary.addProperty("bitmap_unresolved", 0);
+                    summary.addProperty("bitmap_ended", false);
+                    summary.addProperty("identity_missing", false);
+                    result.add(summary.toString());
+                }
+                case "scan_rescan" -> counts.put(event.get("scan").getAsString(), new long[5]);
+                case "executor_run_end" -> {
+                    event.addProperty("returned", 0);
+                    event.add("row_hashes", new com.google.gson.JsonArray());
+                    result.add(event.toString());
+                    continue;
+                }
+                default -> {}
+            }
+            result.add(line);
+        }
+        return result;
+    }
+
+    /** Concurrent compilation of a summary capture: every merged part keeps its file's format. */
+    @Test
+    public void concurrentSummaryCapturesCompileLikeTheirRows() throws Exception {
+        Path rowsFixture = temporary.newFolder().toPath(), summaryFixture = temporary.newFolder().toPath();
+        String before = row("2024-01-01 00:00:00"), after = row("2024-01-02 00:00:00");
+        var sessions = new ArrayList<>(overlappingSessions(before, after, 200));
+        // A later transaction of the writer searches too, so a summary sits in a later merged part.
+        var writer = new ArrayList<>(sessions.get(0));
+        writer.addAll(request(101, 3, "SELECT 1", snapshotSearch("a3", "2024-01-02 00:00:00", 260, "[]", 52, false)));
+        writer.add(commit(101, 3, 0, 300));
+        sessions.set(0, writer);
+        var manifests = new ArrayList<JsonObject>();
+        for (Path fixture : List.of(rowsFixture, summaryFixture)) {
+            CaptureConfig config = baseline(fixture);
+            var input = fixture == rowsFixture
+                    ? sessions
+                    : List.of(summarized(101, sessions.get(0)), summarized(102, sessions.get(1)));
+            Path raw = concurrentCapture(fixture, input);
+            audit(config, raw, after);
+            Path output = fixture.resolve("compiled");
+            compile(config, raw, output);
+            manifests.add(JsonParser.parseString(Files.readString(output.resolve("manifest.json"))).getAsJsonObject());
+            assertEquals("passed", ReferenceReplay.run(output, new ReplayConfig(true, "none", 0, 0, 0, 0, "operation"),
+                    fixture.resolve("replay.json")).get("status"));
+        }
+        for (String key : List.of("committed_transactions", "search_operations", "snapshot_searches", "workload_operations"))
+            assertEquals(key, manifests.get(0).get(key), manifests.get(1).get(key));
+        assertEquals(3, manifests.get(1).get("search_operations").getAsLong());
+    }
+
     @Test
     public void concurrentCompilationRejectsACounterThatDisagreesWithItsSnapshot()
             throws Exception {
@@ -1082,5 +1172,189 @@ public class IndexTraceCompilerTest {
                             .contains("Primary key value UPDATE"));
             assertFalse(Files.exists(RowStateAudit.defaultReport(rewrite)));
         }
+    }
+
+    private static JsonObject json(Path file) throws java.io.IOException {
+        return JsonParser.parseString(Files.readString(file)).getAsJsonObject();
+    }
+
+    /** Two concurrent sessions that search, update and search again, as a full capture audits them. */
+    private Path auditedConcurrentCapture(Path fixture, CaptureConfig config, boolean summary) throws Exception {
+        String before = row("2024-01-01 00:00:00"), after = row("2024-01-02 00:00:00");
+        var sessions = new ArrayList<>(overlappingSessions(before, after, 200));
+        var writer = new ArrayList<>(sessions.get(0));
+        writer.addAll(request(101, 3, "SELECT 1", snapshotSearch("a3", "2024-01-02 00:00:00", 260, "[]", 52, false)));
+        writer.add(commit(101, 3, 0, 300));
+        sessions.set(0, writer);
+        Path raw =
+                concurrentCapture(
+                        fixture,
+                        summary ? List.of(summarized(101, sessions.get(0)), summarized(102, sessions.get(1))) : sessions);
+        // A packaged run records its build; the fixture names one so it can be certified.
+        Path run = raw.resolve("capture-run.json");
+        JsonObject manifest = json(run);
+        JsonObject build = new JsonObject();
+        build.addProperty("sibench_jar_sha256", "jar");
+        build.addProperty("postgres_sha256", "postgres");
+        manifest.add("build", build);
+        Files.writeString(run, manifest.toString());
+        audit(config, raw, after);
+        return raw;
+    }
+
+    /** PG counter snapshots that agree with a ledger: zero before, the ledger's tallies after. */
+    private static Path[] counters(Path directory, JsonObject ledger, long extraCandidates) throws Exception {
+        var before = new JsonArray();
+        var after = new JsonArray();
+        boolean first = true;
+        for (JsonElement item : ledger.getAsJsonArray("indexes")) {
+            JsonObject index = item.getAsJsonObject();
+            for (JsonArray target : List.of(before, after)) {
+                JsonObject counter = new JsonObject();
+                counter.addProperty("schemaname", "public");
+                counter.addProperty("relname", index.get("table").getAsString());
+                counter.addProperty("indexrelname", index.get("index").getAsString());
+                boolean end = target == after;
+                counter.addProperty("idx_scan", end ? index.get("tree_descents_min").getAsLong() : 0);
+                counter.addProperty(
+                        "idx_tup_read",
+                        end ? index.get("candidates").getAsLong() + (first ? extraCandidates : 0) : 0);
+                counter.addProperty("idx_tup_fetch", end ? index.get("heap_fetch_visible").getAsLong() : 0);
+                target.add(counter);
+            }
+            first = false;
+        }
+        var files = new Path[2];
+        for (int i = 0; i < 2; i++) {
+            JsonObject snapshot = new JsonObject();
+            snapshot.addProperty("schema_version", CaptureCompleteness.VERSION);
+            snapshot.addProperty("source", "pg_stat_user_indexes");
+            snapshot.addProperty("profile", "fixture.yaml");
+            snapshot.addProperty("database", "fixture");
+            snapshot.addProperty("track_counts", "on");
+            snapshot.add("indexes", i == 0 ? before : after);
+            files[i] = directory.resolve((i == 0 ? "before-" : "after-") + extraCandidates + ".json");
+            Files.writeString(files[i], snapshot.toString());
+        }
+        return files;
+    }
+
+    @Test
+    public void compilationBuildsTheStandaloneLedgerInTheSamePass() throws Exception {
+        for (boolean summary : new boolean[] {false, true}) {
+            Path fixture = temporary.newFolder().toPath();
+            CaptureConfig config = baseline(fixture);
+            Path raw = auditedConcurrentCapture(fixture, config, summary);
+            Path output = fixture.resolve("compiled");
+            compile(config, raw, output);
+            JsonObject manifest = json(output.resolve("manifest.json"));
+            var standalone =
+                    AccessLedger.analyze(
+                            SourceSchema.hybench(config.source()), raw, manifest.get("text_intervals_ordered").getAsBoolean());
+            assertEquals(
+                    JsonParser.parseString(new GsonBuilder().serializeNulls().create().toJson(standalone)),
+                    json(output.resolve("access-ledger.json")));
+            assertEquals(
+                    BaselineGenerator.sha256(output.resolve("access-ledger.json")),
+                    manifest.get("access_ledger_sha256").getAsString());
+            // The traces are hashed as they are written; the digest is that of the file.
+            assertEquals(
+                    BaselineGenerator.sha256(output.resolve("workload.ops")),
+                    manifest.get("workload_trace_sha256").getAsString());
+            assertEquals(
+                    BaselineGenerator.sha256(output.resolve("baseline.ops")),
+                    manifest.get("baseline_trace_sha256").getAsString());
+            assertEquals("row_audit", manifest.getAsJsonObject("verification").get("mode").getAsString());
+            assertEquals("not_checked", manifest.get("capture_completeness").getAsString());
+        }
+    }
+
+    @Test
+    public void indexCountersThatDisagreeWithTheLedgerLeaveTheTraceUncommitted() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        CaptureConfig config = baseline(fixture);
+        Path raw = auditedConcurrentCapture(fixture, config, true);
+        compile(config, raw, fixture.resolve("first"));
+        JsonObject ledger = json(fixture.resolve("first/access-ledger.json"));
+        var schema = SourceSchema.hybench(config.source());
+        Path[] agree = counters(fixture, ledger, 0), disagree = counters(fixture, ledger, 1);
+        Path output = fixture.resolve("checked");
+        IndexTraceCompiler.compile(
+                schema, config.layout(), raw, output,
+                new IndexTraceCompiler.Checks(RowStateAudit.defaultReport(raw), null, agree[0], agree[1]));
+        assertEquals("consistent", json(output.resolve("manifest.json")).get("capture_completeness").getAsString());
+        Path rejected = fixture.resolve("rejected");
+        var failure =
+                assertThrows(
+                        java.io.IOException.class,
+                        () -> IndexTraceCompiler.compile(
+                                schema, config.layout(), raw, rejected,
+                                new IndexTraceCompiler.Checks(RowStateAudit.defaultReport(raw), null, disagree[0], disagree[1])));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("disagree"));
+        assertTrue(Files.exists(rejected.resolve("INCOMPLETE")));
+        assertEquals("inconsistent", json(rejected.resolve("capture-completeness.json")).get("status").getAsString());
+    }
+
+    @Test
+    public void aCertificationReplacesTheRowAuditOnlyForTheSameBuildAndCoverage() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        CaptureConfig config = baseline(fixture);
+        var schema = SourceSchema.hybench(config.source());
+        Path raw = auditedConcurrentCapture(fixture, config, true);
+        Path artifacts = fixture.resolve("artifacts");
+        Files.createDirectories(artifacts);
+        compile(config, raw, fixture.resolve("first"));
+        Path[] agree = counters(fixture, json(fixture.resolve("first/access-ledger.json")), 0);
+        Path trace = artifacts.resolve("trace");
+        IndexTraceCompiler.compile(
+                schema, config.layout(), raw, trace,
+                new IndexTraceCompiler.Checks(RowStateAudit.defaultReport(raw), null, agree[0], agree[1]));
+        var profile = new CaptureProfile(schema, config.layout(), raw, artifacts);
+        var certificate = Certification.certify(profile);
+        assertEquals("certified", certificate.get("status"));
+        Path certification = artifacts.resolve(Certification.FILE);
+        assertThrows(java.io.IOException.class, () -> Certification.certify(profile));
+
+        // The same capture, relying on the certificate instead of its row audit.
+        Path certified = fixture.resolve("certified");
+        IndexTraceCompiler.compile(
+                schema, config.layout(), raw, certified,
+                new IndexTraceCompiler.Checks(null, certification, agree[0], agree[1]));
+        JsonObject manifest = json(certified.resolve("manifest.json"));
+        assertEquals("certified", manifest.getAsJsonObject("verification").get("mode").getAsString());
+        assertEquals(
+                json(trace.resolve("manifest.json")).get("workload_trace_sha256"),
+                manifest.get("workload_trace_sha256"));
+
+        // An access path the certifying capture never exercised.
+        JsonObject narrowed = json(certification);
+        var paths = narrowed.getAsJsonObject("coverage").getAsJsonArray("access_paths");
+        String dropped = paths.remove(0).getAsString();
+        Path narrow = fixture.resolve("narrow.json");
+        Files.writeString(narrow, narrowed.toString());
+        Path outside = fixture.resolve("outside");
+        var failure =
+                assertThrows(
+                        java.io.IOException.class,
+                        () -> IndexTraceCompiler.compile(
+                                schema, config.layout(), raw, outside,
+                                new IndexTraceCompiler.Checks(null, narrow, agree[0], agree[1])));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("outside its certification"));
+        assertTrue(failure.getMessage(), failure.getMessage().contains(dropped));
+        assertTrue(Files.exists(outside.resolve("INCOMPLETE")));
+
+        // Another build is not vouched for, whatever it exercised.
+        JsonObject rebuilt = json(certification);
+        rebuilt.getAsJsonObject("build").addProperty("postgres_sha256", "another");
+        Path other = fixture.resolve("other-build.json");
+        Files.writeString(other, rebuilt.toString());
+        failure =
+                assertThrows(
+                        java.io.IOException.class,
+                        () -> IndexTraceCompiler.compile(
+                                schema, config.layout(), raw, fixture.resolve("other"),
+                                new IndexTraceCompiler.Checks(null, other, agree[0], agree[1])));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("build"));
+        assertFalse(Files.exists(fixture.resolve("other")));
     }
 }

@@ -131,6 +131,39 @@ public class CaptureRunTest {
     }
 
     @Test
+    public void verificationTrustsOnlyTheAuditTheRunRecordedForUnchangedFiles() throws Exception {
+        Path directory = temporary.newFolder().toPath(), pg = directory.resolve("pg-123.jsonl");
+        try (CaptureRun run = CaptureRun.begin(directory)) {
+            try (var connection = CaptureDriver.wrap(actual("", null, new boolean[1]), directory)) {
+                connection.prepareStatement("SELECT 1").executeQuery();
+                connection.commit();
+            }
+            String application =
+                    Files.readAllLines(jdbc(directory)).stream()
+                            .map(line -> JsonParser.parseString(line).getAsJsonObject())
+                            .filter(e -> e.get("event").getAsString().equals("request_start"))
+                            .findFirst()
+                            .orElseThrow()
+                            .get("application")
+                            .getAsString();
+            Files.writeString(
+                    pg,
+                    event("executor_start", application, ",\"sql\":\"SELECT 1\"")
+                            + event("executor_run_end", application, "")
+                            + event("executor_end", application, "")
+                            + event("transaction_commit", application, ""));
+            run.complete();
+        }
+        CaptureRun.verifyInput(directory);
+        Path manifest = directory.resolve("capture-run.json");
+        JsonObject value = manifest(directory);
+        value.getAsJsonArray("sessions").get(0).getAsJsonObject().remove("audit");
+        Files.writeString(manifest, value.toString());
+        var failure = assertThrows(IOException.class, () -> CaptureRun.verifyInput(directory));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("lacks a passed audit"));
+    }
+
+    @Test
     public void incompleteOrFailedPrefixCannotBeCompiledEvenBeforeBaselineCheck() throws Exception {
         Path directory = temporary.newFolder().toPath();
         try (CaptureRun run = CaptureRun.begin(directory)) {
@@ -138,12 +171,12 @@ public class CaptureRunTest {
             Files.writeString(raw, "{}\n");
             assertThrows(
                     IOException.class,
-                    () -> IndexTraceCompiler.compile(null, null, raw, directory.resolve("output"), null));
+                    () -> IndexTraceCompiler.compile(null, null, raw, directory.resolve("output"), (Path) null));
             assertFalse(Files.exists(directory.resolve("output")));
             run.fail(new SQLException("broken", "08006"), Map.of("operation", "commit"));
             assertThrows(
                     IOException.class,
-                    () -> IndexTraceCompiler.compile(null, null, raw, directory.resolve("output"), null));
+                    () -> IndexTraceCompiler.compile(null, null, raw, directory.resolve("output"), (Path) null));
         }
     }
 
@@ -273,7 +306,11 @@ public class CaptureRunTest {
         for (var row : consumed) {
             assertEquals(application, row.get("application").getAsString());
             assertEquals(1, row.get("request").getAsInt());
-            assertEquals("42", row.get("1").getAsString());
+            // The text stays only with SIBENCH_CAPTURE_DETAIL=rows; the hash always identifies it.
+            assertEquals(
+                    ResultRowHash.of(java.util.List.of("42"), java.util.List.of(java.sql.Types.INTEGER)),
+                    row.get("row_hash").getAsString());
+            if (CaptureDriver.DETAIL_ROWS) assertEquals("42", row.get("1").getAsString());
         }
     }
 

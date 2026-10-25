@@ -34,11 +34,9 @@ public record NativeCaptureConfig(
         // Verifies the pinned source commit and a clean worktree.
         SourceSchema.read(root, doc);
         var nativeConfig = object(doc, "native");
-        require(
-                positive(nativeConfig, "threads") == 1,
-                "Native clients run one session each: their completion audit pairs one client"
-                        + " process with one backend, and several threads need concurrent"
-                        + " session orchestration first");
+        // Each client thread is one backend session; several overlap and are merged by PG's
+        // transaction completion counter.
+        require(positive(nativeConfig, "threads") <= 256, "threads must be at most 256");
         // sysbench decides BEGIN / COMMIT at run time through --skip-trx; the run must state it.
         if (nativeConfig.containsKey("skip-trx"))
             require(
@@ -111,12 +109,17 @@ public record NativeCaptureConfig(
                 nativeConfig.containsKey("timeout_minutes") ? positive(nativeConfig, "timeout_minutes") : 30);
     }
 
-    /** Client threads used to load YCSB; the captured runs always use one. */
+    /** Client threads of a captured run: one backend session each. */
+    public long threads() {
+        return positive(nativeConfig, "threads");
+    }
+
+    /** Client threads used to load YCSB, which is not captured. */
     public long loadThreads() {
         return nativeConfig.containsKey("load_threads") ? positive(nativeConfig, "load_threads") : 1;
     }
 
-    /** sysbench prepare parallelises across tables; the captured runs always use one thread. */
+    /** sysbench prepare parallelises across tables; it is not captured. */
     public long prepareThreads() {
         return nativeConfig.containsKey("prepare_threads") ? positive(nativeConfig, "prepare_threads") : 1;
     }

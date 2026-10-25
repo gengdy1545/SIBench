@@ -18,6 +18,7 @@ public final class HybenchNativeRun {
         try (CaptureRun run = CaptureRun.begin(config.raw())) {
             try {
                 CaptureRun.requireQueryIdentity(config.jdbc(), config.user());
+                run.build(CaptureBuild.identity(config.root()));
                 run.schemaPreflight(
                         PgSchemaCheck.check(
                                 config.root(), config.document(), config.jdbc(), config.user()));
@@ -25,7 +26,7 @@ public final class HybenchNativeRun {
                 try (var output =
                         Files.newOutputStream(
                                 properties, java.nio.file.StandardOpenOption.CREATE_NEW)) {
-                    config.nativeProperties().store(output, "Resolved SF1 capture configuration");
+                    config.nativeProperties().store(output, "Resolved " + config.scaleFactor() + " capture configuration");
                 }
                 execute(
                         properties,

@@ -39,7 +39,7 @@ public class NativeCaptureConfigTest {
         String text = Files.readString(source);
         for (String[] change :
                 new String[][] {
-                    {"  threads: 1\n", "  threads: 2\n"},
+                    {"  threads: 1\n", "  threads: 257\n"},
                     {"load_threads: 16", "load_threads: 65"},
                     {"timeout_minutes: 360", "timeout_minutes: 1441"},
                 }) {

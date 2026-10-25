@@ -102,9 +102,11 @@ public final class RequestCaptureAudit {
                 executed = new HashSet<>(),
                 writeRequests = new HashSet<>();
         Map<String, List<JsonArray>> serverResults = new HashMap<>();
+        // Row hashes from each top-level return, in result order.
+        Map<String, List<String>> serverHashes = new HashMap<>();
         long commits = 0, aborts = 0, indexEvents = 0, unmatched = 0;
         boolean serverTransactionOpen = false;
-        try (var input = Files.newBufferedReader(pg)) {
+        try (var input = ServerTrace.open(pg)) {
             String line;
             while ((line = input.readLine()) != null) {
                 JsonObject e = JsonParser.parseString(line).getAsJsonObject();
@@ -139,6 +141,11 @@ public final class RequestCaptureAudit {
                     if (!started.contains(app))
                         throw new IOException("Execution return without start");
                     executed.add(app);
+                    if (e.has("row_hashes") && e.get("depth").getAsInt() <= 1) {
+                        var hashes = serverHashes.computeIfAbsent(app, k -> new ArrayList<>());
+                        for (JsonElement hash : e.getAsJsonArray("row_hashes"))
+                            hashes.add(hash.getAsString());
+                    }
                 } else if (event.equals("result_row")) {
                     serverResults
                             .computeIfAbsent(app, k -> new ArrayList<>())
@@ -229,10 +236,28 @@ public final class RequestCaptureAudit {
         long checkedRows = 0;
         for (var request : consumed.entrySet()) {
             List<JsonArray> server = serverResults.getOrDefault(request.getKey(), List.of());
-            if (request.getValue().size() > server.size())
+            List<String> hashes = serverHashes.getOrDefault(request.getKey(), List.of());
+            int consumedRows = request.getValue().size();
+            if (consumedRows > Math.max(server.size(), hashes.size()))
                 throw new IOException("Client consumed uncaptured row: " + request.getKey());
-            for (int i = 0; i < request.getValue().size(); i++) {
+            for (int i = 0; i < consumedRows; i++) {
                 JsonObject client = request.getValue().get(i);
+                boolean hashed = i < hashes.size();
+                if (hashed && !hashes.get(i).equals(clientHash(client)))
+                    throw new IOException(
+                            "Client result differs from same-execution server result: "
+                                    + request.getKey()
+                                    + " row="
+                                    + (i + 1)
+                                    + " server_hash="
+                                    + hashes.get(i));
+                boolean valued = i < server.size() && client.has("column_types");
+                if (!hashed && !valued)
+                    throw new IOException("Client row has nothing to compare: " + request.getKey());
+                if (!valued) {
+                    checkedRows++;
+                    continue;
+                }
                 for (int j = 0; j < server.get(i).size(); j++) {
                     JsonElement expected = server.get(i).get(j),
                             actual = client.get(Integer.toString(j + 1));
@@ -286,6 +311,30 @@ public final class RequestCaptureAudit {
         report.put("executor_returns", executed.size());
         report.put("executor_cleanup_events", finished.size());
         return report;
+    }
+
+    /**
+     * The client's hash of a consumed row. A row that also kept its text must hash to what it
+     * recorded; a row from before hashes existed is hashed from its text.
+     */
+    static String clientHash(JsonObject client) throws IOException {
+        String recorded = client.has("row_hash") ? client.get("row_hash").getAsString() : null;
+        if (!client.has("column_types")) {
+            if (recorded == null) throw new IOException("Consumed row without values or hash");
+            return recorded;
+        }
+        JsonObject types = client.getAsJsonObject("column_types");
+        var values = new ArrayList<String>();
+        var jdbcTypes = new ArrayList<Integer>();
+        for (int j = 1; j <= types.size(); j++) {
+            JsonElement value = client.get(Integer.toString(j));
+            values.add(value == null || value.isJsonNull() ? null : value.getAsString());
+            jdbcTypes.add(types.get(Integer.toString(j)).getAsInt());
+        }
+        String computed = ResultRowHash.of(values, jdbcTypes);
+        if (recorded != null && !recorded.equals(computed))
+            throw new IOException("Consumed row hash differs from its values");
+        return computed;
     }
 
     /** Planner endpoint probes carry no bound value; they are not search predicates. */

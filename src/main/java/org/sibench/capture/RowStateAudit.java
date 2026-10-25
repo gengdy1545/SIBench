@@ -80,7 +80,7 @@ public final class RowStateAudit {
         PgBaselineVerify.verifyFiles(baseline);
         if (!connection.getAutoCommit())
             throw new IOException("Row audit requires a fresh autocommit connection");
-        Map<String, String> inputs = inputHashes(raw);
+        Map<String, String> inputs = inputHashes(raw, false);
         var tables = new LinkedHashMap<String, SourceSchema.Table>();
         var tableOrder = new HashMap<String, Integer>();
         for (var table : schema.tables()) {
@@ -101,7 +101,7 @@ public final class RowStateAudit {
                 Path source = sources.get(sourceIndex);
                 var pending = new ArrayList<Change>();
                 long xid = 0, position = 0;
-                try (var reader = Files.newBufferedReader(source)) {
+                try (var reader = ServerTrace.open(source)) {
                     String line;
                     while ((line = reader.readLine()) != null) {
                         position++;
@@ -122,6 +122,13 @@ public final class RowStateAudit {
                                 throw new IOException("Row transaction boundary XID mismatch");
                             if (type.equals("transaction_commit")) {
                                 commits++;
+                                // Concurrent sessions interleave by PostgreSQL's completion
+                                // counter, not by the session a change came from: a change's
+                                // before-image is the row as of its own commit, so the chain of
+                                // one key only lines up in that order.
+                                // Sessions that never overlap need no counter: then the order is
+                                // the session order. Concurrent compilation requires one.
+                                long csn = event.has("csn") ? event.get("csn").getAsLong() : 0;
                                 for (Change change : pending) {
                                     var table =
                                             tables.get(change.source().get("relation").getAsString());
@@ -132,6 +139,7 @@ public final class RowStateAudit {
                                                     tableOrder.get(table.name()),
                                                     table,
                                                     SourceRow.key(table, row),
+                                                    csn,
                                                     sourceIndex,
                                                     change.position()),
                                             EVENTS.toJson(change.source())
@@ -205,7 +213,7 @@ public final class RowStateAudit {
             }
             // Publish transitions first; only the final report makes the audit consumable.
             Files.move(transitionsPartial, transitions, StandardCopyOption.ATOMIC_MOVE);
-            if (!inputs.equals(inputHashes(raw)))
+            if (!inputs.equals(inputHashes(raw, true)))
                 throw new IOException("Source changed during row audit");
             var result = new LinkedHashMap<String, Object>();
             result.put("schema_version", 1);
@@ -242,17 +250,24 @@ public final class RowStateAudit {
      * Sort key of one committed change: table, the primary key in PostgreSQL's btree order (the
      * order of the baseline files and of the final scan), then the change's place in the capture.
      */
+    /**
+     * (table, primary key, commit position, session, position). The commit position is
+     * PostgreSQL's transaction completion counter: it is what orders the changes of one key when
+     * several sessions write it, and it is distinct for every writing transaction.
+     */
     private static byte[] sortKey(
-            int table, SourceSchema.Table schemaTable, String key, int session, long position)
+            int table, SourceSchema.Table schemaTable, String key, long csn, int session,
+            long position)
             throws IOException {
         var primary = SourceRow.primary(schemaTable);
         IndexKey encoded =
                 primary.type().equals("integer")
                         ? IndexKey.ofInt(Long.parseLong(key))
                         : IndexKey.ofText(key);
-        return ByteBuffer.allocate(4 + encoded.length() + 4 + 8)
+        return ByteBuffer.allocate(4 + encoded.length() + 8 + 4 + 8)
                 .putInt(table)
                 .put(encoded.bytes())
+                .putLong(csn)
                 .putInt(session)
                 .putLong(position)
                 .array();
@@ -315,7 +330,7 @@ public final class RowStateAudit {
             }
             byte[] first = sorted.peekKey();
             int table = ByteBuffer.wrap(first).getInt();
-            int prefixLength = first.length - 12;
+            int prefixLength = first.length - 20;
             var changes = new ArrayList<Change>();
             String key = null;
             while (sorted.hasNext()
@@ -325,8 +340,9 @@ public final class RowStateAudit {
                             prefixLength,
                             sorted.peekKey(),
                             0,
-                            sorted.peekKey().length - 12)) {
-                ByteBuffer tail = ByteBuffer.wrap(sorted.peekKey(), prefixLength, 12);
+                            sorted.peekKey().length - 20)) {
+                ByteBuffer tail = ByteBuffer.wrap(sorted.peekKey(), prefixLength, 20);
+                tail.getLong();
                 int session = tail.getInt();
                 long position = tail.getLong();
                 JsonObject event =
@@ -439,9 +455,10 @@ public final class RowStateAudit {
             String previous = null;
             try (Statement statement = connection.createStatement()) {
                 statement.setFetchSize(8192);
+                // Columns as text, compared column by column: no JSON round trip on either side.
                 try (ResultSet actual =
                         statement.executeQuery(
-                                "SELECT row_to_json(t)::text FROM "
+                                "SELECT * FROM "
                                         + quote(table.name())
                                         + " t ORDER BY "
                                         + order)) {
@@ -488,11 +505,7 @@ public final class RowStateAudit {
                         if (expected == null) continue;
                         if (!actual.next()
                                 || !Objects.equals(
-                                        SourceRow.values(table, expected),
-                                        SourceRow.values(
-                                                table,
-                                                JsonParser.parseString(actual.getString(1))
-                                                        .getAsJsonObject())))
+                                        SourceRow.values(table, expected), finalRow(table, actual)))
                             throw new IOException(
                                     "Final source row mismatch: " + table.name() + "/" + key);
                         count++;
@@ -525,6 +538,19 @@ public final class RowStateAudit {
                 else throw failure;
             }
         }
+    }
+
+    /** One final PG row in the comparable form {@link SourceRow#values} gives an image. */
+    private static Map<String, String> finalRow(SourceSchema.Table table, ResultSet row)
+            throws Exception {
+        var values = new java.util.LinkedHashMap<String, String>();
+        for (var column : table.columns()) {
+            String text = row.getString(column.name());
+            if (text == null && !column.nullable())
+                throw new IOException("Null required column: " + table.name() + "." + column.name());
+            values.put(column.name(), SourceRow.normalize(column, text));
+        }
+        return values;
     }
 
     /** Position of the table in schema order, which is how the sorted changes are grouped. */
@@ -577,13 +603,13 @@ public final class RowStateAudit {
                 || !schema.benchmark().equals(value.get("benchmark").getAsString())
                 || !JSON.toJsonTree(schema.tables()).equals(value.get("source_schema"))
                 || !JSON.toJsonTree(schema.fingerprints()).equals(value.get("source_schema_sha256"))
-                || !JSON.toJsonTree(inputHashes(raw)).equals(value.get("source_inputs_sha256"))
+                || !JSON.toJsonTree(inputHashes(raw, false)).equals(value.get("source_inputs_sha256"))
                 || !BaselineGenerator.sha256(baseline.resolve("verified-manifest.json"))
                         .equals(value.get("baseline_verified_manifest_sha256").getAsString()))
             throw new IOException("Row audit does not match source/baseline/schema");
         PgBaselineVerify.verifyFiles(baseline);
         Path changes = changesFile(report, value);
-        if (!BaselineGenerator.sha256(changes).equals(value.get("changes_sha256").getAsString()))
+        if (!FileDigests.sha256(changes).equals(value.get("changes_sha256").getAsString()))
             throw new IOException("Audited row transitions changed");
         var result = new LinkedHashMap<String, Object>();
         for (var entry : value.entrySet()) result.put(entry.getKey(), entry.getValue());
@@ -623,20 +649,25 @@ public final class RowStateAudit {
         return List.of(raw);
     }
 
-    private static Map<String, String> inputHashes(Path raw) throws IOException {
+    /** {@code fresh} reads every file again instead of trusting this process's earlier digests. */
+    private static Map<String, String> inputHashes(Path raw, boolean fresh) throws IOException {
         Path directory = Files.isDirectory(raw) ? raw : raw.toAbsolutePath().getParent();
         var hashes = new TreeMap<String, String>();
         Path manifest = directory.resolve("capture-run.json");
         if (Files.exists(manifest))
-            hashes.put("capture-run.json", BaselineGenerator.sha256(manifest));
+            hashes.put("capture-run.json", digest(manifest, fresh));
         for (Path source : sourceFiles(raw))
-            hashes.put(source.getFileName().toString(), BaselineGenerator.sha256(source));
+            hashes.put(source.getFileName().toString(), digest(source, fresh));
         try (var paths = Files.list(directory)) {
             for (Path path :
                     paths.filter(p -> p.getFileName().toString().startsWith("jdbc-")).toList())
-                hashes.put(path.getFileName().toString(), BaselineGenerator.sha256(path));
+                hashes.put(path.getFileName().toString(), digest(path, fresh));
         }
         return hashes;
+    }
+
+    private static String digest(Path file, boolean fresh) throws IOException {
+        return fresh ? BaselineGenerator.sha256(file) : FileDigests.sha256(file);
     }
 
     private static ParquetReader<Group> reader(Path path) throws IOException {

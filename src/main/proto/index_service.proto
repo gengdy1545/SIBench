@@ -1,0 +1,157 @@
+// SIBench index service protocol, version 1.
+//
+// A benchmark driver replays a canonical index trace against a KV index service through this
+// protocol. It carries logical index operations only; how a service lays them out physically
+// (key encoding, version suffix, column families, files) is its own. The semantics are those of
+// docs/contracts/index-service.md and docs/contracts/trace.md.
+syntax = "proto3";
+
+package sibench.index.v1;
+
+option java_multiple_files = true;
+option java_package = "org.sibench.adapters.proto";
+option java_outer_classname = "IndexServiceProto";
+
+service IndexService {
+  // What the service implements; the driver refuses a service that lacks a semantic it needs.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+
+  // One ordered stream per benchmark client. The service executes a stream's requests in the
+  // order it receives them; a request sees every write received earlier on the same stream.
+  // Responses carry the request id and may be returned in any order. Ordering and visibility
+  // across streams are the service's own and are declared by Describe.
+  rpc Execute(stream Request) returns (stream Response);
+
+  // Completes after every request received before it on any stream is durable to the level the
+  // service declares. Used between load, measurement and drain phases, never as a read barrier.
+  rpc Flush(FlushRequest) returns (FlushResponse);
+}
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  string name = 1;
+  uint32 protocol_version = 2;  // 1
+  ValueKind value_kind = 3;
+  // Reads at a version select the newest version at or below it (required).
+  bool versioned_reads = 4;
+  // Writes of one key at one version overwrite in stream order (required for
+  // transaction-local searches).
+  bool ordered_same_version_overwrite = 5;
+  // SearchGroup executes on the service; otherwise the driver must not send groups.
+  bool search_groups = 6;
+  // Requests from different client streams are executed in the driver's send order, given by
+  // Request.sequence, not in arrival order. The trace's reads are only reproducible when writes and
+  // searches keep their source order, so a replay with more than one client requires this.
+  bool cross_client_ordering = 8;
+  // Free text: durability level of an acknowledged write, cache and WAL placement.
+  string durability = 7;
+}
+
+enum ValueKind {
+  VALUE_KIND_UNSPECIFIED = 0;
+  LOCATOR = 1;  // (file id, row position) of the row version in a data file
+  ROW_ID = 2;   // logical row identity
+}
+
+// An index entry is (table, index, indexed value, primary key); the primary key index (index 0)
+// has no indexed value. Components are order-preserving encodings: their unsigned byte order is
+// the source order, and each component delimits itself.
+message EntryKey {
+  uint32 table = 1;
+  uint32 index = 2;
+  bytes indexed_value = 3;  // empty for index 0
+  bytes primary_key = 4;
+}
+
+message Value {
+  // LOCATOR uses file and position; ROW_ID uses row_id.
+  int64 file = 1;
+  int64 position = 2;
+  int64 row_id = 3;
+}
+
+message Request {
+  uint64 id = 1;  // unique per stream
+  // The driver's send position of this request, 1, 2, 3, ... over the whole replay and every
+  // stream; a search group takes one position. A service declaring cross_client_ordering executes
+  // requests in this order whichever stream they arrive on.
+  uint64 sequence = 5;
+  oneof operation {
+    Write write = 2;
+    Search search = 3;
+    SearchGroup group = 4;
+  }
+}
+
+message Write {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    INSERT = 1;          // baseline load at version 0
+    UPSERT = 2;          // a new version of the entry
+    LOGICAL_DELETE = 3;  // the entry does not exist from this version on; no value
+    RELOCATE = 4;        // replace the value of this exact, existing version
+  }
+  Kind kind = 1;
+  EntryKey key = 2;
+  uint64 version = 3;
+  Value value = 4;
+}
+
+// An ordered search over one index. The bounds apply to the leading component: the primary key
+// for index 0, the indexed value otherwise. Results are entries in (indexed value, primary key)
+// order, descending when asked, each at the newest version <= read_version that is not deleted.
+message Search {
+  uint32 table = 1;
+  uint32 index = 2;
+  Bound lower = 3;  // absent: unbounded
+  Bound upper = 4;  // absent: unbounded
+  bool descending = 5;
+  uint64 limit = 6;  // 0: no limit
+  uint64 read_version = 7;
+  // A pinned search names exactly one secondary entry: lower == upper == the indexed value, and
+  // this primary key.
+  bytes pinned_primary_key = 8;
+}
+
+message Bound {
+  bytes key = 1;
+  bool inclusive = 2;
+}
+
+// The searches of one source access, combined by primary key on the service.
+message SearchGroup {
+  enum Mode {
+    MODE_UNSPECIFIED = 0;
+    INTERSECTION = 1;
+    UNION = 2;
+  }
+  Mode mode = 1;
+  repeated Search members = 2;  // all of one table, at one read_version
+}
+
+message Response {
+  uint64 id = 1;
+  Status status = 2;
+  string message = 3;
+  // Searches and groups: the result entries, in result order (group: first member's order, then
+  // entries only later members added).
+  repeated Result results = 4;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  OK = 1;
+  INVALID = 2;      // the request breaks the protocol (no such version to relocate, ...)
+  UNAVAILABLE = 3;  // the service could not execute it; the outcome of a write is unknown
+}
+
+message Result {
+  bytes primary_key = 1;
+  uint64 version = 2;
+  Value value = 3;
+}
+
+message FlushRequest {}
+
+message FlushResponse {}
