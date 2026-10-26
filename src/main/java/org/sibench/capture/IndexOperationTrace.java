@@ -2,7 +2,6 @@ package org.sibench.capture;
 
 import org.sibench.trace.IndexKey;
 
-import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
@@ -40,6 +39,13 @@ public final class IndexOperationTrace {
     public static final int VERSION = 9;
     public static final int MAX_TABLE = 65535, MAX_INDEX = 1024;
     private static final int MAGIC = 0x53494f50;
+    /**
+     * A file of zstd-compressed blocks: the same records, each block compressed on its own. Its
+     * digest, like that of a derived stream, is the logical one: the SHA256 of the plain file the
+     * same operations form ({@link #sha256}), so it does not depend on the compressor.
+     */
+    private static final int MAGIC_ZSTD = 0x53494f5a;
+    static final int ZSTD_LEVEL = 3;
 
     private IndexOperationTrace() {}
 
@@ -369,14 +375,30 @@ public final class IndexOperationTrace {
         void accept(Operation operation) throws IOException;
     }
 
+    /** A stream of operations: a trace file, or one derived when it is read. Returns the count. */
+    @FunctionalInterface
+    public interface Source {
+        long read(Consumer consumer) throws IOException;
+
+        static Source file(Path file) {
+            return consumer -> IndexOperationTrace.read(file, consumer);
+        }
+    }
+
+    /**
+     * Encodes operations exactly as a trace file holds them. A writer without a file only counts
+     * them and takes the SHA256 of the file they would form, for a stream derived when it is read.
+     */
     public static final class Writer implements Closeable {
         private final FileChannel channel;
-        private final ByteArrayOutputStream block = new ByteArrayOutputStream();
+        /** The current block's records, encoded in place; grown when a record does not fit. */
+        private ByteBuffer block = ByteBuffer.allocate(BLOCK_RECORDS * (RECORD_BYTES + 32)).order(ByteOrder.LITTLE_ENDIAN);
         /** The file's SHA256, taken from the bytes as they are written instead of a reread. */
         private final java.security.MessageDigest digest;
         private String sha256;
         private long count;
 
+        /** {@code file}: where the trace is written, or null to only digest it. */
         public Writer(Path file) throws IOException {
             try {
                 digest = java.security.MessageDigest.getInstance("SHA-256");
@@ -384,18 +406,20 @@ public final class IndexOperationTrace {
                 throw new IllegalStateException(error);
             }
             channel =
-                    FileChannel.open(file, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+                    file == null
+                            ? null
+                            : FileChannel.open(file, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+            digest.update(header(MAGIC));
+            if (channel != null) write(channel, header(MAGIC_ZSTD));
+        }
+
+        private static ByteBuffer header(int magic) {
             ByteBuffer header = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
-            header.putInt(MAGIC).putInt(VERSION).putInt(RECORD_BYTES).putInt(BLOCK_RECORDS).flip();
-            written(header);
+            header.putInt(magic).putInt(VERSION).putInt(RECORD_BYTES).putInt(BLOCK_RECORDS).flip();
+            return header;
         }
 
-        private void written(ByteBuffer buffer) throws IOException {
-            digest.update(buffer.duplicate());
-            write(channel, buffer);
-        }
-
-        /** The SHA256 of the closed file. */
+        /** The logical SHA256 of the closed stream: that of its plain file. */
         public String sha256() {
             if (sha256 == null) throw new IllegalStateException("Trace writer is still open");
             return sha256;
@@ -403,14 +427,15 @@ public final class IndexOperationTrace {
 
         public void append(Operation o) throws IOException {
             validate(o);
-            ByteBuffer record =
-                    ByteBuffer.allocate(
-                                    RECORD_BYTES
-                                            + length(o.key())
-                                            + length(o.indexedValue())
-                                            + length(o.lower())
-                                            + length(o.upper()))
-                            .order(ByteOrder.LITTLE_ENDIAN);
+            int size = RECORD_BYTES + length(o.key()) + length(o.indexedValue()) + length(o.lower()) + length(o.upper());
+            if (block.remaining() < size) {
+                ByteBuffer larger = ByteBuffer.allocate(Math.max(block.capacity() * 2, block.position() + size))
+                        .order(ByteOrder.LITTLE_ENDIAN);
+                block.flip();
+                larger.put(block);
+                block = larger;
+            }
+            ByteBuffer record = block;
             record.putLong(o.sourceEvent())
                     .putInt(o.kind())
                     .putInt(o.table())
@@ -428,11 +453,14 @@ public final class IndexOperationTrace {
                     .putLong(o.limit())
                     .putInt(o.expansionPosition())
                     .putInt(o.expansionSize());
-            for (IndexKey part : new IndexKey[] {o.key(), o.indexedValue(), o.lower(), o.upper()})
-                record.putInt(part == null ? -1 : part.length());
-            for (IndexKey part : new IndexKey[] {o.key(), o.indexedValue(), o.lower(), o.upper()})
-                if (part != null) part.writeTo(record);
-            block.writeBytes(record.array());
+            record.putInt(o.key() == null ? -1 : o.key().length())
+                    .putInt(o.indexedValue() == null ? -1 : o.indexedValue().length())
+                    .putInt(o.lower() == null ? -1 : o.lower().length())
+                    .putInt(o.upper() == null ? -1 : o.upper().length());
+            if (o.key() != null) o.key().writeTo(record);
+            if (o.indexedValue() != null) o.indexedValue().writeTo(record);
+            if (o.lower() != null) o.lower().writeTo(record);
+            if (o.upper() != null) o.upper().writeTo(record);
             count++;
             if (count % BLOCK_RECORDS == 0) flush();
         }
@@ -446,64 +474,116 @@ public final class IndexOperationTrace {
         }
 
         private void flush() throws IOException {
-            if (block.size() == 0) return;
-            byte[] payload = block.toByteArray();
-            int length = payload.length;
+            if (block.position() == 0) return;
+            byte[] payload = block.array();
+            int length = block.position();
             CRC32C crc = new CRC32C();
             crc.update(payload, 0, length);
+            int records = (int) ((count - 1) % BLOCK_RECORDS + 1);
             ByteBuffer header = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
-            header.putInt(length)
-                    .putInt((int) ((count - 1) % BLOCK_RECORDS + 1))
-                    .putInt((int) crc.getValue())
-                    .flip();
-            written(header);
-            written(ByteBuffer.wrap(payload));
-            block.reset();
+            header.putInt(length).putInt(records).putInt((int) crc.getValue()).flip();
+            digest.update(header);
+            digest.update(payload, 0, length);
+            if (channel != null) {
+                // The checksum covers the records, so it holds whatever compressed them.
+                byte[] compressed = com.github.luben.zstd.Zstd.compress(java.util.Arrays.copyOf(payload, length), ZSTD_LEVEL);
+                ByteBuffer stored = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
+                stored.putInt(compressed.length).putInt(records).putInt((int) crc.getValue()).putInt(length).flip();
+                write(channel, stored);
+                write(channel, ByteBuffer.wrap(compressed));
+            }
+            block.clear();
         }
 
         @Override
         public void close() throws IOException {
-            if (!channel.isOpen()) return;
+            if (sha256 != null || channel != null && !channel.isOpen()) return;
             try {
                 flush();
                 sha256 = HexFormat.of().formatHex(digest.digest());
             } finally {
-                channel.close();
+                if (channel != null) channel.close();
             }
         }
     }
 
-    /** Reads a current-format trace; every other version is rejected. */
-    public static long read(Path file, Consumer consumer) throws IOException {
+    /** One block's records, as the plain format holds them. */
+    private interface Blocks {
+        void block(int records, int checksum, ByteBuffer payload) throws IOException;
+    }
+
+    /** The blocks of a plain or zstd-block trace, each checked against its checksum. */
+    private static void blocks(Path file, Blocks blocks) throws IOException {
         try (FileChannel channel = FileChannel.open(file)) {
             ByteBuffer header = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
             fill(channel, header);
             header.flip();
-            if (header.getInt() != MAGIC
+            int magic = header.getInt();
+            if (magic != MAGIC && magic != MAGIC_ZSTD
                     || header.getInt() != VERSION
                     || header.getInt() != RECORD_BYTES
                     || header.getInt() != BLOCK_RECORDS)
                 throw new IOException("Unknown normalized trace header");
-            long count = 0;
+            boolean compressed = magic == MAGIC_ZSTD;
             while (channel.position() < channel.size()) {
-                header.clear().limit(12);
+                header.clear().limit(compressed ? 16 : 12);
                 fill(channel, header);
                 header.flip();
-                int bytes = header.getInt(), records = header.getInt(), checksum = header.getInt();
+                int stored = header.getInt(), records = header.getInt(), checksum = header.getInt();
+                int bytes = compressed ? header.getInt() : stored;
                 // Records carry variable-length keys, so only a lower bound is fixed.
                 if (bytes <= 0
+                        || stored <= 0
                         || records < 1
                         || bytes > (long) records * (RECORD_BYTES + 4L * IndexKey.MAX_BYTES)
                         || records > BLOCK_RECORDS
                         || bytes < (long) records * RECORD_BYTES)
                     throw new IOException("Invalid normalized block length");
-                ByteBuffer block = ByteBuffer.allocate(bytes).order(ByteOrder.LITTLE_ENDIAN);
+                ByteBuffer block = ByteBuffer.allocate(stored).order(ByteOrder.LITTLE_ENDIAN);
                 fill(channel, block);
-                block.flip();
+                byte[] payload = block.array();
+                if (compressed) {
+                    try {
+                        payload = com.github.luben.zstd.Zstd.decompress(payload, bytes);
+                    } catch (RuntimeException corrupt) {
+                        throw new IOException("Normalized block does not decompress", corrupt);
+                    }
+                    if (payload.length != bytes) throw new IOException("Invalid normalized block length");
+                }
                 CRC32C crc = new CRC32C();
-                crc.update(block.array(), 0, bytes);
+                crc.update(payload, 0, bytes);
                 if ((int) crc.getValue() != checksum)
                     throw new IOException("Normalized block checksum mismatch");
+                blocks.block(records, checksum, ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN));
+            }
+        }
+    }
+
+    /**
+     * The logical SHA256 of a trace: that of the plain file its operations form, which for a plain
+     * file is the SHA256 of the file itself.
+     */
+    public static String sha256(Path file) throws IOException {
+        java.security.MessageDigest digest;
+        try {
+            digest = java.security.MessageDigest.getInstance("SHA-256");
+        } catch (java.security.NoSuchAlgorithmException error) {
+            throw new IllegalStateException(error);
+        }
+        digest.update(Writer.header(MAGIC));
+        blocks(file, (records, checksum, payload) -> {
+            ByteBuffer header = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
+            header.putInt(payload.remaining()).putInt(records).putInt(checksum).flip();
+            digest.update(header);
+            digest.update(payload);
+        });
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    /** Reads a trace of the current record format, plain or in zstd blocks. */
+    public static long read(Path file, Consumer consumer) throws IOException {
+        long[] count = {0};
+        blocks(file, (records, checksum, block) -> {
                 for (int i = 0; i < records; i++) {
                     if (block.remaining() < RECORD_BYTES)
                         throw new IOException("Truncated normalized operation prefix");
@@ -558,12 +638,11 @@ public final class IndexOperationTrace {
                                     limit);
                     validate(o);
                     consumer.accept(o);
-                    count++;
+                    count[0]++;
                 }
                 if (block.hasRemaining()) throw new IOException("Trailing operation block bytes");
-            }
-            return count;
-        }
+        });
+        return count[0];
     }
 
     private static void fill(FileChannel channel, ByteBuffer target) throws IOException {

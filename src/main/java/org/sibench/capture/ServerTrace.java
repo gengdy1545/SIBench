@@ -13,7 +13,8 @@ import java.nio.file.Path;
 /**
  * The backend trace files of a capture: {@code pg-<pid>.jsonl}, or {@code pg-<pid>.jsonl.zst}
  * when the instrumentation wrote a zstd stream ({@code capture.compression: zstd}). Readers see the
- * same lines either way; a compressed file whose backend did not end its frame fails to read.
+ * same lines either way; a compressed file whose backend did not end its frame fails to read. The
+ * client traces ({@code jdbc-*.jsonl[.zst]}) of the capture driver open the same way.
  */
 public final class ServerTrace {
     private static final String PREFIX = "pg-", PLAIN = ".jsonl", ZSTD = ".jsonl.zst";

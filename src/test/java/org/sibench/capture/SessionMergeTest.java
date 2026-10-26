@@ -58,7 +58,7 @@ public class SessionMergeTest {
                 counters.add(chunk.csn());
                 sessions.add(chunk.session());
                 int streamed = 0;
-                while (merge.line() != null) streamed++;
+                while (merge.event() != null) streamed++;
                 assertEquals(chunk.lineCount(), streamed);
                 lines.add(streamed);
             }
@@ -83,17 +83,17 @@ public class SessionMergeTest {
         try (var merge = SessionMerge.open(List.of(file))) {
             assertTrue(merge.hasNext());
             assertEquals(4, merge.next().lineCount());
-            // The lines are streamed from the file, in order, and stop at the chunk's end.
-            for (int i = 0; i < 4; i++) assertEquals(lines.get(i), merge.line());
-            assertNull(merge.line());
+            // The events are streamed from the file, in order, and stop at the chunk's end.
+            for (int i = 0; i < 4; i++) assertEquals(com.google.gson.JsonParser.parseString(lines.get(i)), merge.event().json());
+            assertNull(merge.event());
             assertTrue(merge.hasNext());
             var aborted = merge.next();
             assertEquals(9, aborted.csn());
             assertEquals(2, aborted.lineCount());
-            assertEquals(lines.get(4), merge.line());
+            assertEquals(com.google.gson.JsonParser.parseString(lines.get(4)), merge.event().json());
             // A chunk must be read to its end before the next one is taken.
             assertThrows(IOException.class, merge::next);
-            assertEquals(lines.get(5), merge.line());
+            assertEquals(com.google.gson.JsonParser.parseString(lines.get(5)), merge.event().json());
             assertFalse(merge.hasNext());
         }
     }
@@ -161,7 +161,7 @@ public class SessionMergeTest {
         try (var merge = SessionMerge.open(List.of(readers, writers))) {
             while (merge.hasNext()) {
                 var chunk = merge.next();
-                while (merge.line() != null) {}
+                while (merge.event() != null) {}
                 order.add(chunk.csn() + (chunk.writer() ? "w" : "r"));
             }
         }
@@ -181,7 +181,7 @@ public class SessionMergeTest {
                             try (var merge = SessionMerge.open(List.of(first, second))) {
                                 while (merge.hasNext()) {
                                     merge.next();
-                                    while (merge.line() != null) {}
+                                    while (merge.event() != null) {}
                                 }
                             }
                         });
@@ -193,8 +193,122 @@ public class SessionMergeTest {
         try (var merge = SessionMerge.open(List.of(file))) {
             while (merge.hasNext()) {
                 merge.next();
-                while (merge.line() != null) {}
+                while (merge.event() != null) {}
             }
         }
+    }
+
+    /** A chunk far longer than a parse batch, interleaved with another session, keeps every event in order. */
+    @Test
+    public void parsingAheadKeepsEveryEventInOrderAcrossBatches() throws Exception {
+        Path directory = temporary.newFolder().toPath();
+        int length = ParsedTrace.BATCH * (ParsedTrace.WINDOW + 3) + 7;
+        var first = new ArrayList<String>();
+        for (int i = 0; i < length; i++) first.add(record("executor_start", 101, -1).replace("}", ",\"i\":" + i + "}"));
+        first.add(record("transaction_commit", 101, 5));
+        first.add(record("executor_start", 101, -1));
+        first.add(record("transaction_commit", 101, 7));
+        var second = List.of(record("executor_start", 102, -1), record("transaction_commit", 102, 6));
+        Path a = directory.resolve("pg-101.jsonl"), b = directory.resolve("pg-102.jsonl");
+        Files.write(a, first);
+        Files.write(b, second);
+        String previous = System.getProperty("sibench.compile.parse_threads");
+        System.setProperty("sibench.compile.parse_threads", "3");
+        try (var merge = SessionMerge.open(List.of(a, b))) {
+            var expected = new ArrayList<String>(first.subList(0, length + 1));
+            expected.addAll(second);
+            expected.addAll(first.subList(length + 1, first.size()));
+            var actual = new ArrayList<com.google.gson.JsonObject>();
+            while (merge.hasNext()) {
+                merge.next();
+                for (Event e; (e = merge.event()) != null; ) actual.add(e.json());
+            }
+            assertEquals(expected.size(), actual.size());
+            for (int i = 0; i < expected.size(); i++)
+                assertEquals(com.google.gson.JsonParser.parseString(expected.get(i)), actual.get(i));
+        } finally {
+            if (previous == null) System.clearProperty("sibench.compile.parse_threads");
+            else System.setProperty("sibench.compile.parse_threads", previous);
+        }
+    }
+
+    /** A line that does not parse fails only when it is reached, after every event before it. */
+    @Test
+    public void anUnparsableLineFailsWhereItIsReached() throws Exception {
+        Path directory = temporary.newFolder().toPath();
+        var lines = new ArrayList<String>();
+        lines.add(record("executor_start", 101, -1));
+        lines.add(record("executor_start", 101, -1).substring(0, 10));
+        lines.add(record("transaction_commit", 101, 7));
+        Path file = directory.resolve("pg-101.jsonl");
+        Files.write(file, lines);
+        try (var merge = SessionMerge.open(List.of(file))) {
+            merge.next();
+            assertEquals(com.google.gson.JsonParser.parseString(lines.get(0)), merge.event().json());
+            assertThrows(com.google.gson.JsonParseException.class, merge::event);
+        }
+    }
+
+    /** The records and per-chunk line counts readLine finds, for comparing the byte scanner. */
+    private static List<String> byReadLine(java.io.BufferedReader reader) throws IOException {
+        var result = new ArrayList<String>();
+        long lines = 0;
+        for (String line; (line = reader.readLine()) != null; ) {
+            lines++;
+            if (line.startsWith("{\"event\":\"transaction_commit\"") || line.startsWith("{\"event\":\"transaction_abort\"")) {
+                result.add(lines + " " + line);
+                lines = 0;
+            }
+        }
+        result.add(lines + " end");
+        return result;
+    }
+
+    private static List<String> byScanner(Path file) throws IOException {
+        var result = new ArrayList<String>();
+        try (var scanner = new SessionMerge.Boundaries(file)) {
+            for (String line; (line = scanner.next()) != null; ) result.add(scanner.lines() + " " + line);
+            result.add(scanner.lines() + " end");
+        }
+        return result;
+    }
+
+    /**
+     * Chunk ends and line counts are those readLine gives: LF, CR and CRLF ends, empty and short
+     * lines, near-miss prefixes, lines and records across the scanner's buffer, a last line without
+     * an end, in a plain and a zstd file.
+     */
+    @Test
+    public void boundariesSplitLinesAsReadLineDoes() throws Exception {
+        var random = new java.util.Random(7);
+        String[] ends = {"\n", "\r", "\r\n"};
+        var text = new StringBuilder();
+        for (int i = 0; i < 6000; i++) {
+            String line =
+                    switch (random.nextInt(200) == 0 ? 5 + random.nextInt(2) : random.nextInt(5) == 0 ? 7 : random.nextInt(5)) {
+                        case 0 -> "";
+                        case 1 -> "{\"event\":\"transaction_";
+                        case 2 -> "{\"event\":\"transaction_commit\",\"csn\":" + i + ",\"note\":\"\u00e9\u4e2d\"}";
+                        case 3 -> "{\"event\":\"transaction_abort\",\"csn\":" + i + "}";
+                        case 4 -> "{\"event\":\"transaction_abor\"}";
+                        case 5 -> "x".repeat(300_000 + random.nextInt(900_000));
+                        case 6 -> "{\"event\":\"transaction_commit\",\"pad\":\"" + "y".repeat(700_000) + "\"}";
+                        default -> "{\"event\":\"executor_start\",\"pid\":1,\"sql\":\"select \u00fc\"}";
+                    };
+            text.append(line);
+            if (i < 5999 || random.nextBoolean()) text.append(ends[random.nextInt(3)]);
+        }
+        byte[] bytes = text.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        Path directory = temporary.newFolder().toPath();
+        Path plain = Files.write(directory.resolve("pg-1.jsonl"), bytes);
+        Path zstd = directory.resolve("pg-2.jsonl.zst");
+        try (var out = new com.github.luben.zstd.ZstdOutputStream(Files.newOutputStream(zstd))) {
+            out.write(bytes);
+        }
+        List<String> expected = byReadLine(ServerTrace.open(plain));
+        assertTrue(expected.size() > 500);
+        assertEquals(expected, byScanner(plain));
+        assertEquals(expected, byScanner(zstd));
+        assertEquals(List.of("0 end"), byScanner(Files.write(directory.resolve("pg-3.jsonl"), new byte[0])));
     }
 }

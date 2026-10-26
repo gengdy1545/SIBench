@@ -257,9 +257,9 @@ public class VersionedLookupTest {
                                             "workload_operations",
                                             17,
                                             "baseline_trace_sha256",
-                                            BaselineGenerator.sha256(baseline),
+                                            org.sibench.capture.IndexOperationTrace.sha256(baseline),
                                             "workload_trace_sha256",
-                                            BaselineGenerator.sha256(workload),
+                                            org.sibench.capture.IndexOperationTrace.sha256(workload),
                                             "work_units_sha256",
                                             BaselineGenerator.sha256(
                                                     directory.resolve("work-units.jsonl")))));

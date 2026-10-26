@@ -115,9 +115,9 @@ public class ReferenceReplayTest {
                                     "workload_operations",
                                     1L,
                                     "baseline_trace_sha256",
-                                    BaselineGenerator.sha256(baseline),
+                                    org.sibench.capture.IndexOperationTrace.sha256(baseline),
                                     "workload_trace_sha256",
-                                    BaselineGenerator.sha256(workload)));
+                                    org.sibench.capture.IndexOperationTrace.sha256(workload)));
             String identities =
                     "{\"work_unit_id\":1,\"source_event\":1,\"pid\":1,\"application\":\"request\"}\n";
             Files.writeString(units, identities);

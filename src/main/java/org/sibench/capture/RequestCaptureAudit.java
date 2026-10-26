@@ -25,7 +25,7 @@ public final class RequestCaptureAudit {
         boolean clientTransactionOpen = false;
         long clientCommits = 0, clientRollbacks = 0;
         int backendPid = 0, connections = 0, closes = 0;
-        try (var input = Files.newBufferedReader(jdbc)) {
+        try (var input = ServerTrace.open(jdbc)) {
             String line;
             while ((line = input.readLine()) != null) {
                 JsonObject e = JsonParser.parseString(line).getAsJsonObject();

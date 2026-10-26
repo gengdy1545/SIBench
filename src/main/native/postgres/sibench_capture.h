@@ -32,9 +32,6 @@ extern void *sibench_bitmap_heap_node;
  */
 extern int sibench_depth;
 extern uint64 sibench_request;
-/* Completion counter of the last snapshot this backend built, kept because a copied or imported
- * snapshot loses the field GetSnapshotData() set. */
-extern uint64 sibench_snapshot_csn;
 
 extern bool sib_enabled(void);
 extern bool sib_relation(Relation relation);

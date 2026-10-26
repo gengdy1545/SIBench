@@ -27,7 +27,48 @@ public final class SnapshotLookupValidation {
     private static final int RANGE_ANCHORS = 4;
     private static final int RANGE_LIMIT = 32;
 
-    private record Key(int table, IndexKey key) {}
+    /**
+     * A row by table and primary key, hashed with {@link org.sibench.trace.KeyHash}: the key's
+     * own hash collides heavily on integer keys and turned this oracle's maps into trees.
+     */
+    private static final class Key {
+        private final int table;
+        private final IndexKey key;
+        private final int hash;
+
+        Key(int table, IndexKey key) {
+            this.table = table;
+            this.key = key;
+            this.hash = 31 * table + mixed(key);
+        }
+
+        int table() {
+            return table;
+        }
+
+        IndexKey key() {
+            return key;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof Key that && table == that.table && key.equals(that.key);
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+
+        @Override
+        public String toString() {
+            return "Key[table=" + table + ", key=" + key + "]";
+        }
+    }
+
+    static int mixed(IndexKey key) {
+        return org.sibench.trace.KeyHash.of(key.bytes());
+    }
 
     private record Predicate(int table, int index, IndexKey value) {}
 
@@ -134,7 +175,8 @@ public final class SnapshotLookupValidation {
         final int table, index;
         final Range range;
         final TreeSet<Entry> unchanged;
-        final Map<IndexKey, History> changed = new LinkedHashMap<>();
+        // Rows of one table, each once: only iterated, so no map (integer keys' own hash collides).
+        final List<Map.Entry<IndexKey, History>> changed = new ArrayList<>();
         final SortedSet<Long> times = new TreeSet<>();
 
         RangeProbe(int table, int index, Range range) {
@@ -170,7 +212,7 @@ public final class SnapshotLookupValidation {
         List<LookupResult> expected(long time, boolean rowIds) {
             var candidates = new TreeMap<Entry, LookupResult>(unchanged.comparator());
             for (Entry entry : unchanged) candidates.put(entry, entry.result(rowIds));
-            for (var change : changed.entrySet()) {
+            for (var change : changed) {
                 Row row = change.getValue().at(time);
                 if (contains(change.getKey(), row))
                     candidates.put(
@@ -238,8 +280,8 @@ public final class SnapshotLookupValidation {
             throws IOException {
         if (Files.exists(report))
             throw new IOException("Snapshot report already exists: " + report);
-        Path baseline = directory.resolve("baseline.ops"),
-                workload = directory.resolve("workload.ops");
+        var baseline = org.sibench.capture.BaselineOperations.of(directory);
+        Path workload = directory.resolve("workload.ops");
         var preflight = ReferenceReplay.check(directory, config);
         JsonObject manifest =
                 JsonParser.parseString(Files.readString(directory.resolve("manifest.json")))
@@ -256,8 +298,9 @@ public final class SnapshotLookupValidation {
         if (!verification.get("status").getAsString().equals("verified_complete")
                 || !BaselineGenerator.sha256(sourceBaseline.resolve("files.jsonl"))
                         .equals(verification.get("files_manifest_sha256").getAsString())
-                || !BaselineGenerator.sha256(sourceBaseline.resolve("locators.tsv"))
-                        .equals(verification.get("locators_sha256").getAsString()))
+                || verification.has("locators_sha256")
+                        && !BaselineGenerator.sha256(sourceBaseline.resolve("locators.tsv"))
+                                .equals(verification.get("locators_sha256").getAsString()))
             throw new IOException("Independent baseline manifests changed or are incomplete");
         for (var item : verification.getAsJsonArray("files"))
             verifyFile(sourceBaseline, item.getAsJsonObject());
@@ -467,11 +510,13 @@ public final class SnapshotLookupValidation {
         for (RangeProbe probe : probes) {
             probe.times.addAll(List.of(0L, lastCommit[0]));
             long first = Long.MAX_VALUE;
+            // Only a row whose entry lies in the range at some version can ever be returned, so
+            // each probe keeps those alone; keeping every changed row of the table in every probe
+            // made memory the probe count times the changed rows.
             for (var change : histories.entrySet())
-                if (change.getKey().table() == probe.table) {
-                    probe.changed.put(change.getKey().key(), change.getValue());
-                    if (probe.ever(change.getKey().key(), change.getValue()))
-                        first = Math.min(first, change.getValue().commits.firstKey());
+                if (change.getKey().table() == probe.table && probe.ever(change.getKey().key(), change.getValue())) {
+                    probe.changed.add(Map.entry(change.getKey().key(), change.getValue()));
+                    first = Math.min(first, change.getValue().commits.firstKey());
                 }
             if (first != Long.MAX_VALUE) {
                 probe.times.add(first - 1);
@@ -483,7 +528,7 @@ public final class SnapshotLookupValidation {
             try (var model = new IndexReferenceReplay(rowIds, config.secondaryIndexes());
                     var load = new ReplayProjection(config, false, model::accept);
                     var runtime = new ReplayProjection(config, true, model::accept)) {
-                IndexOperationTrace.read(baseline, load);
+                baseline.read(load);
                 load.finish();
                 IndexOperationTrace.read(workload, runtime);
                 runtime.finish();
@@ -532,13 +577,13 @@ public final class SnapshotLookupValidation {
                 for (var entry : buckets.entrySet()) {
                     Predicate predicate = entry.getKey();
                     Keys keys = entry.getValue();
-                    var relevant = new LinkedHashMap<IndexKey, History>();
+                    var relevant = new ArrayList<Map.Entry<IndexKey, History>>();
                     var times = new TreeSet<Long>(List.of(0L, lastCommit[0]));
                     long first = Long.MAX_VALUE;
                     for (var change : histories.entrySet())
                         if (change.getKey().table() == predicate.table()
                                 && matchesHistory(change.getValue(), predicate)) {
-                            relevant.put(change.getKey().key(), change.getValue());
+                            relevant.add(Map.entry(change.getKey().key(), change.getValue()));
                             first = Math.min(first, change.getValue().commits.firstKey());
                         }
                     if (first != Long.MAX_VALUE) {
@@ -547,7 +592,7 @@ public final class SnapshotLookupValidation {
                     }
                     for (long time : times) {
                         long expectedCount = keys.size;
-                        for (var change : relevant.entrySet()) {
+                        for (var change : relevant) {
                             if (keys.contains(change.getKey())) expectedCount--;
                             if (matches(change.getValue().at(time), predicate)) expectedCount++;
                         }
@@ -624,8 +669,9 @@ public final class SnapshotLookupValidation {
                 "provenance",
                 "derived_history_validation_from_independent_parquet_rows_not_native_queries");
         output.put("preflight", preflight);
-        output.put("baseline_trace_sha256", BaselineGenerator.sha256(baseline));
-        output.put("workload_trace_sha256", BaselineGenerator.sha256(workload));
+        // A derived load was checked against this digest when it was read.
+        output.put("baseline_trace_sha256", manifest.get("baseline_trace_sha256").getAsString());
+        output.put("workload_trace_sha256", IndexOperationTrace.sha256(workload));
         output.put("changed_primary_keys", histories.size());
         output.put("secondary_predicate_sample_limit_per_index", SECONDARY_PREDICATES);
         output.put("sampled_secondary_predicates", buckets.size());

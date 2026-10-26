@@ -98,12 +98,18 @@ public final class IndexTraceCompiler {
      * built in the same pass must match; without them the completeness check is left to a
      * separate {@code check-capture-completeness}.
      */
-    public record Checks(Path rowAudit, Path certification, Path countersBefore, Path countersAfter) {
+    public record Checks(
+            Path rowAudit, Path certification, Path countersBefore, Path countersAfter, Path runJar) {
         public Checks {
             if (rowAudit != null && certification != null)
                 throw new IllegalArgumentException("A capture is verified by its row audit or a certification, not both");
             if ((countersBefore == null) != (countersAfter == null))
                 throw new IllegalArgumentException("Index counters come as a before and after pair");
+        }
+
+        /** Checks without the capture's run jar, which only a certified compilation reads. */
+        public Checks(Path rowAudit, Path certification, Path countersBefore, Path countersAfter) {
+            this(rowAudit, certification, countersBefore, countersAfter, null);
         }
 
         public static Checks rowAudit(Path report) {
@@ -118,6 +124,10 @@ public final class IndexTraceCompiler {
         if (checks.certification() == null && checks.rowAudit() == null)
             checks = new Checks(
                     RowStateAudit.defaultReport(capture.raw()), null, checks.countersBefore(), checks.countersAfter());
+        else if (checks.certification() != null && checks.runJar() == null)
+            checks = new Checks(
+                    null, checks.certification(), checks.countersBefore(), checks.countersAfter(),
+                    Certification.runJar(capture.artifacts()));
         return compile(capture.schema(), capture.layout(), capture.raw(), output, checks);
     }
 
@@ -191,7 +201,10 @@ public final class IndexTraceCompiler {
             // The certification vouches for the row changes; the baseline is still checked here.
             certificate =
                     Certification.require(
-                            checks.certification(), raw, IndexCatalog.fromSchema(sourceSchema).provenance());
+                            checks.certification(),
+                            raw,
+                            checks.runJar(),
+                            IndexCatalog.fromSchema(sourceSchema).provenance());
             PgBaselineVerify.verifyFiles(baseline);
         } else RowStateAudit.reuse(sourceSchema, baseline, raw, auditReport);
         Path verified = baseline.resolve("verified-manifest.json");
@@ -213,45 +226,40 @@ public final class IndexTraceCompiler {
         long maximumRowId = 0, maximumFileId = 0, baselineCount, baselineRows = 0;
         String baselineDigest, workloadDigest;
         RunTiming.current().phase("baseline");
-        var baselineOperations = new IndexOperationTrace.Writer(output.resolve("baseline.ops"));
+        // The baseline load is derived again by every reader (BaselineOperations), so only its
+        // count and the digest of the file it would form are recorded.
+        var baselineOperations = new WriterThread(new IndexOperationTrace.Writer(null), "baseline-writer");
         try (var operations = baselineOperations) {
-            for (String line : Files.readAllLines(baseline.resolve("files.jsonl"))) {
-                JsonObject file = JsonParser.parseString(line).getAsJsonObject();
-                String table = file.get("table").getAsString();
-                int tableId = catalog.tableId(table);
-                long fileId = file.get("file_id").getAsLong();
-                maximumFileId = Math.max(maximumFileId, fileId);
-                long position = 0;
-                try (ParquetReader<Group> reader = reader(baseline.resolve(file.get("path").getAsString()));
-                        var identity = identities.baseline(tableId)) {
-                    Group row;
-                    while ((row = reader.read()) != null) {
-                        schemas.putIfAbsent(
-                                table, new MessageType(table, row.getType().getFields()));
-                        long rowId = row.getLong("_sib_row_id", 0);
-                        maximumRowId = Math.max(maximumRowId, rowId);
-                        Operation primary =
-                                IndexOperationTrace.write(
-                                                0,
-                                                IndexOperationTrace.INSERT,
-                                                tableId,
-                                                0,
-                                                catalog.primaryKey(table, row),
-                                                0,
-                                                fileId,
-                                                position++,
-                                                rowId)
-                                        .withWorkUnitId(
-                                                1 + baselineRows++ / IndexOperationTrace.BLOCK_RECORDS);
-                        identity.add(primary.key(), rowId);
-                        IndexMutation.emit(
-                                primary, Map.of(), catalog.keys(table, row), operations::append);
-                    }
-                    identity.finish();
-                }
-                if (position != file.get("rows").getAsLong())
-                    throw new IOException("Baseline manifest row mismatch");
-            }
+            var extent =
+                    BaselineOperations.derive(
+                            baseline,
+                            catalog,
+                            operations,
+                            new BaselineOperations.Rows() {
+                                RowIdentities.Baseline identity;
+
+                                @Override
+                                public void file(String table, int tableId) throws IOException {
+                                    identity = identities.baseline(tableId);
+                                }
+
+                                @Override
+                                public void row(String table, org.apache.parquet.schema.GroupType type, Operation primary)
+                                        throws IOException {
+                                    if (!schemas.containsKey(table)) schemas.put(table, new MessageType(table, type.getFields()));
+                                    identity.add(primary.key(), primary.rowId());
+                                }
+
+                                @Override
+                                public void fileFinished() throws IOException {
+                                    try (var finished = identity) {
+                                        finished.finish();
+                                    }
+                                }
+                            });
+            maximumRowId = extent.maximumRowId();
+            maximumFileId = extent.maximumFileId();
+            baselineRows = extent.rows();
             baselineCount = operations.count();
         }
         baselineDigest = baselineOperations.sha256();
@@ -262,12 +270,10 @@ public final class IndexTraceCompiler {
         state.firstIncrementalFile = maximumFileId;
         var sessionReports = new ArrayList<Map<String, Object>>();
         RunTiming.current().phase("workload");
-        var workloadOperations = new IndexOperationTrace.Writer(output.resolve("workload.ops"));
+        var workloadOperations = new WriterThread(new IndexOperationTrace.Writer(output.resolve("workload.ops")), "workload-writer");
+        var workUnits = WorkUnits.create(output);
         try (var operations = workloadOperations;
-                var units =
-                        Files.newBufferedWriter(
-                                output.resolve("work-units.jsonl"),
-                                StandardOpenOption.CREATE_NEW)) {
+                var units = workUnits.lines()) {
             state.operations = operations;
             state.units = units;
             if (concurrent) sessionReports.addAll(state.merge(sessions.files()));
@@ -339,7 +345,7 @@ public final class IndexTraceCompiler {
                 "one audited top-level source SQL execution, numbered in source order before"
                         + " abort/secondary filtering");
         report.put(
-                "work_units_sha256", BaselineGenerator.sha256(output.resolve("work-units.jsonl")));
+                "work_units_sha256", HexFormat.of().formatHex(workUnits.digest().digest()));
         report.put("workload_operations", state.operationsCount);
         report.put("searched_accesses", state.searches);
         report.put("search_operations", state.partSearches);
@@ -512,7 +518,7 @@ public final class IndexTraceCompiler {
         final List<Map<String, Object>> files = new ArrayList<>();
         /** Committed changes per table and operation: the change classes a capture exercised. */
         final Map<String, Map<String, Long>> changesByTable = new TreeMap<>();
-        IndexOperationTrace.Writer operations;
+        WriterThread operations;
         BufferedWriter units;
         long maximumRowId, firstIncrementalFile, event, version, operationsCount;
         long requestUnits, currentUnit, mutations, searches, rawInserts, inserts, updates;
@@ -578,22 +584,28 @@ public final class IndexTraceCompiler {
             var accessUnits = new long[files.size()];
             // Each file's first part names its capture format; later parts inherit it.
             var details = new AccessUnits.Detail[files.size()];
-            try (SessionMerge merge = SessionMerge.open(files)) {
+            // Each session's access tracking runs ahead on its own thread (SessionTracking); the
+            // merge replays its calls where they were made.
+            try (SessionMerge merge = SessionMerge.open(files, SessionTracking::new)) {
                 while (merge.hasNext()) {
                     var chunk = merge.next();
                     long firstEvent = event + 1, sessionRequests = requestUnits, unitsBefore = ledger.settled();
                     pid = 0;
                     sessionFile = files.get(chunk.session()).getFileName().toString();
-                    var tracker = new AccessUnits(this);
-                    if (details[chunk.session()] == null) tracker.beginSession();
-                    else tracker.continueSession(details[chunk.session()]);
                     // The final record is line lineCount, so its ordinal is known now.
                     knownCommit = chunk.committed();
                     knownEvent = event + chunk.lineCount();
-                    for (String line; (line = merge.line()) != null; ) line(line, tracker);
-                    details[chunk.session()] = tracker.detail();
-                    tracker.endSession();
-                    ledger.absorb(tracker);
+                    SessionTracking.Tracked last = null;
+                    for (Object item; (item = merge.item()) != null; ) {
+                        last = (SessionTracking.Tracked) item;
+                        event(last.event, null, last);
+                    }
+                    if (last == null || last.endCalls == null)
+                        throw new IOException("Session trace changed while it was merged");
+                    details[chunk.session()] = last.detail;
+                    replay(last.endCalls);
+                    rethrow(last.endFailure);
+                    ledger.absorb(last.tracker);
                     finishSession();
                     accessUnits[chunk.session()] += ledger.settled() - unitsBefore;
                     events[chunk.session()] += event - firstEvent + 1;
@@ -628,15 +640,29 @@ public final class IndexTraceCompiler {
         }
 
         private void line(String line, AccessUnits tracker) throws IOException {
+            event(Event.parse(line), tracker, null);
+        }
+
+        /**
+         * One event, routed by {@code tracker} here or, when {@code tracked} is given, by its
+         * session's tracker ahead of the merge, whose calls are replayed first.
+         */
+        private void event(Event e, AccessUnits tracker, SessionTracking.Tracked tracked) throws IOException {
             event++;
             RunTiming.current().advance(1);
-            JsonObject e = JsonParser.parseString(line).getAsJsonObject();
-            int eventPid = e.get("pid").getAsInt();
+            int eventPid = e.pid();
             if (pid == 0) pid = eventPid;
             else if (pid != eventPid)
                 throw new IOException("One session trace must contain one backend");
-            String type = e.get("event").getAsString();
-            ledger.event(e, tracker.accept(e));
+            String type = e.type();
+            boolean routed;
+            if (tracked == null) routed = tracker.accept(e);
+            else {
+                replay(tracked.calls);
+                rethrow(tracked.failure);
+                routed = tracked.tracked;
+            }
+            ledger.event(e, routed);
             switch (type) {
                 case "executor_start" -> {
                     transactionOpen = true;
@@ -658,7 +684,7 @@ public final class IndexTraceCompiler {
         }
 
         @Override
-        public void requestStarted(Request request, JsonObject e) throws IOException {
+        public void requestStarted(Request request, Event e) throws IOException {
             currentUnit = ++requestUnits;
             JsonObject identity = new JsonObject();
             identity.addProperty("work_unit_id", currentUnit);
@@ -670,13 +696,39 @@ public final class IndexTraceCompiler {
             units.newLine();
         }
 
+        /** A session tracker's calls, made again in the order it made them. */
+        private void replay(List<SessionTracking.Call> calls) throws IOException {
+            for (var call : calls)
+                switch (call.kind()) {
+                    case SessionTracking.Call.REQUEST_STARTED -> requestStarted(call.request(), null);
+                    case SessionTracking.Call.REQUEST_FINISHED -> requestFinished(call.request());
+                    case SessionTracking.Call.UNIT_STARTED -> started(call.unit(), call.group(), call.first());
+                    case SessionTracking.Call.UNIT_SETTLED -> settled(call.unit(), call.group());
+                    case SessionTracking.Call.GROUP_FORMED -> formed(call.group(), call.members());
+                    default -> groupSettled(call.group());
+                }
+        }
+
+        private static void rethrow(Throwable failure) throws IOException {
+            if (failure == null) return;
+            if (failure instanceof IOException io) throw io;
+            if (failure instanceof RuntimeException runtime) throw runtime;
+            if (failure instanceof Error error) throw error;
+            throw new IOException(failure);
+        }
+
         @Override
-        public void unitStarted(Unit unit, JsonObject e) throws IOException {
+        public void unitStarted(Unit unit, Event e) throws IOException {
+            started(unit, unit.group, unit.group != null && unit.group.members.get(0) == unit);
+        }
+
+        /** {@code group} and {@code first}: the unit's BitmapAnd group as it started, and whether it was the group's first input. */
+        private void started(Unit unit, AccessUnits.BitmapGroup group, boolean first) throws IOException {
             if (unit.source == AccessUnits.Source.PLANNER_PROBE) return;
             // A BitmapAnd group is one access, placed where its first input started.
-            if (unit.group != null && unit.group.members.get(0) != unit) return;
+            if (group != null && !first) return;
             Search search = new Search(event, readTimestampFor(unit), pendingMutations, currentUnit);
-            if (unit.group != null) liveGroups.put(unit.group, search);
+            if (group != null) liveGroups.put(group, search);
             else live.put(unit, search);
             pending.add(search);
         }
@@ -752,8 +804,12 @@ public final class IndexTraceCompiler {
 
         @Override
         public void unitSettled(Unit unit) throws IOException {
+            settled(unit, unit.group);
+        }
+
+        private void settled(Unit unit, AccessUnits.BitmapGroup group) throws IOException {
             ledger.unit(unit);
-            if (unit.group != null) return;
+            if (group != null) return;
             Decision decision = AccessProjection.decide(unit, catalog, cCollation);
             ledger.record(unit, decision);
             Search search = live.remove(unit);
@@ -774,8 +830,13 @@ public final class IndexTraceCompiler {
          */
         @Override
         public void groupFormed(AccessUnits.BitmapGroup group) throws IOException {
+            formed(group, group.members);
+        }
+
+        /** {@code members}: the group's inputs as it formed; later ones join it as they start. */
+        private void formed(AccessUnits.BitmapGroup group, List<Unit> members) throws IOException {
             Search first = null;
-            for (Unit unit : group.members) {
+            for (Unit unit : members) {
                 Search search = live.remove(unit);
                 if (search == null) throw new IOException("Bitmap input without a search position");
                 if (first == null) first = search;
@@ -809,20 +870,22 @@ public final class IndexTraceCompiler {
                             + unit.request.sql);
         }
 
-        private void change(JsonObject e) throws IOException {
+        private void change(Event e) throws IOException {
             String relation = e.get("relation").getAsString();
             var table =
                     catalog.schema().tables().stream()
                             .filter(t -> t.name().equals(relation))
                             .findFirst()
                             .orElseThrow(() -> new IOException("Unknown source row table"));
-            SourceRow.requireStablePrimaryKey(table, e);
+            // Row changes are few next to index events; they keep the Gson form SourceRow reads.
+            JsonObject row = e.json();
+            SourceRow.requireStablePrimaryKey(table, row);
             long xid = e.get("xid").getAsLong();
             if (pendingMutations != 0 && pendingXid != xid)
                 throw new IOException("Interleaved transactions unsupported");
             pendingXid = xid;
             transactionOpen = true;
-            pending.add(new Change(e, event, currentUnit));
+            pending.add(new Change(row, event, currentUnit));
             rawMutations++;
             pendingMutations++;
         }
@@ -872,7 +935,7 @@ public final class IndexTraceCompiler {
             transactionRequest = false;
         }
 
-        private void abort(JsonObject e) throws IOException {
+        private void abort(Event e) throws IOException {
             requireSettled();
             if (pendingMutations != 0 && pendingXid != e.get("xid").getAsLong())
                 throw new IOException("Abort XID mismatch");
@@ -920,7 +983,7 @@ public final class IndexTraceCompiler {
             else if (behind) snapshotSearches++;
         }
 
-        private void commit(JsonObject e) throws IOException {
+        private void commit(Event e) throws IOException {
             requireSettled();
             if (pendingMutations != 0 && pendingXid != e.get("xid").getAsLong())
                 throw new IOException("Commit XID mismatch");

@@ -173,7 +173,7 @@ final class CaptureRun implements AutoCloseable {
             try (var paths = Files.list(directory)) {
                 for (Path path : paths.sorted().toList()) {
                     String name = path.getFileName().toString();
-                    if (name.startsWith("jdbc-") && name.endsWith(".jsonl")) {
+                    if (name.startsWith("jdbc-") && (name.endsWith(".jsonl") || name.endsWith(".jsonl.zst"))) {
                         int pid = connectionPid(path);
                         if (clients.put(pid, path) != null)
                             throw new IOException("Several JDBC traces for backend " + pid);
@@ -264,7 +264,7 @@ final class CaptureRun implements AutoCloseable {
     }
 
     static int connectionPid(Path jdbc) throws IOException {
-        try (var input = Files.newBufferedReader(jdbc)) {
+        try (var input = ServerTrace.open(jdbc)) {
             String line = input.readLine();
             if (line == null) throw new IOException("Empty JDBC trace: " + jdbc.getFileName());
             JsonObject first = JsonParser.parseString(line).getAsJsonObject();
@@ -307,6 +307,12 @@ final class CaptureRun implements AutoCloseable {
     /** The code the run executes; see {@link CaptureBuild}. */
     synchronized void build(Map<String, Object> identity) throws IOException {
         manifest.put("build", identity);
+        publish();
+    }
+
+    /** The server's configured parameters; the plan-relevant ones are also in the build. */
+    synchronized void postgresSettings(Map<String, String> settings) throws IOException {
+        manifest.put("postgres_settings", settings);
         publish();
     }
 
@@ -397,8 +403,12 @@ final class CaptureRun implements AutoCloseable {
             for (int i = 0; i < pairs.size(); i++) results.add(null);
             for (int i : order) {
                 Pair pair = pairs.get(i);
-                // About eight heap bytes per JDBC trace byte, measured on HyBench TP sessions.
-                long client = pair.client() == null ? 0 : Files.size(pair.client());
+                // About eight heap bytes per JDBC trace byte, measured on HyBench TP sessions; a
+                // zstd trace holds about fourteen times its size in lines.
+                long client =
+                        pair.client() == null
+                                ? 0
+                                : Files.size(pair.client()) * (pair.client().toString().endsWith(".zst") ? 14 : 1);
                 int cost = (int) Math.min(budget, 64 + (client * 8 >> 20));
                 results.set(i, executor.submit(() -> {
                     heap.acquire(cost);
@@ -471,6 +481,9 @@ final class CaptureRun implements AutoCloseable {
         }
         if (inventory.isEmpty()) throw new IOException("Capture has no sessions");
         verifyInventory(directory, inventory);
+        var files = new java.util.ArrayList<Path>();
+        for (String name : inventory) files.add(checkedPath(directory, name));
+        FileDigests.prefetch(files);
         for (var item : doc.getAsJsonArray("sessions")) {
             var session = item.getAsJsonObject();
             Path server = checkedPath(directory, session.get("pg_file").getAsString());

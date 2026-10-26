@@ -31,9 +31,7 @@ public final class RelocationCheck {
         IndexCatalog catalog = IndexCatalog.fromManifest(manifest);
         Map<Key, Operation> latest = new LinkedHashMap<>();
         long[] maximumFile = {0};
-        IndexOperationTrace.read(
-                input.resolve("baseline.ops"),
-                o -> maximumFile[0] = Math.max(maximumFile[0], o.file()));
+        BaselineOperations.of(input).read(o -> maximumFile[0] = Math.max(maximumFile[0], o.file()));
         IndexOperationTrace.read(
                 input.resolve("workload.ops"),
                 o -> {
@@ -156,7 +154,7 @@ public final class RelocationCheck {
                     var load = new ReplayProjection(ReplayConfig.defaults(), false, model::accept);
                     var runtime =
                             new ReplayProjection(ReplayConfig.defaults(), true, model::accept)) {
-                IndexOperationTrace.read(input.resolve("baseline.ops"), load);
+                BaselineOperations.of(input).read(load);
                 load.finish();
                 IndexOperationTrace.read(input.resolve("workload.ops"), runtime);
                 runtime.finish();
@@ -218,7 +216,7 @@ public final class RelocationCheck {
                                         "results",
                                         results,
                                         "trace_sha256",
-                                        BaselineGenerator.sha256(output.resolve("relocation.ops")),
+                                        IndexOperationTrace.sha256(output.resolve("relocation.ops")),
                                         "scope",
                                         "Forced latest-only control over all live modified tables"
                                             + " and source indexes; no protected historical-version"

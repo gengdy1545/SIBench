@@ -2,7 +2,6 @@ package org.sibench.schema;
 
 import static org.sibench.config.ConfigValues.*;
 
-import org.sibench.generation.BaselineGenerator;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -233,7 +232,7 @@ public final class SourceSchema {
 
     private static Map<String, String> hashes(Path source, String... paths) throws IOException {
         var result = new LinkedHashMap<String, String>();
-        for (String path : paths) result.put(path, BaselineGenerator.sha256(source.resolve(path)));
+        for (String path : paths) result.put(path, org.sibench.config.Digests.sha256(source.resolve(path)));
         return result;
     }
 

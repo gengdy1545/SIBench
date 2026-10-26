@@ -56,11 +56,11 @@ final class AccessUnits {
     }
 
     interface Listener {
-        default void requestStarted(Request request, JsonObject event) throws IOException {}
+        default void requestStarted(Request request, Event event) throws IOException {}
 
         default void requestFinished(Request request) throws IOException {}
 
-        default void unitStarted(Unit unit, JsonObject event) throws IOException {}
+        default void unitStarted(Unit unit, Event event) throws IOException {}
 
         default void unitSettled(Unit unit) throws IOException {}
 
@@ -191,6 +191,8 @@ final class AccessUnits {
         /** The bitmap combination this scan feeds, and its BitmapAnd group when it has one. */
         Combination combination = Combination.SINGLE;
         BitmapGroup group;
+        /** The ledger's decision label, held from the unit's decision until its request finishes. */
+        String decision;
         /**
          * The identities of the visible rows, in scan order, kept as runs of equal indexed values:
          * completed runs (only for array keys, whose elements each need their own count), the
@@ -203,12 +205,18 @@ final class AccessUnits {
         final List<JsonElement> lastPks = new ArrayList<>();
         boolean identityMissing;
 
+        /** Whether a scan key is an array; the keys are fixed when the scan starts. */
+        private final boolean arrayKeys;
+
         Unit(Scan scan, Source source, JsonArray keys, Request request, int depth) {
             this.scan = scan;
             this.source = source;
             this.keys = keys;
             this.request = request;
             this.depth = depth;
+            boolean array = false;
+            for (JsonElement key : keys) array |= key.getAsJsonObject().has("array");
+            this.arrayKeys = array;
         }
 
         boolean bitmap() {
@@ -271,9 +279,7 @@ final class AccessUnits {
         }
 
         boolean arrayKeys() {
-            for (JsonElement key : keys)
-                if (key.getAsJsonObject().has("array")) return true;
-            return false;
+            return arrayKeys;
         }
 
         /** One visible row, in scan order: extends the last run or starts the next. */
@@ -356,10 +362,10 @@ final class AccessUnits {
     }
 
     /** Routes one event; returns false for events that are not part of request/scan tracking. */
-    boolean accept(JsonObject e) throws IOException {
+    boolean accept(Event e) throws IOException {
         if (!e.has("req") || !e.has("depth"))
             throw new IOException("Trace lacks request ordinals and executor depth");
-        String type = e.get("event").getAsString();
+        String type = e.type();
         int depth = e.get("depth").getAsInt();
         Session state = session;
         boolean first = !state.seenEvent;
@@ -564,7 +570,7 @@ final class AccessUnits {
         return and ? Combination.AND : Combination.OR;
     }
 
-    private void startRequest(JsonObject e) throws IOException {
+    private void startRequest(Event e) throws IOException {
         finishRequest();
         Session state = session;
         state.current =
@@ -580,7 +586,7 @@ final class AccessUnits {
         listener.requestStarted(state.current, e);
     }
 
-    private void rescan(JsonObject e, int depth) throws IOException {
+    private void rescan(Event e, int depth) throws IOException {
         Session state = session;
         String id = e.get("scan").getAsString(), index = e.get("relation").getAsString();
         Scan scan = state.scans.get(id);
@@ -649,7 +655,7 @@ final class AccessUnits {
                 && (key.get("flags").getAsInt() & SK_SEARCHNOTNULL) != 0;
     }
 
-    private void fetch(JsonObject e, String type) throws IOException {
+    private void fetch(Event e, String type) throws IOException {
         Scan scan = session.scans.get(e.get("scan").getAsString());
         if (scan == null || scan.current == null)
             throw new IOException("Index event without an access unit: " + type);
@@ -687,7 +693,7 @@ final class AccessUnits {
     }
 
     /** The identity of one visible heap row: the scanning index's value and the table's PK. */
-    private static void identity(Unit unit, JsonObject e) throws IOException {
+    private static void identity(Unit unit, Event e) throws IOException {
         if (!e.has("row"))
             throw new IOException(
                     "Visible heap row without its identity; recapture with the current"
@@ -702,7 +708,7 @@ final class AccessUnits {
         unit.row(indexed.get(0), pk.get(0));
     }
 
-    private BitmapHeap heap(JsonObject e) throws IOException {
+    private BitmapHeap heap(Event e) throws IOException {
         BitmapHeap heap = session.heaps.get(e.get("heap").getAsString());
         if (heap == null) throw new IOException("Bitmap heap event without a plan binding");
         return heap;
@@ -724,7 +730,7 @@ final class AccessUnits {
      * visible matches. A BitmapAnd checks only the intersection of its group's inputs: every
      * input of the cycle must have produced the TID, and the group counts it once.
      */
-    private void verdict(JsonObject e) throws IOException {
+    private void verdict(Event e) throws IOException {
         BitmapHeap heap = heap(e);
         String tid = e.get("tid").getAsString();
         boolean found = e.get("found").getAsBoolean(), claimed = false;
@@ -756,7 +762,7 @@ final class AccessUnits {
      * whose current unit produced the TID. Written before any of those units changes, so the
      * attribution is the one each TID's own verdict would make.
      */
-    private void verdicts(JsonObject e) throws IOException {
+    private void verdicts(Event e) throws IOException {
         if (session.detail == Detail.LEGACY)
             throw new IOException("Bitmap verdict summary in a per-row capture");
         BitmapHeap heap = heap(e);
@@ -836,7 +842,7 @@ final class AccessUnits {
      * The facts of the scan's current unit, written right before the event that settles it. In a
      * ROWS capture every fact must equal what the unit's per-row events added up to.
      */
-    private void summary(JsonObject e) throws IOException {
+    private void summary(Event e) throws IOException {
         if (session.detail == Detail.LEGACY)
             throw new IOException("Scan summary in a per-row capture");
         String id = e.get("scan").getAsString();
@@ -922,12 +928,12 @@ final class AccessUnits {
         if (intersection != null) unit.group.summarizedIntersection = intersection;
     }
 
-    private static void same(List<String> differences, String field, JsonObject e, long value) {
+    private static void same(List<String> differences, String field, Event e, long value) {
         if (e.get(field).getAsLong() != value)
             differences.add(field + " " + e.get(field) + " != " + value);
     }
 
-    private static void same(List<String> differences, String field, JsonObject e, boolean value) {
+    private static void same(List<String> differences, String field, Event e, boolean value) {
         if (e.get(field).getAsBoolean() != value)
             differences.add(field + " " + e.get(field) + " != " + value);
     }
@@ -936,7 +942,7 @@ final class AccessUnits {
      * The rows one execution returned, from its return. A ROWS capture also has them one by one,
      * and their number must match.
      */
-    private void returned(JsonObject e, int depth) throws IOException {
+    private void returned(Event e, int depth) throws IOException {
         if (!e.has("returned")) throw new IOException("Executor return without its result rows");
         long returned = e.get("returned").getAsLong();
         if (session.detail == Detail.ROWS) {

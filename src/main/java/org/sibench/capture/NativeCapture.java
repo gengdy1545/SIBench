@@ -3,13 +3,9 @@ package org.sibench.capture;
 import com.google.gson.GsonBuilder;
 
 import org.sibench.schema.PgSchemaCheck;
-import org.sibench.schema.SourceSchema;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.Statement;
 import java.util.LinkedHashMap;
 
 /**
@@ -18,7 +14,6 @@ import java.util.LinkedHashMap;
  * one.
  */
 public final class NativeCapture {
-    private static final String LIBRARY = CaptureBuild.ROW_CAPTURE;
 
     private NativeCapture() {}
 
@@ -85,7 +80,7 @@ public final class NativeCapture {
     public static void main(String[] args) throws Exception {
         if (args.length != 3 && args.length != 4)
             throw new IllegalArgumentException(
-                    "NativeCapture paths|base|prepare|check|export|run ROOT CONFIG [TIMING]");
+                    "NativeCapture paths|base|prepare|check|run ROOT CONFIG [TIMING]");
         var timing = RunTiming.open(args.length == 4 ? Path.of(args[3]).toAbsolutePath() : null);
         try {
             timing.phase(args[0]);
@@ -122,8 +117,10 @@ public final class NativeCapture {
                 System.out.println("SIBENCH_PORT=" + config.port());
                 System.out.println("SIBENCH_DATABASE='" + config.database() + "'");
                 System.out.println("SIBENCH_ARTIFACTS='" + config.artifacts() + "'");
+                System.out.println("SIBENCH_BASE='" + config.cloneFrom() + "'");
                 paths(config.document());
             }
+            case "base" -> StillBase.build(config);
             case "prepare" -> prepare(config);
             case "check" ->
                     System.out.println(
@@ -133,14 +130,6 @@ public final class NativeCapture {
                                             config.document(),
                                             config.jdbc(),
                                             config.user())));
-            case "export" -> {
-                PgBaselineExport.export(config.jdbc(), config.layout().output(), config.layout());
-                PgBaselineVerify.verify(
-                        config.jdbc(),
-                        config.user(),
-                        SourceSchema.read(config.root(), config.document()),
-                        config.layout().output());
-            }
             case "run" -> run(config);
             default -> throw new IllegalArgumentException("Unknown stage: " + args[0]);
         }
@@ -161,6 +150,7 @@ public final class NativeCapture {
                 System.out.println("SIBENCH_DATABASE='" + config.database() + "'");
                 System.out.println("SIBENCH_ARTIFACTS='" + config.artifacts() + "'");
                 System.out.println("SIBENCH_WORKDIR='" + config.workDir() + "'");
+                System.out.println("SIBENCH_BASE='" + config.cloneFrom() + "'");
                 paths(config.document());
             }
             case "base" -> HybenchNativeBase.build(config);
@@ -170,15 +160,6 @@ public final class NativeCapture {
                             org.sibench.schema.PgSchemaCheck.json(
                                     org.sibench.schema.PgSchemaCheck.check(
                                             root, config.document(), config.jdbc(), config.user())));
-            case "export" -> {
-                org.sibench.capture.PgBaselineExport.export(
-                        config.jdbc(), config.layout().output(), config.layout());
-                org.sibench.capture.PgBaselineVerify.verify(
-                        config.jdbc(),
-                        config.user(),
-                        org.sibench.schema.SourceSchema.hybench(config.source()),
-                        config.layout().output());
-            }
             case "run" -> {
                 java.nio.file.Files.createDirectories(config.artifacts().resolve("native"));
                 HybenchNativeRun.run(root, Path.of(profile));
@@ -187,42 +168,11 @@ public final class NativeCapture {
         }
     }
 
-    /** New database, native schema and data, row-capture triggers, then statistics. */
+    /** This capture's clone of the still database becomes the profile's database. */
     static void prepare(NativeCaptureConfig config) throws Exception {
-        Path library = config.root().resolve(LIBRARY);
-        if (!Files.isRegularFile(library))
-            throw new IllegalStateException("Row capture library is not built: " + library);
-        Path logs = config.artifacts().resolve("native");
-        String password = System.getenv().getOrDefault("PGPASSWORD", "");
-        // Fail before any database exists when the native client is not the pinned build.
-        if (config.benchmark().equals("ycsb")) YcsbNativeRun.libraries(config);
-        else SysbenchNativeRun.binary(config);
-        try (Connection admin = DriverManager.getConnection(config.adminJdbc(), config.user(), password);
-                Statement statement = admin.createStatement()) {
-            statement.execute(
-                    "CREATE DATABASE "
-                            + config.database()
-                            + " LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0");
-        }
-        if (config.benchmark().equals("ycsb")) YcsbNativeRun.load(config, logs);
-        else SysbenchNativeRun.prepare(config, logs);
-        var schema = SourceSchema.read(config.root(), config.document());
-        try (Connection connection = DriverManager.getConnection(config.jdbc(), config.user(), password);
-                Statement statement = connection.createStatement()) {
-            statement.execute(
-                    "CREATE FUNCTION public.sibench_row_capture() RETURNS trigger AS '"
-                            + library.toString().replace("'", "''")
-                            + "', 'sibench_row_capture' LANGUAGE C");
-            for (var table : schema.tables())
-                statement.execute(
-                        "CREATE TRIGGER sibench_row_capture AFTER INSERT OR UPDATE OR DELETE ON \""
-                                + table.name()
-                                + "\" FOR EACH ROW EXECUTE FUNCTION public.sibench_row_capture()");
-            // Autovacuum is off in the capture cluster. A loaded benchmark database normally has
-            // hint bits, a visibility map and statistics by the time it is measured; VACUUM does
-            // not move live tuples or change any value.
-            statement.execute("VACUUM (ANALYZE)");
-        }
+        StillBase.library(config.root());
+        StillBase.attach(
+                config.root(), config.adminJdbc(), config.user(), config.cloneFrom(), config.database(), config.loadConfig());
     }
 
     static void run(NativeCaptureConfig config) throws Exception {
@@ -231,7 +181,9 @@ public final class NativeCapture {
         try (CaptureRun run = CaptureRun.beginExternal(config.raw(), config.benchmark())) {
             try {
                 CaptureRun.requireQueryIdentity(config.jdbc(), config.user());
-                run.build(CaptureBuild.identity(config.root()));
+                var settings = PgSettings.read(config.jdbc(), config.user());
+                run.build(PgSettings.identity(CaptureBuild.identity(config.root()), settings));
+                run.postgresSettings(settings.all());
                 run.schemaPreflight(
                         PgSchemaCheck.check(
                                 config.root(), config.document(), config.jdbc(), config.user()));

@@ -181,7 +181,7 @@ public class SnapshotLookupValidationTest {
                             SnapshotLookupValidation.spread(new ArrayList<>(changedValues), 4)))
                 probes.add(new RangeProbe(TABLE, 1, range));
             for (RangeProbe probe : probes) {
-                probe.changed.putAll(histories);
+                probe.changed.addAll(histories.entrySet());
                 for (var row : baseline.entrySet()) {
                     IndexKey id = key(row.getKey());
                     if (histories.containsKey(id)) continue;
@@ -243,7 +243,7 @@ public class SnapshotLookupValidationTest {
         var fixture = new Fixture();
         var probe =
                 new RangeProbe(TABLE, 0, new Range(key(18), true, key(22), true, false, 32));
-        probe.changed.putAll(fixture.histories);
+        probe.changed.addAll(fixture.histories.entrySet());
         probe.offer(new Entry(key(18), key(18), 18, 0, 0));
         probe.offer(new Entry(key(22), key(22), 22, 0, 0));
         // 20 is deleted at 2 and reinserted at 6; 21 lives from 3 to 5.

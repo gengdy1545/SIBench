@@ -1,7 +1,5 @@
 package org.sibench.capture;
 
-import org.sibench.generation.BaselineGenerator;
-
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -26,7 +24,7 @@ final class NativeBuildCheck {
                     if (SOURCE_SUFFIXES.stream().noneMatch(name::endsWith)) continue;
                     Path copy = build.resolve(pinned.relativize(file));
                     if (!Files.isRegularFile(copy)
-                            || !BaselineGenerator.sha256(copy).equals(BaselineGenerator.sha256(file)))
+                            || !FileDigests.read(copy).equals(FileDigests.read(file)))
                         throw new IOException(
                                 "Build copy differs from the pinned source: " + pinned.relativize(file));
                     checked++;

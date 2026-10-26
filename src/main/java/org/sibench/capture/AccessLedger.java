@@ -58,15 +58,18 @@ public final class AccessLedger {
     /** One index access of a template: plan node, index, scan kind, source and decision. */
     private record AccessPath(String source, int planNode, String index, String kind, String decision) {}
 
+    private static final Comparator<AccessPath> PATH_ORDER =
+            Comparator.comparing(AccessPath::source)
+                    .thenComparingInt(AccessPath::planNode)
+                    .thenComparing(AccessPath::index)
+                    .thenComparing(AccessPath::kind)
+                    .thenComparing(AccessPath::decision);
+
+    /** Tallied per request and unit, so hashed; the report sorts them. */
     private static final class Template {
-        final Set<String> texts = new TreeSet<>();
-        final Map<String, Long> plans = new TreeMap<>();
-        final Map<AccessPath, Tally> paths = new TreeMap<>(
-                Comparator.comparing(AccessPath::source)
-                        .thenComparingInt(AccessPath::planNode)
-                        .thenComparing(AccessPath::index)
-                        .thenComparing(AccessPath::kind)
-                        .thenComparing(AccessPath::decision));
+        final Set<String> texts = new HashSet<>();
+        final Map<String, Long> plans = new HashMap<>();
+        final Map<AccessPath, Tally> paths = new HashMap<>();
         long requests, withoutIndex, units, candidates, visible, returned, writes, rowChanges;
         long rejected;
     }
@@ -88,7 +91,8 @@ public final class AccessLedger {
     private final Tally total = new Tally();
     private final List<Map<String, Object>> inputs = new ArrayList<>();
     private final Map<Request, List<Unit>> requestUnits = new HashMap<>();
-    private final Map<Unit, String> decisions = new IdentityHashMap<>();
+    /** Units holding a decision whose request has not finished. */
+    private long pendingDecisions;
     private long events, unitEvents, unitCounted, settled, withoutIndex, requests;
     /** Tracker facts, summed over every tracker that fed this ledger. */
     private long openAtClose, abortedOpen, nestedExecutors, nestedRows, probesAssigned;
@@ -216,9 +220,9 @@ public final class AccessLedger {
         try (var input = ServerTrace.open(file)) {
             String line;
             while ((line = input.readLine()) != null) {
-                JsonObject e = JsonParser.parseString(line).getAsJsonObject();
+                Event e = Event.parse(line);
                 RunTiming.current().advance(1);
-                int eventPid = e.get("pid").getAsInt();
+                int eventPid = e.pid();
                 if (pid == 0) pid = eventPid;
                 else if (pid != eventPid)
                     throw new IOException("One access ledger input must contain one backend");
@@ -234,9 +238,9 @@ public final class AccessLedger {
      * Claims one raw event, once its tracker has seen it ({@code tracked}: the tracker routed it
      * to a request or an access unit). Every event is claimed by exactly one category.
      */
-    void event(JsonObject e, boolean tracked) throws IOException {
+    void event(Event e, boolean tracked) throws IOException {
         events++;
-        String type = e.get("event").getAsString();
+        String type = e.type();
         eventTypes.merge(type, 1L, Long::sum);
         if (!e.has("req") || !e.has("depth"))
             throw new IOException("Trace lacks request ordinals and executor depth");
@@ -328,12 +332,33 @@ public final class AccessLedger {
         (decision.projected() ? projected : decision.excluded() ? excluded : rejected)
                 .merge(decision.projected() ? decision.shape() : decision.reason(), 1L, Long::sum);
         if (decision.projected()) searchOperations += decision.parts().size();
-        if (unit.request != null) decisions.put(unit, label);
+        if (unit.request != null) {
+            if (unit.decision == null) pendingDecisions++;
+            unit.decision = label;
+        }
+    }
+
+    /** A request's SQL, normalized, and its template; a function of the SQL text alone. */
+    private record Normalized(String sql, String template) {}
+
+    /** Normalized SQL by request text: workloads repeat a few texts millions of times. */
+    private final Map<String, Normalized> normalized = new HashMap<>();
+
+    private Normalized normalize(String text) {
+        Normalized known = normalized.get(text);
+        if (known != null) return known;
+        // Workloads with literal SQL would grow the cache without bound; it is only a cache.
+        if (normalized.size() >= 1 << 16) normalized.clear();
+        String sql = text.strip().replaceAll("\\s+", " ").toLowerCase(Locale.ROOT);
+        known = new Normalized(sql, template(sql));
+        normalized.put(text, known);
+        return known;
     }
 
     void request(Request request) throws IOException {
         requests++;
-        String sql = request.sql.strip().replaceAll("\\s+", " ").toLowerCase(Locale.ROOT);
+        Normalized normal = normalize(request.sql);
+        String sql = normal.sql();
         if (request.processed >= 0
                 && (request.returned > 0 || sql.startsWith("select"))
                 && request.returned != request.processed)
@@ -344,7 +369,7 @@ public final class AccessLedger {
                             + request.returned
                             + " != "
                             + request.processed);
-        String text = template(sql);
+        String text = normal.template();
         Template template = templates.computeIfAbsent(request.queryId, ignored -> new Template());
         template.texts.add(text);
         template.requests++;
@@ -360,7 +385,10 @@ public final class AccessLedger {
         template.writes += request.writes;
         template.rowChanges += request.rowChanges;
         for (Unit unit : requestUnits.getOrDefault(request, List.of())) {
-            String decision = decisions.remove(unit);
+            String decision = unit.decision;
+            if (decision == null) throw new IOException("Access unit without a decision in request r" + request.ordinal);
+            unit.decision = null;
+            pendingDecisions--;
             if (decision.startsWith("rejected:")) template.rejected++;
             template.paths
                     .computeIfAbsent(
@@ -396,7 +424,7 @@ public final class AccessLedger {
                             + (claimed + unitEvents)
                             + " != "
                             + events);
-        if (!requestUnits.isEmpty() || !decisions.isEmpty())
+        if (!requestUnits.isEmpty() || pendingDecisions != 0)
             throw new IOException("Access units outside any finished request");
         long rejectedUnits = rejected.values().stream().mapToLong(Long::longValue).sum();
         var result = new LinkedHashMap<String, Object>();
@@ -465,7 +493,7 @@ public final class AccessLedger {
             // A string: int64 identifiers do not survive JSON tools that read numbers as doubles.
             item.put("query_id", Long.toString(entry.getKey()));
             // The first text in order, so the report does not depend on the order sessions are read.
-            item.put("sql", t.texts.iterator().next());
+            item.put("sql", java.util.Collections.min(t.texts));
             if (t.texts.size() > 1) item.put("text_variants", t.texts.size());
             item.put("requests", t.requests);
             item.put("requests_without_index_access", t.withoutIndex);
@@ -478,7 +506,7 @@ public final class AccessLedger {
             item.put("row_changes", t.rowChanges);
             item.put("plan_variants", t.plans.size());
             var plans = new ArrayList<Map<String, Object>>();
-            t.plans.forEach(
+            new TreeMap<>(t.plans).forEach(
                     (plan, count) -> {
                         var entryReport = new LinkedHashMap<String, Object>();
                         entryReport.put("plan", plan);
@@ -487,7 +515,9 @@ public final class AccessLedger {
                     });
             item.put("plans", plans);
             var paths = new ArrayList<Map<String, Object>>();
-            for (var path : t.paths.entrySet()) {
+            var ordered = new ArrayList<>(t.paths.entrySet());
+            ordered.sort(Map.Entry.comparingByKey(PATH_ORDER));
+            for (var path : ordered) {
                 var description = new LinkedHashMap<String, Object>();
                 description.put("source", path.getKey().source());
                 description.put("plan_node", path.getKey().planNode());

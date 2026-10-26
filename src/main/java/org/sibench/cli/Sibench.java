@@ -44,6 +44,9 @@ public final class Sibench {
                 "       java -jar build/sibench/sibench.jar plan-write-ratio PROFILE CALIBRATION_TRACE"
                         + " RATIO   (native parameters for committed row writes = RATIO x baseline)");
         out.println(
+                "       java -jar build/sibench/sibench.jar plan-operations PROFILE CALIBRATION_TRACE"
+                        + " REPLAY_CONFIG   (native parameters for the replay configuration's operation budget)");
+        out.println(
                 "       java -jar build/sibench/sibench.jar index-server SERVICE_CONFIG"
                         + "   (serves a fresh RocksDB index over the SIBench index protocol)");
         out.println(
@@ -83,7 +86,8 @@ public final class Sibench {
                             "check-relocation",
                             "index-server",
                             "replay-service",
-                            "plan-write-ratio")
+                            "plan-write-ratio",
+                            "plan-operations")
                     .contains(args[0])) {
                 throw new IllegalArgumentException("Unknown command: " + args[0]);
             }
@@ -330,11 +334,21 @@ public final class Sibench {
                     throw new IllegalArgumentException(
                             "plan-write-ratio requires PROFILE CALIBRATION_TRACE RATIO");
                 var plan =
-                        org.sibench.capture.WriteRatioPlan.plan(
+                        org.sibench.capture.CapturePlan.writeRatio(
                                 root,
                                 Path.of(profiles.get(0)),
                                 root.resolve(profiles.get(1)),
                                 Double.parseDouble(profiles.get(2)));
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(plan));
+                return 0;
+            }
+            if (args[0].equals("plan-operations")) {
+                if (profiles.size() != 3)
+                    throw new IllegalArgumentException(
+                            "plan-operations requires PROFILE CALIBRATION_TRACE REPLAY_CONFIG");
+                var plan =
+                        org.sibench.capture.CapturePlan.operations(
+                                root, Path.of(profiles.get(0)), root.resolve(profiles.get(1)), Path.of(profiles.get(2)));
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(plan));
                 return 0;
             }

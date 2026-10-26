@@ -796,7 +796,7 @@ public class IndexTraceCompilerTest {
                     var model = new IndexReferenceReplay(rowIds, secondary);
                     try (var load = new ReplayProjection(replay, false, model::accept);
                             var runtime = new ReplayProjection(replay, true, model::accept)) {
-                        IndexOperationTrace.read(output.resolve("baseline.ops"), load);
+                        BaselineOperations.of(output).read(load);
                         load.finish();
                         IndexOperationTrace.read(output.resolve("workload.ops"), runtime);
                         runtime.finish();
@@ -833,13 +833,13 @@ public class IndexTraceCompilerTest {
                 () -> ReferenceReplay.check(output, ReplayConfig.defaults()));
         Files.writeString(output.resolve("manifest.json"), new Gson().toJson(manifest));
         var records = new ArrayList<IndexOperationTrace.Operation>();
-        IndexOperationTrace.read(output.resolve("baseline.ops"), records::add);
-        Files.delete(output.resolve("baseline.ops"));
+        BaselineOperations.of(output).read(records::add);
+        // A stored load (as traces compiled before derivation hold) is read as it is.
         try (var writer = new IndexOperationTrace.Writer(output.resolve("baseline.ops"))) {
             for (int i = 0; i < records.size() - 1; i++) writer.append(records.get(i));
         }
         manifest.addProperty(
-                "baseline_trace_sha256", BaselineGenerator.sha256(output.resolve("baseline.ops")));
+                "baseline_trace_sha256", IndexOperationTrace.sha256(output.resolve("baseline.ops")));
         manifest.addProperty("baseline_operations", records.size() - 1);
         Files.writeString(output.resolve("manifest.json"), new Gson().toJson(manifest));
         assertThrows(
@@ -1191,15 +1191,47 @@ public class IndexTraceCompilerTest {
                         fixture,
                         summary ? List.of(summarized(101, sessions.get(0)), summarized(102, sessions.get(1))) : sessions);
         // A packaged run records its build; the fixture names one so it can be certified.
+        Path jar = runJar(fixture.resolve("artifacts"), "compiler", false);
+        recordBuild(raw, jar);
+        audit(config, raw, after);
+        return raw;
+    }
+
+    private static void recordBuild(Path raw, Path jar) throws Exception {
         Path run = raw.resolve("capture-run.json");
         JsonObject manifest = json(run);
         JsonObject build = new JsonObject();
-        build.addProperty("sibench_jar_sha256", "jar");
+        build.addProperty("sibench_jar_sha256", FileDigests.sha256(jar));
         build.addProperty("postgres_sha256", "postgres");
         manifest.add("build", build);
         Files.writeString(run, manifest.toString());
-        audit(config, raw, after);
-        return raw;
+    }
+
+    /**
+     * The run jar of a capture under {@code artifacts}: the real capture roots, one compiler class
+     * with the given content, and a library entry. {@code changedDriver} alters the capture
+     * driver's class file after its constant pool, which changes its digest but not its references.
+     */
+    private static Path runJar(Path artifacts, String compiler, boolean changedDriver) throws Exception {
+        Path jar = Certification.runJar(artifacts);
+        Files.createDirectories(jar.getParent());
+        try (var out = new java.util.zip.ZipOutputStream(Files.newOutputStream(jar))) {
+            for (Class<?> type : CaptureCode.ROOTS) {
+                String name = type.getName().replace('.', '/') + ".class";
+                byte[] bytes;
+                try (var in = type.getClassLoader().getResourceAsStream(name)) {
+                    bytes = in.readAllBytes();
+                }
+                if (changedDriver && type == CaptureDriver.class) bytes = Arrays.copyOf(bytes, bytes.length + 1);
+                out.putNextEntry(new java.util.zip.ZipEntry(name));
+                out.write(bytes);
+            }
+            out.putNextEntry(new java.util.zip.ZipEntry("org/sibench/capture/IndexTraceCompiler.class"));
+            out.write(compiler.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            out.putNextEntry(new java.util.zip.ZipEntry("com/example/Library.class"));
+            out.write(new byte[] {1, 2, 3});
+        }
+        return jar;
     }
 
     /** PG counter snapshots that agree with a ledger: zero before, the ledger's tallies after. */
@@ -1259,11 +1291,19 @@ public class IndexTraceCompilerTest {
                     manifest.get("access_ledger_sha256").getAsString());
             // The traces are hashed as they are written; the digest is that of the file.
             assertEquals(
-                    BaselineGenerator.sha256(output.resolve("workload.ops")),
+                    IndexOperationTrace.sha256(output.resolve("workload.ops")),
                     manifest.get("workload_trace_sha256").getAsString());
+            // The baseline load is not stored; deriving it again yields the recorded stream.
+            assertFalse(Files.exists(output.resolve("baseline.ops")));
             assertEquals(
-                    BaselineGenerator.sha256(output.resolve("baseline.ops")),
-                    manifest.get("baseline_trace_sha256").getAsString());
+                    manifest.get("baseline_operations").getAsLong(),
+                    BaselineOperations.of(output).read(operation -> {}));
+            JsonObject altered = manifest.deepCopy();
+            altered.addProperty("baseline_trace_sha256", "0".repeat(64));
+            Files.writeString(output.resolve("manifest.json"), altered.toString());
+            var failure = assertThrows(java.io.IOException.class, () -> BaselineOperations.of(output).read(operation -> {}));
+            assertTrue(failure.getMessage(), failure.getMessage().contains("differs from the compiled trace"));
+            Files.writeString(output.resolve("manifest.json"), manifest.toString());
             assertEquals("row_audit", manifest.getAsJsonObject("verification").get("mode").getAsString());
             assertEquals("not_checked", manifest.get("capture_completeness").getAsString());
         }
@@ -1315,11 +1355,18 @@ public class IndexTraceCompilerTest {
         Path certification = artifacts.resolve(Certification.FILE);
         assertThrows(java.io.IOException.class, () -> Certification.certify(profile));
 
-        // The same capture, relying on the certificate instead of its row audit.
+        assertFalse(json(certification).getAsJsonObject("build").has("sibench_jar_sha256"));
+        assertTrue(json(certification).getAsJsonObject("build").getAsJsonObject("capture_code")
+                .getAsJsonObject("classes").has("org/sibench/capture/CaptureDriver.class"));
+
+        // The same capture, relying on the certificate instead of its row audit; a run with
+        // another compiler in its jar is still the certified capture build.
+        Path jar = runJar(fixture.resolve("recompiled"), "another compiler", false);
+        recordBuild(raw, jar);
         Path certified = fixture.resolve("certified");
         IndexTraceCompiler.compile(
                 schema, config.layout(), raw, certified,
-                new IndexTraceCompiler.Checks(null, certification, agree[0], agree[1]));
+                new IndexTraceCompiler.Checks(null, certification, agree[0], agree[1], jar));
         JsonObject manifest = json(certified.resolve("manifest.json"));
         assertEquals("certified", manifest.getAsJsonObject("verification").get("mode").getAsString());
         assertEquals(
@@ -1338,7 +1385,7 @@ public class IndexTraceCompilerTest {
                         java.io.IOException.class,
                         () -> IndexTraceCompiler.compile(
                                 schema, config.layout(), raw, outside,
-                                new IndexTraceCompiler.Checks(null, narrow, agree[0], agree[1])));
+                                new IndexTraceCompiler.Checks(null, narrow, agree[0], agree[1], jar)));
         assertTrue(failure.getMessage(), failure.getMessage().contains("outside its certification"));
         assertTrue(failure.getMessage(), failure.getMessage().contains(dropped));
         assertTrue(Files.exists(outside.resolve("INCOMPLETE")));
@@ -1353,8 +1400,27 @@ public class IndexTraceCompilerTest {
                         java.io.IOException.class,
                         () -> IndexTraceCompiler.compile(
                                 schema, config.layout(), raw, fixture.resolve("other"),
-                                new IndexTraceCompiler.Checks(null, other, agree[0], agree[1])));
-        assertTrue(failure.getMessage(), failure.getMessage().contains("build"));
+                                new IndexTraceCompiler.Checks(null, other, agree[0], agree[1], jar)));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("postgres_sha256"));
         assertFalse(Files.exists(fixture.resolve("other")));
+
+        // A changed capture driver is another capture build, and the message names it.
+        Path changed = runJar(fixture.resolve("driver"), "another compiler", true);
+        recordBuild(raw, changed);
+        failure =
+                assertThrows(
+                        java.io.IOException.class,
+                        () -> IndexTraceCompiler.compile(
+                                schema, config.layout(), raw, fixture.resolve("changed"),
+                                new IndexTraceCompiler.Checks(null, certification, agree[0], agree[1], changed)));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("org/sibench/capture/CaptureDriver.class"));
+        // A jar that is not the one the capture recorded is refused before it is compared.
+        failure =
+                assertThrows(
+                        java.io.IOException.class,
+                        () -> IndexTraceCompiler.compile(
+                                schema, config.layout(), raw, fixture.resolve("unrecorded"),
+                                new IndexTraceCompiler.Checks(null, certification, agree[0], agree[1], jar)));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("not the one the capture ran"));
     }
 }

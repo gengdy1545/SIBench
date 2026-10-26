@@ -49,7 +49,7 @@ public class RowStateAuditTest {
             throws Exception {
         Path directory = RowAuditTestSupport.baseline(fixture, schema, rows);
         PgBaselineVerify.verify(
-                RowAuditTestSupport.connection(schema, rows, new int[1]), schema, directory);
+                RowAuditTestSupport.connections(schema, rows, new int[1]), schema, directory);
         return directory;
     }
 
@@ -530,21 +530,63 @@ public class RowStateAuditTest {
             wrong.put(entry.getKey(), rows);
         }
         Path report = RowStateAudit.defaultReport(scenario.raw());
-        var error =
-                assertThrows(
-                        IOException.class,
-                        () ->
-                                RowStateAudit.audit(
-                                        RowAuditTestSupport.connection(schema, wrong, new int[1]),
-                                        schema,
-                                        scenario.baseline(),
-                                        scenario.raw(),
-                                        report,
-                                        1));
-        assertTrue(error.getMessage(), error.getMessage().contains("Final source row mismatch"));
-        assertFalse(Files.exists(report));
-        assertFalse(Files.exists(Path.of(report + ".changes.jsonl")));
-        assertFalse(Files.exists(Path.of(report + ".changes.jsonl.partial")));
-        assertFalse(Files.exists(Path.of(report + ".work")));
+        // The digest finds the table; the exact comparison names the row.
+        for (boolean exact : new boolean[] {false, true}) {
+            if (exact) System.setProperty(RowStateAudit.EXACT, "true");
+            try {
+                var error =
+                        assertThrows(
+                                IOException.class,
+                                () ->
+                                        RowStateAudit.audit(
+                                                RowAuditTestSupport.connection(schema, wrong, new int[1]),
+                                                schema,
+                                                scenario.baseline(),
+                                                scenario.raw(),
+                                                report,
+                                                1));
+                assertTrue(
+                        error.getMessage(),
+                        error.getMessage().contains(exact ? "Final source row mismatch" : "Final source rows differ"));
+            } finally {
+                System.clearProperty(RowStateAudit.EXACT);
+            }
+            assertFalse(Files.exists(report));
+            assertFalse(Files.exists(Path.of(report + ".changes.jsonl")));
+            assertFalse(Files.exists(Path.of(report + ".changes.jsonl.partial")));
+            assertFalse(Files.exists(Path.of(report + ".work")));
+        }
+    }
+
+    /** A row PostgreSQL holds that the capture does not explain, or one it lacks, fails the digest. */
+    @Test
+    public void anExtraOrMissingFinalRowFailsTheDigest() throws Exception {
+        var schema = schema("sysbench", 3);
+        Scenario scenario = scenario("sysbench", temporary.newFolder().toPath());
+        for (boolean extra : new boolean[] {true, false}) {
+            var wrong = new LinkedHashMap<String, List<JsonObject>>();
+            for (var entry : scenario.finalRows().entrySet()) {
+                var rows = new ArrayList<JsonObject>();
+                for (JsonObject row : entry.getValue()) rows.add(row.deepCopy());
+                if (extra) {
+                    JsonObject copy = rows.get(0).deepCopy();
+                    copy.addProperty("id", 99_999_999);
+                    rows.add(copy);
+                } else rows.remove(rows.size() - 1);
+                wrong.put(entry.getKey(), rows);
+            }
+            Path report = RowStateAudit.defaultReport(scenario.raw());
+            var error =
+                    assertThrows(
+                            IOException.class,
+                            () ->
+                                    RowStateAudit.audit(
+                                            RowAuditTestSupport.connection(schema, wrong, new int[1]),
+                                            schema,
+                                            scenario.baseline(),
+                                            scenario.raw(),
+                                            report));
+            assertTrue(error.getMessage(), error.getMessage().contains("Final source rows differ"));
+        }
     }
 }

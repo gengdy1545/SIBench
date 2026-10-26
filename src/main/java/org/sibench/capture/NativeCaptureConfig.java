@@ -103,6 +103,29 @@ public record NativeCaptureConfig(
                 root, benchmark, artifacts, raw, database, port, user, layout, doc, nativeConfig);
     }
 
+    /** The still database a capture clones ({@code postgres.clone_from}); see {@link StillBase}. */
+    public String cloneFrom() {
+        String base = string(object(document, "postgres"), "clone_from");
+        require(base.matches("[a-z][a-z0-9_]*"), "Invalid clone_from identifier");
+        return base;
+    }
+
+    /** The same capture against another database: the still database while it is loaded. */
+    NativeCaptureConfig withDatabase(String name) {
+        return new NativeCaptureConfig(root, benchmark, artifacts, raw, name, port, user, layout, document, nativeConfig);
+    }
+
+    /** Native parameters that only shape a captured run; every other one shapes the loaded data. */
+    private static final Set<String> RUN_ONLY = Set.of("workloads", "threads", "timeout_minutes", "skip-trx");
+
+    /** The parameters the still database was loaded with: a profile may clone it only if they match. */
+    Map<String, Object> loadConfig() {
+        var result = new java.util.TreeMap<String, Object>();
+        for (var entry : nativeConfig.entrySet())
+            if (!RUN_ONLY.contains(entry.getKey())) result.put(entry.getKey(), entry.getValue());
+        return result;
+    }
+
     /** Upper bound for each native client process (load, prepare or one workload). */
     public java.time.Duration timeout() {
         return java.time.Duration.ofMinutes(

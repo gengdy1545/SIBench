@@ -2,58 +2,24 @@ package org.sibench.capture;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Prepares the database a native HyBench run reads. The verified SF1 load is never measured
- * directly: it is cloned, the upstream secondary indexes are created on the clone, and the row
- * capture triggers are installed on it, so a run always starts from a still, known state.
- *
- * <p>Nothing here generates data. The still database is produced by the native load and must
- * already exist, exactly as the YCSB and sysbench clients must already be built.
+ * Prepares the database a native HyBench run reads: this capture's reflink clone of the still
+ * database ({@link StillBase}), which already carries the upstream secondary indexes, the row
+ * capture triggers and statistics, is renamed to the profile's database, so a run always starts
+ * from a still, known state. Nothing here generates or loads data.
  */
 final class HybenchNativePrepare {
-    private static final String LIBRARY = "build/services/postgresql-capture/row_capture.so";
-
     private HybenchNativePrepare() {}
 
+    /** This capture's clone of the still database becomes the profile's database. */
     static void prepare(Path root, CaptureConfig config) throws Exception {
-        Path library = root.resolve(LIBRARY);
-        if (!Files.isRegularFile(library))
-            throw new IllegalStateException("Row capture library is not built: " + library);
-        String cloneFrom = config.cloneFrom();
-        String password = System.getenv().getOrDefault("PGPASSWORD", "");
-        try (Connection admin =
-                DriverManager.getConnection(config.adminJdbc(), config.user(), password)) {
-            try (Statement statement = admin.createStatement()) {
-                statement.execute(
-                        "CREATE DATABASE " + config.database() + " TEMPLATE " + cloneFrom);
-            }
-        }
-        try (Connection connection =
-                        DriverManager.getConnection(config.jdbc(), config.user(), password);
-                Statement statement = connection.createStatement()) {
-            for (String sql : statements(config.source().resolve("conf/create_index_pg.sql")))
-                statement.execute(sql);
-            statement.execute(
-                    "CREATE FUNCTION public.sibench_row_capture() RETURNS trigger AS '"
-                            + library.toString().replace("'", "''")
-                            + "', 'sibench_row_capture' LANGUAGE C");
-            for (var table : org.sibench.schema.SourceSchema.hybench(config.source()).tables())
-                statement.execute(
-                        "CREATE TRIGGER sibench_row_capture AFTER INSERT OR UPDATE OR DELETE ON \""
-                                + table.name()
-                                + "\" FOR EACH ROW EXECUTE FUNCTION public.sibench_row_capture()");
-            // As for YCSB and sysbench: autovacuum is off in the capture cluster, but a loaded
-            // benchmark database has hint bits, a visibility map and planner statistics by the
-            // time it is measured. Without statistics PostgreSQL plans HyBench's point lookups as
-            // ordered scans of the timestamp index. VACUUM moves no live tuple and changes no value.
-            statement.execute("VACUUM (ANALYZE)");
-        }
+        StillBase.library(root);
+        StillBase.attach(root, config.adminJdbc(), config.user(), config.cloneFrom(), config.database(), null);
+        HybenchNativeBase.requireRuntimeInputs(
+                config.workDir().resolve("Data_" + config.scaleFactor()), HybenchNativeBase.manifest(config));
     }
 
     /** The upstream index script: one statement per non-empty line, comments and blanks skipped. */

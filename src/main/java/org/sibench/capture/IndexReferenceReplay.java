@@ -92,7 +92,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
 
         @Override
         public int hashCode() {
-            return Arrays.hashCode(bytes);
+            return org.sibench.trace.KeyHash.of(bytes);
         }
     }
 
@@ -926,7 +926,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
         selectedVersionChecksum =
                 Long.rotateLeft(selectedVersionChecksum, 1)
                         ^ result.commitVersion()
-                        ^ Long.rotateLeft(result.key().hashCode(), 17)
+                        ^ Long.rotateLeft(result.key().checksumWord(), 17)
                         ^ ((long) operation.table() << 48)
                         ^ ((long) operation.index() << 40);
     }
@@ -1011,7 +1011,8 @@ public final class IndexReferenceReplay implements AutoCloseable {
     }
 
     private static long stateHash(int table, Composite key, StoredVersion version) {
-        return Long.rotateLeft(key.hashCode(), 17)
+        // The checksum's key word is fixed, independent of the hash the maps use.
+        return Long.rotateLeft(Arrays.hashCode(key.bytes), 17)
                 ^ Long.rotateLeft(version.value(), 31)
                 ^ Long.rotateLeft(version.position(), 43)
                 ^ version.version()

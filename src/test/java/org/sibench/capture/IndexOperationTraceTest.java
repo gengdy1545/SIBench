@@ -266,4 +266,39 @@ public class IndexOperationTraceTest {
             Files.deleteIfExists(file);
         }
     }
+
+    /**
+     * A trace is stored in zstd blocks; its digest is that of the plain stream, so it equals the
+     * digest of the same operations never written, and a damaged block fails to read.
+     */
+    @Test
+    public void compressedBlocksReadBackAndKeepThePlainDigest() throws Exception {
+        Path directory = Files.createTempDirectory("ops");
+        Path file = directory.resolve("workload.ops");
+        var operations = new ArrayList<Operation>();
+        int count = IndexOperationTrace.BLOCK_RECORDS * 2 + 17;
+        for (int i = 0; i < count; i++)
+            operations.add(
+                    IndexOperationTrace.write(i + 1, IndexOperationTrace.INSERT, 1, 0, IndexKey.ofInt(i), 0, 1, i, i + 1)
+                            .withWorkUnitId(1 + i / IndexOperationTrace.BLOCK_RECORDS));
+        var stored = new IndexOperationTrace.Writer(file);
+        var digest = new IndexOperationTrace.Writer(null);
+        try (stored; digest) {
+            for (Operation operation : operations) {
+                stored.append(operation);
+                digest.append(operation);
+            }
+        }
+        assertEquals(digest.sha256(), stored.sha256());
+        assertEquals(stored.sha256(), IndexOperationTrace.sha256(file));
+        var read = new ArrayList<Operation>();
+        assertEquals(count, IndexOperationTrace.read(file, read::add));
+        assertEquals(operations, read);
+        // Records repeat little, so blocks compress well below the plain record size.
+        assertTrue(Files.size(file) < (long) count * IndexOperationTrace.RECORD_BYTES / 2);
+        byte[] bytes = Files.readAllBytes(file);
+        bytes[bytes.length - 3] ^= 0x5a;
+        Files.write(file, bytes);
+        assertThrows(IOException.class, () -> IndexOperationTrace.read(file, operation -> {}));
+    }
 }

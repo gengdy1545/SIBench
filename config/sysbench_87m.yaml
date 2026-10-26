@@ -35,6 +35,8 @@ postgres:
   version: '14.24'
   port: 55433
   database: sibench_sysbench_87m_capture
+  # The still database this capture clones; built once from the native load (see StillBase).
+  clone_from: sibench_sysbench_87m_base
   user: postgres
   isolation: read_committed
   max_parallel_workers_per_gather: 0

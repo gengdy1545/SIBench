@@ -24,10 +24,12 @@ import java.util.TreeSet;
  *
  * <p>A certifying capture passed every check: the client/server session audits, the row-state
  * audit against the baseline and PostgreSQL's final state, the access ledger against PG's own
- * index counters, and the compilation's structural checks. Its certificate records the build that
- * ran (jar, server, trigger library), the source and index definitions, the capture format, and
- * what the run exercised: every access path (source, index, scan kind, projection decision) and
- * every committed change class (table, operation).
+ * index counters, and the compilation's structural checks. Its certificate records the capture
+ * build that ran (the capture code of the run's jar, see {@link CaptureCode}, the server, the
+ * trigger library and the plan-relevant server parameters), the source and index definitions, the
+ * capture format, and what the run exercised: every access path (source, index, scan kind,
+ * projection decision) and every committed change class (table, operation). The compiler is not
+ * part of the build: compiling with a changed compiler keeps the certificate.
  *
  * <p>A certified capture skips the row-state audit. It still runs its own session audits, ledger
  * partition, counter check and compilation checks, and it must stay inside the certificate: the
@@ -36,7 +38,10 @@ import java.util.TreeSet;
  * exercises it is certified.
  */
 public final class Certification {
-    public static final int VERSION = 1;
+    /** 2: the build is the capture code of the run's jar, no longer the whole jar. */
+    public static final int VERSION = 2;
+    /** Where native-capture.sh keeps the immutable copy of the jar a capture ran. */
+    static final String RUN_JAR = "native/sibench-run.jar";
     public static final String FILE = "certification.json";
 
     private Certification() {}
@@ -65,13 +70,11 @@ public final class Certification {
             throw new IOException("Access ledger changed after compilation");
         JsonObject ledger = json(ledgerFile);
         JsonObject run = json(capture.raw().resolve("capture-run.json"));
-        if (!run.has("build") || !CaptureBuild.complete(map(run.getAsJsonObject("build"))))
-            throw new IOException("The capture recorded no complete build; run it from the packaged jar");
         var result = new LinkedHashMap<String, Object>();
         result.put("schema_version", VERSION);
         result.put("status", "certified");
         result.put("benchmark", manifest.get("benchmark").getAsString());
-        result.put("build", run.get("build"));
+        result.put("build", captureBuild(run, runJar(capture.artifacts())));
         result.put("source", source(manifest));
         result.put("capture_detail", details(ledger));
         var coverage = new LinkedHashMap<String, Object>();
@@ -104,21 +107,89 @@ public final class Certification {
      * The certificate a capture relies on, once its build, source and index definitions match;
      * coverage is checked when the capture's ledger is complete, see {@link #requireCovered}.
      */
-    static JsonObject require(Path certificate, Path raw, Map<String, Object> provenance)
+    static JsonObject require(Path certificate, Path raw, Path runJar, Map<String, Object> provenance)
             throws IOException {
         JsonObject value = json(certificate);
-        if (value.get("schema_version").getAsInt() != VERSION
-                || !value.get("status").getAsString().equals("certified"))
+        if (!value.get("status").getAsString().equals("certified"))
             throw new IOException("Not a certification: " + certificate);
+        if (value.get("schema_version").getAsInt() != VERSION)
+            throw new IOException(
+                    "Certification of schema "
+                            + value.get("schema_version")
+                            + ", this build reads "
+                            + VERSION
+                            + "; certify the capture again with certify-capture: "
+                            + certificate);
+        if (runJar == null)
+            throw new IOException("A certified compilation needs the jar the capture ran");
         JsonObject run = json((Files.isDirectory(raw) ? raw : raw.toAbsolutePath().getParent()).resolve("capture-run.json"));
-        if (!run.has("build") || !CaptureBuild.complete(map(run.getAsJsonObject("build"))))
-            throw new IOException("A certified capture must record its build; run it from the packaged jar");
-        if (!run.get("build").equals(value.get("build")))
-            throw new IOException("The capture's build differs from the certified build " + certificate);
+        JsonObject build = new GsonBuilder().create().toJsonTree(captureBuild(run, runJar)).getAsJsonObject();
+        if (!build.equals(value.get("build")))
+            throw new IOException(
+                    "The capture's build differs from the certified build "
+                            + certificate
+                            + differences(build, value.getAsJsonObject("build")));
         JsonObject source = new GsonBuilder().create().toJsonTree(provenance).getAsJsonObject();
         if (!source(source).equals(value.getAsJsonObject("source")))
             throw new IOException("The capture's source or index definitions differ from the certification");
         return value;
+    }
+
+    /** The run's jar copy under a capture's artifacts directory. */
+    static Path runJar(Path artifacts) {
+        return artifacts.resolve(RUN_JAR);
+    }
+
+    /**
+     * The part of a capture's recorded build a certificate vouches for: the capture code of the jar
+     * it ran instead of that jar's digest, plus everything else the run recorded (server, trigger
+     * library, plan-relevant parameters). The jar must be the very one the run recorded.
+     */
+    static Map<String, Object> captureBuild(JsonObject run, Path runJar) throws IOException {
+        if (!run.has("build") || !CaptureBuild.complete(map(run.getAsJsonObject("build"))))
+            throw new IOException("The capture recorded no complete build; run it from the packaged jar");
+        var recorded = map(run.getAsJsonObject("build"));
+        if (!Files.isRegularFile(runJar))
+            throw new IOException("The jar the capture ran is missing: " + runJar);
+        if (!FileDigests.sha256(runJar).equals(recorded.get("sibench_jar_sha256")))
+            throw new IOException("This jar is not the one the capture ran: " + runJar);
+        var result = new LinkedHashMap<String, Object>();
+        result.put("capture_code", CaptureCode.identity(runJar));
+        for (var entry : new java.util.TreeMap<>(recorded).entrySet())
+            if (!entry.getKey().equals("sibench_jar_sha256")) result.put(entry.getKey(), entry.getValue());
+        return result;
+    }
+
+    /** The build fields and capture classes that differ, for the failure message. */
+    private static String differences(JsonObject actual, JsonObject certified) {
+        var changed = new TreeSet<String>();
+        if (certified == null) return "";
+        for (String key : union(actual.keySet(), certified.keySet())) {
+            JsonElement a = actual.get(key), c = certified.get(key);
+            if (java.util.Objects.equals(a, c)) continue;
+            if (!key.equals("capture_code") || a == null || c == null) {
+                changed.add(key);
+                continue;
+            }
+            JsonObject ac = a.getAsJsonObject(), cc = c.getAsJsonObject();
+            for (String part : union(ac.keySet(), cc.keySet())) {
+                if (java.util.Objects.equals(ac.get(part), cc.get(part))) continue;
+                if (!part.equals("classes") || !ac.has(part) || !cc.has(part)) {
+                    changed.add("capture_code." + part);
+                    continue;
+                }
+                JsonObject x = ac.getAsJsonObject(part), y = cc.getAsJsonObject(part);
+                for (String name : union(x.keySet(), y.keySet()))
+                    if (!java.util.Objects.equals(x.get(name), y.get(name))) changed.add(name);
+            }
+        }
+        return changed.isEmpty() ? "" : ": " + String.join(", ", changed);
+    }
+
+    private static Set<String> union(Set<String> a, Set<String> b) {
+        var result = new TreeSet<String>(a);
+        result.addAll(b);
+        return result;
     }
 
     /** Fails on anything the certifying capture did not exercise. */

@@ -6,13 +6,13 @@ import com.google.gson.JsonParser;
 import org.postgresql.PGConnection;
 import org.sibench.generation.BaselineGenerator;
 
+import java.io.IOException;
 import java.io.Reader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.sql.Connection;
 import java.sql.DriverManager;
-import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.LinkedHashMap;
 import java.util.regex.Pattern;
@@ -20,42 +20,45 @@ import java.util.regex.Pattern;
 /**
  * Builds the still database a HyBench capture clones ({@code postgres.clone_from}) the way the
  * upstream README does: native data generation in the work directory, the upstream DDL, and the
- * upstream {@code \copy} load. Its secondary indexes, sequences and statistics come later, on each
- * clone ({@link HybenchNativePrepare}).
+ * upstream {@code \copy} load.
  *
  * <p>The upstream generator draws from unseeded random sources, so one generation is the fact
  * every capture of that scale shares: an existing {@code Data_<sf>} is never regenerated, and the
- * base manifest records each file's SHA256 and the rows PostgreSQL loaded from it. An existing
- * base database is reused only when its row counts still match that manifest.
+ * base manifest records each file's SHA256 and the rows PostgreSQL loaded from it. The still
+ * database then receives what every capture needs before it runs (upstream secondary indexes,
+ * row-capture triggers, statistics) and is never written again; captures run on reflink copies
+ * of its stopped cluster ({@link StillBase}).
+ *
+ * <p>Once the base database holds the rows, the generated CSV files serve nothing: only the
+ * runtime inputs stay ({@link #RUNTIME_INPUTS}), the rest is deleted (at SF1000 they are the size
+ * of the data). A lost base database is generated again, as a new fact, rather than reloaded.
  */
 final class HybenchNativeBase {
     /** One upstream load statement: {@code \copy table from 'Data_1x/file.csv' CSV DELIMITER ','}. */
     private static final Pattern COPY =
             Pattern.compile("\\\\copy\\s+(\\w+)\\s+from\\s+'Data_1x/([\\w.]+)'\\s+CSV\\s+DELIMITER\\s+','\\s*;?", Pattern.CASE_INSENSITIVE);
 
+    /**
+     * The generated files the workload clients read when they start ({@code Client.init}). Upstream
+     * only logs a missing one and leaves its id list null, so every AP client then fails on its
+     * first query; the base stage checks them before anything is exported or run.
+     */
+    static final java.util.List<String> RUNTIME_INPUTS = java.util.List.of("Related_transfer_bids", "Related_checking_bids");
+
     private HybenchNativeBase() {}
 
     static Path manifest(CaptureConfig config) {
-        return config.workDir().resolve("base-" + config.cloneFrom() + ".json");
+        return StillBase.manifest(config.root(), config.cloneFrom());
     }
 
+    /** Builds the still database in its own, freshly initialized cluster (see {@link StillBase}). */
     static void build(CaptureConfig config) throws Exception {
         String sf = config.scaleFactor();
         Path data = config.workDir().resolve("Data_" + sf);
         Path manifest = manifest(config);
         String password = System.getenv().getOrDefault("PGPASSWORD", "");
-        boolean exists;
-        try (Connection admin = DriverManager.getConnection(config.adminJdbc(), config.user(), password);
-                Statement statement = admin.createStatement();
-                ResultSet rows = statement.executeQuery(
-                        "SELECT 1 FROM pg_database WHERE datname = '" + config.cloneFrom() + "'")) {
-            exists = rows.next();
-        }
-        if (exists) {
-            verify(config, manifest, password);
-            return;
-        }
-        if (Files.exists(manifest)) throw new IllegalStateException("Base manifest without its database: " + manifest);
+        if (Files.exists(manifest)) throw new IllegalStateException("Still database already built: " + manifest);
+        Path library = StillBase.library(config.root());
         var report = new LinkedHashMap<String, Object>();
         report.put("sf", sf);
         report.put("database", config.cloneFrom());
@@ -104,30 +107,54 @@ final class HybenchNativeBase {
         }
         report.put("load_seconds", (System.nanoTime() - started) / 1e9);
         report.put("loaded_rows", counts);
+        // Everything a capture needs before it runs is part of the still database, done once:
+        // the upstream secondary indexes, the row-capture triggers and the statistics.
+        started = System.nanoTime();
+        try (Connection connection = DriverManager.getConnection(base, config.user(), password);
+                Statement statement = connection.createStatement()) {
+            for (String sql : HybenchNativePrepare.statements(config.source().resolve("conf/create_index_pg.sql")))
+                statement.execute(sql);
+        }
+        StillBase.captureReady(base, config.user(), library, org.sibench.schema.SourceSchema.hybench(config.source()));
+        report.put("capture_ready_seconds", (System.nanoTime() - started) / 1e9);
         report.put("total_rows", counts.values().stream().mapToLong(Long::longValue).sum());
         Files.writeString(manifest, new GsonBuilder().setPrettyPrinting().create().toJson(report), StandardOpenOption.CREATE_NEW);
+        requireRuntimeInputs(data, manifest);
+        dropLoadInputs(data);
         System.out.println("HyBench " + sf + " base " + config.cloneFrom() + ": " + report.get("total_rows") + " rows");
     }
 
-    /** A reused base must still hold exactly the rows its manifest says were loaded. */
-    private static void verify(CaptureConfig config, Path manifest, String password) throws Exception {
-        if (!Files.exists(manifest)) {
-            // The SF1 base predates base manifests; it was verified when its first capture ran.
-            System.out.println("Reusing base " + config.cloneFrom() + " without a base manifest");
-            return;
+    /**
+     * The client's runtime inputs exist in the work directory's {@code Data_<sf>} and, when the
+     * base has a manifest, are the very files generated with that base.
+     */
+    static void requireRuntimeInputs(Path data, Path manifest) throws Exception {
+        var recorded = Files.exists(manifest)
+                ? JsonParser.parseString(Files.readString(manifest)).getAsJsonObject().getAsJsonObject("data_sha256")
+                : null;
+        for (String name : RUNTIME_INPUTS) {
+            Path file = data.resolve(name);
+            if (!Files.isRegularFile(file))
+                throw new IllegalStateException(
+                        "HyBench runtime input missing: " + file + "; the work directory must hold the Data_ directory"
+                                + " its base was generated with");
+            if (recorded == null) continue;
+            if (!recorded.has(name) || !BaselineGenerator.sha256(file).equals(recorded.get(name).getAsString()))
+                throw new IllegalStateException("HyBench runtime input differs from the base manifest: " + file);
         }
-        var expected = JsonParser.parseString(Files.readString(manifest)).getAsJsonObject().getAsJsonObject("loaded_rows");
-        String base = config.adminJdbc().substring(0, config.adminJdbc().lastIndexOf('/') + 1) + config.cloneFrom();
-        try (Connection connection = DriverManager.getConnection(base, config.user(), password);
-                Statement statement = connection.createStatement()) {
-            for (var table : expected.entrySet())
-                try (ResultSet rows = statement.executeQuery("SELECT count(*) FROM \"" + table.getKey() + "\"")) {
-                    rows.next();
-                    if (rows.getLong(1) != table.getValue().getAsLong())
-                        throw new IllegalStateException("Base " + config.cloneFrom() + " changed: " + table.getKey());
-                }
+    }
+
+    /** Deletes the loaded CSV files of {@code Data_<sf>}, keeping the client's runtime inputs. */
+    static void dropLoadInputs(Path data) throws IOException {
+        long freed = 0;
+        try (var list = Files.list(data)) {
+            for (Path file : list.sorted().toList()) {
+                if (RUNTIME_INPUTS.contains(file.getFileName().toString()) || !Files.isRegularFile(file)) continue;
+                freed += Files.size(file);
+                Files.delete(file);
+            }
         }
-        System.out.println("Reusing base " + config.cloneFrom() + " (" + expected.size() + " tables match " + manifest.getFileName() + ")");
+        if (freed > 0) System.out.println("Deleted loaded CSV files of " + data + ": " + freed / (1 << 20) + " MiB");
     }
 
     /** The table and file of one upstream load statement, or null when it is not one. */

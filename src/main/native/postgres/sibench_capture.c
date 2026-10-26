@@ -50,7 +50,6 @@ IndexScanDesc sibench_bitmap_scan = NULL;
 void	   *sibench_bitmap_heap_node = NULL;
 int			sibench_depth = 0;
 uint64		sibench_request = 0;
-uint64		sibench_snapshot_csn = 0;
 
 static FILE *sib_stream = NULL;
 static int	sib_detail_mode = -1;
@@ -130,17 +129,6 @@ sib_write(const char *data, size_t length)
 		elog(ERROR, "SIBench trace write failed");
 }
 
-static void
-sib_sync(void)
-{
-	if (!sib_stream)
-		return;
-	if (sib_zstd && !sib_zstd_feed(NULL, 0, ZSTD_e_flush))
-		elog(ERROR, "SIBench trace write failed");
-	if (fflush(sib_stream) != 0)
-		elog(ERROR, "SIBench trace write failed");
-}
-
 /* Ends the zstd frame; anything written later starts a new frame of the same stream. */
 static void
 sib_finish(void)
@@ -191,13 +179,19 @@ sib_open(void)
 		if (zstd)
 		{
 			sib_zstd = ZSTD_createCCtx();
-			if (!sib_zstd || ZSTD_isError(ZSTD_CCtx_setParameter(sib_zstd, ZSTD_c_compressionLevel, 3)))
+			/* The fastest regular level: compression runs inside every captured backend. */
+			if (!sib_zstd || ZSTD_isError(ZSTD_CCtx_setParameter(sib_zstd, ZSTD_c_compressionLevel, 1)))
 				elog(ERROR, "SIBench cannot start zstd for %s", path);
 			sib_zstd_out_size = ZSTD_CStreamOutSize();
 			sib_zstd_out = MemoryContextAlloc(TopMemoryContext, sib_zstd_out_size);
 		}
 	}
-	/* Flushed at transaction ends and exit; a lost backend fails the capture anyway. */
+	/*
+	 * Written out only when buffers fill and at exit, where the zstd frame ends: the audit waits
+	 * for every backend to exit before it reads a trace, and a lost backend fails the capture
+	 * anyway. A flush per transaction cost a zstd block and a write per commit on the CPUs the
+	 * native run is bound by.
+	 */
 	setvbuf(sib_stream, NULL, _IOFBF, 1 << 20);
 	before_shmem_exit(sib_before_exit, (Datum) 0);
 	on_proc_exit(sib_proc_exit, (Datum) 0);
@@ -214,10 +208,60 @@ sib_open(void)
 	return true;
 }
 
+/* A non-negative integer in decimal, as %u / %llu / %d print it, without printf. */
+static inline void
+sib_append_uint(StringInfo out, uint64 value)
+{
+	char		digits[MAXINT8LEN + 1];
+
+	appendBinaryStringInfo(out, digits, pg_ulltoa_n(value, digits));
+}
+
+/* A 64-bit value as 16 lower-case hex digits, as %016llx prints it. */
+static inline void
+sib_append_hex16(StringInfo out, uint64 value)
+{
+	static const char hex[] = "0123456789abcdef";
+	char		digits[16];
+	int			i;
+
+	for (i = 15; i >= 0; i--, value >>= 4)
+		digits[i] = hex[value & 0xf];
+	appendBinaryStringInfo(out, digits, 16);
+}
+
+/*
+ * application_name as JSON. It changes once per request (the capture driver names each one) while
+ * every event of the request repeats it, so its escaped form is kept until the name changes.
+ */
+static const char *
+sib_application_json(void)
+{
+	static char *source = NULL;
+	static StringInfoData escaped;
+	const char *name = application_name ? application_name : "";
+
+	if (source && strcmp(source, name) == 0)
+		return escaped.data;
+	if (!source)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+		initStringInfo(&escaped);
+		MemoryContextSwitchTo(old);
+	}
+	else
+		pfree(source);
+	source = MemoryContextStrdup(TopMemoryContext, name);
+	resetStringInfo(&escaped);
+	escape_json(&escaped, name);
+	return escaped.data;
+}
+
 static void
 sib_emit_named(const char *event, Oid relid, const char *relname, const char *detail)
 {
-	StringInfoData message;
+	static StringInfoData message;
 	bool		executor_end,
 				transaction_abort;
 
@@ -234,21 +278,43 @@ sib_emit_named(const char *event, Oid relid, const char *relname, const char *de
 	transaction_abort = strcmp(event, "transaction_abort") == 0;
 	if (sib_open())
 	{
-		initStringInfo(&message);
-		appendStringInfo(&message, "{\"event\":\"%s\",\"pid\":%d,\"xid\":%u,\"cid\":%u,\"req\":%llu,\"depth\":%d,\"application\":",
-						 event, MyProcPid, GetTopTransactionIdIfAny(), GetCurrentCommandId(false),
-						 (unsigned long long) sibench_request, sibench_depth);
-		escape_json(&message, application_name);
+		/* One buffer for every event of the backend; the fields are those printf wrote. */
+		if (!message.data)
+		{
+			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+			initStringInfo(&message);
+			MemoryContextSwitchTo(old);
+		}
+		resetStringInfo(&message);
+		appendStringInfoString(&message, "{\"event\":\"");
+		appendStringInfoString(&message, event);
+		appendStringInfoString(&message, "\",\"pid\":");
+		sib_append_uint(&message, (uint64) MyProcPid);
+		appendStringInfoString(&message, ",\"xid\":");
+		sib_append_uint(&message, GetTopTransactionIdIfAny());
+		appendStringInfoString(&message, ",\"cid\":");
+		sib_append_uint(&message, GetCurrentCommandId(false));
+		appendStringInfoString(&message, ",\"req\":");
+		sib_append_uint(&message, sibench_request);
+		appendStringInfoString(&message, ",\"depth\":");
+		sib_append_uint(&message, (uint64) sibench_depth);
+		appendStringInfoString(&message, ",\"application\":");
+		appendStringInfoString(&message, sib_application_json());
 		if (relname)
 		{
-			appendStringInfo(&message, ",\"relation_oid\":%u,\"relation\":", relid);
+			appendStringInfoString(&message, ",\"relation_oid\":");
+			sib_append_uint(&message, relid);
+			appendStringInfoString(&message, ",\"relation\":");
 			escape_json(&message, relname);
 		}
 		if (detail && detail[0])
-			appendStringInfo(&message, ",%s", detail);
+		{
+			appendStringInfoChar(&message, ',');
+			appendStringInfoString(&message, detail);
+		}
 		appendStringInfoString(&message, "}\n");
 		sib_write(message.data, message.len);
-		pfree(message.data);
 	}
 	/* An aborted transaction never reaches ExecutorEnd for its active executors. */
 	if (executor_end && sibench_depth > 0)
@@ -368,20 +434,19 @@ sib_scan_detail(StringInfo out, IndexScanDesc scan, ScanKey keys, int nkeys,
 		/*
 		 * Only MVCC snapshots carry xmin/xmax/xip; others (e.g. planner endpoint probes use a
 		 * stack-allocated SnapshotNonVacuumable) leave those fields uninitialized. csn is the
-		 * transaction completion count at the time this snapshot was built: the counter is
-		 * incremented under ProcArrayLock exactly when a transaction stops counting as running,
-		 * so a commit is visible to a snapshot iff the snapshot's counter is at or after the
-		 * commit's. A copied snapshot loses the field, so it falls back to the counter of the
-		 * last snapshot this backend built, which is the same value under read committed, where
-		 * every statement builds a fresh snapshot before it runs.
+		 * transaction completion count GetSnapshotData() read under ProcArrayLock together with
+		 * xmin, xmax and xip: the counter is incremented under that lock exactly when a
+		 * transaction stops counting as running, so a commit is visible to a snapshot iff the
+		 * snapshot's counter is at or after the commit's. The snapshot carries it (sibenchCsn), so
+		 * every copy a scan uses keeps it; a backend-wide "last snapshot built" would also follow
+		 * catalog snapshots built after the statement's. An unknown counter is left out.
 		 */
 		if (s->snapshot_type == SNAPSHOT_MVCC)
 		{
-			appendStringInfo(out, ",\"snapshot_type\":%d,\"csn\":%llu,\"xmin\":%u,\"xmax\":%u,\"snapshot_cid\":%u,\"xip\":[",
-							 s->snapshot_type,
-							 (unsigned long long) (s->snapXactCompletionCount != 0
-												   ? s->snapXactCompletionCount
-												   : sibench_snapshot_csn),
+			appendStringInfo(out, ",\"snapshot_type\":%d", s->snapshot_type);
+			if (s->sibenchCsn != 0)
+				appendStringInfo(out, ",\"csn\":%llu", (unsigned long long) s->sibenchCsn);
+			appendStringInfo(out, ",\"xmin\":%u,\"xmax\":%u,\"snapshot_cid\":%u,\"xip\":[",
 							 s->xmin, s->xmax, s->curcid);
 			for (i = 0; i < s->xcnt; i++)
 				appendStringInfo(out, "%s%u", i ? "," : "", s->xip[i]);
@@ -1813,8 +1878,11 @@ sib_receive(TupleTableSlot *slot, DestReceiver *receiver)
 		hash = sib_fnv(hash, "\x1f", 1);
 	}
 	self->returned++;
-	appendStringInfo(&self->hashes, "%s\"%016llx\"", self->returned > 1 ? "," : "",
-					 (unsigned long long) hash);
+	if (self->returned > 1)
+		appendStringInfoChar(&self->hashes, ',');
+	appendStringInfoChar(&self->hashes, '"');
+	sib_append_hex16(&self->hashes, hash);
+	appendStringInfoChar(&self->hashes, '"');
 	return self->original->receiveSlot(slot, self->original);
 }
 
@@ -1911,7 +1979,6 @@ sib_transaction_commit(void)
 		return;
 	snprintf(detail, sizeof(detail), "\"csn\":%llu", (unsigned long long) sib_completion());
 	sib_emit("transaction_commit", NULL, detail);
-	sib_sync();
 }
 
 /* A failed statement never ends its scans: their units end with the abort, after their summaries. */
@@ -1939,5 +2006,4 @@ sib_transaction_abort(void)
 	}
 	snprintf(detail, sizeof(detail), "\"csn\":%llu", (unsigned long long) sib_completion());
 	sib_emit("transaction_abort", NULL, detail);
-	sib_sync();
 }

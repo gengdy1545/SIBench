@@ -26,6 +26,13 @@ final class RowAuditTestSupport {
 
     static Path baseline(Path fixture, SourceSchema schema, Map<String, List<JsonObject>> rows)
             throws Exception {
+        return baseline(fixture, schema, rows, 0);
+    }
+
+    /** {@code groupRows}, when positive, caps the rows of every Parquet row group. */
+    static Path baseline(
+            Path fixture, SourceSchema schema, Map<String, List<JsonObject>> rows, long groupRows)
+            throws Exception {
         Path directory = Files.createDirectory(fixture.resolve("baseline"));
         var original =
                 CaptureConfig.read(Path.of(""), Path.of("config/hybench_sf1.yaml"))
@@ -37,7 +44,7 @@ final class RowAuditTestSupport {
                         original.benchmark(),
                         original.seed(),
                         original.targetBytes(),
-                        original.maxRows(),
+                        groupRows > 0 ? groupRows : original.maxRows(),
                         original.groupBytes(),
                         original.pageBytes(),
                         original.dictionaryBytes(),
@@ -135,8 +142,25 @@ final class RowAuditTestSupport {
         return result;
     }
 
+    /** Fresh connections over the same contents, as PgBaselineVerify opens one per worker. */
+    static PgBaselineVerify.Connections connections(
+            SourceSchema schema, Map<String, List<JsonObject>> contents, int[] queries) {
+        return connections(schema, contents, queries, 1.0);
+    }
+
+    /** {@code correlation}: what pg_stats reports for every key, which decides how tables are read. */
+    static PgBaselineVerify.Connections connections(
+            SourceSchema schema, Map<String, List<JsonObject>> contents, int[] queries, double correlation) {
+        return () -> connection(schema, contents, queries, correlation);
+    }
+
     static Connection connection(
             SourceSchema schema, Map<String, List<JsonObject>> contents, int[] queries) {
+        return connection(schema, contents, queries, 1.0);
+    }
+
+    static Connection connection(
+            SourceSchema schema, Map<String, List<JsonObject>> contents, int[] queries, double correlation) {
         boolean[] transaction = {false}, readOnly = {false};
         return proxy(
                 Connection.class,
@@ -154,8 +178,86 @@ final class RowAuditTestSupport {
                             case "setTransactionIsolation", "commit", "rollback", "close" -> null;
                             case "createStatement" ->
                                     statement(schema, contents, queries, transaction, readOnly);
+                            case "prepareStatement" -> {
+                                if (!args[0].toString().contains("pg_stats")) throw new AssertionError(args[0]);
+                                yield proxy(
+                                        PreparedStatement.class,
+                                        (s, m, a) ->
+                                                switch (m.getName()) {
+                                                    case "setString", "close" -> null;
+                                                    case "executeQuery" -> rows(List.of(JsonParser.parseString(
+                                                            "{\"correlation\":" + correlation + "}").getAsJsonObject()), true);
+                                                    default -> throw new AssertionError(m);
+                                                });
+                            }
                             default -> throw new AssertionError(method);
                         });
+    }
+
+    private static final java.util.regex.Pattern BOUND =
+            java.util.regex.Pattern.compile("(>|<=) (-?\\d+|'(?:[^']|'')*')");
+
+    /**
+     * A column query of PgBaselineVerify: the table's columns in schema order, in C key order, for
+     * keys after a {@code >} bound and through a {@code <=} bound when the SQL states them.
+     */
+    private static ResultSet columns(SourceSchema schema, Map<String, List<JsonObject>> contents, int[] queries, String sql) {
+        var table = table(schema, sql);
+        var pk = SourceRow.primary(table);
+        Object low = null, high = null;
+        var matcher = BOUND.matcher(sql);
+        while (matcher.find()) {
+            String text = matcher.group(2);
+            Object bound = text.startsWith("'") ? text.substring(1, text.length() - 1).replace("''", "'") : (Object) Long.parseLong(text);
+            if (matcher.group(1).equals(">")) low = bound;
+            else high = bound;
+        }
+        queries[0]++;
+        var data = new ArrayList<JsonObject>();
+        for (JsonObject row : sorted(table, contents)) {
+            if (low != null && compare(pk, row, low) <= 0) continue;
+            if (high != null && compare(pk, row, high) > 0) continue;
+            data.add(row);
+        }
+        int[] cursor = {-1};
+        return proxy(
+                ResultSet.class,
+                (r, m, a) ->
+                        switch (m.getName()) {
+                            case "next" -> ++cursor[0] < data.size();
+                            case "close" -> null;
+                            case "getString" -> {
+                                var name = table.columns().get((Integer) a[0] - 1).name();
+                                var value = data.get(cursor[0]).get(name);
+                                yield value == null || value.isJsonNull() ? null : value.getAsString();
+                            }
+                            default -> throw new AssertionError(m);
+                        });
+    }
+
+    private static SourceSchema.Table table(SourceSchema schema, String sql) {
+        return schema.tables().stream()
+                .filter(t -> sql.contains("FROM \"" + t.name() + "\""))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError(sql));
+    }
+
+    private static int compare(SourceSchema.Column pk, JsonObject row, Object bound) {
+        if (pk.type().equals("integer")) return Long.compare(row.get(pk.name()).getAsLong(), (Long) bound);
+        return Arrays.compareUnsigned(
+                row.get(pk.name()).getAsString().getBytes(StandardCharsets.UTF_8),
+                ((String) bound).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static List<JsonObject> sorted(SourceSchema.Table table, Map<String, List<JsonObject>> contents) {
+        var data = new ArrayList<>(contents.getOrDefault(table.name(), List.of()));
+        var pk = SourceRow.primary(table);
+        data.sort((a, b) -> pk.type().equals("integer")
+                ? Long.compare(a.get(pk.name()).getAsLong(), b.get(pk.name()).getAsLong())
+                : Arrays.compareUnsigned(
+                        a.get(pk.name()).getAsString().getBytes(StandardCharsets.UTF_8),
+                        b.get(pk.name()).getAsString().getBytes(StandardCharsets.UTF_8)));
+        return data;
     }
 
     private static Statement statement(
@@ -169,10 +271,25 @@ final class RowAuditTestSupport {
                 (s, method, args) ->
                         switch (method.getName()) {
                             case "close", "setFetchSize" -> null;
+                            case "execute" -> {
+                                if (!transaction[0]
+                                        || !(args[0].toString().startsWith("SET TRANSACTION SNAPSHOT ")
+                                                || args[0].toString().startsWith("SET LOCAL work_mem = ")
+                                                || args[0].toString().startsWith("SET LOCAL max_parallel_workers_per_gather = ")))
+                                    throw new AssertionError(args[0]);
+                                yield false;
+                            }
                             case "executeQuery" -> {
                                 if (!transaction[0] || !readOnly[0])
                                     throw new AssertionError("Not a read-only transaction");
                                 String sql = args[0].toString();
+                                if (sql.startsWith("SELECT \""))
+                                    yield columns(schema, contents, queries, sql);
+                                // A fixture table is a few blocks: the row audit reads it whole.
+                                if (sql.startsWith("SELECT pg_relation_size("))
+                                    yield rows(List.of(JsonParser.parseString("{\"blocks\":1}").getAsJsonObject()), true);
+                                if (sql.equals("SELECT pg_export_snapshot()"))
+                                    yield rows(List.of(JsonParser.parseString("{\"snapshot\":\"fixture\"}").getAsJsonObject()), true);
                                 var table =
                                         schema.tables().stream()
                                                 .filter(
@@ -211,6 +328,11 @@ final class RowAuditTestSupport {
     }
 
     private static ResultSet rows(List<JsonObject> data) {
+        return rows(data, false);
+    }
+
+    /** {@code firstColumn}: an index reads the row's only value, not the row as JSON. */
+    private static ResultSet rows(List<JsonObject> data, boolean firstColumn) {
         int[] cursor = {-1};
         return proxy(
                 ResultSet.class,
@@ -219,12 +341,26 @@ final class RowAuditTestSupport {
                             case "next" -> ++cursor[0] < data.size();
                             case "close" -> null;
                             case "getString" -> {
+                                if (args[0] instanceof Integer && firstColumn)
+                                    yield data.get(cursor[0]).entrySet().iterator().next().getValue().getAsString();
                                 if (args[0] instanceof Integer)
                                     yield JSON.toJson(data.get(cursor[0]));
                                 var value = data.get(cursor[0]).get(args[0].toString());
                                 yield value == null || value.isJsonNull()
                                         ? null
                                         : value.getAsString();
+                            }
+                            case "getObject" -> {
+                                if (!firstColumn) throw new AssertionError(method);
+                                yield data.get(cursor[0]).entrySet().iterator().next().getValue().getAsDouble();
+                            }
+                            case "getDouble" -> {
+                                if (!firstColumn) throw new AssertionError(method);
+                                yield data.get(cursor[0]).entrySet().iterator().next().getValue().getAsDouble();
+                            }
+                            case "getLong" -> {
+                                if (!firstColumn) throw new AssertionError(method);
+                                yield data.get(cursor[0]).entrySet().iterator().next().getValue().getAsLong();
                             }
                             default -> throw new AssertionError(method);
                         });

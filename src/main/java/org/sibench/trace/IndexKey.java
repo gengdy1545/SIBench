@@ -73,6 +73,8 @@ public final class IndexKey implements Comparable<IndexKey> {
      * value of {@code type}: int, timestamp, date (compared as midnight with a timestamp column),
      * char(n)/bpchar, varchar or text. A null value is {@link #NULL}.
      */
+    private static final java.util.regex.Pattern CHAR = java.util.regex.Pattern.compile("char\\([0-9]+\\)");
+
     public static IndexKey parse(String type, String text) throws IOException {
         if (text == null) return NULL;
         try {
@@ -83,7 +85,7 @@ public final class IndexKey implements Comparable<IndexKey> {
                 return ofTimestamp(LocalDateTime.parse(text.replace(' ', 'T')));
             }
             if (type.equals("date")) return ofTimestamp(LocalDate.parse(text).atStartOfDay());
-            if (type.equals("bpchar") || type.matches("char\\([0-9]+\\)")) {
+            if (type.equals("bpchar") || CHAR.matcher(type).matches()) {
                 int end = text.length();
                 while (end > 0 && text.charAt(end - 1) == ' ') end--;
                 return ofText(text.substring(0, end));
@@ -170,8 +172,17 @@ public final class IndexKey implements Comparable<IndexKey> {
         return other instanceof IndexKey key && Arrays.equals(bytes, key.bytes);
     }
 
+    /**
+     * Hashed with {@link KeyHash}: {@code Arrays.hashCode} collides heavily on the big-endian
+     * integer keys this encoding gives, which turned hash maps of keys into trees.
+     */
     @Override
     public int hashCode() {
+        return KeyHash.of(bytes);
+    }
+
+    /** The base-31 polynomial of the bytes, which the replay reports' checksums are defined with. */
+    public int checksumWord() {
         return Arrays.hashCode(bytes);
     }
 

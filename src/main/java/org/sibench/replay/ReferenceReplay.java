@@ -32,13 +32,15 @@ public final class ReferenceReplay {
                         .getAsJsonObject();
         for (String name : List.of("baseline", "workload")) {
             String checksum = name + "_trace_sha256";
+            Path file = directory.resolve(name + ".ops");
+            // A derived baseline load is checked against its digest as it is read.
             if (!manifest.has(checksum)
-                    || !BaselineGenerator.sha256(directory.resolve(name + ".ops"))
-                            .equals(manifest.get(checksum).getAsString()))
+                    || (Files.exists(file) || name.equals("workload"))
+                            && !IndexOperationTrace.sha256(file).equals(manifest.get(checksum).getAsString()))
                 throw new IOException("Trace checksum mismatch: " + name);
         }
         if (!manifest.has("work_units_sha256")
-                || !BaselineGenerator.sha256(directory.resolve("work-units.jsonl"))
+                || !org.sibench.capture.WorkUnits.sha256(directory)
                         .equals(manifest.get("work_units_sha256").getAsString()))
             throw new IOException("Source work-unit identity checksum mismatch");
         if (!manifest.has("secondary_index_coverage")
@@ -49,8 +51,8 @@ public final class ReferenceReplay {
         validateIndexCoverage(directory, manifest);
         var checked =
                 checkFiles(
-                        directory.resolve("baseline.ops"),
-                        directory.resolve("workload.ops"),
+                        org.sibench.capture.BaselineOperations.of(directory),
+                        IndexOperationTrace.Source.file(directory.resolve("workload.ops")),
                         config);
         for (String name : List.of("baseline", "workload")) {
             var counts = (Map<?, ?>) checked.get(name);
@@ -67,7 +69,7 @@ public final class ReferenceReplay {
         IndexCatalog.fromManifest(manifest);
         Map<Long, Long> units = new LinkedHashMap<>();
         long lastUnit = 0, lastEvent = 0;
-        for (String line : Files.readAllLines(directory.resolve("work-units.jsonl"))) {
+        for (String line : org.sibench.capture.WorkUnits.lines(directory)) {
             var unit = JsonParser.parseString(line).getAsJsonObject();
             long id = unit.get("work_unit_id").getAsLong(),
                     event = unit.get("source_event").getAsLong();
@@ -98,9 +100,10 @@ public final class ReferenceReplay {
             int[] position = {0}, group = {0};
             long[] rows = {0}, groupEvent = {0};
             java.util.Set<Integer> loadedTables = new java.util.HashSet<>();
-            IndexOperationTrace.read(
-                    directory.resolve(name + ".ops"),
-                    operation -> {
+            (name.equals("baseline")
+                            ? org.sibench.capture.BaselineOperations.of(directory)
+                            : IndexOperationTrace.Source.file(directory.resolve(name + ".ops")))
+                    .read(operation -> {
                         if (!IndexOperationTrace.isControl(operation) && name.equals("workload")) {
                             Long start = units.get(operation.workUnitId());
                             Long next = units.get(operation.workUnitId() + 1);
@@ -225,14 +228,20 @@ public final class ReferenceReplay {
 
     public static Map<String, Object> checkFiles(Path baseline, Path workload, ReplayConfig config)
             throws IOException {
+        return checkFiles(IndexOperationTrace.Source.file(baseline), IndexOperationTrace.Source.file(workload), config);
+    }
+
+    public static Map<String, Object> checkFiles(
+            IndexOperationTrace.Source baseline, IndexOperationTrace.Source workload, ReplayConfig config)
+            throws IOException {
         config.requireReferenceCapabilities();
         try (var load = new ReplayProjection(config, false, operation -> {});
                 var runtime = new ReplayProjection(config, true, operation -> {})) {
             RunTiming.current().phase("load");
-            long loadRecords = IndexOperationTrace.read(baseline, load);
+            long loadRecords = baseline.read(load);
             load.finish();
             RunTiming.current().phase("runtime");
-            long runtimeRecords = IndexOperationTrace.read(workload, runtime);
+            long runtimeRecords = workload.read(runtime);
             runtime.finish();
             runtime.requireClientCoverage();
             if (runtime.dispatched() < config.requiredOperations())
@@ -267,23 +276,29 @@ public final class ReferenceReplay {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
         var preflight = check(directory, config);
         return runChecked(
-                directory.resolve("baseline.ops"),
-                directory.resolve("workload.ops"),
+                org.sibench.capture.BaselineOperations.of(directory),
+                IndexOperationTrace.Source.file(directory.resolve("workload.ops")),
                 config,
                 preflight,
                 report);
     }
 
+    public static Map<String, Object> runFiles(Path baseline, Path workload, ReplayConfig config, Path report)
+            throws IOException {
+        return runFiles(IndexOperationTrace.Source.file(baseline), IndexOperationTrace.Source.file(workload), config, report);
+    }
+
     public static Map<String, Object> runFiles(
-            Path baseline, Path workload, ReplayConfig config, Path report) throws IOException {
+            IndexOperationTrace.Source baseline, IndexOperationTrace.Source workload, ReplayConfig config, Path report)
+            throws IOException {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
         return runChecked(
                 baseline, workload, config, checkFiles(baseline, workload, config), report);
     }
 
     private static Map<String, Object> runChecked(
-            Path baseline,
-            Path workload,
+            IndexOperationTrace.Source baseline,
+            IndexOperationTrace.Source workload,
             ReplayConfig config,
             Map<String, Object> preflight,
             Path report)
@@ -295,12 +310,12 @@ public final class ReferenceReplay {
                     var runtime = new ReplayProjection(config, true, index::accept)) {
                 RunTiming.current().phase("load");
                 long start = System.nanoTime();
-                IndexOperationTrace.read(baseline, load);
+                baseline.read(load);
                 load.finish();
                 double loadSeconds = (System.nanoTime() - start) / 1e9;
                 RunTiming.current().phase("runtime");
                 start = System.nanoTime();
-                IndexOperationTrace.read(workload, runtime);
+                workload.read(runtime);
                 runtime.finish();
                 double seconds = (System.nanoTime() - start) / 1e9;
                 Map<String, Object> result = new LinkedHashMap<>();

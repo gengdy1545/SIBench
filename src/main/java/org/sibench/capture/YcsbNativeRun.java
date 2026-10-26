@@ -440,7 +440,7 @@ final class YcsbNativeRun {
     }
 
     private static long countRequests(Path trace) throws IOException {
-        try (var lines = Files.lines(trace)) {
+        try (var lines = ServerTrace.open(trace).lines()) {
             return lines.filter(line -> line.contains("\"event\":\"request_start\"")).count();
         }
     }

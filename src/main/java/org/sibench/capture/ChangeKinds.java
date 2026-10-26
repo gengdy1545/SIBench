@@ -80,18 +80,85 @@ public final class ChangeKinds {
         return counter.report();
     }
 
-    /** Counts the raw server traces of one workload, in file order. */
+    /**
+     * Counts the raw server traces of one workload, in file order. The traces are read concurrently,
+     * a bounded number ahead, keeping only the lines {@link Counter#accept} acts on: a line whose
+     * first field names another event type is passed over without being parsed, as accept ignores
+     * it. The kept lines are applied in file order, so the counts are those of reading every line.
+     * (Parsing every line of every trace on one thread held up each workload of a native run.)
+     */
     public static Report countTraces(SourceSchema schema, List<Path> traces) throws IOException {
         Objects.requireNonNull(schema, "schema");
         var counter = new Counter(schema);
-        for (Path trace : traces) {
-            try (var lines = ServerTrace.open(trace)) {
-                String line;
-                while ((line = lines.readLine()) != null)
-                    counter.accept(JsonParser.parseString(line).getAsJsonObject());
+        int threads = Math.max(1, Math.min(traces.size(), Runtime.getRuntime().availableProcessors()));
+        var pool = java.util.concurrent.Executors.newFixedThreadPool(threads, task -> {
+            var thread = new Thread(task, "change-kinds");
+            thread.setDaemon(true);
+            return thread;
+        });
+        var window = new java.util.concurrent.Semaphore(threads * 2);
+        try {
+            var reads = new ArrayList<java.util.concurrent.Future<List<Item>>>();
+            for (Path trace : traces)
+                reads.add(pool.submit(() -> {
+                    window.acquire();
+                    return items(counter, trace);
+                }));
+            for (var read : reads) {
+                List<Item> items;
+                try {
+                    items = read.get();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while counting change kinds", interrupted);
+                } catch (java.util.concurrent.ExecutionException failed) {
+                    if (failed.getCause() instanceof IOException io) throw io;
+                    if (failed.getCause() instanceof RuntimeException runtime) throw runtime;
+                    throw new IOException(failed.getCause());
+                }
+                window.release();
+                for (Item item : items) counter.accept(item);
             }
+        } finally {
+            pool.shutdownNow();
         }
         return counter.report();
+    }
+
+    private static final String EVENT = "{\"event\":\"";
+
+    /**
+     * The trace's events the counter acts on, in order and already classified, without the lines
+     * that name an event type it ignores; runs on the reading threads.
+     */
+    private static List<Item> items(Counter counter, Path trace) throws IOException {
+        var kept = new ArrayList<Item>();
+        try (var lines = ServerTrace.open(trace)) {
+            String line;
+            while ((line = lines.readLine()) != null) {
+                if (line.startsWith(EVENT)
+                        && !line.startsWith("row_change\"", EVENT.length())
+                        && !line.startsWith("transaction_commit\"", EVENT.length())
+                        && !line.startsWith("transaction_abort\"", EVENT.length()))
+                    continue;
+                Item item = counter.item(JsonParser.parseString(line).getAsJsonObject());
+                if (item != null) kept.add(item);
+            }
+        }
+        return kept;
+    }
+
+    /**
+     * One event the counter acts on: a committed-or-not row change as its kind of maintenance
+     * (table, operation and the primary key it pairs deletes and inserts by; whether an UPDATE
+     * changed an indexed column), or a transaction end.
+     */
+    private record Item(int kind, String table, String operation, String key, boolean indexedChange, Exception error) {
+        static final int CHANGE = 0, COMMIT = 1, ABORT = 2;
+
+        Item(int kind, String table, String operation, String key, boolean indexedChange) {
+            this(kind, table, operation, key, indexedChange, null);
+        }
     }
 
     private record TableKey(String table, String key) {}
@@ -101,7 +168,7 @@ public final class ChangeKinds {
         private final Map<String, Set<String>> indexed = new LinkedHashMap<>();
         private final Map<String, Tally> byTable = new LinkedHashMap<>();
         private final Map<TableKey, Integer> deleted = new HashMap<>();
-        private final List<JsonObject> pending = new ArrayList<>();
+        private final List<Item> pending = new ArrayList<>();
 
         Counter(SourceSchema schema) throws IOException {
             var catalog = IndexCatalog.fromSchema(schema);
@@ -116,15 +183,36 @@ public final class ChangeKinds {
         }
 
         void accept(JsonObject event) throws IOException {
+            Item item = item(event);
+            if (item != null) accept(item);
+        }
+
+        /** The event as the counter acts on it, or null for an event it ignores; keeps no state. */
+        Item item(JsonObject event) throws IOException {
             String type = event.get("event").getAsString();
-            switch (type) {
-                case "row_change" -> pending.add(event);
-                case "transaction_commit" -> {
-                    for (JsonObject change : pending) apply(change);
+            return switch (type) {
+                case "row_change" -> {
+                    // A change is checked when its transaction commits, as applying it always was.
+                    try {
+                        yield classify(event);
+                    } catch (IOException | RuntimeException error) {
+                        yield new Item(Item.CHANGE, null, null, null, false, error);
+                    }
+                }
+                case "transaction_commit" -> new Item(Item.COMMIT, null, null, null, false);
+                case "transaction_abort" -> new Item(Item.ABORT, null, null, null, false);
+                default -> null;
+            };
+        }
+
+        void accept(Item item) throws IOException {
+            switch (item.kind()) {
+                case Item.CHANGE -> pending.add(item);
+                case Item.COMMIT -> {
+                    for (Item change : pending) apply(change);
                     pending.clear();
                 }
-                case "transaction_abort" -> pending.clear();
-                default -> {}
+                default -> pending.clear();
             }
         }
 
@@ -139,25 +227,19 @@ public final class ChangeKinds {
             return new Report(totals.counts(), perTable);
         }
 
-        private void apply(JsonObject change) throws IOException {
+        /**
+         * A row change as its kind of maintenance, with the checks applying it made; a change the
+         * workload cannot produce fails when its transaction commits.
+         */
+        private Item classify(JsonObject change) throws IOException {
             String relation = change.get("relation").getAsString();
             var table = tables.get(relation);
             if (table == null) throw new IOException("Unknown source row table: " + relation);
-            Tally tally = byTable.get(relation);
             JsonObject before = SourceRow.image(change, "old");
             JsonObject after = SourceRow.image(change, "new");
             String operation = change.get("operation").getAsString();
-            switch (operation) {
-                case "insert" -> {
-                    tally.inserts++;
-                    var open = new TableKey(relation, key(table, after));
-                    Integer awaiting = deleted.get(open);
-                    if (awaiting != null && awaiting > 0) {
-                        tally.reinserted++;
-                        if (awaiting == 1) deleted.remove(open);
-                        else deleted.put(open, awaiting - 1);
-                    }
-                }
+            return switch (operation) {
+                case "insert" -> new Item(Item.CHANGE, relation, operation, key(table, after), false);
                 case "update" -> {
                     String beforeKey = key(table, before), afterKey = key(table, after);
                     if (!beforeKey.equals(afterKey))
@@ -172,15 +254,37 @@ public final class ChangeKinds {
                     for (String column : indexed.get(relation))
                         if (!Objects.equals(oldValues.get(column), newValues.get(column)))
                             indexedChange = true;
-                    if (indexedChange) tally.indexColumnUpdates++;
+                    yield new Item(Item.CHANGE, relation, operation, beforeKey, indexedChange);
+                }
+                case "delete" -> new Item(Item.CHANGE, relation, operation, key(table, before), false);
+                default -> throw new IOException("Unsupported source row change: " + operation);
+            };
+        }
+
+        private void apply(Item change) throws IOException {
+            if (change.error() instanceof IOException error) throw error;
+            if (change.error() instanceof RuntimeException error) throw error;
+            String relation = change.table();
+            Tally tally = byTable.get(relation);
+            switch (change.operation()) {
+                case "insert" -> {
+                    tally.inserts++;
+                    var open = new TableKey(relation, change.key());
+                    Integer awaiting = deleted.get(open);
+                    if (awaiting != null && awaiting > 0) {
+                        tally.reinserted++;
+                        if (awaiting == 1) deleted.remove(open);
+                        else deleted.put(open, awaiting - 1);
+                    }
+                }
+                case "update" -> {
+                    if (change.indexedChange()) tally.indexColumnUpdates++;
                     else tally.ordinaryColumnUpdates++;
                 }
-                case "delete" -> {
+                default -> {
                     tally.deleteEvents++;
-                    deleted.merge(new TableKey(relation, key(table, before)), 1, Integer::sum);
+                    deleted.merge(new TableKey(relation, change.key()), 1, Integer::sum);
                 }
-                default ->
-                        throw new IOException("Unsupported source row change: " + operation);
             }
         }
 

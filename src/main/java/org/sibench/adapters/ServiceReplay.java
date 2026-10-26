@@ -62,7 +62,10 @@ public final class ServiceReplay {
                 RunTiming.current().phase(phase);
                 long start = System.nanoTime();
                 try (var projection = ReplayProjection.withClients(config, runtime, factory)) {
-                    IndexOperationTrace.read(directory.resolve(phase + ".ops"), projection);
+                    (runtime
+                                    ? IndexOperationTrace.Source.file(directory.resolve("workload.ops"))
+                                    : org.sibench.capture.BaselineOperations.of(directory))
+                            .read(projection);
                     projection.finish();
                     if (runtime) projection.requireClientCoverage();
                     double seconds = (System.nanoTime() - start) / 1e9;

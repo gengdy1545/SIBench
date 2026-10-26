@@ -129,7 +129,7 @@ public final class ReplayDispatcher implements AutoCloseable {
             orderChecksum =
                     Long.rotateLeft(orderChecksum, 7)
                             ^ operation.sourceEvent()
-                            ^ Long.rotateLeft(java.util.Objects.hashCode(operation.key()), 13)
+                            ^ Long.rotateLeft(word(operation.key()), 13)
                             ^ operation.kind()
                             ^ ((long) operation.table() << 48)
                             ^ ((long) operation.index() << 40)
@@ -140,10 +140,11 @@ public final class ReplayDispatcher implements AutoCloseable {
                             ^ Long.rotateLeft(operation.file(), 37)
                             ^ Long.rotateLeft(operation.position(), 41)
                             ^ Long.rotateLeft(operation.rowId(), 43)
-                            ^ Long.rotateLeft(java.util.Objects.hashCode(operation.indexedValue()), 47)
+                            ^ Long.rotateLeft(word(operation.indexedValue()), 47)
+                            // Objects.hash(lower, upper, limit) as it was defined.
                             ^ Long.rotateLeft(
-                                    java.util.Objects.hash(
-                                            operation.lower(), operation.upper(), operation.limit()),
+                                    31 * (31 * (31 + word(operation.lower())) + word(operation.upper()))
+                                            + Long.hashCode(operation.limit()),
                                     53)
                             ^ Long.rotateLeft(operation.expectedCount(), 59)
                             ^ Long.rotateLeft(operation.transactionId(), 61)
@@ -262,5 +263,10 @@ public final class ReplayDispatcher implements AutoCloseable {
             }
         }
         if (error != null) throw error;
+    }
+
+    /** A key's word in the order checksum: its checksum word, 0 for none. */
+    private static int word(org.sibench.trace.IndexKey key) {
+        return key == null ? 0 : key.checksumWord();
     }
 }

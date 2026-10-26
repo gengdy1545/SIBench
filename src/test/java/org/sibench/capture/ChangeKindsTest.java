@@ -177,4 +177,54 @@ public class ChangeKindsTest {
         assertEquals(1L, report.total().inserts());
         assertEquals(0L, report.total().deleteThenReinsert());
     }
+
+    /**
+     * Many traces, read concurrently: the counts are those of every line in file order, events of
+     * other types (even ones that would not parse) are passed over, and a delete in one trace pairs
+     * with the re-insert in a later one.
+     */
+    @Test
+    public void manyTracesCountAsTheirLinesInFileOrder() throws Exception {
+        Path directory = folder.newFolder("many").toPath();
+        var traces = new ArrayList<Path>();
+        var all = new ArrayList<JsonObject>();
+        var random = new java.util.Random(3);
+        long k = 0;
+        for (int t = 0; t < 40; t++) {
+            var lines = new ArrayList<String>();
+            for (int i = 0; i < 200; i++) {
+                long id = random.nextInt(50);
+                JsonObject change =
+                        switch (random.nextInt(3)) {
+                            case 0 -> row("sbtest1", "delete", sbtest(id, 1, "c"), null);
+                            case 1 -> row("sbtest1", "insert", null, sbtest(id, 1, "c"));
+                            default -> row("sbtest1", "update", sbtest(id, 1, "c"), sbtest(id, random.nextBoolean() ? 1 : 2 + k++, "d"));
+                        };
+                lines.add(change.toString());
+                all.add(change);
+                lines.add("{\"event\":\"scan_summary\",\"not json");
+                JsonObject end = event(random.nextInt(5) == 0 ? "transaction_abort" : "transaction_commit");
+                lines.add(end.toString());
+                all.add(end);
+            }
+            Path trace = directory.resolve("pg-" + t + ".jsonl");
+            Files.write(trace, lines);
+            traces.add(trace);
+        }
+        var expected = ChangeKinds.count(sysbench(), all);
+        var actual = ChangeKinds.countTraces(sysbench(), traces);
+        assertEquals(expected.describe(), actual.describe());
+        assertTrue(expected.total().deleteThenReinsert() > 0);
+    }
+
+    /** A change the workload cannot produce fails only when its transaction commits. */
+    @Test
+    public void anInvalidChangeFailsOnlyWhenCommitted() throws Exception {
+        Path directory = folder.newFolder("invalid").toPath();
+        var rewrite = row("sbtest1", "update", sbtest(1, 1, "c"), sbtest(2, 1, "c"));
+        Path aborted = Files.write(directory.resolve("pg-1.jsonl"), List.of(rewrite.toString(), event("transaction_abort").toString()));
+        assertEquals(0L, ChangeKinds.countTraces(sysbench(), List.of(aborted)).total().ordinaryColumnUpdates());
+        Path committed = Files.write(directory.resolve("pg-2.jsonl"), List.of(rewrite.toString(), event("transaction_commit").toString()));
+        assertThrows(IOException.class, () -> ChangeKinds.countTraces(sysbench(), List.of(committed)));
+    }
 }

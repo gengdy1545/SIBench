@@ -18,7 +18,9 @@ public final class HybenchNativeRun {
         try (CaptureRun run = CaptureRun.begin(config.raw())) {
             try {
                 CaptureRun.requireQueryIdentity(config.jdbc(), config.user());
-                run.build(CaptureBuild.identity(config.root()));
+                var settings = PgSettings.read(config.jdbc(), config.user());
+                run.build(PgSettings.identity(CaptureBuild.identity(config.root()), settings));
+                run.postgresSettings(settings.all());
                 run.schemaPreflight(
                         PgSchemaCheck.check(
                                 config.root(), config.document(), config.jdbc(), config.user()));
