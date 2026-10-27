@@ -51,26 +51,7 @@ final class SessionMerge implements AutoCloseable {
     /** Per session: the chunks its scanner thread found and the merge has not taken yet. */
     private final List<java.util.concurrent.BlockingQueue<Object>> ahead = new ArrayList<>();
     private final List<Thread> scannerThreads = new ArrayList<>();
-    private final List<Items> contents = new ArrayList<>();
-
-    /** One session's events, or what a per-session stage made of them, in order. */
-    interface Items extends AutoCloseable {
-        /** The next item, or null after the last one. */
-        Object next() throws IOException;
-
-        @Override
-        void close();
-    }
-
-    /**
-     * Turns one session's parsed events into its items, on a thread of its own: work that depends
-     * only on the session's own events moves off the merge, and the merge takes the items in the
-     * same places it took the events.
-     */
-    @FunctionalInterface
-    interface Stage {
-        Items apply(ParsedTrace events);
-    }
+    private final List<ParsedTrace> contents = new ArrayList<>();
     private final java.util.concurrent.ExecutorService parsers =
             java.util.concurrent.Executors.newFixedThreadPool(
                     parseThreads(),
@@ -109,15 +90,11 @@ final class SessionMerge implements AutoCloseable {
     }
 
     static SessionMerge open(List<Path> files) throws IOException {
-        return open(files, events -> events);
-    }
-
-    static SessionMerge open(List<Path> files, Stage stage) throws IOException {
         var merge = new SessionMerge(files);
         try {
             for (Path file : files) {
                 merge.scanners.add(new Boundaries(file));
-                merge.contents.add(stage.apply(new ParsedTrace(file, merge.parsers)));
+                merge.contents.add(new ParsedTrace(file, merge.parsers));
             }
             merge.fillAll();
         } catch (IOException | RuntimeException error) {
@@ -147,16 +124,11 @@ final class SessionMerge implements AutoCloseable {
 
     /** The next event of the current chunk, or null after its last one. */
     Event event() throws IOException {
-        return (Event) item();
-    }
-
-    /** The next item of the current chunk (an event unless a stage was given), or null after its last. */
-    Object item() throws IOException {
         if (remaining == 0) return null;
-        Object item = contents.get(current.session()).next();
-        if (item == null) throw new IOException("Session trace changed while it was merged");
+        Event event = contents.get(current.session()).next();
+        if (event == null) throw new IOException("Session trace changed while it was merged");
         remaining--;
-        return item;
+        return event;
     }
 
     /** Chunks a session's scanner finds ahead of the merge; they are a few numbers each. */
@@ -268,7 +240,7 @@ final class SessionMerge implements AutoCloseable {
             } catch (IOException ignored) {
                 // Closing after a failure must not mask the original error.
             }
-        for (Items reader : contents) reader.close();
+        for (ParsedTrace reader : contents) reader.close();
         parsers.shutdownNow();
     }
 

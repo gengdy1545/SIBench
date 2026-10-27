@@ -207,7 +207,7 @@ final class AccessProjection {
         // Earlier runs, with their values encoded once, attributed to the interval holding them.
         var runs = new ArrayList<IndexKey>();
         var counts = new ArrayList<Long>();
-        for (Run run : unit.runs) {
+        for (Run run : unit.runs == null ? List.<Run>of() : unit.runs) {
             runs.add(definition.encode(text(run.value())));
             counts.add(run.rows());
         }
@@ -231,7 +231,7 @@ final class AccessProjection {
         }
         Range range = ordered.get(boundary);
         long before = unit.rowsBeforeLastRun - attributed;
-        if (!unit.runs.isEmpty()) {
+        if (unit.runs != null && !unit.runs.isEmpty()) {
             // Array keys keep every run: the rows before the boundary interval must all be in it.
             long inside = 0;
             for (int r = 0; r < runs.size(); r++) if (range.contains(runs.get(r))) inside += counts.get(r);
@@ -251,13 +251,13 @@ final class AccessProjection {
         Range point = Range.equal(last);
         if (definition.indexId() == 0) {
             // A primary key value is one row.
-            if (unit.lastPks.size() != 1)
+            if ((unit.lastPks == null ? 0 : unit.lastPks.size()) != 1)
                 return Decision.reject("returned_row_outside_scan_interval");
             parts.add(new Part(definition.tableId(), 0, point, null, 1));
         } else {
             IndexCatalog.Definition primary = catalog.primary(definition.tableId());
             Set<IndexKey> pinned = new TreeSet<>();
-            for (JsonElement pk : unit.lastPks) {
+            for (JsonElement pk : unit.lastPks == null ? List.<JsonElement>of() : unit.lastPks) {
                 IndexKey key = primary.encode(text(pk));
                 if (!pinned.add(key)) return Decision.reject("row_returned_twice");
                 parts.add(new Part(definition.tableId(), definition.indexId(), point, key, 1));

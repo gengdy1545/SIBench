@@ -76,18 +76,18 @@ public final class AccessLedger {
 
     private final IndexCatalog catalog;
     private final boolean cCollation;
-    private final Map<String, Long> eventTypes = new TreeMap<>();
-    private final Map<String, Long> partition = new TreeMap<>();
-    private final Map<String, Long> bySource = new TreeMap<>();
-    private final Map<String, Long> byKind = new TreeMap<>();
-    private final Map<String, Long> projected = new TreeMap<>();
-    private final Map<String, Long> rejected = new TreeMap<>();
-    private final Map<String, Long> excluded = new TreeMap<>();
-    private final Map<String, Long> writes = new TreeMap<>();
-    private final Map<String, Long> groups = new TreeMap<>();
+    private final Map<String, long[]> eventTypes = new HashMap<>();
+    private final Map<String, long[]> partition = new HashMap<>();
+    private final Map<String, long[]> bySource = new HashMap<>();
+    private final Map<String, long[]> byKind = new HashMap<>();
+    private final Map<String, long[]> projected = new HashMap<>();
+    private final Map<String, long[]> rejected = new HashMap<>();
+    private final Map<String, long[]> excluded = new HashMap<>();
+    private final Map<String, long[]> writes = new HashMap<>();
+    private final Map<String, long[]> groups = new HashMap<>();
     private long searchOperations;
-    private final Map<String, Tally> byIndex = new TreeMap<>();
-    private final Map<Long, Template> templates = new TreeMap<>();
+    private final Map<String, Tally> byIndex = new HashMap<>();
+    private final Map<Long, Template> templates = new HashMap<>();
     private final Tally total = new Tally();
     private final List<Map<String, Object>> inputs = new ArrayList<>();
     private final Map<Request, List<Unit>> requestUnits = new HashMap<>();
@@ -210,7 +210,19 @@ public final class AccessLedger {
     }
 
     private void claim(String category) {
-        partition.merge(category, 1L, Long::sum);
+        increment(partition, category);
+    }
+
+    /** Counts a key without boxing a Long per event; reports sort the maps once. */
+    private static void increment(Map<String, long[]> counts, String key) {
+        counts.computeIfAbsent(key, ignored -> new long[1])[0]++;
+    }
+
+    /** A deterministic report view: the maps are hashed because they are written per event. */
+    private static Map<String, Long> sorted(Map<String, long[]> counts) {
+        var result = new TreeMap<String, Long>();
+        counts.forEach((key, count) -> result.put(key, count[0]));
+        return result;
     }
 
     private void session(Path file, AccessUnits units) throws IOException {
@@ -241,7 +253,7 @@ public final class AccessLedger {
     void event(Event e, boolean tracked) throws IOException {
         events++;
         String type = e.type();
-        eventTypes.merge(type, 1L, Long::sum);
+        increment(eventTypes, type);
         if (!e.has("req") || !e.has("depth"))
             throw new IOException("Trace lacks request ordinals and executor depth");
         if (type.equals("executor_start")
@@ -253,7 +265,7 @@ public final class AccessLedger {
         if (type.equals("index_insert_attempt")) {
             String index = e.get("relation").getAsString();
             catalog.named(index);
-            writes.merge(index, 1L, Long::sum);
+            increment(writes, index);
         }
         if (type.equals("scan_rescan")) catalog.named(e.get("relation").getAsString());
         if (!tracked
@@ -312,14 +324,14 @@ public final class AccessLedger {
         unitCounted += unit.events;
         total.add(unit);
         byIndex.computeIfAbsent(unit.scan.index, ignored -> new Tally()).add(unit);
-        bySource.merge(unit.source.label, 1L, Long::sum);
-        byKind.merge(unit.kind(), 1L, Long::sum);
+        increment(bySource, unit.source.label);
+        increment(byKind, unit.kind());
         if (unit.request != null) requestUnits.computeIfAbsent(unit.request, ignored -> new ArrayList<>()).add(unit);
     }
 
     /** A settled BitmapAnd group: every member carries the group's decision. */
     void group(AccessUnits.BitmapGroup group, Decision decision) {
-        groups.merge(decision.projected() ? "intersection_groups" : "rejected_groups", 1L, Long::sum);
+        increment(groups, decision.projected() ? "intersection_groups" : "rejected_groups");
         for (Unit unit : group.members) record(unit, decision);
     }
 
@@ -329,8 +341,9 @@ public final class AccessLedger {
                 decision.projected()
                         ? decision.shape()
                         : (decision.excluded() ? "excluded:" : "rejected:") + decision.reason();
-        (decision.projected() ? projected : decision.excluded() ? excluded : rejected)
-                .merge(decision.projected() ? decision.shape() : decision.reason(), 1L, Long::sum);
+        increment(
+                decision.projected() ? projected : decision.excluded() ? excluded : rejected,
+                decision.projected() ? decision.shape() : decision.reason());
         if (decision.projected()) searchOperations += decision.parts().size();
         if (unit.request != null) {
             if (unit.decision == null) pendingDecisions++;
@@ -414,7 +427,7 @@ public final class AccessLedger {
     }
 
     Map<String, Object> report(SourceSchema schema) throws IOException {
-        long claimed = partition.values().stream().mapToLong(Long::longValue).sum();
+        long claimed = partition.values().stream().mapToLong(count -> count[0]).sum();
         if (unitCounted != unitEvents)
             throw new IOException(
                     "Index events were not claimed exactly once: " + unitCounted + " != " + unitEvents);
@@ -426,7 +439,7 @@ public final class AccessLedger {
                             + events);
         if (!requestUnits.isEmpty() || pendingDecisions != 0)
             throw new IOException("Access units outside any finished request");
-        long rejectedUnits = rejected.values().stream().mapToLong(Long::longValue).sum();
+        long rejectedUnits = rejected.values().stream().mapToLong(count -> count[0]).sum();
         var result = new LinkedHashMap<String, Object>();
         result.put("schema_version", VERSION);
         result.put("status", "passed_event_partition");
@@ -436,16 +449,16 @@ public final class AccessLedger {
         result.put("inputs", inputs);
         var eventReport = new LinkedHashMap<String, Object>();
         eventReport.put("total", events);
-        eventReport.put("by_type", eventTypes);
+        eventReport.put("by_type", sorted(eventTypes));
         result.put("events", eventReport);
-        var parts = new LinkedHashMap<String, Object>(partition);
+        var parts = new LinkedHashMap<String, Object>(sorted(partition));
         parts.put("access_unit_events", unitEvents);
         parts.put("sum", events);
         result.put("partition", parts);
         var unitReport = new LinkedHashMap<String, Object>();
         unitReport.put("total", settled);
-        unitReport.put("by_source", bySource);
-        unitReport.put("by_kind", byKind);
+        unitReport.put("by_source", sorted(bySource));
+        unitReport.put("by_kind", sorted(byKind));
         unitReport.put("open_at_connection_close", openAtClose);
         unitReport.put("open_when_statement_aborted", abortedOpen);
         unitReport.putAll(total.describe());
@@ -454,10 +467,10 @@ public final class AccessLedger {
         var projection = new LinkedHashMap<String, Object>();
         projection.put("status", rejectedUnits == 0 ? "complete" : "has_rejected_units");
         projection.put("text_intervals_ordered", cCollation);
-        projection.put("projected", projected);
-        projection.put("rejected", rejected);
-        projection.put("excluded", excluded);
-        projection.put("bitmap_and_groups", groups);
+        projection.put("projected", sorted(projected));
+        projection.put("rejected", sorted(rejected));
+        projection.put("excluded", sorted(excluded));
+        projection.put("bitmap_and_groups", sorted(groups));
         projection.put("search_operations", searchOperations);
         result.put("projection", projection);
         var indexReports = new ArrayList<Map<String, Object>>();
@@ -473,7 +486,7 @@ public final class AccessLedger {
             item.put("column", definition.column());
             item.put("role", definition.indexId() == 0 ? "primary" : "secondary");
             item.putAll(byIndex.getOrDefault(name, new Tally()).describe());
-            item.put("index_insert_attempts", writes.getOrDefault(name, 0L));
+            item.put("index_insert_attempts", writes.containsKey(name) ? writes.get(name)[0] : 0L);
             indexReports.add(item);
         }
         result.put("indexes", indexReports);
@@ -487,7 +500,9 @@ public final class AccessLedger {
         requestReport.put("planner_endpoint_probes_without_request", probesUnassigned);
         result.put("requests", requestReport);
         var templateReports = new ArrayList<Map<String, Object>>();
-        for (var entry : templates.entrySet()) {
+        var templateEntries = new ArrayList<>(templates.entrySet());
+        templateEntries.sort(Map.Entry.comparingByKey());
+        for (var entry : templateEntries) {
             Template t = entry.getValue();
             var item = new LinkedHashMap<String, Object>();
             // A string: int64 identifiers do not survive JSON tools that read numbers as doubles.

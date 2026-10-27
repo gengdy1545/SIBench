@@ -584,28 +584,25 @@ public final class IndexTraceCompiler {
             var accessUnits = new long[files.size()];
             // Each file's first part names its capture format; later parts inherit it.
             var details = new AccessUnits.Detail[files.size()];
-            // Each session's access tracking runs ahead on its own thread (SessionTracking); the
-            // merge replays its calls where they were made.
-            try (SessionMerge merge = SessionMerge.open(files, SessionTracking::new)) {
+            // Each session's events are tracked here, in the merge's own order: moving the
+            // per-session tracking onto threads of its own cost more in calls and queueing than
+            // it saved on the one ordered thread, so tracking stays in-line.
+            try (SessionMerge merge = SessionMerge.open(files)) {
                 while (merge.hasNext()) {
                     var chunk = merge.next();
                     long firstEvent = event + 1, sessionRequests = requestUnits, unitsBefore = ledger.settled();
                     pid = 0;
                     sessionFile = files.get(chunk.session()).getFileName().toString();
+                    var tracker = new AccessUnits(this);
+                    if (details[chunk.session()] == null) tracker.beginSession();
+                    else tracker.continueSession(details[chunk.session()]);
                     // The final record is line lineCount, so its ordinal is known now.
                     knownCommit = chunk.committed();
                     knownEvent = event + chunk.lineCount();
-                    SessionTracking.Tracked last = null;
-                    for (Object item; (item = merge.item()) != null; ) {
-                        last = (SessionTracking.Tracked) item;
-                        event(last.event, null, last);
-                    }
-                    if (last == null || last.endCalls == null)
-                        throw new IOException("Session trace changed while it was merged");
-                    details[chunk.session()] = last.detail;
-                    replay(last.endCalls);
-                    rethrow(last.endFailure);
-                    ledger.absorb(last.tracker);
+                    for (Event event; (event = merge.event()) != null; ) event(event, tracker);
+                    details[chunk.session()] = tracker.detail();
+                    tracker.endSession();
+                    ledger.absorb(tracker);
                     finishSession();
                     accessUnits[chunk.session()] += ledger.settled() - unitsBefore;
                     events[chunk.session()] += event - firstEvent + 1;
@@ -640,14 +637,11 @@ public final class IndexTraceCompiler {
         }
 
         private void line(String line, AccessUnits tracker) throws IOException {
-            event(Event.parse(line), tracker, null);
+            event(Event.parse(line), tracker);
         }
 
-        /**
-         * One event, routed by {@code tracker} here or, when {@code tracked} is given, by its
-         * session's tracker ahead of the merge, whose calls are replayed first.
-         */
-        private void event(Event e, AccessUnits tracker, SessionTracking.Tracked tracked) throws IOException {
+        /** One event, routed by {@code tracker} and claimed once by the ledger. */
+        private void event(Event e, AccessUnits tracker) throws IOException {
             event++;
             RunTiming.current().advance(1);
             int eventPid = e.pid();
@@ -655,13 +649,7 @@ public final class IndexTraceCompiler {
             else if (pid != eventPid)
                 throw new IOException("One session trace must contain one backend");
             String type = e.type();
-            boolean routed;
-            if (tracked == null) routed = tracker.accept(e);
-            else {
-                replay(tracked.calls);
-                rethrow(tracked.failure);
-                routed = tracked.tracked;
-            }
+            boolean routed = tracker.accept(e);
             ledger.event(e, routed);
             switch (type) {
                 case "executor_start" -> {
@@ -694,27 +682,6 @@ public final class IndexTraceCompiler {
             identity.addProperty("source_event", event);
             units.write(identity.toString());
             units.newLine();
-        }
-
-        /** A session tracker's calls, made again in the order it made them. */
-        private void replay(List<SessionTracking.Call> calls) throws IOException {
-            for (var call : calls)
-                switch (call.kind()) {
-                    case SessionTracking.Call.REQUEST_STARTED -> requestStarted(call.request(), null);
-                    case SessionTracking.Call.REQUEST_FINISHED -> requestFinished(call.request());
-                    case SessionTracking.Call.UNIT_STARTED -> started(call.unit(), call.group(), call.first());
-                    case SessionTracking.Call.UNIT_SETTLED -> settled(call.unit(), call.group());
-                    case SessionTracking.Call.GROUP_FORMED -> formed(call.group(), call.members());
-                    default -> groupSettled(call.group());
-                }
-        }
-
-        private static void rethrow(Throwable failure) throws IOException {
-            if (failure == null) return;
-            if (failure instanceof IOException io) throw io;
-            if (failure instanceof RuntimeException runtime) throw runtime;
-            if (failure instanceof Error error) throw error;
-            throw new IOException(failure);
         }
 
         @Override

@@ -1,8 +1,5 @@
 package org.sibench.capture;
 
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -24,7 +21,7 @@ import java.util.concurrent.Future;
  * the memory however large a chunk is. A line that does not parse fails where the compiler reaches
  * it, after every event before it, exactly as parsing in place would.
  */
-final class ParsedTrace implements SessionMerge.Items {
+final class ParsedTrace {
     static final int BATCH = 512, WINDOW = 4;
     /** Parsed lines up to the first that failed, and that line's failure. */
     private record Batch(List<Event> events, RuntimeException failure) {}
@@ -78,7 +75,6 @@ final class ParsedTrace implements SessionMerge.Items {
     }
 
     /** The next event, or null after the last one. */
-    @Override
     public Event next() throws IOException {
         while (index == batch.events().size()) {
             if (batch.failure() != null) throw batch.failure();
@@ -107,7 +103,6 @@ final class ParsedTrace implements SessionMerge.Items {
         return batch.events().get(index++);
     }
 
-    @Override
     public void close() {
         reader.interrupt();
     }

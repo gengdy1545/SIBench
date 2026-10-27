@@ -114,13 +114,15 @@ final class AccessUnits {
         private boolean intersectionFromRows() {
             Unit smallest = null;
             for (Unit unit : members)
-                if (smallest == null || unit.unresolved.size() < smallest.unresolved.size())
+                if (smallest == null
+                        || (unit.unresolved == null ? 0 : unit.unresolved.size())
+                                < (smallest.unresolved == null ? 0 : smallest.unresolved.size()))
                     smallest = unit;
-            if (smallest == null) return false;
+            if (smallest == null || smallest.unresolved == null) return false;
             for (String tid : smallest.unresolved) {
                 boolean everywhere = true;
                 for (Unit unit : members)
-                    if (unit != smallest && !unit.unresolved.contains(tid)) {
+                    if (unit != smallest && (unit.unresolved == null || !unit.unresolved.contains(tid))) {
                         everywhere = false;
                         break;
                     }
@@ -175,8 +177,8 @@ final class AccessUnits {
         final int depth;
         long events = 1, calls, found, heapFetches, heapVisible, vmVisible, recheck, bitmapTids;
         long bitmapHeapVisible;
-        /** Bitmap candidate TIDs still waiting for their heap visibility verdict. */
-        final java.util.Set<String> unresolved = new java.util.HashSet<>();
+        /** Bitmap candidate TIDs still waiting for their heap visibility verdict; null for non-bitmap units. */
+        java.util.Set<String> unresolved;
         /** The same count, from a summary that carries no TIDs. */
         long summarizedUnresolved;
         boolean bitmapEnded, bitmapLossy, lastFound, forward, backward;
@@ -199,10 +201,12 @@ final class AccessUnits {
          * number of rows before the last run, and the last run's value and primary keys. A row
          * made visible without its identity (an all-visible index-only row) leaves them unusable.
          */
-        final List<Run> runs = new ArrayList<>();
+        /** Runs of equal indexed values; allocated only for array-key scans. */
+        List<Run> runs;
         long rowsBeforeLastRun;
         JsonElement lastValue;
-        final List<JsonElement> lastPks = new ArrayList<>();
+        /** Primary keys of the last run; allocated when the scan makes a row visible. */
+        List<JsonElement> lastPks;
         boolean identityMissing;
 
         /** Whether a scan key is an array; the keys are fixed when the scan starts. */
@@ -225,7 +229,7 @@ final class AccessUnits {
 
         /** Candidate TIDs the heap never checked. */
         long unresolvedCount() {
-            return unresolved.size() + summarizedUnresolved;
+            return (unresolved == null ? 0 : unresolved.size()) + summarizedUnresolved;
         }
 
         String kind() {
@@ -282,15 +286,30 @@ final class AccessUnits {
             return arrayKeys;
         }
 
+        java.util.Set<String> unresolved() {
+            if (unresolved == null) unresolved = new java.util.HashSet<>();
+            return unresolved;
+        }
+
+        List<Run> runs() {
+            if (runs == null) runs = new ArrayList<>();
+            return runs;
+        }
+
+        List<JsonElement> lastPks() {
+            if (lastPks == null) lastPks = new ArrayList<>();
+            return lastPks;
+        }
+
         /** One visible row, in scan order: extends the last run or starts the next. */
         void row(JsonElement value, JsonElement pk) {
             if (lastValue != null && !lastValue.equals(value)) {
-                if (arrayKeys()) runs.add(new Run(lastValue, lastPks.size()));
-                rowsBeforeLastRun += lastPks.size();
-                lastPks.clear();
+                if (arrayKeys()) runs().add(new Run(lastValue, lastPks == null ? 0 : lastPks.size()));
+                rowsBeforeLastRun += lastPks == null ? 0 : lastPks.size();
+                if (lastPks != null) lastPks.clear();
             }
             lastValue = value;
-            lastPks.add(pk);
+            lastPks().add(pk);
         }
     }
 
@@ -686,7 +705,7 @@ final class AccessUnits {
             }
             case "bitmap_candidate" -> {
                 unit.bitmapTids++;
-                unit.unresolved.add(e.get("tid").getAsString());
+                unit.unresolved().add(e.get("tid").getAsString());
             }
             default -> unit.bitmapEnded = true;
         }
@@ -739,7 +758,7 @@ final class AccessUnits {
             BitmapGroup group = heap.current;
             if (group == null) throw new IOException("BitmapAnd verdict without a cycle: " + tid);
             for (Unit unit : group.members)
-                if (unit.unresolved.remove(tid)) {
+                if (unit.unresolved != null && unit.unresolved.remove(tid)) {
                     claimed = true;
                     inputs |= 1L << heap.inputs.indexOf(unit.scan.id);
                     if (found) unit.bitmapHeapVisible++;
@@ -747,7 +766,7 @@ final class AccessUnits {
             if (found) group.visible++;
         } else
             for (Unit unit : bitmapUnits(heap))
-                if (unit.unresolved.remove(tid)) {
+                if (unit.unresolved != null && unit.unresolved.remove(tid)) {
                     claimed = true;
                     inputs |= 1L << heap.inputs.indexOf(unit.scan.id);
                     if (found) unit.bitmapHeapVisible++;
@@ -885,14 +904,14 @@ final class AccessUnits {
             same(differences, "heap_visible", e, unit.heapVisible);
             same(differences, "vm_visible", e, unit.vmVisible);
             same(differences, "bitmap_tids", e, unit.bitmapTids);
-            same(differences, "bitmap_unresolved", e, (long) unit.unresolved.size());
+            same(differences, "bitmap_unresolved", e, unit.unresolved == null ? 0L : (long) unit.unresolved.size());
             same(differences, "bitmap_ended", e, unit.bitmapEnded);
             same(differences, "identity_missing", e, unit.identityMissing);
             if (limited) {
                 same(differences, "rows_before_last_run", e, unit.rowsBeforeLastRun);
-                if (!runs.equals(unit.runs)) differences.add("runs");
+                if (!runs.equals(unit.runs == null ? List.of() : unit.runs)) differences.add("runs");
                 if (!java.util.Objects.equals(last, unit.lastValue)) differences.add("last_value");
-                if (!pks.equals(unit.lastPks)) differences.add("last_pks");
+                if (!pks.equals(unit.lastPks == null ? List.of() : unit.lastPks)) differences.add("last_pks");
             }
             if (intersection != null && intersection != unit.group.intersectionFromRows())
                 differences.add("group_unresolved_intersection");
@@ -921,9 +940,9 @@ final class AccessUnits {
         unit.identityMissing = e.get("identity_missing").getAsBoolean();
         if (limited) {
             unit.rowsBeforeLastRun = e.get("rows_before_last_run").getAsLong();
-            unit.runs.addAll(runs);
+            unit.runs().addAll(runs);
             unit.lastValue = last;
-            unit.lastPks.addAll(pks);
+            unit.lastPks().addAll(pks);
         }
         if (intersection != null) unit.group.summarizedIntersection = intersection;
     }

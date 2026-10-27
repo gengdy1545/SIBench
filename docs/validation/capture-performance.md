@@ -1,6 +1,6 @@
 # 采集性能：机器与 PG 配置
 
-2026-10-25。回答两个问题：采集 PG 的配置能把原生执行提速多少，插桩本身占多少；以及采集应在哪类机器上运行。
+2026-10-25 至 27。回答两个问题：采集 PG 的配置能把原生执行提速多少，插桩本身占多少；以及采集应在哪类机器上运行。
 
 ## 方法
 
@@ -85,6 +85,14 @@ YCSB 87m 5% 正式采集（`ycsb-87m-w5`，计划因子 7.39）：写入比例 0
 基线推出（jar new18，按行组读列、分段并行编码）：开发机 SF1 推出本身 16.4 s → 3.4 s；远程 HyBench SF10 基线阶段 115 s → 63 s（`hybench-sf10-w5c32j`，负载 313 s、原生 875 s）。
 
 采集阶段的后处理（jar new20）：sysbench 87m 原生执行阶段 831 s 中约 350 s 是负载之外的时间（`oltp_read_write` 后 243 s、其余每负载 6–23 s、最后会话审计约 55 s），YCSB 每个负载之后约 100 s。负载之间的线程栈都在 `ChangeKinds.countTraces`。改为并行读取并只解析行修改与事务记录后，同一份 sysbench 原始采集四个负载的变化类别报告与旧实现逐项相同，`oltp_read_write` 一项 128 s → 35–55 s；之后的正式采集 sysbench 87m 原生 387–420 s、编译 243–249 s，合计约 10.5 min（`w5e2`–`w5g2`）。YCSB 87m 32 线程完整核验 `w5c32v2` 原生 1,641 s。
+
+首次导出与核验（jar new21，远程 sibench_2，YCSB 87m 的 95 GB 表，主键与堆顺序无关）：导出的流式读取改为 PG 并行排序（8 worker），约 30 min（排序约 21 min、写出 Parquet 约 8 min）；核验不再对表排序——PG 侧按块区间并行物理扫描、Parquet 侧按行组并行读取，比较与顺序无关的逐行摘要（Parquet 的主键顺序在读取时逐行检查），8,706 万行全部一致用时 676 s。原先导出与核验合计 2,194–6,595 s。按序逐行比对仍可用 `-Dsibench.baseline.verify_ordered=true` 打开以定位首个不同的行。导出与核验都不属于认证覆盖的采集代码。
+
+编译按会话跟踪（jar new22）在远程 sysbench 87m 上实测为回退：运行到 79M / 106M 事件时已用约 1,002 CPU 秒，旧 jar 跑完 106M 只用约 705 CPU 秒；主线程始终 100%，tracker 线程多数空闲，调用与队列开销大于并行收益。该轮已停止并回退，未以它的计时作为结论。
+
+编译主线程（jar new24，只改编译器，采集代码身份不变）：恢复内联跟踪；账本的热路径计数改为无装箱的长整型数组并按需在报告端排序；`Unit` 的 bitmap 候选、array-key runs 与 last PK 列表改为按需分配。用同一份 raw、同一 baseline、同一认证与 PG 计数器对照：HyBench SF10 390.99 → 384.85 s（负载 322.88 → 321.49 s，baseline 64.27 → 59.52 s，RSS 24.24 → 24.13 GB）；sysbench 87m 243.93 → 243.07 s（负载 205.81 → 205.87 s，CPU 704.6 → 678.7 s，RSS 15.57 → 15.30 GB）；YCSB 87m 561.02 → 553.71 s（负载 520.62 → 524.29 s，baseline 36.23 → 25.31 s，RSS 13.40 → 14.87 GB；baseline 差异主要是 page cache）。三份 Trace 与旧 jar 逐字节相同（HyBench / sysbench 各 13 个文件，YCSB 16 个），`capture-completeness` 均为 `consistent`。YCSB 的 raw 是本轮以 32 线程、5% 写入重采的（原生 1,572.1 s、原始 9.3 GB），Trace 仍由真实原生负载编译，见 [编译阶段对照](compile-optimization-20261026.md) 与 [并发采集验证](concurrent-native-capture.md)。最终清理构建只删除未接入的 `SessionTracking` 与 per-session stage 接口；SF1 c8 重编的 13 个文件仍与 v22 逐字节相同。
+
+解析线程（同一 new24，仅 `-Dsibench.compile.parse_threads=8`）：sysbench 87m wall 241.76 s、RSS 14.76 GB（默认 32 线程 243.07 s、15.30 GB）；HyBench SF10 wall 386.65 s、RSS 23.58 GB（默认 384.85 s、24.13 GB）；YCSB 87m wall 559.47 s、RSS 15.01 GB（默认 553.71 s、14.87 GB）。8 线程只在 sysbench 上略快并省内存，HyBench / YCSB 都更慢；默认仍保留“每个处理器一个解析线程”，需要压内存时显式设小，Trace 字节不变。
 
 快照 oracle（`validate-snapshots`，jar 内 `KeyHash` 修正后）：远程 `hybench-sf10-c32cal2` 通过，200 万个变化主键、4,342 万次原生查询、2.58 亿个结果项（locator 与 rowid 各一遍），2 h 27 min、峰值 RSS 26.9 GB；修正前开发机同类 SF10 oracle 在 40 GB 被杀。开发机 SF1 c8 oracle 15 min 55 s、峰值 13.7 GB（修正前 15.7 GB），报告除计时外与保留版本相同。
 

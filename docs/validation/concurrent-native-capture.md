@@ -103,6 +103,22 @@
 
 参考回放（128 client，两种 value，`config/index_replay_128clients.yaml`）通过：每种 value 191,117,063 个查询、187,415,485 个快照查询，核对 44,507,577,021 个结果项，locator 10,223 s、row_id 10,430 s，峰值常驻 31.8 GB。快照 oracle（`validate-snapshots`，40 GB 堆）在 63 分钟后内存溢出：每个区间探针各复制一份该表全部变化键的历史，内存为探针数 × 变化键数，属 oracle 实现问题，不涉及 Trace；按计划修复后在远程机的认证采集上验证，不再在这份旧代码产生的 Trace 上重跑。
 
+## YCSB 87m 32 线程重采（2026-10-26）
+
+原 87m YCSB raw 在此前的循环采集清理中删除，无法对 new24 做 compile-only；因此用 `results/profiles/ycsb_87m_n22.yaml`（32 线程、`plan-write-ratio` 0.05）对同一静止库重新采集，并以 `ycsb-87m-yl3` 的完整核验认证做 `certified` 编译。产物 `results/poc/ycsb-87m-n22/`。
+
+| 项 | 结果 |
+| --- | --- |
+| 原生 | 1,572.1 s；原始采集 9.3 GB |
+| 负载 | 81,653,024 个运行期操作；25,862,780 个提交事务（全部 utility-only）；295,019 插入、4,064,684 更新，`row_write_ratio` 0.05008 |
+| 访问投影 | 25,567,761 次，0 拒绝（equality 24,163,595、limited_range 1,404,166） |
+| 审计 | `certified`，认证 `ycsb-87m-yl3`；PG 计数器 `consistent`；未重跑行审计 |
+| 编译 | 旧 jar 561.02 s（基线 36.23 / 负载 520.62）；new24 553.71 s（25.31 / 524.29）；两者 16 个 Trace 文件逐字节相同 |
+| 体积 | Trace 4.1 GB；Baseline 共享 66 GB |
+| 合计 | 原生 + 编译约 35.4 min |
+
+该次采集的 raw 与 Trace 保留；编译阶段的对照细节见 [编译阶段对照](compile-optimization-20261026.md)。
+
 ## 产物清理
 
 2026-10-25 起采集改在远程机运行，开发机只保留四份完整产物作为编译与回放的回归基准：`hybench-htap-sf10-w5`、`hybench-htap-sf1-c8-20261024`、`sysbench-8m-c8-20261024`、`ycsb-8m-c8b-20261024`。其余 `results/poc/*` 删除了全部大于 1 MB 的文件（原始追踪、Trace、Baseline、`Data_<sf>`、运行用 jar 副本），清单、报告与日志保留；开发机 PG 中的采集库与 SF10 静止库一并删除，本文与其他验证文档中引用这些目录的数据文件已不在。
