@@ -79,6 +79,70 @@ public class ReplayProjectionTest {
     }
 
     @Test
+    public void publicationMarkersCountOnlySentOperationsAndResetAfterEachTransaction() throws Exception {
+        for (String mode : List.of("operation", "transaction")) {
+            for (boolean secondary : new boolean[] {false, true}) {
+                var sent = new ArrayList<org.sibench.adapters.proto.Request>();
+                var requests = new org.sibench.adapters.TraceRequests(org.sibench.adapters.proto.ValueKind.ROW_ID);
+                ReplayTarget.Factory target = clientId -> new ReplayTarget() {
+                    @Override
+                    public SendHandle send(long sequence, Operation operation) throws IOException {
+                        sent.add(requests.request(sequence, operation));
+                        return SendHandle.completed();
+                    }
+
+                    @Override
+                    public SendHandle sendCommit(long sequence, long transactionId, long version) throws IOException {
+                        sent.add(requests.commit(sequence, transactionId, version));
+                        return SendHandle.completed();
+                    }
+                };
+                try (var replay = ReplayProjection.withClients(
+                        new ReplayConfig(secondary, "none", 0, 0, 0, 0, mode), true, target, true)) {
+                    replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
+                    org.sibench.capture.TransferIndexFixtures.expandRow(mutation(5, 1, 1, 10, 1, 3), replay);
+                    for (int index : new int[] {0, 1}) {
+                        replay.accept(IndexOperationTrace.search(2 + index, 5, index,
+                                Range.equal(IndexKey.ofInt(1)), 0, 1,
+                                IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
+                                .withTransaction(10, 1).withVersion(1));
+                    }
+                    assertTrue("operations cannot escape before the source commit", sent.isEmpty());
+                    replay.accept(IndexOperationTrace.transaction(10, 7, 10, 1, 1));
+                    int operations = secondary ? 5 : 2;
+                    assertEquals(operations + 1, sent.size());
+                    for (int i = 0; i < operations; i++) {
+                        assertFalse(sent.get(i).hasCommit());
+                        assertEquals(i + 1L, sent.get(i).getTransactionOperation());
+                        assertEquals(10, sent.get(i).getTransactionId());
+                        if (sent.get(i).hasSearch()) {
+                            assertEquals(0, sent.get(i).getSearch().getReadVersion());
+                            assertEquals(1, sent.get(i).getSearch().getLocalVersion());
+                        }
+                    }
+                    var marker = sent.get(operations);
+                    assertTrue(marker.hasCommit());
+                    assertEquals(1, marker.getCommit().getVersion());
+                    assertEquals(secondary ? 3 : 1, marker.getCommit().getWrites());
+                    assertEquals(operations, marker.getCommit().getOperations());
+                    // A second read-only transaction may become empty after secondary filtering.
+                    replay.accept(IndexOperationTrace.transaction(11, 6, 11, 2, 0));
+                    replay.accept(IndexOperationTrace.search(4, 5, 1,
+                            Range.equal(IndexKey.ofInt(10)), 1, 0, 0).withTransaction(11, 0));
+                    replay.accept(IndexOperationTrace.transaction(11, 7, 11, 2, 0));
+                    replay.finish();
+                    var next = sent.get(sent.size() - 1);
+                    assertTrue(next.hasCommit());
+                    assertEquals(11, next.getTransactionId());
+                    assertEquals(2, next.getCommit().getVersion());
+                    assertEquals(0, next.getCommit().getWrites());
+                    assertEquals(secondary ? 1 : 0, next.getCommit().getOperations());
+                }
+            }
+        }
+    }
+
+    @Test
     public void rejectsMalformedBoundariesEvenWhenSecondaryWritesAreFiltered() throws Exception {
         var config = new ReplayConfig(false, "none", 0, 0, 0, 0);
         var projection = new ReplayProjection(config, true, operation -> {});

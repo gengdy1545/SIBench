@@ -59,7 +59,17 @@ public final class IndexReferenceReplay implements AutoCloseable {
 
     private record Namespace(int table, int index) {}
 
-    private record StoredVersion(long version, long value, long position, boolean present) {}
+    private record StoredVersion(
+            long version,
+            long transaction,
+            long ordinal,
+            long value,
+            long position,
+            boolean present) {
+        static StoredVersion baseline(long value, long position) {
+            return new StoredVersion(0, 0, 0, value, position, true);
+        }
+    }
 
     private record WritePosition(long version, long transaction, long ordinal) {}
 
@@ -175,7 +185,9 @@ public final class IndexReferenceReplay implements AutoCloseable {
     }
 
     private static byte[] encode(StoredVersion version, int split) {
-        return ByteBuffer.allocate(21)
+        return ByteBuffer.allocate(37)
+                .putLong(version.transaction())
+                .putLong(version.ordinal())
                 .putLong(version.value())
                 .putLong(version.position())
                 .putInt(split)
@@ -331,12 +343,12 @@ public final class IndexReferenceReplay implements AutoCloseable {
                 byte[] found = run.getBytes(entry.bytes());
                 if (found == null) return null;
                 ByteBuffer value = ByteBuffer.wrap(found);
-                return new StoredVersion(0, value.getLong(), value.getLong(), true);
+                return StoredVersion.baseline(value.getLong(), value.getLong());
             }
             int position = lowerBound(entry.bytes());
             if (position >= size || !Arrays.equals(keys[position], entry.bytes())) return null;
-            return new StoredVersion(
-                    0, values[position], positions == null ? 0 : positions[position], true);
+            return StoredVersion.baseline(
+                    values[position], positions == null ? 0 : positions[position]);
         }
 
         /** The entries with {@code start <= key < end} (a null end is open) in the given order. */
@@ -455,7 +467,14 @@ public final class IndexReferenceReplay implements AutoCloseable {
         static StoredVersion decode(byte[] key, byte[] value) {
             long version = ByteBuffer.wrap(key).getLong(key.length - 8);
             ByteBuffer v = ByteBuffer.wrap(value);
-            return new StoredVersion(version, v.getLong(), v.getLong(), value[20] == 1);
+            long transaction = v.getLong(), ordinal = v.getLong();
+            return new StoredVersion(
+                    version,
+                    transaction,
+                    ordinal,
+                    v.getLong(),
+                    v.getLong(),
+                    value[36] == 1);
         }
 
         /** The latest version of the entry, or null when it has no history. */
@@ -483,6 +502,12 @@ public final class IndexReferenceReplay implements AutoCloseable {
 
         boolean has(Composite entry, long version) throws IOException {
             return map.getBytes(key(entry, version)) != null;
+        }
+
+        /** The entry's own version, or null when that version did not write it. */
+        StoredVersion exact(Composite entry, long version) throws IOException {
+            byte[] value = map.getBytes(key(entry, version));
+            return value == null ? null : decode(key(entry, version), value);
         }
 
         void put(Composite entry, StoredVersion version) throws IOException {
@@ -521,6 +546,22 @@ public final class IndexReferenceReplay implements AutoCloseable {
             return exists[0] ? selected : baseline.find(entry);
         }
 
+        /**
+         * A transaction-local read: the statement snapshot, plus only this transaction's own
+         * writes at {@code localVersion} up to {@code ordinal}. Another transaction's version
+         * between the snapshot and this one stays invisible.
+         */
+        StoredVersion visible(
+                Composite entry, long timestamp, long localVersion, long transaction, long ordinal)
+                throws IOException {
+            if (localVersion > 0 && localVersion > timestamp) {
+                StoredVersion local = overlay.exact(entry, localVersion);
+                if (local != null && local.transaction() == transaction && local.ordinal() <= ordinal)
+                    return local;
+            }
+            return visible(entry, timestamp);
+        }
+
         @Override
         public void close() throws IOException {
             baseline.close();
@@ -532,6 +573,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
     private final Settings settings;
     private final Workspace workspace;
     private final Budget budget;
+    private final org.sibench.replay.QueryDigest.Sink queryResults;
     private final Map<Namespace, Store> stores = new LinkedHashMap<>();
     /** Where entries were last written, kept for the transaction being applied only. */
     private final Map<EntryId, WritePosition> writePositions = new HashMap<>();
@@ -548,9 +590,18 @@ public final class IndexReferenceReplay implements AutoCloseable {
     }
 
     public IndexReferenceReplay(boolean rowIds, boolean secondaryIndexes, Settings settings) {
+        this(rowIds, secondaryIndexes, settings, null);
+    }
+
+    public IndexReferenceReplay(
+            boolean rowIds,
+            boolean secondaryIndexes,
+            Settings settings,
+            org.sibench.replay.QueryDigest.Sink queryResults) {
         this.rowIds = rowIds;
         this.secondaryIndexes = secondaryIndexes;
         this.settings = settings;
+        this.queryResults = queryResults;
         this.workspace = new Workspace(settings);
         this.budget = new Budget(settings.baselineEntries());
     }
@@ -596,6 +647,8 @@ public final class IndexReferenceReplay implements AutoCloseable {
             for (LookupResult result : results) checked(operation, result);
             checkedResults += results.size();
             queries++;
+            if (queryResults != null)
+                queryResults.accept(List.of(operation), List.copyOf(results));
             if ((operation.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0) snapshotQueries++;
             return;
         }
@@ -645,6 +698,8 @@ public final class IndexReferenceReplay implements AutoCloseable {
                 entry,
                 new StoredVersion(
                         operation.version(),
+                        operation.transactionId(),
+                        operation.mutationOrdinal(),
                         value,
                         position,
                         operation.kind() != IndexOperationTrace.LOGICAL_DELETE));
@@ -669,10 +724,22 @@ public final class IndexReferenceReplay implements AutoCloseable {
 
     private StoredVersion visible(int table, int index, Composite entry, long timestamp)
             throws IOException {
+        return visible(table, index, entry, timestamp, 0, 0, 0);
+    }
+
+    private StoredVersion visible(
+            int table,
+            int index,
+            Composite entry,
+            long timestamp,
+            long localVersion,
+            long transaction,
+            long ordinal)
+            throws IOException {
         Store store = stores.get(new Namespace(table, index));
         if (store == null) return null;
         store.seal();
-        return store.visible(entry, timestamp);
+        return store.visible(entry, timestamp, localVersion, transaction, ordinal);
     }
 
     public LookupResult lookupPrimary(int table, IndexKey key, long timestamp) throws IOException {
@@ -687,6 +754,19 @@ public final class IndexReferenceReplay implements AutoCloseable {
     public LookupResult lookupEntry(
             int table, int index, IndexKey key, IndexKey indexedValue, long timestamp)
             throws IOException {
+        return lookupEntry(table, index, key, indexedValue, timestamp, 0, 0, 0);
+    }
+
+    public LookupResult lookupEntry(
+            int table,
+            int index,
+            IndexKey key,
+            IndexKey indexedValue,
+            long timestamp,
+            long localVersion,
+            long transaction,
+            long ordinal)
+            throws IOException {
         if (table < 1
                 || index < 0
                 || key == null
@@ -694,7 +774,14 @@ public final class IndexReferenceReplay implements AutoCloseable {
                 || (index > 0 && (!secondaryIndexes || indexedValue == null)))
             throw new IOException("Invalid full index identity lookup");
         StoredVersion selected =
-                visible(table, index, Composite.of(index == 0 ? null : indexedValue, key), timestamp);
+                visible(
+                        table,
+                        index,
+                        Composite.of(index == 0 ? null : indexedValue, key),
+                        timestamp,
+                        localVersion,
+                        transaction,
+                        ordinal);
         return selected == null || !selected.present()
                 ? null
                 : new LookupResult(key, selected.version(), selected.value(), selected.position());
@@ -724,12 +811,21 @@ public final class IndexReferenceReplay implements AutoCloseable {
      */
     private static final class HistoryScan implements Closeable {
         private final SpillingMap.Entries entries;
-        private final long timestamp;
+        private final long timestamp, localVersion, transaction, ordinal;
         private boolean pending;
 
-        HistoryScan(SpillingMap.Entries entries, long timestamp) throws IOException {
+        HistoryScan(
+                SpillingMap.Entries entries,
+                long timestamp,
+                long localVersion,
+                long transaction,
+                long ordinal)
+                throws IOException {
             this.entries = entries;
             this.timestamp = timestamp;
+            this.localVersion = localVersion;
+            this.transaction = transaction;
+            this.ordinal = ordinal;
             pending = entries.next();
         }
 
@@ -737,11 +833,16 @@ public final class IndexReferenceReplay implements AutoCloseable {
             if (!pending) return null;
             byte[] first = entries.key();
             int length = first.length - 8;
-            History history = new History(Arrays.copyOf(first, length), ByteBuffer.wrap(entries.value()).getInt(16));
+            History history = new History(Arrays.copyOf(first, length), ByteBuffer.wrap(entries.value()).getInt(32));
             while (pending && entries.key().length - 8 == length
                     && Arrays.equals(entries.key(), 0, length, history.entry, 0, length)) {
                 StoredVersion version = Overlay.decode(entries.key(), entries.value());
-                if (version.version() <= timestamp
+                boolean local =
+                        localVersion > timestamp
+                                && version.version() == localVersion
+                                && version.transaction() == transaction
+                                && version.ordinal() <= ordinal;
+                if ((version.version() <= timestamp || local)
                         && (history.selected == null
                                 || version.version() > history.selected.version()))
                     history.selected = version;
@@ -761,6 +862,22 @@ public final class IndexReferenceReplay implements AutoCloseable {
      * stopping at the range limit. Returned keys are PKs.
      */
     public List<LookupResult> search(int table, int index, Range range, long timestamp)
+            throws IOException {
+        return search(table, index, range, timestamp, 0, 0, 0);
+    }
+
+    /**
+     * A search at a statement snapshot, plus a transaction's own writes at {@code localVersion}
+     * up to {@code ordinal}. A zero {@code localVersion} is a plain snapshot read.
+     */
+    public List<LookupResult> search(
+            int table,
+            int index,
+            Range range,
+            long timestamp,
+            long localVersion,
+            long transaction,
+            long ordinal)
             throws IOException {
         if (table < 1 || index < 0 || timestamp < 0 || (index > 0 && !secondaryIndexes))
             throw new IOException("Invalid index search");
@@ -786,7 +903,11 @@ public final class IndexReferenceReplay implements AutoCloseable {
         try (BaselineScan baseline = store.baseline.scan(start, end, descending);
                 HistoryScan overlay =
                         new HistoryScan(
-                                store.overlay.map.scan(start, end, descending), timestamp)) {
+                                store.overlay.map.scan(start, end, descending),
+                                timestamp,
+                                localVersion,
+                                transaction,
+                                ordinal)) {
             boolean baselineLeft = baseline.next();
             History pending = overlay.next();
             while (range.limit() == 0 || results.size() < range.limit()) {
@@ -803,7 +924,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
                 if (order < 0) {
                     entry = baseline.key();
                     split = baseline.split();
-                    selected = new StoredVersion(0, baseline.value(), baseline.position(), true);
+                    selected = StoredVersion.baseline(baseline.value(), baseline.position());
                     baselineLeft = baseline.next();
                 } else {
                     entry = pending.entry;
@@ -826,16 +947,27 @@ public final class IndexReferenceReplay implements AutoCloseable {
 
     /** The entries one search names: a range, or the single entry a pinned search names. */
     private List<LookupResult> results(Operation operation) throws IOException {
+        boolean local = (operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0;
+        long localVersion = local ? operation.version() : 0;
         if (operation.key() == null)
             return search(
-                    operation.table(), operation.index(), operation.range(), operation.readTimestamp());
+                    operation.table(),
+                    operation.index(),
+                    operation.range(),
+                    operation.readTimestamp(),
+                    localVersion,
+                    operation.transactionId(),
+                    operation.mutationOrdinal());
         LookupResult entry =
                 lookupEntry(
                         operation.table(),
                         operation.index(),
                         operation.key(),
                         operation.range().lower(),
-                        operation.readTimestamp());
+                        operation.readTimestamp(),
+                        localVersion,
+                        operation.transactionId(),
+                        operation.mutationOrdinal());
         return entry == null ? List.of() : List.of(entry);
     }
 
@@ -868,6 +1000,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
                     || operation.table() != first.table()
                     || groupFlags(operation) != groupFlags(first)
                     || operation.readTimestamp() != first.readTimestamp()
+                    || operation.version() != first.version()
                     || operation.expectedCount() != first.expectedCount()
                     || operation.expansionSize() != first.expansionSize()
                     || operation.transactionId() != first.transactionId()
@@ -891,12 +1024,15 @@ public final class IndexReferenceReplay implements AutoCloseable {
             }
             if (intersect) combined.keySet().retainAll(keys);
         }
+        List<Operation> members = List.copyOf(groupMembers);
         groupMembers.clear();
         groupResults.clear();
         expect(operation, combined.size());
         for (LookupResult result : combined.values()) checked(operation, result);
         checkedResults += combined.size();
         queries++;
+        if (queryResults != null)
+            queryResults.accept(members, List.copyOf(combined.values()));
         if ((operation.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0) snapshotQueries++;
     }
 
@@ -909,15 +1045,24 @@ public final class IndexReferenceReplay implements AutoCloseable {
     }
 
     private void validateSearch(Operation operation) throws IOException {
-        if (operation.version() != 0
-                || operation.readTimestamp() < 0
+        boolean local = (operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0;
+        if (operation.readTimestamp() < 0
                 || operation.expectedCount() < 0
-                || (operation.flags() & ~IndexOperationTrace.SEARCH_FLAGS) != 0)
+                || (operation.flags() & ~IndexOperationTrace.SEARCH_FLAGS) != 0
+                || (!local && operation.version() != 0))
             throw new IOException("Invalid search metadata");
-        if ((operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0
+        // Older v9 local searches carry the read point in readTimestamp; new ones name their
+        // own version and keep the statement snapshot.
+        boolean orderedLocal =
+                operation.version() == 0
+                        ? operation.readTimestamp() == lastAppliedVersion
+                        : operation.version() == lastAppliedVersion
+                                && operation.readTimestamp() < operation.version();
+        if (local
                 && (operation.transactionId() <= 0
                         || operation.mutationOrdinal() <= 0
-                        || operation.readTimestamp() != lastAppliedVersion))
+                        || (operation.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0
+                        || !orderedLocal))
             throw new IOException("Invalid ordered transaction-local search");
     }
 
@@ -947,7 +1092,15 @@ public final class IndexReferenceReplay implements AutoCloseable {
             return;
         }
         // Baseline entries are immutable; the moved location becomes their version-0 history.
-        store.overlay.put(entry, new StoredVersion(operation.version(), value, position, true));
+        store.overlay.put(
+                entry,
+                new StoredVersion(
+                        operation.version(),
+                        operation.transactionId(),
+                        operation.mutationOrdinal(),
+                        value,
+                        position,
+                        true));
         relocationWrites++;
     }
 

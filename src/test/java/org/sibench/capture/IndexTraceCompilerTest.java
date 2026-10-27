@@ -269,13 +269,22 @@ public class IndexTraceCompilerTest {
     }
 
     private void audit(CaptureConfig config, Path raw, String finalRow) throws Exception {
+        audit(
+                config,
+                raw,
+                finalRow == null
+                        ? Map.of("loantrans", List.of())
+                        : Map.of(
+                                "loantrans",
+                                List.of(JsonParser.parseString(finalRow).getAsJsonObject())));
+    }
+
+    private void audit(
+            CaptureConfig config, Path raw, Map<String, List<JsonObject>> finalRows)
+            throws Exception {
         var schema = SourceSchema.hybench(config.source());
         var contents = RowAuditTestSupport.baseline(config.layout().output());
-        contents.put(
-                "loantrans",
-                finalRow == null
-                        ? List.of()
-                        : List.of(JsonParser.parseString(finalRow).getAsJsonObject()));
+        contents.putAll(finalRows);
         RowStateAudit.audit(
                 RowAuditTestSupport.connection(schema, contents, new int[1]),
                 schema,
@@ -290,26 +299,59 @@ public class IndexTraceCompilerTest {
 
     /** One bound, fetched-to-the-end index scan of idx_loantrans_2 with one scan key. */
     private static String search(String scan, int found, int strategy, int flags) {
+        return search(
+                scan,
+                "idx_loantrans_2",
+                1114,
+                "2024-01-02 00:00:00",
+                "2024-01-02 00:00:00",
+                "1",
+                found,
+                strategy,
+                flags);
+    }
+
+    private static String search(
+            String scan,
+            String relation,
+            int typeOid,
+            String value,
+            String indexed,
+            String pk,
+            int found,
+            int strategy,
+            int flags) {
         String next =
                 "{\"event\":\"scan_next\",\"scan\":\""
                         + scan
                         + "\",\"direction\":1,\"recheck\":false,\"found\":";
         return "{\"event\":\"plan_scan\",\"scan\":\""
                 + scan
-                + "\",\"relation\":\"idx_loantrans_2\",\"plan_node\":1,\"kind\":\"index\"}\n"
+                + "\",\"relation\":\""
+                + relation
+                + "\",\"plan_node\":1,\"kind\":\"index\"}\n"
                 + "{\"event\":\"scan_rescan\",\"scan\":\""
                 + scan
-                + "\",\"relation\":\"idx_loantrans_2\",\"keys\":[{\"attribute\":1,\"strategy\":"
+                + "\",\"relation\":\""
+                + relation
+                + "\",\"keys\":[{\"attribute\":1,\"strategy\":"
                 + strategy
                 + ",\"flags\":"
                 + flags
-                + ",\"type_oid\":1114,\"value\":\"2024-01-02 00:00:00\"}]}\n"
+                + ",\"type_oid\":"
+                + typeOid
+                + ",\"value\":\""
+                + value
+                + "\"}]}\n"
                 + (found == 1
                         ? next
                                 + "true}\n{\"event\":\"heap_visibility\",\"scan\":\""
                                 + scan
-                                + "\",\"found\":true,\"row\":{\"indexed\":[\"2024-01-02 00:00:00\"],"
-                                + "\"pk\":[\"1\"]}}\n"
+                                + "\",\"found\":true,\"row\":{\"indexed\":[\""
+                                + indexed
+                                + "\"],\"pk\":[\""
+                                + pk
+                                + "\"]}}\n"
                         : "")
                 + next
                 + "false}\n"
@@ -378,8 +420,33 @@ public class IndexTraceCompilerTest {
     /** A fetched-to-the-end scan whose rescan carries the snapshot PostgreSQL took for it. */
     private static List<String> snapshotSearch(
             String scan, String value, long csn, String xip, long xmax, boolean suboverflowed) {
+        return snapshotSearch(
+                scan,
+                "idx_loantrans_2",
+                1114,
+                value,
+                value,
+                "1",
+                csn,
+                xip,
+                xmax,
+                suboverflowed);
+    }
+
+    private static List<String> snapshotSearch(
+            String scan,
+            String relation,
+            int typeOid,
+            String value,
+            String indexed,
+            String pk,
+            long csn,
+            String xip,
+            long xmax,
+            boolean suboverflowed) {
         var lines = new ArrayList<String>();
-        for (String line : search(scan, 1, 3, 0).lines().toList()) {
+        for (String line :
+                search(scan, relation, typeOid, value, indexed, pk, 1, 3, 0).lines().toList()) {
             var event = JsonParser.parseString(line).getAsJsonObject();
             if (event.get("event").getAsString().equals("scan_rescan")) {
                 event.getAsJsonArray("keys").get(0).getAsJsonObject().addProperty("value", value);
@@ -402,6 +469,21 @@ public class IndexTraceCompilerTest {
                 + ",\"new\":"
                 + after
                 + "}";
+    }
+
+    /** One row change on any table; a missing side is the JSON null an insert/delete carries. */
+    private static String rowChange(
+            String relation, long xid, String operation, JsonObject before, JsonObject after) {
+        var event = new JsonObject();
+        event.addProperty("event", "row_change");
+        event.addProperty("xid", xid);
+        event.addProperty("relation", relation);
+        event.addProperty("operation", operation);
+        if (before == null) event.add("old", com.google.gson.JsonNull.INSTANCE);
+        else event.add("old", before);
+        if (after == null) event.add("new", com.google.gson.JsonNull.INSTANCE);
+        else event.add("new", after);
+        return event.toString();
     }
 
     private Path concurrentCapture(Path directory, List<List<String>> sessions) throws Exception {
@@ -571,6 +653,174 @@ public class IndexTraceCompilerTest {
         for (String key : List.of("committed_transactions", "search_operations", "snapshot_searches", "workload_operations"))
             assertEquals(key, manifests.get(0).get(key), manifests.get(1).get(key));
         assertEquals(3, manifests.get(1).get("search_operations").getAsLong());
+    }
+
+    /**
+     * T1 updates A and then reads B. T2 moves B out of B's index value and inserts C into it, with
+     * the same result count, before T1 commits. T1's search keeps its own snapshot: B0, not C.
+     */
+    @Test
+    public void transactionLocalSearchKeepsItsSnapshotAndOnlyItsOwnWrites() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        CaptureConfig config = baseline(fixture);
+        var contents = RowAuditTestSupport.baseline(config.layout().output());
+        JsonObject loanBefore = contents.get("loantrans").get(0).deepCopy();
+        JsonObject loanAfter = loanBefore.deepCopy();
+        loanAfter.addProperty("timestamp", "2024-01-02 00:00:00");
+        JsonObject transferBefore = contents.get("transfer").get(0).deepCopy();
+        JsonObject transferAfter = transferBefore.deepCopy();
+        transferAfter.addProperty("sourceid", 2);
+        JsonObject transferNew = transferBefore.deepCopy();
+        transferNew.addProperty("id", 2);
+
+        var readerEvents = new ArrayList<String>();
+        readerEvents.add(rowChange("loantrans", 50, "update", loanBefore, loanAfter));
+        readerEvents.addAll(
+                snapshotSearch(
+                        "b1", "idx_transfer_1", 23, "1", "1", "1", 150, "[60]", 61, false));
+        var writerEvents = new ArrayList<String>();
+        writerEvents.add(rowChange("transfer", 60, "update", transferBefore, transferAfter));
+        writerEvents.add(rowChange("transfer", 60, "insert", null, transferNew));
+        var reader = new ArrayList<String>();
+        reader.addAll(
+                request(
+                        101,
+                        1,
+                        "UPDATE loantrans; SELECT transfer",
+                        readerEvents));
+        reader.add(commit(101, 1, 50, 300));
+        var writer = new ArrayList<String>();
+        writer.addAll(
+                request(
+                        102,
+                        1,
+                        "UPDATE transfer; INSERT transfer",
+                        writerEvents));
+        writer.add(commit(102, 1, 60, 200));
+
+        Path raw = concurrentCapture(fixture, List.of(reader, writer));
+        audit(
+                config,
+                raw,
+                Map.of(
+                        "loantrans", List.of(loanAfter),
+                        "transfer", List.of(transferAfter, transferNew)));
+        Path output = fixture.resolve("compiled");
+        var manifest = compile(config, raw, output);
+        assertEquals(1L, ((Number) manifest.get("transaction_local_searches")).longValue());
+        assertEquals(2L, ((Number) manifest.get("committed_transactions")).longValue());
+
+        var local = new ArrayList<IndexOperationTrace.Operation>();
+        var workload = new ArrayList<IndexOperationTrace.Operation>();
+        IndexOperationTrace.read(
+                output.resolve("workload.ops"),
+                operation -> {
+                    workload.add(operation);
+                    if (operation.kind() == IndexOperationTrace.SEARCH
+                            && (operation.flags()
+                                            & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
+                                    != 0) local.add(operation);
+                });
+        assertEquals(1, local.size());
+        var search = local.get(0);
+        assertEquals(2, search.version());
+        assertEquals(0, search.readTimestamp());
+        assertEquals(1, search.mutationOrdinal());
+
+        try (var model = new IndexReferenceReplay(true, true)) {
+            try (var load =
+                            new ReplayProjection(
+                                    ReplayConfig.defaults(), false, model::accept);
+                    var runtime =
+                            new ReplayProjection(
+                                    ReplayConfig.defaults(), true, model::accept)) {
+                org.sibench.capture.BaselineOperations.of(output).read(load);
+                load.finish();
+                IndexOperationTrace.read(output.resolve("workload.ops"), runtime);
+                runtime.finish();
+            }
+            var results =
+                    model.search(
+                            search.table(),
+                            search.index(),
+                            search.range(),
+                            search.readTimestamp(),
+                            search.version(),
+                            search.transactionId(),
+                            search.mutationOrdinal());
+            assertEquals(1, results.size());
+            assertEquals(IndexKey.ofInt(1), results.get(0).key());
+            assertEquals(0, results.get(0).commitVersion());
+            // The former single-timestamp projection reads T1's commit version and returns C,
+            // which has the same count but is a different row: the counterexample this fixes.
+            var old =
+                    model.search(
+                            search.table(),
+                            search.index(),
+                            search.range(),
+                            search.version(),
+                            0,
+                            0,
+                            0);
+            assertEquals(1, old.size());
+            assertEquals(IndexKey.ofInt(2), old.get(0).key());
+        }
+
+        assertEquals(
+                "passed",
+                ReferenceReplay.run(
+                                output,
+                                ReplayConfig.defaults(),
+                                fixture.resolve("replay.json"))
+                        .get("status"));
+        assertEquals(
+                "passed",
+                SnapshotLookupValidation.run(
+                                output,
+                                ReplayConfig.defaults(),
+                                fixture.resolve("snapshots.json"))
+                        .get("status"));
+        var service =
+                new org.sibench.adapters.ServiceConfig(
+                        "rocksdb",
+                        null,
+                        fixture.resolve("service-index"),
+                        0,
+                        org.sibench.adapters.proto.ValueKind.ROW_ID,
+                        true,
+                        false);
+        var served =
+                org.sibench.adapters.ServiceReplay.run(
+                        output,
+                        ReplayConfig.defaults(),
+                        service,
+                        null,
+                        fixture.resolve("service.json"));
+        assertEquals("passed", served.get("status"));
+        var servedResult = (Map<?, ?>) served.get("result");
+        assertEquals(1L, ((Number) servedResult.get("per_query_digest_checks")).longValue());
+        var publishedService =
+                new org.sibench.adapters.ServiceConfig(
+                        "rocksdb",
+                        null,
+                        fixture.resolve("service-index-published"),
+                        0,
+                        org.sibench.adapters.proto.ValueKind.ROW_ID,
+                        false,
+                        true);
+        var published =
+                org.sibench.adapters.ServiceReplay.run(
+                        output,
+                        ReplayConfig.defaults(),
+                        publishedService,
+                        null,
+                        fixture.resolve("service-published.json"));
+        assertEquals("passed", published.get("status"));
+        var publishedResult = (Map<?, ?>) published.get("result");
+        assertEquals(1L, ((Number) publishedResult.get("per_query_digest_checks")).longValue());
+        assertEquals(
+                ((Number) servedResult.get("result_checksum")).longValue(),
+                ((Number) publishedResult.get("result_checksum")).longValue());
     }
 
     @Test

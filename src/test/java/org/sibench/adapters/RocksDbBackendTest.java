@@ -108,6 +108,122 @@ public class RocksDbBackendTest {
     }
 
     @Test
+    public void transactionLocalReadSeesOwnWritesAndKeepsTheStatementSnapshot() throws Exception {
+        int table = 1;
+        var operations = new ArrayList<Operation>();
+        for (int id = 1; id <= 2; id++) {
+            Operation row =
+                    IndexOperationTrace.write(
+                            1,
+                            IndexOperationTrace.INSERT,
+                            table,
+                            0,
+                            IndexKey.ofInt(id),
+                            0,
+                            1,
+                            id - 1,
+                            id);
+            operations.add(row);
+            operations.add(row.withIndex(1, IndexKey.ofInt(1), IndexOperationTrace.INSERT));
+        }
+        // Another transaction moves row 2 from value 1 to value 2 at version 1.
+        Operation other =
+                IndexOperationTrace.write(
+                                2,
+                                IndexOperationTrace.UPSERT,
+                                table,
+                                0,
+                                IndexKey.ofInt(2),
+                                1,
+                                1,
+                                2,
+                                2)
+                        .withTransaction(1, 1);
+        operations.add(other);
+        operations.add(
+                other.withIndex(1, IndexKey.ofInt(1), IndexOperationTrace.LOGICAL_DELETE));
+        operations.add(other.withIndex(1, IndexKey.ofInt(2), IndexOperationTrace.UPSERT));
+        // Our transaction moves row 1 from value 1 to value 2 at version 2.
+        Operation own =
+                IndexOperationTrace.write(
+                                3,
+                                IndexOperationTrace.UPSERT,
+                                table,
+                                0,
+                                IndexKey.ofInt(1),
+                                2,
+                                1,
+                                2,
+                                1)
+                        .withTransaction(2, 1);
+        operations.add(own);
+        operations.add(
+                own.withIndex(1, IndexKey.ofInt(1), IndexOperationTrace.LOGICAL_DELETE));
+        operations.add(own.withIndex(1, IndexKey.ofInt(2), IndexOperationTrace.UPSERT));
+
+        Operation local =
+                IndexOperationTrace.search(
+                                4,
+                                table,
+                                1,
+                                Range.equal(IndexKey.ofInt(2)),
+                                0,
+                                1,
+                                IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
+                        .withTransaction(2, 1)
+                        .withVersion(2);
+        Operation localPrimary =
+                IndexOperationTrace.search(
+                                5,
+                                table,
+                                0,
+                                Range.equal(IndexKey.ofInt(1)),
+                                0,
+                                1,
+                                IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
+                        .withTransaction(2, 1)
+                        .withVersion(2);
+        try (var backend = load(operations, ValueKind.ROW_ID)) {
+            var requests = new TraceRequests(ValueKind.ROW_ID);
+            var request = requests.request(1, local);
+            assertEquals(2, request.getSearch().getLocalVersion());
+            assertEquals(0, request.getSearch().getReadVersion());
+            var response = IndexExecution.execute(backend, request);
+            assertEquals(response.getMessage(), Status.OK, response.getStatus());
+            // Hand-derived oracle: own row 1 moved to value 2; other row 2 is still at value 1.
+            var ownResult = List.of(new LookupResult(IndexKey.ofInt(1), 2, 1, 0));
+            same("own secondary", ownResult, response.getResultsList(), true);
+            same("own primary", ownResult,
+                    IndexExecution.execute(backend, requests.request(2, localPrimary)).getResultsList(), true);
+            Search oldSecondary = search(1, Range.equal(IndexKey.ofInt(1)), 0).toBuilder()
+                    .setTable(table).setLocalVersion(2).build();
+            same("other transaction remains at snapshot", List.of(new LookupResult(IndexKey.ofInt(2), 0, 2, 0)),
+                    backend.search(oldSecondary), true);
+
+            // Same transaction, later prefix: delete then reinsert the same PK with a new RowID.
+            Operation deleted = IndexOperationTrace.write(6, IndexOperationTrace.LOGICAL_DELETE,
+                    table, 0, IndexKey.ofInt(1), 2, 0, 0, 1).withTransaction(2, 2);
+            assertEquals(Status.OK, IndexExecution.execute(backend, requests.request(3, deleted)).getStatus());
+            assertEquals(Status.OK, IndexExecution.execute(backend, requests.request(4,
+                    deleted.withIndex(1, IndexKey.ofInt(2), IndexOperationTrace.LOGICAL_DELETE))).getStatus());
+            assertTrue(backend.search(request.getSearch()).isEmpty());
+            assertTrue(backend.search(requests.request(5, localPrimary).getSearch()).isEmpty());
+            same("deletion does not erase the snapshot", List.of(new LookupResult(IndexKey.ofInt(1), 0, 1, 0)),
+                    backend.search(search(0, Range.equal(IndexKey.ofInt(1)), 0).toBuilder().setTable(table).build()), true);
+
+            Operation reinserted = IndexOperationTrace.write(7, IndexOperationTrace.UPSERT,
+                    table, 0, IndexKey.ofInt(1), 2, 1, 3, 101).withTransaction(2, 3);
+            assertEquals(Status.OK, IndexExecution.execute(backend, requests.request(6, reinserted)).getStatus());
+            assertEquals(Status.OK, IndexExecution.execute(backend, requests.request(7,
+                    reinserted.withIndex(1, IndexKey.ofInt(2), IndexOperationTrace.UPSERT))).getStatus());
+            var reinsertedResult = List.of(new LookupResult(IndexKey.ofInt(1), 2, 101, 0));
+            same("new identity in secondary", reinsertedResult, backend.search(request.getSearch()), true);
+            same("new identity in primary", reinsertedResult,
+                    backend.search(requests.request(8, localPrimary).getSearch()), true);
+        }
+    }
+
+    @Test
     public void groupsCombineMembersByPrimaryKey() throws Exception {
         var operations = IndexReferenceSpillTest.stream(true, 4);
         long last = operations.stream().mapToLong(Operation::version).max().orElse(0);

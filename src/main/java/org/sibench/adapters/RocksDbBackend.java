@@ -76,9 +76,13 @@ public final class RocksDbBackend implements IndexBackend {
                 .setValueKind(valueKind)
                 .setVersionedReads(true)
                 .setOrderedSameVersionOverwrite(true)
+                .setTransactionLocalReads(true)
                 .setSearchGroups(true)
                 .setDurability("acknowledged writes are in the memtable and WAL without fsync;"
                         + " baseline inserts skip the WAL until Flush")
+                .setWriteAck(org.sibench.adapters.proto.Acknowledgement.ACK_WAL)
+                .setBaselineDurableOnlyAtFlush(true)
+                .setFlushMakesDurable(true)
                 .build();
     }
 
@@ -125,7 +129,7 @@ public final class RocksDbBackend implements IndexBackend {
                 throw new IllegalArgumentException("A pinned search names one secondary entry");
             byte[] entry = entry(search.getTable(), search.getIndex(), search.getLower().getKey(), search.getPinnedPrimaryKey());
             try (var iterator = db.newIterator()) {
-                Result result = visible(iterator, entry, search.getReadVersion());
+                Result result = visible(iterator, entry, search.getReadVersion(), search.getLocalVersion());
                 if (result != null) results.add(result);
             } catch (RocksDBException error) {
                 throw new IOException(error);
@@ -149,7 +153,7 @@ public final class RocksDbBackend implements IndexBackend {
                     iterator.seek(start);
                     while (iterator.isValid() && (limit == 0 || results.size() < limit)) {
                         byte[] entry = logical(iterator.key());
-                        Result result = visible(versions, entry, search.getReadVersion());
+                        Result result = visible(versions, entry, search.getReadVersion(), search.getLocalVersion());
                         if (result != null) results.add(result);
                         // Past the oldest possible version of this entry.
                         iterator.seek(versioned(entry, 0));
@@ -162,7 +166,7 @@ public final class RocksDbBackend implements IndexBackend {
                         iterator.prev();
                     while (iterator.isValid() && (limit == 0 || results.size() < limit)) {
                         byte[] entry = logical(iterator.key());
-                        Result result = visible(versions, entry, search.getReadVersion());
+                        Result result = visible(versions, entry, search.getReadVersion(), search.getLocalVersion());
                         if (result != null) results.add(result);
                         // Every version of the entry sorts after the entry itself.
                         iterator.seekForPrev(entry);
@@ -176,9 +180,15 @@ public final class RocksDbBackend implements IndexBackend {
         return results;
     }
 
-    /** The newest version of {@code entry} at or below the read version, if it is present. */
-    private static Result visible(RocksIterator versions, byte[] entry, long readVersion) throws RocksDBException {
-        versions.seek(versioned(entry, readVersion));
+    /**
+     * The newest version of {@code entry} at or below the read version, or the exact local version
+     * when a transaction-local search asks for one above it, if that state is present.
+     */
+    private static Result visible(
+            RocksIterator versions, byte[] entry, long readVersion, long localVersion)
+            throws RocksDBException {
+        byte[] selected = versioned(entry, Math.max(readVersion, localVersion));
+        versions.seek(selected);
         if (!versions.isValid()) {
             versions.status();
             return null;
@@ -186,6 +196,18 @@ public final class RocksDbBackend implements IndexBackend {
         byte[] key = versions.key();
         if (key.length != entry.length + VERSION || !Arrays.equals(key, 0, entry.length, entry, 0, entry.length))
             return null;
+        if (localVersion > readVersion
+                && ~ByteBuffer.wrap(key, entry.length, VERSION).getLong() != localVersion) {
+            // The transaction did not write this entry; read the statement snapshot instead.
+            versions.seek(versioned(entry, readVersion));
+            if (!versions.isValid()) {
+                versions.status();
+                return null;
+            }
+            key = versions.key();
+            if (key.length != entry.length + VERSION
+                    || !Arrays.equals(key, 0, entry.length, entry, 0, entry.length)) return null;
+        }
         ByteBuffer value = ByteBuffer.wrap(versions.value());
         if (value.get(0) == 0) return null;
         int indexedValue = value.getInt(1);

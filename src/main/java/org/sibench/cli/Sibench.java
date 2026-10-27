@@ -357,7 +357,12 @@ public final class Sibench {
                     throw new IllegalArgumentException("index-server requires SERVICE_CONFIG");
                 var service = ServiceConfig.ofServer(root, Path.of(profiles.get(0)));
                 try (var backend = RocksDbBackend.create(service.path(), service.value());
-                        var server = IndexServer.start(service.port(), backend, service.ordered())) {
+                        var server =
+                        IndexServer.start(
+                                service.port(),
+                                backend,
+                                service.ordered(),
+                                service.publication())) {
                     out.println("index-server " + backend.describe().getName() + " on port " + server.port());
                     out.flush();
                     server.awaitTermination();

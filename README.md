@@ -1,6 +1,6 @@
 # SIBench
 
-通过原生 benchmark 执行、真实 Parquet 和确定性索引 Trace，评估 KV Index Service。HyBench 默认采用原生 `runHTAP`：AP → TP → 并发 AT/IQ，保留原生事务比例和业务分支。v9 规范 Trace 由来源 schema 驱动，使用保序键编码，把每个原生索引访问投影为一组能重现原生结果集的有序查询（区间、带 limit 的主键扫描、二级扫描的前段加钉住点查、BitmapAnd 交集组、`= ANY` 并集组），否则带原因拒绝。三来源（含并发的完整 HyBench HTAP）已在 8,706,000 行基线上端到端验证：0 拒绝，1/64/128 client 参考回放与独立 oracle 通过。通用 Index Service 协议（gRPC）与 RocksDB 参照实现已能回放真实 Trace 并逐查询核对原生期望数；正式实验尚未开始。
+通过原生 benchmark 执行、真实 Parquet 和确定性索引 Trace，评估 KV Index Service。HyBench 默认采用原生 `runHTAP`：AP → TP → 并发 AT/IQ，保留原生事务比例和业务分支。v9 规范 Trace 由来源 schema 驱动，使用保序键编码，把每个原生索引访问投影为一组能重现原生结果集的有序查询（区间、带 limit 的主键扫描、二级扫描的前段加钉住点查、BitmapAnd 交集组、`= ANY` 并集组），否则带原因拒绝。历史 v9 记录中，三来源（含并发的完整 HyBench HTAP）已在 8,706,000 行基线上端到端验证：0 拒绝，1/64/128 client 参考回放与独立 oracle 通过。事务内读语义已修正为保留原语句快照并只叠加本事务此前的修改，夹具与小型 RocksDB 回归通过；三来源大 Trace 的重跑尚未执行。通用 Index Service 协议（gRPC）与 RocksDB 参照实现已能回放 Trace，逐查询核对原生期望数和完整 `(PK, version, value)` 摘要。真实 PG 受控反例和完整提交发布 / 全序对照已在远程小库通过；正式大 Trace 与性能实验尚未完成。
 
 ## 构建
 
@@ -68,13 +68,13 @@ java -Xmx24g -jar build/sibench/sibench.jar check-relocation PROFILE $T OUTPUT_D
 - `replay.dispatch_mode` 默认 `operation`，以操作为驱动输入单位；[index_replay_transaction.yaml](config/index_replay_transaction.yaml) 使用 `transaction` 按已提交源事务组织输入。两者最终均逐操作路由、单线程保序发送，不合并修改，不向索引发送事务控制，也不要求下游事务 API。
 - `replay.client_count` 默认 1；[64 client](config/index_replay_64clients.yaml) 和 [128 client](config/index_replay_128clients.yaml) 使用同一份 Trace。按源 SQL 请求分配 `workUnitId`，固定路由为 `(workUnitId - 1) % client_count`；同请求的主键/二级展开共用 client，同事务可跨 client。不按索引键或事务绑定，不增加其他路由策略。数量可超过 128，但过滤后的运行期操作必须覆盖全部配置 client，不足则拒绝并继续原生采集。
 - 本地发送完成后即可发下一项，不等待执行完成或跨 client 可见。`sent`/`response` 分开确认；`max_in_flight` 默认 4096，`request_timeout_seconds` 默认 60。驱动只在背压及最终排空时等待响应，遇到错误停止并清理，不通过屏障、重试或补偿修复服务端可见性。
-- 默认只向下游发送已提交变更，不限定 Index Service 场景。源 commit 后保留事务内查询与修改的原始顺序；写后查询携带源提交时间戳及此前修改位置。回滚修改及修改后的查询排除，修改前的受支持查询保留；原始事实不变，无反向操作或回撤开关。
+- 默认只向下游发送已提交变更，不限定 Index Service 场景。源 commit 后保留事务内查询与修改的原始顺序；写后查询携带原语句快照、本事务 CommitVersion 及此前修改位置，读取时只叠加本事务的这部分写入。回滚修改及修改后的查询排除，修改前的受支持查询保留；原始事实不变，无反向操作或回撤开关。
 - [long_replay.yaml](config/long_replay.yaml) 要求 single_pass、666,000,000 个有效操作；SF1 短输入会在预检失败。持续调度和分段供应尚未实现。
 - 异常运行保留诊断并拒绝编译；修复后从明确初始状态换新目录重跑。
 
 ## Index Service 回放
 
-驱动通过 [Index Service 协议](docs/contracts/index-service.md)（`src/main/proto/index_service.proto`）把规范 Trace 发给 KV 索引服务：每个 client 一条有序 gRPC 流，查询组整体发送，每个查询的返回条数必须等于原生期望数。`--reference` 给出同一 Trace 的参考回放报告时，查询数、结果项数和结果校验和也必须相同。
+驱动通过 [Index Service 协议](docs/contracts/index-service.md)（`src/main/proto/index_service.proto`）把规范 Trace 发给 KV 索引服务：每个 client 一条有序 gRPC 流，查询组整体发送，每个查询的返回条数必须等于原生期望数，并逐查询核对绑定查询身份与完整 `(PK, version, value)` 的 SHA-256 摘要。`--reference` 给出同一 Trace 的参考回放报告时复用其摘要 sidecar；没有时在回放前从同一 Trace 生成。
 
 ```bash
 T=results/poc/sysbench-8m-c8-20261024/trace
@@ -83,7 +83,7 @@ java -jar build/sibench/sibench.jar replay-service config/service_replay_grpc.ya
 java -jar build/sibench/sibench.jar replay-service config/service_replay_rocksdb.yaml $T REPORT  # 进程内 RocksDB，无网络
 ```
 
-索引目录已存在即拒绝；一个索引只由一份 Trace 的 Baseline 加载一次。
+索引目录已存在即拒绝；一个索引只由一份 Trace 的 Baseline 加载一次。`service.ordered: true` 提供 `sequence` 全序诊断；`service.publication: true` 使用事务 lane、`Commit` 标记和完整发布水位，查询等待 `read_version` 发布；两种模式不能同时开启。
 
 ## Baseline 生成配置
 
@@ -122,6 +122,9 @@ dry-run 只校验源码指纹、配置和 schema，不创建数据。去掉 `--d
 - [来源 Schema 契约](docs/contracts/source-schema.md)：三来源布局、PG 预检及失败边界。
 - [YCSB / sysbench 原生 Trace](docs/validation/ycsb-sysbench-native-trace.md)：完整访问投影、v9 Trace、回放与 oracle。
 - [按设计并发的原生采集](docs/validation/concurrent-native-capture.md)、[采集性能](docs/validation/capture-performance.md)：并发采集、HyBench SF10 与远程机 PG 配置对照。
+- [P0 读取正确性与逐查询结果校验](docs/validation/p0-read-validation.md)：事务内读、夹具反例与摘要负例。
+- [P0 原生反例、短流程矩阵与完整提交发布](docs/validation/p0-native-publish-validation.md)：真实 PG 两会话、短 sysbench 新语义 1/64/128 矩阵与发布 / 全序对照。
+- [P0 测试复核](docs/validation/p0-test-review.md)：发布模式迟到 / 重复请求缺陷的复核与修复记录。
 - [存储契约](docs/contracts/storage.md)：布局、Rewrite、GC 和测量边界。
 - [能力矩阵](docs/benchmarks/capability-matrix.md)：各来源当前覆盖。
 - 来源差异：[HyBench](docs/benchmarks/hybench.md)、[YCSB](docs/benchmarks/ycsb.md)、[sysbench](docs/benchmarks/sysbench.md)。

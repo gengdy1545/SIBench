@@ -29,6 +29,24 @@ abstract class ServiceClient implements ReplayTarget {
     abstract CompletableFuture<Response> transmit(Request request) throws IOException;
 
     @Override
+    public final SendHandle sendCommit(long dispatchSequence, long transactionId, long version)
+            throws IOException {
+        if (!group.isEmpty()) throw new IOException("Commit marker inside a search group");
+        var answer = transmit(requests.commit(dispatchSequence, transactionId, version));
+        CompletableFuture<Void> response =
+                answer.thenApply(
+                        result -> {
+                            try {
+                                requests.checkCommit(result);
+                                return null;
+                            } catch (IOException mismatch) {
+                                throw new java.util.concurrent.CompletionException(mismatch);
+                            }
+                        });
+        return new SendHandle(CompletableFuture.completedFuture(null), response);
+    }
+
+    @Override
     public final SendHandle send(long dispatchSequence, Operation operation) throws IOException {
         if (operation.grouped()) {
             group.add(operation);

@@ -12,6 +12,7 @@ import org.sibench.capture.IndexReferenceReplay;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 
 public class ReferenceReplayTest {
@@ -63,6 +64,10 @@ public class ReferenceReplayTest {
                     () -> ReferenceReplay.runFiles(baseline, workload, config, report));
         } finally {
             Files.deleteIfExists(report);
+            for (String mode : List.of("locator", "rowid"))
+                Files.deleteIfExists(
+                        report.toAbsolutePath()
+                                .resolveSibling(report.getFileName() + "." + mode + ".queries"));
             Files.deleteIfExists(baseline);
             Files.deleteIfExists(workload);
             Files.delete(directory);

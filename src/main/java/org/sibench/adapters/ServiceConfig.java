@@ -21,7 +21,13 @@ import java.util.Set;
  * {@code value} is {@code locator} or {@code row_id}: what an index entry points to.
  */
 public record ServiceConfig(
-        String adapter, String endpoint, Path path, int port, ValueKind value, boolean ordered) {
+        String adapter,
+        String endpoint,
+        Path path,
+        int port,
+        ValueKind value,
+        boolean ordered,
+        boolean publication) {
     public ServiceConfig {
         require(Set.of("grpc", "rocksdb").contains(adapter), "Unknown service adapter: " + adapter);
         require(!adapter.equals("grpc") || endpoint != null, "A gRPC target needs an endpoint");
@@ -33,16 +39,18 @@ public record ServiceConfig(
         var target = object(document, "target");
         if (!target.containsKey("service")) return null;
         var service = object(target, "service");
-        keys(service, Set.of("adapter", "endpoint", "path", "value"));
+        keys(service, Set.of("adapter", "endpoint", "path", "value", "publication"));
         String adapter = string(service, "adapter");
-        // In process, requests run on the sending thread: in send order whatever the client.
+        // In process, ordinary requests run on the sending thread; a published in-process service runs
+// them on a background executor so a read can wait for a commit the sender still has to send.
         return new ServiceConfig(
                 adapter,
                 service.containsKey("endpoint") ? string(service, "endpoint") : null,
                 service.containsKey("path") ? root.resolve(string(service, "path")) : null,
                 0,
                 value(service),
-                adapter.equals("rocksdb"));
+                adapter.equals("rocksdb") && !(service.containsKey("publication") && bool(service, "publication")),
+                service.containsKey("publication") && bool(service, "publication"));
     }
 
     /**
@@ -55,15 +63,19 @@ public record ServiceConfig(
         require(integer(document, "schema_version") == 1, "Expected index service config v1");
         require(string(document, "purpose").equals("index_service"), "Expected index_service purpose");
         var service = object(document, "service");
-        keys(service, Set.of("backend", "path", "port", "value", "ordered"));
+        keys(service, Set.of("backend", "path", "port", "value", "ordered", "publication"));
         require(string(service, "backend").equals("rocksdb"), "Only the RocksDB backend is implemented");
+        boolean ordered = service.containsKey("ordered") && bool(service, "ordered");
+        boolean publication = service.containsKey("publication") && bool(service, "publication");
+        require(!(ordered && publication), "Choose ordered or complete publication, not both");
         return new ServiceConfig(
                 "rocksdb",
                 null,
                 root.resolve(string(service, "path")),
                 Math.toIntExact(positive(service, "port")),
                 value(service),
-                service.containsKey("ordered") && bool(service, "ordered"));
+                ordered,
+                publication);
     }
 
     private static ValueKind value(Map<String, Object> service) {

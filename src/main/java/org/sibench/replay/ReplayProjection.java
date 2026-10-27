@@ -12,7 +12,7 @@ import java.util.Map;
 /** Validates committed source groups, then serializes local sends without waiting for execution. */
 public final class ReplayProjection implements IndexOperationTrace.Consumer, AutoCloseable {
     public static final int MAX_TRANSACTION_OPERATIONS = 1_000_000;
-    private final boolean secondaryIndexes, sourceTransactions;
+    private final boolean secondaryIndexes, sourceTransactions, publication;
     private final String dispatchMode;
     private final ReplayDispatcher dispatcher;
     private final List<Operation> pending = new ArrayList<>();
@@ -39,13 +39,31 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
 
     public static ReplayProjection withClients(
             ReplayConfig config, boolean sourceTransactions, ReplayTarget.Factory target) {
-        return new ReplayProjection(config, sourceTransactions, target);
+        return new ReplayProjection(config, sourceTransactions, target, false);
+    }
+
+    /** {@code publication}: send complete-commit markers to a service that declares them. */
+    public static ReplayProjection withClients(
+            ReplayConfig config,
+            boolean sourceTransactions,
+            ReplayTarget.Factory target,
+            boolean publication) {
+        return new ReplayProjection(config, sourceTransactions, target, publication);
     }
 
     private ReplayProjection(
             ReplayConfig config, boolean sourceTransactions, ReplayTarget.Factory target) {
+        this(config, sourceTransactions, target, false);
+    }
+
+    private ReplayProjection(
+            ReplayConfig config,
+            boolean sourceTransactions,
+            ReplayTarget.Factory target,
+            boolean publication) {
         this.secondaryIndexes = config.secondaryIndexes();
         this.sourceTransactions = sourceTransactions;
+        this.publication = publication;
         this.dispatchMode = config.dispatchMode();
         this.dispatcher = new ReplayDispatcher(config, target);
     }
@@ -132,6 +150,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
                     || o.table() != first.table()
                     || o.workUnitId() != first.workUnitId()
                     || o.readTimestamp() != first.readTimestamp()
+                    || o.version() != first.version()
                     || o.expectedCount() != first.expectedCount()
                     || o.expansionSize() != first.expansionSize()
                     || o.transactionId() != first.transactionId()
@@ -158,10 +177,10 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
 
     private void validateSearch(Operation o) throws IOException {
         boolean local = (o.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0;
-        if (o.version() != 0
-                || o.readTimestamp() < 0
+        if (o.readTimestamp() < 0
                 || (o.flags() & ~IndexOperationTrace.SEARCH_FLAGS) != 0
-                || o.expectedCount() < 0)
+                || o.expectedCount() < 0
+                || (!local && o.version() != 0))
             throw new IOException("Invalid search timestamp/flags/count");
         if (activeTransaction != 0) {
             requireCompleteExpansion();
@@ -170,8 +189,14 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         } else if (o.transactionId() != 0 || o.mutationOrdinal() != 0 || local)
             throw new IOException("Transaction-local search outside source group");
         if (local) {
+            // A new trace names its own version and keeps the statement snapshot; an older v9
+            // trace has no version and carries that read point in readTimestamp.
+            boolean ordered =
+                    o.version() == 0
+                            ? o.readTimestamp() == activeVersion
+                            : o.version() == activeVersion && o.readTimestamp() < activeVersion;
             if (lastOrdinal == 0
-                    || o.readTimestamp() != activeVersion
+                    || !ordered
                     || (o.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0)
                 throw new IOException("Invalid transaction-local read point");
         } else if (sourceTransactions
@@ -280,6 +305,8 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
             if (dispatchMode.equals("transaction") && !pending.isEmpty()) groups++;
             for (Operation operation : pending) sendOperation(operation);
             pending.clear();
+            if (publication)
+                dispatcher.sendCommit(activeTransaction, activeVersion);
             lastVersion = activeVersion;
             lastTransactionId = activeTransaction;
             activeTransaction = 0;
@@ -319,6 +346,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         report.put("change_delivery", sourceTransactions ? "committed_only" : "baseline");
         report.put("transaction_control_records", controls);
         report.put("dispatch_mode", dispatchMode);
+        report.put("complete_commit_publication", publication);
         report.put("source_dispatch_groups", groups);
         report.putAll(dispatcher.describe());
         report.put("sending_threads", 1);

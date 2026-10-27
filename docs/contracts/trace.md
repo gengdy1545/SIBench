@@ -52,7 +52,7 @@
 
 编译器要求匹配报告或匹配的认证，并检查转换所需的字段、身份及支持范围。
 
-证明方法的检查只做一次。`capture.verification: full` 的采集做行状态审计，编译（带 PG 计数器核对）通过后 `certify-capture` 写出 `certification.json`：构建（运行用 jar、PG 二进制、触发器库的 SHA256，见 `capture-run.json` 的 `build`）、来源提交与 schema 摘要、索引定义、采集格式（`capture_detail`），以及覆盖范围：账本中的全部访问路径（来源、索引、扫描种类、投影决定）和 Trace manifest 中的提交变化类别（表、操作）。`certified` 的采集以 `--certification` 代替行状态审计：编译前要求构建与来源相同，编译后要求格式、访问路径与变化类别全部在认证覆盖范围内，否则编译失败、Trace 保持未完成。认证采集仍做会话审计、账本划分、PG 计数器核对与编译检查；manifest 的 `verification.mode` 为 `row_audit` 或 `certified`。转换产物验收负责源事件到 Parquet / 完整索引展开的映射，独立 Parquet oracle 负责当前 / 历史键、版本和值，Backend 回放负责目标返回结果；这些检查不重新证明源行状态。换 client 数、发送开关或 Backend 复用来源审计结论，并复核文件摘要。
+证明方法的检查只做一次。`capture.verification: full` 的采集做行状态审计，编译（带 PG 计数器核对）通过后 `certify-capture` 写出 `certification.json`：构建（运行用 jar、PG 二进制、触发器库的 SHA256，见 `capture-run.json` 的 `build`）、来源提交与 schema 摘要、索引定义、采集格式（`capture_detail`），以及覆盖范围：账本中的全部访问路径（来源、索引、扫描种类、投影决定）和 Trace manifest 中的提交变化类别（表、操作）。`certified` 的采集以 `--certification` 代替行状态审计：编译前要求构建与来源相同，编译后要求格式、访问路径与变化类别全部在认证覆盖范围内，否则编译失败、Trace 保持未完成。认证采集仍做会话审计、账本划分、PG 计数器核对与编译检查；manifest 的 `verification.mode` 为 `row_audit` 或 `certified`。转换产物验收负责源事件到 Parquet / 完整索引展开的映射，独立 Parquet oracle 负责当前 / 历史键、版本和值，Backend 回放负责目标返回结果；这些检查不重新证明源行状态。参考回放按查询生成绑定查询身份、结果顺序和完整 `(PK, version, value)` 的强摘要，服务回放逐查询核对；原生条数仍是独立来源事实，摘要不得由服务响应反向生成。换 client 数、发送开关或 Backend 复用来源审计结论，并复核文件摘要。
 
 三来源 PK 值 UPDATE 固定为范围外负载，提交及回滚尝试均拒绝；同主键普通列 / 二级索引列 UPDATE、DELETE / 重插入仍支持。CHAR 只忽略尾部 ASCII 空格，VARCHAR / TEXT 保留原文，REAL 按源单精度比较，date / timestamp 按类型比较。
 
@@ -73,9 +73,9 @@ LogicalValue = RowID
 - `session_order=concurrent` 的会话按 PostgreSQL 事务完成计数器（`ShmemVariableCache->xactCompletionCount`）归并。持有 XID 的事务（写事务，含回滚）在 `ProcArrayEndTransactionInternal` 持 `ProcArrayLock` 排他锁时自增该计数器，这正是它对其他快照可见的时刻；补丁在同一处把自增后的值记到该事务的 `PGPROC` 上（组清理时由组长代为执行，所以记在成员的 `PGPROC` 而不是后端变量），提交 / 回滚记录写出的就是这个精确值，因此"提交对快照可见"等价于"快照计数器 >= 提交位置"，写事务两两位置不同。不持有 XID 的只读事务不改变任何快照、不自增计数器，记录其提交时观察到的计数器，排在同一位置的写事务之后。归并按（位置、写事务优先、会话顺序）对事务大小的片段做 k 路归并，不按 PID、XID 大小、文件顺序或墙钟推断；会话内写事务位置必须严格递增、只读事务不得递减，两个写事务共用位置即失败。片段是事务粒度，所以扫描不会跨片段，访问划分按片段重新开始，避免不同后端复用同一个扫描指针。
 - 回滚不推进 CommitVersion，不分配 RowID，不改变已提交索引状态，也不写入增量 Parquet。后续事务从最近的已提交状态继续。
 - transactionId 是源提交事件序号。修改的 mutationOrdinal 是事务内行修改序号，二级展开共享序号；组内查询携带同一 transactionId，mutationOrdinal 表示查询前已发生的行修改数。两者只用于来源关联和顺序校验，不作为 KV 版本后缀，不要求索引维护事务状态。
-- ReadTimestamp 表示查询可见的提交上界，在 T 选择同键最大版本 `<=T`。没有版本或选中删除版本时不存在，不能跳过删除标记返回旧值。
-- 顺序会话中，事务首次修改前的查询使用前一次提交的 ReadTimestamp；修改后的查询使用本源事务的 CommitVersion，并标记 TRANSACTION_LOCAL_SEARCH。必须按原始位置发送：此前修改 → 查询 → 后续修改。期望结果对应查询位置的此前写入，不包括后续修改；驱动不等待跨 client 执行或可见性。Index Service 必须实现其声明的有序覆盖与读取语义，否则结果核对失败。仅有时间戳不自动保证同版本中间结果或跨连接可见。事务结束后同键同版本只保留最后效果。
-- 修改前查询读前一次提交只对互不重叠的会话成立。并发会话中，修改前的查询改为读取"其语句快照的计数器所见的最后一个写事务提交"（只读事务的提交不改变数据，不作读取点）：每个扫描事件记录该快照的计数器、xmin、xmax 和 xip，编译器取位置 <= 快照计数器的最后一个写事务提交作为 ReadTimestamp，因此可以早于其发送位置之前的提交，并标记 SNAPSHOT_SEARCH。编译器对每个扫描交叉验证：计数器判定为可见的提交，不得出现在该快照自己的 xip 里；冲突说明单个 ReadTimestamp 无法表达该可见集合，整次编译失败而不是近似。`suboverflowed` 的快照无法逐个核对子事务，不做交叉验证并单独计数。修改后的查询在两种会话顺序下都读本源事务的 CommitVersion 并标记 TRANSACTION_LOCAL_SEARCH。原始 xmin/xmax/xip 仍是可见性判定本身，不直接当作提交版本。显式历史查询选择可用历史点，未来读点拒绝。
+- ReadTimestamp 表示查询的原语句快照（可见提交上界），在 T 选择同键最大版本 `<=T`。没有版本或选中删除版本时不存在，不能跳过删除标记返回旧值。
+- **事务内读**：查询保留原语句快照，同时携带本源事务的 CommitVersion（SEARCH.version）和 mutationOrdinal，并标记 TRANSACTION_LOCAL_SEARCH。读取结果 = 快照 `<= ReadTimestamp` 的最新状态，再只叠加本事务在 mutationOrdinal 之前写入的该版本状态；两个位置之间提交的其它事务版本不可见。必须按原始位置发送：此前修改 → 查询 → 后续修改。事务结束后同键同版本只保留最后效果。旧 v9 编译产物以 `version=0` 且 `ReadTimestamp=本源 CommitVersion` 表示事务内读，读取器仍接受该历史形式，但不据此生成新 Trace。
+- 顺序会话中，事务首次修改前的查询使用前一次提交的 ReadTimestamp。并发会话中，查询使用"其语句快照的计数器所见的最后一个写事务提交"（只读事务的提交不改变数据，不作读取点）：每个扫描事件记录该快照的计数器、xmin、xmax 和 xip，编译器取位置 <= 快照计数器的最后一个写事务提交作为 ReadTimestamp，因此可以早于其发送位置之前的提交，并标记 SNAPSHOT_SEARCH。编译器对每个扫描交叉验证：计数器判定为可见的提交，不得出现在该快照自己的 xip 里；冲突说明单个 ReadTimestamp 无法表达该可见集合，整次编译失败而不是近似。`suboverflowed` 的快照无法逐个核对子事务，不做交叉验证并单独计数。原始 xmin/xmax/xip 仍是可见性判定本身，不直接当作提交版本。显式历史查询选择可用历史点，未来读点拒绝。
 - UPDATE 保留 RowID；DELETE 后重插入分配新 RowID。Rewrite 不改变逻辑版本或 RowID。
 - FileID 从 1 分配且不复用；文件内行号从 0 开始。数据集隔离，int64 无损解析。
 
@@ -96,7 +96,7 @@ v9 每条记录为 128 字节固定前缀加四个可变键分量，每块最多
 | 操作 | 语义 |
 | --- | --- |
 | INSERT | Baseline 索引加载 |
-| SEARCH | 有序查询：主键比较 PK，二级比较 IndexedValue，结果按 (IndexedValue, PK) 升序（DESCENDING 时降序），limit>0 时取前 limit 个可见项且期望数等于 limit；version=0、readTimestamp>=0；flags：SNAPSHOT_SEARCH=1、TRANSACTION_LOCAL_SEARCH=4、LOWER_INCLUSIVE=8、UPPER_INCLUSIVE=16、DESCENDING=32、INTERSECT_GROUP=64、UNION_GROUP=128。**钉住点查**：二级点区间且 key 带 PK，恰好命名一个索引条目 (IndexedValue, PK)，期望数 1，无 limit、不入组。**查询组**：带 INTERSECT_GROUP 或 UNION_GROUP 的连续查询是同一次源访问，`expansionPosition` 0..n-1、`expansionSize`=n≥2，成员共享 sourceEvent、table、readTimestamp、事务位置、工作单元和组期望数；交集组成员可在同表不同索引，并集组成员是同一索引的点；期望数是成员结果按 PK 求交 / 求并后的行数，成员自身的条数不是源事实，不单独校验 |
+| SEARCH | 有序查询：主键比较 PK，二级比较 IndexedValue，结果按 (IndexedValue, PK) 升序（DESCENDING 时降序），limit>0 时取前 limit 个可见项且期望数等于 limit；`readTimestamp>=0` 为原语句快照；普通 / 快照查询 version=0，TRANSACTION_LOCAL_SEARCH 的 version 为本事务 CommitVersion（历史形式为 0）；flags：SNAPSHOT_SEARCH=1、TRANSACTION_LOCAL_SEARCH=4、LOWER_INCLUSIVE=8、UPPER_INCLUSIVE=16、DESCENDING=32、INTERSECT_GROUP=64、UNION_GROUP=128。**钉住点查**：二级点区间且 key 带 PK，恰好命名一个索引条目 (IndexedValue, PK)，期望数 1，无 limit、不入组。**查询组**：带 INTERSECT_GROUP 或 UNION_GROUP 的连续查询是同一次源访问，`expansionPosition` 0..n-1、`expansionSize`=n≥2，成员共享 sourceEvent、table、readTimestamp、version、事务位置、工作单元和组期望数；交集组成员可在同表不同索引，并集组成员是同一索引的点；期望数是成员结果按 PK 求交 / 求并后的行数，成员自身的条数不是源事实，不单独校验 |
 | UPSERT | 带提交版本的写入；flags：业务 INSERT=1、UPDATE=2 |
 | LOGICAL_DELETE | 显式版本化失效，不使用合法 Locator/RowID 作为哨兵 |
 | RELOCATE | 更新完整索引键的确切版本位置；删除或不存在版本拒绝 |

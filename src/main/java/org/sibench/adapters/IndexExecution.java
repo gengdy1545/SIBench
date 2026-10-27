@@ -16,6 +16,12 @@ import java.util.List;
 
 /** Executes one protocol request on a backend; shared by the server and in-process clients. */
 public final class IndexExecution {
+    /** One request executor behind a stream; the ordered and published modes provide one. */
+    @FunctionalInterface
+    public interface Executor {
+        Response execute(Request request);
+    }
+
     private IndexExecution() {}
 
     public static Response execute(IndexBackend backend, Request request) {
@@ -51,7 +57,9 @@ public final class IndexExecution {
         for (Result result : backend.search(first)) combined.put(result.getPrimaryKey(), result);
         for (int i = 1; i < group.getMembersCount(); i++) {
             Search member = group.getMembers(i);
-            if (member.getTable() != first.getTable() || member.getReadVersion() != first.getReadVersion())
+            if (member.getTable() != first.getTable()
+                    || member.getReadVersion() != first.getReadVersion()
+                    || member.getLocalVersion() != first.getLocalVersion())
                 throw new IllegalArgumentException("Group members span tables or read versions");
             var keys = new HashSet<ByteString>();
             for (Result result : backend.search(member)) {

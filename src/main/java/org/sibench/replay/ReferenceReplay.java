@@ -276,6 +276,7 @@ public final class ReferenceReplay {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
         var preflight = check(directory, config);
         return runChecked(
+                binding(directory, config),
                 org.sibench.capture.BaselineOperations.of(directory),
                 IndexOperationTrace.Source.file(directory.resolve("workload.ops")),
                 config,
@@ -293,10 +294,72 @@ public final class ReferenceReplay {
             throws IOException {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
         return runChecked(
-                baseline, workload, config, checkFiles(baseline, workload, config), report);
+                null, baseline, workload, config, checkFiles(baseline, workload, config), report);
+    }
+
+    /**
+     * A one-time expected-result stream for a service replay. It is generated from the same
+     * canonical trace and value mode, and can be reused by any number of service runs.
+     */
+    public static Path writeQueryDigests(
+            Path directory, ReplayConfig config, boolean rowIds, Path output, String binding)
+            throws IOException {
+        if (Files.exists(output))
+            throw new IOException("Query digest file already exists: " + output);
+        try (var digest = new QueryDigest.File(output, rowIds, binding);
+                var index =
+                        new IndexReferenceReplay(
+                                rowIds,
+                                config.secondaryIndexes(),
+                                IndexReferenceReplay.Settings.defaults(),
+                                digest);
+                var load = new ReplayProjection(config, false, index::accept);
+                var runtime = new ReplayProjection(config, true, index::accept)) {
+            org.sibench.capture.BaselineOperations.of(directory).read(load);
+            load.finish();
+            IndexOperationTrace.read(directory.resolve("workload.ops"), runtime);
+            runtime.finish();
+        }
+        return output;
+    }
+
+    /** Binds a digest stream to the trace and replay settings that produced it. */
+    public static String binding(Path directory, ReplayConfig config) throws IOException {
+        var manifest =
+                JsonParser.parseString(
+                                Files.readString(directory.resolve("manifest.json")))
+                        .getAsJsonObject();
+        return "workload="
+                + manifest.get("workload_trace_sha256").getAsString()
+                + " baseline="
+                + manifest.get("baseline_trace_sha256").getAsString()
+                + " version="
+                + manifest.get("operation_trace_version").getAsInt()
+                + " secondary="
+                + config.secondaryIndexes();
+    }
+
+    /** The per-query digest file recorded in a reference report, or null when it has none. */
+    public static Path queryDigestFile(Path report, String mode) throws IOException {
+        var document = JsonParser.parseString(Files.readString(report)).getAsJsonObject();
+        if (!document.has("results")) return null;
+        for (var item : document.getAsJsonArray("results")) {
+            var result = item.getAsJsonObject();
+            if (!result.get("mode").getAsString().equals(mode)) continue;
+            if (!result.has("query_digest_file") || !result.has("query_digest_sha256"))
+                return null;
+            Path file = Path.of(result.get("query_digest_file").getAsString());
+            if (!Files.isRegularFile(file)
+                    || !BaselineGenerator.sha256(file)
+                            .equals(result.get("query_digest_sha256").getAsString()))
+                throw new IOException("Reference query digest file changed or is missing: " + file);
+            return file;
+        }
+        return null;
     }
 
     private static Map<String, Object> runChecked(
+            String binding,
             IndexOperationTrace.Source baseline,
             IndexOperationTrace.Source workload,
             ReplayConfig config,
@@ -305,7 +368,22 @@ public final class ReferenceReplay {
             throws IOException {
         List<Map<String, Object>> results = new ArrayList<>();
         for (boolean rowId : new boolean[] {false, true}) {
-            try (var index = new IndexReferenceReplay(rowId, config.secondaryIndexes());
+            String mode = rowId ? "rowid" : "locator";
+            Path digests =
+                    report.toAbsolutePath()
+                            .resolveSibling(report.getFileName() + "." + mode + ".queries");
+            long[] digestCount = {0};
+            try (var digest =
+                            new QueryDigest.File(
+                                    digests,
+                                    rowId,
+                                    binding == null ? null : binding + " mode=" + mode);
+                    var index =
+                            new IndexReferenceReplay(
+                                    rowId,
+                                    config.secondaryIndexes(),
+                                    IndexReferenceReplay.Settings.defaults(),
+                                    digest);
                     var load = new ReplayProjection(config, false, index::accept);
                     var runtime = new ReplayProjection(config, true, index::accept)) {
                 RunTiming.current().phase("load");
@@ -317,9 +395,11 @@ public final class ReferenceReplay {
                 start = System.nanoTime();
                 workload.read(runtime);
                 runtime.finish();
+                digestCount[0] = digest.count();
+                digest.close();
                 double seconds = (System.nanoTime() - start) / 1e9;
                 Map<String, Object> result = new LinkedHashMap<>();
-                result.put("mode", rowId ? "rowid" : "locator");
+                result.put("mode", mode);
                 result.put("baseline_operations", load.dispatched());
                 result.put("workload_operations", runtime.dispatched());
                 result.put("baseline_seconds", loadSeconds);
@@ -335,7 +415,10 @@ public final class ReferenceReplay {
                 result.put("selected_version_checksum", index.selectedVersionChecksum());
                 result.put("snapshot_queries", index.snapshotQueries());
                 result.put("retained_index_versions", index.retainedVersions());
-                result.put("read_model", "committed_version_at_read_timestamp");
+                result.put("read_model", "statement_snapshot_plus_transaction_local_prefix");
+                result.put("query_digests", digestCount[0]);
+                result.put("query_digest_file", digests.toString());
+                result.put("query_digest_sha256", BaselineGenerator.sha256(digests));
                 results.add(result);
             }
         }

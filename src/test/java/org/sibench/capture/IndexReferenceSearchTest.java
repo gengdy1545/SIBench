@@ -71,6 +71,34 @@ public class IndexReferenceSearchTest {
     }
 
     @Test
+    public void oldV9LocalSearchFormStillReadsItsOwnVersion() throws Exception {
+        var model = new IndexReferenceReplay(true);
+        IndexMutation.emit(
+                IndexOperationTrace.write(0, IndexOperationTrace.INSERT, 1, 0, key(1), 0, 1, 0, 1),
+                Map.of(),
+                Map.of(1, key(0)),
+                model::accept);
+        var update =
+                IndexOperationTrace.write(
+                                1, IndexOperationTrace.UPSERT, 1, 0, key(1), 1, 1, 1, 1)
+                        .withTransaction(1, 1);
+        IndexMutation.emit(update, Map.of(1, key(0)), Map.of(1, key(0)), model::accept);
+        // Historical v9 form: no SEARCH.version, read point in readTimestamp.
+        var old =
+                IndexOperationTrace.search(
+                                2,
+                                1,
+                                0,
+                                Range.equal(key(1)),
+                                1,
+                                1,
+                                IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
+                        .withTransaction(1, 1);
+        model.accept(old);
+        assertEquals(1, model.queries());
+    }
+
+    @Test
     public void secondaryResultsFollowValueThenPrimaryKeyAtEachReadPoint() throws Exception {
         var model = model(true);
         // Value 0 holds 3, 6, 9 at baseline; 3 is deleted and 5 moves in at version 1.

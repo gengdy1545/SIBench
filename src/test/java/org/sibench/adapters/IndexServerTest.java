@@ -20,6 +20,7 @@ import org.sibench.adapters.proto.Status;
 import org.sibench.adapters.proto.Value;
 import org.sibench.adapters.proto.ValueKind;
 import org.sibench.adapters.proto.Write;
+import org.sibench.capture.IndexOperationTrace;
 import org.sibench.trace.IndexKey;
 
 import java.util.concurrent.CompletableFuture;
@@ -77,7 +78,11 @@ public class IndexServerTest {
         try (var backend = RocksDbBackend.create(temporary.getRoot().toPath().resolve("ordered"), ValueKind.ROW_ID);
                 var server = IndexServer.start(0, backend, true)) {
             var channel = ManagedChannelBuilder.forAddress("127.0.0.1", server.port()).usePlaintext().build();
-            assertTrue(IndexServiceGrpc.newBlockingStub(channel).describe(DescribeRequest.getDefaultInstance()).getCrossClientOrdering());
+            var description = IndexServiceGrpc.newBlockingStub(channel).describe(DescribeRequest.getDefaultInstance());
+            assertTrue(description.getCrossClientOrdering());
+            assertTrue(description.getTransactionLocalReads());
+            assertTrue(description.getFlushMakesDurable());
+            assertEquals(org.sibench.adapters.proto.Acknowledgement.ACK_WAL, description.getWriteAck());
             channel.shutdownNow();
             var reader = new Stream(server.port());
             var writer = new Stream(server.port());
@@ -94,6 +99,50 @@ public class IndexServerTest {
             assertEquals(Status.INVALID, writer.send(write(1).toBuilder().setId(9).build()).get(10, TimeUnit.SECONDS).getStatus());
             reader.close();
             writer.close();
+        }
+    }
+
+    @Test
+    public void completePublicationWaitsForTheDriverCommitMarker() throws Exception {
+        try (var backend = RocksDbBackend.create(temporary.getRoot().toPath().resolve("published"), ValueKind.ROW_ID);
+                var server = IndexServer.start(0, backend, false, true);
+                var grpc = new GrpcService("127.0.0.1:" + server.port(), new TraceRequests(ValueKind.ROW_ID))) {
+            assertTrue(grpc.describe().getCompleteCommitPublication());
+            var target = grpc.factory().open(0);
+            // The target's requests must use the same request builder state as its commit marker.
+            var insert =
+                    IndexOperationTrace.write(
+                            1, IndexOperationTrace.INSERT, 1, 0, IndexKey.ofInt(7), 0, 0, 0, 70);
+            target.send(1, insert).response().toCompletableFuture().get(10, TimeUnit.SECONDS);
+            var update =
+                    IndexOperationTrace.write(
+                                    2,
+                                    IndexOperationTrace.UPSERT,
+                                    1,
+                                    0,
+                                    IndexKey.ofInt(7),
+                                    1,
+                                    0,
+                                    0,
+                                    71)
+                            .withTransaction(100, 1);
+            target.send(2, update).response().toCompletableFuture().get(10, TimeUnit.SECONDS);
+            var search =
+                    IndexOperationTrace.search(
+                            3,
+                            1,
+                            0,
+                            new org.sibench.capture.IndexOperationTrace.Range(
+                                    null, false, null, false, false, 0),
+                            1,
+                            1,
+                            0);
+            var waited = target.send(3, search).response().toCompletableFuture();
+            Thread.sleep(150);
+            assertFalse("search waits for the commit marker", waited.isDone());
+            target.sendCommit(4, 100, 1).response().toCompletableFuture().get(10, TimeUnit.SECONDS);
+            waited.get(10, TimeUnit.SECONDS);
+            assertEquals(1, grpc.flush());
         }
     }
 

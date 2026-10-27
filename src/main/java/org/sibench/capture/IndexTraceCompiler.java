@@ -363,6 +363,9 @@ public final class IndexTraceCompiler {
         report.put("discarded_aborted_transaction_local_searches", state.discardedSearches);
         report.put("transaction_local_searches", state.localSearches);
         report.put(
+                "transaction_local_read_model",
+                "statement_snapshot_plus_own_writes_up_to_mutation_ordinal");
+        report.put(
                 "ordering",
                 concurrent
                         ? "postgresql_transaction_completion_counter_then_operation_order"
@@ -410,19 +413,21 @@ public final class IndexTraceCompiler {
                 "version_rule",
                 "SIBench assigns one commit version per committed source transaction that ran a"
                     + " request, in original session order; transactions that ran no request"
-                    + " (connection setup, request labels) carry no version; transaction-local"
-                    + " mutation ordinal preserves all row changes; source boundaries group"
-                    + " ordered operations and are not index transactions");
+                    + " (connection setup, request labels) carry no version; a transaction-local"
+                    + " search's version is that transaction's commit and its mutation ordinal"
+                    + " preserves the read position; source boundaries group ordered operations"
+                    + " and are not index transactions");
         report.put(
                 "read_timestamp_rule",
-                "pre-write searches use the preceding commit; transaction-local searches use their"
-                        + " source commit version and preceding mutation position"
+                "every search reads the statement's own snapshot"
                         + (concurrent
-                                ? "; concurrent sessions instead use the commit PostgreSQL's"
-                                        + " transaction completion counter made visible to the"
-                                        + " statement's own snapshot, so a search may read a"
-                                        + " version older than the commit before it"
-                                : "; sessions do not overlap"));
+                                ? " (the last writer PostgreSQL's transaction completion counter"
+                                        + " made visible to it, so it may be older than the commit"
+                                        + " before it)"
+                                : " (the preceding commit; sessions do not overlap)")
+                        + "; a transaction-local search also names its transaction's commit version"
+                        + " and mutation ordinal, so a reader overlays only this transaction's"
+                        + " writes up to that ordinal and never another transaction's later commit");
         report.put("snapshot_searches", state.snapshotSearches);
         var crosscheck = new LinkedHashMap<String, Object>();
         crosscheck.put("searches_checked", state.crossChecked);
@@ -927,25 +932,31 @@ public final class IndexTraceCompiler {
                 return;
             }
             boolean behind = search.readTimestamp < previousVersion;
-            emit(search, search.readTimestamp, behind ? IndexOperationTrace.SNAPSHOT_SEARCH : 0, 0, 0);
+            emit(search, search.readTimestamp, behind ? IndexOperationTrace.SNAPSHOT_SEARCH : 0, 0, 0, 0);
             if (behind) snapshotSearches++;
             emitted(search.workUnitId);
             searches++;
         }
 
-        /** A search of a committed transaction; after a change it reads the transaction's own version. */
+        /**
+         * A search of a committed transaction. A transaction-local search keeps its statement
+         * snapshot and names the transaction's own version; a reader overlays that transaction's
+         * writes up to the search's mutation ordinal, so other transactions that committed after
+         * the snapshot stay invisible.
+         */
         private void emitCommitted(Search search, long previousVersion, long commitVersion, long transactionId)
                 throws IOException {
             boolean local = search.precedingMutations != 0;
             boolean behind = !local && search.readTimestamp < previousVersion;
             emit(
                     search,
-                    local ? commitVersion : search.readTimestamp,
+                    search.readTimestamp,
                     local
                             ? IndexOperationTrace.TRANSACTION_LOCAL_SEARCH
                             : behind ? IndexOperationTrace.SNAPSHOT_SEARCH : 0,
                     transactionId,
-                    search.precedingMutations);
+                    search.precedingMutations,
+                    local ? commitVersion : 0);
             emitted(search.workUnitId);
             searches++;
             if (local) localSearches++;
@@ -1002,7 +1013,12 @@ public final class IndexTraceCompiler {
          * flag, their positions and the group's count; independent searches carry their own.
          */
         private void emit(
-                Search search, long readTimestamp, int flags, long transactionId, long preceding)
+                Search search,
+                long readTimestamp,
+                int flags,
+                long transactionId,
+                long preceding,
+                long localVersion)
                 throws IOException {
             Decision decision = search.decision;
             int size = decision.mode() == AccessProjection.Mode.INDEPENDENT ? 0 : decision.parts().size();
@@ -1027,6 +1043,7 @@ public final class IndexTraceCompiler {
                                         size == 0 ? 0 : position++,
                                         size)
                                 .withTransaction(transactionId, preceding)
+                                .withVersion(localVersion)
                                 .withWorkUnitId(search.workUnitId));
                 partSearches++;
             }

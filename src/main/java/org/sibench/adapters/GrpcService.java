@@ -47,11 +47,13 @@ public final class GrpcService implements AutoCloseable {
         }
     }
 
-    /** Waits until every request the service received is durable to its declared level. */
-    public void flush() {
+    /** Waits until every request received is durable; returns its complete-publication watermark. */
+    public long flush() {
         ManagedChannel channel = channel(endpoint);
         try {
-            IndexServiceGrpc.newBlockingStub(channel).flush(FlushRequest.getDefaultInstance());
+            return IndexServiceGrpc.newBlockingStub(channel)
+                    .flush(FlushRequest.getDefaultInstance())
+                    .getPublishedVersion();
         } finally {
             channel.shutdownNow();
         }

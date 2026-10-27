@@ -17,7 +17,7 @@ public final class ReplayDispatcher implements AutoCloseable {
     private final Set<Long> workUnits = new HashSet<>();
     private final Map<Integer, long[]> counts = new TreeMap<>();
     private final Map<Long, Pending> inFlight = new LinkedHashMap<>();
-    private long sent, completed, peakInFlight, orderChecksum, backpressureNanos;
+    private long sent, completed, peakInFlight, orderChecksum, backpressureNanos, commitMarkers;
     private IOException failure;
     private CompletableFuture<Void> localSend;
     private volatile boolean closed;
@@ -168,6 +168,84 @@ public final class ReplayDispatcher implements AutoCloseable {
         }
     }
 
+    /** Sends one complete-commit marker after its transaction's operations, on the control client. */
+    public void sendCommit(long transactionId, long version) throws IOException {
+        checkSender();
+        int clientId = 0;
+        synchronized (inFlight) {
+            while (inFlight.size() >= config.maxInFlight()) {
+                checkFailure();
+                waitForResponse();
+            }
+            checkFailure();
+        }
+        try {
+            ReplayTarget client = clients.get(clientId);
+            if (client == null) {
+                client = Objects.requireNonNull(factory.open(clientId));
+                clients.put(clientId, client);
+            }
+            long sequence = sent + 1;
+            long deadline =
+                    System.nanoTime() + TimeUnit.SECONDS.toNanos(config.requestTimeoutSeconds());
+            ReplayTarget.SendHandle handle =
+                    Objects.requireNonNull(client.sendCommit(sequence, transactionId, version));
+            localSend = handle.sent().toCompletableFuture();
+            CompletableFuture<Void> response = handle.response().toCompletableFuture();
+            synchronized (inFlight) {
+                inFlight.put(sequence, new Pending(deadline, response));
+                peakInFlight = Math.max(peakInFlight, inFlight.size());
+            }
+            response.whenComplete(
+                    (unused, error) -> {
+                        synchronized (inFlight) {
+                            inFlight.remove(sequence);
+                            if (error != null && !closed)
+                                fail(
+                                        new IOException(
+                                                "Commit response failed at dispatch "
+                                                        + sequence
+                                                        + ", client "
+                                                        + clientId,
+                                                error));
+                            else if (error == null && !closed) {
+                                if (deadline <= System.nanoTime())
+                                    fail(
+                                            new IOException(
+                                                    "Commit response timeout at dispatch "
+                                                            + sequence
+                                                            + ", client "
+                                                            + clientId));
+                                else completed++;
+                            }
+                            inFlight.notifyAll();
+                        }
+                    });
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) throw new TimeoutException("Local send timeout");
+            localSend.get(remaining, TimeUnit.NANOSECONDS);
+            localSend = null;
+            sent++;
+            commitMarkers++;
+            synchronized (inFlight) {
+                checkFailure();
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            synchronized (inFlight) {
+                throw fail(new IOException("Replay interrupted", error));
+            }
+        } catch (ExecutionException | TimeoutException | RuntimeException error) {
+            synchronized (inFlight) {
+                throw fail(new IOException("Local send failed", error));
+            }
+        } catch (IOException error) {
+            synchronized (inFlight) {
+                throw fail(error);
+            }
+        }
+    }
+
     private void waitForResponse() throws IOException {
         long nanos = inFlight.values().iterator().next().deadline() - System.nanoTime();
         if (nanos <= 0) {
@@ -210,6 +288,7 @@ public final class ReplayDispatcher implements AutoCloseable {
         report.put("work_units", workUnits.size());
         report.put("client_routing", "source_work_unit_round_robin");
         report.put("target_calls", sent);
+        report.put("commit_markers", commitMarkers);
         report.put("operation_order_checksum", orderChecksum);
         report.put("local_send_boundary", "complete_local_transmission_not_service_execution");
         report.put("service_visibility_owner", "index_service");

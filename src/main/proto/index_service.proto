@@ -16,10 +16,11 @@ service IndexService {
   // What the service implements; the driver refuses a service that lacks a semantic it needs.
   rpc Describe(DescribeRequest) returns (DescribeResponse);
 
-  // One ordered stream per benchmark client. The service executes a stream's requests in the
-  // order it receives them; a request sees every write received earlier on the same stream.
-  // Responses carry the request id and may be returned in any order. Ordering and visibility
-  // across streams are the service's own and are declared by Describe.
+  // One ordered stream per benchmark client. A cross-client-ordered service executes a stream's
+  // requests in receive order; a complete-publication service instead orders a transaction's
+  // requests by transaction_operation and waits for published read versions. Responses carry the
+  // request id and may be returned in any order. Ordering and visibility across streams are the
+  // service's own and are declared by Describe.
   rpc Execute(stream Request) returns (stream Response);
 
   // Completes after every request received before it on any stream is durable to the level the
@@ -38,14 +39,33 @@ message DescribeResponse {
   // Writes of one key at one version overwrite in stream order (required for
   // transaction-local searches).
   bool ordered_same_version_overwrite = 5;
+  // A search with local_version > 0 reads its read_version snapshot and then the exact writes of
+  // that one version received earlier; other versions between them stay invisible.
+  bool transaction_local_reads = 9;
   // SearchGroup executes on the service; otherwise the driver must not send groups.
   bool search_groups = 6;
   // Requests from different client streams are executed in the driver's send order, given by
-  // Request.sequence, not in arrival order. The trace's reads are only reproducible when writes and
-  // searches keep their source order, so a replay with more than one client requires this.
+  // Request.sequence, not in arrival order. A multi-client replay requires this or
+  // complete_commit_publication.
   bool cross_client_ordering = 8;
   // Free text: durability level of an acknowledged write, cache and WAL placement.
   string durability = 7;
+  // Machine-checkable acknowledgement level for workload writes; free text above explains it.
+  Acknowledgement write_ack = 10;
+  // Baseline INSERTs are memory-only until Flush; workload writes still follow write_ack.
+  bool baseline_durable_only_at_flush = 11;
+  // Flush returns only after the declared durable level is reached.
+  bool flush_makes_durable = 12;
+  // The service accepts Commit markers and exposes a complete-publication watermark. A search
+  // waits for its read_version to be published, not merely for the highest version seen.
+  bool complete_commit_publication = 13;
+}
+
+enum Acknowledgement {
+  ACK_UNSPECIFIED = 0;
+  ACK_MEMORY = 1;  // acknowledged before durable state
+  ACK_WAL = 2;     // acknowledged in a write-ahead log, not necessarily fsynced
+  ACK_FSYNC = 3;   // acknowledged after fsync
 }
 
 enum ValueKind {
@@ -77,11 +97,25 @@ message Request {
   // stream; a search group takes one position. A service declaring cross_client_ordering executes
   // requests in this order whichever stream they arrive on.
   uint64 sequence = 5;
+  // Source transaction identity and 1-based position of this request among the transaction's
+  // actually sent requests (writes, searches and groups, after secondary filtering). Zero for
+  // baseline loads and for services using only sequence ordering. A complete-publication service
+  // executes one transaction's requests in this position order, independently of other
+  // transactions.
+  uint64 transaction_id = 6;
+  uint64 transaction_operation = 7;
   oneof operation {
     Write write = 2;
     Search search = 3;
     SearchGroup group = 4;
+    Commit commit = 8;
   }
+}
+
+message Commit {
+  uint64 version = 1;
+  uint64 writes = 2;      // index write requests in this transaction
+  uint64 operations = 3;  // all requests in this transaction, writes + searches + groups
 }
 
 message Write {
@@ -112,6 +146,12 @@ message Search {
   // A pinned search names exactly one secondary entry: lower == upper == the indexed value, and
   // this primary key.
   bytes pinned_primary_key = 8;
+  // Transaction-local read: the statement snapshot is read_version; the search also sees this
+  // exact version's writes already executed before it (stream order, or Request.sequence order
+  // when cross_client_ordering is declared). 0: snapshot only. A service advertising
+  // transaction_local_reads selects max(read_version, an existing local_version), without
+  // exposing any version strictly between them.
+  uint64 local_version = 9;
 }
 
 message Bound {
@@ -154,4 +194,8 @@ message Result {
 
 message FlushRequest {}
 
-message FlushResponse {}
+message FlushResponse {
+  // Highest version whose complete commit was received and whose writes were applied before this
+  // Flush. It is not the highest version merely seen; a partial or missing commit does not advance.
+  uint64 published_version = 1;
+}

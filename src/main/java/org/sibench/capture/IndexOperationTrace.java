@@ -107,6 +107,11 @@ public final class IndexOperationTrace {
      * search may also carry a PK in {@code key}: it then names exactly one index entry, the row a
      * scan its consumer stopped early returned among equal indexed values.
      */
+    /**
+     * One normalized operation. For SEARCH, {@code version} is 0 unless the read is
+     * transaction-local, when it is the source transaction's CommitVersion; writes use it as the
+     * new entry version.
+     */
     public record Operation(
             long sourceEvent,
             int kind,
@@ -243,6 +248,38 @@ public final class IndexOperationTrace {
                     upper,
                     limit);
         }
+
+        /**
+         * A search's {@code version} is 0 unless it is transaction-local; then it is the
+         * committing transaction's own version. Its {@code readTimestamp} remains the statement
+         * snapshot, so a reader takes that snapshot and overlays this transaction's writes up to
+         * {@code mutationOrdinal}. Older v9 traces carry a local search's read point in
+         * {@code readTimestamp} with {@code version=0}; readers must keep accepting that form.
+         */
+        public Operation withVersion(long searchVersion) {
+            return new Operation(
+                    sourceEvent,
+                    kind,
+                    table,
+                    index,
+                    flags,
+                    key,
+                    indexedValue,
+                    searchVersion,
+                    file,
+                    position,
+                    rowId,
+                    expectedCount,
+                    transactionId,
+                    mutationOrdinal,
+                    readTimestamp,
+                    workUnitId,
+                    expansionPosition,
+                    expansionSize,
+                    lower,
+                    upper,
+                    limit);
+        }
     }
 
     /** A primary-key write; {@link IndexMutation} expands it to the secondary indexes. */
@@ -347,7 +384,13 @@ public final class IndexOperationTrace {
     private static boolean validSearch(Operation o) {
         int group = o.flags() & (INTERSECT_GROUP | UNION_GROUP);
         boolean pinned = o.key() != null;
-        return o.version() == 0
+        boolean local = (o.flags() & TRANSACTION_LOCAL_SEARCH) != 0;
+        return (local
+                        ? o.version() >= 0
+                                && o.transactionId() > 0
+                                && o.mutationOrdinal() > 0
+                                && (o.flags() & SNAPSHOT_SEARCH) == 0
+                        : o.version() == 0)
                 && o.readTimestamp() >= 0
                 && o.indexedValue() == null
                 && (o.flags() & ~SEARCH_FLAGS) == 0

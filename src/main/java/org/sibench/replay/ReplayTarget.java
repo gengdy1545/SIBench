@@ -19,6 +19,15 @@ public interface ReplayTarget extends AutoCloseable {
      */
     SendHandle send(long dispatchSequence, Operation operation) throws IOException;
 
+    /**
+     * Sends a complete-commit marker after the transaction's operations. Services that only use
+     * sequence ordering do not need it; the default fails rather than silently dropping it.
+     */
+    default SendHandle sendCommit(long dispatchSequence, long transactionId, long version)
+            throws IOException {
+        throw new IOException("Replay target does not support complete-commit markers");
+    }
+
     record SendHandle(CompletionStage<Void> sent, CompletionStage<Void> response) {
         public SendHandle {
             Objects.requireNonNull(sent);
