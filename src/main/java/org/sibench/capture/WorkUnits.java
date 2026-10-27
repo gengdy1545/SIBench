@@ -26,10 +26,10 @@ import java.util.List;
 /**
  * The source work-unit catalog of a trace, one JSON line per source SQL request, stored as a zstd
  * stream. Its digest ({@code work_units_sha256}) is that of the plain lines, so it does not depend
- * on the compressor; a trace compiled before keeps its plain {@code work-units.jsonl}.
+ * on the compressor.
  */
 public final class WorkUnits {
-    static final String FILE = "work-units.jsonl.zst", PLAIN = "work-units.jsonl";
+    static final String FILE = "work-units.jsonl.zst";
 
     private WorkUnits() {}
 
@@ -46,9 +46,8 @@ public final class WorkUnits {
     }
 
     private static InputStream open(Path trace) throws IOException {
-        Path plain = trace.resolve(PLAIN);
-        if (Files.exists(plain)) return Files.newInputStream(plain);
-        return new ZstdInputStream(new BufferedInputStream(Files.newInputStream(trace.resolve(FILE)), 1 << 20));
+        return new ZstdInputStream(
+                new BufferedInputStream(Files.newInputStream(trace.resolve(FILE)), 1 << 20));
     }
 
     /** The catalog's lines, in order. */

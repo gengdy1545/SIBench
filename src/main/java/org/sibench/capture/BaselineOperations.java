@@ -23,12 +23,8 @@ import java.util.Map;
  * definitions alone, so the trace does not store it: compilation records only its count and the
  * SHA256 of the file it would form ({@code baseline_trace_sha256}), and every reader derives it
  * again from the verified baseline and checks that digest when it ends.
- *
- * <p>A trace compiled before this keeps its {@code baseline.ops}, which is read as it is.
  */
 public final class BaselineOperations {
-    static final String FILE = "baseline.ops";
-
     private BaselineOperations() {}
 
     /** What a compiler records per baseline file and row while the load is derived. */
@@ -340,13 +336,11 @@ public final class BaselineOperations {
             };
 
     /**
-     * The baseline load of a compiled trace: its {@code baseline.ops} when it has one, otherwise
-     * derived from the baseline directory its manifest names. A derived load requires the baseline
-     * files to be the verified ones and, once read, to be the stream the trace was compiled with.
+     * The baseline load of a compiled trace, derived from the baseline directory its manifest
+     * names. It requires the baseline files to be the verified ones and, once read, to be the
+     * stream the trace was compiled with.
      */
     public static IndexOperationTrace.Source of(Path trace) {
-        Path file = trace.resolve(FILE);
-        if (Files.exists(file)) return IndexOperationTrace.Source.file(file);
         return consumer -> {
             JsonObject manifest = JsonParser.parseString(Files.readString(trace.resolve("manifest.json"))).getAsJsonObject();
             for (String field : java.util.List.of("baseline_directory", "baseline_trace_sha256", "baseline_operations", "baseline_verified_manifest_sha256"))

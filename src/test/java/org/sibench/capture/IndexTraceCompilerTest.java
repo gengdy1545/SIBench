@@ -118,7 +118,6 @@ public class IndexTraceCompilerTest {
         Files.writeString(
                 baseline.resolve("schema-preflight.json"),
                 "{\"status\":\"schema_verified\",\"environment\":{\"lc_collate\":\"C\"}}");
-        Files.writeString(baseline.resolve("locators.tsv"), "");
         Files.writeString(
                 baseline.resolve("verified-manifest.json"),
                 new Gson()
@@ -130,8 +129,6 @@ public class IndexTraceCompilerTest {
                                         8,
                                         "files_manifest_sha256",
                                         BaselineGenerator.sha256(baseline.resolve("files.jsonl")),
-                                        "locators_sha256",
-                                        BaselineGenerator.sha256(baseline.resolve("locators.tsv")),
                                         "files",
                                         hashes)));
         return new CaptureConfig(
@@ -150,6 +147,7 @@ public class IndexTraceCompilerTest {
     private Path capture(Path directory, List<String> transactions) throws Exception {
         var client = new ArrayList<String>(List.of("{\"event\":\"connection\",\"pid\":1}"));
         var server = new ArrayList<String>();
+        server.add(header(1, "rows"));
         for (int i = 0; i < transactions.size(); i++) {
             String application = "fixture-" + i;
             client.add(
@@ -222,6 +220,8 @@ public class IndexTraceCompilerTest {
                                             "depth",
                                             1,
                                             "processed",
+                                            0,
+                                            "returned",
                                             0)));
             server.add(
                     new Gson()
@@ -247,10 +247,8 @@ public class IndexTraceCompilerTest {
                                         "close",
                                         "application",
                                         "fixture-" + (transactions.size() - 1))));
-        Path jdbc = directory.resolve("jdbc-fixture.jsonl");
-        Files.write(jdbc, client);
-        Path raw = directory.resolve("pg-1.jsonl");
-        Files.write(raw, server);
+        Path jdbc = RowAuditTestSupport.writeTrace(directory.resolve("jdbc-fixture.jsonl.zst"), client);
+        Path raw = RowAuditTestSupport.writeTrace(directory.resolve("pg-1.jsonl.zst"), server);
         RowAuditTestSupport.complete(directory, jdbc, raw);
         return raw;
     }
@@ -349,7 +347,8 @@ public class IndexTraceCompilerTest {
                                         "pid", pid,
                                         "req", ordinal,
                                         "depth", 1,
-                                        "processed", 0)));
+                                        "processed", 0,
+                                        "returned", 0)));
         result.add(
                 new Gson()
                         .toJson(
@@ -408,8 +407,12 @@ public class IndexTraceCompilerTest {
     private Path concurrentCapture(Path directory, List<List<String>> sessions) throws Exception {
         var servers = new ArrayList<Path>();
         for (int i = 0; i < sessions.size(); i++) {
-            Path server = directory.resolve("pg-" + (101 + i) + ".jsonl");
-            Files.write(server, sessions.get(i));
+            var lines = new ArrayList<>(sessions.get(i));
+            if (lines.isEmpty() || !lines.get(0).contains("\"capture_start\""))
+                lines.add(0, header(101 + i, "rows"));
+            Path server =
+                    RowAuditTestSupport.writeTrace(
+                            directory.resolve("pg-" + (101 + i) + ".jsonl.zst"), lines);
             servers.add(server);
         }
         RowAuditTestSupport.completeConcurrent(directory, servers);
@@ -472,6 +475,14 @@ public class IndexTraceCompilerTest {
                         .get("status"));
     }
 
+
+    private static String header(int pid, String detail) {
+        return "{\"event\":\"capture_start\",\"pid\":"
+                + pid
+                + ",\"xid\":0,\"cid\":0,\"req\":0,\"depth\":0,\"format\":2,\"detail\":\""
+                + detail
+                + "\"}";
+    }
     /**
      * A backend trace as the summary capture writes it: a header, no per-row events, one summary
      * per access right before the event that ends it, result rows counted at the return.
@@ -479,7 +490,7 @@ public class IndexTraceCompilerTest {
     private static List<String> summarized(int pid, List<String> rows) {
         var result = new ArrayList<String>();
         result.add("{\"event\":\"capture_start\",\"pid\":" + pid + ",\"xid\":0,\"cid\":0,\"req\":0,\"depth\":0,"
-                + "\"application\":\"sibench:fixture\",\"format\":2,\"detail\":\"summary\"}");
+                + "\"format\":2,\"detail\":\"summary\"}");
         var counts = new LinkedHashMap<String, long[]>();
         for (String line : rows) {
             var event = JsonParser.parseString(line).getAsJsonObject();
@@ -832,19 +843,6 @@ public class IndexTraceCompilerTest {
                 java.io.IOException.class,
                 () -> ReferenceReplay.check(output, ReplayConfig.defaults()));
         Files.writeString(output.resolve("manifest.json"), new Gson().toJson(manifest));
-        var records = new ArrayList<IndexOperationTrace.Operation>();
-        BaselineOperations.of(output).read(records::add);
-        // A stored load (as traces compiled before derivation hold) is read as it is.
-        try (var writer = new IndexOperationTrace.Writer(output.resolve("baseline.ops"))) {
-            for (int i = 0; i < records.size() - 1; i++) writer.append(records.get(i));
-        }
-        manifest.addProperty(
-                "baseline_trace_sha256", IndexOperationTrace.sha256(output.resolve("baseline.ops")));
-        manifest.addProperty("baseline_operations", records.size() - 1);
-        Files.writeString(output.resolve("manifest.json"), new Gson().toJson(manifest));
-        assertThrows(
-                java.io.IOException.class,
-                () -> ReferenceReplay.check(output, ReplayConfig.defaults()));
     }
 
     @Test
@@ -963,6 +961,7 @@ public class IndexTraceCompilerTest {
                 + candidates("a", "idx_loantrans_1", "(0,1)")
                 + candidates("b", "idx_loantrans_2", "(0,1)")
                 + event("bitmap_heap_candidate", "\"heap\":\"h\",\"relation\":\"loantrans\",\"tid\":\"(0,1)\",\"found\":true")
+                + event("bitmap_verdicts", "\"heap\":\"h\",\"relation\":\"loantrans\",\"lossy_pages\":0,\"verdicts\":[{\"inputs\":[0,1],\"visible\":1,\"invisible\":0}]")
                 + event("scan_end", "\"scan\":\"a\",\"relation\":\"idx_loantrans_1\"")
                 + event("scan_end", "\"scan\":\"b\",\"relation\":\"idx_loantrans_2\"");
     }
@@ -977,6 +976,7 @@ public class IndexTraceCompilerTest {
                 + event("plan_bitmap_heap", "\"heap\":\"g\",\"relation\":\"loantrans\",\"plan_node\":6,\"tree\":\"c\",\"scans\":[\"c\"]")
                 + candidates("c", "idx_loantrans_1", "(0,1)")
                 + event("bitmap_heap_candidate", "\"heap\":\"g\",\"relation\":\"loantrans\",\"tid\":\"(0,1)\",\"found\":true")
+                + event("bitmap_verdicts", "\"heap\":\"g\",\"relation\":\"loantrans\",\"lossy_pages\":0,\"verdicts\":[{\"inputs\":[0],\"visible\":1,\"invisible\":0}]")
                 + event("scan_end", "\"scan\":\"c\",\"relation\":\"idx_loantrans_1\"");
     }
 

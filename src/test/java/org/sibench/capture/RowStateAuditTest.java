@@ -298,23 +298,21 @@ public class RowStateAuditTest {
                                                     i == 0 ? middle : initial,
                                                     i == 0 ? last : middle))),
                             Set.of());
-            Path client = directory.resolve("jdbc-fixture.jsonl");
-            Path pg = raw.resolve("pg-" + i + ".jsonl"), jdbc = raw.resolve("jdbc-" + i + ".jsonl");
-            Files.copy(server, pg);
-            Files.copy(client, jdbc);
-            Files.writeString(
-                    pg,
+            Path client = directory.resolve("jdbc-fixture.jsonl.zst");
+            Path pg = raw.resolve("pg-" + i + ".jsonl.zst"), jdbc = raw.resolve("jdbc-" + i + ".jsonl.zst");
+            var pgLines = RowAuditTestSupport.readTrace(server);
+            pgLines.add(
                     new Gson()
-                                    .toJson(
-                                            Map.of(
-                                                    "event",
-                                                    "executor_run_end",
-                                                    "application",
-                                                    "fixture-0",
-                                                    "pid",
-                                                    1))
-                            + "\n",
-                    StandardOpenOption.APPEND);
+                            .toJson(
+                                    Map.of(
+                                            "event",
+                                            "executor_run_end",
+                                            "application",
+                                            "fixture-0",
+                                            "pid",
+                                            1)));
+            RowAuditTestSupport.writeTrace(pg, pgLines);
+            RowAuditTestSupport.writeTrace(jdbc, RowAuditTestSupport.readTrace(client));
             sessions.add(
                     Map.of(
                             "pg_file",
@@ -356,8 +354,8 @@ public class RowStateAuditTest {
                 Files.readAllLines(Path.of(report + ".changes.jsonl")).stream()
                         .map(line -> JsonParser.parseString(line).getAsJsonObject())
                         .toList();
-        assertEquals("pg-1.jsonl", transitions.get(0).get("source_session").getAsString());
-        assertEquals("pg-0.jsonl", transitions.get(1).get("source_session").getAsString());
+        assertEquals("pg-1.jsonl.zst", transitions.get(0).get("source_session").getAsString());
+        assertEquals("pg-0.jsonl.zst", transitions.get(1).get("source_session").getAsString());
         assertEquals(
                 new JsonPrimitive("passed_source_row_state"),
                 RowStateAudit.reuse(schema, baseline, raw, report).get("status"));

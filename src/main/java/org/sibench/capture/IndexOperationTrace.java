@@ -512,25 +512,24 @@ public final class IndexOperationTrace {
         void block(int records, int checksum, ByteBuffer payload) throws IOException;
     }
 
-    /** The blocks of a plain or zstd-block trace, each checked against its checksum. */
+    /** The zstd blocks of a trace, each checked against its checksum. */
     private static void blocks(Path file, Blocks blocks) throws IOException {
         try (FileChannel channel = FileChannel.open(file)) {
             ByteBuffer header = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
             fill(channel, header);
             header.flip();
             int magic = header.getInt();
-            if (magic != MAGIC && magic != MAGIC_ZSTD
+            if (magic != MAGIC_ZSTD
                     || header.getInt() != VERSION
                     || header.getInt() != RECORD_BYTES
                     || header.getInt() != BLOCK_RECORDS)
                 throw new IOException("Unknown normalized trace header");
-            boolean compressed = magic == MAGIC_ZSTD;
             while (channel.position() < channel.size()) {
-                header.clear().limit(compressed ? 16 : 12);
+                header.clear().limit(16);
                 fill(channel, header);
                 header.flip();
                 int stored = header.getInt(), records = header.getInt(), checksum = header.getInt();
-                int bytes = compressed ? header.getInt() : stored;
+                int bytes = header.getInt();
                 // Records carry variable-length keys, so only a lower bound is fixed.
                 if (bytes <= 0
                         || stored <= 0
@@ -541,15 +540,13 @@ public final class IndexOperationTrace {
                     throw new IOException("Invalid normalized block length");
                 ByteBuffer block = ByteBuffer.allocate(stored).order(ByteOrder.LITTLE_ENDIAN);
                 fill(channel, block);
-                byte[] payload = block.array();
-                if (compressed) {
-                    try {
-                        payload = com.github.luben.zstd.Zstd.decompress(payload, bytes);
-                    } catch (RuntimeException corrupt) {
-                        throw new IOException("Normalized block does not decompress", corrupt);
-                    }
-                    if (payload.length != bytes) throw new IOException("Invalid normalized block length");
+                byte[] payload;
+                try {
+                    payload = com.github.luben.zstd.Zstd.decompress(block.array(), bytes);
+                } catch (RuntimeException corrupt) {
+                    throw new IOException("Normalized block does not decompress", corrupt);
                 }
+                if (payload.length != bytes) throw new IOException("Invalid normalized block length");
                 CRC32C crc = new CRC32C();
                 crc.update(payload, 0, bytes);
                 if ((int) crc.getValue() != checksum)
@@ -560,8 +557,7 @@ public final class IndexOperationTrace {
     }
 
     /**
-     * The logical SHA256 of a trace: that of the plain file its operations form, which for a plain
-     * file is the SHA256 of the file itself.
+     * The logical SHA256 of a trace: that of the plain file its operations form.
      */
     public static String sha256(Path file) throws IOException {
         java.security.MessageDigest digest;
@@ -580,7 +576,7 @@ public final class IndexOperationTrace {
         return HexFormat.of().formatHex(digest.digest());
     }
 
-    /** Reads a trace of the current record format, plain or in zstd blocks. */
+    /** Reads a trace of the current record format, in zstd blocks. */
     public static long read(Path file, Consumer consumer) throws IOException {
         long[] count = {0};
         blocks(file, (records, checksum, block) -> {

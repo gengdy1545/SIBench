@@ -297,10 +297,7 @@ public final class SnapshotLookupValidation {
                         .getAsJsonObject();
         if (!verification.get("status").getAsString().equals("verified_complete")
                 || !BaselineGenerator.sha256(sourceBaseline.resolve("files.jsonl"))
-                        .equals(verification.get("files_manifest_sha256").getAsString())
-                || verification.has("locators_sha256")
-                        && !BaselineGenerator.sha256(sourceBaseline.resolve("locators.tsv"))
-                                .equals(verification.get("locators_sha256").getAsString()))
+                        .equals(verification.get("files_manifest_sha256").getAsString()))
             throw new IOException("Independent baseline manifests changed or are incomplete");
         for (var item : verification.getAsJsonArray("files"))
             verifyFile(sourceBaseline, item.getAsJsonObject());

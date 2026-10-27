@@ -33,8 +33,6 @@ final class AccessUnits {
 
     /** How a backend trace records its index accesses, from its {@code capture_start} line. */
     enum Detail {
-        /** Per-row events only: captures written before summaries existed. */
-        LEGACY,
         /** Per-row events and summaries; the summaries are checked against the rows. */
         ROWS,
         /** Summaries only. */
@@ -331,7 +329,7 @@ final class AccessUnits {
         Request current;
         boolean currentEnded;
         long pendingProbes;
-        Detail detail = Detail.LEGACY;
+        Detail detail;
         boolean seenEvent;
         /** Result rows per executor depth since that depth's last return, checked in ROWS. */
         final Map<Integer, Long> resultRows = new HashMap<>();
@@ -389,6 +387,8 @@ final class AccessUnits {
         Session state = session;
         boolean first = !state.seenEvent;
         state.seenEvent = true;
+        if (first && !type.equals("capture_start"))
+            throw new IOException("Trace does not start with capture_start");
         if (state.detail == Detail.SUMMARY && PER_ROW.contains(type))
             throw new IOException("Per-row event in a summary capture: " + type);
         switch (type) {
@@ -420,7 +420,7 @@ final class AccessUnits {
                 if (state.current == null)
                     throw new IOException("Executor return without a started request");
                 if (depth <= 1) state.current.processed = e.get("processed").getAsLong();
-                if (state.detail != Detail.LEGACY) returned(e, depth);
+                returned(e, depth);
             }
             case "executor_end" -> {
                 if (state.current == null)
@@ -782,8 +782,6 @@ final class AccessUnits {
      * attribution is the one each TID's own verdict would make.
      */
     private void verdicts(Event e) throws IOException {
-        if (session.detail == Detail.LEGACY)
-            throw new IOException("Bitmap verdict summary in a per-row capture");
         BitmapHeap heap = heap(e);
         long lossy = e.get("lossy_pages").getAsLong();
         var sets = new HashMap<Long, long[]>();
@@ -862,8 +860,6 @@ final class AccessUnits {
      * ROWS capture every fact must equal what the unit's per-row events added up to.
      */
     private void summary(Event e) throws IOException {
-        if (session.detail == Detail.LEGACY)
-            throw new IOException("Scan summary in a per-row capture");
         String id = e.get("scan").getAsString();
         Scan scan = session.scans.get(id);
         if (scan == null || scan.current == null)

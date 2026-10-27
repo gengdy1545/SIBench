@@ -63,7 +63,7 @@
 | sysbench 87m（events × 7.02） | 0.04999 | 272 s | 49 s | 596 s | 535 s | 833 MB | 3.5 GB | 7.9 GB |
 | HyBench SF10（TP / XP 各 20 min） | 0.05314 | 178 s | 57 s | 2,622 s | 1,410 s | 1.5 GB | 5.6 GB | 1.6 GB |
 
-正确性：开发机四份保留产物用新代码重编，基线与负载两个流的逻辑摘要、条数及其余数据文件与原产物相同；sysbench c8 的 128 client 参考回放报告除计时外逐项相同；同一静止库两次导出逐字节相同（带时间的预检报告除外）；远程 sysbench 87m 新旧两次校准的写入比例与业务变化计数相同。远程的 prepare 与原生执行在两轮之间相差至多 2 倍而代码未变，是共享宿主的负载波动。
+正确性：开发机当时保留的产物用新代码重编，基线与负载两个流的逻辑摘要、条数及其余数据文件与原产物相同；sysbench c8 的 128 client 参考回放报告除计时外逐项相同；同一静止库两次导出逐字节相同（带时间的预检报告除外）；远程 sysbench 87m 新旧两次校准的写入比例与业务变化计数相同。远程的 prepare 与原生执行在两轮之间相差至多 2 倍而代码未变，是共享宿主的负载波动。
 
 2026-10-26，静止集群、共享基线、32 并发与编译主线程优化之后的远程正式采集（同上口径）：
 
@@ -90,7 +90,7 @@ YCSB 87m 5% 正式采集（`ycsb-87m-w5`，计划因子 7.39）：写入比例 0
 
 编译按会话跟踪（jar new22）在远程 sysbench 87m 上实测为回退：运行到 79M / 106M 事件时已用约 1,002 CPU 秒，旧 jar 跑完 106M 只用约 705 CPU 秒；主线程始终 100%，tracker 线程多数空闲，调用与队列开销大于并行收益。该轮已停止并回退，未以它的计时作为结论。
 
-编译主线程（jar new24，只改编译器，采集代码身份不变）：恢复内联跟踪；账本的热路径计数改为无装箱的长整型数组并按需在报告端排序；`Unit` 的 bitmap 候选、array-key runs 与 last PK 列表改为按需分配。用同一份 raw、同一 baseline、同一认证与 PG 计数器对照：HyBench SF10 390.99 → 384.85 s（负载 322.88 → 321.49 s，baseline 64.27 → 59.52 s，RSS 24.24 → 24.13 GB）；sysbench 87m 243.93 → 243.07 s（负载 205.81 → 205.87 s，CPU 704.6 → 678.7 s，RSS 15.57 → 15.30 GB）；YCSB 87m 561.02 → 553.71 s（负载 520.62 → 524.29 s，baseline 36.23 → 25.31 s，RSS 13.40 → 14.87 GB；baseline 差异主要是 page cache）。三份 Trace 与旧 jar 逐字节相同（HyBench / sysbench 各 13 个文件，YCSB 16 个），`capture-completeness` 均为 `consistent`。YCSB 的 raw 是本轮以 32 线程、5% 写入重采的（原生 1,572.1 s、原始 9.3 GB），Trace 仍由真实原生负载编译，见 [编译阶段对照](compile-optimization-20261026.md) 与 [并发采集验证](concurrent-native-capture.md)。最终清理构建只删除未接入的 `SessionTracking` 与 per-session stage 接口；SF1 c8 重编的 13 个文件仍与 v22 逐字节相同。
+编译主线程（jar new24，只改编译器，采集代码身份不变）：恢复内联跟踪；账本的热路径计数改为无装箱的长整型数组并按需在报告端排序；`Unit` 的 bitmap 候选、array-key runs 与 last PK 列表改为按需分配。用同一份 raw、同一 baseline、同一认证与 PG 计数器对照：HyBench SF10 390.99 → 384.85 s（负载 322.88 → 321.49 s，baseline 64.27 → 59.52 s，RSS 24.24 → 24.13 GB）；sysbench 87m 243.93 → 243.07 s（负载 205.81 → 205.87 s，CPU 704.6 → 678.7 s，RSS 15.57 → 15.30 GB）；YCSB 87m 561.02 → 553.71 s（负载 520.62 → 524.29 s，baseline 36.23 → 25.31 s，RSS 13.40 → 14.87 GB；baseline 差异主要是 page cache）。三份 Trace 与旧 jar 逐字节相同（HyBench / sysbench 各 13 个文件，YCSB 16 个），`capture-completeness` 均为 `consistent`。YCSB 的 raw 是本轮以 32 线程、5% 写入重采的（原生 1,572.1 s、原始 9.3 GB），Trace 仍由真实原生负载编译，见 [编译阶段对照](compile-optimization-20261026.md) 与 [并发采集验证](concurrent-native-capture.md)。最终 v9 / zstd 严格版本删除旧明文、`Detail.LEGACY`、旧 `baseline.ops`、`locators.tsv` 与未接入的 per-session stage；当前 zstd raw 的 HyBench / sysbench / YCSB 重编均逐字节相同。
 
 解析线程（同一 new24，仅 `-Dsibench.compile.parse_threads=8`）：sysbench 87m wall 241.76 s、RSS 14.76 GB（默认 32 线程 243.07 s、15.30 GB）；HyBench SF10 wall 386.65 s、RSS 23.58 GB（默认 384.85 s、24.13 GB）；YCSB 87m wall 559.47 s、RSS 15.01 GB（默认 553.71 s、14.87 GB）。8 线程只在 sysbench 上略快并省内存，HyBench / YCSB 都更慢；默认仍保留“每个处理器一个解析线程”，需要压内存时显式设小，Trace 字节不变。
 

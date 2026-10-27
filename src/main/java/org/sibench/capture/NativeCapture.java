@@ -22,18 +22,14 @@ public final class NativeCapture {
      * default), or also every row ({@code rows}), which the access ledger checks the summaries
      * against. The script passes it to PG and the native clients as SIBENCH_CAPTURE_DETAIL.
      */
-    /**
-     * How backend traces are encoded: {@code zstd} (the default) writes each as one zstd stream,
-     * {@code none} as plain JSON lines. The script passes it to PG as SIBENCH_CAPTURE_COMPRESS.
-     */
+    /** Backend traces are always zstd streams; the script passes this to PG. */
     static String compression(java.util.Map<String, Object> document) {
         var capture = org.sibench.config.ConfigValues.object(document, "capture");
-        if (!capture.containsKey("compression")) return "zstd";
-        String compression = org.sibench.config.ConfigValues.string(capture, "compression");
-        org.sibench.config.ConfigValues.require(
-                compression.equals("zstd") || compression.equals("none"),
-                "capture.compression must be zstd or none");
-        return compression;
+        if (capture.containsKey("compression"))
+            org.sibench.config.ConfigValues.require(
+                    org.sibench.config.ConfigValues.string(capture, "compression").equals("zstd"),
+                    "capture.compression must be zstd");
+        return "zstd";
     }
 
     static String detail(java.util.Map<String, Object> document) {

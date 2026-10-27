@@ -112,29 +112,20 @@ public final class CaptureDriver implements Driver {
         private String application;
         private final String phase = CaptureRun.phase();
         private final Path path;
-        /**
-         * Whether the trace is a zstd stream, as the server traces are ({@code capture.compression}).
-         * A compressed trace is buffered rather than flushed per event: a client that dies fails the
-         * capture either way, and per-event flushes would cost the CPU the native run is bound by.
-         */
-        private final boolean compressed = "zstd".equals(System.getenv("SIBENCH_CAPTURE_COMPRESS"));
-
         Session(Connection connection, Path directory) throws IOException, SQLException {
             this.connection = connection;
             path =
                     directory.resolve(
-                            "jdbc-" + ProcessHandle.current().pid() + "-" + id + (compressed ? ".jsonl.zst" : ".jsonl"));
+                            "jdbc-" + ProcessHandle.current().pid() + "-" + id + ".jsonl.zst");
             output =
-                    compressed
-                            ? new BufferedWriter(
-                                    new java.io.OutputStreamWriter(
-                                            new com.github.luben.zstd.ZstdOutputStream(
-                                                    new java.io.BufferedOutputStream(
-                                                            Files.newOutputStream(path, StandardOpenOption.CREATE_NEW), 1 << 16),
-                                                    ZSTD_LEVEL),
-                                            java.nio.charset.StandardCharsets.UTF_8),
-                                    1 << 16)
-                            : Files.newBufferedWriter(path, StandardOpenOption.CREATE_NEW);
+                    new BufferedWriter(
+                            new java.io.OutputStreamWriter(
+                                    new com.github.luben.zstd.ZstdOutputStream(
+                                            new java.io.BufferedOutputStream(
+                                                    Files.newOutputStream(path, StandardOpenOption.CREATE_NEW), 1 << 16),
+                                            ZSTD_LEVEL),
+                                    java.nio.charset.StandardCharsets.UTF_8),
+                            1 << 16);
             try (Statement s = connection.createStatement();
                     ResultSet r = s.executeQuery("SELECT pg_backend_pid()")) {
                 if (!r.next()) throw new SQLException("Missing backend PID");
@@ -187,7 +178,6 @@ public final class CaptureDriver implements Driver {
             try {
                 output.write(json.toJson(entry));
                 output.newLine();
-                if (!compressed) output.flush();
             } catch (IOException e) {
                 SQLException error = new SQLException("Trace write failure", e);
                 CaptureRun.recordFailure(error, context("write_trace", null));

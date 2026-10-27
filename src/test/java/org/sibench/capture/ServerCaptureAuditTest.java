@@ -30,9 +30,16 @@ public class ServerCaptureAuditTest {
         return lines;
     }
 
+    private int files;
+
     private Path write(List<String> lines) throws IOException {
-        Path file = folder.newFile().toPath();
-        Files.write(file, lines);
+        Path file = folder.newFile("pg-" + (++files) + ".jsonl.zst").toPath();
+        try (var out = new com.github.luben.zstd.ZstdOutputStream(Files.newOutputStream(file))) {
+            for (String line : lines) {
+                out.write(line.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                out.write('\n');
+            }
+        }
         return file;
     }
 

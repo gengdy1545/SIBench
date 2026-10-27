@@ -163,7 +163,7 @@ public class ChangeKindsTest {
 
     @Test
     public void aRawTraceIsCountedInFileOrder() throws Exception {
-        Path trace = folder.newFolder("raw").toPath().resolve("pg-1.jsonl");
+        Path trace = folder.newFolder("raw").toPath().resolve("pg-1.jsonl.zst");
         var lines = new ArrayList<String>();
         lines.add(row("sbtest1", "delete", sbtest(5, 10, "aaaa"), null).toString());
         lines.add(event("transaction_commit").toString());
@@ -171,7 +171,7 @@ public class ChangeKindsTest {
         // different key is not: file order is what the classifier reads.
         lines.add(row("sbtest1", "insert", null, sbtest(6, 10, "eeee")).toString());
         lines.add(event("transaction_commit").toString());
-        Files.write(trace, lines);
+        RowAuditTestSupport.writeTrace(trace, lines);
         var report = ChangeKinds.countTraces(sysbench(), List.of(trace));
         assertEquals(1L, report.total().deletes());
         assertEquals(1L, report.total().inserts());
@@ -207,8 +207,8 @@ public class ChangeKindsTest {
                 lines.add(end.toString());
                 all.add(end);
             }
-            Path trace = directory.resolve("pg-" + t + ".jsonl");
-            Files.write(trace, lines);
+            Path trace = directory.resolve("pg-" + t + ".jsonl.zst");
+            RowAuditTestSupport.writeTrace(trace, lines);
             traces.add(trace);
         }
         var expected = ChangeKinds.count(sysbench(), all);
@@ -222,9 +222,9 @@ public class ChangeKindsTest {
     public void anInvalidChangeFailsOnlyWhenCommitted() throws Exception {
         Path directory = folder.newFolder("invalid").toPath();
         var rewrite = row("sbtest1", "update", sbtest(1, 1, "c"), sbtest(2, 1, "c"));
-        Path aborted = Files.write(directory.resolve("pg-1.jsonl"), List.of(rewrite.toString(), event("transaction_abort").toString()));
+        Path aborted = RowAuditTestSupport.writeTrace(directory.resolve("pg-1.jsonl.zst"), List.of(rewrite.toString(), event("transaction_abort").toString()));
         assertEquals(0L, ChangeKinds.countTraces(sysbench(), List.of(aborted)).total().ordinaryColumnUpdates());
-        Path committed = Files.write(directory.resolve("pg-2.jsonl"), List.of(rewrite.toString(), event("transaction_commit").toString()));
+        Path committed = RowAuditTestSupport.writeTrace(directory.resolve("pg-2.jsonl.zst"), List.of(rewrite.toString(), event("transaction_commit").toString()));
         assertThrows(IOException.class, () -> ChangeKinds.countTraces(sysbench(), List.of(committed)));
     }
 }

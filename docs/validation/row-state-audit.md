@@ -26,7 +26,7 @@ java -Xmx12g -jar build/sibench/sibench.jar audit-rows \
 
 默认生成 `RAW/row-state-audit.json` 和 `RAW/row-state-audit.json.changes.jsonl`。可指定第四个位置参数 REPORT；编译使用自定义报告时以 `compile-trace PROFILE OUTPUT ROW_AUDIT` 显式传入。审计历史输入时必须提供与原采集结束状态一致的 PG；新报告使用独立路径，历史证据保持原样。
 
-Baseline 验证由采集编排的 `export` 阶段在导出后执行（`PgBaselineVerify`）：按来源 schema 验证基线全值和身份，要求 Parquet 按主键有序、RowID 从 1 连续、版本为 0，`locators.tsv` 存在。字符串对账显式使用 C 排序，不代表原生查询 collation 投影已实现。
+Baseline 验证由采集编排的 `export` 阶段在导出后执行（`PgBaselineVerify`）：按来源 schema 验证基线全值和身份，要求 Parquet 按主键有序、RowID 从 1 连续、版本为 0。字符串对账显式使用 C 排序，不代表原生查询 collation 投影已实现。
 
 ## 验证范围
 

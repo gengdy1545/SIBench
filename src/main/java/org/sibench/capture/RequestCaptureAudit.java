@@ -110,10 +110,11 @@ public final class RequestCaptureAudit {
             String line;
             while ((line = input.readLine()) != null) {
                 JsonObject e = JsonParser.parseString(line).getAsJsonObject();
+                String event = e.get("event").getAsString();
+                if (event.equals("capture_start")) continue;
                 if (e.get("pid").getAsInt() != backendPid)
                     throw new IOException("Backend PID differs from JDBC connection");
-                String app = e.get("application").getAsString(),
-                        event = e.get("event").getAsString();
+                String app = e.get("application").getAsString();
                 JsonObject request = requests.get(app);
                 if (request == null) {
                     unmatched++;

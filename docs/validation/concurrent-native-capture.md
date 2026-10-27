@@ -121,4 +121,4 @@
 
 ## 产物清理
 
-2026-10-25 起采集改在远程机运行，开发机只保留四份完整产物作为编译与回放的回归基准：`hybench-htap-sf10-w5`、`hybench-htap-sf1-c8-20261024`、`sysbench-8m-c8-20261024`、`ycsb-8m-c8b-20261024`。其余 `results/poc/*` 删除了全部大于 1 MB 的文件（原始追踪、Trace、Baseline、`Data_<sf>`、运行用 jar 副本），清单、报告与日志保留；开发机 PG 中的采集库与 SF10 静止库一并删除，本文与其他验证文档中引用这些目录的数据文件已不在。
+2026-10-27 清理后，开发机只保留 `regress-20261025/sf1-c8-v22` 的 zstd Trace、SF1 baseline 与报告，以及小型测试证据；旧明文 raw/trace、旧 SF10 Trace、旧 8m raw/trace 与临时 profiling 已删除。当前 SF10/87m 的 zstd raw 与 Trace 在远程机保留：`hybench-sf10-hl9`、`hybench-sf10-w5c32v2`、`sysbench-87m-sl16`、`sysbench-87m-w5v2`、`ycsb-87m-n22`。本文与其他验证文档中引用旧大文件的地方只保留报告口径，不再提供本地重编。

@@ -8,7 +8,9 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Map;
 import java.sql.Types;
 
@@ -34,9 +36,9 @@ public class RequestCaptureAuditTest {
     @Test
     public void acceptsMatchedRollbackAndCloseAbortInSingleSessionCapture() throws Exception {
         var directory = temporary.newFolder().toPath();
-        var client = directory.resolve("client.jsonl");
-        var server = directory.resolve("server.jsonl");
-        Files.writeString(
+        var client = directory.resolve("client.jsonl.zst");
+        var server = directory.resolve("server.jsonl.zst");
+        write(
                 client,
                 """
                 {"event":"connection","pid":42}
@@ -57,16 +59,16 @@ public class RequestCaptureAuditTest {
                 {"event":"executor_run_end","pid":42,"application":"b"}
                 {"event":"executor_end","pid":42,"application":"b"}
                 """;
-        Files.writeString(
+        write(
                 server,
                 pg + "{\"event\":\"transaction_abort\",\"pid\":42,\"application\":\"b\"}\n");
         var audit = RequestCaptureAudit.audit(client, server, true);
         assertEquals("passed", audit.get("status"));
         assertEquals(1L, audit.get("explicit_rollbacks"));
         assertEquals(1L, audit.get("close_aborts"));
-        Files.writeString(server, pg);
+        write(server, pg);
         assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
-        Files.writeString(
+        write(
                 server,
                 pg.replace(
                                 "\"event\":\"transaction_abort\",\"pid\":42,\"application\":\"a\"",
@@ -82,8 +84,8 @@ public class RequestCaptureAuditTest {
     @Test
     public void comparesConsumedRowsWithServerRowHashes() throws Exception {
         var directory = temporary.newFolder().toPath();
-        var client = directory.resolve("client.jsonl");
-        var server = directory.resolve("server.jsonl");
+        var client = directory.resolve("client.jsonl.zst");
+        var server = directory.resolve("server.jsonl.zst");
         String hash = ResultRowHash.of(java.util.List.of("2000.0"), java.util.List.of(Types.REAL));
         String requests =
                 """
@@ -101,18 +103,18 @@ public class RequestCaptureAuditTest {
                 {"event":"executor_end","pid":42,"application":"a","depth":1}
                 {"event":"transaction_commit","pid":42,"application":"a"}
                 """;
-        Files.writeString(server, pg.formatted(ResultRowHash.of(java.util.List.of("2000"), java.util.List.of(Types.REAL))));
-        Files.writeString(client, requests.formatted("{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"" + hash + "\"}"));
+        write(server, pg.formatted(ResultRowHash.of(java.util.List.of("2000"), java.util.List.of(Types.REAL))));
+        write(client, requests.formatted("{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"" + hash + "\"}"));
         assertEquals(1L, RequestCaptureAudit.audit(client, server, false).get("client_consumed_rows_checked"));
         // A row with its text: the hash must be the text's, and both must match the server.
         String text = "{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"%s\",\"1\":\"2000.0\",\"column_types\":{\"1\":7}}";
-        Files.writeString(client, requests.formatted(text.formatted(hash)));
+        write(client, requests.formatted(text.formatted(hash)));
         assertEquals(1L, RequestCaptureAudit.audit(client, server, false).get("client_consumed_rows_checked"));
-        Files.writeString(client, requests.formatted(text.formatted("0000000000000000")));
+        write(client, requests.formatted(text.formatted("0000000000000000")));
         assertTrue(assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, false))
                 .getMessage().contains("hash differs from its values"));
-        Files.writeString(server, pg.formatted("0000000000000000"));
-        Files.writeString(client, requests.formatted("{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"" + hash + "\"}"));
+        write(server, pg.formatted("0000000000000000"));
+        write(client, requests.formatted("{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"" + hash + "\"}"));
         assertTrue(assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, false))
                 .getMessage().contains("differs from same-execution server result"));
     }
@@ -120,9 +122,9 @@ public class RequestCaptureAuditTest {
     @Test
     public void rejectsRollbackWithoutCompletedRequest() throws Exception {
         var directory = temporary.newFolder().toPath();
-        var client = directory.resolve("client.jsonl");
-        var server = directory.resolve("server.jsonl");
-        Files.writeString(
+        var client = directory.resolve("client.jsonl.zst");
+        var server = directory.resolve("server.jsonl.zst");
+        write(
                 client,
                 """
                 {"event":"connection","pid":42}
@@ -131,7 +133,7 @@ public class RequestCaptureAuditTest {
                 {"event":"request_return","application":"a"}
                 {"event":"close","application":"a"}
                 """);
-        Files.writeString(server, "");
+        write(server, "");
         assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
     }
 
@@ -165,35 +167,35 @@ public class RequestCaptureAuditTest {
     @Test
     public void autocommitConnectionsCommitTheLabelAndTheRequest() throws Exception {
         var directory = temporary.newFolder().toPath();
-        var client = directory.resolve("client.jsonl");
-        var server = directory.resolve("server.jsonl");
-        Files.writeString(client, AUTOCOMMIT_CLIENT);
-        Files.writeString(server, server(2, ""));
+        var client = directory.resolve("client.jsonl.zst");
+        var server = directory.resolve("server.jsonl.zst");
+        write(client, AUTOCOMMIT_CLIENT);
+        write(server, server(2, ""));
         assertEquals("passed", RequestCaptureAudit.audit(client, server, true).get("status"));
         // One commit fewer, or one more, is an event-loss signature.
-        Files.writeString(server, server(1, ""));
+        write(server, server(1, ""));
         assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
-        Files.writeString(server, server(3, ""));
+        write(server, server(3, ""));
         assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
     }
 
     @Test
     public void pointAccessBindingsAreCheckedOnlyWhenRequested() throws Exception {
         var directory = temporary.newFolder().toPath();
-        var client = directory.resolve("client.jsonl");
-        var server = directory.resolve("server.jsonl");
-        Files.writeString(client, AUTOCOMMIT_CLIENT);
+        var client = directory.resolve("client.jsonl.zst");
+        var server = directory.resolve("server.jsonl.zst");
+        write(client, AUTOCOMMIT_CLIENT);
         // Key 7 was never bound by the client: a join-derived key, or a capture error.
-        Files.writeString(server, server(2, scan("3", "0", "\"7\"")));
+        write(server, server(2, scan("3", "0", "\"7\"")));
         assertThrows(
                 java.io.IOException.class,
                 () -> RequestCaptureAudit.audit(client, server, true));
         assertEquals(
                 "passed", RequestCaptureAudit.audit(client, server, false).get("status"));
-        Files.writeString(server, server(2, scan("3", "0", "\"5\"")));
+        write(server, server(2, scan("3", "0", "\"5\"")));
         assertEquals("passed", RequestCaptureAudit.audit(client, server, true).get("status"));
         // Planner endpoint probes (IS NOT NULL, no bound value) are not search predicates.
-        Files.writeString(server, server(2, scan("0", "129", "null")));
+        write(server, server(2, scan("0", "129", "null")));
         assertEquals("passed", RequestCaptureAudit.audit(client, server, true).get("status"));
     }
 
@@ -205,10 +207,10 @@ public class RequestCaptureAuditTest {
     @Test
     public void aCommitAfterTheTransactionAlreadyEndedIsRecordedNotToleratedAway() throws Exception {
         var directory = temporary.newFolder().toPath();
-        var client = directory.resolve("client.jsonl");
-        var server = directory.resolve("server.jsonl");
-        Files.writeString(client, COMMIT_AFTER_ROLLBACK_CLIENT);
-        Files.writeString(server, server(0, "") + abortEvent());
+        var client = directory.resolve("client.jsonl.zst");
+        var server = directory.resolve("server.jsonl.zst");
+        write(client, COMMIT_AFTER_ROLLBACK_CLIENT);
+        write(server, server(0, "") + abortEvent());
         var report = RequestCaptureAudit.audit(client, server, true);
         assertEquals("passed", report.get("status"));
         assertEquals(1L, ((Map<?, ?>) report.get("client_commits_ended_by_server_abort")).get("a"));
@@ -227,10 +229,10 @@ public class RequestCaptureAuditTest {
     @Test
     public void aCommitThatChangedRowsButNeverCommittedFails() throws Exception {
         var directory = temporary.newFolder().toPath();
-        var client = directory.resolve("client.jsonl");
-        var server = directory.resolve("server.jsonl");
-        Files.writeString(client, COMMIT_AFTER_ROLLBACK_CLIENT);
-        Files.writeString(
+        var client = directory.resolve("client.jsonl.zst");
+        var server = directory.resolve("server.jsonl.zst");
+        write(client, COMMIT_AFTER_ROLLBACK_CLIENT);
+        write(
                 server,
                 server(0, "")
                         + abortEvent()
@@ -242,5 +244,12 @@ public class RequestCaptureAuditTest {
 
     private static String abortEvent() {
         return "{\"event\":\"transaction_abort\",\"pid\":42,\"application\":\"a\"}\n";
+    }
+
+    private static Path write(Path file, String text) throws IOException {
+        try (var out = new com.github.luben.zstd.ZstdOutputStream(Files.newOutputStream(file))) {
+            out.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+        return file;
     }
 }

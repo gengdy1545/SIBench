@@ -117,7 +117,6 @@ final class RowAuditTestSupport {
                                             fileId++)));
         }
         Files.write(directory.resolve("files.jsonl"), files);
-        Files.writeString(directory.resolve("locators.tsv"), "");
         return directory;
     }
 
@@ -437,10 +436,8 @@ final class RowAuditTestSupport {
                                 "close",
                                 "application",
                                 "fixture-" + (transactions.size() - 1))));
-        Path jdbc = directory.resolve("jdbc-fixture.jsonl");
-        Files.write(jdbc, client);
-        Path raw = directory.resolve("pg-1.jsonl");
-        Files.write(raw, server);
+        Path jdbc = writeTrace(directory.resolve("jdbc-fixture.jsonl.zst"), client);
+        Path raw = writeTrace(directory.resolve("pg-1.jsonl.zst"), server);
         complete(directory, jdbc, raw);
         return raw;
     }
@@ -521,5 +518,30 @@ final class RowAuditTestSupport {
     static <T> T proxy(Class<T> type, InvocationHandler handler) {
         return type.cast(
                 Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[] {type}, handler));
+    }
+
+    static Path writeTrace(Path file, Iterable<String> lines) throws Exception {
+        try (var out = new com.github.luben.zstd.ZstdOutputStream(Files.newOutputStream(file))) {
+            for (String line : lines) {
+                out.write(line.getBytes(StandardCharsets.UTF_8));
+                out.write('\n');
+            }
+        }
+        return file;
+    }
+
+    static Path writeTrace(Path file, byte[] bytes) throws Exception {
+        try (var out = new com.github.luben.zstd.ZstdOutputStream(Files.newOutputStream(file))) {
+            out.write(bytes);
+        }
+        return file;
+    }
+
+    static List<String> readTrace(Path file) throws Exception {
+        var lines = new ArrayList<String>();
+        try (var input = ServerTrace.open(file)) {
+            for (String line; (line = input.readLine()) != null; ) lines.add(line);
+        }
+        return lines;
     }
 }

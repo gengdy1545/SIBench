@@ -19,6 +19,8 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 public class CaptureRunTest {
@@ -89,14 +91,14 @@ public class CaptureRunTest {
             assertEquals("failed", manifest(directory).get("status").getAsString());
             assertThrows(
                     IOException.class,
-                    () -> CaptureRun.verifyInput(directory.resolve("pg-123.jsonl")));
+                    () -> CaptureRun.verifyInput(directory.resolve("pg-123.jsonl.zst")));
             assertThrows(IOException.class, () -> CaptureRun.begin(directory));
         }
     }
 
     @Test
     public void completionRequiresAuditAndDetectsSubsequentFileChanges() throws Exception {
-        Path directory = temporary.newFolder().toPath(), pg = directory.resolve("pg-123.jsonl");
+        Path directory = temporary.newFolder().toPath(), pg = directory.resolve("pg-123.jsonl.zst");
         try (CaptureRun run = CaptureRun.begin(directory)) {
             try (var connection = CaptureDriver.wrap(actual("", null, new boolean[1]), directory)) {
                 connection.prepareStatement("SELECT 1").executeQuery();
@@ -104,54 +106,56 @@ public class CaptureRunTest {
             }
             Path jdbc = jdbc(directory);
             String application =
-                    Files.readAllLines(jdbc).stream()
+                    RowAuditTestSupport.readTrace(jdbc).stream()
                             .map(line -> JsonParser.parseString(line).getAsJsonObject())
                             .filter(e -> e.get("event").getAsString().equals("request_start"))
                             .findFirst()
                             .orElseThrow()
                             .get("application")
                             .getAsString();
-            Files.writeString(
+            RowAuditTestSupport.writeTrace(
                     pg,
-                    event("executor_start", application, ",\"sql\":\"SELECT 1\"")
-                            + event("executor_run_end", application, "")
-                            + event("executor_end", application, "")
-                            + event("transaction_commit", application, ""));
+                    List.of(
+                            event("executor_start", application, ",\"sql\":\"SELECT 1\""),
+                            event("executor_run_end", application, ""),
+                            event("executor_end", application, ""),
+                            event("transaction_commit", application, "")));
             run.complete();
         }
         assertEquals("complete", manifest(directory).get("status").getAsString());
         CaptureRun.verifyInput(pg);
         Path jdbc = jdbc(directory);
-        String original = Files.readString(jdbc);
-        Files.writeString(jdbc, original + "{}\n");
+        var original = RowAuditTestSupport.readTrace(jdbc);
+        RowAuditTestSupport.writeTrace(jdbc, append(original, "{}"));
         assertThrows(IOException.class, () -> CaptureRun.verifyInput(pg));
-        Files.writeString(jdbc, original);
-        Files.writeString(pg, Files.readString(pg) + "{}\n");
+        RowAuditTestSupport.writeTrace(jdbc, original);
+        RowAuditTestSupport.writeTrace(pg, append(RowAuditTestSupport.readTrace(pg), "{}"));
         assertThrows(IOException.class, () -> CaptureRun.verifyInput(pg));
     }
 
     @Test
     public void verificationTrustsOnlyTheAuditTheRunRecordedForUnchangedFiles() throws Exception {
-        Path directory = temporary.newFolder().toPath(), pg = directory.resolve("pg-123.jsonl");
+        Path directory = temporary.newFolder().toPath(), pg = directory.resolve("pg-123.jsonl.zst");
         try (CaptureRun run = CaptureRun.begin(directory)) {
             try (var connection = CaptureDriver.wrap(actual("", null, new boolean[1]), directory)) {
                 connection.prepareStatement("SELECT 1").executeQuery();
                 connection.commit();
             }
             String application =
-                    Files.readAllLines(jdbc(directory)).stream()
+                    RowAuditTestSupport.readTrace(jdbc(directory)).stream()
                             .map(line -> JsonParser.parseString(line).getAsJsonObject())
                             .filter(e -> e.get("event").getAsString().equals("request_start"))
                             .findFirst()
                             .orElseThrow()
                             .get("application")
                             .getAsString();
-            Files.writeString(
+            RowAuditTestSupport.writeTrace(
                     pg,
-                    event("executor_start", application, ",\"sql\":\"SELECT 1\"")
-                            + event("executor_run_end", application, "")
-                            + event("executor_end", application, "")
-                            + event("transaction_commit", application, ""));
+                    List.of(
+                            event("executor_start", application, ",\"sql\":\"SELECT 1\""),
+                            event("executor_run_end", application, ""),
+                            event("executor_end", application, ""),
+                            event("transaction_commit", application, "")));
             run.complete();
         }
         CaptureRun.verifyInput(directory);
@@ -167,8 +171,8 @@ public class CaptureRunTest {
     public void incompleteOrFailedPrefixCannotBeCompiledEvenBeforeBaselineCheck() throws Exception {
         Path directory = temporary.newFolder().toPath();
         try (CaptureRun run = CaptureRun.begin(directory)) {
-            Path raw = directory.resolve("pg-123.jsonl");
-            Files.writeString(raw, "{}\n");
+            Path raw = directory.resolve("pg-123.jsonl.zst");
+            RowAuditTestSupport.writeTrace(raw, List.of("{}"));
             assertThrows(
                     IOException.class,
                     () -> IndexTraceCompiler.compile(null, null, raw, directory.resolve("output"), (Path) null));
@@ -222,8 +226,8 @@ public class CaptureRunTest {
     @Test
     public void captureWithoutARunManifestIsRejected() throws Exception {
         Path directory = temporary.newFolder().toPath();
-        Path pg = directory.resolve("pg-123.jsonl");
-        Files.writeString(pg, event("transaction_commit", "fixture", ""));
+        Path pg = directory.resolve("pg-123.jsonl.zst");
+        RowAuditTestSupport.writeTrace(pg, List.of(event("transaction_commit", "fixture", "")));
         assertThrows(IOException.class, () -> CaptureRun.verifyInput(pg));
     }
 
@@ -233,21 +237,23 @@ public class CaptureRunTest {
         try (CaptureRun run = CaptureRun.begin(directory)) {
             run.phase("xp", null);
             for (int pid : new int[] {123, 124}) {
-                Path jdbc = directory.resolve("jdbc-" + pid + ".jsonl");
+                Path jdbc = directory.resolve("jdbc-" + pid + ".jsonl.zst");
                 CaptureRun.session(jdbc, pid);
-                Files.writeString(jdbc, """
-                        {"event":"connection","pid":%d,"phase":"xp"}
-                        {"event":"request_start","application":"p%d","sql":"SELECT 1","parameters":{}}
-                        {"event":"request_return","application":"p%d"}
-                        {"event":"rollback","application":"p%d"}
-                        {"event":"close","application":"p%d"}
-                        """.formatted(pid, pid, pid, pid, pid));
-                Files.writeString(directory.resolve("pg-" + pid + ".jsonl"), """
-                        {"event":"executor_start","pid":%d,"application":"p%d","sql":"SELECT 1"}
-                        {"event":"executor_end","pid":%d,"application":"p%d"}
-                        {"event":"executor_run_end","pid":%d,"application":"p%d"}
-                        {"event":"transaction_abort","pid":%d,"application":"p%d"}
-                        """.formatted(pid, pid, pid, pid, pid, pid, pid, pid));
+                RowAuditTestSupport.writeTrace(
+                        jdbc,
+                        List.of(
+                                "{\"event\":\"connection\",\"pid\":" + pid + ",\"phase\":\"xp\"}",
+                                "{\"event\":\"request_start\",\"application\":\"p" + pid + "\",\"sql\":\"SELECT 1\",\"parameters\":{}}",
+                                "{\"event\":\"request_return\",\"application\":\"p" + pid + "\"}",
+                                "{\"event\":\"rollback\",\"application\":\"p" + pid + "\"}",
+                                "{\"event\":\"close\",\"application\":\"p" + pid + "\"}"));
+                RowAuditTestSupport.writeTrace(
+                        directory.resolve("pg-" + pid + ".jsonl.zst"),
+                        List.of(
+                                "{\"event\":\"executor_start\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\",\"sql\":\"SELECT 1\"}",
+                                "{\"event\":\"executor_end\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\"}",
+                                "{\"event\":\"executor_run_end\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\"}",
+                                "{\"event\":\"transaction_abort\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\"}"));
                 CaptureRun.sessionClosed(jdbc);
             }
             run.complete();
@@ -258,12 +264,12 @@ public class CaptureRunTest {
         // transaction completion counter, which these fixture traces do not carry.
         assertEquals("concurrent", IndexTraceCompiler.sessions(directory).order());
         assertEquals(2, IndexTraceCompiler.sessions(directory).files().size());
-        Path extra = directory.resolve("pg-unregistered.jsonl");
-        Files.writeString(extra, "{}\n");
+        Path extra = directory.resolve("pg-unregistered.jsonl.zst");
+        RowAuditTestSupport.writeTrace(extra, List.of("{}"));
         assertThrows(IOException.class, () -> CaptureRun.verifyInput(directory));
         Files.delete(extra);
-        Path server = directory.resolve("pg-124.jsonl");
-        Files.writeString(server, Files.readString(server) + "{}\n");
+        Path server = directory.resolve("pg-124.jsonl.zst");
+        RowAuditTestSupport.writeTrace(server, append(RowAuditTestSupport.readTrace(server), "{}"));
         assertThrows(IOException.class, () -> CaptureRun.verifyInput(directory));
     }
 
@@ -295,7 +301,7 @@ public class CaptureRunTest {
             rows.next();
             first.getResultSet().next();
         }
-        var events = Files.readAllLines(jdbc(directory)).stream()
+        var events = RowAuditTestSupport.readTrace(jdbc(directory)).stream()
                 .map(line -> JsonParser.parseString(line).getAsJsonObject()).toList();
         String application = events.stream()
                 .filter(e -> e.get("event").getAsString().equals("request_start"))
@@ -322,7 +328,7 @@ public class CaptureRunTest {
                         CaptureDriver.wrap(actual("", null, new boolean[1]), directory)) {
             connection.createStatement().executeQuery("SELECT 1");
         }
-        var request = Files.readAllLines(jdbc(directory)).stream()
+        var request = RowAuditTestSupport.readTrace(jdbc(directory)).stream()
                 .map(line -> JsonParser.parseString(line).getAsJsonObject())
                 .filter(e -> e.get("event").getAsString().equals("request_start"))
                 .findFirst().orElseThrow();
@@ -403,7 +409,7 @@ public class CaptureRunTest {
                 wrapped.prepareStatement("SELECT 1").executeQuery();
             }
             var events =
-                    Files.readAllLines(jdbc(directory)).stream()
+                    RowAuditTestSupport.readTrace(jdbc(directory)).stream()
                             .map(line -> JsonParser.parseString(line).getAsJsonObject())
                             .toList();
             var start =
@@ -452,6 +458,12 @@ public class CaptureRunTest {
                 + application
                 + "\""
                 + details
-                + "}\n";
+                + "}";
+    }
+
+    private static List<String> append(List<String> lines, String line) {
+        var result = new ArrayList<>(lines);
+        result.add(line);
+        return result;
     }
 }

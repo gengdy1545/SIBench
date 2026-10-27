@@ -612,8 +612,10 @@ public final class IndexTraceCompiler {
             }
             var reports = new ArrayList<Map<String, Object>>();
             for (int session = 0; session < files.size(); session++) {
-                // A trace without events declared no format, as a tracker that read none reports.
-                var detail = details[session] == null ? AccessUnits.Detail.LEGACY : details[session];
+                if (details[session] == null)
+                    throw new IOException(
+                            "Session trace has no capture_start: " + files.get(session));
+                var detail = details[session];
                 ledger.input(files.get(session), backends[session], detail, events[session], accessUnits[session]);
                 reports.add(report(files.get(session), backends[session], events[session], requests[session]));
             }

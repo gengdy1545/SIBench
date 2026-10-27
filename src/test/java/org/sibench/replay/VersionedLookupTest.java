@@ -246,7 +246,11 @@ public class VersionedLookupTest {
                 writer.append(snapshot(5, 2, 20, 0, 1));
                 writer.append(snapshot(5, 0, 1, 110, 0));
             }
-            Files.writeString(directory.resolve("work-units.jsonl"), "");
+            try (var out =
+                    new com.github.luben.zstd.ZstdOutputStream(
+                            Files.newOutputStream(directory.resolve("work-units.jsonl.zst")))) {
+                out.write(new byte[0]);
+            }
             Files.writeString(
                     directory.resolve("manifest.json"),
                     new Gson()
@@ -261,8 +265,7 @@ public class VersionedLookupTest {
                                             "workload_trace_sha256",
                                             org.sibench.capture.IndexOperationTrace.sha256(workload),
                                             "work_units_sha256",
-                                            BaselineGenerator.sha256(
-                                                    directory.resolve("work-units.jsonl")))));
+                                            org.sibench.capture.WorkUnits.sha256(directory))));
             for (boolean secondary : new boolean[] {false, true}) {
                 List<?> previous = null;
                 for (String dispatchMode : new String[] {"operation", "transaction"}) {

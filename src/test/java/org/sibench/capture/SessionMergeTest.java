@@ -3,6 +3,7 @@ package org.sibench.capture;
 import static org.junit.Assert.*;
 
 import com.google.gson.Gson;
+import com.github.luben.zstd.ZstdOutputStream;
 
 import org.junit.Rule;
 import org.junit.Test;
@@ -39,8 +40,8 @@ public class SessionMergeTest {
             lines.add(record("executor_start", pid, -1));
             lines.add(record("transaction_commit", pid, csn));
         }
-        Path file = directory.resolve("pg-" + pid + ".jsonl");
-        Files.write(file, lines);
+        Path file = directory.resolve("pg-" + pid + ".jsonl.zst");
+        write(file, lines);
         return file;
     }
 
@@ -78,8 +79,8 @@ public class SessionMergeTest {
         lines.add(record("transaction_commit", 101, 7));
         lines.add(record("executor_start", 101, -1));
         lines.add(record("transaction_abort", 101, 9));
-        Path file = directory.resolve("pg-101.jsonl");
-        Files.write(file, lines);
+        Path file = directory.resolve("pg-101.jsonl.zst");
+        write(file, lines);
         try (var merge = SessionMerge.open(List.of(file))) {
             assertTrue(merge.hasNext());
             assertEquals(4, merge.next().lineCount());
@@ -120,8 +121,8 @@ public class SessionMergeTest {
         var lines = new ArrayList<String>();
         lines.add(record("transaction_commit", 101, 5));
         lines.add(record("executor_start", 101, -1));
-        Path file = directory.resolve("pg-101.jsonl");
-        Files.write(file, lines);
+        Path file = directory.resolve("pg-101.jsonl.zst");
+        write(file, lines);
         var failure = assertThrows(IOException.class, () -> drain(file));
         assertTrue(failure.getMessage(), failure.getMessage().contains("without a commit or abort"));
     }
@@ -133,8 +134,8 @@ public class SessionMergeTest {
         var lines = new java.util.ArrayList<String>();
         lines.add(record("executor_start", 101, -1));
         lines.add(record("transaction_abort", 101, -1));
-        Path file = directory.resolve("pg-101.jsonl");
-        java.nio.file.Files.write(file, lines);
+        Path file = directory.resolve("pg-101.jsonl.zst");
+        write(file, lines);
         var failure = assertThrows(java.io.IOException.class, () -> drain(file));
         assertTrue(failure.getMessage(), failure.getMessage().contains("completion counter"));
     }
@@ -146,15 +147,15 @@ public class SessionMergeTest {
     @Test
     public void readersSortAfterTheWriterAtTheirPosition() throws Exception {
         Path directory = temporary.newFolder().toPath();
-        Path readers = directory.resolve("pg-101.jsonl");
-        Files.write(
+        Path readers = directory.resolve("pg-101.jsonl.zst");
+        write(
                 readers,
                 List.of(
                         record("transaction_commit", 101, 5, 0),
                         record("transaction_commit", 101, 5, 0),
                         record("transaction_commit", 101, 7, 0)));
-        Path writers = directory.resolve("pg-102.jsonl");
-        Files.write(
+        Path writers = directory.resolve("pg-102.jsonl.zst");
+        write(
                 writers,
                 List.of(record("transaction_commit", 102, 5, 40), record("transaction_commit", 102, 6, 41)));
         var order = new ArrayList<String>();
@@ -171,9 +172,9 @@ public class SessionMergeTest {
     @Test
     public void twoWritersNeverShareAPosition() throws Exception {
         Path directory = temporary.newFolder().toPath();
-        Path first = directory.resolve("pg-101.jsonl"), second = directory.resolve("pg-102.jsonl");
-        Files.write(first, List.of(record("transaction_commit", 101, 5, 40)));
-        Files.write(second, List.of(record("transaction_abort", 102, 5, 41)));
+        Path first = directory.resolve("pg-101.jsonl.zst"), second = directory.resolve("pg-102.jsonl.zst");
+        write(first, List.of(record("transaction_commit", 101, 5, 40)));
+        write(second, List.of(record("transaction_abort", 102, 5, 41)));
         var failure =
                 assertThrows(
                         IOException.class,
@@ -209,9 +210,9 @@ public class SessionMergeTest {
         first.add(record("executor_start", 101, -1));
         first.add(record("transaction_commit", 101, 7));
         var second = List.of(record("executor_start", 102, -1), record("transaction_commit", 102, 6));
-        Path a = directory.resolve("pg-101.jsonl"), b = directory.resolve("pg-102.jsonl");
-        Files.write(a, first);
-        Files.write(b, second);
+        Path a = directory.resolve("pg-101.jsonl.zst"), b = directory.resolve("pg-102.jsonl.zst");
+        write(a, first);
+        write(b, second);
         String previous = System.getProperty("sibench.compile.parse_threads");
         System.setProperty("sibench.compile.parse_threads", "3");
         try (var merge = SessionMerge.open(List.of(a, b))) {
@@ -240,8 +241,8 @@ public class SessionMergeTest {
         lines.add(record("executor_start", 101, -1));
         lines.add(record("executor_start", 101, -1).substring(0, 10));
         lines.add(record("transaction_commit", 101, 7));
-        Path file = directory.resolve("pg-101.jsonl");
-        Files.write(file, lines);
+        Path file = directory.resolve("pg-101.jsonl.zst");
+        write(file, lines);
         try (var merge = SessionMerge.open(List.of(file))) {
             merge.next();
             assertEquals(com.google.gson.JsonParser.parseString(lines.get(0)), merge.event().json());
@@ -300,15 +301,27 @@ public class SessionMergeTest {
         }
         byte[] bytes = text.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
         Path directory = temporary.newFolder().toPath();
-        Path plain = Files.write(directory.resolve("pg-1.jsonl"), bytes);
-        Path zstd = directory.resolve("pg-2.jsonl.zst");
-        try (var out = new com.github.luben.zstd.ZstdOutputStream(Files.newOutputStream(zstd))) {
+        Path zstd = write(directory.resolve("pg-2.jsonl.zst"), bytes);
+        List<String> expected = byReadLine(ServerTrace.open(zstd));
+        assertTrue(expected.size() > 500);
+        assertEquals(expected, byScanner(zstd));
+        assertEquals(List.of("0 end"), byScanner(write(directory.resolve("pg-3.jsonl.zst"), new byte[0])));
+    }
+
+    private static Path write(Path file, byte[] bytes) throws IOException {
+        try (var out = new ZstdOutputStream(Files.newOutputStream(file))) {
             out.write(bytes);
         }
-        List<String> expected = byReadLine(ServerTrace.open(plain));
-        assertTrue(expected.size() > 500);
-        assertEquals(expected, byScanner(plain));
-        assertEquals(expected, byScanner(zstd));
-        assertEquals(List.of("0 end"), byScanner(Files.write(directory.resolve("pg-3.jsonl"), new byte[0])));
+        return file;
+    }
+
+    private static Path write(Path file, List<String> lines) throws IOException {
+        try (var out = new ZstdOutputStream(Files.newOutputStream(file))) {
+            for (String line : lines) {
+                out.write(line.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                out.write('\n');
+            }
+        }
+        return file;
     }
 }

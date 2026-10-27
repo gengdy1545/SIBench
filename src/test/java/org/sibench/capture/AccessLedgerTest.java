@@ -3,6 +3,7 @@ package org.sibench.capture;
 import static org.junit.Assert.*;
 
 import com.google.gson.JsonParser;
+import com.github.luben.zstd.ZstdOutputStream;
 
 import org.junit.Rule;
 import org.junit.Test;
@@ -62,9 +63,15 @@ public class AccessLedgerTest {
                     "\"sql\":\"" + sql + "\",\"query_id\":" + (sql.hashCode() | 1));
         }
 
+        long resultRows;
+
         Trace end(long processed) {
-            event("executor_run_end", null, "\"processed\":" + processed);
+            event(
+                    "executor_run_end",
+                    null,
+                    "\"processed\":" + processed + ",\"returned\":" + resultRows);
             event("executor_end", null, "\"processed\":" + processed);
+            resultRows = 0;
             depth--;
             return this;
         }
@@ -139,6 +146,7 @@ public class AccessLedgerTest {
         }
 
         Trace row() {
+            resultRows++;
             return event("result_row", null, "\"values\":[\"x\"]");
         }
 
@@ -186,8 +194,13 @@ public class AccessLedgerTest {
         }
 
         Path write(Path directory, String name) throws IOException {
-            Path file = directory.resolve(name);
-            Files.write(file, lines);
+            Path file = directory.resolve(name.endsWith(".zst") ? name : name + ".zst");
+            try (var out = new ZstdOutputStream(Files.newOutputStream(file))) {
+                for (String line : lines) {
+                    out.write(line.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    out.write('\n');
+                }
+            }
             return file;
         }
     }
@@ -210,7 +223,7 @@ public class AccessLedgerTest {
 
     @Test
     public void claimsEveryEventOnceAndKeepsLayersSeparate() throws Exception {
-        var t = new Trace();
+        var t = new Trace().header("rows");
         // The planner probes the index endpoint before the executor starts.
         t.event("transaction_commit", null, null);
         t.rescan("p", PK, PROBE).next("p", PK, true, false).visible("p", PK, true).scanEnd("p", PK);
@@ -228,6 +241,7 @@ public class AccessLedgerTest {
         for (int i = 1; i <= 4; i++) t.tid("c", K, "(7," + i + ")");
         t.bitmapEnd("c", K);
         for (int i = 1; i <= 4; i++) t.verdict("h", "(7," + i + ")", i != 2);
+        t.verdicts("h", 0, "{\"inputs\":[0],\"visible\":3,\"invisible\":1}");
         t.row();
         t.end(1).scanEnd("c", K);
         // A nested loop rescans one inner scan three times.
@@ -304,7 +318,7 @@ public class AccessLedgerTest {
 
     @Test
     public void treeDescentsFollowPassesAndArrayElements() throws Exception {
-        var t = new Trace().start("SELECT 1");
+        var t = new Trace().header("rows").start("SELECT 1");
         // A scan the consumer stopped early, and one that was rescanned without fetching.
         t.plan("a", PK, 0, "index").rescan("a", PK, EQUALITY).next("a", PK, true, false);
         t.visible("a", PK, true).scanEnd("a", PK);
@@ -327,7 +341,7 @@ public class AccessLedgerTest {
 
     @Test
     public void everyUnitIsProjectedOrRejectedWithItsReason() throws Exception {
-        var t = new Trace().start("SELECT 1");
+        var t = new Trace().header("rows").start("SELECT 1");
         int[] node = {0};
         java.util.function.BiConsumer<String, String> exhausted =
                 (index, keys) -> {
@@ -351,11 +365,13 @@ public class AccessLedgerTest {
         t.plan("o1", K, 22, "bitmap").plan("o2", PK, 23, "bitmap").bitmapHeap("or", "o1", "o2");
         t.rescan("o1", K, EQUALITY).tid("o1", K, "(1,1)").tid("o1", K, "(1,2)").bitmapEnd("o1", K);
         t.rescan("o2", PK, EQUALITY).tid("o2", PK, "(1,2)").bitmapEnd("o2", PK);
-        t.verdict("or", "(1,1)", true).verdict("or", "(1,2)", true).scanEnd("o1", K).scanEnd("o2", PK);
+        t.verdict("or", "(1,1)", true).verdict("or", "(1,2)", true)
+                .verdicts("or", 0, "{\"inputs\":[0],\"visible\":1,\"invisible\":0},{\"inputs\":[0,1],\"visible\":1,\"invisible\":0}")
+                .scanEnd("o1", K).scanEnd("o2", PK);
         // Candidates the heap never checked, and a lossy page.
         t.plan("b1", K, 24, "bitmap").bitmapHeap("h1", "b1").rescan("b1", K, EQUALITY).tid("b1", K).bitmapEnd("b1", K).scanEnd("b1", K);
         t.plan("b2", K, 25, "bitmap").bitmapHeap("h2", "b2").rescan("b2", K, EQUALITY).tid("b2", K).bitmapEnd("b2", K)
-                .lossy("h2").scanEnd("b2", K);
+                .lossy("h2").verdicts("h2", 1, "").scanEnd("b2", K);
         // A rescan that was never fetched from searched nothing.
         t.plan("n", PK, 24, "index").rescan("n", PK, EQUALITY).rescan("n", PK, EQUALITY).next("n", PK, false, false).scanEnd("n", PK);
         t.end(0);
@@ -387,7 +403,7 @@ public class AccessLedgerTest {
      */
     @Test
     public void stoppedSecondaryScansKeepTheirReturnedRows() throws Exception {
-        var t = new Trace().start("SELECT 1");
+        var t = new Trace().header("rows").start("SELECT 1");
         String atLeastFive = "[" + KEY.formatted(1, 4, 0, "\"5\"") + "]";
         t.plan("s", K, 1, "index").rescan("s", K, atLeastFive);
         // k = 5 twice, then k = 6 once; k = 6 has more rows the consumer never asked for.
@@ -411,14 +427,15 @@ public class AccessLedgerTest {
      */
     @Test
     public void bitmapAndInputsFormOneGroupPerCycle() throws Exception {
-        var t = new Trace().start("SELECT 1");
+        var t = new Trace().header("rows").start("SELECT 1");
         // Cycle 1 in PostgreSQL's order: constant keys reach both indexes while the plan is
         // initialized, before the heap node binds them; (2,2) is only on one side.
         t.plan("x", K, 1, "bitmap").rescan("x", K, EQUALITY);
         t.plan("y", PK, 2, "bitmap").rescan("y", PK, RANGE).combined("h", "and", "x", "y");
         t.tid("x", K, "(2,1)").tid("x", K, "(2,2)").bitmapEnd("x", K);
         t.tid("y", PK, "(2,1)").bitmapEnd("y", PK);
-        t.verdict("h", "(2,1)", true);
+        t.verdict("h", "(2,1)", true)
+                .verdicts("h", 0, "{\"inputs\":[0,1],\"visible\":1,\"invisible\":0}");
         // Cycle 2: x is empty, so y never runs.
         t.rescan("x", K, EQUALITY).bitmapEnd("x", K);
         // Cycle 3: both again; the heap stops before checking the shared TID.
@@ -446,12 +463,13 @@ public class AccessLedgerTest {
     /** An = ANY array is one point per distinct non-null element, as one union. */
     @Test
     public void arrayKeysAreUnionsOfTheirElements() throws Exception {
-        var t = new Trace().start("SELECT 1");
+        var t = new Trace().header("rows").start("SELECT 1");
         String array =
                 "[{\"attribute\":1,\"strategy\":3,\"flags\":32,\"type_oid\":23,\"value\":null,"
                         + "\"array_type_oid\":23,\"array\":[\"9\",\"4\",null,\"9\"]}]";
         t.plan("a", K, 1, "bitmap").bitmapHeap("h", "a").rescan("a", K, array);
-        t.tid("a", K, "(1,1)").bitmapEnd("a", K).verdict("h", "(1,1)", true).scanEnd("a", K);
+        t.tid("a", K, "(1,1)").bitmapEnd("a", K).verdict("h", "(1,1)", true)
+                .verdicts("h", 0, "{\"inputs\":[0],\"visible\":1,\"invisible\":0}").scanEnd("a", K);
         // Both null: = ANY of an array holding only nulls never matches, so PG does not search.
         String nulls =
                 "[{\"attribute\":1,\"strategy\":3,\"flags\":32,\"type_oid\":23,\"value\":null,"
@@ -473,7 +491,7 @@ public class AccessLedgerTest {
                         Path.of("benchmark/YCSB"),
                         Map.of("fieldcount", 2L, "table", "usertable"));
         String text = "{\"attribute\":1,\"strategy\":%d,\"flags\":0,\"type_oid\":25,\"value\":\"user1\"}";
-        var t = new Trace().start("SELECT 1");
+        var t = new Trace().header("rows").start("SELECT 1");
         for (int strategy : new int[] {3, 4}) {
             String id = "u" + strategy;
             t.plan(id, "usertable_pkey", strategy, "index").rescan(id, "usertable_pkey", "[" + text.formatted(strategy) + "]");
@@ -498,7 +516,7 @@ public class AccessLedgerTest {
         String array =
                 "[{\"attribute\":1,\"strategy\":3,\"flags\":32,\"type_oid\":23,\"value\":null,"
                         + "\"array_type_oid\":23,\"array\":[\"9\",\"4\"]}]";
-        var rows = new Trace();
+        var rows = new Trace().header("rows");
         var summary = new Trace().header("summary");
         // A range with one dead candidate, read to its end.
         rows.start("SELECT c FROM sbtest1 WHERE id BETWEEN $1 AND $2").plan("a", PK, 0, "index").rescan("a", PK, RANGE);
@@ -517,7 +535,8 @@ public class AccessLedgerTest {
         // A bitmap union of array points; one of three candidates is dead.
         rows.start("SELECT 2").plan("u", K, 2, "bitmap").bitmapHeap("hu", "u").rescan("u", K, array);
         rows.tid("u", K, "(1,1)").tid("u", K, "(1,2)").tid("u", K, "(1,3)").bitmapEnd("u", K);
-        rows.verdict("hu", "(1,1)", true).verdict("hu", "(1,2)", false).verdict("hu", "(1,3)", true).end(0).scanEnd("u", K);
+        rows.verdict("hu", "(1,1)", true).verdict("hu", "(1,2)", false).verdict("hu", "(1,3)", true)
+                .verdicts("hu", 0, "{\"inputs\":[0],\"visible\":2,\"invisible\":1}").end(0).scanEnd("u", K);
         summary.start("SELECT 2").plan("u", K, 2, "bitmap").bitmapHeap("hu", "u").rescan("u", K, array);
         summary.returned(0, 0).verdicts("hu", 0, "{\"inputs\":[0],\"visible\":2,\"invisible\":1}");
         summary.summary("u", K, "\"bitmap_tids\":3,\"bitmap_distinct\":3,\"bitmap_ended\":true").scanEnd("u", K);
@@ -525,7 +544,9 @@ public class AccessLedgerTest {
         rows.start("SELECT 3").plan("x", K, 3, "bitmap").rescan("x", K, EQUALITY);
         rows.plan("y", PK, 4, "bitmap").rescan("y", PK, RANGE).combined("ha", "and", "x", "y");
         rows.tid("x", K, "(2,1)").tid("x", K, "(2,2)").bitmapEnd("x", K).tid("y", PK, "(2,1)").bitmapEnd("y", PK);
-        rows.verdict("ha", "(2,1)", true).end(0).scanEnd("x", K).scanEnd("y", PK);
+        rows.verdict("ha", "(2,1)", true)
+                .verdicts("ha", 0, "{\"inputs\":[0,1],\"visible\":1,\"invisible\":0}")
+                .end(0).scanEnd("x", K).scanEnd("y", PK);
         summary.start("SELECT 3").plan("x", K, 3, "bitmap").rescan("x", K, EQUALITY);
         summary.plan("y", PK, 4, "bitmap").rescan("y", PK, RANGE).combined("ha", "and", "x", "y");
         summary.returned(0, 0).verdicts("ha", 0, "{\"inputs\":[0,1],\"visible\":1,\"invisible\":0}");
@@ -583,7 +604,7 @@ public class AccessLedgerTest {
         rowInSummary.start("SELECT c FROM t").row();
         assertTrue(failure(rowInSummary, "pg-27.jsonl").contains("Per-row event in a summary capture"));
 
-        var late = new Trace().start("SELECT 1").header("rows");
+        var late = new Trace().header("summary").start("SELECT 1").header("rows");
         assertTrue(failure(late, "pg-28.jsonl").contains("not the first event"));
     }
 
@@ -604,53 +625,56 @@ public class AccessLedgerTest {
     @Test
     public void rejectsEventsThatCannotBeClaimedExactlyOnce() throws Exception {
         // A trace without request ordinals cannot be attributed to requests.
-        Path unnumbered = folder.newFile("pg-0.jsonl").toPath();
-        Files.writeString(unnumbered, "{\"event\":\"executor_start\",\"pid\":1,\"sql\":\"SELECT 1\"}\n");
+        Path unnumbered = folder.getRoot().toPath().resolve("pg-0.jsonl.zst");
+        try (var out = new ZstdOutputStream(Files.newOutputStream(unnumbered))) {
+            out.write("{\"event\":\"executor_start\",\"pid\":1,\"sql\":\"SELECT 1\"}\n"
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
         assertTrue(
                 assertThrows(IOException.class, () -> AccessLedger.analyze(schema(), unnumbered, true))
                         .getMessage()
                         .contains("request ordinals"));
 
-        var anonymous = new Trace();
+        var anonymous = new Trace().header("rows");
         anonymous.depth = 1;
         anonymous.req = 1;
         anonymous.event("executor_start", null, "\"sql\":\"SELECT 1\"");
         assertTrue(failure(anonymous, "pg-14.jsonl").contains("query identifiers"));
 
-        var orphan = new Trace().start("SELECT 1");
+        var orphan = new Trace().header("rows").start("SELECT 1");
         orphan.next("a", PK, true, false);
         assertTrue(failure(orphan, "pg-1.jsonl").contains("without an access unit"));
 
-        var unbound = new Trace().start("SELECT 1");
+        var unbound = new Trace().header("rows").start("SELECT 1");
         unbound.rescan("a", PK, EQUALITY);
         assertTrue(failure(unbound, "pg-2.jsonl").contains("without plan binding"));
 
-        var repeated = new Trace().start("SELECT 1");
+        var repeated = new Trace().header("rows").start("SELECT 1");
         repeated.plan("a", PK, 0, "index").plan("a", PK, 0, "index");
         assertTrue(failure(repeated, "pg-3.jsonl").contains("Repeated live scan identity"));
 
-        var outside = new Trace();
+        var outside = new Trace().header("rows");
         outside.rescan("a", PK, EQUALITY);
         assertTrue(failure(outside, "pg-4.jsonl").contains("outside any executor"));
 
-        var mismatch = new Trace().start("SELECT c FROM t");
+        var mismatch = new Trace().header("rows").start("SELECT c FROM t");
         mismatch.row().end(2);
         assertTrue(failure(mismatch, "pg-5.jsonl").contains("differ from executor return"));
 
-        var unknown = new Trace().start("SELECT 1");
+        var unknown = new Trace().header("rows").start("SELECT 1");
         unknown.event("mystery", null, null);
         assertTrue(failure(unknown, "pg-6.jsonl").contains("Unclassified raw event"));
 
-        var foreign = new Trace().start("SELECT 1");
+        var foreign = new Trace().header("rows").start("SELECT 1");
         foreign.plan("a", "other_pkey", 0, "index").rescan("a", "other_pkey", EQUALITY);
         assertTrue(failure(foreign, "pg-15.jsonl").contains("Unsupported accessed index"));
 
-        var lingering = new Trace().start("SELECT 1");
+        var lingering = new Trace().header("rows").start("SELECT 1");
         lingering.plan("a", PK, 0, "index").rescan("a", PK, EQUALITY).end(0);
         lingering.start("SELECT 2").end(0);
         assertTrue(failure(lingering, "pg-7.jsonl").contains("left open before its request ended"));
 
-        var survived = new Trace().start("SELECT 1");
+        var survived = new Trace().header("rows").start("SELECT 1");
         survived.plan("a", PK, 0, "index").rescan("a", PK, EQUALITY).end(0);
         survived.start("SELECT 2").end(0).abort();
         assertTrue(failure(survived, "pg-11.jsonl").contains("survived the abort"));
@@ -658,7 +682,7 @@ public class AccessLedgerTest {
 
     @Test
     public void failedStatementScansEndWithTheAbort() throws Exception {
-        var t = new Trace().start("INSERT INTO t VALUES ($1)");
+        var t = new Trace().header("rows").start("INSERT INTO t VALUES ($1)");
         t.plan("a", PK, 0, "index").rescan("a", PK, EQUALITY).abort();
         t.start("SELECT 1").end(0).commit();
         assertEquals(1L, map(analyze(t, "pg-8.jsonl").get("access_units")).get("open_when_statement_aborted"));
@@ -666,14 +690,14 @@ public class AccessLedgerTest {
 
     @Test
     public void connectionCloseMayLeaveOnlyTheLastRequestOpen() throws Exception {
-        var t = new Trace().start("SELECT 1");
+        var t = new Trace().header("rows").start("SELECT 1");
         t.plan("a", PK, 0, "index").rescan("a", PK, EQUALITY).next("a", PK, true, false);
         assertEquals(1L, map(analyze(t, "pg-9.jsonl").get("access_units")).get("open_at_connection_close"));
     }
 
     @Test
     public void reportIsDeterministicAndNeverOverwritten() throws Exception {
-        var t = new Trace().start("SELECT 1");
+        var t = new Trace().header("rows").start("SELECT 1");
         t.plan("a", PK, 0, "index").rescan("a", PK, EQUALITY).next("a", PK, false, false).end(0).scanEnd("a", PK);
         Path file = t.write(folder.getRoot().toPath(), "pg-10.jsonl");
         Path report = folder.getRoot().toPath().resolve("ledger.json");

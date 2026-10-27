@@ -646,11 +646,6 @@ public final class PgBaselineVerify {
         if (!FileDigests.sha256(baseline.resolve("files.jsonl"))
                 .equals(verification.get("files_manifest_sha256").getAsString()))
             throw new IOException("Baseline file manifest changed");
-        // Baselines exported before locators were dropped still name theirs.
-        if (verification.has("locators_sha256")
-                && !FileDigests.sha256(baseline.resolve("locators.tsv"))
-                        .equals(verification.get("locators_sha256").getAsString()))
-            throw new IOException("Baseline locators changed");
         var data = new java.util.ArrayList<Path>();
         for (JsonElement item : verification.getAsJsonArray("files")) {
             Path path = baseline.resolve(item.getAsJsonObject().get("path").getAsString()).normalize();

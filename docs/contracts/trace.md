@@ -8,7 +8,7 @@
 
 默认原生执行为 HyBench `runHTAP`，保存 AP/TP/并发 AT-IQ 的多会话采集，行变化触发器覆盖八表。v9 **规范投影**编译顺序会话（YCSB / sysbench 各 workload 依次运行）或并发会话（HTAP，按事务完成计数器归并，见下文“身份与版本”）采集，三来源 schema 驱动：每个访问单元（或一个 BitmapAnd 组）按下文“访问投影”成为一组能重现原生结果的有序查询，否则整次编译失败并给出原因；索引维护覆盖固定 schema 的全部主键和二级索引，支持索引列值 UPDATE、DELETE / 重插入、已提交事务写后查询及多 client 路由。
 
-原始层是每个后端一个 `pg-<pid>.jsonl`（另有 JDBC 客户端的 `jdbc-*.jsonl`），完成后由 `capture-run.json` 登记文件清单与 SHA256。配置 `capture.compression` 默认 `zstd`：后端把同样的 JSON 行写成一个 zstd 流 `pg-<pid>.jsonl.zst`，每个事务结束时 flush，后端退出时结束帧；读取方透明解压，帧未结束的文件读取失败（后端未正常退出的采集不可用）。`none` 写明文。插桩实现在 `src/main/native/postgres/sibench_capture.c`，补丁只在 PG 执行器、索引访问、堆与事务路径上挂调用点。每个文件第一行是 `capture_start`（`format` 2，`detail` 为 `summary` 或 `rows`，由配置 `capture.detail` 决定，默认 `summary`）；没有该行的旧采集只含逐行事件。
+原始层是每个后端一个 zstd 流 `pg-<pid>.jsonl.zst`（JDBC 客户端为 `jdbc-*.jsonl.zst`），完成后由 `capture-run.json` 登记文件清单与 SHA256。每个事务结束时 flush，后端退出时结束帧；帧未结束的文件读取失败（后端未正常退出的采集不可用）。插桩实现在 `src/main/native/postgres/sibench_capture.c`，补丁只在 PG 执行器、索引访问、堆与事务路径上挂调用点。每个文件第一行必须是 `capture_start`（`format` 2，`detail` 为 `summary` 或 `rows`，由配置 `capture.detail` 决定，默认 `summary`）；缺少该行拒绝编译。
 
 一个访问单元的事实在 PG 内按访问累加，在结束它的事件（下一次 `scan_rescan`、`scan_end`、事务 abort 或连接关闭）之前写成一条 `scan_summary`：取行调用次数、找到的候选、最后一次是否找到、扫描方向、recheck、回表次数与可见行、可见性图全可见行、bitmap 候选数与未被判定的候选数、bitmap 是否填完、是否缺行身份。扫描被消费者提前停止时另带最后一个值之前的可见行数、数组键的已完成值段、最后一个值及其上被返回行的主键；BitmapAnd 一轮的第一个成员结束时带“是否有全部输入都产生却从未被判定的候选”。bitmap 堆判定按“产生该 TID 的输入集合”聚合为 `bitmap_verdicts`（可见 / 不可见数和有损页数），在任何输入换单元之前写出，与逐 TID 归属等价。`executor_run_end` 带本次执行返回的行数和每行的 64 位 FNV-1a 哈希（列文本规范化后计算，客户端 `consumed_row` 用同一算法，见 `ResultRowHash`），供客户端 / 服务端结果核对。`detail = rows` 时另写全部逐行事件（`scan_next`、`heap_visibility`、`vm_visible`、`bitmap_candidate`、`bitmap_end`、`bitmap_heap_candidate`、`bitmap_heap_lossy`、`result_row`，客户端行保留列文本）：账本用逐行事件计算并要求每条汇总与之完全相等，用于在同一次原生执行上验收汇总；`summary` 采集中出现逐行事件即失败。
 
@@ -83,7 +83,7 @@ LogicalValue = RowID
 
 `workUnitId` 是请求工作单元身份，与索引键、transactionId、CommitVersion、PID 和物理节点身份独立。编译器把一个经过审计的顶层源 SQL 执行（JDBC/PG 配对或服务端请求序号）作为一个工作单元，在 `executor_start` 处按源请求顺序从 1 编号，先编号再进行回滚或二级过滤。同请求的多个扫描、嵌套查询、行修改及其主键/二级展开共用身份，不把一个请求人为拆成多个工作单元。
 
-`work-units.jsonl` 按编号记录 `work_unit_id`、原始 `application`、`pid`、会话内请求序号 `request` 和请求开始的 `source_event`（跨会话连续编号），其 SHA256 写入 manifest；二进制操作保留 `sourceEvent` 和 `workUnitId`。没有有效索引操作的请求仍在身份清单中，不占用运行期发送量。单个 SQL 工作单元是明确的执行任务近似，不声称恢复了真实 serverless task DAG 或数据节点拓扑。
+`work-units.jsonl.zst` 按编号记录 `work_unit_id`、原始 `application`、`pid`、会话内请求序号 `request` 和请求开始的 `source_event`（跨会话连续编号），其 SHA256 写入 manifest；二进制操作保留 `sourceEvent` 和 `workUnitId`。没有有效索引操作的请求仍在身份清单中，不占用运行期发送量。单个 SQL 工作单元是明确的执行任务近似，不声称恢复了真实 serverless task DAG 或数据节点拓扑。
 
 回放使用固定的 `clientId = (workUnitId - 1) % client_count`，不保存固定 clientId、不按索引键 hash、不绑定源事务、不提供替代路由策略。相同工作单元始终使用一个 client；同一事务的多个工作单元允许跨 client。改变 client 数只改变发送连接，不改变 Trace、版本、Parquet 或操作序列。Baseline 使用连续每 4096 行一个加载工作单元，每行索引展开共用身份；加载身份与运行期 SQL 身份分别统计，Baseline 覆盖不能代替运行期覆盖。
 

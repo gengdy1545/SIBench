@@ -68,7 +68,7 @@ final class CaptureRun implements AutoCloseable {
         CaptureRun run = active;
         if (run == null) return;
         synchronized (run) {
-            if (Files.exists(ServerTrace.locate(run.directory, pid))
+            if (Files.exists(ServerTrace.path(run.directory, pid))
                     || run.sessions.containsValue(pid) || run.sessions.containsKey(jdbc))
                 throw new IOException("Backend trace already exists; restart in a fresh run directory");
             run.sessions.put(jdbc, pid);
