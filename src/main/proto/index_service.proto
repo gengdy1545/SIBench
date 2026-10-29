@@ -1,4 +1,4 @@
-// SIBench index service protocol, version 1.
+// SIBench index service protocol, version 2.
 //
 // A benchmark driver replays a canonical index trace against a KV index service through this
 // protocol. It carries logical index operations only; how a service lays them out physically
@@ -6,7 +6,7 @@
 // docs/contracts/index-service.md and docs/contracts/trace.md.
 syntax = "proto3";
 
-package sibench.index.v1;
+package sibench.index.v2;
 
 option java_multiple_files = true;
 option java_package = "org.sibench.adapters.proto";
@@ -16,11 +16,9 @@ service IndexService {
   // What the service implements; the driver refuses a service that lacks a semantic it needs.
   rpc Describe(DescribeRequest) returns (DescribeResponse);
 
-  // One ordered stream per benchmark client. A cross-client-ordered service executes a stream's
-  // requests in receive order; a complete-publication service instead orders a transaction's
-  // requests by transaction_operation and waits for published read versions. Responses carry the
-  // request id and may be returned in any order. Ordering and visibility across streams are the
-  // service's own and are declared by Describe.
+  // One stream per client. The service orders a transaction by transaction_operation and waits
+  // for complete commits before reading a version. Responses carry the request id and may arrive
+  // out of order across requests and streams.
   rpc Execute(stream Request) returns (stream Response);
 
   // Completes after every request received before it on any stream is durable to the level the
@@ -32,7 +30,7 @@ message DescribeRequest {}
 
 message DescribeResponse {
   string name = 1;
-  uint32 protocol_version = 2;  // 1
+  uint32 protocol_version = 2;  // 2
   ValueKind value_kind = 3;
   // Reads at a version select the newest version at or below it (required).
   bool versioned_reads = 4;
@@ -44,10 +42,7 @@ message DescribeResponse {
   bool transaction_local_reads = 9;
   // SearchGroup executes on the service; otherwise the driver must not send groups.
   bool search_groups = 6;
-  // Requests from different client streams are executed in the driver's send order, given by
-  // Request.sequence, not in arrival order. A multi-client replay requires this or
-  // complete_commit_publication.
-  bool cross_client_ordering = 8;
+  reserved 8;
   // Free text: durability level of an acknowledged write, cache and WAL placement.
   string durability = 7;
   // Machine-checkable acknowledgement level for workload writes; free text above explains it.
@@ -59,6 +54,8 @@ message DescribeResponse {
   // The service accepts Commit markers and exposes a complete-publication watermark. A search
   // waits for its read_version to be published, not merely for the highest version seen.
   bool complete_commit_publication = 13;
+  // WriteBatch requests of Baseline INSERTs (version 0) are accepted.
+  bool baseline_write_batches = 14;
 }
 
 enum Acknowledgement {
@@ -93,15 +90,10 @@ message Value {
 
 message Request {
   uint64 id = 1;  // unique per stream
-  // The driver's send position of this request, 1, 2, 3, ... over the whole replay and every
-  // stream; a search group takes one position. A service declaring cross_client_ordering executes
-  // requests in this order whichever stream they arrive on.
-  uint64 sequence = 5;
-  // Source transaction identity and 1-based position of this request among the transaction's
-  // actually sent requests (writes, searches and groups, after secondary filtering). Zero for
-  // baseline loads and for services using only sequence ordering. A complete-publication service
-  // executes one transaction's requests in this position order, independently of other
-  // transactions.
+  reserved 5;
+  // Source transaction identity and 1-based position among actually sent transaction requests
+  // (writes, searches and groups, after secondary filtering). Zero for baseline loads and
+  // non-transactional snapshot searches.
   uint64 transaction_id = 6;
   uint64 transaction_operation = 7;
   oneof operation {
@@ -109,7 +101,15 @@ message Request {
     Search search = 3;
     SearchGroup group = 4;
     Commit commit = 8;
+    WriteBatch batch = 9;
   }
+}
+
+// Baseline INSERTs (version 0) applied in order as one request: they carry no versions, ordering
+// or publication, so a batch only saves per-request cost. A batch with any other write is refused
+// before any of it is applied.
+message WriteBatch {
+  repeated Write writes = 1;
 }
 
 message Commit {
@@ -147,8 +147,7 @@ message Search {
   // this primary key.
   bytes pinned_primary_key = 8;
   // Transaction-local read: the statement snapshot is read_version; the search also sees this
-  // exact version's writes already executed before it (stream order, or Request.sequence order
-  // when cross_client_ordering is declared). 0: snapshot only. A service advertising
+  // exact version's writes at earlier transaction_operation positions. 0: snapshot only. A service advertising
   // transaction_local_reads selects max(read_version, an existing local_version), without
   // exposing any version strictly between them.
   uint64 local_version = 9;
@@ -177,6 +176,9 @@ message Response {
   // Searches and groups: the result entries, in result order (group: first member's order, then
   // entries only later members added).
   repeated Result results = 4;
+  // More responses with this id follow. A large result is sent in chunks whose results
+  // concatenate in order; only the last chunk (more = false) carries the final status.
+  bool more = 5;
 }
 
 enum Status {
@@ -192,10 +194,17 @@ message Result {
   Value value = 3;
 }
 
-message FlushRequest {}
+message FlushRequest {
+  // The trace this index holds (Trace / Baseline digests, format, secondary coverage, value mode).
+  // The index records it at its first Flush and refuses a Flush naming another trace.
+  string index_binding = 1;
+}
 
 message FlushResponse {
   // Highest version whose complete commit was received and whose writes were applied before this
   // Flush. It is not the highest version merely seen; a partial or missing commit does not advance.
   uint64 published_version = 1;
+  // The binding the index holds, and where the index lives (a directory or an object location).
+  string index_binding = 2;
+  string index_location = 3;
 }

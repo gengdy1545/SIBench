@@ -1,79 +1,34 @@
-# P0 测试复核
+# 发布与结果校验的不变量
 
-日期：2026-10-27。范围：当前工作区的 P0 发布、事务内读取、逐查询校验与驱动提交标记测试。复核阶段仅修改测试并记录验证；随后按下方“复核处理”修复了两项生产缺陷。本记录不代替原生 PG 及三来源完整验收。
+更新：2026-10-29。本文保留仍需防止回归的具体反例和当前测试职责。原生与全量证据见 [原生反例](p0-native-publish-validation.md)、[三来源验收](p0-three-source-acceptance.md)。
 
-## 复核处理
+## 发布与拒绝必须发生在正确边界
 
-复核后已修复两项发布模式缺陷，未降低断言、未使用 Ignore：
+| 场景 | 预期及测试 |
+| --- | --- |
+| 已发布事务再次写入 | 事务 800 写 PK=1 / version=1 / RowID=11 并提交；迟到写 99 必须拒绝，原读仍为 11。`rejectedLateWriteCannotChangeAnAlreadyPublishedSnapshot`。 |
+| 另一事务复用已发布版本 | 在接触后端前拒绝，不能靠事后返回 INVALID 掩盖已发生修改。`lateWriteUnderAnotherTransactionCannotReuseAPublishedVersion`。 |
+| pending / executing 位置重复 | 事务 900 的 operation=2 首个值 22 不被重复值 99 替换；原请求最终正常执行。`duplicatePendingPositionCannotReplaceTheOriginalWrite`。 |
+| commit 先到或前一版本缺失 | 必须等全部声明操作与连续水位；最大已见版本不代表已发布。`commitArrivingBeforeOperationsWaitsForEveryDeclaredWrite`、`laterCompleteVersionCannotPublishAcrossAMissingCommit`。 |
+| 查询等事务前缀 / 提交 | 暂存请求不占执行线程，独立事务仍能推进；原提交者暂停也不能丢失唤醒。`transactionOperationsExecuteInPositionOrderWhenTheyArriveOutOfOrder`、`parkedOperationRunsWithoutItsSubmitterAndPublishes`。 |
+| 已完成事务状态 | lane 释放且迟到请求仍被拒绝；5,000 个事务不累积 lane。`completedTransactionLanesAreReleasedButLateOperationsStayRefused`。 |
+| 重开索引 | 恢复最后 Flush 水位，不暴露未发布版本。`reopenedIndexResumesItsRecordedWatermark`。 |
 
-- `PublishedIndex` 不再在提交后删除事务 lane，而是标记 `complete`。迟到请求在 `Lane.prepare` 阶段被拒绝，不会触碰后端。`Publication` 在写入前用 `reserve(version, transaction)` 校验发布水位、事务归属和提交声明的写入数，并在写进行期间阻止该版本发布；写入失败时释放预留。即使迟到请求使用另一事务 ID，也会在 `reserve` 阶段拒绝。
-- `Lane.prepare` 现在同时拒绝 pending 中已存在的位置和正在执行的 `next` 位置，重复请求不会覆盖首个请求。
-- 新增 `lateWriteUnderAnotherTransactionCannotReuseAPublishedVersion`，并保留复核文档中的迟到 / 重复位置回归。
-- 当前 `mvn -q -Dtest=PublishedIndexTest,TraceRequestsTest,ReplayProjectionTest test` 与根目录 `mvn -q test`：**296 tests，0 failures / 0 errors / 0 skipped**。
+上述测试在 [PublishedIndexTest](../../src/test/java/org/sibench/adapters/PublishedIndexTest.java)。合法性预留、实际写入与发布之间的受控交错需要保留；不能删掉失败断言或只检查响应状态。
 
-复核时的两个失败仍保留在下面的原始记录中，作为修复前证据；不能把这些失败当作当前结果。
+## 当前服务与强结果依据
 
-## 结论与复现
+服务只有完整提交发布路径。`IndexServerTest` 验证跨连接读取等待 commit、大结果流控与分块、关闭边界，以及旧协议 / 缺少完整发布能力的拒绝。`ServiceConfigTest` 拒绝移除的 ordered / publication 开关，不为旧配置提供另一套执行语义。
 
-复核时根目录 `rtk mvn -q test`：**294 tests，2 failures，0 errors，0 skipped**；292 项通过。两项失败均来自新增的发布模式边界测试，针对性运行和完整运行都复现。失败断言保持启用，不改为“期望当前错误”的测试，也未使用 Ignore。修复后的当前结果为 **296 tests，0 failures / 0 errors / 0 skipped**，见“复核处理”。
+`TraceRequestsTest` 用手算错值、PK、version、Locator 两个 int64、顺序和跨查询身份反例验证逐查询摘要。组合矩阵使用 query_digest_sha256，最终状态、选中版本和调度顺序仍各自有独立检查。显式参考报告没有当前摘要时直接失败。
+
+原生反例、Parquet oracle 和不支持输入的拒绝测试共同覆盖当前不变量。
 
 ```bash
-rtk mvn -q -Dtest=PublishedIndexTest,TraceRequestsTest,ReplayProjectionTest test
-rtk mvn -q test
+rtk mvn -Dtest=PublishedIndexTest,TraceRequestsTest,ReplayProjectionTest,IndexServerTest,ServiceConfigTest,ReferenceReplayTest test
+rtk mvn test
 ```
 
-原始结果：`build/sibench/surefire-reports/TEST-org.sibench.adapters.PublishedIndexTest.xml` 及同目录其他测试报告（重跑会覆盖）。本次不改用户已有暂存内容；下方 SHA256 标识受查实现及本次测试版本，不能只用未提交工作区的 HEAD 代表测试身份。
+测试不证明真实网络重传、目标规模崩溃恢复或性能上限。实际服务确认条件和剩余边界见 [Index Service 契约](../contracts/index-service.md)。
 
-## 复核时已确认的缺陷（已修复）
-
-### 已发布版本被返回失败的迟到写入改变
-
-测试：`PublishedIndexTest.rejectedLateWriteCannotChangeAnAlreadyPublishedSnapshot`。
-
-1. 事务 800 写入 PK=1、version=1、RowID=11，提交并发布。
-2. 同一事务及操作位置再次写 RowID=99。
-3. 请求返回非 OK，但读取 version=1 得到 99；预期仍为 11。
-
-[PublishedIndex](../../src/main/java/org/sibench/adapters/PublishedIndex.java) 在提交完成后删除 lane；迟到请求重新创建 lane。`Lane.execute` 先调用 `backend.write`，随后 `Publication.applied` 才拒绝已发布版本，因此错误响应不能阻止状态损坏。需要在写入前验证版本 / 事务是否合法，并保证检查与并发发布之间不存在竞争；不能仅修改返回状态或吞掉异常。
-
-### 重复的待执行事务位置覆盖原请求
-
-测试：`PublishedIndexTest.duplicatePendingPositionCannotReplaceTheOriginalWrite`。
-
-先送事务 900 的 operation=2（RowID=22），在缺少 operation=1 时等待；再送同一位置的不同写入（RowID=99），最后补 operation=1。当前两个请求均返回 OK，新增断言在“duplicate position accepted”处失败。
-
-`Lane.prepare` 只检查 `operation < next`，随后 `pending.put` 覆盖已有相同位置；没有拒绝待执行的重复操作。需要覆盖 pending 和 executing 两个状态的唯一性，并保留首个合法请求。测试后续还要求最终结果保持 22。
-
-这两个用例属于迟到 / 重复请求的防御与状态完整性验证；**未据此声称正常无重试 Trace 必然得到错误结果**。但发布模式不能满足当前错误处理与验证要求，不能据原有绿灯宣称 P0 全部验收完成。
-
-## 测试整理与补强
-
-| 文件 | 调整 | 理由与保留的验证职责 |
-| --- | --- | --- |
-| [PublishedIndexTest](../../src/test/java/org/sibench/adapters/PublishedIndexTest.java) | 新增提交标记先到、版本缺口、迟到写入与待执行重复位置四项测试；事务内前缀测试改为后续写先到；替换固定等待 100–150 ms 的猜测为有界观察工作线程等待 / 完成状态，退出时检查线程池终止。 | 覆盖完整性、连续发布和事务内顺序；保留原有关闭与独立事务并行测试。 |
-| [TraceRequestsTest](../../src/test/java/org/sibench/adapters/TraceRequestsTest.java) | 修正 `query(sourceEvent,...)` 忽略参数、固定写 5 的夹具；增加同结果不同来源身份及 workUnit 绑定检查；删除与错键重叠的 set 分支，把 XOR 负例改为仅改变 RowID。 | 防止夹具掩盖身份差异；错值测试不再被错主键顺带抓住。 |
-| 同上 | 用逐字段、顺序、条数、64 位高位变化测试替换 `digest(x) == digest(x)` 自我比较；保留 RowID 模式不受物理 position 影响的语义检查。 | 原测试名声称验证 identity，实际仅比较自身和 version；新用例覆盖真实语义，而非重复实现。 |
-| [RocksDbBackendTest](../../src/test/java/org/sibench/adapters/RocksDbBackendTest.java) | 事务内读预期改为手算的具体主键 / 版本 / RowID，补删除、同 PK 重插入、新身份和旧 snapshot。 | 避免在关键语义上仅让 RocksDB 与参考模型互证；原有随机差分测试继续保留，提供更广覆盖。 |
-| [ReplayProjectionTest](../../src/test/java/org/sibench/replay/ReplayProjectionTest.java) | 替换只统计一次 commit 的旧用例，使用 `readTimestamp=0/version=1` 新语义，跨两种输入模式及二级开关核对发送顺序、实际写 / 操作计数、事务位置、下一事务计数清零和过滤后的空事务标记。 | 原用例仍采用旧 local-read 表达，并未验证方法名所称的操作顺序；新测试沿真实 TraceRequests 转换路径检查协议结果。 |
-
-没有整批删除兼容 / 旧格式相关测试：仍声明支持的 v9 读取、拒绝缺字段输入，以及 sequence 全序诊断模式都有当前职责。只按“旧”或“兼容”关键词删除会丢失有效验证。本轮精简集中于上述 P0 用例，没有宣称审计并清理整个仓库的每项测试。
-
-## 交接与边界
-
-- 先修复两项发布缺陷并跑 `PublishedIndexTest`；相关小测试通过后按 AGENTS.md 运行完整 `mvn test`。测试预期无需随错误实现改变。
-- 复核时 `plan.md` 仍有任务 3 的 P0 测量口径未完成；1.3 的矩阵依据是短 sysbench，新语义三来源完整验收不能由本次单测替代。复核处理后已在 `plan.md` 1.3 记录迟到 / 重复请求修复；完整三来源、网络重传和正式性能仍不能由本次单测替代。
-- 未核查远程原生证据身份、未运行大 Trace 回放、未进行性能评估或故障恢复全量审计。两个失败通过直接调用真实 RocksDB 发布执行器复现，未声称已覆盖网络重传全过程。
-
-## 受查版本
-
-复核处理后的当前版本：
-
-| 文件 | SHA256 |
-| --- | --- |
-| `src/main/java/org/sibench/adapters/PublishedIndex.java` | `9763f5d4f90fba20f14ecb904e1dfbfc5766d3a71d5e4b705424ea7139587bd6` |
-| `src/test/java/org/sibench/adapters/PublishedIndexTest.java` | `206344d034bb00935feacf96a1ac8ee76be63d0b3cff7ba2acdd7ac9d83cc60a` |
-| `src/test/java/org/sibench/adapters/TraceRequestsTest.java` | `03969de1d81a4d1c0177952e3e7c2d384285ad629e3267643bf680b405df40eb` |
-| `src/test/java/org/sibench/adapters/RocksDbBackendTest.java` | `a0315e747b0d7fef7e3f488012d0a33074791e1a6cac4f1b3a4a5765effe9220` |
-| `src/test/java/org/sibench/replay/ReplayProjectionTest.java` | `9c926f7c07f56cf3fb860e850e53849b2a91729eaaa84a5f221517ec21de5ab8` |
-
-复核时（修复前）`PublishedIndex.java` / `PublishedIndexTest.java` 的 SHA256 分别为 `27ef8abb...e08b` / `32afb447...145e`，保留为问题复现身份。
+当前验证：[协议 2 验证记录](../../results/validation/index-service-20261029b/validation.json)。JDK 17 根测试 319 项及 Python 汇总测试 4 项通过；2,000 行小输入的 12 个组合、两种 value 和两份独立 Parquet oracle 通过。64 client 的真实 gRPC 回放核对 2,050 次摘要 / 0 不匹配；停止旧服务后用新进程重开，核对 1,850 个快照查询 / 0 不匹配，200 个事务内查询按定义不核对，水位 500。新报告不含结果 XOR，汇总脚本读取该报告及实际 LOG 通过。未重跑长捕获或目标规模实验。

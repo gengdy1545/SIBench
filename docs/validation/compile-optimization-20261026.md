@@ -11,7 +11,6 @@
 | old | `bec20bf5c4c4a47d4bbbee4cde7bd34dafd17765402a653231ab947f266a32c1` | 部署中的旧 jar（内联跟踪） |
 | new22 | `a1b1c420b6792a3fe1df45b3342e79aea3fb2071ed39359f9b037d11ea9f27a9` | 按会话跟踪，实测更慢，已回退 |
 | new24 | `8c54705a1a5242a9164ab9a54bbb84f12d200b0b6e253915e43074d6296564a1`（HyBench / sysbench） / `cbe03ed169f82565c5d5738e84cc36d6d5ddf6ce260d9867fb8873cdaabb1c09`（YCSB） | 内联跟踪 + 账本无装箱计数 + Unit 集合按需分配；两次打包的编译器类字节相同 |
-| strict | `f41dcb01d6758e86cefaa77b137c58bc681ee105a7ce1f17040f21ab28f65711` | 最终 v9 / zstd 严格版本：删除旧明文、`baseline.ops`、`locators.tsv`、`Detail.LEGACY` 与未接入的 per-session stage；273 个测试通过；当前 zstd raw 重编逐字节相同 |
 
 ## 结果
 
@@ -46,7 +45,7 @@
 
 - 全部对照都通过 `--certification` 与 `--counters`；认证覆盖、账本和 PG 计数器一致。
 - 本地 SF1 c8 在本轮清理前用 new24 重编保留 raw，13 个 Trace 文件与 `regress-20261025/sf1-c8-v22` 逐字节相同；负载阶段 272.8 s（此前 294.7 s）。该旧 raw/trace 已随旧格式数据清理，报告保留。
-- 最终严格构建（`f41d…`）删除旧明文、`baseline.ops`、`locators.tsv`、`Detail.LEGACY` 与未接入的 stage；当前 zstd raw（HyBench / sysbench / YCSB）同 raw 重编仍逐字节相同。SF1 旧明文 raw 已清理，只保留 v22 zstd Trace、baseline 与报告。
+- zstd raw 的同输入重编结论限于格式与语义不变的边界；当前读取语义的独立验证见 [读取验证](p0-read-validation.md)。
 - 未运行新的行审计或 oracle；本轮只验证编译器输出与既有认证 Trace 等价，不重复方法层面的审计。
 
 ## 保留

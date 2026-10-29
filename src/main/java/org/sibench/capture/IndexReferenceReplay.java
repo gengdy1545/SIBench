@@ -578,8 +578,9 @@ public final class IndexReferenceReplay implements AutoCloseable {
     /** Where entries were last written, kept for the transaction being applied only. */
     private final Map<EntryId, WritePosition> writePositions = new HashMap<>();
     private long positionsTransaction;
-    private long relocationWrites, queries, checkedResults, checksum;
+    private long relocationWrites, queries, checkedResults;
     private long selectedVersionChecksum, snapshotQueries, retainedVersions, lastAppliedVersion;
+    private long skippedHistories;
 
     public IndexReferenceReplay(boolean rowIds) {
         this(rowIds, true);
@@ -604,6 +605,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
         this.queryResults = queryResults;
         this.workspace = new Workspace(settings);
         this.budget = new Budget(settings.baselineEntries());
+        if (settings.directory() != null) org.sibench.capture.RunTiming.current().measure(settings.directory());
     }
 
     private Store store(int table, int index) throws IOException {
@@ -810,17 +812,30 @@ public final class IndexReferenceReplay implements AutoCloseable {
      * descending; the group selects the newest version at or below the timestamp.
      */
     private static final class HistoryScan implements Closeable {
+        /**
+         * Versions of one entry read one by one before the rest are skipped: most entries have
+         * one or two versions, while a hot entry's long history is answered by a floor lookup.
+         */
+        static final int SKIP_AFTER = 8;
+
+        private final SpillingMap map;
         private final SpillingMap.Entries entries;
+        private final boolean descending;
         private final long timestamp, localVersion, transaction, ordinal;
         private boolean pending;
+        private long skipped;
 
         HistoryScan(
+                SpillingMap map,
+                boolean descending,
                 SpillingMap.Entries entries,
                 long timestamp,
                 long localVersion,
                 long transaction,
                 long ordinal)
                 throws IOException {
+            this.map = map;
+            this.descending = descending;
             this.entries = entries;
             this.timestamp = timestamp;
             this.localVersion = localVersion;
@@ -834,21 +849,65 @@ public final class IndexReferenceReplay implements AutoCloseable {
             byte[] first = entries.key();
             int length = first.length - 8;
             History history = new History(Arrays.copyOf(first, length), ByteBuffer.wrap(entries.value()).getInt(32));
+            int read = 0;
             while (pending && entries.key().length - 8 == length
                     && Arrays.equals(entries.key(), 0, length, history.entry, 0, length)) {
-                StoredVersion version = Overlay.decode(entries.key(), entries.value());
-                boolean local =
-                        localVersion > timestamp
-                                && version.version() == localVersion
-                                && version.transaction() == transaction
-                                && version.ordinal() <= ordinal;
-                if ((version.version() <= timestamp || local)
-                        && (history.selected == null
-                                || version.version() > history.selected.version()))
-                    history.selected = version;
+                if (++read > SKIP_AFTER) {
+                    skipRest(history);
+                    return history;
+                }
+                consider(history, Overlay.decode(entries.key(), entries.value()));
                 pending = entries.next();
             }
             return history;
+        }
+
+        /** Selects the newest version at or below the snapshot, or the transaction's own write. */
+        private void consider(History history, StoredVersion version) {
+            boolean local =
+                    localVersion > timestamp
+                            && version.version() == localVersion
+                            && version.transaction() == transaction
+                            && version.ordinal() <= ordinal;
+            if ((version.version() <= timestamp || local)
+                    && (history.selected == null || version.version() > history.selected.version()))
+                history.selected = version;
+        }
+
+        /** The rest of a long history: the snapshot's floor and the exact local version, then past it. */
+        private void skipRest(History history) throws IOException {
+            skipped++;
+            var entry = new Composite(history.entry, history.split);
+            var floor = map.floor(Overlay.key(entry, timestamp));
+            if (floor != null && Overlay.same(floor.getKey(), entry))
+                consider(history, Overlay.decode(floor.getKey(), floor.getValue()));
+            if (localVersion > timestamp) {
+                byte[] key = Overlay.key(entry, localVersion), value = map.getBytes(key);
+                if (value != null) consider(history, Overlay.decode(key, value));
+            }
+            // Every version of the entry sorts after the entry and before its successor.
+            byte[] next = descending ? history.entry : successor(history.entry);
+            if (next == null) {
+                pending = false;
+                return;
+            }
+            entries.seek(next);
+            pending = entries.next();
+        }
+
+        /** The smallest key above every key starting with {@code prefix}, or null for none. */
+        private static byte[] successor(byte[] prefix) {
+            for (int i = prefix.length - 1; i >= 0; i--)
+                if (prefix[i] != (byte) 0xff) {
+                    byte[] next = Arrays.copyOf(prefix, i + 1);
+                    next[i]++;
+                    return next;
+                }
+            return null;
+        }
+
+        long skipped() {
+            return skipped;
         }
 
         @Override
@@ -903,11 +962,26 @@ public final class IndexReferenceReplay implements AutoCloseable {
         try (BaselineScan baseline = store.baseline.scan(start, end, descending);
                 HistoryScan overlay =
                         new HistoryScan(
+                                store.overlay.map,
+                                descending,
                                 store.overlay.map.scan(start, end, descending),
                                 timestamp,
                                 localVersion,
                                 transaction,
                                 ordinal)) {
+            try {
+                return search(baseline, overlay, range, results);
+            } finally {
+                skippedHistories += overlay.skipped();
+            }
+        }
+    }
+
+    private List<LookupResult> search(
+            BaselineScan baseline, HistoryScan overlay, Range range, List<LookupResult> results)
+            throws IOException {
+        int step = range.descending() ? -1 : 1;
+        {
             boolean baselineLeft = baseline.next();
             History pending = overlay.next();
             while (range.limit() == 0 || results.size() < range.limit()) {
@@ -1051,34 +1125,22 @@ public final class IndexReferenceReplay implements AutoCloseable {
                 || (operation.flags() & ~IndexOperationTrace.SEARCH_FLAGS) != 0
                 || (!local && operation.version() != 0))
             throw new IOException("Invalid search metadata");
-        // Older v9 local searches carry the read point in readTimestamp; new ones name their
-        // own version and keep the statement snapshot.
-        boolean orderedLocal =
-                operation.version() == 0
-                        ? operation.readTimestamp() == lastAppliedVersion
-                        : operation.version() == lastAppliedVersion
-                                && operation.readTimestamp() < operation.version();
         if (local
                 && (operation.transactionId() <= 0
                         || operation.mutationOrdinal() <= 0
-                        || (operation.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0
-                        || !orderedLocal))
+                        || operation.version() != lastAppliedVersion
+                        || operation.readTimestamp() >= operation.version()
+                        || (operation.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0))
             throw new IOException("Invalid ordered transaction-local search");
     }
 
     private void checked(Operation operation, LookupResult result) {
-        checksum ^= word(result);
         selectedVersionChecksum =
                 Long.rotateLeft(selectedVersionChecksum, 1)
                         ^ result.commitVersion()
                         ^ Long.rotateLeft(result.key().checksumWord(), 17)
                         ^ ((long) operation.table() << 48)
                         ^ ((long) operation.index() << 40);
-    }
-
-    /** One checksum word per result; equals the old packed Locator while both parts fit it. */
-    private long word(LookupResult result) {
-        return rowIds ? result.value() : (result.value() << 32) | result.position();
     }
 
     private void relocate(
@@ -1185,10 +1247,6 @@ public final class IndexReferenceReplay implements AutoCloseable {
         return checkedResults;
     }
 
-    public long checksum() {
-        return checksum;
-    }
-
     public long selectedVersionChecksum() {
         return selectedVersionChecksum;
     }
@@ -1199,6 +1257,11 @@ public final class IndexReferenceReplay implements AutoCloseable {
 
     public long retainedVersions() {
         return retainedVersions;
+    }
+
+    /** Entry histories whose remaining versions a search skipped with a floor lookup. */
+    public long skippedHistories() {
+        return skippedHistories;
     }
 
     /** Releases files and memory; a model that never spilled holds no files. */

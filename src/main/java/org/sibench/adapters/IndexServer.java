@@ -15,60 +15,25 @@ import org.sibench.adapters.proto.Response;
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
-/**
- * Serves one {@link IndexBackend} over the SIBench index protocol. Unordered, each client stream
- * executes its requests in arrival order on gRPC's callback for that stream, and different streams
- * run concurrently. Ordered, every request waits for its send position (Request.sequence): requests
- * that arrive early on one stream are held until every earlier position, from any stream, has
- * executed, so execution follows the driver's send order rather than network arrival.
- */
+/** Serves complete-commit publication, transaction-local order and versioned reads over gRPC. */
 public final class IndexServer implements AutoCloseable {
     private final Server server;
     private final PublishedIndex published;
-    private final java.util.concurrent.ExecutorService publicationExecutor;
 
-    private IndexServer(
-            Server server,
-            PublishedIndex published,
-            java.util.concurrent.ExecutorService publicationExecutor) {
+    private IndexServer(Server server, PublishedIndex published) {
         this.server = server;
         this.published = published;
-        this.publicationExecutor = publicationExecutor;
     }
 
-    public static IndexServer start(int port, IndexBackend backend, boolean ordered) throws IOException {
-        return start(port, backend, ordered, false);
-    }
-
-    /**
-     * {@code publication} serves complete-commit publication instead of sequence ordering. The two
-     * modes are alternatives: a published service keeps transaction order and waits for complete
-     * commits, while an ordered service is the diagnostic all-request-order reference.
-     */
-    public static IndexServer start(
-            int port, IndexBackend backend, boolean ordered, boolean publication)
-            throws IOException {
-        if (ordered && publication)
-            throw new IllegalArgumentException("Choose sequence ordering or complete publication");
-        var sequencer = ordered ? new Sequencer(backend) : null;
-        var published = publication ? new PublishedIndex(backend) : null;
+    public static IndexServer start(int port, IndexBackend backend) throws IOException {
+        var published = new PublishedIndex(backend);
         var publicationPending = new java.util.concurrent.atomic.AtomicInteger();
-        var publicationExecutor =
-                published == null
-                        ? null
-                        : java.util.concurrent.Executors.newCachedThreadPool(
-                                runnable -> {
-                                    Thread thread = new Thread(runnable, "sibench-published");
-                                    thread.setDaemon(true);
-                                    return thread;
-                                });
         var service = new IndexServiceGrpc.IndexServiceImplBase() {
             @Override
             public void describe(DescribeRequest request, StreamObserver<DescribeResponse> response) {
                 response.onNext(
                         backend.describe().toBuilder()
-                                .setCrossClientOrdering(ordered)
-                                .setCompleteCommitPublication(publication)
+                                .setCompleteCommitPublication(true)
                                 .build());
                 response.onCompleted();
             }
@@ -76,10 +41,17 @@ public final class IndexServer implements AutoCloseable {
             @Override
             public void flush(FlushRequest request, StreamObserver<FlushResponse> response) {
                 try {
-                    long version = published == null ? 0 : published.flush();
-                    if (published == null) backend.flush();
-                    response.onNext(FlushResponse.newBuilder().setPublishedVersion(version).build());
+                    backend.bind(request.getIndexBinding());
+                    long version = published.flush();
+                    response.onNext(
+                            FlushResponse.newBuilder()
+                                    .setPublishedVersion(version)
+                                    .setIndexBinding(request.getIndexBinding())
+                                    .setIndexLocation(backend.location())
+                                    .build());
                     response.onCompleted();
+                } catch (IllegalArgumentException invalid) {
+                    response.onError(io.grpc.Status.INVALID_ARGUMENT.withDescription(invalid.getMessage()).asRuntimeException());
                 } catch (IOException | RuntimeException error) {
                     response.onError(io.grpc.Status.UNAVAILABLE.withDescription(String.valueOf(error)).asRuntimeException());
                 }
@@ -87,38 +59,45 @@ public final class IndexServer implements AutoCloseable {
 
             @Override
             public StreamObserver<Request> execute(StreamObserver<Response> responses) {
+                // Responses respect gRPC flow control: a sender waits while the client has not
+                // read earlier messages, so chunks of large results are not buffered unboundedly.
+                var call = (io.grpc.stub.ServerCallStreamObserver<Response>) responses;
+                var ready = new Object();
+                call.setOnReadyHandler(() -> {
+                    synchronized (ready) {
+                        ready.notifyAll();
+                    }
+                });
+                java.util.function.Consumer<Response> send = response -> {
+                    synchronized (ready) {
+                        while (!call.isReady() && !call.isCancelled()) {
+                            try {
+                                ready.wait(10);
+                            } catch (InterruptedException interrupted) {
+                                // Shutting down: send now, so the client fails fast, not by timeout.
+                                Thread.currentThread().interrupt();
+                                break;
+                            }
+                        }
+                    }
+                    synchronized (responses) {
+                        responses.onNext(response);
+                    }
+                };
                 return new StreamObserver<>() {
                     @Override
                     public void onNext(Request request) {
-                        if (published != null) {
-                            publicationPending.incrementAndGet();
-                            publicationExecutor.execute(
-                                    () -> {
-                                        try {
-                                            var response = published.execute(request);
-                                            synchronized (responses) {
-                                                responses.onNext(response);
-                                            }
-                                        } catch (RuntimeException error) {
-                                            synchronized (responses) {
-                                                responses.onNext(
-                                                        Response.newBuilder()
-                                                                .setId(request.getId())
-                                                                .setStatus(
-                                                                        org.sibench.adapters.proto
-                                                                                .Status.UNAVAILABLE)
-                                                                .setMessage(String.valueOf(error))
-                                                                .build());
-                                            }
-                                        } finally {
-                                            if (publicationPending.decrementAndGet() == 0)
-                                                synchronized (publicationPending) {
-                                                    publicationPending.notifyAll();
-                                                }
-                                        }
-                                    });
-                        } else if (sequencer != null) sequencer.submit(request, responses);
-                        else responses.onNext(IndexExecution.execute(backend, request));
+                        publicationPending.incrementAndGet();
+                        published.submit(request, send).thenAccept(response -> {
+                            try {
+                                send.accept(response);
+                            } finally {
+                                if (publicationPending.decrementAndGet() == 0)
+                                    synchronized (publicationPending) {
+                                        publicationPending.notifyAll();
+                                    }
+                            }
+                        });
                     }
 
                     @Override
@@ -126,25 +105,17 @@ public final class IndexServer implements AutoCloseable {
 
                     @Override
                     public void onCompleted() {
-                        // Held requests of other streams write to this observer under the lock.
-                        if (sequencer == null) {
-                            if (published == null) responses.onCompleted();
-                            else {
-                                synchronized (publicationPending) {
-                                    while (publicationPending.get() != 0) {
-                                        try {
-                                            publicationPending.wait(1000);
-                                        } catch (InterruptedException interrupted) {
-                                            Thread.currentThread().interrupt();
-                                            break;
-                                        }
-                                    }
-                                }
-                                synchronized (responses) {
-                                    responses.onCompleted();
+                        synchronized (publicationPending) {
+                            while (publicationPending.get() != 0) {
+                                try {
+                                    publicationPending.wait(1000);
+                                } catch (InterruptedException interrupted) {
+                                    Thread.currentThread().interrupt();
+                                    break;
                                 }
                             }
-                        } else synchronized (sequencer) {
+                        }
+                        synchronized (responses) {
                             responses.onCompleted();
                         }
                     }
@@ -153,43 +124,7 @@ public final class IndexServer implements AutoCloseable {
         };
         return new IndexServer(
                 ServerBuilder.forPort(port).addService(service).maxInboundMessageSize(Integer.MAX_VALUE).build().start(),
-                published,
-                publicationExecutor);
-    }
-
-    /**
-     * Executes requests in send position order. Positions are contiguous from 1, so a request runs
-     * once every lower position has; held requests are bounded by the driver's in-flight limit.
-     * This is the diagnostic reference, not a performance mode: it serializes independent
-     * requests and has no commit-complete watermark, so the highest version seen never advances
-     * visibility on its own. Responses are written while holding the lock, which also serializes
-     * each stream's observer.
-     */
-    private static final class Sequencer {
-        private record Held(Request request, StreamObserver<Response> responses) {}
-
-        private final IndexBackend backend;
-        private final java.util.Map<Long, Held> held = new java.util.HashMap<>();
-        private long next = 1;
-
-        Sequencer(IndexBackend backend) {
-            this.backend = backend;
-        }
-
-        synchronized void submit(Request request, StreamObserver<Response> responses) {
-            long position = request.getSequence();
-            if (position < next || held.containsKey(position)) {
-                responses.onNext(Response.newBuilder()
-                        .setId(request.getId())
-                        .setStatus(org.sibench.adapters.proto.Status.INVALID)
-                        .setMessage("Send position " + position + " is missing or repeated")
-                        .build());
-                return;
-            }
-            held.put(position, new Held(request, responses));
-            for (Held ready; (ready = held.remove(next)) != null; next++)
-                ready.responses().onNext(IndexExecution.execute(backend, ready.request()));
-        }
+                published);
     }
 
     public int port() {
@@ -202,8 +137,7 @@ public final class IndexServer implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
-        if (published != null) published.close();
-        if (publicationExecutor != null) publicationExecutor.shutdownNow();
+        published.close();
         server.shutdown();
         try {
             if (!server.awaitTermination(30, TimeUnit.SECONDS)) server.shutdownNow();

@@ -4,6 +4,7 @@ import static org.sibench.config.ConfigValues.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -90,7 +91,10 @@ public record ReplayConfig(
                 string(document, "purpose").equals("index_replay"),
                 "Expected index_replay purpose");
         var target = object(document, "target");
-        keys(target, Set.of("secondary_indexes", "service"));
+        keys(target, Set.of("secondary_indexes", "service", "value"));
+        require(
+                !(target.containsKey("value") && target.containsKey("service")),
+                "A service replay names its value in target.service");
         var secondary = object(target, "secondary_indexes");
         keys(secondary, Set.of("enabled"));
         var replay = object(document, "replay");
@@ -145,6 +149,20 @@ public record ReplayConfig(
                 replay.containsKey("request_timeout_seconds")
                         ? integer(replay, "request_timeout_seconds")
                         : 60);
+    }
+
+    /**
+     * The value modes a reference replay or oracle runs, as row-id flags: {@code target.value}
+     * ({@code locator} or {@code row_id}) selects one, its absence both.
+     */
+    public static List<Boolean> rowIdModes(Map<String, Object> document) {
+        var target = object(document, "target");
+        if (!target.containsKey("value")) return List.of(false, true);
+        return switch (string(target, "value")) {
+            case "locator" -> List.of(false);
+            case "row_id" -> List.of(true);
+            default -> throw new IllegalArgumentException("target.value must be locator or row_id");
+        };
     }
 
     public long requiredOperations() {

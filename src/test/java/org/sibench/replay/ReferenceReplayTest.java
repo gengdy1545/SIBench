@@ -16,6 +16,20 @@ import java.util.List;
 import java.util.Map;
 
 public class ReferenceReplayTest {
+    @Test
+    public void checksumOnlyReferenceReportsAreRejected() throws Exception {
+        Path report = Files.createTempFile("sibench-reference-", ".json");
+        try {
+            Files.writeString(report, "{\"results\":[{\"mode\":\"rowid\",\"result_checksum\":0}]}");
+            var error = assertThrows(IOException.class, () -> ReferenceReplay.queryDigestFile(report, "rowid"));
+            assertTrue(error.getMessage().contains("no query digests"));
+            Files.writeString(report, "{\"results\":[]}");
+            assertThrows(IOException.class, () -> ReferenceReplay.queryDigestFile(report, "rowid"));
+        } finally {
+            Files.delete(report);
+        }
+    }
+
     private static Operation row(int kind, long version, long file, long rowId) {
         return TestOps.op(1, kind, 5, 0, 0, 1, version, file, 0, rowId, 10, 20, 0);
     }
@@ -130,7 +144,7 @@ public class ReferenceReplayTest {
                 for (int mode = 0; mode < 2; mode++) {
                     var x = (Map<?, ?>) a.get(mode);
                     var y = (Map<?, ?>) b.get(mode);
-                    assertEquals(x.get("result_checksum"), y.get("result_checksum"));
+                    assertEquals(x.get("query_digest_sha256"), y.get("query_digest_sha256"));
                     assertEquals(x.get("primary_state_checksum"), y.get("primary_state_checksum"));
                     assertEquals(secondary ? 14L : 6L, x.get("workload_operations"));
                     assertEquals(secondary ? 14L : 6L, y.get("workload_operations"));

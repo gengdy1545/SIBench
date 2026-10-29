@@ -74,7 +74,7 @@ LogicalValue = RowID
 - 回滚不推进 CommitVersion，不分配 RowID，不改变已提交索引状态，也不写入增量 Parquet。后续事务从最近的已提交状态继续。
 - transactionId 是源提交事件序号。修改的 mutationOrdinal 是事务内行修改序号，二级展开共享序号；组内查询携带同一 transactionId，mutationOrdinal 表示查询前已发生的行修改数。两者只用于来源关联和顺序校验，不作为 KV 版本后缀，不要求索引维护事务状态。
 - ReadTimestamp 表示查询的原语句快照（可见提交上界），在 T 选择同键最大版本 `<=T`。没有版本或选中删除版本时不存在，不能跳过删除标记返回旧值。
-- **事务内读**：查询保留原语句快照，同时携带本源事务的 CommitVersion（SEARCH.version）和 mutationOrdinal，并标记 TRANSACTION_LOCAL_SEARCH。读取结果 = 快照 `<= ReadTimestamp` 的最新状态，再只叠加本事务在 mutationOrdinal 之前写入的该版本状态；两个位置之间提交的其它事务版本不可见。必须按原始位置发送：此前修改 → 查询 → 后续修改。事务结束后同键同版本只保留最后效果。旧 v9 编译产物以 `version=0` 且 `ReadTimestamp=本源 CommitVersion` 表示事务内读，读取器仍接受该历史形式，但不据此生成新 Trace。
+- **事务内读**：查询保留原语句快照，同时携带本源事务的 CommitVersion（SEARCH.version）和 mutationOrdinal，并标记 TRANSACTION_LOCAL_SEARCH。读取结果 = 快照 `<= ReadTimestamp` 的最新状态，再只叠加本事务在 mutationOrdinal 之前写入的该版本状态；两个位置之间提交的其它事务版本不可见。必须按原始位置发送：此前修改 → 查询 → 后续修改。事务结束后同键同版本只保留最后效果。读取器要求事务内读的 `version>0` 且 `readTimestamp<version`，不满足即拒绝。
 - 顺序会话中，事务首次修改前的查询使用前一次提交的 ReadTimestamp。并发会话中，查询使用"其语句快照的计数器所见的最后一个写事务提交"（只读事务的提交不改变数据，不作读取点）：每个扫描事件记录该快照的计数器、xmin、xmax 和 xip，编译器取位置 <= 快照计数器的最后一个写事务提交作为 ReadTimestamp，因此可以早于其发送位置之前的提交，并标记 SNAPSHOT_SEARCH。编译器对每个扫描交叉验证：计数器判定为可见的提交，不得出现在该快照自己的 xip 里；冲突说明单个 ReadTimestamp 无法表达该可见集合，整次编译失败而不是近似。`suboverflowed` 的快照无法逐个核对子事务，不做交叉验证并单独计数。原始 xmin/xmax/xip 仍是可见性判定本身，不直接当作提交版本。显式历史查询选择可用历史点，未来读点拒绝。
 - UPDATE 保留 RowID；DELETE 后重插入分配新 RowID。Rewrite 不改变逻辑版本或 RowID。
 - FileID 从 1 分配且不复用；文件内行号从 0 开始。数据集隔离，int64 无损解析。
@@ -96,7 +96,7 @@ v9 每条记录为 128 字节固定前缀加四个可变键分量，每块最多
 | 操作 | 语义 |
 | --- | --- |
 | INSERT | Baseline 索引加载 |
-| SEARCH | 有序查询：主键比较 PK，二级比较 IndexedValue，结果按 (IndexedValue, PK) 升序（DESCENDING 时降序），limit>0 时取前 limit 个可见项且期望数等于 limit；`readTimestamp>=0` 为原语句快照；普通 / 快照查询 version=0，TRANSACTION_LOCAL_SEARCH 的 version 为本事务 CommitVersion（历史形式为 0）；flags：SNAPSHOT_SEARCH=1、TRANSACTION_LOCAL_SEARCH=4、LOWER_INCLUSIVE=8、UPPER_INCLUSIVE=16、DESCENDING=32、INTERSECT_GROUP=64、UNION_GROUP=128。**钉住点查**：二级点区间且 key 带 PK，恰好命名一个索引条目 (IndexedValue, PK)，期望数 1，无 limit、不入组。**查询组**：带 INTERSECT_GROUP 或 UNION_GROUP 的连续查询是同一次源访问，`expansionPosition` 0..n-1、`expansionSize`=n≥2，成员共享 sourceEvent、table、readTimestamp、version、事务位置、工作单元和组期望数；交集组成员可在同表不同索引，并集组成员是同一索引的点；期望数是成员结果按 PK 求交 / 求并后的行数，成员自身的条数不是源事实，不单独校验 |
+| SEARCH | 有序查询：主键比较 PK，二级比较 IndexedValue，结果按 (IndexedValue, PK) 升序（DESCENDING 时降序），limit>0 时取前 limit 个可见项且期望数等于 limit；`readTimestamp>=0` 为原语句快照；普通 / 快照查询 version=0，TRANSACTION_LOCAL_SEARCH 的 version 为本事务 CommitVersion，且必须大于 readTimestamp；flags：SNAPSHOT_SEARCH=1、TRANSACTION_LOCAL_SEARCH=4、LOWER_INCLUSIVE=8、UPPER_INCLUSIVE=16、DESCENDING=32、INTERSECT_GROUP=64、UNION_GROUP=128。**钉住点查**：二级点区间且 key 带 PK，恰好命名一个索引条目 (IndexedValue, PK)，期望数 1，无 limit、不入组。**查询组**：带 INTERSECT_GROUP 或 UNION_GROUP 的连续查询是同一次源访问，`expansionPosition` 0..n-1、`expansionSize`=n≥2，成员共享 sourceEvent、table、readTimestamp、version、事务位置、工作单元和组期望数；交集组成员可在同表不同索引，并集组成员是同一索引的点；期望数是成员结果按 PK 求交 / 求并后的行数，成员自身的条数不是源事实，不单独校验 |
 | UPSERT | 带提交版本的写入；flags：业务 INSERT=1、UPDATE=2 |
 | LOGICAL_DELETE | 显式版本化失效，不使用合法 Locator/RowID 作为哨兵 |
 | RELOCATE | 更新完整索引键的确切版本位置；删除或不存在版本拒绝 |
@@ -108,7 +108,7 @@ v9 每条记录为 128 字节固定前缀加四个可变键分量，每块最多
 
 Baseline 每索引 INSERT；运行期 INSERT 每索引 UPSERT；DELETE 失效主键及全部二级条目。同主键重插入分配新 RowID，UPDATE 保留原 RowID。旧、新条目及主键共享来源事件、版本、事务、mutationOrdinal、workUnitId 和 RowID；除删除条目无物理位置外，值位置一致。`expansionPosition` 从 0 连续编号，`expansionSize` 为完整展开宽度，查询和控制不得插入其中；查询组复用这两个字段表示组内位置与组宽，同样不得被其它记录打断。预检在二级过滤前核对全清单、完整展开和源工作单元绑定，截断或漏项拒绝。
 
-增量文件按实际表惰性创建 `<table>-versions.parquet`，FileID 从基线最大值加 TableID 分配；每次写入保留 `_sib_timestamp`、`_sib_mutation_ordinal` 和 `_sib_row_id`。同键同版本按序覆盖，中间效果服务于原始事务内查询，不产生额外提交版本；后续源事务只能看到最终提交效果。主键值 UPDATE 是范围外操作，明确拒绝；增量 rollover 尚未实现，到达阈值使编译失败而非丢弃后续行。
+增量文件按实际表惰性创建 `<table>-versions.parquet`，FileID 从基线最大值加 TableID 分配；每次写入保留 `_sib_timestamp`、`_sib_mutation_ordinal` 和 `_sib_row_id`。同键同版本按序覆盖，中间效果服务于原始事务内查询，不产生额外提交版本；后续源事务只能看到最终提交效果。主键值 UPDATE 是范围外操作，明确拒绝；增量文件在关闭 row group 后达到配置大小时滚动；首个 FileID 为基线最大值加 TableID，后续 FileID 从所有表的首文件范围之后全局递增，使用完整 int64。逐文件校验实际行数与 SHA-256，Locator 指向实际文件和位置。
 
 格式只支持 v9：读取其他版本一律拒绝。
 

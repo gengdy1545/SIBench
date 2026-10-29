@@ -6,6 +6,7 @@ import org.sibench.adapters.proto.ValueKind;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -18,7 +19,11 @@ import java.util.Set;
  *   <li>{@code adapter: rocksdb} with {@code path} — a fresh RocksDB index in the driver process.
  * </ul>
  *
- * {@code value} is {@code locator} or {@code row_id}: what an index entry points to.
+ * {@code value} is {@code locator} or {@code row_id}: what an index entry points to. An index
+ * server's {@code backend} is {@code rocksdb}, or {@code rocksdb_cloud} with {@code storage} (the
+ * storage config), {@code profile} and the index's {@code object_path} below the profile prefix.
+ * {@code reopen: true} serves an index this server created before instead of a new one: after a
+ * restart, or for rocksdb-cloud without its local directory, from the bucket alone.
  */
 public record ServiceConfig(
         String adapter,
@@ -26,8 +31,8 @@ public record ServiceConfig(
         Path path,
         int port,
         ValueKind value,
-        boolean ordered,
-        boolean publication) {
+        ObjectStore objects,
+        boolean reopen) {
     public ServiceConfig {
         require(Set.of("grpc", "rocksdb").contains(adapter), "Unknown service adapter: " + adapter);
         require(!adapter.equals("grpc") || endpoint != null, "A gRPC target needs an endpoint");
@@ -39,43 +44,59 @@ public record ServiceConfig(
         var target = object(document, "target");
         if (!target.containsKey("service")) return null;
         var service = object(target, "service");
-        keys(service, Set.of("adapter", "endpoint", "path", "value", "publication"));
+        keys(service, Set.of("adapter", "endpoint", "path", "value"));
         String adapter = string(service, "adapter");
-        // In process, ordinary requests run on the sending thread; a published in-process service runs
-// them on a background executor so a read can wait for a commit the sender still has to send.
         return new ServiceConfig(
                 adapter,
                 service.containsKey("endpoint") ? string(service, "endpoint") : null,
                 service.containsKey("path") ? root.resolve(string(service, "path")) : null,
                 0,
                 value(service),
-                adapter.equals("rocksdb") && !(service.containsKey("publication") && bool(service, "publication")),
-                service.containsKey("publication") && bool(service, "publication"));
+                null,
+                false);
     }
 
-    /**
-     * An index server: a backend, its storage and the port it listens on. {@code ordered} makes it
-     * execute requests in the driver's send order across client streams (Request.sequence).
-     */
+    /** A server with complete-commit publication and versioned reads. */
     public static ServiceConfig ofServer(Path root, Path path) throws java.io.IOException {
         Map<String, Object> document = parse(Files.readString(root.resolve(path)));
         keys(document, Set.of("schema_version", "purpose", "service"));
         require(integer(document, "schema_version") == 1, "Expected index service config v1");
         require(string(document, "purpose").equals("index_service"), "Expected index_service purpose");
         var service = object(document, "service");
-        keys(service, Set.of("backend", "path", "port", "value", "ordered", "publication"));
-        require(string(service, "backend").equals("rocksdb"), "Only the RocksDB backend is implemented");
-        boolean ordered = service.containsKey("ordered") && bool(service, "ordered");
-        boolean publication = service.containsKey("publication") && bool(service, "publication");
-        require(!(ordered && publication), "Choose ordered or complete publication, not both");
+        keys(
+                service,
+                Set.of(
+                        "backend", "path", "port", "value", "storage",
+                        "profile", "object_path", "reopen"));
+        String backend = string(service, "backend");
+        require(
+                backend.equals("rocksdb") || backend.equals("rocksdb_cloud"),
+                "backend must be rocksdb or rocksdb_cloud");
+        boolean cloud = backend.equals("rocksdb_cloud");
+        for (String key : List.of("storage", "profile", "object_path"))
+            require(cloud == service.containsKey(key), key + " is for and required by rocksdb_cloud");
         return new ServiceConfig(
                 "rocksdb",
                 null,
                 root.resolve(string(service, "path")),
                 Math.toIntExact(positive(service, "port")),
                 value(service),
-                ordered,
-                publication);
+                cloud
+                        ? ObjectStore.of(
+                                root.resolve(string(service, "storage")),
+                                string(service, "profile"),
+                                string(service, "object_path"))
+                        : null,
+                service.containsKey("reopen") && bool(service, "reopen"));
+    }
+
+    /** This server's index, new or reopened: a local RocksDB, or rocksdb-cloud. */
+    public RocksDbBackend backend() throws java.io.IOException {
+        if (objects == null)
+            return reopen ? RocksDbBackend.open(path, value) : RocksDbBackend.create(path, value);
+        return reopen
+                ? RocksDbBackend.openCloud(path, value, objects)
+                : RocksDbBackend.cloud(path, value, objects);
     }
 
     private static ValueKind value(Map<String, Object> service) {

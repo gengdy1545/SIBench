@@ -1,0 +1,11 @@
+schema_version: 1
+purpose: update_locality
+layout:
+  # Equal-entry-count approximation, not Parquet row groups or real SST boundaries.
+  entries_per_block: 256
+  blocks_per_file: 4096
+  sort_memory_bytes: 1073741824
+window:
+  business_changes: 10000
+  l0_index_modifications: 10000
+  heatmap_bins: 1000

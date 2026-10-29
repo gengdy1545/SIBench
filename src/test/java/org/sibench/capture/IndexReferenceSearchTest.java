@@ -7,6 +7,7 @@ import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexOperationTrace.Range;
 import org.sibench.trace.IndexKey;
 
+import java.io.IOException;
 import java.util.*;
 
 public class IndexReferenceSearchTest {
@@ -71,7 +72,7 @@ public class IndexReferenceSearchTest {
     }
 
     @Test
-    public void oldV9LocalSearchFormStillReadsItsOwnVersion() throws Exception {
+    public void oldV9LocalSearchFormWithoutItsOwnVersionIsRejected() throws Exception {
         var model = new IndexReferenceReplay(true);
         IndexMutation.emit(
                 IndexOperationTrace.write(0, IndexOperationTrace.INSERT, 1, 0, key(1), 0, 1, 0, 1),
@@ -94,8 +95,8 @@ public class IndexReferenceSearchTest {
                                 1,
                                 IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
                         .withTransaction(1, 1);
-        model.accept(old);
-        assertEquals(1, model.queries());
+        assertThrows(IOException.class, () -> model.accept(old));
+        assertEquals(0, model.queries());
     }
 
     @Test

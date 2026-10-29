@@ -6,7 +6,4 @@ service:
   backend: rocksdb
   path: build/services/index/rocksdb
   port: 50551
-  value: locator
-  # Execute requests in the driver's send order across client streams (Request.sequence), so a
-  # replay may use several clients; false executes each stream as it arrives (one client only).
-  ordered: true
+  value: row_id

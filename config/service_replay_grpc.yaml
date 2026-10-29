@@ -7,7 +7,7 @@ target:
   service:
     adapter: grpc
     endpoint: 127.0.0.1:50551
-    value: locator
+    value: row_id
 replay:
   strategy: single_pass
   dispatch_mode: operation

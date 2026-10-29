@@ -216,6 +216,7 @@ public final class IndexTraceCompiler {
                         JsonParser.parseString(Files.readString(preflightFile)).getAsJsonObject());
         IndexCatalog catalog = IndexCatalog.fromSchema(sourceSchema);
         Files.createDirectory(output);
+        RunTiming.current().measure(output);
         Files.writeString(
                 output.resolve("INCOMPLETE"),
                 "Compilation not committed\n",
@@ -464,7 +465,7 @@ public final class IndexTraceCompiler {
                         "Searches occupy native scan-start positions; counts finalized when the"
                                 + " access unit settles",
                         "No historical lookup or Rewrite events in this native trace",
-                        "Incremental rollover and disk-backed compilation state not implemented"));
+                        "Disk-backed compilation state not implemented"));
         Files.writeString(
                 output.resolve("manifest.json"),
                 new GsonBuilder().setPrettyPrinting().create().toJson(report),
@@ -1167,8 +1168,8 @@ public final class IndexTraceCompiler {
         }
 
         /**
-         * The table's next incremental file. The first keeps the name and FileID it has always had
-         * (the baseline's last FileID plus the table's id); rollover files take the FileIDs after
+         * The table's next incremental file. The first uses the baseline's last FileID plus the
+         * table's id; rollover files take the FileIDs after
          * the last table's, in the order they are opened, so every FileID is unique and int64.
          */
         private Output open(String table, int tableId) throws IOException {

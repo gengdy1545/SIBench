@@ -1,10 +1,16 @@
 # 采集性能：机器与 PG 配置
 
+## 执行环境
+
+开发机为 32 线程、约 62 GB 内存、/mnt/disk1 约 985 GB，用于开发和已有输入回归。远程工作区为 /data/sibench；sibench_1 / 2 / 3 分别承担 HyBench / YCSB / sysbench 采集，sibench_4–7 用于引擎构建、参考 / oracle、服务和 COS 对照。各远程 pod 配额 32 CPU / 64 GB（含页缓存）、/data 500 GB xfs，共享宿主上存在其他负载；TencentOS 3.2 / glibc 2.28 的 native 构建须核验兼容性。
+
+采集使用 PG 14.24、read_committed、无 parallel worker、postgres 角色、C collation 和 zstd；静止库、PG 参数与认证身份匹配后复用。新服务使用非 root 用户，历史运行身份以原证据为准。不使用已有数据的 /codev 分区；跨机或竞争负载下的单次耗时不能作为版本收益依据。
+
 2026-10-25 至 27。回答两个问题：采集 PG 的配置能把原生执行提速多少，插桩本身占多少；以及采集应在哪类机器上运行。
 
 ## 方法
 
-在 `sibench_1`（远程机，见 [计划的执行资源](../../plan.md#执行资源)：Kubernetes pod，32 CPU / 64 GB，EPYC 9K65，`/data` 云盘）上，以 TencentOS 构建的同一份插桩 PG 14.24 与同一个 jar，从同一个 SF10 静止库（`base` 阶段原生 gendata 161 s、装载约 150 s，87,060,000 行）每次克隆新库，按 `config/hybench_sf10.yaml` 的并发（TP 8、AT 8、IQ 8 client）运行 AP 一轮、TP 2 分钟、XP 2 分钟。每种配置跑两遍，顺序交错，以摊平宿主机上其他负载的波动。原版 PG 由同一源码不打补丁构建，用同一数据目录运行（补丁只改共享内存结构，不改盘上格式）；克隆库由插桩 PG 准备后删去行捕获触发器再切换，HyBench 由相同方式（不经采集驱动）运行。
+在 `sibench_1`（远程机，见 [执行环境](#执行环境)：Kubernetes pod，32 CPU / 64 GB，EPYC 9K65，`/data` 云盘）上，以 TencentOS 构建的同一份插桩 PG 14.24 与同一个 jar，从同一个 SF10 静止库（`base` 阶段原生 gendata 161 s、装载约 150 s，87,060,000 行）每次克隆新库，按 `config/hybench_sf10.yaml` 的并发（TP 8、AT 8、IQ 8 client）运行 AP 一轮、TP 2 分钟、XP 2 分钟。每种配置跑两遍，顺序交错，以摊平宿主机上其他负载的波动。原版 PG 由同一源码不打补丁构建，用同一数据目录运行（补丁只改共享内存结构，不改盘上格式）；克隆库由插桩 PG 准备后删去行捕获触发器再切换，HyBench 由相同方式（不经采集驱动）运行。
 
 | 配置 | 内容 |
 | --- | --- |
@@ -35,68 +41,15 @@
 - 写入比例固定时，原生执行时长 = 目标写入 ÷ 写入吞吐。按 B1 在远程机，HyBench SF10 达到 5% 写入约需 TP、XP 各 17.5 分钟（开发机为各 53 分钟），以远程实测为准。
 - 配置已接近上限（原版 PG 也只快 0–17%）；进一步缩短原生执行只能靠 benchmark 自身的并发参数，需同时验证正确性与来源失败处理。
 
-## 管线优化（导出、编译、产物）
+## 生成管线与选定对照
 
-2026-10-25，同一配置（B1）下的管线改动；采集侧代码（认证闭包）只为解除对 Parquet writer 的依赖而改动一次，见 [计划的核验职责](../../plan.md)。
+当前管线并行导出 / 核验，编译共享解析池并同遍构建账本；Baseline 操作从已验证 Parquet 派生，workload 与工作单元目录按 zstd 保存。不同阶段的确认与计数职责见 [Trace 契约](../contracts/trace.md)。
 
-| 改动 | 内容 |
-| --- | --- |
-| 导出与核验 | 每文件恰好 1,048,576 行，文件与行身份由行数预先确定；同一导出快照下多连接并行。主键与堆顺序相关的表按主键区间读，不相关的表（YCSB 按 hash 插入）由 PG 排序一次后流式读（该事务 `work_mem` 1 GB），切段并行编码 / 比对。不再写 `locators.tsv` |
-| 编译 | 各会话读取线程分批交给共享线程池解析 JSON；原始文件摘要与各会话首个片段的扫描并行 |
-| 产物 | `baseline.ops` 不落盘，读取时由已核验的基线 Parquet 与索引定义推出并核对摘要；`workload.ops` 与工作单元目录按块 / 流 zstd 压缩，摘要按明文计算 |
+2026-10-25 的同配置 B1 对照记录了 HyBench SF10 导出 / 核验 572 → 60 s、sysbench 87m 452 → 50 s，以及 HyBench SF10 5% Trace 从 70 GB 降至 2.3 GB。收益包含避免重复读取、并行编码与不再落盘 Baseline 操作；这些是所记录构建的观测，不是当前 jar 的重新测量。三来源最终生成基线见 [测量结果](p0-measurement.md#三来源生成基线)。
 
-| 测量 | 之前 | 之后 |
-| --- | --- | --- |
-| 远程 HyBench SF10 导出 + 核验 | 572 s | 60 s |
-| 远程 sysbench 87m 导出 + 核验 | 452 s | 50 s（正式采集 50 s） |
-| 远程 YCSB 87m 导出 + 核验（95 GB 表，各一次外部排序） | 11,371 s（导出 4,680 s） | 待测 |
-| 开发机 YCSB 870 万行导出 + 核验 | 约 920 s | 158 s |
-| 开发机 HyBench SF10 5% 重编（4.13 亿事件） | 约 5,480 s | 2,142 s |
-| 远程 sysbench 87m 编译 | 223 s | 178 s |
-| HyBench SF10 5% Trace | 70 GB（`baseline.ops` 42 GB、`workload.ops` 28 GB） | 2.3 GB（`workload.ops` 1.86 GB；工作单元目录压缩前 516 MB） |
-| 远程 sysbench 87m 校准 Trace / 基线目录 | 24 GB / 11 GB | 120 MB / 7.9 GB |
+YCSB 87m 的首次导出 / 核验单列：new21 在 sibench_2 上读取主键与堆顺序无关的 95 GB 表，PG 8 worker 排序后流式导出约 30 min，核验按块并行扫描 PG、按 row group 读取 Parquet 并比较顺序无关行摘要，用时 676 s；Parquet 主键顺序另逐行检查。此前合计耗时 2,194–6,595 s，缓存及共享宿主影响不能忽略。`-Dsibench.baseline.verify_ordered=true` 可用逐行比较定位差异；两条核验路径均不属于采集认证闭包。
 
-远程三来源的 5% 正式采集（`capture.verification: certified`，以同机同配置的校准兼认证为准，写入比例由 `plan-write-ratio` 推出）：
-
-| 来源 | 写入比例 | prepare | 导出 + 核验 | 原生执行 | 编译 | Trace | 原始采集 | 基线 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| sysbench 87m（events × 7.02） | 0.04999 | 272 s | 49 s | 596 s | 535 s | 833 MB | 3.5 GB | 7.9 GB |
-| HyBench SF10（TP / XP 各 20 min） | 0.05314 | 178 s | 57 s | 2,622 s | 1,410 s | 1.5 GB | 5.6 GB | 1.6 GB |
-
-正确性：开发机当时保留的产物用新代码重编，基线与负载两个流的逻辑摘要、条数及其余数据文件与原产物相同；sysbench c8 的 128 client 参考回放报告除计时外逐项相同；同一静止库两次导出逐字节相同（带时间的预检报告除外）；远程 sysbench 87m 新旧两次校准的写入比例与业务变化计数相同。远程的 prepare 与原生执行在两轮之间相差至多 2 倍而代码未变，是共享宿主的负载波动。
-
-2026-10-26，静止集群、共享基线、32 并发与编译主线程优化之后的远程正式采集（同上口径）：
-
-| 来源 | 写入比例 | prepare | 导出（共享基线链接） | 原生执行 | 编译（启动 / 基线 / 负载） | 合计 | Trace |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| HyBench SF10，32 client（TP / XP 各 6 min，`hybench-sf10-w5c32c`） | 0.05458 | 0.4 s | 1.3 s | 898 s | 4 / 135 / 474 s | 约 25 min | 756 MB（7,269 万操作） |
-| sysbench 87m，32 线程（`sysbench-87m-w5g`） | 0.04999 | 0.3 s | 5.9 s | 968 s | 97 / 80 / 304 s | 约 24 min | 835 MB（3,082 万操作） |
-| sysbench 87m，同一 profile（`sysbench-87m-w5h`） | 0.04999 | 0.3 s | 5.8 s | 631 s | 9 / 81 / 308 s | 约 17 min | 同上 |
-
-| HyBench SF10，32 client，jar 含编译主线程优化（`hybench-sf10-w5c32d`） | 0.05523 | 0.3 s | 0.4 s | 887 s | 3 / 131 / 367 s | 约 23 min | 804 MB（7,805 万操作） |
-| sysbench 87m（`sysbench-87m-w5k`） | 0.04999 | 0.3 s | 1.0 s | 652 s | 36 / 83 / 256 s | 约 17 min | — |
-
-w5g 与 w5h 代码与 profile 相同，原生执行相差 337 s、编译启动（原始文件摘要）相差 88 s，是宿主负载与页缓存的波动。HyBench 认证采集的行审计约 730 s（`hybench-sf10-c32cal2`：原生 615 s、行审计 736 s）。旧行审计在 YCSB 87m 上运行 3 h 后只比对了 52% 的行：按主键排序的终态扫描是 95 GB 表的一次外部排序（PG 临时文件 87 GB），该次校准用的是旧 PG 构建，已中止并在新构建上以新行审计重跑。
-
-YCSB 87m 校准兼认证（新 PG 构建 `c5e02bff`，8 线程，`ycsb-87m`）：写入比例 0.00677、1,105 万操作；prepare 0.5 s、共享基线链接 320 s（66 GB 基线串行摘要）、原生 829 s（旧 PG 构建 2,286 s）、行审计 1,394 s（新实现；终态 8,710 万行、变化键 36 万）、编译 461 / 509 / 148 s（启动 / 基线 / 负载）；Trace 558 MB、原始采集 1.3 GB、基线 66 GB。基线 509 s 与启动 461 s 的主因分别是基线解码只有一个文件在进行、基线摘要串行，均已改（开发机 YCSB 870 万行：基线 38 → 10 s、启动 32 → 5 s，摘要与条数不变）。
-
-YCSB 87m 5% 正式采集（`ycsb-87m-w5`，计划因子 7.39）：写入比例 0.0501、8,166 万操作；原生 4,346 s、共享基线链接 369 s（66 GB 串行摘要，其后改为跨进程记录）；认证编译因未覆盖的 `range` 路径被拒后补做完整核验：行审计 1,910 s、编译 1,260 s（启动 526 / 基线 65 / 负载 669 s）；Trace 4.1 GB、原始采集 9.1 GB。
-
-基线推出（jar new18，按行组读列、分段并行编码）：开发机 SF1 推出本身 16.4 s → 3.4 s；远程 HyBench SF10 基线阶段 115 s → 63 s（`hybench-sf10-w5c32j`，负载 313 s、原生 875 s）。
-
-采集阶段的后处理（jar new20）：sysbench 87m 原生执行阶段 831 s 中约 350 s 是负载之外的时间（`oltp_read_write` 后 243 s、其余每负载 6–23 s、最后会话审计约 55 s），YCSB 每个负载之后约 100 s。负载之间的线程栈都在 `ChangeKinds.countTraces`。改为并行读取并只解析行修改与事务记录后，同一份 sysbench 原始采集四个负载的变化类别报告与旧实现逐项相同，`oltp_read_write` 一项 128 s → 35–55 s；之后的正式采集 sysbench 87m 原生 387–420 s、编译 243–249 s，合计约 10.5 min（`w5e2`–`w5g2`）。YCSB 87m 32 线程完整核验 `w5c32v2` 原生 1,641 s。
-
-首次导出与核验（jar new21，远程 sibench_2，YCSB 87m 的 95 GB 表，主键与堆顺序无关）：导出的流式读取改为 PG 并行排序（8 worker），约 30 min（排序约 21 min、写出 Parquet 约 8 min）；核验不再对表排序——PG 侧按块区间并行物理扫描、Parquet 侧按行组并行读取，比较与顺序无关的逐行摘要（Parquet 的主键顺序在读取时逐行检查），8,706 万行全部一致用时 676 s。原先导出与核验合计 2,194–6,595 s。按序逐行比对仍可用 `-Dsibench.baseline.verify_ordered=true` 打开以定位首个不同的行。导出与核验都不属于认证覆盖的采集代码。
-
-编译按会话跟踪（jar new22）在远程 sysbench 87m 上实测为回退：运行到 79M / 106M 事件时已用约 1,002 CPU 秒，旧 jar 跑完 106M 只用约 705 CPU 秒；主线程始终 100%，tracker 线程多数空闲，调用与队列开销大于并行收益。该轮已停止并回退，未以它的计时作为结论。
-
-编译主线程（jar new24，只改编译器，采集代码身份不变）：恢复内联跟踪；账本的热路径计数改为无装箱的长整型数组并按需在报告端排序；`Unit` 的 bitmap 候选、array-key runs 与 last PK 列表改为按需分配。用同一份 raw、同一 baseline、同一认证与 PG 计数器对照：HyBench SF10 390.99 → 384.85 s（负载 322.88 → 321.49 s，baseline 64.27 → 59.52 s，RSS 24.24 → 24.13 GB）；sysbench 87m 243.93 → 243.07 s（负载 205.81 → 205.87 s，CPU 704.6 → 678.7 s，RSS 15.57 → 15.30 GB）；YCSB 87m 561.02 → 553.71 s（负载 520.62 → 524.29 s，baseline 36.23 → 25.31 s，RSS 13.40 → 14.87 GB；baseline 差异主要是 page cache）。三份 Trace 与旧 jar 逐字节相同（HyBench / sysbench 各 13 个文件，YCSB 16 个），`capture-completeness` 均为 `consistent`。YCSB 的 raw 是本轮以 32 线程、5% 写入重采的（原生 1,572.1 s、原始 9.3 GB），Trace 仍由真实原生负载编译，见 [编译阶段对照](compile-optimization-20261026.md) 与 [并发采集验证](concurrent-native-capture.md)。最终 v9 / zstd 严格版本删除旧明文、`Detail.LEGACY`、旧 `baseline.ops`、`locators.tsv` 与未接入的 per-session stage；当前 zstd raw 的 HyBench / sysbench / YCSB 重编均逐字节相同。
-
-解析线程（同一 new24，仅 `-Dsibench.compile.parse_threads=8`）：sysbench 87m wall 241.76 s、RSS 14.76 GB（默认 32 线程 243.07 s、15.30 GB）；HyBench SF10 wall 386.65 s、RSS 23.58 GB（默认 384.85 s、24.13 GB）；YCSB 87m wall 559.47 s、RSS 15.01 GB（默认 553.71 s、14.87 GB）。8 线程只在 sysbench 上略快并省内存，HyBench / YCSB 都更慢；默认仍保留“每个处理器一个解析线程”，需要压内存时显式设小，Trace 字节不变。
-
-快照 oracle（`validate-snapshots`，jar 内 `KeyHash` 修正后）：远程 `hybench-sf10-c32cal2` 通过，200 万个变化主键、4,342 万次原生查询、2.58 亿个结果项（locator 与 rowid 各一遍），2 h 27 min、峰值 RSS 26.9 GB；修正前开发机同类 SF10 oracle 在 40 GB 被杀。开发机 SF1 c8 oracle 15 min 55 s、峰值 13.7 GB（修正前 15.7 GB），报告除计时外与保留版本相同。
-
-编译主线程（开发机 SF1 c8 保留产物重编，13 个产物文件与此前逐字节相同）：负载阶段 306 s；写出移到 `WriterThread`、账本去掉恒等表、事件预读类型与 pid 后 296 s；解析线程由 8 改为 32、顶层字段直接解析为哈希表、账本按哈希表计数后 253 s。
+同 raw、Baseline、认证及计数器的编译器 / 解析线程对照统一见 [编译对照](compile-optimization-20261026.md)。改善约 0.4%–1.6%，YCSB 负载阶段没有改善，默认解析线程未因单个较快样本改变；不重复保存各轮实现记录。参考模型的完整输入优化另见 [参考回放对照](p0-measurement.md#参考模型版本跳过)。
 
 ## 产物
 

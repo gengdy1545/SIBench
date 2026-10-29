@@ -266,4 +266,36 @@ public class RocksDbBackendTest {
         RocksDbBackend.create(path, ValueKind.LOCATOR).close();
         assertThrows(java.io.IOException.class, () -> RocksDbBackend.create(path, ValueKind.LOCATOR));
     }
+
+    @Test
+    public void reopenedIndexKeepsItsWatermarkAndRefusesAnotherValueKind() throws Exception {
+        java.nio.file.Path path = temporary.getRoot().toPath().resolve("reopen");
+        try (var backend = RocksDbBackend.create(path, ValueKind.ROW_ID)) {
+            assertEquals(0, backend.publishedVersion());
+            backend.bind("trace-a");
+            backend.bind("trace-a");
+            assertThrows(java.io.IOException.class, () -> backend.bind("trace-b"));
+            assertThrows(IllegalArgumentException.class, () -> backend.bind(""));
+            backend.recordPublishedVersion(42);
+            backend.flush();
+        }
+        try (var backend = RocksDbBackend.open(path, ValueKind.ROW_ID)) {
+            assertEquals(42, backend.publishedVersion());
+            // The binding survives the reopen: the index still refuses another trace.
+            backend.bind("trace-a");
+            assertThrows(java.io.IOException.class, () -> backend.bind("trace-b"));
+            assertEquals(path.toAbsolutePath().toString(), backend.location());
+        }
+        var stats = java.nio.file.Files.readAllLines(path.resolveSibling("reopen.engine-stats.jsonl"));
+        assertEquals(1, stats.size());
+        var line = com.google.gson.JsonParser.parseString(stats.get(0)).getAsJsonObject();
+        assertEquals(1, line.get("flush").getAsLong());
+        assertEquals("N/A", line.get("object_requests").getAsString());
+        assertTrue(line.get("rocksdb.stats").getAsString().contains("Compaction Stats"));
+        assertThrows(java.io.IOException.class, () -> RocksDbBackend.open(path, ValueKind.LOCATOR));
+        assertThrows(
+                java.io.IOException.class,
+                () -> RocksDbBackend.open(temporary.getRoot().toPath().resolve("missing"), ValueKind.ROW_ID));
+        assertThrows(java.io.IOException.class, () -> RocksDbBackend.create(path, ValueKind.ROW_ID));
+    }
 }

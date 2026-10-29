@@ -265,7 +265,7 @@ public class VersionedLookupTest {
                                             "workload_trace_sha256",
                                             org.sibench.capture.IndexOperationTrace.sha256(workload),
                                             "work_units_sha256",
-                                            org.sibench.capture.WorkUnits.sha256(directory))));
+                                            org.sibench.capture.WorkUnits.read(directory).sha256())));
             for (boolean secondary : new boolean[] {false, true}) {
                 List<?> previous = null;
                 for (String dispatchMode : new String[] {"operation", "transaction"}) {
@@ -284,7 +284,7 @@ public class VersionedLookupTest {
                         if (previous != null) {
                             var before = (Map<?, ?>) previous.get(mode);
                             assertEquals(
-                                    before.get("result_checksum"), report.get("result_checksum"));
+                                    before.get("query_digest_sha256"), report.get("query_digest_sha256"));
                             assertEquals(
                                     before.get("selected_version_checksum"),
                                     report.get("selected_version_checksum"));

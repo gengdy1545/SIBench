@@ -16,7 +16,6 @@ import org.sibench.config.ConfigValues;
 import org.sibench.generation.BaselineGenerator;
 import org.sibench.replay.ReferenceReplay;
 import org.sibench.adapters.IndexServer;
-import org.sibench.adapters.RocksDbBackend;
 import org.sibench.adapters.ServiceConfig;
 import org.sibench.adapters.ServiceReplay;
 import org.sibench.replay.ReplayConfig;
@@ -48,11 +47,18 @@ public final class Sibench {
                         + " REPLAY_CONFIG   (native parameters for the replay configuration's operation budget)");
         out.println(
                 "       java -jar build/sibench/sibench.jar index-server SERVICE_CONFIG"
-                        + "   (serves a fresh RocksDB index over the SIBench index protocol)");
+                        + "   (serves a new or reopened RocksDB / rocksdb-cloud index over the SIBench index protocol)");
         out.println(
                 "       java -jar build/sibench/sibench.jar replay-service REPLAY_CONFIG"
                         + " NORMALIZED_DIRECTORY REPORT [--reference REFERENCE_REPORT]"
                         + "   (target.service: grpc endpoint or in-process rocksdb path)");
+        out.println(
+                "       java -jar build/sibench/sibench.jar verify-service REPLAY_CONFIG"
+                        + " NORMALIZED_DIRECTORY REPORT --reference REFERENCE_REPORT"
+                        + "   (snapshot searches against an index already holding the trace)");
+        out.println(
+                "       java -jar build/sibench/sibench.jar analyze-locality TRACE CONFIG OUTPUT"
+                        + "   (static baseline layout, update windows and overlap estimate)");
     }
 
     public static void main(String[] args) {
@@ -86,8 +92,10 @@ public final class Sibench {
                             "check-relocation",
                             "index-server",
                             "replay-service",
+                            "verify-service",
                             "plan-write-ratio",
-                            "plan-operations")
+                            "plan-operations",
+                            "analyze-locality")
                     .contains(args[0])) {
                 throw new IllegalArgumentException("Unknown command: " + args[0]);
             }
@@ -123,7 +131,8 @@ public final class Sibench {
                         throw new IllegalArgumentException("--counters requires BEFORE AFTER snapshots");
                     countersBefore = args[++i];
                     countersAfter = args[++i];
-                } else if (args[0].equals("replay-service") && args[i].equals("--reference")) {
+                } else if ((args[0].equals("replay-service") || args[0].equals("verify-service"))
+                        && args[i].equals("--reference")) {
                     if (++i == args.length)
                         throw new IllegalArgumentException("--reference requires a report");
                     reference = args[i];
@@ -356,13 +365,9 @@ public final class Sibench {
                 if (profiles.size() != 1)
                     throw new IllegalArgumentException("index-server requires SERVICE_CONFIG");
                 var service = ServiceConfig.ofServer(root, Path.of(profiles.get(0)));
-                try (var backend = RocksDbBackend.create(service.path(), service.value());
-                        var server =
-                        IndexServer.start(
-                                service.port(),
-                                backend,
-                                service.ordered(),
-                                service.publication())) {
+                RunTiming.current().measure(service.path());
+                try (var backend = service.backend();
+                        var server = IndexServer.start(service.port(), backend)) {
                     out.println("index-server " + backend.describe().getName() + " on port " + server.port());
                     out.flush();
                     server.awaitTermination();
@@ -388,6 +393,35 @@ public final class Sibench {
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result.get("result")));
                 return 0;
             }
+            if (args[0].equals("verify-service")) {
+                if (profiles.size() != 3 || reference == null)
+                    throw new IllegalArgumentException(
+                            "verify-service requires REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT --reference REPORT");
+                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
+                ServiceConfig service = ServiceConfig.ofReplay(root, document);
+                if (service == null)
+                    throw new IllegalArgumentException("verify-service needs target.service in its config");
+                var result =
+                        ServiceReplay.verify(
+                                root.resolve(profiles.get(1)),
+                                ReplayConfig.from(document),
+                                service,
+                                root.resolve(reference),
+                                root.resolve(profiles.get(2)));
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result.get("result")));
+                return 0;
+            }
+            if (args[0].equals("analyze-locality")) {
+                if (profiles.size() != 3)
+                    throw new IllegalArgumentException(
+                            "analyze-locality requires TRACE CONFIG OUTPUT_DIRECTORY");
+                org.sibench.analysis.UpdateLocality.run(
+                        root.resolve(profiles.get(0)),
+                        root.resolve(profiles.get(1)),
+                        root.resolve(profiles.get(2)));
+                out.println(Files.readString(root.resolve(profiles.get(2)).resolve("summary.json")));
+                return 0;
+            }
             if (List.of("replay", "check-replay", "validate-snapshots").contains(args[0])) {
                 boolean check = args[0].equals("check-replay");
                 if (profiles.size() != (check ? 2 : 3))
@@ -395,16 +429,18 @@ public final class Sibench {
                             args[0]
                                     + " requires REPLAY_CONFIG NORMALIZED_DIRECTORY"
                                     + (check ? "" : " REPORT"));
-                ReplayConfig config = ReplayConfig.read(root, Path.of(profiles.get(0)));
+                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
+                ReplayConfig config = ReplayConfig.from(document);
+                var modes = ReplayConfig.rowIdModes(document);
                 Path directory = root.resolve(profiles.get(1));
                 var result =
                         check
                                 ? ReferenceReplay.check(directory, config)
                                 : args[0].equals("validate-snapshots")
                                         ? SnapshotLookupValidation.run(
-                                                directory, config, root.resolve(profiles.get(2)))
+                                                directory, config, modes, root.resolve(profiles.get(2)))
                                         : ReferenceReplay.run(
-                                                directory, config, root.resolve(profiles.get(2)));
+                                                directory, config, modes, root.resolve(profiles.get(2)));
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result));
                 return 0;
             }

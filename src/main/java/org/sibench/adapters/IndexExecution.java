@@ -16,20 +16,39 @@ import java.util.List;
 
 /** Executes one protocol request on a backend; shared by the server and in-process clients. */
 public final class IndexExecution {
-    /** One request executor behind a stream; the ordered and published modes provide one. */
+    /**
+     * One request executor behind a stream; the response may complete later. A large search
+     * result goes to {@code partial} in chunks ({@code more = true}) before the final response.
+     */
     @FunctionalInterface
     public interface Executor {
-        Response execute(Request request);
+        java.util.concurrent.CompletableFuture<Response> submit(
+                Request request, java.util.function.Consumer<Response> partial);
     }
+
+    /**
+     * Results per response message; a larger search result is sent in several chunks. About
+     * 1 MB, so a chunk fits gRPC's default 4 MiB inbound message limit.
+     */
+    static final int CHUNK_RESULTS = 16_384;
 
     private IndexExecution() {}
 
+    /** Executes a request whose results, if any, fit one message. */
     public static Response execute(IndexBackend backend, Request request) {
+        return execute(backend, request, chunk -> {
+            throw new IllegalStateException("Unexpected partial response");
+        });
+    }
+
+    public static Response execute(
+            IndexBackend backend, Request request, java.util.function.Consumer<Response> partial) {
         var response = Response.newBuilder().setId(request.getId());
         try {
             switch (request.getOperationCase()) {
                 case WRITE -> backend.write(request.getWrite());
-                case SEARCH -> response.addAllResults(backend.search(request.getSearch()));
+                case BATCH -> batch(backend, request.getBatch());
+                case SEARCH -> response = search(backend, request, partial);
                 case GROUP -> response.addAllResults(group(backend, request.getGroup()));
                 default -> throw new IllegalArgumentException("Request without an operation");
             }
@@ -39,6 +58,34 @@ public final class IndexExecution {
         } catch (IOException | RuntimeException error) {
             return response.setStatus(Status.UNAVAILABLE).setMessage(String.valueOf(error)).build();
         }
+    }
+
+    /** A batch of Baseline INSERTs; any other write refuses the whole batch before applying it. */
+    static void batch(IndexBackend backend, org.sibench.adapters.proto.WriteBatch batch) throws IOException {
+        for (var write : batch.getWritesList())
+            if (write.getKind() != org.sibench.adapters.proto.Write.Kind.INSERT || write.getVersion() != 0)
+                throw new IllegalArgumentException("A write batch holds Baseline INSERTs only");
+        for (var write : batch.getWritesList()) backend.write(write);
+    }
+
+    /**
+     * Runs a search, handing every full chunk of results to {@code partial} as a response with
+     * {@code more = true}; the returned builder holds the remaining results.
+     */
+    static Response.Builder search(
+            IndexBackend backend, Request request, java.util.function.Consumer<Response> partial)
+            throws IOException {
+        var chunk = new Response.Builder[] {Response.newBuilder().setId(request.getId())};
+        backend.search(
+                request.getSearch(),
+                result -> {
+                    chunk[0].addResults(result);
+                    if (chunk[0].getResultsCount() == CHUNK_RESULTS) {
+                        partial.accept(chunk[0].setStatus(Status.OK).setMore(true).build());
+                        chunk[0] = Response.newBuilder().setId(request.getId());
+                    }
+                });
+        return chunk[0];
     }
 
     /**

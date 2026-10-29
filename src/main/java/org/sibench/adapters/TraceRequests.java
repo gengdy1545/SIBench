@@ -40,13 +40,16 @@ public final class TraceRequests {
             long sourceEvent, long workUnitId, String digest, List<Operation> members) {}
 
     private final ValueKind valueKind;
-    private final AtomicLong checksum = new AtomicLong(), results = new AtomicLong(), queries = new AtomicLong();
+    private final AtomicLong results = new AtomicLong(), queries = new AtomicLong();
     private final BufferedReader expectedInput;
     private String pendingExpectedLine;
     private final Map<Long, Expected> expected = new ConcurrentHashMap<>();
+    private final AtomicLong skippedQueries = new AtomicLong();
+    private boolean snapshotReads;
     private final AtomicLong digestChecks = new AtomicLong(), digestMismatches = new AtomicLong();
-    /** The last send position handed out; requests are built on the single sending thread. */
-    private long sequence;
+    private final AtomicLong requestBytes = new AtomicLong(), resultBytes = new AtomicLong();
+    private final AtomicLong maxResults = new AtomicLong(), maxExpected = new AtomicLong(), maxGroupMembers = new AtomicLong();
+    private volatile int baselineBatch = 1;
     /** The source transaction of the requests being built and its sent-operation counters. */
     private long currentTransaction, currentOperation, currentWrites;
 
@@ -87,19 +90,77 @@ public final class TraceRequests {
         }
     }
 
+    /**
+     * Searches of an index that already holds the whole trace: they go out as plain snapshot reads
+     * at their read version, without the transaction position a live replay sends.
+     */
+    public void snapshotReads() {
+        snapshotReads = true;
+    }
+
+    /** Consumes the expected digest of a search that is deliberately not sent, keeping order. */
+    public void skipExpected(List<Operation> members) throws IOException {
+        if (expectedInput == null) return;
+        expect(-1, members);
+        expected.remove(-1L);
+        skippedQueries.incrementAndGet();
+    }
+
+    public long skippedQueries() {
+        return skippedQueries.get();
+    }
+
     public ValueKind valueKind() {
         return valueKind;
     }
 
     /** A write or a search that is not part of a group. */
     public Request request(long id, Operation operation) throws IOException {
-        var request = Request.newBuilder().setId(id).setSequence(++sequence);
+        var request = Request.newBuilder().setId(id);
         if (operation.kind() == IndexOperationTrace.SEARCH) {
             if (operation.grouped()) throw new IOException("Group members are sent as one group");
             expect(id, List.of(operation));
             transaction(request, operation);
-            return request.setSearch(search(operation)).build();
+            return countRequest(request.setSearch(search(operation)).build());
         }
+        transaction(request, operation);
+        return countRequest(request.setWrite(write(operation)).build());
+    }
+
+    /** Baseline INSERTs sent as one request; a batch takes one send position. */
+    public Request batch(long id, List<Operation> inserts) throws IOException {
+        var batch = org.sibench.adapters.proto.WriteBatch.newBuilder();
+        for (Operation insert : inserts) {
+            if (!baselineInsert(insert)) throw new IOException("Only Baseline INSERTs travel in a batch");
+            batch.addWrites(write(insert));
+        }
+        return countRequest(Request.newBuilder().setId(id).setBatch(batch).build());
+    }
+
+    static boolean baselineInsert(Operation operation) {
+        return operation.kind() == IndexOperationTrace.INSERT
+                && operation.version() == 0
+                && operation.transactionId() == 0;
+    }
+
+    /** A write batch response carries no results. */
+    public void checkBatch(Response response) throws IOException {
+        if (response.getStatus() != Status.OK)
+            throw new IOException("Service " + response.getStatus() + " for a write batch: " + response.getMessage());
+        if (response.getResultsCount() != 0) throw new IOException("Write batch returned results");
+    }
+
+    /** Baseline INSERTs per batch request; 1 sends each on its own. */
+    public void baselineBatch(int writes) {
+        if (writes < 1) throw new IllegalArgumentException("A batch holds at least one write");
+        baselineBatch = writes;
+    }
+
+    int baselineBatch() {
+        return baselineBatch;
+    }
+
+    private Write.Builder write(Operation operation) throws IOException {
         Write.Kind kind = switch (operation.kind()) {
             case IndexOperationTrace.INSERT -> Write.Kind.INSERT;
             case IndexOperationTrace.UPSERT -> Write.Kind.UPSERT;
@@ -116,8 +177,7 @@ public final class TraceRequests {
                         .setPrimaryKey(bytes(operation.key())))
                 .setVersion(operation.version());
         if (kind != Write.Kind.LOGICAL_DELETE) write.setValue(value(operation));
-        transaction(request, operation);
-        return request.setWrite(write).build();
+        return write;
     }
 
     /** The members of one search group, in trace order. */
@@ -130,15 +190,16 @@ public final class TraceRequests {
                         ? SearchGroup.Mode.INTERSECTION
                         : SearchGroup.Mode.UNION);
         for (Operation member : members) group.addMembers(search(member));
-        var request = Request.newBuilder().setId(id).setSequence(++sequence);
+        var request = Request.newBuilder().setId(id);
         transaction(request, first);
-        return request.setGroup(group).build();
+        maxGroupMembers.accumulateAndGet(members.size(), Math::max);
+        return countRequest(request.setGroup(group).build());
     }
 
     /** Marks the request with its source transaction and sent-operation position. */
     private void transaction(Request.Builder request, Operation operation) throws IOException {
         long transaction = operation.transactionId();
-        if (transaction <= 0) return;
+        if (transaction <= 0 || snapshotReads) return;
         if (currentTransaction != transaction) {
             currentTransaction = transaction;
             currentOperation = 0;
@@ -163,7 +224,7 @@ public final class TraceRequests {
         var request =
                 Request.newBuilder()
                         .setId(id)
-                        .setSequence(++sequence)
+
                         .setTransactionId(transactionId)
                         .setTransactionOperation(0)
                         .setCommit(
@@ -174,7 +235,7 @@ public final class TraceRequests {
         currentTransaction = 0;
         currentOperation = 0;
         currentWrites = 0;
-        return request.build();
+        return countRequest(request.build());
     }
 
     private Search search(Operation operation) {
@@ -240,6 +301,7 @@ public final class TraceRequests {
                             + "/"
                             + unit);
         expected.put(id, new Expected(event, unit, fields[2], members));
+        maxExpected.accumulateAndGet(expected.size(), Math::max);
     }
 
     /**
@@ -247,25 +309,96 @@ public final class TraceRequests {
      * it answers. Writes and requests without an expected stream check only the native shape.
      */
     public void check(Operation operation, Response response) throws IOException {
-        if (response.getStatus() != Status.OK)
-            throw new IOException("Service " + response.getStatus() + " at source event "
-                    + operation.sourceEvent() + ": " + response.getMessage());
-        if (operation.kind() == IndexOperationTrace.SEARCH) {
-            if (response.getResultsCount() != operation.expectedCount())
+        receive(operation, response.getId()).finish(response);
+    }
+
+    /** The response to request {@code id}, received as one or more chunks. */
+    public Received receive(Operation operation, long id) {
+        return new Received(operation, id);
+    }
+
+    /**
+     * One response being received: counts and digest accumulate per chunk, so a large
+     * result is never held whole. The digest starts from the native expected count; a different
+     * number of results fails the count check before the digest is compared.
+     */
+    public final class Received {
+        private final Operation operation;
+        private final long id;
+        private final Expected wanted;
+        private final QueryDigest.Incremental digest;
+        private long count, bytes;
+        private IOException failure;
+
+        private Received(Operation operation, long id) {
+            this.operation = operation;
+            this.id = id;
+            this.wanted = operation.kind() == IndexOperationTrace.SEARCH ? expected.get(id) : null;
+            this.digest =
+                    wanted == null
+                            ? null
+                            : new QueryDigest.Incremental(
+                                    wanted.members(),
+                                    operation.expectedCount(),
+                                    valueKind == ValueKind.ROW_ID);
+        }
+
+        /** Chunks as a transport delivers them; a failure is reported by {@link #finish}. */
+        public java.util.function.Consumer<Response> partial() {
+            return chunk -> {
+                if (failure != null) return;
+                try {
+                    add(chunk);
+                } catch (IOException error) {
+                    failure = error;
+                }
+            };
+        }
+
+        /** A chunk with {@code more = true}: results only. */
+        public void add(Response chunk) throws IOException {
+            if (chunk.getId() != id || !chunk.getMore() || chunk.getStatus() != Status.OK)
+                throw new IOException("Invalid partial response for request " + id);
+            if (operation.kind() != IndexOperationTrace.SEARCH)
+                throw new IOException("Partial response to a write");
+            accept(chunk);
+        }
+
+        private void accept(Response chunk) throws IOException {
+            count += chunk.getResultsCount();
+            if (count > operation.expectedCount())
                 throw new IOException("Search count mismatch at source event " + operation.sourceEvent()
-                        + ": expected " + operation.expectedCount() + ", found " + response.getResultsCount());
-            long words = 0;
-            for (Result result : response.getResultsList()) words ^= word(result);
-            checksum.getAndAccumulate(words, (a, b) -> a ^ b);
-            results.addAndGet(response.getResultsCount());
+                        + ": expected " + operation.expectedCount() + ", found more");
+            for (Result result : chunk.getResultsList()) {
+                bytes += result.getSerializedSize();
+                if (digest != null) digest.add(result);
+            }
+        }
+
+        /** The final response (more = false): status, the remaining results and every check. */
+        public void finish(Response response) throws IOException {
+            if (failure != null) throw failure;
+            if (response.getMore()) throw new IOException("Final response marked partial");
+            if (response.getStatus() != Status.OK)
+                throw new IOException("Service " + response.getStatus() + " at source event "
+                        + operation.sourceEvent() + ": " + response.getMessage());
+            if (operation.kind() != IndexOperationTrace.SEARCH) {
+                if (count + response.getResultsCount() != 0) throw new IOException("Write returned results");
+                if (expected.remove(response.getId()) != null)
+                    throw new IOException("Expected a search result but the request was a write");
+                return;
+            }
+            accept(response);
+            if (count != operation.expectedCount())
+                throw new IOException("Search count mismatch at source event " + operation.sourceEvent()
+                        + ": expected " + operation.expectedCount() + ", found " + count);
+            results.addAndGet(count);
             queries.incrementAndGet();
-            Expected wanted = expected.remove(response.getId());
+            resultBytes.addAndGet(bytes);
+            maxResults.accumulateAndGet(count, Math::max);
             if (wanted != null) {
-                String actual =
-                        QueryDigest.ofResponse(
-                                wanted.members(),
-                                response.getResultsList(),
-                                valueKind == ValueKind.ROW_ID);
+                expected.remove(id);
+                String actual = digest.hex();
                 if (!actual.equals(wanted.digest())) {
                     digestMismatches.incrementAndGet();
                     throw new IOException(
@@ -280,11 +413,7 @@ public final class TraceRequests {
                 }
                 digestChecks.incrementAndGet();
             }
-            return;
         }
-        if (response.getResultsCount() != 0) throw new IOException("Write returned results");
-        if (expected.remove(response.getId()) != null)
-            throw new IOException("Expected a search result but the request was a write");
     }
 
     /** A commit marker response carries no results. */
@@ -295,17 +424,6 @@ public final class TraceRequests {
                             + response.getMessage());
         if (response.getResultsCount() != 0)
             throw new IOException("Commit marker returned results");
-    }
-
-    /** The reference replay's word: the row id, or the Locator packed as file << 32 | position. */
-    private long word(Result result) {
-        return valueKind == ValueKind.ROW_ID
-                ? result.getValue().getRowId()
-                : (result.getValue().getFile() << 32) | result.getValue().getPosition();
-    }
-
-    public long checksum() {
-        return checksum.get();
     }
 
     public long checkedResults() {
@@ -322,6 +440,26 @@ public final class TraceRequests {
 
     public long digestMismatches() {
         return digestMismatches.get();
+    }
+
+    public long requestBytes() {
+        return requestBytes.get();
+    }
+
+    public long resultBytes() {
+        return resultBytes.get();
+    }
+
+    public long maxResults() {
+        return maxResults.get();
+    }
+
+    public long maxExpected() {
+        return maxExpected.get();
+    }
+
+    public long maxGroupMembers() {
+        return maxGroupMembers.get();
     }
 
     /**
@@ -343,5 +481,10 @@ public final class TraceRequests {
                             + queries
                             + " queries");
         expectedInput.close();
+    }
+
+    private Request countRequest(Request request) {
+        requestBytes.addAndGet(request.getSerializedSize());
+        return request;
     }
 }

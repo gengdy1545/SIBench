@@ -98,13 +98,15 @@ public class SnapshotLookupValidationTest {
                                     if (value != null)
                                         created.baseline =
                                                 new Row(0, change[1], 0, 0, Map.of(1, key(value)));
+                                    created.remember(created.baseline);
                                     return created;
                                 });
-                history.commits.put(
-                        change[0],
+                Row row =
                         change[2] < 0
                                 ? null
-                                : new Row(change[0], change[3], 0, 0, Map.of(1, key(change[2]))));
+                                : new Row(change[0], change[3], 0, 0, Map.of(1, key(change[2])));
+                history.commits.put(change[0], row);
+                history.remember(row);
             }
         }
 
@@ -181,7 +183,7 @@ public class SnapshotLookupValidationTest {
                             SnapshotLookupValidation.spread(new ArrayList<>(changedValues), 4)))
                 probes.add(new RangeProbe(TABLE, 1, range));
             for (RangeProbe probe : probes) {
-                probe.changed.addAll(histories.entrySet());
+                probe.select(SnapshotLookupValidation.changed(histories, probe.index));
                 for (var row : baseline.entrySet()) {
                     IndexKey id = key(row.getKey());
                     if (histories.containsKey(id)) continue;
@@ -243,7 +245,7 @@ public class SnapshotLookupValidationTest {
         var fixture = new Fixture();
         var probe =
                 new RangeProbe(TABLE, 0, new Range(key(18), true, key(22), true, false, 32));
-        probe.changed.addAll(fixture.histories.entrySet());
+        probe.select(SnapshotLookupValidation.changed(fixture.histories, 0));
         probe.offer(new Entry(key(18), key(18), 18, 0, 0));
         probe.offer(new Entry(key(22), key(22), 22, 0, 0));
         // 20 is deleted at 2 and reinserted at 6; 21 lives from 3 to 5.

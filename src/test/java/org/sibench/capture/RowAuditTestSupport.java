@@ -21,6 +21,8 @@ import java.util.*;
 /** Independent JDBC fixture: SQL results are supplied rows, not audit-derived expectations. */
 final class RowAuditTestSupport {
     private static final Gson JSON = new GsonBuilder().serializeNulls().create();
+    private static final java.util.concurrent.atomic.AtomicLong WRITES =
+            new java.util.concurrent.atomic.AtomicLong();
 
     private RowAuditTestSupport() {}
 
@@ -527,6 +529,7 @@ final class RowAuditTestSupport {
                 out.write('\n');
             }
         }
+        bump(file);
         return file;
     }
 
@@ -534,7 +537,16 @@ final class RowAuditTestSupport {
         try (var out = new com.github.luben.zstd.ZstdOutputStream(Files.newOutputStream(file))) {
             out.write(bytes);
         }
+        bump(file);
         return file;
+    }
+
+    /** FileDigests keys on size and mtime; make a test rewrite observably newer. */
+    private static void bump(Path file) throws Exception {
+        Files.setLastModifiedTime(
+                file,
+                java.nio.file.attribute.FileTime.fromMillis(
+                        System.currentTimeMillis() + 5_000 + WRITES.incrementAndGet()));
     }
 
     static List<String> readTrace(Path file) throws Exception {

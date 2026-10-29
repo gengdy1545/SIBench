@@ -145,6 +145,33 @@ public final class SnapshotLookupValidation {
     private static final Comparator<Entry> ENTRY_ORDER =
             Comparator.comparing(Entry::value).thenComparing(Entry::key);
 
+    /** A changed row under one value it holds in an index at some version (its PK for index 0). */
+    record Changed(IndexKey value, IndexKey key, History history) {
+        Entry entry() {
+            return new Entry(value, key, 0, 0, 0);
+        }
+    }
+
+    private static final Comparator<Changed> CHANGED_ORDER =
+            Comparator.comparing(Changed::value).thenComparing(Changed::key);
+
+    /** One table's changed rows under every value they hold in the index at some version. */
+    static List<Changed> changed(Map<IndexKey, History> rows, int index) {
+        var changed = new ArrayList<Changed>();
+        rows.forEach(
+                (key, history) -> {
+                    if (index == 0) {
+                        if (history.baseline != null
+                                || history.commits.values().stream().anyMatch(Objects::nonNull))
+                            changed.add(new Changed(key, key, history));
+                    } else
+                        for (IndexKey value : history.indexedValues.getOrDefault(index, Set.of()))
+                            changed.add(new Changed(value, key, history));
+                });
+        changed.sort(CHANGED_ORDER);
+        return changed;
+    }
+
     /** The values of one index over the whole baseline: its extremes and an even sample. */
     private static final class Domain {
         final List<IndexKey> sample = new ArrayList<>();
@@ -175,8 +202,8 @@ public final class SnapshotLookupValidation {
         final int table, index;
         final Range range;
         final TreeSet<Entry> unchanged;
-        // Rows of one table, each once: only iterated, so no map (integer keys' own hash collides).
-        final List<Map.Entry<IndexKey, History>> changed = new ArrayList<>();
+        /** Changed rows under each value in the range they ever hold, in the search's order. */
+        final List<Changed> changed = new ArrayList<>();
         final SortedSet<Long> times = new TreeSet<>();
 
         RangeProbe(int table, int index, Range range) {
@@ -188,38 +215,52 @@ public final class SnapshotLookupValidation {
 
         void offer(Entry entry) {
             if (!range.contains(entry.value())) return;
+            if (unchanged.size() >= range.limit()
+                    && unchanged.comparator().compare(entry, unchanged.last()) >= 0) return;
             unchanged.add(entry);
             if (unchanged.size() > range.limit()) unchanged.pollLast();
+        }
+
+        /** Keeps the changed entries in the range, in the search's order. */
+        void select(List<Changed> sorted) {
+            for (Changed change : sorted) if (range.contains(change.value())) changed.add(change);
+            if (range.descending()) Collections.reverse(changed);
         }
 
         IndexKey value(IndexKey key, Row row) {
             return index == 0 ? key : row.indexes().get(index);
         }
 
-        /** Whether the row's entry in this index lies in the range; a deleted row has none. */
-        boolean contains(IndexKey key, Row row) {
-            if (row == null) return false;
-            IndexKey value = value(key, row);
-            return value != null && range.contains(value);
-        }
-
-        boolean ever(IndexKey key, History history) {
-            if (contains(key, history.baseline)) return true;
-            for (Row row : history.commits.values()) if (contains(key, row)) return true;
-            return false;
-        }
-
+        /**
+         * The first {@code limit} entries at the time: unchanged and changed rows are disjoint and
+         * both in search order, so the first {@code limit} changed rows holding their listed value
+         * at the time, merged with the unchanged ones, are the answer.
+         */
         List<LookupResult> expected(long time, boolean rowIds) {
-            var candidates = new TreeMap<Entry, LookupResult>(unchanged.comparator());
-            for (Entry entry : unchanged) candidates.put(entry, entry.result(rowIds));
-            for (var change : changed) {
-                Row row = change.getValue().at(time);
-                if (contains(change.getKey(), row))
-                    candidates.put(
-                            new Entry(value(change.getKey(), row), change.getKey(), 0, 0, 0),
-                            row.result(change.getKey(), rowIds));
+            var order = unchanged.comparator();
+            var current = new ArrayList<Changed>();
+            for (Changed change : changed) {
+                if (current.size() == range.limit()) break;
+                Row row = change.history().at(time);
+                if (row != null && change.value().equals(value(change.key(), row)))
+                    current.add(change);
             }
-            return candidates.values().stream().limit(range.limit()).toList();
+            var results = new ArrayList<LookupResult>();
+            Iterator<Entry> base = unchanged.iterator();
+            Entry nextBase = base.hasNext() ? base.next() : null;
+            int nextChanged = 0;
+            while (results.size() < range.limit() && (nextBase != null || nextChanged < current.size())) {
+                Changed change = nextChanged < current.size() ? current.get(nextChanged) : null;
+                if (change == null
+                        || nextBase != null && order.compare(nextBase, change.entry()) < 0) {
+                    results.add(nextBase.result(rowIds));
+                    nextBase = base.hasNext() ? base.next() : null;
+                } else {
+                    results.add(change.history().at(time).result(change.key(), rowIds));
+                    nextChanged++;
+                }
+            }
+            return results;
         }
 
         @Override
@@ -278,6 +319,14 @@ public final class SnapshotLookupValidation {
 
     public static Map<String, Object> run(Path directory, ReplayConfig config, Path report)
             throws IOException {
+        return run(directory, config, List.of(false, true), report);
+    }
+
+    /** {@code rowIdModes}: the value modes whose reference model is checked, as row-id flags. */
+    public static Map<String, Object> run(
+            Path directory, ReplayConfig config, List<Boolean> rowIdModes, Path report)
+            throws IOException {
+        if (rowIdModes.isEmpty()) throw new IOException("No value mode to check");
         if (Files.exists(report))
             throw new IOException("Snapshot report already exists: " + report);
         var baseline = org.sibench.capture.BaselineOperations.of(directory);
@@ -504,24 +553,41 @@ public final class SnapshotLookupValidation {
                         if (retained) locations.add(table, key, row.rowId(), row.file(), row.position());
                     },
                     null);
+        // Every changed row under every value it holds, sorted once per index: probes and
+        // predicates select from it instead of scanning every history.
+        Map<Integer, Map<IndexKey, History>> changedRows = new HashMap<>();
+        histories.forEach(
+                (key, history) ->
+                        changedRows
+                                .computeIfAbsent(key.table(), ignored -> new LinkedHashMap<>())
+                                .put(key.key(), history));
+        Map<String, List<Changed>> changedByIndex = new HashMap<>();
+        for (var definition : catalog.definitions())
+            changedByIndex.put(
+                    definition.tableId() + "/" + definition.indexId(),
+                    changed(
+                            changedRows.getOrDefault(definition.tableId(), Map.of()),
+                            definition.indexId()));
+        Map<Predicate, List<Changed>> relevantByPredicate = new HashMap<>();
+        for (Predicate predicate : buckets.keySet())
+            relevantByPredicate.put(
+                    predicate,
+                    changedByIndex.get(predicate.table() + "/" + predicate.index()).stream()
+                            .filter(change -> change.value().equals(predicate.value()))
+                            .toList());
         for (RangeProbe probe : probes) {
             probe.times.addAll(List.of(0L, lastCommit[0]));
+            probe.select(changedByIndex.get(probe.table + "/" + probe.index));
             long first = Long.MAX_VALUE;
-            // Only a row whose entry lies in the range at some version can ever be returned, so
-            // each probe keeps those alone; keeping every changed row of the table in every probe
-            // made memory the probe count times the changed rows.
-            for (var change : histories.entrySet())
-                if (change.getKey().table() == probe.table && probe.ever(change.getKey().key(), change.getValue())) {
-                    probe.changed.add(Map.entry(change.getKey().key(), change.getValue()));
-                    first = Math.min(first, change.getValue().commits.firstKey());
-                }
+            for (Changed change : probe.changed)
+                first = Math.min(first, change.history().commits.firstKey());
             if (first != Long.MAX_VALUE) {
                 probe.times.add(first - 1);
                 probe.times.add(first);
             }
         }
         List<Map<String, Object>> modes = new ArrayList<>();
-        for (boolean rowIds : new boolean[] {false, true}) {
+        for (boolean rowIds : rowIdModes) {
             try (var model = new IndexReferenceReplay(rowIds, config.secondaryIndexes());
                     var load = new ReplayProjection(config, false, model::accept);
                     var runtime = new ReplayProjection(config, true, model::accept)) {
@@ -574,24 +640,20 @@ public final class SnapshotLookupValidation {
                 for (var entry : buckets.entrySet()) {
                     Predicate predicate = entry.getKey();
                     Keys keys = entry.getValue();
-                    var relevant = new ArrayList<Map.Entry<IndexKey, History>>();
+                    var relevant = relevantByPredicate.getOrDefault(predicate, List.of());
                     var times = new TreeSet<Long>(List.of(0L, lastCommit[0]));
                     long first = Long.MAX_VALUE;
-                    for (var change : histories.entrySet())
-                        if (change.getKey().table() == predicate.table()
-                                && matchesHistory(change.getValue(), predicate)) {
-                            relevant.add(Map.entry(change.getKey().key(), change.getValue()));
-                            first = Math.min(first, change.getValue().commits.firstKey());
-                        }
+                    for (Changed change : relevant)
+                        first = Math.min(first, change.history().commits.firstKey());
                     if (first != Long.MAX_VALUE) {
                         times.add(first - 1);
                         times.add(first);
                     }
                     for (long time : times) {
                         long expectedCount = keys.size;
-                        for (var change : relevant) {
-                            if (keys.contains(change.getKey())) expectedCount--;
-                            if (matches(change.getValue().at(time), predicate)) expectedCount++;
+                        for (Changed change : relevant) {
+                            if (keys.contains(change.key())) expectedCount--;
+                            if (matches(change.history().at(time), predicate)) expectedCount++;
                         }
                         var actual =
                                 model.lookupSecondary(
@@ -703,11 +765,6 @@ public final class SnapshotLookupValidation {
         return row != null
                 && row.indexes().containsKey(predicate.index())
                 && Objects.equals(row.indexes().get(predicate.index()), predicate.value());
-    }
-
-    private static boolean matchesHistory(History history, Predicate predicate) {
-        return matches(history.baseline, predicate)
-                || history.commits.values().stream().anyMatch(row -> matches(row, predicate));
     }
 
     private static SortedSet<Long> times(History history, long last) {

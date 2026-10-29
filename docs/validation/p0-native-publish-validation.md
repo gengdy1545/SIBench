@@ -1,6 +1,6 @@
-# P0 原生反例、短流程矩阵与完整提交发布
+# 原生读取反例与完整提交发布验证
 
-更新：2026-10-27。远程 `sibench_3`（PG 14.24 插桩 runtime，32 CPU cgroup）上的小型实验；不是正式性能实验，也不是 SF10 规模结论。
+更新：2026-10-29。保留直接支持当前读取语义、发布不变量与组合正确性的证据。已有实验按记录中的构建解释；当前服务协议 2 只提供完整提交发布，不维护旧执行器。配置与命令细节由所选运行的快照保存，当前使用入口见 [README](../../README.md)。
 
 ## 原生两会话反例
 
@@ -24,33 +24,22 @@
 | `trace/workload.ops` | 本地读 `event=38`、`read=0`、`version=2`、`ordinal=1` |
 | `replay.json`、`snapshots.json` | 参考回放 / 独立 Parquet oracle `passed` |
 | `service-locator.json`、`service-rowid.json` | 进程内 RocksDB 3/3 查询摘要通过 |
-| `service-publication.json`、`service-ordered2.json` | gRPC 完整发布与全序诊断 3/3 查询摘要通过 |
+| `service-publication.json` | gRPC 完整发布 3/3 查询摘要通过 |
 | `old-semantics.txt` | 旧读取点返回 `2000001@v1` 的反事实 |
 
-命令（在 `/data/sibench`，新 jar 为 `native/sibench-run.jar` / `sibench-p0-perf.jar`）：
+该手工实验没有 PG index counter 前后快照，`capture_completeness=not_checked`；行审计、请求配对和会话审计通过。它证明快照与本事务写入语义，不能替代 PG 计数器完整性认证。
 
-```bash
-java -jar .../sibench-run.jar compile-trace config/p0_native_counterexample.yaml .../trace
-java -Xmx8g -jar .../sibench-run.jar replay config/index_replay.yaml .../trace .../replay.json
-java -Xmx8g -jar .../sibench-run.jar validate-snapshots config/index_replay.yaml .../trace .../snapshots.json
-java -Xmx8g -jar .../sibench-run.jar replay-service config/p0_native_service_locator.yaml .../trace .../service-locator.json
-java -Xmx8g -jar .../sibench-run.jar replay-service config/p0_replay_publication.yaml .../trace .../service-publication.json
-java -Xmx8g -jar .../sibench-run.jar replay-service config/p0_replay_ordered.yaml .../trace .../service-ordered2.json
-```
-
-`capture_completeness=not_checked`：该手工小实验没有取 PG index counter 前后快照；行审计、请求配对和 session audit 已通过。它证明快照 / 本事务写入语义，不建立 PG 计数器完整性。
-
-## 新语义短流程与 1/64/128 矩阵
+## sysbench 短流程与组合矩阵
 
 用新 jar 从 `sibench_sysbench_8m_base` 复跑一个短 sysbench 流程，未重采集 SF10：
 
-- 配置：`config/p0_sysbench_8m_short.yaml`；6 个固定 sysbench 脚本，事件数 500/500/500/200/200/1000。
+- 配置：历史一次性 profile 已归档到 [p0-sysbench-8m-short/config](../../results/poc/p0-sysbench-8m-short/config/p0_sysbench_8m_short.yaml)；6 个固定 sysbench 脚本，事件数 500/500/500/200/200/1000。
 - `run` 73.4 s；行审计 28.2 s；编译 0.25 s。
 - `baseline_rows=8,706,000`，`workload_operations=24,300`，`source_work_units=11,400`，`transaction_local_searches=1,000`，`search_operations=10,700`。
 - `baseline_trace_sha256=7dc20a21756b20f780f5f8c3b8551aa86765f2f5596c9d90ac8f866589587505`，`workload_trace_sha256=c85751aac0e7a0fe054116c5ca9811fe671cebf98bb5fda32f01a3b00507420a`，`access_ledger_sha256=1b06c64fa03cba343c5be6e1d6211e2f639ccca761262af0b6fe30590d66baa9`，`capture_completeness=consistent`。
 - `validate-replay-matrix`：`status=passed`，12 个变体（1/64/128 × operation/transaction × 二级开/关），Locator / RowID 逐查询摘要和 Parquet oracle 通过。耗时约 7 分钟；矩阵报告在 `matrix/matrix.json`。
 
-证据目录：`/data/sibench/results/poc/p0-sysbench-8m-short/`（trace、matrix 与 64 client 报告已复制到本地同名 `results/poc/`；8.45 GB Baseline 留在远程）。
+证据目录：`/data/sibench/results/poc/p0-sysbench-8m-short/`（本地同名 `results/poc/` 保留 Trace、矩阵、报告与 Baseline 副本）。
 
 ## SF10 结果影响
 
@@ -61,23 +50,10 @@ java -Xmx8g -jar .../sibench-run.jar replay-service config/p0_replay_ordered.yam
 - 分组本地查询记录 3,530,167 条（156 个额外成员属于同一搜索组，组结果已合并核对）；**changed=0，missing=0**。该样本没有触发结果变化；原生小反例仍证明旧语义会返回另一主键。
 - 证据：`/data/sibench/results/poc/hybench-sf10-hl9/impact-compare.txt`，本地小副本见 `results/poc/p0-native-counterexample-20261027/impact-compare.txt`。这不是错误率，也不是正式性能结论。
 
-## 完整提交发布 vs 全序诊断
+## 发布与回归证据
 
-协议新增 `Commit`、`transaction_id` / `transaction_operation`、`complete_commit_publication`、`FlushResponse.published_version`。`PublishedIndex` 以事务 lane 执行，版本只在提交标记到达且全部写入应用后连续发布；查询等待 `read_version`，事务内查询还等待同一事务前缀。
+原生小 Trace 的 operation / transaction 完整发布回放各核对 3 次摘要、0 不匹配，提交标记数与发布水位均为 2。短 sysbench 的 64 client 完整发布也通过，水位 2,900，10,700 次摘要 / 208,500 个结果项。三来源目标规模与最终重开证据见 [完整验收](p0-three-source-acceptance.md)。
 
-原生小 Trace 结果：
+有意义的失败保留在 `p0-publication-timeout-20261027T2332`：首次失败为 dispatch 13,750 的 version 550 提交超时，水位停在 549，4,096 个请求线程阻塞在 lane / 发布等待，后续连接关闭栈不是首因。当前实现只把就绪请求交给固定线程池，等待请求挂起且不占线程；受控交错验证在 [PublishedIndexTest](../../src/test/java/org/sibench/adapters/PublishedIndexTest.java)。重复小输入偶然通过、忽略结果的 workload-only 试验和混合来源的 `current` 报告不再作为保留结论或验收依据。
 
-| 模式 | 状态 | 查询 / 结果项 | 逐查询摘要 | `published_version` | commit markers |
-| --- | --- | ---: | ---: | ---: | ---: |
-| `sequence` 全序诊断 | passed | 3 / 3 | 3 | 0（未声明） | 0 |
-| 完整提交发布，operation 输入 | passed | 3 / 3 | 3 | 2 | 2 |
-| 完整提交发布，transaction 输入 | passed | 3 / 3 | 3 | 2 | 2 |
-
-短 sysbench Trace 的 64 client 完整发布回放已通过（`service-publication64c.json`）：64/64 client 使用，2,900 个提交标记，`published_version=2900`，10,700 个查询请求、208,500 个结果项、10,700 个逐查询摘要全部通过；driver 复用 1-client 矩阵报告的期望摘要 sidecar，避免再次在驱动内构建完整参考模型。基线加载 225.7 s / 77k ops/s，负载 10.6 s / 1.75k ops/s（含 64 client 与等待发布；不是稳态性能）。全序 64 client 对照 `service-ordered64.json` 同样 `passed`：64/64 client、10,700 查询、208,500 结果项、10,700 摘要，0 个 commit marker；两种模式的逐查询摘要一致。该 64 client 报告构建早于迟到 / 重复请求防御修复；正常输入结果不变，最终构建的远端复验仍待执行，最终代码由 296 项本地测试覆盖。实现为正确性参照：等待查询占用服务线程，未做非阻塞调度、恢复或高并发吞吐证明。
-
-## 未覆盖
-
-- SF10 / 87m 级本地结果-only 摘要影响比较已完成（changed=0），但 87m 级完整服务回放尚未执行。
-- 迟到 / 重复请求防御修复后的最终构建尚未重跑远端 64 client；现有 64 client 报告是修复前构建。
-- 生产规模提交发布、恢复后的水位、网络断连 / 未知写入诊断仍只做小型测试。
-- 原生小实验使用单机克隆和短流程，不等于三来源大 Trace 或正式性能。
+关闭不等于请求执行完成；提交、读取、流控与关闭的测试职责见 [发布不变量](p0-test-review.md)。保留独立反例与原始首次失败诊断，不继续维护旧序号调度或阻塞式执行路径。

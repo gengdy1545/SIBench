@@ -242,4 +242,58 @@ public class IndexReferenceSpillTest {
         }
         assertFalse(Files.exists(directory));
     }
+
+    /**
+     * A hot entry with far more versions than are read one by one, between quiet neighbours: every
+     * read point and both directions answer the newest version at or below it, hand-computed, in
+     * memory and with histories on disk; a transaction-local read sees exactly its own write.
+     */
+    @Test
+    public void aLongHistoryIsSkippedWithoutChangingAnyAnswer() throws Exception {
+        Path directory = temporary.newFolder().toPath();
+        for (var settings : List.of(IndexReferenceReplay.Settings.defaults(), tiny(directory))) {
+            try (var model = new IndexReferenceReplay(true, false, settings)) {
+                long event = 0;
+                for (int id = 1; id <= 5; id++)
+                    model.accept(IndexOperationTrace.write(
+                            ++event, IndexOperationTrace.INSERT, TABLE, 0, IndexKey.ofInt(id), 0, 1, id, id));
+                long[][] latest = new long[6][53];
+                for (int version = 1; version <= 52; version++) {
+                    for (int id = 1; id <= 5; id++)
+                        latest[id][version] = latest[id][version - 1] == 0 ? id : latest[id][version - 1];
+                    if (version > 50) continue;
+                    List<Integer> ids = new ArrayList<>(List.of(3));
+                    if (version == 10 || version == 30) ids.addAll(List.of(2, 4));
+                    int ordinal = 0;
+                    for (int id : ids) {
+                        long rowId = 100L * id + version;
+                        model.accept(IndexOperationTrace.write(
+                                        ++event, IndexOperationTrace.UPSERT, TABLE, 0, IndexKey.ofInt(id), version, 1, id, rowId)
+                                .withTransaction(version, ++ordinal));
+                        latest[id][version] = rowId;
+                    }
+                }
+                for (int id = 1; id <= 5; id++) latest[id][0] = id;
+                var all = new Range(null, false, null, false, false, 0);
+                var allDown = new Range(null, false, null, false, true, 0);
+                for (int time = 0; time <= 52; time++) {
+                    List<Long> up = new ArrayList<>(), down = new ArrayList<>();
+                    for (LookupResult result : model.search(TABLE, 0, all, time)) up.add(result.value());
+                    for (LookupResult result : model.search(TABLE, 0, allDown, time)) down.add(result.value());
+                    List<Long> expected = new ArrayList<>();
+                    for (int id = 1; id <= 5; id++) expected.add(latest[id][Math.min(time, 52)]);
+                    assertEquals("ascending at " + time, expected, up);
+                    java.util.Collections.reverse(expected);
+                    assertEquals("descending at " + time, expected, down);
+                }
+                // Transaction 51 writes key 3 at its first position; a later read of it sees the write.
+                model.accept(IndexOperationTrace.write(
+                                ++event, IndexOperationTrace.UPSERT, TABLE, 0, IndexKey.ofInt(3), 51, 1, 3, 999)
+                        .withTransaction(51, 1));
+                assertEquals(999, model.search(TABLE, 0, all, 50, 51, 51, 1).get(2).value());
+                assertEquals(350, model.search(TABLE, 0, all, 50, 51, 51, 0).get(2).value());
+                assertTrue("the long history was never skipped", model.skippedHistories() > 0);
+            }
+        }
+    }
 }

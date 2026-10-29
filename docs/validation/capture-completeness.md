@@ -10,8 +10,6 @@
 | YCSB | `results/poc/ycsb-8m/` | `.../ycsb_8m-v9.log` |
 | sysbench | `results/poc/sysbench-8m/` | `.../sysbench_8m-v9.log` |
 
-上一轮（2026-10-23 中午）的同名产物原样改名为 `results/poc/native-trace-20261022/superseded/<名称>-20261023-v9/`，其采集库改名为 `<库名>_20261023_v9`；内容未改写。这些旧产物没有采集前后的计数器快照，不能用于完整性对照，也不用于任何比较。
-
 ## 采集完整性对照
 
 原生执行前后各取一次 `pg_stat_user_indexes` 快照（等其它会话退出且两次读数一致后才记录），`check-capture-completeness` 按 PG14 计数位置核对账本。三来源均为 `consistent`，没有不一致的索引。
@@ -24,7 +22,7 @@
 
 HyBench 上 `idx_tup_fetch` 小于候选数且不等于账本的可见行：`idx_loanapps_1` 候选 2,070,231、回表可见行 1,710,231；纯 bitmap 路径的索引（如 `idx_transfer_3`，17,408,201 个候选）`idx_tup_fetch` 为 0。bitmap 堆检查不经过 `index_fetch_heap`，所以比较对象是账本的 `heap_fetch_visible`，而不是 `visible_rows`。
 
-边界：PG14 统计经 UDP 上报，丢失只会表现为计数低于账本；本轮未出现。尚未做故障注入（人为丢弃事件）与插桩前后开销对比，所以只能说明在本次负载下独立计数与账本一致，不能说明各类事件丢失都能被发现。
+边界：PG14 统计经 UDP 上报，丢失只会表现为计数低于账本；本轮未出现。未做人为丢事件的故障注入，只能说明这次负载的独立计数与账本一致；插桩开销由 [独立对照](capture-performance.md) 验证。
 
 ## 区间 oracle
 
@@ -51,7 +49,7 @@ Locator 与 RowID 两种模式的结果相同。HyBench 的 3,004,751 个原生�
 
 ## 同遍账本、计数器核对与认证
 
-2026-10-25。编译改为同遍构建账本并在提交前核对 PG 计数器，编译开头不再重跑会话审计（只核对运行清单中已记录的审计与文件摘要），Trace 文件在写入时计算摘要。用改动后的代码重编三份按设计并发的采集（`--counters` 取各自的计数器快照），与原产物比较：
+编译同遍构建账本并在提交前核对 PG 计数器，复核采集时的审计与文件摘要，写 Trace 时计算摘要。2026-10-25 对三份并发采集的同 raw 对照如下，时间仅属于所记录的构建：
 
 | 来源 | Trace 数据文件 | 账本（不计输入摘要字段） | 计数器核对 | 编译耗时（s，原 → 现） |
 | --- | --- | --- | --- | --- |
@@ -61,7 +59,7 @@ Locator 与 RowID 两种模式的结果相同。HyBench 的 3,004,751 个原生�
 
 HyBench 的差异来自同一 `query_id` 的两种文本写法：单独的账本按文件名顺序读、编译按完成计数器顺序读，先见到的文本不同；显示文本已改为取字典序第一个，与读取顺序无关。编译的负载阶段因同遍构建账本多 6–27%，编译开头的核验从 686 s 降到 154 s（剩余为输入摘要）。
 
-单元测试覆盖：编译产出的账本与独立账本相同；计数器不一致时 Trace 保持未完成并写出核对报告；认证由完整核验的采集写出，同一采集凭认证（不带行审计）编译出相同的 `workload.ops`，删去一条访问路径或换一个构建即编译失败。真实采集上的认证流程待远程机的校准采集验证。
+单元测试覆盖：编译产出的账本与独立账本相同；计数器不一致时 Trace 保持未完成并写出核对报告；认证由完整核验的采集写出，同一采集凭认证（不带行审计）编译出相同的 `workload.ops`，删去一条访问路径或换一个构建即编译失败。真实并发采集的 full / certified 证据见 [并发采集](concurrent-native-capture.md)，代表规模结果见 [完整验收](p0-three-source-acceptance.md)。
 
 ## 有界状态
 
@@ -96,20 +94,9 @@ HyBench 的差异来自同一 `query_id` 的两种文本写法：单独的账本
 
 逐行采集只用于验收：HyBench rows 采集原始体积 38 GB，默认 12 GB 堆在编译的会话归并处内存不足（一个 AP 事务片段含上百万逐行事件），以 36 GB 堆重编；summary 采集不受影响。这次对照还发现并修复了一个问题：并发归并为每个事务片段新建访问划分，原先只有文件的第一个片段带格式声明，后续片段被当作逐行格式而拒绝汇总事件；现在格式按文件延续，`IndexTraceCompilerTest.concurrentSummaryCapturesCompileLikeTheirRows` 覆盖该路径。YCSB 派生副本仍有 3.5 GB，因为客户端 JDBC 文件是原样复制的（含每行列文本），实际 summary 采集的客户端只记哈希。
 
-## 产物清理记录
-
-2026-10-23 重新采集后，旧产物不再用于任何比较（缺少计数器快照，且格式已从 v8 变为 v9），按用户确认回收其重量级载荷：
-
-- `results/poc/native-trace-20261022/`（含 `superseded/`）与 `results/poc/sysbench-small-20261021/`：删除全部 `raw*` / `trace*` 目录及 `*.jsonl`、`*.parquet`、`*.ops`、`*.jar`、`*.tsv`、`*.bin`；共 639 个文件，回收 327 GiB。
-- `results/poc/native-trace-20261023/recompile-sysbench`、`recompile-hybench`：重编译回归副本，已逐字节比对完毕（结论见上文「重编译回归」），整目录删除。
-- 保留：每份归档运行的 `manifest.json`、`trace-summary.json`、`access-ledger-summary.json`、`row-state-audit-summary.json`、`run-summary.json`、`run-timing.json`、`schema-preflight.json`、`verified-manifest.json`、`baseline.log`、`*.props`、`native/` 下除 jar 外的文件，以及 `native-trace-20261022/` 下的全部日志与 yaml。这些共约 6 MiB，仍能说明每次运行的事实与结果。
-- 未改动：当前三份产物（`hybench-htap-sf1`、`ycsb-8m`、`sysbench-8m`）、HyBench 原生工作目录 `hybench-sf1`，以及 `sibench_sf1_baseline_check` 采集源库。
-
-清单与日志保留、只删载荷，是因为 [仓库约定](../../AGENTS.md) 要求历史日志与清单按记录保留。删除不影响 git：`/results/` 已在 `.gitignore` 中。
-
 ## 不代表
 
-- 不是容量验收：落盘路径只在 SF1 规模的输入上与内存路径对照，没有在超过内存的输入上跑过。
+- 本页落盘与内存路径对照限于小输入；SF10 / 87m 的完整验收见对应报告，远超内存规模仍未验收。
 - 编译的提交窗口默认 400 万个写事务；更早的快照会直接失败，而不是静默读到「无提交」。
 - 分段续编译、Checkpoint 与恢复尚未接入编译与回放；`SpillingMap` 只提供由文件清单恢复的能力。
-- 汇总格式之后，Baseline 导出（sysbench 约 300 s、HyBench 约 400 s）仍未优化；行审计只在完整核验（认证）时运行。
+- 本页耗时只属于记录中的实验构建；当前生成成本与优化对照见 [采集性能](capture-performance.md) 和 [测量](p0-measurement.md)。行审计在 full 认证时运行，certified 复用匹配认证。

@@ -29,13 +29,13 @@
 
 目标为 Validity-Based Rewrite + Deterministic Bin-Packing，当前仅有独立强制搬迁控制，尚未实现自然触发。
 
-`Validity = RetainedRows / TotalRows`，`<=70%` 触发。RetainedRows 是当前版本与仍受保护历史点所需版本的去重集合；不能把受保护旧版本算作可回收，行比例也不等于字节比例。
+拟采用 `Validity = RetainedRows / TotalRows`，有效率阈值及最小可回收字节为待验证的策略参数。RetainedRows 是当前版本与仍受保护历史点所需版本的去重集合；不能把受保护旧版本算作可回收，行比例也不等于字节比例。
 
 在固定逻辑边界检查，按确定顺序在同 Table/Partition/Bucket 内装箱，使用相同文件、组及压缩规则。生成完整键、确切版本、旧/新 Locator 的 relocation；Locator 更新位置，RowID 不写索引。发布屏障完成且旧位置不再被在途操作引用后才回收旧文件。全部可回收时无需替代文件。
 
 Rewrite 不改变键、CommitVersion、RowID 或逻辑可见性。保留窗口、检查周期、装箱单位及并发失败处理仍需固定；所有 Backend 复用相同布局和发布序列。
 
-`check-relocation`（`RelocationCheck`）是 manifest 驱动的受控诊断：选择全部实际修改表的最新存活行，分配高于已有文件的 FileID，写回真实 Parquet 并更新全部源索引的精确版本 Locator；RowID 验证不产生索引搬迁写。它不保留或搬迁受保护旧版本，不自然触发、不回收旧文件；不能据此宣称 Rewrite 生命周期完成。参考模型仅把 Locator 打包为 int64（FileID 最大 `Integer.MAX_VALUE`，行位置最大 `0xffffffff`），超过宽度拒绝；通用 Locator 结构尚待实现。
+`check-relocation`（`RelocationCheck`）是 manifest 驱动的受控诊断：选择全部实际修改表的最新存活行，分配高于已有文件的 FileID，写回真实 Parquet 并更新全部源索引的精确版本 Locator；RowID 验证不产生索引搬迁写。它不保留或搬迁受保护旧版本，不自然触发、不回收旧文件；不能据此宣称 Rewrite 生命周期完成。Locator 由 FileID 与文件内行号两个 int64 表示，FileID 必须为正、行号非负；参考模型、搬迁与查询摘要均保留完整两个值。
 
 ## 真实索引测量
 
@@ -43,4 +43,4 @@ Rewrite 不改变键、CommitVersion、RowID 或逻辑可见性。保留窗口�
 
 记录吞吐/延迟、索引存储量、读写放大、维护、CPU/内存/GC、实际本地/EFS/S3 I/O；缺失指标为 N/A。上传 Trace/Parquet 不能证明索引存储能力。连接中断或写结果未知时保留诊断，不自动重试非幂等请求；恢复按 Backend 声明验证。
 
-当前无真实 Backend、对象存储性能或故障恢复验收。
+对象存储后端目前只有 rocksdb-cloud：短输入的结果核对、进程被杀后的重启与仅从 bucket 的冷启动已验证（[rocksdb-cloud 验证](../validation/rocksdb-cloud.md)），持久化层级见 [Index Service 契约](index-service.md#rocksdb-cloud-后端)。每次 Flush 后的引擎统计与对象存储请求计数写入 `<index>.engine-stats.jsonl`。三来源目标规模与成本见 [对象存储验收](../validation/rocksdb-cloud-scale.md)；正式性能排名和断电级耐久性未证明。

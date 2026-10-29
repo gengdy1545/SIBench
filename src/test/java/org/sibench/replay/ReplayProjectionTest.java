@@ -143,6 +143,46 @@ public class ReplayProjectionTest {
     }
 
     @Test
+    public void snapshotVerificationSendsAndSkipsSearchesInTraceOrderWithoutWrites()
+            throws Exception {
+        var events = new ArrayList<String>();
+        ReplayTarget.Factory target = clientId -> new ReplayTarget() {
+            @Override
+            public SendHandle send(long sequence, Operation operation) {
+                events.add("send " + operation.sourceEvent());
+                return SendHandle.completed();
+            }
+
+            @Override
+            public SendHandle sendCommit(long sequence, long transactionId, long version) {
+                events.add("commit " + transactionId);
+                return SendHandle.completed();
+            }
+        };
+        try (var replay =
+                ReplayProjection.snapshotSearches(
+                        new ReplayConfig(true, "none", 0, 0, 0, 0),
+                        target,
+                        members -> events.add("skip " + members.get(0).sourceEvent()))) {
+            replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
+            org.sibench.capture.TransferIndexFixtures.expandRow(mutation(5, 1, 1, 10, 1, 3), replay);
+            // A snapshot search, then a transaction-local one, inside the same transaction.
+            replay.accept(IndexOperationTrace.search(2, 5, 0, Range.equal(IndexKey.ofInt(1)), 0, 1, 0)
+                    .withTransaction(10, 1));
+            replay.accept(IndexOperationTrace.search(3, 5, 0, Range.equal(IndexKey.ofInt(1)), 0, 1,
+                            IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
+                    .withTransaction(10, 1).withVersion(1));
+            replay.accept(IndexOperationTrace.search(4, 5, 0, Range.equal(IndexKey.ofInt(2)), 0, 0, 0)
+                    .withTransaction(10, 1));
+            replay.accept(IndexOperationTrace.transaction(10, 7, 10, 1, 1));
+            replay.finish();
+            assertEquals(List.of("send 2", "skip 3", "send 4"), events);
+            assertEquals(3L, replay.describe().get("unsent_writes"));
+            assertEquals(1L, replay.describe().get("unsent_transaction_local_searches"));
+        }
+    }
+
+    @Test
     public void rejectsMalformedBoundariesEvenWhenSecondaryWritesAreFiltered() throws Exception {
         var config = new ReplayConfig(false, "none", 0, 0, 0, 0);
         var projection = new ReplayProjection(config, true, operation -> {});
@@ -174,7 +214,7 @@ public class ReplayProjectionTest {
                             new ReplayConfig(false, "none", 0, 0, 0, 0, mode), true, target);
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
             Operation write = mutation(3, 1, 1, 10, 1, 3);
-            Operation search = local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 1);
+            Operation search = local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 0, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH).withVersion(1), 10, 1);
             replay.accept(write);
             replay.accept(search);
             assertTrue(received.isEmpty());
@@ -230,6 +270,9 @@ public class ReplayProjectionTest {
         for (Operation invalid :
                 List.of(
                         local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 0, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 1),
+                        // The former v9 form put the local read point in readTimestamp and left
+                        // SEARCH.version=0; it must not be accepted as the current form.
+                        local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 1),
                         local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 11, 1),
                         local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 2))) {
             var replay = new ReplayProjection(ReplayConfig.defaults(), true, operation -> fail());
@@ -247,7 +290,7 @@ public class ReplayProjectionTest {
                 IOException.class,
                 () ->
                         replay.accept(
-                                local(IndexOperationTrace.search(2, 5, 1, Range.equal(IndexKey.ofInt(10)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 1)));
+                                local(IndexOperationTrace.search(2, 5, 1, Range.equal(IndexKey.ofInt(10)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH).withVersion(1), 10, 1)));
     }
 
     @Test

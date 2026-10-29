@@ -34,7 +34,7 @@ public final class ReplayMatrixValidation {
                                 List.of(
                                                 result.get("workload_operations"),
                                                 result.get("queries"),
-                                                result.get("result_checksum"),
+                                                result.get("query_digest_sha256"),
                                                 result.get("primary_state_checksum"),
                                                 result.get("selected_version_checksum"),
                                                 workload.get("operation_order_checksum"))

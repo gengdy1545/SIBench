@@ -4,7 +4,7 @@
 
 ## 离线验证
 
-JDK 17，根 Maven 工程离线构建：
+当前测试由根 Maven 工程维护，JDK 17：
 
 ```bash
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
@@ -15,7 +15,7 @@ java -jar build/sibench/sibench.jar prepare --dry-run config/sysbench_large.yaml
 git diff --check
 ```
 
-104 项测试零失败 / 错误 / 跳过；新增 CLI 显示 `check-schema`，两个 Baseline dry-run 通过且不生成数据。
+CLI 提供 `check-schema`，Baseline dry-run 核对配置且不生成数据。根测试结果见 [当前验证](p0-test-review.md)，下表列出 schema 测试的职责。
 
 | 测试域 | 已覆盖 |
 | --- | --- |
@@ -30,9 +30,9 @@ git diff --check
 
 经用户授权启动已有隔离 PG14.24，监听 `127.0.0.1:55433`。既有数据库 `sibench_htap_sf1_capture` 只运行只读预检，不修改 SF1 业务行、表或索引。三个独立、随机命名的测试数据库由测试创建，验证后自动删除；失败采集 manifest 与逐项报告保留。
 
-最终扩展运行 **51 项检查全部通过**，证据目录为 `results/validation/schema-preflight-20261021/catalog-boundaries/`，总报告为 `integration-summary.json`；第一次 48 项运行保留在上级目录，不覆盖原始证据。
+最终扩展运行 **51 项检查全部通过**，证据目录为 `results/validation/schema-preflight-20261021/catalog-boundaries/`，总报告为 `integration-summary.json`。
 
-最终 JDK17 打包 CLI 再次核对 SF1，通过报告为 `packaged-cli-sf1.json`；全量离线构建仍为 104 项测试零失败 / 错误 / 跳过，两个来源 Baseline dry-run 和 `git diff --check` 通过。验证结束确认无残留测试库，隔离 PG 恢复为验证前的停止状态。
+最终 JDK17 打包 CLI 再次核对 SF1，通过报告为 `packaged-cli-sf1.json`；同次来源 Baseline dry-run 和差异格式检查通过。验证结束确认无残留测试库，隔离 PG 恢复为验证前的停止状态。
 
 | 实际验证 | 结果 |
 | --- | --- |
@@ -57,4 +57,4 @@ mvn -o -q -Dtest=PgSchemaIntegrationIT \
 
 ## 验收边界
 
-本次完成来源 schema 与实际 PG 的采集前一致性检查，不验证初始数据规模、序列当前计数、原生加载是否正确、查询 collation / 范围等价性或运行期外部 DDL 漂移。YCSB / sysbench 原生生成、负载执行、采集入口预检和 Trace 转换仍待接入，不属于本次通过证据。
+本次完成来源 schema 与实际 PG 的采集前一致性检查，不验证初始数据规模、序列当前计数、原生加载是否正确、查询 collation / 范围等价性或运行期外部 DDL 漂移。YCSB / sysbench 原生生成、执行及 Trace 转换的独立证据见 [来源验证](ycsb-sysbench-native-trace.md)，完整代表规模见 [验收结果](p0-three-source-acceptance.md)。

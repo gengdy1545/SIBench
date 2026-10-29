@@ -2,6 +2,7 @@ package org.sibench.capture;
 
 import com.github.luben.zstd.ZstdInputStream;
 import com.github.luben.zstd.ZstdOutputStream;
+import com.google.gson.JsonParser;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -19,14 +20,16 @@ import java.security.DigestInputStream;
 import java.security.DigestOutputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.ArrayList;
 import java.util.HexFormat;
-import java.util.List;
 
 /**
  * The source work-unit catalog of a trace, one JSON line per source SQL request, stored as a zstd
  * stream. Its digest ({@code work_units_sha256}) is that of the plain lines, so it does not depend
  * on the compressor.
+ *
+ * <p>The catalog is read once, in order: identities are contiguous from 1 and source events
+ * increase. Only each unit's first source event is kept, because checking an operation's work unit
+ * must not retain every JSON line or a boxed map of all units.
  */
 public final class WorkUnits {
     static final String FILE = "work-units.jsonl.zst";
@@ -35,6 +38,14 @@ public final class WorkUnits {
 
     /** The catalog being written and the digest of its plain lines, final once it is closed. */
     record Output(BufferedWriter lines, MessageDigest digest) {}
+
+    /** The checked catalog: its plain-line digest and the first source event of each unit. */
+    public record Catalog(String sha256, long[] firstEvents, long count) {
+        /** The first source event of a unit, or -1 when the identity is outside the catalog. */
+        public long firstEvent(long workUnitId) {
+            return workUnitId < 1 || workUnitId > count ? -1 : firstEvents[(int) workUnitId];
+        }
+    }
 
     static Output create(Path trace) throws IOException {
         MessageDigest digest = sha256();
@@ -50,22 +61,37 @@ public final class WorkUnits {
                 new BufferedInputStream(Files.newInputStream(trace.resolve(FILE)), 1 << 20));
     }
 
-    /** The catalog's lines, in order. */
-    public static List<String> lines(Path trace) throws IOException {
-        var result = new ArrayList<String>();
-        try (var reader = new BufferedReader(new InputStreamReader(open(trace), StandardCharsets.UTF_8), 1 << 16)) {
-            for (String line; (line = reader.readLine()) != null; ) result.add(line);
-        }
-        return result;
-    }
-
-    /** The SHA256 of the catalog's plain lines. */
-    public static String sha256(Path trace) throws IOException {
+    /**
+     * Reads and checks the catalog once. Unit identities must be {@code 1..count}, source events
+     * strictly increasing, and each unit must name a process and application.
+     */
+    public static Catalog read(Path trace) throws IOException {
         MessageDigest digest = sha256();
-        try (var input = new DigestInputStream(open(trace), digest)) {
-            input.transferTo(java.io.OutputStream.nullOutputStream());
+        long[] events = new long[1024];
+        long count = 0, lastEvent = 0;
+        try (var input = new DigestInputStream(open(trace), digest);
+                var reader =
+                        new BufferedReader(
+                                new InputStreamReader(input, StandardCharsets.UTF_8), 1 << 16)) {
+            for (String line; (line = reader.readLine()) != null; ) {
+                var unit = JsonParser.parseString(line).getAsJsonObject();
+                long id = unit.get("work_unit_id").getAsLong(),
+                        event = unit.get("source_event").getAsLong();
+                if (id != count + 1
+                        || event <= lastEvent
+                        || unit.get("pid").getAsInt() < 1
+                        || unit.get("application").getAsString().isEmpty())
+                    throw new IOException("Invalid source work-unit catalog order/identity");
+                if (id > Integer.MAX_VALUE - 8)
+                    throw new IOException("Source work-unit catalog exceeds the in-memory index range");
+                if (id >= events.length)
+                    events = java.util.Arrays.copyOf(events, Math.toIntExact(Math.max(id + 1, events.length * 2)));
+                events[(int) id] = event;
+                count = id;
+                lastEvent = event;
+            }
         }
-        return HexFormat.of().formatHex(digest.digest());
+        return new Catalog(HexFormat.of().formatHex(digest.digest()), events, count);
     }
 
     private static MessageDigest sha256() {

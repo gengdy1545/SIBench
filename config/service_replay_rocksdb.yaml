@@ -3,11 +3,11 @@ purpose: index_replay
 target:
   secondary_indexes:
     enabled: true
-  # A fresh RocksDB index in the driver process: the index without protocol or network.
+  # A fresh RocksDB index in the driver process: complete publication without gRPC or network transport.
   service:
     adapter: rocksdb
     path: build/services/index/rocksdb-inprocess
-    value: locator
+    value: row_id
 replay:
   strategy: single_pass
   dispatch_mode: operation

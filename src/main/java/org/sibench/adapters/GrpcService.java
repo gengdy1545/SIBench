@@ -16,7 +16,6 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Clients of a remote index service over gRPC: each benchmark client has its own connection and
@@ -47,13 +46,15 @@ public final class GrpcService implements AutoCloseable {
         }
     }
 
-    /** Waits until every request received is durable; returns its complete-publication watermark. */
-    public long flush() {
+    /**
+     * Waits until every request received is durable, binding the index to {@code binding}; returns
+     * the complete-publication watermark and where the index lives.
+     */
+    public org.sibench.adapters.proto.FlushResponse flush(String binding) {
         ManagedChannel channel = channel(endpoint);
         try {
             return IndexServiceGrpc.newBlockingStub(channel)
-                    .flush(FlushRequest.getDefaultInstance())
-                    .getPublishedVersion();
+                    .flush(FlushRequest.newBuilder().setIndexBinding(binding).build());
         } finally {
             channel.shutdownNow();
         }
@@ -76,7 +77,11 @@ public final class GrpcService implements AutoCloseable {
     private final class Client extends ServiceClient {
         private final ManagedChannel channel;
         private final StreamObserver<Request> stream;
-        private final Map<Long, CompletableFuture<Response>> pending = new ConcurrentHashMap<>();
+        /** An outstanding request: where its result chunks go and its final response. */
+        private record Pending(
+                java.util.function.Consumer<Response> partial, CompletableFuture<Response> done) {}
+
+        private final Map<Long, Pending> pending = new ConcurrentHashMap<>();
         private volatile Throwable failure;
         private boolean closed;
 
@@ -86,9 +91,14 @@ public final class GrpcService implements AutoCloseable {
             this.stream = IndexServiceGrpc.newStub(channel).execute(new StreamObserver<>() {
                 @Override
                 public void onNext(Response response) {
-                    var waiting = pending.remove(response.getId());
-                    if (waiting != null) waiting.complete(response);
-                    else fail(new IOException("Response for an unknown request " + response.getId()));
+                    var waiting =
+                            response.getMore()
+                                    ? pending.get(response.getId())
+                                    : pending.remove(response.getId());
+                    if (waiting == null)
+                        fail(new IOException("Response for an unknown request " + response.getId()));
+                    else if (response.getMore()) waiting.partial().accept(response);
+                    else waiting.done().complete(response);
                 }
 
                 @Override
@@ -105,15 +115,16 @@ public final class GrpcService implements AutoCloseable {
 
         private void fail(Throwable error) {
             failure = error;
-            for (var waiting : pending.values()) waiting.completeExceptionally(error);
+            for (var waiting : pending.values()) waiting.done().completeExceptionally(error);
             pending.clear();
         }
 
         @Override
-        CompletableFuture<Response> transmit(Request request) throws IOException {
+        CompletableFuture<Response> transmit(
+                Request request, java.util.function.Consumer<Response> partial) throws IOException {
             if (failure != null) throw new IOException("Service stream failed", failure);
             var response = new CompletableFuture<Response>();
-            if (pending.putIfAbsent(request.getId(), response) != null)
+            if (pending.putIfAbsent(request.getId(), new Pending(partial, response)) != null)
                 throw new IOException("Duplicate request id " + request.getId());
             stream.onNext(request);
             return response;
@@ -124,13 +135,9 @@ public final class GrpcService implements AutoCloseable {
             if (closed) return;
             closed = true;
             if (failure == null) stream.onCompleted();
-            channel.shutdown();
-            try {
-                if (!channel.awaitTermination(30, TimeUnit.SECONDS)) channel.shutdownNow();
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                channel.shutdownNow();
-            }
+            // A stream may still be half-closed on the service side after a failed run, which
+            // makes a graceful channel shutdown wait for its own timeout on every client.
+            channel.shutdownNow();
         }
     }
 }

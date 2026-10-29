@@ -11,111 +11,240 @@ import org.sibench.adapters.proto.Write;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.function.Consumer;
 
 /**
  * The complete-commit publication mode of the reference index service. Requests of one source
  * transaction execute in {@code Request.transaction_operation} order, while different
- * transactions run independently. A read waits for its {@code read_version} to be published; a
+ * transactions run independently. A read runs once its {@code read_version} is published; a
  * version is published only after its Commit marker was received and every declared write was
  * applied. The highest version merely seen is never used as a watermark.
  *
- * <p>This is a correctness reference for the protocol, not a throughput-optimized service. Each
- * lane executes its transaction in order, and a waiting read occupies its caller thread.
+ * <p>The watermark is recorded in the backend at every {@link #flush()} and resumed from it when
+ * the index is reopened; versions above it were never published and stay invisible.
+ *
+ * <p>Requests never hold a thread while they wait: a transaction's next operation, or a read
+ * whose version is not yet published, is parked and dispatched to a fixed worker pool when its
+ * predecessor completes or its version is published. All ordering state is guarded by this
+ * object's monitor, which is never held during a backend call or a response callback.
  */
 public final class PublishedIndex implements AutoCloseable, IndexExecution.Executor {
     private final IndexBackend backend;
-    private final Publication publication = new Publication();
+    private final ExecutorService workers;
+    /**
+     * Searches run apart from writes and commits: a search streaming a large result waits for the
+     * client under flow control, which must not hold back the writes that publish versions.
+     */
+    private final ExecutorService readers;
     private final Map<Long, Lane> lanes = new HashMap<>();
-    private volatile boolean closed;
+    /** Committed source transactions, kept so a late request can still be refused. */
+    private final BitSet completedTransactions = new BitSet();
+    /** Requests not yet answered, failed on close. */
+    private final Set<Task> open = ConcurrentHashMap.newKeySet();
+    /** Actions waiting for a version to be published, by that version. */
+    private final TreeMap<Long, List<Consumer<Effects>>> waiting = new TreeMap<>();
+    private final TreeMap<Long, Commit> commits = new TreeMap<>();
+    private final Map<Long, Long> applied = new HashMap<>();
+    private final Map<Long, Long> active = new HashMap<>();
+    private final Map<Long, Long> owners = new HashMap<>();
+    private long published, nextVersion = 1;
+    private boolean closed;
 
-    public PublishedIndex(IndexBackend backend) {
+    public PublishedIndex(IndexBackend backend) throws IOException {
         this.backend = backend;
+        this.published = backend.publishedVersion();
+        this.nextVersion = published + 1;
+        int processors = Runtime.getRuntime().availableProcessors();
+        this.workers = pool(processors, "sibench-published");
+        this.readers = pool(2 * processors, "sibench-published-search");
     }
 
-    private Lane lane(long transaction) {
-        synchronized (lanes) {
-            if (closed) throw new IllegalStateException("Published index is closed");
-            return lanes.computeIfAbsent(transaction, ignored -> new Lane());
+    private static ExecutorService pool(int threads, String name) {
+        return Executors.newFixedThreadPool(
+                threads,
+                runnable -> {
+                    Thread thread = new Thread(runnable, name);
+                    thread.setDaemon(true);
+                    return thread;
+                });
+    }
+
+    private static final class Task {
+        final Request request;
+        /** Full chunks of a large search result, sent before the final response. */
+        final java.util.function.Consumer<Response> partial;
+        final CompletableFuture<Response> response = new CompletableFuture<>();
+
+        Task(Request request, java.util.function.Consumer<Response> partial) {
+            this.request = request;
+            this.partial = partial;
         }
+    }
+
+    /** Work found under the monitor and run after leaving it: responses and backend calls. */
+    private final class Effects {
+        private final List<Runnable> actions = new ArrayList<>();
+
+        void respond(Task task, Response response) {
+            actions.add(
+                    () -> {
+                        open.remove(task);
+                        task.response.complete(response);
+                    });
+        }
+
+        void dispatch(Request request, Runnable call) {
+            var pool = request.getOperationCase() == Request.OperationCase.WRITE ? workers : readers;
+            actions.add(
+                    () -> {
+                        try {
+                            pool.execute(call);
+                        } catch (RejectedExecutionException closing) {
+                            // close() answers every open request.
+                        }
+                    });
+        }
+
+        void apply() {
+            for (Runnable action : actions) action.run();
+        }
+    }
+
+    /** Submits a request whose results, if any, fit one message. */
+    public CompletableFuture<Response> submit(Request request) {
+        return submit(request, chunk -> {
+            throw new IllegalStateException("Unexpected partial response");
+        });
     }
 
     @Override
-    public Response execute(Request request) {
-        var response = Response.newBuilder().setId(request.getId());
+    public CompletableFuture<Response> submit(
+            Request request, java.util.function.Consumer<Response> partial) {
+        // Baseline entries (version 0) need no ordering or publication; they load in parallel.
+        if (request.getOperationCase() == Request.OperationCase.BATCH
+                || request.getOperationCase() == Request.OperationCase.WRITE
+                        && request.getWrite().getVersion() == 0) {
+            try {
+                return CompletableFuture.supplyAsync(
+                        () -> IndexExecution.execute(backend, request), workers);
+            } catch (RejectedExecutionException closing) {
+                return CompletableFuture.completedFuture(closedResponse(request));
+            }
+        }
+        var task = new Task(request, partial);
+        open.add(task);
+        var effects = new Effects();
+        synchronized (this) {
+            try {
+                if (closed) throw new IOException("Published index is closed");
+                accept(task, effects);
+            } catch (IOException | RuntimeException error) {
+                effects.respond(task, failure(request, error));
+            }
+        }
+        effects.apply();
+        return task.response;
+    }
+
+    private void accept(Task task, Effects effects) throws IOException {
+        Request request = task.request;
+        switch (request.getOperationCase()) {
+            case WRITE -> {
+                requireTransaction(request);
+                lane(request.getTransactionId()).add(task, request.getWrite().getVersion(), effects);
+            }
+            case SEARCH -> {
+                Search search = request.getSearch();
+                if (search.getLocalVersion() == 0 && request.getTransactionId() == 0)
+                    whenPublished(
+                            search.getReadVersion(),
+                            ready -> ready.dispatch(task.request, () -> run(null, task)),
+                            effects);
+                else {
+                    requireTransaction(request);
+                    lane(request.getTransactionId()).add(task, search.getLocalVersion(), effects);
+                }
+            }
+            case GROUP -> {
+                SearchGroup group = request.getGroup();
+                if (group.getMembersCount() == 0) throw new IllegalArgumentException("Empty group");
+                Search first = group.getMembers(0);
+                if (first.getLocalVersion() == 0 && request.getTransactionId() == 0)
+                    whenPublished(
+                            first.getReadVersion(),
+                            ready -> ready.dispatch(task.request, () -> run(null, task)),
+                            effects);
+                else {
+                    requireTransaction(request);
+                    lane(request.getTransactionId()).add(task, first.getLocalVersion(), effects);
+                }
+            }
+            case COMMIT -> {
+                requireTransaction(request);
+                lane(request.getTransactionId()).commit(task, effects);
+            }
+            default -> throw new IllegalArgumentException("Request without an operation");
+        }
+    }
+
+    /** Runs one ready request on a worker; a lane's request then advances its lane. */
+    private void run(Lane lane, Task task) {
+        Request request = task.request;
+        List<Result> found = null;
+        Throwable error = null;
         try {
             switch (request.getOperationCase()) {
-                case WRITE -> {
-                    Write write = request.getWrite();
-                    if (write.getVersion() == 0) backend.write(write);
-                    else {
-                        requireTransaction(request);
-                        lane(request.getTransactionId()).write(request, write);
-                    }
-                    return response.setStatus(Status.OK).build();
-                }
-                case SEARCH -> {
-                    Search search = request.getSearch();
-                    List<Result> results;
-                    if (search.getLocalVersion() == 0 && request.getTransactionId() == 0) {
-                        publication.await(search.getReadVersion());
-                        results = backend.search(search);
-                    } else {
-                        requireTransaction(request);
-                        results = lane(request.getTransactionId()).search(request, search);
-                    }
-                    return response.addAllResults(results).setStatus(Status.OK).build();
-                }
-                case GROUP -> {
-                    SearchGroup group = request.getGroup();
-                    if (group.getMembersCount() == 0) throw new IllegalArgumentException("Empty group");
-                    Search first = group.getMembers(0);
-                    List<Result> results;
-                    if (first.getLocalVersion() == 0 && request.getTransactionId() == 0) {
-                        publication.await(first.getReadVersion());
-                        results = IndexExecution.group(backend, group);
-                    } else {
-                        requireTransaction(request);
-                        results = lane(request.getTransactionId()).group(request, group);
-                    }
-                    return response.addAllResults(results).setStatus(Status.OK).build();
-                }
-                case COMMIT -> {
-                    requireTransaction(request);
-                    Commit commit = request.getCommit();
-                    Lane lane = lane(request.getTransactionId());
-                    lane.commit(
-                            commit.getVersion(),
-                            commit.getWrites(),
-                            commit.getOperations());
-                    publication.commit(
-                            commit.getVersion(),
-                            request.getTransactionId(),
-                            commit.getWrites(),
-                            commit.getOperations());
-                    publication.await(commit.getVersion());
-                    lane.complete();
-                    return response.setStatus(Status.OK).build();
-                }
-                default -> throw new IllegalArgumentException("Request without an operation");
+                case WRITE -> backend.write(request.getWrite());
+                case SEARCH ->
+                        found = IndexExecution.search(backend, request, task.partial).getResultsList();
+                case GROUP -> found = IndexExecution.group(backend, request.getGroup());
+                default -> throw new IOException("Unsupported transaction lane operation");
             }
-        } catch (IllegalArgumentException invalid) {
-            return response.setStatus(Status.INVALID)
-                    .setMessage(String.valueOf(invalid.getMessage()))
-                    .build();
-        } catch (IOException | InterruptedException error) {
-            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
-            return response.setStatus(Status.UNAVAILABLE)
-                    .setMessage(String.valueOf(error))
-                    .build();
-        } catch (RuntimeException error) {
-            return response.setStatus(Status.UNAVAILABLE)
-                    .setMessage(String.valueOf(error))
-                    .build();
+        } catch (IOException | RuntimeException failure) {
+            error = failure;
         }
+        var effects = new Effects();
+        synchronized (this) {
+            if (request.getOperationCase() == Request.OperationCase.WRITE) {
+                long version = request.getWrite().getVersion();
+                if (error != null) release(version);
+                else {
+                    try {
+                        applied(version, effects);
+                    } catch (IOException failure) {
+                        error = failure;
+                    }
+                }
+            }
+            if (error == null) effects.respond(task, ok(request, found));
+            else effects.respond(task, failure(request, error));
+            if (lane != null) lane.completed(error, effects);
+        }
+        effects.apply();
+    }
+
+    private Lane lane(long transaction) throws IOException {
+        if (transaction < 1 || transaction > Integer.MAX_VALUE - 8)
+            throw new IOException("Transaction id is outside the supported range");
+        if (completedTransactions.get((int) transaction))
+            throw new IOException("Transaction already committed");
+        return lanes.computeIfAbsent(transaction, Lane::new);
+    }
+
+    /** Lanes still holding an incomplete transaction; completed ones are removed after commit. */
+    synchronized int laneCount() {
+        return lanes.size();
     }
 
     private static void requireTransaction(Request request) {
@@ -123,302 +252,272 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
             throw new IllegalArgumentException("Complete-publication request needs a transaction id");
     }
 
-    public long publishedVersion() {
-        return publication.publishedVersion();
+    public synchronized long publishedVersion() {
+        return published;
     }
 
+    /** Records the current watermark and flushes; returns the watermark now durable. */
     public long flush() throws IOException {
+        long version = publishedVersion();
+        backend.recordPublishedVersion(version);
         backend.flush();
-        return publication.publishedVersion();
+        return version;
     }
 
     @Override
     public void close() {
-        closed = true;
-        publication.close();
-        synchronized (lanes) {
-            for (Lane lane : lanes.values()) lane.close();
+        synchronized (this) {
+            if (closed) return;
+            closed = true;
+            waiting.clear();
         }
+        for (Task task : List.copyOf(open)) {
+            open.remove(task);
+            task.response.complete(closedResponse(task.request));
+        }
+        workers.shutdownNow();
+        readers.shutdownNow();
     }
 
-    /** One source transaction's ordered operations. */
+    private static Response ok(Request request, List<Result> results) {
+        var response = Response.newBuilder().setId(request.getId()).setStatus(Status.OK);
+        if (results != null) response.addAllResults(results);
+        return response.build();
+    }
+
+    private static Response failure(Request request, Throwable error) {
+        var response = Response.newBuilder().setId(request.getId());
+        if (error instanceof IllegalArgumentException)
+            return response.setStatus(Status.INVALID)
+                    .setMessage(String.valueOf(error.getMessage()))
+                    .build();
+        return response.setStatus(Status.UNAVAILABLE).setMessage(String.valueOf(error)).build();
+    }
+
+    private static Response closedResponse(Request request) {
+        return failure(request, new IOException("Publication closed"));
+    }
+
+    /** One source transaction's ordered operations and its commit marker. */
     private final class Lane {
-        private final TreeMap<Long, Request> pending = new TreeMap<>();
-        private final Map<Long, List<Result>> results = new HashMap<>();
+        private final long transaction;
+        private final TreeMap<Long, Task> pending = new TreeMap<>();
         private long version;
         private long total = -1;
         private long declaredWrites = -1;
-        private long next = 1, lastApplied;
-        private boolean executing;
-        private boolean closed;
-        private boolean complete;
+        /** The next operation to execute; every lower one has been applied. */
+        private long next = 1;
+        private boolean executing, parked, committing;
+        private Task commit;
         private IOException failure;
 
-        void write(Request request, Write write) throws IOException, InterruptedException {
-            submit(request, write.getVersion());
+        Lane(long transaction) {
+            this.transaction = transaction;
         }
 
-        List<Result> search(Request request, Search search) throws IOException, InterruptedException {
-            return submit(request, search.getLocalVersion());
-        }
-
-        List<Result> group(Request request, SearchGroup group) throws IOException, InterruptedException {
-            return submit(request, group.getMembers(0).getLocalVersion());
-        }
-
-        private List<Result> submit(Request request, long requestVersion)
-                throws IOException, InterruptedException {
-            long operation;
-            synchronized (this) {
-                prepare(request, requestVersion);
-                operation = request.getTransactionOperation();
-            }
-            while (true) {
-                synchronized (this) {
-                    check();
-                    if (lastApplied >= operation) return results.remove(operation);
-                }
-                step();
-            }
-        }
-
-        void commit(long commitVersion, long writes, long operations)
-                throws IOException, InterruptedException {
-            synchronized (this) {
-                check();
-                if (complete) throw new IOException("Transaction already committed");
-                if (version != 0 && version != commitVersion)
-                    throw new IOException("Transaction version differs from its writes");
-                version = commitVersion;
-                if (declaredWrites >= 0 && declaredWrites != writes)
-                    throw new IOException("Repeated commit declares another write count");
-                declaredWrites = writes;
-                if (total >= 0 && total != operations) throw new IOException("Repeated commit count");
-                if (operations < lastApplied)
-                    throw new IOException("Commit has fewer operations than already applied");
-                total = operations;
-                if (total < declaredWrites)
-                    throw new IOException("More writes than operations in a transaction");
-                if (!pending.isEmpty() && pending.lastKey() > total)
-                    throw new IOException("Operation beyond the committed transaction count");
-            }
-            while (true) {
-                synchronized (this) {
-                    check();
-                    if (lastApplied >= total) return;
-                }
-                step();
-            }
-        }
-
-        private void prepare(Request request, long requestVersion) throws IOException {
-            if (closed) throw new IOException("Transaction lane closed");
-            if (complete) throw new IOException("Transaction already committed");
+        void add(Task task, long requestVersion, Effects effects) throws IOException {
             if (failure != null) throw failure;
             if (requestVersion > 0) {
                 if (version != 0 && version != requestVersion)
                     throw new IOException("One transaction spans versions");
-                version = requestVersion;
             }
-            long operation = request.getTransactionOperation();
+            long operation = task.request.getTransactionOperation();
             if (operation < 1) throw new IOException("Transaction operation must be positive");
             if (total >= 0 && operation > total)
                 throw new IOException("Operation exceeds its committed transaction");
-            if (operation < next) throw new IOException("Repeated transaction operation");
-            if (pending.containsKey(operation) || (executing && operation == next))
+            if (operation < next || pending.containsKey(operation) || executing && operation == next)
                 throw new IOException("Repeated transaction operation");
-            pending.put(operation, request);
+            if (requestVersion > 0) version = requestVersion;
+            pending.put(operation, task);
+            pump(effects);
         }
 
-        private void check() throws IOException {
-            if (closed) throw new IOException("Transaction lane closed");
+        void commit(Task task, Effects effects) throws IOException {
             if (failure != null) throw failure;
+            if (commit != null) throw new IOException("Repeated commit marker for the transaction");
+            Commit marker = task.request.getCommit();
+            if (version != 0 && version != marker.getVersion())
+                throw new IOException("Transaction version differs from its writes");
+            if (marker.getOperations() < next - 1)
+                throw new IOException("Commit has fewer operations than already applied");
+            if (marker.getOperations() < marker.getWrites())
+                throw new IOException("More writes than operations in a transaction");
+            if (!pending.isEmpty() && pending.lastKey() > marker.getOperations())
+                throw new IOException("Operation beyond the committed transaction count");
+            version = marker.getVersion();
+            total = marker.getOperations();
+            declaredWrites = marker.getWrites();
+            commit = task;
+            pump(effects);
         }
 
-        /**
-         * Executes at most one contiguous operation. The lane monitor is never held while the
-         * backend runs or while a read waits for publication, so an earlier operation arriving on
-         * another stream can make progress.
-         */
-        private void step() throws IOException, InterruptedException {
-            Request request;
-            long operation;
-            synchronized (this) {
-                check();
-                if (executing || !pending.containsKey(next)) {
-                    wait();
+        /** Dispatches the next operation if it is present and its read version is published. */
+        private void pump(Effects effects) {
+            if (executing || parked || failure != null || closed) return;
+            Task head = pending.get(next);
+            if (head == null) {
+                if (commit != null && !committing && next - 1 >= total) publish(effects);
+                return;
+            }
+            long readVersion = readVersion(head.request);
+            if (readVersion > published) {
+                parked = true;
+                whenPublished(
+                        readVersion,
+                        ready -> {
+                            parked = false;
+                            pump(ready);
+                        },
+                        effects);
+                return;
+            }
+            pending.remove(next);
+            if (head.request.getOperationCase() == Request.OperationCase.WRITE) {
+                try {
+                    reserve(head.request.getWrite().getVersion(), transaction);
+                } catch (IOException refused) {
+                    effects.respond(head, failure(head.request, refused));
+                    fail(refused, effects);
                     return;
                 }
-                executing = true;
-                operation = next;
-                request = pending.remove(operation);
             }
+            executing = true;
+            effects.dispatch(head.request, () -> run(this, head));
+        }
+
+        void completed(Throwable error, Effects effects) {
+            executing = false;
+            if (error != null) {
+                fail(
+                        error instanceof IOException io
+                                ? io
+                                : new IOException("Transaction lane failed", error),
+                        effects);
+                return;
+            }
+            next++;
+            pump(effects);
+        }
+
+        /** Every operation is applied: register the marker and answer it once published. */
+        private void publish(Effects effects) {
+            committing = true;
             try {
-                List<Result> found = execute(request);
-                synchronized (this) {
-                    if (found != null) results.put(operation, found);
-                    lastApplied = operation;
-                    next = operation + 1;
-                    executing = false;
-                    notifyAll();
-                }
-            } catch (IOException | InterruptedException | RuntimeException error) {
-                synchronized (this) {
-                    executing = false;
-                    if (error instanceof IOException failure) this.failure = failure;
-                    else if (error instanceof InterruptedException)
-                        this.failure = new IOException("Transaction lane interrupted", error);
-                    else this.failure = new IOException("Transaction lane failed", error);
-                    notifyAll();
-                }
-                throw error;
+                registerCommit(version, transaction, declaredWrites, total);
+            } catch (IOException refused) {
+                effects.respond(commit, failure(commit.request, refused));
+                return;
             }
+            whenPublished(
+                    version,
+                    ready -> {
+                        completedTransactions.set((int) transaction);
+                        lanes.remove(transaction);
+                        ready.respond(commit, ok(commit.request, null));
+                    },
+                    effects);
+            publishReady(effects);
         }
 
-        private List<Result> execute(Request request) throws IOException, InterruptedException {
-            switch (request.getOperationCase()) {
-                case WRITE -> {
-                    long version = request.getWrite().getVersion();
-                    publication.reserve(version, request.getTransactionId());
-                    boolean applied = false;
-                    try {
-                        backend.write(request.getWrite());
-                        publication.applied(version);
-                        applied = true;
-                    } finally {
-                        if (!applied) publication.release(version);
-                    }
-                    return null;
-                }
-                case SEARCH -> {
-                    publication.await(request.getSearch().getReadVersion());
-                    return backend.search(request.getSearch());
-                }
-                case GROUP -> {
-                    publication.await(request.getGroup().getMembers(0).getReadVersion());
-                    return IndexExecution.group(backend, request.getGroup());
-                }
-                default -> throw new IOException("Unsupported transaction lane operation");
-            }
-        }
-
-        synchronized void complete() throws IOException {
-            if (failure != null) throw failure;
-            complete = true;
-        }
-
-        synchronized void close() {
-            closed = true;
-            notifyAll();
+        private void fail(IOException error, Effects effects) {
+            failure = error;
+            for (Task task : pending.values()) effects.respond(task, failure(task.request, error));
+            pending.clear();
+            if (commit != null && !committing) effects.respond(commit, failure(commit.request, error));
         }
     }
 
-    /** Commit markers, write ownership and the applied-write counts that publish them. */
-    private static final class Publication {
-        private final TreeMap<Long, Commit> commits = new TreeMap<>();
-        private final Map<Long, Long> applied = new HashMap<>();
-        private final Map<Long, Long> active = new HashMap<>();
-        private final Map<Long, Long> owners = new HashMap<>();
-        private long published, next = 1;
-        private boolean closed;
+    private static long readVersion(Request request) {
+        return switch (request.getOperationCase()) {
+            case SEARCH -> request.getSearch().getReadVersion();
+            case GROUP -> request.getGroup().getMembers(0).getReadVersion();
+            default -> 0;
+        };
+    }
 
-        synchronized void commit(
-                long version, long transaction, long writes, long operations)
-                throws IOException {
-            if (version < 1) throw new IOException("Commit version must be positive");
-            if (commits.containsKey(version))
-                throw new IOException("Repeated commit marker for version " + version);
-            if (version < next) throw new IOException("Commit marker for an already published version");
-            Long owner = owners.putIfAbsent(version, transaction);
-            if (owner != null && owner != transaction)
-                throw new IOException("Commit marker changes the version's transaction");
-            long used = applied.getOrDefault(version, 0L) + active.getOrDefault(version, 0L);
-            if (used > writes)
-                throw new IOException("Commit declares fewer writes than were accepted");
-            commits.put(
-                    version,
-                    Commit.newBuilder()
-                            .setVersion(version)
-                            .setWrites(writes)
-                            .setOperations(operations)
-                            .build());
-            publish();
-        }
+    private void whenPublished(long version, Consumer<Effects> action, Effects effects) {
+        if (published >= version) action.accept(effects);
+        else waiting.computeIfAbsent(version, ignored -> new ArrayList<>()).add(action);
+    }
 
-        /**
-         * Reserves a write slot before touching the backend. A write for an already published
-         * version, another transaction's version, or a version whose declared write count is
-         * already covered is refused before it can mutate state.
-         */
-        synchronized void reserve(long version, long transaction) throws IOException {
-            if (version < 1) throw new IOException("Write without a version");
-            if (version <= published)
-                throw new IOException("Write for an already published version");
-            Long owner = owners.putIfAbsent(version, transaction);
-            if (owner != null && owner != transaction)
-                throw new IOException("Write belongs to another transaction's version");
-            Commit commit = commits.get(version);
-            if (commit != null
-                    && applied.getOrDefault(version, 0L)
-                                    + active.getOrDefault(version, 0L)
-                            >= commit.getWrites())
-                throw new IOException("Write exceeds the committed write count");
-            active.merge(version, 1L, Long::sum);
-        }
+    // ---- publication: commit markers, write ownership and applied-write counts ----
 
-        synchronized void applied(long version) throws IOException {
-            if (version < 1) throw new IOException("Applied write without a version");
-            if (version <= published)
-                throw new IOException("Write applied after its version was published");
-            long activeWrites = active.getOrDefault(version, 0L);
-            if (activeWrites <= 0) throw new IOException("Write was not reserved");
-            if (activeWrites == 1) active.remove(version);
-            else active.put(version, activeWrites - 1);
-            applied.merge(version, 1L, Long::sum);
-            publish();
-        }
+    private void registerCommit(long version, long transaction, long writes, long operations)
+            throws IOException {
+        if (version < 1) throw new IOException("Commit version must be positive");
+        if (commits.containsKey(version))
+            throw new IOException("Repeated commit marker for version " + version);
+        if (version < nextVersion)
+            throw new IOException("Commit marker for an already published version");
+        Long owner = owners.putIfAbsent(version, transaction);
+        if (owner != null && owner != transaction)
+            throw new IOException("Commit marker changes the version's transaction");
+        long used = applied.getOrDefault(version, 0L) + active.getOrDefault(version, 0L);
+        if (used > writes) throw new IOException("Commit declares fewer writes than were accepted");
+        commits.put(
+                version,
+                Commit.newBuilder()
+                        .setVersion(version)
+                        .setWrites(writes)
+                        .setOperations(operations)
+                        .build());
+    }
 
-        synchronized void release(long version) {
-            long activeWrites = active.getOrDefault(version, 0L);
-            if (activeWrites <= 1) active.remove(version);
-            else active.put(version, activeWrites - 1);
-            notifyAll();
-        }
+    /**
+     * Reserves a write slot before touching the backend. A write for an already published
+     * version, another transaction's version, or a version whose declared write count is already
+     * covered is refused before it can mutate state.
+     */
+    private void reserve(long version, long transaction) throws IOException {
+        if (version < 1) throw new IOException("Write without a version");
+        if (version <= published) throw new IOException("Write for an already published version");
+        Long owner = owners.putIfAbsent(version, transaction);
+        if (owner != null && owner != transaction)
+            throw new IOException("Write belongs to another transaction's version");
+        Commit commit = commits.get(version);
+        if (commit != null
+                && applied.getOrDefault(version, 0L) + active.getOrDefault(version, 0L)
+                        >= commit.getWrites())
+            throw new IOException("Write exceeds the committed write count");
+        active.merge(version, 1L, Long::sum);
+    }
 
-        private void publish() throws IOException {
-            while (true) {
-                if (active.getOrDefault(next, 0L) > 0) return;
-                Commit commit = commits.get(next);
-                if (commit == null) return;
-                long writes = applied.getOrDefault(next, 0L);
-                if (writes > commit.getWrites())
-                    throw new IOException("More applied writes than the commit declares");
-                if (writes < commit.getWrites()) return;
-                published = next;
-                commits.remove(next);
-                applied.remove(next);
-                active.remove(next);
-                owners.remove(next);
-                next++;
-                notifyAll();
-            }
-        }
+    private void applied(long version, Effects effects) throws IOException {
+        if (version <= published)
+            throw new IOException("Write applied after its version was published");
+        long activeWrites = active.getOrDefault(version, 0L);
+        if (activeWrites <= 0) throw new IOException("Write was not reserved");
+        if (activeWrites == 1) active.remove(version);
+        else active.put(version, activeWrites - 1);
+        applied.merge(version, 1L, Long::sum);
+        publishReady(effects);
+    }
 
-        synchronized void await(long version) throws IOException, InterruptedException {
-            while (!closed && published < version) {
-                if (closed) throw new IOException("Publication closed");
-                wait();
-            }
-            if (closed) throw new IOException("Publication closed");
-        }
+    private void release(long version) {
+        long activeWrites = active.getOrDefault(version, 0L);
+        if (activeWrites <= 1) active.remove(version);
+        else active.put(version, activeWrites - 1);
+    }
 
-        synchronized long publishedVersion() {
-            return published;
+    /** Advances the watermark over every complete version and wakes what waited for it. */
+    private void publishReady(Effects effects) {
+        boolean advanced = false;
+        while (active.getOrDefault(nextVersion, 0L) == 0) {
+            Commit commit = commits.get(nextVersion);
+            if (commit == null) break;
+            long writes = applied.getOrDefault(nextVersion, 0L);
+            // A count above the declaration is refused by reserve(); equality publishes.
+            if (writes < commit.getWrites()) break;
+            published = nextVersion;
+            commits.remove(nextVersion);
+            applied.remove(nextVersion);
+            owners.remove(nextVersion);
+            nextVersion++;
+            advanced = true;
         }
-
-        synchronized void close() {
-            closed = true;
-            notifyAll();
-        }
+        if (!advanced) return;
+        while (!waiting.isEmpty() && waiting.firstKey() <= published)
+            for (Consumer<Effects> action : waiting.pollFirstEntry().getValue())
+                action.accept(effects);
     }
 }

@@ -1,0 +1,15 @@
+# Pinned upstream sources for index backends; scripts/build-rocksdb-cloud.sh clones them here.
+rocksdb_cloud:
+  repository: https://github.com/rockset/rocksdb-cloud
+  commit: 20a0918820ef89d71f4a059da4864db66678c38b   # 2025-09-22, RocksDB 9.1.1 base
+  license: Apache-2.0 OR GPL-2.0 (RocksDB dual license)
+  build: static_lib with USE_AWS=1 PORTABLE=1 DEBUG_LEVEL=0 USE_RTTI=1, gcc 8.5, glibc 2.28
+aws_sdk_cpp:
+  repository: https://github.com/aws/aws-sdk-cpp
+  tag: 1.8.8          # the version rocksdb-cloud's own Dockerfile uses; predates default request checksums
+  license: Apache-2.0
+  components: [core, s3, transfer, kinesis]
+seaweedfs:            # local S3-compatible test service only, not an index backend
+  release: "4.51"
+  binary_sha256: eb9adf3a75b53c32f5ad9ba856e1fb652dae03dc6f6222673c3f88c0cbd25d0e
+  license: Apache-2.0

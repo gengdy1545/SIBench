@@ -27,7 +27,8 @@ public class ServiceClientTest {
         }
 
         @Override
-        java.util.concurrent.CompletableFuture<org.sibench.adapters.proto.Response> transmit(Request request) {
+        java.util.concurrent.CompletableFuture<org.sibench.adapters.proto.Response> transmit(
+                Request request, java.util.function.Consumer<org.sibench.adapters.proto.Response> partial) {
             sent.add(request);
             var response = org.sibench.adapters.proto.Response.newBuilder()
                     .setId(request.getId())
@@ -86,5 +87,59 @@ public class ServiceClientTest {
         var alone = IndexOperationTrace.search(11, 3, 1, Range.equal(IndexKey.ofInt(7)), 5, 1, 0);
         assertTrue(assertThrows(IOException.class, () -> client.send(2, alone))
                 .getMessage().contains("Search group interrupted"));
+    }
+
+    private static Operation insert(long event, long key, long unit) {
+        return IndexOperationTrace.write(event, IndexOperationTrace.INSERT, 3, 0, IndexKey.ofInt(key), 0, 1, key, key)
+                .withWorkUnitId(unit);
+    }
+
+    @Test
+    public void baselineInsertsTravelInBatchesFlushedByUnitOtherRequestsAndFlush() throws IOException {
+        var requests = new TraceRequests(ValueKind.ROW_ID);
+        requests.baselineBatch(3);
+        var client = new Recorder(requests);
+        var responses = new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+        for (long key = 1; key <= 3; key++)
+            responses.add(client.send(key, insert(key, key, 1)).response().toCompletableFuture());
+        assertEquals(1, client.sent.size());
+        assertEquals(3, client.sent.get(0).getBatch().getWritesCount());
+        assertTrue(responses.stream().allMatch(java.util.concurrent.CompletableFuture::isDone));
+        // A new work unit sends the held part of the previous one first.
+        client.send(4, insert(4, 4, 1));
+        client.send(5, insert(5, 5, 2));
+        assertEquals(2, client.sent.size());
+        assertEquals(1, client.sent.get(1).getBatch().getWritesCount());
+        // Any other request sends the held inserts before it.
+        client.send(6, IndexOperationTrace.write(6, IndexOperationTrace.UPSERT, 3, 0, IndexKey.ofInt(6), 1, 1, 6, 6));
+        assertEquals(4, client.sent.size());
+        assertEquals(1, client.sent.get(2).getBatch().getWritesCount());
+        assertTrue(client.sent.get(3).hasWrite());
+        client.send(7, insert(7, 7, 3));
+        assertEquals(4, client.sent.size());
+        client.flush();
+        assertEquals(5, client.sent.size());
+        assertEquals(1, client.sent.get(4).getBatch().getWritesCount());
+    }
+
+    @Test
+    public void aFailedBatchFailsEveryInsertInIt() throws IOException {
+        var requests = new TraceRequests(ValueKind.ROW_ID);
+        requests.baselineBatch(2);
+        var client = new ServiceClient(requests) {
+            @Override
+            java.util.concurrent.CompletableFuture<org.sibench.adapters.proto.Response> transmit(
+                    Request request, java.util.function.Consumer<org.sibench.adapters.proto.Response> partial) {
+                return java.util.concurrent.CompletableFuture.completedFuture(
+                        org.sibench.adapters.proto.Response.newBuilder()
+                                .setId(request.getId())
+                                .setStatus(org.sibench.adapters.proto.Status.UNAVAILABLE)
+                                .build());
+            }
+        };
+        var first = client.send(1, insert(1, 1, 1)).response().toCompletableFuture();
+        var second = client.send(2, insert(2, 2, 1)).response().toCompletableFuture();
+        assertTrue(first.isCompletedExceptionally());
+        assertTrue(second.isCompletedExceptionally());
     }
 }

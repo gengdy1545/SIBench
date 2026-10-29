@@ -23,6 +23,25 @@ public class ReplayDispatcherTest {
     }
 
     @Test
+    public void measuredWindowStartsAfterTheWarmupCalls() throws Exception {
+        try (var dispatcher =
+                new ReplayDispatcher(
+                        config(1, 10),
+                        client -> (sequence, operation) -> ReplayTarget.SendHandle.completed(),
+                        2)) {
+            for (long unit = 1; unit <= 5; unit++) dispatcher.send(search(unit));
+            dispatcher.drain();
+            var report = dispatcher.describe();
+            var measurement = (Map<?, ?>) report.get("measurement");
+            assertEquals(2L, measurement.get("warmup_calls"));
+            assertEquals(3L, measurement.get("measured_calls"));
+            assertEquals("N/A", measurement.get("target_arrival_rate"));
+            assertEquals(3L, ((Map<?, ?>) report.get("search_latency")).get("count"));
+            assertEquals(5L, report.get("completed_responses"));
+        }
+    }
+
+    @Test
     public void serializesLocalSendsWithoutWaitingForServiceResponses() throws Exception {
         List<Long> sends = new ArrayList<>();
         List<Integer> clients = new ArrayList<>();
@@ -80,6 +99,7 @@ public class ReplayDispatcherTest {
             assertFalse(sender.isAlive());
             assertNull(failure.get());
             assertEquals(4L, dispatcher.describe().get("completed_responses"));
+            assertEquals(3L, dispatcher.describe().get("work_units"));
             dispatcher.requireClientCoverage();
         }
     }

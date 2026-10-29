@@ -1,6 +1,8 @@
 # SIBench
 
-通过原生 benchmark 执行、真实 Parquet 和确定性索引 Trace，评估 KV Index Service。HyBench 默认采用原生 `runHTAP`：AP → TP → 并发 AT/IQ，保留原生事务比例和业务分支。v9 规范 Trace 由来源 schema 驱动，使用保序键编码，把每个原生索引访问投影为一组能重现原生结果集的有序查询（区间、带 limit 的主键扫描、二级扫描的前段加钉住点查、BitmapAnd 交集组、`= ANY` 并集组），否则带原因拒绝。历史 v9 记录中，三来源（含并发的完整 HyBench HTAP）已在 8,706,000 行基线上端到端验证：0 拒绝，1/64/128 client 参考回放与独立 oracle 通过。事务内读语义已修正为保留原语句快照并只叠加本事务此前的修改，夹具与小型 RocksDB 回归通过；三来源大 Trace 的重跑尚未执行。通用 Index Service 协议（gRPC）与 RocksDB 参照实现已能回放 Trace，逐查询核对原生期望数和完整 `(PK, version, value)` 摘要。真实 PG 受控反例和完整提交发布 / 全序对照已在远程小库通过；正式大 Trace 与性能实验尚未完成。
+通过原生 benchmark、真实 Parquet 和确定性索引 Trace 评估 KV Index Service。HyBench、YCSB JDBC、sysbench PG 的已验证输入保留真实索引访问、语句快照与事务内写入前缀。当前 Trace v9 使用保序键编码；Index Service 协议 2 统一完整提交发布，逐查询核对原生条数及完整有序 SHA-256。
+
+三来源本地完整验收与 COS 目标规模已通过，条件和边界见 [三来源验收](docs/validation/p0-three-source-acceptance.md)、[对象存储结果](docs/validation/rocksdb-cloud-scale.md)。这些结果绑定各自构建；正式后端性能排名、数据文件 Rewrite / 版本 GC 和目标规模崩溃恢复仍未验收。
 
 ## 构建
 
@@ -65,12 +67,25 @@ java -Xmx24g -jar build/sibench/sibench.jar check-relocation PROFILE $T OUTPUT_D
 回放和快照报告必须是新文件。`check-replay` 检查 Trace 完整性、工作单元身份摘要、过滤后的 client 覆盖与有效操作预算；`replay` 是两种 value 的进程内正确性检查，不代表已连接真实的 128 个网络 client；`validate-snapshots` 使用独立行历史 oracle，派生探针不计入原生负载或性能；`validate-replay-matrix` 跑 1/64/128 client × 两种输入模式 × 二级开 / 关，要求操作顺序、状态与结果完全等价；`check-relocation` 搬迁实际修改表的最新存活行，核对精确版本 Locator 搬迁、RowID 不变。
 
 - `target.secondary_indexes.enabled` 默认 true；false 过滤全部二级加载、查询和维护，完整 Trace/Parquet 不变。
+- `target.value`（`locator` / `row_id`）只让 `replay` 与 `validate-snapshots` 运行该 value 模式；缺省两种都运行。服务回放的 value 在 `target.service.value`，两者不能同时出现。
 - `replay.dispatch_mode` 默认 `operation`，以操作为驱动输入单位；[index_replay_transaction.yaml](config/index_replay_transaction.yaml) 使用 `transaction` 按已提交源事务组织输入。两者最终均逐操作路由、单线程保序发送，不合并修改，不向索引发送事务控制，也不要求下游事务 API。
 - `replay.client_count` 默认 1；[64 client](config/index_replay_64clients.yaml) 和 [128 client](config/index_replay_128clients.yaml) 使用同一份 Trace。按源 SQL 请求分配 `workUnitId`，固定路由为 `(workUnitId - 1) % client_count`；同请求的主键/二级展开共用 client，同事务可跨 client。不按索引键或事务绑定，不增加其他路由策略。数量可超过 128，但过滤后的运行期操作必须覆盖全部配置 client，不足则拒绝并继续原生采集。
 - 本地发送完成后即可发下一项，不等待执行完成或跨 client 可见。`sent`/`response` 分开确认；`max_in_flight` 默认 4096，`request_timeout_seconds` 默认 60。驱动只在背压及最终排空时等待响应，遇到错误停止并清理，不通过屏障、重试或补偿修复服务端可见性。
 - 默认只向下游发送已提交变更，不限定 Index Service 场景。源 commit 后保留事务内查询与修改的原始顺序；写后查询携带原语句快照、本事务 CommitVersion 及此前修改位置，读取时只叠加本事务的这部分写入。回滚修改及修改后的查询排除，修改前的受支持查询保留；原始事实不变，无反向操作或回撤开关。
 - [long_replay.yaml](config/long_replay.yaml) 要求 single_pass、666,000,000 个有效操作；SF1 短输入会在预检失败。持续调度和分段供应尚未实现。
 - 异常运行保留诊断并拒绝编译；修复后从明确初始状态换新目录重跑。
+
+## 更新局部性
+
+静态分析只读已有 Trace / Baseline，不重采 PG：
+
+```bash
+java -Xmx24g -jar build/sibench/sibench.jar analyze-locality \
+  results/poc/regress-20261025/sf1-c8-v22 config/update_locality.yaml results/poc/locality-example
+python3 scripts/plot_update_locality.py results/poc/locality-example/analysis --out results/poc/locality-example/analysis/plots
+```
+
+绘图需要 Python 3、pandas 和 matplotlib。`config/update_locality.yaml` 固定 block / 文件布局、业务窗口和 L0 批次参数；输出窗口、block、L0 重叠和热力图。静态估算不是真实 SST / compaction 字节，方法和边界见 [更新局部性验证](docs/validation/update-locality.md)。
 
 ## Index Service 回放
 
@@ -83,7 +98,23 @@ java -jar build/sibench/sibench.jar replay-service config/service_replay_grpc.ya
 java -jar build/sibench/sibench.jar replay-service config/service_replay_rocksdb.yaml $T REPORT  # 进程内 RocksDB，无网络
 ```
 
-索引目录已存在即拒绝；一个索引只由一份 Trace 的 Baseline 加载一次。`service.ordered: true` 提供 `sequence` 全序诊断；`service.publication: true` 使用事务 lane、`Commit` 标记和完整发布水位，查询等待 `read_version` 发布；两种模式不能同时开启。
+索引目录已存在即拒绝；一个索引只加载一份 Trace 的 Baseline。服务与进程内 adapter 都按事务位置执行，以 `Commit` 标记连续推进完整发布水位，查询等待 `read_version` 发布；没有调度模式开关。`Flush` 持久化水位、Trace binding 与数据。示例统一使用 row_id，Locator 需同时修改服务与回放的 value。
+
+重启或冷启动后，`service.reopen: true` 打开同一索引，再用 `verify-service` 按原读点核对 workload 的全部快照查询（不发送写入，事务内查询不核对并单列）：
+
+```bash
+java -jar build/sibench/sibench.jar verify-service REPLAY_CONFIG $T REPORT --reference REFERENCE
+```
+
+`service.backend: rocksdb_cloud` 使用 rocksdb-cloud（JNI，语义与本地 RocksDB 共用），另需 `storage: config/storage.yaml`、`profile`（`local_s3` / `cos`）与 profile prefix 之下的 `object_path`；凭据只从 profile 指定的环境变量读取。JNI 库须在目标机（glibc 2.28）构建，以 root 运行 `scripts/build-rocksdb-cloud.sh`，产物 `build/index/librocksdb_cloud_jni.so`，运行时用 `-Dsibench.rocksdb_cloud.library=PATH` 指定。版本固定在 `index/versions.yaml`，语义见 [Index Service 契约](docs/contracts/index-service.md#rocksdb-cloud-后端)。
+
+jar 与 JNI 的请求统计格式须配套重建；云后端在每次 Flush 的 `*.engine-stats.jsonl` 中记录对象请求延迟桶和分位数上界。成功服务回放与同次运行的 RocksDB 事件日志可生成独立测量摘要（日志可重复指定；输出文件必须尚不存在）：
+
+```bash
+python3 scripts/summarize_index_run.py RUN/service.json --engine-log RUN/index/LOG --output RUN/index-measurement.json
+```
+
+该脚本只分析报告和引擎日志，不解码 Trace。重开后的 `LOG` 与原加载进程的 `LOG.old.*` 分开选择；缺日志写 N/A，缺少结束边界的 job 单列，不把日志采集缺口写成零工作量。观测范围与实例见 [目标规模测量](docs/validation/rocksdb-cloud-scale.md)。
 
 ## Baseline 生成配置
 
@@ -110,21 +141,24 @@ dry-run 只校验源码指纹、配置和 schema，不创建数据。去掉 `--d
 | `benchmark/` | 固定上游子模块，不直接修改 |
 | `src/main/java/org/sibench/`、`src/test/java/org/sibench/` | Java 核心与测试，按职责组织 |
 | `src/main/native/postgres/` | PG 14.24 采集插桩（`sibench_capture.c` 加调用点补丁），作用于隔离构建副本 |
+| `src/main/native/index/` | 索引后端的薄 JNI 绑定（rocksdb-cloud），只转发字节 |
+| `index/` | 索引后端固定版本（`versions.yaml`）；上游源码由构建脚本克隆到其下，不纳入源码 |
 | `src/main/proto/` | Index Service 协议定义 |
 | `scripts/` | 串联已有 Java CLI 阶段的编排脚本，不含来源语义 |
-| `config/` | 平铺配置，工作负载命名 `<benchmark>_<scale>.yaml` |
-| `build/sibench/`、`build/benchmarks/`、`build/services/` | 核心构建、上游构建、本地服务状态 |
+| `config/` | 长期维护的平铺配置，工作负载命名 `<benchmark>_<scale>.yaml`；单次有效配置随运行证据保存，测试夹具归测试资源 / 临时目录 |
+| `build/sibench/`、`build/benchmarks/`、`build/index/`、`build/services/` | 核心构建、上游构建、索引后端构建、本地服务状态 |
 | `results/` | 本地数据与实验证据，不纳入源码 |
 
-- [计划](plan.md)：当前实现、未完成项与验收。
+- [计划](plan.md)：后续目标、依赖与验收。
 - [Trace 契约](docs/contracts/trace.md)：版本、操作、发送及完整性。
 - [Index Service 协议契约](docs/contracts/index-service.md)：gRPC 协议、驱动侧核对与 RocksDB 参照实现。
 - [来源 Schema 契约](docs/contracts/source-schema.md)：三来源布局、PG 预检及失败边界。
 - [YCSB / sysbench 原生 Trace](docs/validation/ycsb-sysbench-native-trace.md)：完整访问投影、v9 Trace、回放与 oracle。
 - [按设计并发的原生采集](docs/validation/concurrent-native-capture.md)、[采集性能](docs/validation/capture-performance.md)：并发采集、HyBench SF10 与远程机 PG 配置对照。
 - [P0 读取正确性与逐查询结果校验](docs/validation/p0-read-validation.md)：事务内读、夹具反例与摘要负例。
-- [P0 原生反例、短流程矩阵与完整提交发布](docs/validation/p0-native-publish-validation.md)：真实 PG 两会话、短 sysbench 新语义 1/64/128 矩阵与发布 / 全序对照。
+- [P0 原生反例、短流程矩阵与完整提交发布](docs/validation/p0-native-publish-validation.md)：真实 PG 两会话、短 sysbench 1/64/128 矩阵与完整提交发布证据。
 - [P0 测试复核](docs/validation/p0-test-review.md)：发布模式迟到 / 重复请求缺陷的复核与修复记录。
 - [存储契约](docs/contracts/storage.md)：布局、Rewrite、GC 和测量边界。
+- [rocksdb-cloud 验证](docs/validation/rocksdb-cloud.md)：构建、对象存储核验、功能 / 重启 / 冷启动与边界。
 - [能力矩阵](docs/benchmarks/capability-matrix.md)：各来源当前覆盖。
 - 来源差异：[HyBench](docs/benchmarks/hybench.md)、[YCSB](docs/benchmarks/ycsb.md)、[sysbench](docs/benchmarks/sysbench.md)。

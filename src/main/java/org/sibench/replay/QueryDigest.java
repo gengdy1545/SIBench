@@ -74,10 +74,26 @@ public final class QueryDigest {
 
     public static String ofResponse(
             List<Operation> members, List<Result> results, boolean rowIds) {
-        MessageDigest digest = digest();
-        query(digest, members);
-        putInt(digest, results.size());
-        for (Result result : results) {
+        var digest = new Incremental(members, results.size(), rowIds);
+        for (Result result : results) digest.add(result);
+        return digest.hex();
+    }
+
+    /**
+     * A service response's digest computed as its results arrive. The count is the one the
+     * digest covers; it equals {@link #ofResponse} exactly when that many results were added.
+     */
+    public static final class Incremental {
+        private final MessageDigest digest = digest();
+        private final boolean rowIds;
+
+        public Incremental(List<Operation> members, long count, boolean rowIds) {
+            this.rowIds = rowIds;
+            query(digest, members);
+            putInt(digest, Math.toIntExact(count));
+        }
+
+        public void add(Result result) {
             putBytes(digest, result.getPrimaryKey().toByteArray());
             putLong(digest, result.getVersion());
             if (rowIds) putLong(digest, result.getValue().getRowId());
@@ -86,7 +102,10 @@ public final class QueryDigest {
                 putLong(digest, result.getValue().getPosition());
             }
         }
-        return HexFormat.of().formatHex(digest.digest());
+
+        public String hex() {
+            return HexFormat.of().formatHex(digest.digest());
+        }
     }
 
     private static void query(MessageDigest digest, List<Operation> members) {

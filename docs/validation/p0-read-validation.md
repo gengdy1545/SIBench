@@ -1,52 +1,31 @@
-# P0 读取正确性与逐查询结果校验
+# 读取正确性与逐查询结果校验
 
-更新：2026-10-27。工作区验证，不是远程大 Trace 或正式性能实验。
+更新：2026-10-29。本文记录当前读取语义与独立反例；完整输入结果见 [三来源验收](p0-three-source-acceptance.md)，协议与持久化边界见 [Index Service 契约](../contracts/index-service.md)。
 
-## 结论
+## 当前语义
 
-事务内读不再把查询的读取点替换成本事务的 CommitVersion。规范 Trace 现在表达：
+事务内读保留原语句 `readTimestamp`，以 `SEARCH.version` 指定本事务 CommitVersion，并只叠加查询之前的 `mutationOrdinal` 前缀。其它处于两个读点之间的提交不可见。读取器要求本地读 version>0、readTimestamp<version；缺失本事务版本的歧义形式被拒绝。
 
-```text
-原语句快照 (readTimestamp)
-+ 本事务 CommitVersion (SEARCH.version)
-+ 查询前已发生的修改数 (mutationOrdinal)
-+ TRANSACTION_LOCAL_SEARCH
-```
+服务回放逐查询核对原生条数和有序 SHA-256，涵盖来源身份、范围、读取点、事务位置、PK、version 和完整 value。期望 sidecar 绑定输入和过滤条件；响应按 request id 核对，可乱序完成。显式参考报告缺少摘要会失败，没有全局 XOR 校验回退。
 
-参考模型和 RocksDB 先取快照 `<= readTimestamp` 的状态，再只叠加该事务 CommitVersion 中已发送的写入；两个位置之间提交的其它事务不可见。旧 v9 的 `version=0`、`readTimestamp=本源 CommitVersion` 形式仍可读，但新编译不再生成；旧 Trace 与新 Trace 不应混在同一次比较结论中。
+## 独立证据
 
-服务回放还新增逐查询强摘要：查询身份、范围 / 钉住键、读取点、事务位置、结果顺序及完整 `(PK, version, value)` 都进入 SHA-256。期望摘要由参考回放生成一次，头部绑定 workload / baseline Trace 摘要、`operation_trace_version`、value 模式和二级过滤配置；服务回放按请求 id 核对，响应仍可乱序完成。
-
-## 证据
-
-| 检查 | 位置 | 结果 |
+| 场景 | 当前测试 / 证据 | 预期 |
 | --- | --- | --- |
-| 两会话夹具反例，T2 先提交移出 B 并插入同值 C，T1 读 B | `IndexTraceCompilerTest.transactionLocalSearchKeepsItsSnapshotAndOnlyItsOwnWrites` | 新语义返回 B0；旧单时间戳语义返回 C，条数同为 1 |
-| 主键 / 二级、删除 / 重插入、同键多次修改 | `IndexTraceCompilerTest.allIndexesAndValueChangesPreserveIdentityHistoryQueriesAndVariants`、`abortDoesNotAllocateVersionsOrRowIdsAndPrewriteReadsSurvive` | 参考回放与 oracle 通过 |
-| 同条数错集合、错版本、错主键、重复、顺序颠倒、跨查询交换、`1^2 == 4^7` | `TraceRequestsTest` | 全部拒绝并定位 source event / work unit |
-| 参考模型与 RocksDB 的事务内读 | `RocksDbBackendTest.transactionLocalReadSeesOwnWritesAndKeepsTheStatementSnapshot` | 结果一致；快照外版本不可见 |
-| 旧 v9 事务内读形式 | `IndexReferenceSearchTest.oldV9LocalSearchFormStillReadsItsOwnVersion` | 兼容读取，不声明新语义 |
-| 进程内 RocksDB `replay-service` 端到端 | `IndexTraceCompilerTest` 同一夹具 | `status=passed`，逐查询摘要检查 1 次 |
-| 乱序 / 缺失位置 / 重复位置 / 超时 / 未知结果 | `ReplayDispatcherTest`、`IndexServerTest` | 后续位置等待、重复拒绝、未知写入不自动重试 |
+| T1 更新 A 后读 B；T2 在快照后移出 B 并插入同值 C | `IndexTraceCompilerTest.transactionLocalSearchKeepsItsSnapshotAndOnlyItsOwnWrites`、[原生 PG 反例](p0-native-publish-validation.md) | 返回 B；把读点替换为 T1 提交版本会错误返回 C，两者条数同为 1。 |
+| 事务内多次改键、删除 / 重插入、主键与二级历史读 | `RocksDbBackendTest`、`IndexTraceCompilerTest`、Parquet oracle | 原语句快照与本事务前缀一致，旧值不复活，重插入保留新身份。 |
+| 缺失本事务版本 | `IndexReferenceSearchTest.oldV9LocalSearchFormWithoutItsOwnVersionIsRejected` | 明确拒绝。 |
+| 同条数的错键、错版本、错 value、重复、顺序颠倒、跨查询交换 | `TraceRequestsTest` | 摘要失败并定位源事件；包括 XOR 相同的错集合和 Locator 高位变化。 |
+| 普通查询分块、丢块、错 id、最终状态失败 | `IndexServerTest`、`PublishedIndexTest` | 完整摘要匹配；中途失败不能算完成。 |
+| 迟到 / 重复请求、缺少提交、跨连接读取 | [发布不变量](p0-test-review.md) | 非法请求不改状态；只在连续完整水位下可读。 |
 
-全部 `mvn test` 在当前工作区通过（296 tests，0 failures / errors / skipped）；发布模式迟到 / 重复请求的复核记录见 [P0 测试复核](p0-test-review.md)。本页的单元测试是夹具和进程内服务验证；真实 PG 两会话、短 sysbench 矩阵和 gRPC 发布 / 全序对照见 [P0 原生反例、短流程矩阵与完整提交发布](p0-native-publish-validation.md)。
-
-## 原生证据与发布模式
-
-真实 PG 两会话反例已在 `sibench_3` 的独立小库中完成：T1 更新 A 后读 B（`k=302261`），T2 在 T1 快照之后把 B 移出该值并插入同值 C，T1 提交。原生结果是 B（`id=2`）；规范 Trace 的本地读为 `read=0/version=2/ordinal=1`；参考 / Parquet / RocksDB / gRPC 回放均返回 B，旧单时间戳反事实返回 C（`id=2000001`）。完整命令、哈希、短 sysbench 新语义 1/64/128 矩阵及发布 / 全序对照见 [P0 原生反例、短流程矩阵与完整提交发布](p0-native-publish-validation.md)。
-
-## 未完成
-
-- SF10 `hl9` 已重编并完成结果-only 影响比较：3,530,167 个分组本地查询 changed=0；3,530,323 个本地搜索是可能受影响上界，不是错误率。
-- 87m 级完整服务回放仍未执行；短 sysbench / 原生小 Trace 的 sidecar 复用与 gRPC 回放已通过。
-- 完整提交发布目前是正确性参照：等待查询占用服务线程，未做非阻塞调度、恢复水位和高并发扩展性证明。
+三来源本地完整服务验收与 COS 目标规模已通过。等待中的查询不占执行线程，发布水位随 Flush 恢复；不能继续把这些能力列为未完成。大规模查询组、目标规模崩溃恢复与正式性能排名仍未证明。
 
 ## 复现
 
 ```bash
-mvn -q -Dtest=IndexTraceCompilerTest#transactionLocalSearchKeepsItsSnapshotAndOnlyItsOwnWrites test
-mvn -q -Dtest=TraceRequestsTest,RocksDbBackendTest,ReplayDispatcherTest,IndexServerTest test
-mvn -q test
+rtk mvn -Dtest=IndexTraceCompilerTest,TraceRequestsTest,RocksDbBackendTest,PublishedIndexTest,IndexServerTest test
+rtk mvn test
 ```
 
-历史 Trace 未改写；旧 `result_checksum` 仅保留为历史回归定位字段。
+根测试检查当前协议与实现；既有原生 PG、Parquet 和全量证据只在输入及对应语义未改变时复用，不用模型间一致替代独立事实。

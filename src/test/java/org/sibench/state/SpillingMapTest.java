@@ -387,4 +387,29 @@ public class SpillingMapTest {
             assertTrue(Files.isDirectory(directory));
         }
     }
+
+    /** A seek continues exactly like a fresh scan from the same key, over memory and runs. */
+    @Test
+    public void seekContinuesLikeAFreshScanInBothDirections() throws Exception {
+        try (var map = new SpillingMap(temporary.newFolder().toPath(), 7, 2)) {
+            for (long k = 0; k < 200; k += 2) map.put(key(k), k);
+            for (long k = 1; k < 200; k += 6) map.put(key(k), -k);
+            for (boolean descending : new boolean[] {false, true}) {
+                for (long at : new long[] {0, 37, 100, 101, 199, 250}) {
+                    List<Long> seeked = new ArrayList<>(), fresh = new ArrayList<>();
+                    try (var scan = map.scan(key(20), key(180), descending)) {
+                        scan.next();
+                        scan.seek(key(at));
+                        while (scan.next()) seeked.add(java.nio.ByteBuffer.wrap(scan.value()).getLong());
+                    }
+                    byte[] from = descending ? key(20) : (at > 20 ? key(at) : key(20));
+                    byte[] to = descending ? (at < 180 ? key(at) : key(180)) : key(180);
+                    try (var scan = map.scan(from, to, descending)) {
+                        while (scan.next()) fresh.add(java.nio.ByteBuffer.wrap(scan.value()).getLong());
+                    }
+                    assertEquals((descending ? "down " : "up ") + at, fresh, seeked);
+                }
+            }
+        }
+    }
 }

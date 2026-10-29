@@ -57,6 +57,12 @@ public final class SpillingMap implements AutoCloseable {
         byte[] key();
 
         byte[] value();
+
+        /**
+         * Continues the scan from {@code key}: ascending, at the first key at or above it;
+         * descending, at the first key below it. Positions within the original bounds only.
+         */
+        void seek(byte[] key) throws IOException;
     }
 
     private final java.util.function.Supplier<Path> directory;
@@ -347,11 +353,16 @@ public final class SpillingMap implements AutoCloseable {
     private final class Scan implements Entries {
         private final List<Source> sources = new ArrayList<>();
         private final PriorityQueue<Ranked> queue;
+        private final byte[] from, to;
+        private final boolean descending;
         private byte[] key, value;
 
         private record Ranked(Source source, int age) {}
 
         Scan(byte[] from, byte[] to, boolean descending) throws IOException {
+            this.from = from;
+            this.to = to;
+            this.descending = descending;
             queue =
                     new PriorityQueue<>(
                             (a, b) -> {
@@ -359,14 +370,27 @@ public final class SpillingMap implements AutoCloseable {
                                 if (descending) order = -order;
                                 return order != 0 ? order : Integer.compare(b.age(), a.age());
                             });
+            open(from, to);
+        }
+
+        private void open(byte[] lower, byte[] upper) throws IOException {
             try {
                 int age = 0;
-                for (Run run : runs) add(run.source(SpillingMap.this, from, to, descending), age++);
-                add(new MemorySource(from, to, descending), age);
+                for (Run run : runs) add(run.source(SpillingMap.this, lower, upper, descending), age++);
+                add(new MemorySource(lower, upper, descending), age);
             } catch (IOException | RuntimeException error) {
                 close();
                 throw error;
             }
+        }
+
+        @Override
+        public void seek(byte[] key) throws IOException {
+            close();
+            sources.clear();
+            queue.clear();
+            if (descending) open(from, to != null && Arrays.compareUnsigned(to, key) < 0 ? to : key);
+            else open(from != null && Arrays.compareUnsigned(from, key) > 0 ? from : key, to);
         }
 
         private void add(Source source, int age) throws IOException {

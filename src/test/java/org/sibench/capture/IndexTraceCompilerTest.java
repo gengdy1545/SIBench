@@ -787,7 +787,7 @@ public class IndexTraceCompilerTest {
                         fixture.resolve("service-index"),
                         0,
                         org.sibench.adapters.proto.ValueKind.ROW_ID,
-                        true,
+                        null,
                         false);
         var served =
                 org.sibench.adapters.ServiceReplay.run(
@@ -799,28 +799,44 @@ public class IndexTraceCompilerTest {
         assertEquals("passed", served.get("status"));
         var servedResult = (Map<?, ?>) served.get("result");
         assertEquals(1L, ((Number) servedResult.get("per_query_digest_checks")).longValue());
-        var publishedService =
+        var referenceRowId = com.google.gson.JsonParser.parseString(
+                        Files.readString(fixture.resolve("replay.json")))
+                .getAsJsonObject().getAsJsonArray("results").get(1).getAsJsonObject();
+        assertEquals("rowid", referenceRowId.get("mode").getAsString());
+        assertEquals(referenceRowId.get("query_digest_sha256").getAsString(),
+                servedResult.get("expected_results_sha256"));
+        // Reopened, the index has nothing to check here: the trace's one search is
+        // transaction-local and its answer is gone once the transaction's later writes landed.
+        var reopened =
                 new org.sibench.adapters.ServiceConfig(
                         "rocksdb",
                         null,
-                        fixture.resolve("service-index-published"),
+                        fixture.resolve("service-index"),
                         0,
                         org.sibench.adapters.proto.ValueKind.ROW_ID,
-                        false,
-                        true);
-        var published =
-                org.sibench.adapters.ServiceReplay.run(
-                        output,
-                        ReplayConfig.defaults(),
-                        publishedService,
                         null,
-                        fixture.resolve("service-published.json"));
-        assertEquals("passed", published.get("status"));
-        var publishedResult = (Map<?, ?>) published.get("result");
-        assertEquals(1L, ((Number) publishedResult.get("per_query_digest_checks")).longValue());
+                        false);
+        var verified =
+                (Map<?, ?>)
+                        org.sibench.adapters.ServiceReplay.verify(
+                                        output,
+                                        ReplayConfig.defaults(),
+                                        reopened,
+                                        fixture.resolve("replay.json"),
+                                        fixture.resolve("verify.json"))
+                                .get("result");
+        assertEquals(0L, ((Number) verified.get("per_query_digest_checks")).longValue());
+        assertEquals(1L, ((Number) verified.get("unchecked_transaction_local_queries")).longValue());
+        // A locator-only reference replay reports that mode alone.
+        var locatorOnly =
+                ReferenceReplay.run(
+                        output, ReplayConfig.defaults(), List.of(false), fixture.resolve("replay-locator.json"));
         assertEquals(
-                ((Number) servedResult.get("result_checksum")).longValue(),
-                ((Number) publishedResult.get("result_checksum")).longValue());
+                List.of("locator"),
+                ((List<?>) locatorOnly.get("results"))
+                        .stream()
+                        .map(item -> ((Map<?, ?>) item).get("mode"))
+                        .toList());
     }
 
     @Test
@@ -863,6 +879,98 @@ public class IndexTraceCompilerTest {
                         .getAsJsonObject("snapshot_crosscheck");
         assertEquals(1, crosscheck.get("searches_checked").getAsLong());
         assertEquals(1, crosscheck.get("searches_without_usable_snapshot").getAsLong());
+        verifyReopenedPublishedIndex(fixture, output);
+    }
+
+    /**
+     * Loads the trace into a published index, reopens it and checks every snapshot search again;
+     * an index that claims the same watermark without the trace's entries must fail.
+     */
+    private static void verifyReopenedPublishedIndex(Path fixture, Path output) throws Exception {
+        var reference = fixture.resolve("verify-reference.json");
+        assertEquals("passed", ReferenceReplay.run(output, ReplayConfig.defaults(), reference).get("status"));
+        var service = publishedInProcess(fixture.resolve("verify-index"));
+        assertEquals(
+                "passed",
+                org.sibench.adapters.ServiceReplay.run(
+                                output, ReplayConfig.defaults(), service, reference, fixture.resolve("verify-load.json"))
+                        .get("status"));
+        var verified =
+                (Map<?, ?>)
+                        org.sibench.adapters.ServiceReplay.verify(
+                                        output,
+                                        ReplayConfig.defaults(),
+                                        service,
+                                        reference,
+                                        fixture.resolve("verify.json"))
+                                .get("result");
+        var manifest =
+                JsonParser.parseString(Files.readString(fixture.resolve("verify-load.json.index-manifest.json")))
+                        .getAsJsonObject();
+        var traceManifest = JsonParser.parseString(Files.readString(output.resolve("manifest.json"))).getAsJsonObject();
+        assertEquals(traceManifest.get("workload_trace_sha256"), manifest.get("workload_trace_sha256"));
+        assertEquals(traceManifest.get("index_definitions"), manifest.get("index_definitions"));
+        assertEquals(verified.get("published_version"), manifest.get("commit_version").getAsLong());
+        assertEquals("encoded_key", manifest.get("versioning_mode").getAsString());
+        assertEquals("N/A", manifest.get("source_snapshot_id").getAsString());
+        assertTrue(manifest.get("index_binding").getAsString().endsWith("mode=rowid"));
+        // An index bound to another trace is refused before any query, even at the same watermark.
+        long published = manifest.get("commit_version").getAsLong();
+        try (var foreign =
+                org.sibench.adapters.RocksDbBackend.create(
+                        fixture.resolve("verify-foreign-index"), org.sibench.adapters.proto.ValueKind.ROW_ID)) {
+            foreign.bind("another-trace mode=rowid");
+            foreign.recordPublishedVersion(published);
+            foreign.flush();
+        }
+        var mismatch =
+                assertThrows(
+                        java.io.IOException.class,
+                        () ->
+                                org.sibench.adapters.ServiceReplay.verify(
+                                        output,
+                                        ReplayConfig.defaults(),
+                                        publishedInProcess(fixture.resolve("verify-foreign-index")),
+                                        reference,
+                                        fixture.resolve("verify-foreign.json")));
+        assertTrue(mismatch.getMessage(), mismatch.getMessage().contains("Index holds another-trace"));
+        long checked = ((Number) verified.get("per_query_digest_checks")).longValue();
+        assertTrue(checked > 0);
+        assertEquals(0L, ((Number) verified.get("per_query_digest_mismatches")).longValue());
+        assertTrue(((Number) verified.get("checked_result_items")).longValue() > 0);
+        long watermark = ((Number) verified.get("published_version")).longValue();
+        assertTrue(watermark > 0);
+        try (var empty =
+                org.sibench.adapters.RocksDbBackend.create(
+                        fixture.resolve("verify-empty-index"), org.sibench.adapters.proto.ValueKind.ROW_ID)) {
+            empty.recordPublishedVersion(watermark);
+            empty.flush();
+        }
+        var wrong =
+                assertThrows(
+                        java.io.IOException.class,
+                        () ->
+                                org.sibench.adapters.ServiceReplay.verify(
+                                        output,
+                                        ReplayConfig.defaults(),
+                                        publishedInProcess(fixture.resolve("verify-empty-index")),
+                                        reference,
+                                        fixture.resolve("verify-empty.json")));
+        var message = new StringBuilder();
+        for (Throwable cause = wrong; cause != null; cause = cause.getCause())
+            message.append(cause.getMessage()).append(" | ");
+        assertTrue(message.toString(), message.toString().contains("Search count mismatch"));
+    }
+
+    private static org.sibench.adapters.ServiceConfig publishedInProcess(Path index) {
+        return new org.sibench.adapters.ServiceConfig(
+                "rocksdb",
+                null,
+                index,
+                0,
+                org.sibench.adapters.proto.ValueKind.ROW_ID,
+                null,
+                false);
     }
 
     @Test
@@ -1089,9 +1197,45 @@ public class IndexTraceCompilerTest {
         var sourceManifest = manifest.deepCopy();
         sourceManifest.getAsJsonArray("index_definitions").remove(20);
         Files.writeString(output.resolve("manifest.json"), new Gson().toJson(sourceManifest));
-        assertThrows(
-                java.io.IOException.class,
-                () -> ReferenceReplay.check(output, ReplayConfig.defaults()));
+        var outside =
+                assertThrows(
+                        java.io.IOException.class,
+                        () -> ReferenceReplay.check(output, ReplayConfig.defaults()));
+        assertEquals("Declared index catalog differs from pinned source schema", outside.getMessage());
+        Files.writeString(output.resolve("manifest.json"), new Gson().toJson(manifest));
+        // A maintenance unit missing one secondary entry, with matching digest and count, must be
+        // refused by the coverage check that runs in the supply pass.
+        Path workload = output.resolve("workload.ops"), saved = fixture.resolve("workload.saved");
+        Files.copy(workload, saved);
+        var operations = new java.util.ArrayList<IndexOperationTrace.Operation>();
+        IndexOperationTrace.read(saved, operations::add);
+        int dropped = -1;
+        for (int i = 0; i < operations.size() && dropped < 0; i++)
+            if (operations.get(i).index() > 0
+                    && operations.get(i).kind() != IndexOperationTrace.SEARCH
+                    && !IndexOperationTrace.isControl(operations.get(i)))
+                dropped = i;
+        assertTrue(dropped > 0);
+        operations.remove(dropped);
+        Files.delete(workload);
+        try (var writer = new IndexOperationTrace.Writer(workload)) {
+            for (var operation : operations) writer.append(operation);
+        }
+        var truncated = manifest.deepCopy();
+        truncated.addProperty("workload_trace_sha256", IndexOperationTrace.sha256(workload));
+        truncated.addProperty("workload_operations", operations.size());
+        Files.writeString(output.resolve("manifest.json"), new Gson().toJson(truncated));
+        var partial =
+                assertThrows(
+                        java.io.IOException.class,
+                        () -> ReferenceReplay.check(output, ReplayConfig.defaults()));
+        assertTrue(
+                partial.getMessage(),
+                partial.getMessage().matches(
+                        "Partial source index maintenance is not supported|Truncated index maintenance unit"
+                                + "|Interrupted index maintenance unit|Invalid maintenance unit identity"
+                                + "|Invalid source index maintenance order"));
+        Files.move(saved, workload, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         Files.writeString(output.resolve("manifest.json"), new Gson().toJson(manifest));
     }
 

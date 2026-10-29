@@ -28,6 +28,9 @@ public interface ReplayTarget extends AutoCloseable {
         throw new IOException("Replay target does not support complete-commit markers");
     }
 
+    /** Sends whatever the client still holds back, such as a partial batch, before a drain. */
+    default void flush() throws IOException {}
+
     record SendHandle(CompletionStage<Void> sent, CompletionStage<Void> response) {
         public SendHandle {
             Objects.requireNonNull(sent);

@@ -47,4 +47,4 @@ mvn -o -Dtest=RowStateAuditIntegrationIT \
 
 `SIBENCH_ROW_TEST_USER` 默认 postgres，密码使用 `PGPASSWORD`。测试创建并自动删除自身的临时库；原始采集、基线、审计和拒绝诊断保留在证据目录。
 
-受控 SQL 不代表原生客户端执行。行因果链不证明全局事件无丢失；审计仍缓存修改集合，未验收 SF1000 有界状态。
+受控 SQL 不代表原生客户端执行。行因果链不证明全局事件无丢失；行审计以外部排序归并修改，落盘等价证据见 [采集完整性](capture-completeness.md)；SF1000 容量尚未验收。

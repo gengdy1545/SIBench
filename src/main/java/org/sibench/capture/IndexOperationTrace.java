@@ -253,8 +253,7 @@ public final class IndexOperationTrace {
          * A search's {@code version} is 0 unless it is transaction-local; then it is the
          * committing transaction's own version. Its {@code readTimestamp} remains the statement
          * snapshot, so a reader takes that snapshot and overlays this transaction's writes up to
-         * {@code mutationOrdinal}. Older v9 traces carry a local search's read point in
-         * {@code readTimestamp} with {@code version=0}; readers must keep accepting that form.
+         * {@code mutationOrdinal}.
          */
         public Operation withVersion(long searchVersion) {
             return new Operation(
@@ -386,7 +385,7 @@ public final class IndexOperationTrace {
         boolean pinned = o.key() != null;
         boolean local = (o.flags() & TRANSACTION_LOCAL_SEARCH) != 0;
         return (local
-                        ? o.version() >= 0
+                        ? o.version() > 0
                                 && o.transactionId() > 0
                                 && o.mutationOrdinal() > 0
                                 && (o.flags() & SNAPSHOT_SEARCH) == 0
