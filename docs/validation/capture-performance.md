@@ -1,62 +1,47 @@
-# 采集性能：机器与 PG 配置
+# 采集环境与阶段计量
+
+更新：2026-10-29。当前单次采集为 `acceptance-20261029T053122Z`，完整结果与输入身份见 [三来源验收](acceptance.md)。本页报告来源生成管线，不把采集吞吐当作索引服务性能。
 
 ## 执行环境
 
-开发机为 32 线程、约 62 GB 内存、/mnt/disk1 约 985 GB，用于开发和已有输入回归。远程工作区为 /data/sibench；sibench_1 / 2 / 3 分别承担 HyBench / YCSB / sysbench 采集，sibench_4–7 用于引擎构建、参考 / oracle、服务和 COS 对照。各远程 pod 配额 32 CPU / 64 GB（含页缓存）、/data 500 GB xfs，共享宿主上存在其他负载；TencentOS 3.2 / glibc 2.28 的 native 构建须核验兼容性。
+开发机为 32 线程、约 62 GB 内存，工作区 `/mnt/disk1/SIBench`，用于构建、离线测试和证据整理。远程工作区 `/data/sibench`，TencentOS 3.2 / glibc 2.28、AMD EPYC 9K65；各 pod 配额 32 CPU，内存上限 64,000,000,000 B（59.60 GiB，含页缓存），`/data` 为 500 GiB xfs。宿主可见 96 个逻辑 CPU，JVM 按配额识别 32；不能把可见数量当作实验配额。原始环境快照见本轮 `environment/`。共享宿主可能存在其他负载，单样本不能排除宿主波动。
 
-采集使用 PG 14.24、read_committed、无 parallel worker、postgres 角色、C collation 和 zstd；静止库、PG 参数与认证身份匹配后复用。新服务使用非 root 用户，历史运行身份以原证据为准。不使用已有数据的 /codev 分区；跨机或竞争负载下的单次耗时不能作为版本收益依据。
+本轮 `sibench_1 / 2 / 3` 分别运行 HyBench / YCSB / sysbench；`sibench_4` 构建 JNI 并完成小输入恢复、存储和 PG 集成验证。完整本地 / COS 后端按来源依次运行，每一对使用同机同输入和相同资源预算，不并行竞争 COS。参考与 oracle 在各来源主机上先完成。
 
-2026-10-25 至 27。回答两个问题：采集 PG 的配置能把原生执行提速多少，插桩本身占多少；以及采集应在哪类机器上运行。
+使用 JDK 17.0.20 / 远程 17.0.20.1、PG 14.24，业务进程以 UID 1000 的 `sibench` 运行。PG 采用 [postgres_capture.conf](../../config/postgres_capture.conf)、read_committed、C collation、禁用 parallel worker，追踪格式为 summary + zstd；实际有效配置随运行保存。
 
-## 方法
+PG 二进制 SHA-256 `c5e02bffee01d18b6ba5a7b6bec19dd52c3a82e4887014ff47b982bc9638bbe1`，row_capture 库 SHA-256 `0c802b68cd168458c554023220cdc1164101397592f9f96ba57ce4b7503ddaa7`。应用、JNI 和来源提交以同轮身份文件为准。
 
-在 `sibench_1`（远程机，见 [执行环境](#执行环境)：Kubernetes pod，32 CPU / 64 GB，EPYC 9K65，`/data` 云盘）上，以 TencentOS 构建的同一份插桩 PG 14.24 与同一个 jar，从同一个 SF10 静止库（`base` 阶段原生 gendata 161 s、装载约 150 s，87,060,000 行）每次克隆新库，按 `config/hybench_sf10.yaml` 的并发（TP 8、AT 8、IQ 8 client）运行 AP 一轮、TP 2 分钟、XP 2 分钟。每种配置跑两遍，顺序交错，以摊平宿主机上其他负载的波动。原版 PG 由同一源码不打补丁构建，用同一数据目录运行（补丁只改共享内存结构，不改盘上格式）；克隆库由插桩 PG 准备后删去行捕获触发器再切换，HyBench 由相同方式（不经采集驱动）运行。
+## 本轮生成条件
 
-| 配置 | 内容 |
-| --- | --- |
-| A | 采集集群当时的配置：`shared_buffers` 256 MB，其余默认（`max_wal_size` 1 GB、`checkpoint_timeout` 5 min、`synchronous_commit` on） |
-| B1 | A 加不改变执行计划的参数：`shared_buffers` 16 GB、`max_wal_size` 32 GB、`min_wal_size` 4 GB、`checkpoint_timeout` 30 min、`checkpoint_completion_target` 0.9、`wal_buffers` 64 MB、`synchronous_commit` off、`maintenance_work_mem` 2 GB |
-| B2 | B1 加改变执行计划的 `effective_cache_size` 40 GB、`work_mem` 64 MB |
-| C | B1，原版 PG，无采集 |
+三组均从已验证、停机的静止 PG 基库 reflink 克隆，复用摘要匹配的 Baseline Parquet；重新执行原生 workload、全部会话审计、完整行状态审计、计数器核对、Trace 编译和新认证。**本轮没有重新测量初始原生 gendata / load / 建索引 / Baseline 全量导出成本**。prepare / export 的亚秒耗时是复用开销，不能写成从零建库或导出速率。
 
-## 结果
+| 来源 | 基线行数 | 原生并发与负载 |
+| --- | ---: | --- |
+| HyBench SF10 | 87,060,000 | AP 1；TP 32；XP AT 32 / IQ 32；TP / XP 各 5 分钟 |
+| YCSB | 87,060,000 | 32 线程，JDBC A / B / C / F / D / E，10 × 100 字节字段 |
+| sysbench | 87,060,000 | 8 线程，8 表 × 10,882,500 行，六个固定 oltp 脚本 |
 
-2 分钟内完成数（两遍）：
+负载量由当前 Java `plan-write-ratio` 根据同来源同规模校准输入推导；有效配置和校准 manifest 随运行保存。按时间停止的 HyBench 会有比例偏差，实际修改数以最终 Trace 为准；不删除查询或截断事务来凑 5%。
 
-| 配置 | TP 事务 | AT 事务 | IQ 查询 |
-| --- | --- | --- | --- |
-| A | 10,921 / 10,262 | 4,914 / 4,639 | 4,292 / 4,263 |
-| B1 | 14,521 / 14,253 | 6,214 / 6,166 | 4,707 / 4,765 |
-| B2 | 14,256 / 14,316 | 6,112 / 6,307 | 4,564 / 4,407 |
-| C | 12,330 / 14,640 | 5,864 / 6,124 | 5,716 / 5,716 |
+## 分阶段墙钟
 
-- B1 相对 A：TP 约 +36%、AT 约 +30%、IQ 约 +10%。B2 相对 B1 无收益，改变计划的参数不采用。
-- C 相对 B1：TP、AT 在两遍之间的波动范围内（C 的两遍 TP 相差 2,300），IQ 约快 17%。插桩开销集中在每个查询含数千次索引访问的 IQ。
-- 同为配置 A，`sibench_1` 的 TP 91 事务 / 秒、AT 41、IQ 36，开发机 SF10 校准为 36.5、17.8、14.7，远程机约快 2.5–3 倍；远程机磁盘随机读更慢（8 KiB 0.8–2 ms，开发机 0.44 ms），说明此规模下原生执行主要受 CPU 限制。
-- 开发机上 SF1 → SF10 同为 8 client，TP 从 332 降到 38.6 事务 / 秒；远程机上的对照表明这一下降中配置可解释的部分有限，主要是更大的数据下每个事务更贵与机器本身。
+单位为秒，取同轮 `run-timing.json` 的阶段记录，保留两位小数。
 
-## 结论
+| 来源 | 原生执行 | 行审计 | 编译初始化 | Baseline 派生 | workload 编译 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HyBench SF10 | 727.85 | 483.55 | 2.14 | 58.34 | 315.21 |
+| YCSB 87m | 1,584.33 | 1,042.27 | 11.98 | 28.84 | 574.66 |
+| sysbench 87m | 411.64 | 202.80 | 2.56 | 36.21 | 245.79 |
 
-- 采集在远程机上运行，使用 B1 配置（`config/postgres_capture.conf`）；开发机用于开发、回归与回放。
-- 写入比例固定时，原生执行时长 = 目标写入 ÷ 写入吞吐。按 B1 在远程机，HyBench SF10 达到 5% 写入约需 TP、XP 各 17.5 分钟（开发机为各 53 分钟），以远程实测为准。
-- 配置已接近上限（原版 PG 也只快 0–17%）；进一步缩短原生执行只能靠 benchmark 自身的并发参数，需同时验证正确性与来源失败处理。
+阶段边界见原始 timing；workload 编译包含访问账本与计数器核对。上述子阶段不包含全部 JVM 启停与收尾，不能简单相加冒充端到端。认证后已审计的逐行变化文件按现有管线规则移除；保留原生事实、行审计报告、新认证和编译输入绑定，以自身认证重编。
 
-## 生成管线与选定对照
+## 资源与保护边界
 
-当前管线并行导出 / 核验，编译共享解析池并同遍构建账本；Baseline 操作从已验证 Parquet 派生，workload 与工作单元目录按 zstd 保存。不同阶段的确认与计数职责见 [Trace 契约](../contracts/trace.md)。
+采集 JVM 堆上限 32 GiB，参考 / 独立 oracle 40 GiB，局部性分析 24 GiB，服务与驱动各 16 GiB。大阶段独立上限 6 小时；后端 setup 600 秒、单请求 600 秒、replay 6 小时、teardown 30 秒分别计时，第一处错误与后续清理分开保存。600 秒是实验保护，不是服务性能验收目标。磁盘余量低于 20 GiB 时停止受影响采集。
 
-2026-10-25 的同配置 B1 对照记录了 HyBench SF10 导出 / 核验 572 → 60 s、sysbench 87m 452 → 50 s，以及 HyBench SF10 5% Trace 从 70 GB 降至 2.3 GB。收益包含避免重复读取、并行编码与不再落盘 Baseline 操作；这些是所记录构建的观测，不是当前 jar 的重新测量。三来源最终生成基线见 [测量结果](p0-measurement.md#三来源生成基线)。
+每个命令保留 `/usr/bin/time -v` 与应用 timing。采集命令的 CPU 不含独立 PG daemon；其 max RSS 是 GNU time 记录的最大子进程值，不能把它当作 PG、客户端和 JVM 的内存总和。各 JVM 的进程 CPU / RSS 可单列。30 秒主机采样包含页缓存与其他进程；cgroup 历史 HWM 不能归因到本轮。共享 `/data` 的前后差值也不能当作单阶段临时空间。
 
-YCSB 87m 的首次导出 / 核验单列：new21 在 sibench_2 上读取主键与堆顺序无关的 95 GB 表，PG 8 worker 排序后流式导出约 30 min，核验按块并行扫描 PG、按 row group 读取 Parquet 并比较顺序无关行摘要，用时 676 s；Parquet 主键顺序另逐行检查。此前合计耗时 2,194–6,595 s，缓存及共享宿主影响不能忽略。`-Dsibench.baseline.verify_ordered=true` 可用逐行比较定位差异；两条核验路径均不属于采集认证闭包。
+阶段 CPU / RSS、最终产物和服务端指标统一见 [测量口径与本轮结果](measurement.md)。原始采集目录为各来源主机 `results/poc/acceptance-20261029T053122Z/<source>/`；命令、配置和资源记录在同机 `results/validation/acceptance-20261029T053122Z/<source>/`。
 
-同 raw、Baseline、认证及计数器的编译器 / 解析线程对照统一见 [编译对照](compile-optimization-20261026.md)。改善约 0.4%–1.6%，YCSB 负载阶段没有改善，默认解析线程未因单个较快样本改变；不重复保存各轮实现记录。参考模型的完整输入优化另见 [参考回放对照](p0-measurement.md#参考模型版本跳过)。
-
-## 产物
-
-`sibench_1:/data/sibench/results/poc/ab/<A1|A2|B1a|B1b|B2a|B2b|Ca|Cb>/`：每次运行的 PG 配置（`postgres.conf`）、`run-timing.json`、`raw/capture-run.json`（插桩运行）或 `run.log`（原版运行）；原始追踪已删除，克隆库已删除，SF10 静止库 `sibench_sf10_base` 保留。驱动脚本与配置在 `sibench_1:/data/sibench/build/ab/`。
-
-## 不代表
-
-- 只覆盖 HyBench SF10、8 client、2 分钟阶段；YCSB / sysbench 与更长阶段未测。
-- 远程机是共享宿主上的 pod，两遍之间的波动可达 15%；结论只取超出波动的差异。
-- 原版运行不经采集驱动，C 与 B1 的差异包含 JDBC 包装层与服务端插桩两部分，未再拆分。
+本轮是一次代表输入验证，不是采集优化前后对照；不沿用旧构建的加速倍数，也未重新测量插桩开销、不同 PG 参数或不同线程数的因果影响。

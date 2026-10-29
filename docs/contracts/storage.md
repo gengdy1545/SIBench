@@ -2,14 +2,17 @@
 
 ## 数据文件
 
-- 默认目标 256 MiB；row group 最多 1,048,576 行，编码缓冲达到 64 MiB 可提前封闭。缓冲阈值不是 JVM 内存硬上限。
+- `data_layout` 默认目标 256 MiB；row group 最多 1,048,576 行，编码缓冲达到 64 MiB 可提前封闭。缓冲阈值不是 JVM 内存硬上限，目标文件大小的适用路径如下。
 - parquet-java 1.15.2、Zstd level 3、单线程压缩、1 MiB page/dictionary，启用 dictionary；codec 支持 zstd/snappy/none，后两者 level=0。
-- 完整组写出后按实际字节封闭文件，允许超过目标一个组及 footer，尾文件可不足目标；最多 32,767 组。行号是文件内绝对位置，不含 RowGroupID。
-- 固定 schema、源顺序、参数和 FileID 分配。按表/桶流式写，当前派生分桶按源序号取模，不额外排序；不引入 Small-File Compaction、Sort 或 Z-Order。
-- 清单记录行数、大小、SHA256、组信息和身份。文件以 `.partial` 发布，最终 manifest 完成后移除 `INCOMPLETE`；失败换新目录，不覆盖或续写。
-- 磁盘保留默认 20 GiB，是停止阈值，不是全量容量校准。文件生成、SQL 和结果数据读取不计入索引性能。
+- 原生 PG Baseline 导出由 `PgBaselineExport` 预先按 `row_group_max_rows` 行分片，每片一个文件，尾片保留剩余行；按表主键顺序确定 FileID / RowID。片内使用相同 Parquet 编码器，但未消费其大小滚动信号，故不按 `target_file_size_bytes` 拆分文件；该参数不能视为此路径的字节上限。
+- `prepare` 的派生生成及 `compile-trace` 的增量写入由 `ParquetDataFile` 在完整 row group 写出后检查实际字节并滚动文件，允许超过目标一个组及 footer，尾文件可不足目标；每文件最多 32,767 组。行号是文件内绝对位置，不含 RowGroupID。
+- 固定 schema、源顺序、参数和 FileID 分配。直接派生生成按表/桶流式写，分桶按源序号取模，不额外排序；原生 PG 导出按主键排序。不引入 Small-File Compaction 或 Z-Order。
+- 清单记录行数、组信息及校验 / 身份依据。`prepare` 逐文件以 `.partial` 发布；原生导出与 Trace 编译以完成 manifest 和目录 `INCOMPLETE` 防止消费未完成产物。失败换新目录，不覆盖或续写。
+- 磁盘保留默认 20 GiB，是停止阈值，不是全量容量校准。离线文件生成、来源 SQL 和全行审计单列；回放阶段实际发生的 Baseline 解码、调度、传输和结果核对按 [测量边界](../validation/measurement.md) 计入，不能把端到端吞吐当作纯引擎执行速率。
 
-原生 SF1 的全行核对及增量重复编译已通过；各来源派生大规模产物尚未校准。更改布局需重建 Physical Trace，不能复用旧 Locator。
+`<table>-versions*.parquet` 在采集后的 Trace 编译中生成，保存已提交 INSERT / UPDATE 的行版本；DELETE 通过版本化索引失效表示。后端服务回放复用相同输入，不重新生成这些 Parquet。RocksDB / rocksdb-cloud 回放时生成的 SST / WAL / MANIFEST 属于索引状态，由引擎的 memtable、flush、compaction 和 OPTIONS 控制，不使用 `data_layout` 作为 SST 大小参数；当前服务配置也未提供这些引擎参数的通用调优接口。
+
+本轮三来源的实际文件分布见 [Parquet 产物](../validation/measurement.md#parquet-文件与-trace-产物)。当前 PG 导出的行数分片与增量的字节目标滚动不同，不能声明统一字节布局已验收，也没有证明某个目标大小合理；更大规模的直接派生生成仍未校准。更改布局需重建相应 Physical Trace，不能复用旧 Locator；RowID 不携带文件位置，但完整回表 / 解析契约仍须单独定义。
 
 ## 删除与 GC
 
@@ -43,4 +46,4 @@ Rewrite 不改变键、CommitVersion、RowID 或逻辑可见性。保留窗口�
 
 记录吞吐/延迟、索引存储量、读写放大、维护、CPU/内存/GC、实际本地/EFS/S3 I/O；缺失指标为 N/A。上传 Trace/Parquet 不能证明索引存储能力。连接中断或写结果未知时保留诊断，不自动重试非幂等请求；恢复按 Backend 声明验证。
 
-对象存储后端目前只有 rocksdb-cloud：短输入的结果核对、进程被杀后的重启与仅从 bucket 的冷启动已验证（[rocksdb-cloud 验证](../validation/rocksdb-cloud.md)），持久化层级见 [Index Service 契约](index-service.md#rocksdb-cloud-后端)。每次 Flush 后的引擎统计与对象存储请求计数写入 `<index>.engine-stats.jsonl`。三来源目标规模与成本见 [对象存储验收](../validation/rocksdb-cloud-scale.md)；正式性能排名和断电级耐久性未证明。
+对象存储后端目前只有 rocksdb-cloud：小输入结果核对、正常重开、仅从 bucket 冷启动，以及最后一次 Flush 边界的 SIGKILL 正反验证已通过（[rocksdb-cloud 验证](../validation/rocksdb-cloud.md)），持久化层级见 [Index Service 契约](index-service.md#rocksdb-cloud-后端)。每次 Flush 后的引擎统计与对象存储请求计数写入 `<index>.engine-stats.jsonl`。三来源目标规模与成本见 [完整验收](../validation/acceptance.md)；正式性能排名、目标规模崩溃恢复和断电级耐久性未证明。

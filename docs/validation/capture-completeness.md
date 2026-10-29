@@ -1,102 +1,46 @@
-# 采集完整性对照与有界状态验证
+# 原生采集与完整性验证
 
-2026-10-23 对三个来源重新采集（同一份 PG 补丁、同一入口 `scripts/native-capture.sh`），在新产物上验证采集完整性对照、区间 oracle 以及有界状态的改动。这是正确性验证，不是性能结论。
+更新：2026-10-29。三来源使用同一 `scripts/native-capture.sh` 入口，采集后再编译规范 Trace。当前应用、输入和完整结果统一见 [三来源验收](acceptance.md)，资源条件见 [采集环境](capture-performance.md)。
 
-## 产物位置
+## 当前采集路径
 
-| 来源 | 产物目录 | 采集日志 |
+| 来源 | 原生执行 | 投影与维护 |
 | --- | --- | --- |
-| HyBench 并发 HTAP | `results/poc/hybench-htap-sf1/` | `results/poc/native-trace-20261023/hybench_sf1-v9.log` |
-| YCSB | `results/poc/ycsb-8m/` | `.../ycsb_8m-v9.log` |
-| sysbench | `results/poc/sysbench-8m/` | `.../sysbench_8m-v9.log` |
+| HyBench | 固定上游 `runHTAP`，同一克隆库依次 AP / TP / XP，阶段之间不恢复数据；TP 和 XP 保留原生并发 | 八表、8 主键和 13 二级；包含数组并集、bitmap 交集和提前停止扫描的受支持投影 |
+| YCSB | 固定 JDBC binding，A / B / C / F / D / E，原生线程与 Return 计数 | 字符串主键点查与带 limit 区间；没有二级索引，不虚构二级维护 |
+| sysbench | 固定 libpq 和六个 oltp Lua 脚本，原生线程与事件数 | 多表主键、k 二级、DELETE / 同主键重插入 |
 
-## 采集完整性对照
+静止基库由原生生成 / 装载并验证，采集使用新克隆。复用 Baseline 必须匹配原生库、schema、参数与验证身份；输入身份不匹配即拒绝。HyBench 运行时数据文件属于来源输入，不能作为旧实验输出删除。固定来源与配置说明见 [HyBench](../benchmarks/hybench.md)、[YCSB](../benchmarks/ycsb.md)、[sysbench](../benchmarks/sysbench.md)。
 
-原生执行前后各取一次 `pg_stat_user_indexes` 快照（等其它会话退出且两次读数一致后才记录），`check-capture-completeness` 按 PG14 计数位置核对账本。三来源均为 `consistent`，没有不一致的索引。
+## 相互独立的核验职责
 
-| 来源 | 参与对照的索引 | `idx_tup_read` = 候选 | `idx_tup_fetch` = 回表可见行 | `idx_scan` 在下降上下界内 |
-| --- | ---: | --- | --- | --- |
-| HyBench | 21 | 全部相等 | 全部相等 | 全部在界内，一个有数组键的索引落在区间内（18，界 [3, 18]） |
-| YCSB | 1 | 1,304,112 | 1,294,028 | 346,372（界内） |
-| sysbench | 16 | 全部相等 | 全部相等 | 全部在界内；`k_1`–`k_8` 无访问，按 0 对照 |
+1. **Schema 与 Baseline**：采集前核对完整来源定义和实际 PG catalog；Baseline 核对原生全列、主键顺序、连续 RowID 和 version 0。见 [Schema 验证](source-schema-preflight.md)。
+2. **请求与会话**：关联 JDBC / libpq 请求、结果摘要、事务结局和 PG 后端会话；缺事件、未完成流或非预期来源错误拒绝。异常、原生重试和业务回滚不是同一种结局，未分类错误维持 fail-closed。
+3. **行状态**：从 Baseline、已提交旧 / 新行和原生 PG 终态三路核对，排除回滚修改，保留同会话 / 同键因果链；PK UPDATE（包括回滚尝试）拒绝。见 [行审计](row-state-audit.md)。
+4. **访问账本与计数器**：每个访问投影或明确拒绝；原生执行前后等会话退出和统计稳定后记录 `pg_stat_user_indexes`，与同遍账本比较。一致才提交 Trace。
+5. **提交与快照**：并发会话按 PG 事务完成计数器归并，快照自己的 xip 独立交叉核对；不按 PID、XID 大小、文件顺序或墙钟猜测。事务内读保留原语句快照并只叠加本事务此前写入。
+6. **产物与结果**：Trace / work unit / Parquet 身份、防截断和来源绑定由预检核对；参考模型、独立 Parquet oracle 与真实服务逐查询摘要分别验收，模型间相等不能替代原生事实。
 
-HyBench 上 `idx_tup_fetch` 小于候选数且不等于账本的可见行：`idx_loanapps_1` 候选 2,070,231、回表可见行 1,710,231；纯 bitmap 路径的索引（如 `idx_transfer_3`，17,408,201 个候选）`idx_tup_fetch` 为 0。bitmap 堆检查不经过 `index_fetch_heap`，所以比较对象是账本的 `heap_fetch_visible`，而不是 `visible_rows`。
+PG14 的 `idx_tup_read` 比较候选数；`idx_tup_fetch` 比较经 index heap fetch 可见的行，不包含 bitmap 堆检查和全可见 index-only 的可见行；`idx_scan` 比较从访问推导出的树下降上下界。PG14 统计通过 UDP 上报，丢失可能造成偏低；本轮没有人为丢统计事件的故障注入。
 
-边界：PG14 统计经 UDP 上报，丢失只会表现为计数低于账本；本轮未出现。未做人为丢事件的故障注入，只能说明这次负载的独立计数与账本一致；插桩开销由 [独立对照](capture-performance.md) 验证。
+本轮三来源均重新执行完整审计，`capture_completeness=consistent`、受支持投影完整、Trace 完成并生成新的认证。原生数据、会话、行审计、计数器和 manifest 在各来源主机 `results/poc/acceptance-20261029T053122Z/<source>/`，选定报告同步至本地同轮证据目录。不用既有认证代替本轮 full 审计。
 
-## 区间 oracle
+## 当前格式与有界状态
 
-`validate-snapshots` 在新产物上通过，全部使用 JDK 17。
+后端写 `pg-<pid>.jsonl.zst`；summary 默认逐访问汇总扫描与 bitmap 判定，客户端保留结果哈希。rows 模式用于逐行核对 summary，不另造兼容读取路径。`IndexTraceCompilerTest.concurrentSummaryCapturesCompileLikeTheirRows` 保留跨事务片段的格式延续反例，`ServerTraceTest` 拒绝截断 zstd 流。当前测试验证格式与结果不变量；已撤下历史格式迁移的体积和加速结论。
 
-| 来源 | 修改主键 | 区间探针（索引 × 区间） | 区间探针执行次数 / 模式 | 原生查询 / 模式 |
-| --- | ---: | ---: | ---: | ---: |
-| HyBench | 4,636 | 874 | 3,268 | 3,004,751 |
-| YCSB | 41,649 | 42 | 158 | 345,827 |
-| sysbench | 48,751 | 672 | 2,623 | 181,000 |
-
-Locator 与 RowID 两种模式的结果相同。HyBench 的 3,004,751 个原生查询、23,676,588 个被核对的结果项。
-
-## 重编译回归
-
-用改动后的代码对同一份原始采集重新编译，与采集时的 Trace 逐文件比较。
-
-| 来源 | 结果 |
+| 状态 / 边界 | 当前验证职责 |
 | --- | --- |
-| sysbench | `baseline.ops`、`workload.ops`、`work-units.jsonl` 与全部增量 Parquet 逐字节一致 |
-| HyBench（并发） | 同上，包括 11 个文件 |
+| 行审计外排 | 小预算与默认预算报告 / 变化等价，错误旧值与错误终态仍拒绝 |
+| 编译落盘与提交窗口 | 小预算与默认预算 Trace 等价；窗口外快照明确拒绝，rollover 的 FileID 唯一且可由 oracle 解码 |
+| 参考基线 / 版本历史落盘 | 内存与强制落盘模型在点查、范围、降序、limit、更新删除下逐项相等 |
+| Locator | FileID 和行位置为两个 int64，高位变化仍可区分，搬迁保持版本 |
+| 认证 | 绑定 jar、PG、触发器、来源定义、文件摘要和覆盖类别；替换构建、删除访问事实或出现认证未覆盖路径必须失败 |
 
-两者的 `manifest.json` 仅多出 `snapshot_crosscheck.commit_window`（窗口上限与淘汰数）一项，其余字段相同。
+完整审计后的变化文件由管线按规则清理，此后重编使用该次采集自己的认证；必要 raw、Baseline、身份和认证仍保留。认证是已核验输入的有界复用，不是证明任何未来负载都完整。
 
-## 同遍账本、计数器核对与认证
+## 边界与复现
 
-编译同遍构建账本并在提交前核对 PG 计数器，复核采集时的审计与文件摘要，写 Trace 时计算摘要。2026-10-25 对三份并发采集的同 raw 对照如下，时间仅属于所记录的构建：
+构建与命令见 [README](../../README.md)。当前采集配置为 `config/hybench_sf10.yaml`、`config/ycsb_87m.yaml`、`config/sysbench_87m.yaml`；重跑使用新的输出目录，实际运行以证据内有效配置为准。短输入、受控 SQL 和 full 输入各证明自己的边界，不冒充正式长时性能或 SF1000 容量。
 
-| 来源 | Trace 数据文件 | 账本（不计输入摘要字段） | 计数器核对 | 编译耗时（s，原 → 现） |
-| --- | --- | --- | --- | --- |
-| sysbench 8 线程 | 11 个逐字节一致 | 相同 | 一致，与原报告相同 | 账本 8 + 编译 48 → 41 |
-| YCSB 8 线程 | 4 个逐字节一致 | 相同 | 一致，与原报告相同 | 账本 18 + 编译 117 → 109 |
-| HyBench SF1 并发（rows） | 11 个逐字节一致 | 仅一个模板的显示文本不同 | 一致，与原报告相同 | 账本 986 + 编译 1,615 → 1,080 |
-
-HyBench 的差异来自同一 `query_id` 的两种文本写法：单独的账本按文件名顺序读、编译按完成计数器顺序读，先见到的文本不同；显示文本已改为取字典序第一个，与读取顺序无关。编译的负载阶段因同遍构建账本多 6–27%，编译开头的核验从 686 s 降到 154 s（剩余为输入摘要）。
-
-单元测试覆盖：编译产出的账本与独立账本相同；计数器不一致时 Trace 保持未完成并写出核对报告；认证由完整核验的采集写出，同一采集凭认证（不带行审计）编译出相同的 `workload.ops`，删去一条访问路径或换一个构建即编译失败。真实并发采集的 full / certified 证据见 [并发采集](concurrent-native-capture.md)，代表规模结果见 [完整验收](p0-three-source-acceptance.md)。
-
-## 有界状态
-
-| 改动 | 验证 |
-| --- | --- |
-| 行审计：按（表、主键、会话、位置）外部排序，与基线、PG 终态三路归并 | sysbench 真实采集重跑：提交 / 回滚数、各表计数、61,999 条变化（按集合比较）与旧报告一致，峰值内存约 2.1 GB（`-Xmx12g` 下）；单测中预算 1 字节与默认预算的报告和变化文件逐字节相同，终态不一致仍被发现 |
-| 编译：行身份落盘、提交位置有界窗口、工作单元只计数、增量 Parquet rollover | 单测：预算 1 与默认预算的 Trace 逐字节相同；窗口外的快照明确报错；rollover 产出 3 个唯一 FileID 的文件并通过回放与 oracle |
-| 参考模型：基线外部排序为磁盘 run，版本历史落入有序可落盘 map | 单测：与全内存模型在随机读写、区间、降序、limit 下逐项相同；真实 sysbench Trace（181,000 个查询）强制落盘（基线预算 300 万条、历史预算 2,000 条）回放，所有校验和与全内存回放逐项相同，耗时约 2.4 倍 |
-| Locator 为（FileID, 行位置）两个 int64 | 单测：两个字都超过原 32 位打包宽度仍区分，relocate 与更新保留 |
-
-## 汇总采集格式
-
-2026-10-24 插桩改为按访问记录（`capture.detail: summary`，见 [Trace 契约](../contracts/trace.md)）。验收方法：同一次原生执行用 `capture.detail: rows` 采集，PG 同时写出逐行事件与汇总，账本用逐行事件计算并要求每条 `scan_summary`、`bitmap_verdicts` 及每次执行返回的行数与之完全相等；再从这份采集删去逐行事件得到只含汇总的副本（`/tmp/sibench-tools/derive_summary_capture.py`，副本不是运行证据），两份分别审计、建账本、核对 PG 计数器并编译，比较 Trace。
-
-| 来源 | 产物目录 | 结果 |
-| --- | --- | --- |
-| sysbench | `results/poc/sysbench-8m-rows-20261024/`（副本 `raw-summary-derived/`、`trace-summary-derived/`） | 账本逐条核对通过，181,000 次投影访问、0 拒绝；两份的 PG 计数器对照均 `consistent`；`baseline.ops` 与 8 个增量 Parquet 逐字节相同；`workload.ops` 438,998 条记录除 `sourceEvent` 与 `transactionId`（原始文件行号，后者一一对应于 58,000 个事务）外逐字段相同；`work-units.jsonl` 除 `source_event` 外相同；行审计的变化集合除原始位置外相同 |
-| YCSB | `results/poc/ycsb-8m-rows-20261024/` | 账本逐条核对通过，346,138 次投影访问、0 拒绝；两份计数器对照均 `consistent`；`baseline.ops` 与增量 Parquet 逐字节相同；`workload.ops` 1,105,329 条记录、350,082 个事务除原始行号外逐字段相同 |
-| HyBench 并发 HTAP | `results/poc/hybench-htap-sf1-rows-20261024/`（副本 `raw-summary-derived/`、`trace-summary-derived/`，逐行格式的 Trace 在 `trace-rows/`） | 账本逐条核对通过：103,108,136 个事件、3,412,523 次投影访问（含 23 个 BitmapAnd 交集组、并集组、二级提前停止扫描），0 拒绝；两份计数器对照均 `consistent`；`baseline.ops` 与 8 个增量 Parquet 逐字节相同；`workload.ops` 3,456,924 条记录、587 个事务除原始行号外逐字段相同，402,417 次快照读与 3,412,523 个单元的快照交叉验证一致；原始体积 38 GB → 3.1 GB |
-
-另以 `capture.detail: summary` 独立采集一次 sysbench（`results/poc/sysbench-8m-summary-20261024/`），计数器对照 `consistent`、0 拒绝。各阶段对比（毫秒）：
-
-| 采集 | 原始事件 | 原始体积 | 原生执行 | 行审计 | 账本 | 编译 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10-23 逐行（旧插桩） | 10,756,381 | 3.5 GB | 232,423 | 184,397 | 50,624 | 49,623 |
-| 10-24 rows | 10,939,380 | 3.7 GB | 215,305 | 163,306 | 51,763 | 53,804 |
-| 10-24 summary | 1,525,974 | 484 MB | 72,245 | 80,656 | 7,897 | 7,844 |
-
-两次独立执行的 Trace 不逐字节相同：sysbench 以 8 线程并行 prepare，sbtest3 / sbtest4 的基线行摘要在两次运行间不同，负载里的 `k` 值随之不同；所以格式等价只以同一次执行的 rows 与派生副本对照为准。
-
-2026-10-24 起后端追踪默认写成 zstd 流（`capture.compression: zstd`）。验收：把 sysbench 8 线程采集的 48 个明文后端文件用 zstd 命令行压成副本（484 MB → 47 MB），账本除输入文件清单外与明文完全相同；`sysbench_small` 以插桩直接写 zstd 采集一次，审计、账本、计数器对照（`consistent`）与编译全部通过（`results/poc/sysbench-small-zstd-20261024/`）。帧未结束的文件读取失败由 `ServerTraceTest` 覆盖。
-
-逐行采集只用于验收：HyBench rows 采集原始体积 38 GB，默认 12 GB 堆在编译的会话归并处内存不足（一个 AP 事务片段含上百万逐行事件），以 36 GB 堆重编；summary 采集不受影响。这次对照还发现并修复了一个问题：并发归并为每个事务片段新建访问划分，原先只有文件的第一个片段带格式声明，后续片段被当作逐行格式而拒绝汇总事件；现在格式按文件延续，`IndexTraceCompilerTest.concurrentSummaryCapturesCompileLikeTheirRows` 覆盖该路径。YCSB 派生副本仍有 3.5 GB，因为客户端 JDBC 文件是原样复制的（含每行列文本），实际 summary 采集的客户端只记哈希。
-
-## 不代表
-
-- 本页落盘与内存路径对照限于小输入；SF10 / 87m 的完整验收见对应报告，远超内存规模仍未验收。
-- 编译的提交窗口默认 400 万个写事务；更早的快照会直接失败，而不是静默读到「无提交」。
-- 分段续编译、Checkpoint 与恢复尚未接入编译与回放；`SpillingMap` 只提供由文件清单恢复的能力。
-- 本页耗时只属于记录中的实验构建；当前生成成本与优化对照见 [采集性能](capture-performance.md) 和 [测量](p0-measurement.md)。行审计在 full 认证时运行，certified 复用匹配认证。
+尚未支持分段续编、Checkpoint 或结果未知时的服务续发。版本、历史深度和查询组超出本轮输入的累计资源风险仍须另验；计划中的失败分类、Rewrite / GC 与正式重复实验见 [剩余工作](../../plan.md#剩余工作)。

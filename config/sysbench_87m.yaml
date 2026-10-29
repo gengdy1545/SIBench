@@ -22,14 +22,14 @@ native:
   build_directory: build/benchmarks/sysbench
   binary: src/sysbench
   # Upstream Lua scripts run in this order on the same tables; each is a separate client process.
-  # Calibration counts (10x the 8m run); plan-write-ratio derives the counts for a target ratio.
+  # Counts calibrated for 5% cumulative row changes; preserve the native script mix.
   workloads:
-    oltp_read_write: {events: 80000}
-    oltp_update_index: {events: 100000}
-    oltp_update_non_index: {events: 100000}
-    oltp_delete: {events: 50000}
-    oltp_insert: {events: 50000}
-    oltp_point_select: {events: 200000}
+    oltp_read_write: {events: 561761}
+    oltp_update_index: {events: 702202}
+    oltp_update_non_index: {events: 702202}
+    oltp_delete: {events: 351101}
+    oltp_insert: {events: 351101}
+    oltp_point_select: {events: 1404403}
 postgres:
   schema: public
   version: '14.24'

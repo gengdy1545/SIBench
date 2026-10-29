@@ -72,6 +72,6 @@ Java / JNI 的统计格式必须配套，缺少直方图的 JNI 在打开时拒�
 
 ## 验证边界
 
-读取与发布语义见 [读取验证](../validation/p0-read-validation.md)、[发布不变量](../validation/p0-test-review.md)、[原生反例](../validation/p0-native-publish-validation.md)；三来源完整输入见 [P0 验收](../validation/p0-three-source-acceptance.md)，对象存储见 [目标规模与恢复证据](../validation/rocksdb-cloud-scale.md)。
+读取、发布与结果校验的反例见 [正确性验证依据](../validation/correctness.md)；三来源完整输入见 [完整验收](../validation/acceptance.md)，对象存储见 [存储与恢复证据](../validation/rocksdb-cloud.md)。
 
 尚未实现数据文件 Rewrite、物理版本 GC、未知写入的恢复重试和完整 source snapshot 生命周期；目标规模崩溃恢复、巨大查询组和正式后端性能排名未验收。已保留完整输入的证据按未改变的 Trace、查询与发布语义复用；协议 2 与单一服务入口由当前测试另行验证，不能把原构建计时当作当前构建性能。

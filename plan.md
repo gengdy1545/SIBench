@@ -10,6 +10,8 @@
 
 当前比较本地 RocksDB 与 Rockset 的 rocksdb-cloud 嵌入式引擎，二者基于 RocksDB 9.1.1；不涉及 Rockset 完整数据库服务。lakehouse 是应用背景，其他引擎、source 接入、完整控制面和 build / query 分离按任务 3 的证据需求推进，不作为当前比较的前置。
 
+当前代表规模限于 HyBench SF10 与同为 87,060,000 行的 YCSB / sysbench，规模与复用边界见 [最新完整验收](docs/validation/acceptance.md)；目标规模崩溃恢复和正式性能排名尚未验证。
+
 ## 约束与依赖
 
 - 当前能力和限制以 [能力矩阵](docs/benchmarks/capability-matrix.md)、[Trace](docs/contracts/trace.md)、[存储](docs/contracts/storage.md)、[Index Service](docs/contracts/index-service.md) 契约为准；构建与使用见 [README](README.md)。
@@ -64,8 +66,8 @@
 #### 2.2 实验矩阵与计量
 
 - [ ] 按研究问题选择规模 / 工作集、访问形态 / 返回基数、修改比例 / 热点、历史深度、缓存、持久化及维护策略，避免全变量组合。按模板、索引、点 / 范围 / 查询组、基数和快照距离分项；来源数量不代表形态均衡，row_write_ratio 不等于索引操作写比例，相同行数不等于相同索引字节。现有分布依据见测量与各来源报告。
-- [ ] 保留 128 / 256 / 512 MiB **数据文件**布局候选，按问题选用；重建 Locator / Physical Trace，报告实际文件 / row group、压缩、回表及 rewrite 成本。与局部性 block、后端 SST 配置分开，不扩张为默认笛卡尔积。
-- [ ] 同 Trace 交错顺序重复实验、报告波动，并以独立采集检验单次执行偏差；受控历史探针单列，SNAPSHOT_SEARCH 数量不代表长期历史覆盖。复用 HyBench 无插桩对照，按需补 YCSB / sysbench；按时间停止的混合负载同时比较分布，失败路径按 2.1 验收。
+- [ ] 先明确按行数或按压缩字节确定文件边界的要求；当前 PG Baseline 按行数分片，增量按 row group 写出后的字节滚动，不能将配置目标当作统一字节布局已实现，见 [实际文件分布](docs/validation/measurement.md#parquet-文件与-trace-产物)。保留 128 / 256 / 512 MiB **数据文件**布局候选，尚未确定合适大小；按问题选用，重建 Locator / Physical Trace，报告实际文件 / row group、压缩、回表及 rewrite 成本。与局部性 block、后端 SST 配置分开，不扩张为默认笛卡尔积。
+- [ ] 同 Trace 交错顺序重复实验、报告波动，并以独立采集检验单次执行偏差；受控历史探针单列，SNAPSHOT_SEARCH 数量不代表长期历史覆盖。按研究需要安排无插桩对照，区分采集开销与来源分布变化；按时间停止的混合负载同时比较分布，失败路径按 2.1 验收。
 - [ ] 短时容量曲线后安排至少 30 分钟连续 single_pass，按实测速率规划预热 / 测量 / 余量，不循环 Trace 填数。long_replay.yaml 的 128 client / 6.66 亿操作、索引 300k / 驱动 900k ops/s 均为待校准目标，不是普遍有效性门槛；预算或负载不足如实报告。
 - [ ] 构建实验记录完整加载及 Flush；查询可恢复经验证的后端专属状态，单列恢复耗时 / 缓存。长时记录吞吐 / 延迟曲线、版本增长、compaction / GC 积压及最终排空；未达稳态不宣称稳态成本。
 
@@ -82,7 +84,7 @@
 | 最小控制面与服务拆分 | 创建绑定输入 / 定义、原子发布、描述覆盖 / freshness、按保护集删除；验证重启、幂等和不暴露半成品，先用配置 / CLI 或薄接口。先单进程 role: all，确需扩展再拆 Build / Maintenance 与 Query；查询权威状态从已发布 manifest 恢复，声明缓存，验收维护期间可见性、发布失败及冷启动。 |
 | native versioning | 持久化 CommitVersion → native snapshot 和保护信息，验证恢复、历史保护、事务内读及同版本中间修改，通过三来源矩阵。同引擎与 encoded_key 比较并计适配成本；区分逻辑版本 / 布局代次 / 引擎快照，旧快照看不到后续 RELOCATE 时仍须保证旧 Locator 生命周期。 |
 | 维护策略消融 | RowID 未改键免二级刷新、并发 rewrite 或其他装箱策略须单独比较并计行版本解析成本；并发维护绑定固定逻辑边界与 sequence / commit version，核验可见性、延迟和排空。 |
-| 采集 / 编译优化 | 先测 wall / CPU / RSS 瓶颈，再考虑行审计分区归并、emitAborted 复制、访问账本串行段、不可变输入摘要复用或行映像精简；同 raw 核对语义，不把缓存或 CPU 单项变化当收益。既有 [编译对照](docs/validation/compile-optimization-20261026.md) 未显示稳定大幅收益；oracle 按方法 / 语义变化触发。 |
+| 采集 / 编译优化 | 先按 [当前计量边界](docs/validation/capture-performance.md) 测 wall / CPU / RSS 瓶颈，再考虑行审计分区归并、emitAborted 复制、访问账本串行段、不可变输入摘要复用或行映像精简；同 raw 核对语义，不把缓存或 CPU 单项变化当收益。oracle 按方法 / 语义变化触发。 |
 | 静止库构建优化 | 先拆原生装载、建索引、VACUUM / ANALYZE，不预断超线性根因；改变装载顺序前核验布局、计划及分布。仅按新负载需要推广当前 PG / 角色 / codec / 路径限制。 |
 | 超内存与更大规模 | SF100+ 另定存储和预算；SF1000 超现有 500 GB 且需处理客户端 / DDL int ID 溢出。验收行审计外排、编译落盘 / 提交窗口、参考基线 / 历史落盘的容量与耗时，计索引、历史、compaction 临时空间及缓存；受限内存驱动测试可先行。 |
 | 分段与 Checkpoint | 以完整事务边界分段，延续版本、RowID / FileID、行身份、提交窗口、工作单元及摘要状态。身份匹配且检查点完整才续编，验证与完整编译确定性一致；拒绝损坏 / 截断 / 错身份，重复恢复不重写已提交产物。不续接结果未知的服务写入；完成校验、重编及调查保障后才清理 raw。 |

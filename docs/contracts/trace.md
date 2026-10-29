@@ -108,7 +108,7 @@ v9 每条记录为 128 字节固定前缀加四个可变键分量，每块最多
 
 Baseline 每索引 INSERT；运行期 INSERT 每索引 UPSERT；DELETE 失效主键及全部二级条目。同主键重插入分配新 RowID，UPDATE 保留原 RowID。旧、新条目及主键共享来源事件、版本、事务、mutationOrdinal、workUnitId 和 RowID；除删除条目无物理位置外，值位置一致。`expansionPosition` 从 0 连续编号，`expansionSize` 为完整展开宽度，查询和控制不得插入其中；查询组复用这两个字段表示组内位置与组宽，同样不得被其它记录打断。预检在二级过滤前核对全清单、完整展开和源工作单元绑定，截断或漏项拒绝。
 
-增量文件按实际表惰性创建 `<table>-versions.parquet`，FileID 从基线最大值加 TableID 分配；每次写入保留 `_sib_timestamp`、`_sib_mutation_ordinal` 和 `_sib_row_id`。同键同版本按序覆盖，中间效果服务于原始事务内查询，不产生额外提交版本；后续源事务只能看到最终提交效果。主键值 UPDATE 是范围外操作，明确拒绝；增量文件在关闭 row group 后达到配置大小时滚动；首个 FileID 为基线最大值加 TableID，后续 FileID 从所有表的首文件范围之后全局递增，使用完整 int64。逐文件校验实际行数与 SHA-256，Locator 指向实际文件和位置。
+增量文件在 `compile-trace` 阶段按实际表惰性创建 `<table>-versions.parquet`，FileID 从基线最大值加 TableID 分配；每次写入保留 `_sib_timestamp`、`_sib_mutation_ordinal` 和 `_sib_row_id`。同键同版本按序覆盖，中间效果服务于原始事务内查询，不产生额外提交版本；后续源事务只能看到最终提交效果。主键值 UPDATE 是范围外操作，明确拒绝；增量文件在关闭 row group 后达到来源配置 `data_layout` 的目标大小时滚动，不由回放后端的 SST 参数决定，见 [数据文件契约](storage.md#数据文件)。首个 FileID 为基线最大值加 TableID，后续 FileID 从所有表的首文件范围之后全局递增，使用完整 int64。逐文件校验实际行数与 SHA-256，Locator 指向实际文件和位置。
 
 格式只支持 v9：读取其他版本一律拒绝。
 

@@ -15,9 +15,8 @@ native:
   fieldlengthdistribution: constant
   insertorder: hashed
   zeropadding: 1
-  # One captured thread; the uncaptured load may use more.
   # Concurrent client threads, one JDBC connection and backend each.
-  threads: 8
+  threads: 32
   load_threads: 16
   # The JDBC binding's documented batched insert for the (uncaptured) load.
   load_batch_size: 1000
@@ -25,17 +24,16 @@ native:
   build_directory: build/benchmarks/YCSB
   client_libraries: jdbc/target/ycsb-jdbc-binding-0.18.0-SNAPSHOT/lib
   # Upstream workload files run in this order on one growing table; each is a separate client JVM.
-  # 8,706,000 rows matches the HyBench SF1 baseline; operation counts give about 60k committed
-  # row changes in total, the order of the HyBench TP subset.
+  # Counts calibrated for about 5% cumulative row changes at the 87,060,000-row baseline.
   workloads:
-    workloada: {operationcount: 600000}
-    workloadb: {operationcount: 1000000}
-    workloadc: {operationcount: 500000}
-    workloadf: {operationcount: 400000}
-    workloadd: {operationcount: 600000}
+    workloada: {operationcount: 4426795}
+    workloadb: {operationcount: 7377990}
+    workloadc: {operationcount: 3688996}
+    workloadf: {operationcount: 2951197}
+    workloadd: {operationcount: 4426795}
     # The pinned JDBC binding fills scan results only for explicit fields; with readallfields=true
     # CoreWorkload divides by the empty result and the client thread dies.
-    workloade: {operationcount: 200000, properties: {readallfields: false}}
+    workloade: {operationcount: 1475599, properties: {readallfields: false}}
 postgres:
   schema: public
   version: '14.24'

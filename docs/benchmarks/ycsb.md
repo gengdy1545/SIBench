@@ -4,7 +4,9 @@
 
 ## 当前入口
 
-使用 [ycsb_large.yaml](../../config/ycsb_large.yaml) 配置 Java Baseline：
+原生采集使用 [ycsb_87m.yaml](../../config/ycsb_87m.yaml)：87,060,000 行、32 线程，A / B / C / F / D / E 依次运行。采集入口与完整性职责见 [原生采集验证](../validation/capture-completeness.md)。
+
+[ycsb_large.yaml](../../config/ycsb_large.yaml) 是另一个 Java 派生 Baseline 入口：
 
 ```bash
 java -jar build/sibench/sibench.jar prepare --dry-run config/ycsb_large.yaml
@@ -27,7 +29,7 @@ java -jar build/sibench/sibench.jar prepare --dry-run config/ycsb_large.yaml
 
 原生 A–F 的 read、update、insert、scan、read-modify-write 比例及分布需要在增量实现中保留或明确标为派生负载。标准 A–F 不产生 delete。scan 使用起始键与数量上限，不能将结束键推导为数值起点加数量。read-modify-write 是多个 API 调用，不能默认具有事务原子性。
 
-数据生成目前仅实现派生 Baseline；使用 binary 字段和固定随机流替代 ThreadLocalRandom，不增加全量 hashed key 去重。该来源产物与容量尚未验证。原生采集为 8,706,000 行、workload A/B/C/F/D/E 依次运行的单线程 JDBC，通过请求配对、声明比例对账、Baseline 核验、行状态审计和访问账本。字符串主键以保序编码进入规范 Trace：read / update 为主键点查，scan 为带 limit 的主键有序区间（读到表尾时无 limit），insert 维护主键；各 workload 依次运行、按顺序会话编译，见 [原生 Trace 验证](../validation/ycsb-sysbench-native-trace.md)。固定 JDBC binding 在 `readallfields=true` 时 scan 结果为空并使 workload E 除零退出，采集对 E 使用文档化的 `readallfields=false`。
+Java `prepare` 只生成派生 Baseline，使用 binary 字段和固定随机流替代 ThreadLocalRandom，不增加全量 hashed key 去重；10 亿行档位容量尚未验收。真实采集使用原生 JDBC load / run，经过请求配对、Return 计数对账、Baseline 核验、行状态审计和访问账本。各 workload 依次运行，其内部多会话按 PG 事务完成计数器归并。字符串主键以保序编码进入规范 Trace：read / update 为主键点查，scan 为带 limit 的主键有序区间（读到表尾时无 limit），insert 维护主键。代表输入的完整结果见 [三来源验收](../validation/acceptance.md)。固定 JDBC binding 在 `readallfields=true` 时 scan 结果为空并使 workload E 除零退出，采集对 E 使用文档化的 `readallfields=false`。
 
 ## 源码入口
 

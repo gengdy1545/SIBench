@@ -4,7 +4,9 @@
 
 ## 当前入口
 
-使用 [sysbench_large.yaml](../../config/sysbench_large.yaml) 配置 Java Baseline：
+原生采集使用 [sysbench_87m.yaml](../../config/sysbench_87m.yaml)：8 表 × 10,882,500 行，共 87,060,000 行，8 线程运行六个固定 oltp 脚本。采集入口与完整性职责见 [原生采集验证](../validation/capture-completeness.md)。
+
+[sysbench_large.yaml](../../config/sysbench_large.yaml) 是另一个 Java 派生 Baseline 入口：
 
 ```bash
 java -jar build/sibench/sibench.jar prepare --dry-run config/sysbench_large.yaml
@@ -26,7 +28,7 @@ java -jar build/sibench/sibench.jar prepare --dry-run config/sysbench_large.yaml
 
 原生 oltp_read_write 的 event 包含多条查询和修改，event 数不等于索引操作数。范围为 BETWEEN 闭区间，可能超出已有键范围；聚合与排序不能计入索引查询时间。index update 修改 k，non-index update 修改 c；两者必须保留来源标签。delete-insert 删除后重新插入同键，需要保留顺序及身份规则。
 
-数据生成目前仅实现派生 Baseline；该来源产物与容量尚未验证。原生采集为 8 表 × 1,088,250 行（共 8,706,000 行）、oltp_read_write / update_index / update_non_index / delete / insert / point_select 依次运行的单线程 libpq，通过服务端对账（控制语句由脚本实际调用与运行时 `--skip-trx` 推出）、Baseline 核验、行状态审计和访问账本。规范 Trace 中点查与 DELETE / UPDATE 的定位为主键点查，`BETWEEN`（含 `sum`、`ORDER BY c`、`DISTINCT`）为主键闭区间，返回行与可见行分别保留；`k` 索引列 UPDATE、`c` 普通列 UPDATE、DELETE / 重插入展开为完整维护，见 [原生 Trace 验证](../validation/ycsb-sysbench-native-trace.md)。标准脚本不按 `k` 查询，二级索引只有维护写。
+Java `prepare` 只生成派生 Baseline，10 亿行档位容量尚未验收。真实采集使用原生 libpq prepare / run，oltp_read_write / update_index / update_non_index / delete / insert / point_select 依次运行，各脚本内部多会话按 PG 事务完成计数器归并。服务端对账保留脚本实际调用与 `--skip-trx` 控制边界，另完成 Baseline 核验、行状态审计和访问账本。规范 Trace 中点查与 DELETE / UPDATE 的定位为主键点查，`BETWEEN`（含 `sum`、`ORDER BY c`、`DISTINCT`）为主键闭区间，返回行与可见行分别保留；`k` 索引列 UPDATE、`c` 普通列 UPDATE、DELETE / 重插入展开为完整维护。代表输入的完整结果见 [三来源验收](../validation/acceptance.md)。标准脚本不按 `k` 查询，二级索引只有维护写。
 
 ## 源码入口
 

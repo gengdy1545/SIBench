@@ -111,9 +111,12 @@ redundant content.
 
 ## Evidence retention
 
-- Keep verified source inputs and certifications needed for regeneration, current
-  acceptance results, meaningful comparisons, independent counterexamples and
-  unresolved failures. Retained conclusions need matching build/input identities,
+- Maintain the latest complete acceptance record for the current design. Replace
+  superseded experiment prose and results after the new acceptance passes; do not
+  accumulate a run history. Keep older evidence only for a retained comparison,
+  current regression case or active investigation, and remove claims that lose
+  their evidence. Preserve the inputs and certifications needed for regeneration.
+- Retained conclusions need matching build/input identities,
   effective configuration, correctness results and same-run resource measurements.
 - Keep one necessary copy of a comparison binary or diagnostic state. Do not retain
   every candidate build, repeated index, temporary cache, setup failure or superseded

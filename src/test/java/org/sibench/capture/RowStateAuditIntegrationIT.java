@@ -6,7 +6,6 @@ import com.google.gson.*;
 
 import org.junit.Test;
 import org.sibench.config.ConfigValues;
-import org.sibench.generation.BaselineGenerator;
 import org.sibench.schema.SourceSchema;
 
 import java.io.IOException;
@@ -250,7 +249,8 @@ public class RowStateAuditIntegrationIT {
             connection.setAutoCommit(false);
             work.run(connection);
         }
-        Path raw = directory.resolve("pg-" + pid + ".jsonl");
+        CaptureRun.awaitBackendExit(pid);
+        Path raw = directory.resolve("pg-" + pid + ".jsonl.zst");
         Files.copy(capture.resolve(raw.getFileName()), raw);
         Path client;
         try (var files = Files.list(directory)) {
@@ -259,22 +259,8 @@ public class RowStateAuditIntegrationIT {
                             .findFirst()
                             .orElseThrow();
         }
-        RequestCaptureAudit.audit(client, raw, true);
-        Files.writeString(
-                directory.resolve("capture-run.json"),
-                json.toJson(
-                        Map.of(
-                                "status",
-                                "complete",
-                                "pg_file",
-                                raw.getFileName().toString(),
-                                "pg_sha256",
-                                BaselineGenerator.sha256(raw),
-                                "jdbc_file",
-                                client.getFileName().toString(),
-                                "jdbc_sha256",
-                                BaselineGenerator.sha256(client))),
-                StandardOpenOption.CREATE_NEW);
+        RowAuditTestSupport.complete(directory, client, raw);
+        CaptureRun.verifyInput(raw);
         return raw;
     }
 

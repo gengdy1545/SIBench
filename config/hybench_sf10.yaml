@@ -11,17 +11,16 @@ native:
   work_dir: results/poc/hybench-sf10/native
   # runHTAP as designed: concurrent TP clients, then concurrent AT and IQ clients (AP runs its
   # rounds on one client, as upstream runAPower does).
-  clients: 8
+  clients: 32
   ap_clients: 1
-  xp_transaction_clients: 8
-  xp_query_clients: 8
+  xp_transaction_clients: 32
+  xp_query_clients: 32
   duration_minutes: 1
-  # TP and XP scale together (upstream A1 / A3 use 1:1). A calibration capture with 2 + 2 minutes
-  # (results/poc/hybench-htap-sf10) committed 164,841 row writes, 0.19% of the baseline;
-  # plan-write-ratio scaled both phases by 26.4 for committed writes of about 5% of the baseline.
+  # TP and XP scale together. At this concurrency, the latest calibrated full capture
+  # recorded cumulative row changes near 5% of the baseline count; timed runs vary.
   phase_duration_minutes:
-    tp: 53
-    xp: 53
+    tp: 5
+    xp: 5
 postgres:
   schema: public
   version: '14.24'

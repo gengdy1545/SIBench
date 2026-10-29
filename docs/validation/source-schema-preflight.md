@@ -1,6 +1,6 @@
 # 来源 Schema 预检实现验证
 
-日期：2026-10-21。范围以 [来源 Schema 契约](../contracts/source-schema.md) 为准。
+更新：2026-10-29。范围以 [来源 Schema 契约](../contracts/source-schema.md) 为准。
 
 ## 离线验证
 
@@ -15,7 +15,7 @@ java -jar build/sibench/sibench.jar prepare --dry-run config/sysbench_large.yaml
 git diff --check
 ```
 
-CLI 提供 `check-schema`，Baseline dry-run 核对配置且不生成数据。根测试结果见 [当前验证](p0-test-review.md)，下表列出 schema 测试的职责。
+CLI 提供 `check-schema`，Baseline dry-run 核对配置且不生成数据。根测试结果见 [完整验收](acceptance.md)，下表列出 schema 测试的职责。
 
 | 测试域 | 已覆盖 |
 | --- | --- |
@@ -28,15 +28,13 @@ CLI 提供 `check-schema`，Baseline dry-run 核对配置且不生成数据。�
 
 ## 实际 PG 集成验证
 
-经用户授权启动已有隔离 PG14.24，监听 `127.0.0.1:55433`。既有数据库 `sibench_htap_sf1_capture` 只运行只读预检，不修改 SF1 业务行、表或索引。三个独立、随机命名的测试数据库由测试创建，验证后自动删除；失败采集 manifest 与逐项报告保留。
+当前验收在 `sibench_4` 的隔离 PG14.24 上运行，监听 `127.0.0.1:55433`。随机命名的测试数据库由测试创建并删除，结束后停止 PG。冻结应用构建和证据入口见 [三来源验收](acceptance.md)。
 
-最终扩展运行 **51 项检查全部通过**，证据目录为 `results/validation/schema-preflight-20261021/catalog-boundaries/`，总报告为 `integration-summary.json`。
-
-最终 JDK17 打包 CLI 再次核对 SF1，通过报告为 `packaged-cli-sf1.json`；同次来源 Baseline dry-run 和差异格式检查通过。验证结束确认无残留测试库，隔离 PG 恢复为验证前的停止状态。
+本轮 **50 项 catalog 检查全部通过**，证据在 `results/validation/acceptance-20261029T053122Z/pg-integration/`。本轮未提供可选的独立 SF1 数据库，因此不包含第 51 项 SF1 预检；真实 SF10 与两组 87m 预检由同轮原生采集另行覆盖。
 
 | 实际验证 | 结果 |
 | --- | --- |
-| HyBench SF1 | 完整八表、8 主键、13 二级及默认值 / 序列所有权与固定源码一致；报告 `hybench-sf1.json` |
+| HyBench 布局 | 执行固定上游 DDL，检查完整八表、8 主键、13 二级及默认值 / 序列所有权 |
 | 来源布局 | HyBench 直接执行固定 `ddl_pg.sql` / `create_index_pg.sql`；YCSB 独立布局为 VARCHAR 主键 + 10 TEXT 字段，也核验配置 3 字段；sysbench 独立布局为 100 表、100 主键 + 100 k 二级及 SERIAL，也核验配置 2 表 / auto-inc=false |
 | 表 / 列差异 | 缺失 / 额外表、视图、quoted 额外表名、缺失 / 额外 / dropped 列、错类型、可空性、默认值、序列失去所有权 / 错引用、生成 / identity 列、额外约束、unlogged、RLS 均拒绝并输出诊断 |
 | 索引差异 | 缺失、同名错列、额外索引、unique 二级、复合、partial、表达式、INCLUDE、hash、降序、自定义 collation / 非默认 operator class 均拒绝；sysbench 最后一张表缺 k 索引拒绝 |
@@ -57,4 +55,4 @@ mvn -o -q -Dtest=PgSchemaIntegrationIT \
 
 ## 验收边界
 
-本次完成来源 schema 与实际 PG 的采集前一致性检查，不验证初始数据规模、序列当前计数、原生加载是否正确、查询 collation / 范围等价性或运行期外部 DDL 漂移。YCSB / sysbench 原生生成、执行及 Trace 转换的独立证据见 [来源验证](ycsb-sysbench-native-trace.md)，完整代表规模见 [验收结果](p0-three-source-acceptance.md)。
+本次完成来源 schema 与实际 PG 的采集前一致性检查，不验证初始数据规模、序列当前计数、原生加载是否正确、查询 collation / 范围等价性或运行期外部 DDL 漂移。YCSB / sysbench 原生生成、执行及 Trace 转换的独立证据见 [来源验证](capture-completeness.md)，完整代表规模见 [验收结果](acceptance.md)。
