@@ -37,6 +37,7 @@ public class IndexTraceCompilerTest {
                         c.benchmark(),
                         c.seed(),
                         targetBytes < 0 ? c.targetBytes() : targetBytes,
+                        c.maxOvershootPercent(),
                         maxRows < 0 ? c.maxRows() : maxRows,
                         c.groupBytes(),
                         c.pageBytes(),
@@ -895,15 +896,17 @@ public class IndexTraceCompilerTest {
                 org.sibench.adapters.ServiceReplay.run(
                                 output, ReplayConfig.defaults(), service, reference, fixture.resolve("verify-load.json"))
                         .get("status"));
-        var verified =
-                (Map<?, ?>)
-                        org.sibench.adapters.ServiceReplay.verify(
-                                        output,
-                                        ReplayConfig.defaults(),
-                                        service,
-                                        reference,
-                                        fixture.resolve("verify.json"))
-                                .get("result");
+        Path baseline = Path.of(JsonParser.parseString(Files.readString(output.resolve("manifest.json")))
+                .getAsJsonObject().get("baseline_directory").getAsString());
+        Path held = fixture.resolve("baseline-offline");
+        Files.move(baseline, held);
+        Map<?, ?> verified;
+        try {
+            verified = (Map<?, ?>) org.sibench.adapters.ServiceReplay.verify(
+                    output, ReplayConfig.defaults(), service, reference, fixture.resolve("verify.json")).get("result");
+        } finally {
+            Files.move(held, baseline);
+        }
         var manifest =
                 JsonParser.parseString(Files.readString(fixture.resolve("verify-load.json.index-manifest.json")))
                         .getAsJsonObject();
@@ -976,20 +979,29 @@ public class IndexTraceCompilerTest {
     @Test
     public void incrementalFilesRollOverWithUniqueInt64FileIds() throws Exception {
         Path fixture = temporary.newFolder().toPath();
-        // Every second row closes a row group, and any closed group reaches the target size.
-        CaptureConfig config = baseline(fixture, 1, 2);
-        String[] days = {"01", "02", "03", "04", "05", "06"};
+        CaptureConfig config = baseline(fixture, 65536, 65536);
         var transactions = new ArrayList<String>();
-        for (int i = 0; i + 1 < days.length; i++)
-            transactions.add(
-                    change("update", row("2024-01-" + days[i] + " 00:00:00"), row("2024-01-" + days[i + 1] + " 00:00:00"))
-                            + "{\"event\":\"transaction_commit\",\"xid\":9}\n");
+        var random = new java.util.Random(71);
+        String before = row("2024-01-01 00:00:00");
+        String finalRow = before;
+        for (int i = 0; i < 6000; i++) {
+            String stamp = java.time.LocalDateTime.of(2024, 1, 1, 0, 0).plusSeconds(i + 1L)
+                    .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            var after = JsonParser.parseString(row(stamp)).getAsJsonObject();
+            byte[] bytes = new byte[12];
+            random.nextBytes(bytes);
+            after.addProperty("status", java.util.Base64.getEncoder().encodeToString(bytes));
+            finalRow = after.toString();
+            transactions.add(change("update", before, finalRow)
+                    + "{\"event\":\"transaction_commit\",\"xid\":9}\n");
+            before = finalRow;
+        }
         Path raw = capture(fixture, transactions);
-        audit(config, raw, row("2024-01-06 00:00:00"));
+        audit(config, raw, finalRow);
         Path output = fixture.resolve("compiled");
         var manifest = compile(config, raw, output);
         var files = (List<?>) manifest.get("incremental_files");
-        assertEquals(3, files.size());
+        assertTrue(files.size() > 1);
         var ids = new HashSet<Long>();
         var rows = new ArrayList<Long>();
         var names = new ArrayList<String>();
@@ -1004,19 +1016,16 @@ public class IndexTraceCompilerTest {
                     BaselineGenerator.sha256(output.resolve((String) file.get("path"))),
                     file.get("sha256"));
         }
-        assertEquals(List.of(2L, 2L, 1L), rows);
-        assertEquals(
-                List.of(
-                        "loantrans-versions.parquet",
-                        "loantrans-versions-000002.parquet",
-                        "loantrans-versions-000003.parquet"),
-                names);
-        assertEquals(3, ids.size());
-        // The first file keeps its FileID (baseline's last plus the table id); loantrans is the
-        // last table, so the rollover files continue right after it.
+        assertEquals(6000L, rows.stream().mapToLong(Long::longValue).sum());
+        assertEquals(files.size(), ids.size());
         long firstId = (Long) ((Map<?, ?>) files.get(0)).get("file_id");
-        assertEquals(firstId + 1, ((Map<?, ?>) files.get(1)).get("file_id"));
-        assertEquals(firstId + 2, ((Map<?, ?>) files.get(2)).get("file_id"));
+        for (int i = 0; i < files.size(); i++) {
+            var file = (Map<?, ?>) files.get(i);
+            assertEquals(firstId + i, file.get("file_id"));
+            long bytes = Files.size(output.resolve((String) file.get("path")));
+            assertTrue(bytes <= 65536L * 105 / 100);
+            if (i + 1 < files.size()) assertTrue(bytes >= 65536);
+        }
         for (boolean secondary : new boolean[] {true, false}) {
             var replay = new ReplayConfig(secondary, "none", 0, 0, 0, 0, "operation");
             assertEquals(
@@ -1395,6 +1404,40 @@ public class IndexTraceCompilerTest {
      * secondary scan stopped among equal values, a BitmapAnd and an = ANY array. Each compiles to
      * searches whose counts are native facts, and the reference replay checks them.
      */
+    @Test
+    public void workloadPreflightDefersBaselineReadButNeverPublishesAnUncheckedBaseline() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        var config = baseline(fixture);
+        Path output = fixture.resolve("compiled");
+        compile(config, nonPrefixCapture(fixture, config, "1"), output);
+        Path baseline = config.layout().output(), hidden = fixture.resolve("baseline-held");
+        Files.move(baseline, hidden);
+        ReferenceReplay.Input input;
+        try {
+            input = ReferenceReplay.prepare(output, ReplayConfig.defaults());
+            assertEquals("workload_integrity_and_supply_valid", input.preflight().get("status"));
+            assertFalse(input.preflight().containsKey("baseline"));
+            assertThrows(java.io.IOException.class, () -> input.baseline().read(ignored -> {}));
+            var shortInput = assertThrows(java.io.IOException.class,
+                    () -> ReferenceReplay.prepare(output, new ReplayConfig(true, "none", 1, 1_000_000, 0, 0)));
+            assertTrue(shortInput.getMessage(), shortInput.getMessage().contains("Insufficient single-pass"));
+        } finally {
+            Files.move(hidden, baseline);
+        }
+        long expected = SourceSchema.hybench(config.source()).tables().stream()
+                .mapToLong(table -> table.indexes().size()).sum();
+        long[] loaded = {0};
+        assertEquals(expected, input.baseline().read(operation -> loaded[0]++));
+        assertEquals(expected, loaded[0]);
+        assertEquals("trace_integrity_and_supply_valid", input.preflight().get("status"));
+        assertEquals(expected, ((Map<?, ?>) input.preflight().get("baseline")).get("encoded_records"));
+        var aborted = assertThrows(java.io.IOException.class,
+                () -> input.baseline().read(operation -> { throw new java.io.IOException("consumer failed"); }));
+        assertEquals("consumer failed", aborted.getMessage());
+        assertEquals("workload_integrity_and_supply_valid", input.preflight().get("status"));
+        assertFalse(input.preflight().containsKey("baseline"));
+    }
+
     @Test
     public void nonPrefixAccessesCompileToSearchesThatReplay() throws Exception {
         Path fixture = temporary.newFolder().toPath();

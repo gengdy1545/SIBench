@@ -2,7 +2,7 @@
 
 通过原生 benchmark、真实 Parquet 和确定性索引 Trace 评估 KV Index Service。HyBench、YCSB JDBC、sysbench PG 的已验证输入保留真实索引访问、语句快照与事务内写入前缀。当前 Trace v9 使用保序键编码；Index Service 协议 2 统一完整提交发布，逐查询核对原生条数及完整有序 SHA-256。
 
-三来源本地完整验收与 COS 目标规模已通过，条件和边界见 [三来源验收](docs/validation/acceptance.md)、[对象存储与恢复](docs/validation/rocksdb-cloud.md)。本轮使用冻结应用提交 `bbff9a3`；正式后端性能排名、数据文件 Rewrite / 版本 GC 和目标规模崩溃恢复仍未验收。
+三来源从零原生生成 / PG 装载、512 MiB 目标文件策略、新采集 / 编译、完整参考 / 独立 oracle 和最新驱动的 COS 全量回放已通过，重试复用边界、分阶段构建及结果见 [最新完整验收](docs/validation/acceptance.md)。文件大小和发送端受控优化见 [测量报告](docs/validation/measurement.md)，小输入恢复保留其 [固定构建证据](docs/validation/rocksdb-cloud.md)。持续饱和容量、正式后端性能排名、数据文件 Rewrite / 版本 GC 和目标规模崩溃恢复仍未验收。
 
 ## 构建
 
@@ -15,9 +15,13 @@ java -jar build/sibench/sibench.jar inspect-scale
 
 使用 JDK 17，`mvn package` 包含测试并生成带依赖 JAR。`--root PATH` 指定仓库，默认为当前目录。配置和运行失败返回非零状态。
 
+原生采集需要支持 reflink 的文件系统。XFS 环境还需安装 `xfsprogs`：脚本在采集库副本上设置 8 KiB CoW 分配提示，限制随机页写产生的未使用预分配；静止基库不变。这是空间容量设置，不能据此推断数据库吞吐提高。
+
 ## 原生采集与回放
 
 流程：原生数据生成与 PG Load/建索引 → 静止边界导出并独立验证 Baseline → 原生采集与同次请求/结果核对 → 最终状态审计（完整核验时）→ 规范 Trace 编译（同遍构建访问账本并核对 PG 索引计数器）→ 认证（完整核验时）。三来源同一入口 `scripts/native-capture.sh`；HyBench 的 AP/TP/XP 阶段之间不重新加载或恢复数据。
+
+维护配置的数据文件目标统一为 512 MiB。原生采集配置在已有 `data_layout` 中设置 `target_file_size_bytes: 536870912` 和 `file_size_max_overshoot_percent: 5`；派生生成配置对应 `data_layout.parquet`。目标可改为其它正整数字节数，允许超量可设为 1–100 的整数百分比。基线与增量共用完整压缩文件字节控制，尾文件及拒绝规则见 [存储契约](docs/contracts/storage.md#数据文件)。增量 Parquet 在编译 Trace 时生成，replay 复用它们；改变布局需新输出目录和相应 Physical Trace，共享基线拒绝复用不匹配的旧布局。索引 SST 的大小由后端单独控制。
 
 [hybench_sf1.yaml](config/hybench_sf1.yaml) 是默认 HTAP 配置。每个采集配置以 `postgres.clone_from` 声明静止库：它在 `build/services/postgresql-still/<clone_from>/` 的单独 PG 集群中由脚本的 `base` 阶段只建一次（HyBench 按上游 README 原生 gendata、`ddl_pg.sql`、`load_data_pg.sql` 并建上游二级索引；YCSB / sysbench 以原生客户端装载；随后安装行变化触发器并 `VACUUM (ANALYZE)`），之后停机不再写入。每次采集以 `cp --reflink` 复制停机的集群（需支持 reflink 的文件系统，如 xfs）、把库改名为采集库，成功后删除副本；失败时副本保留以便诊断，下次运行前需手工删除。HyBench 在 `native.work_dir`（含原生 `Data_<sf>`）下运行，装载后只保留运行时读取的两个文件，见 [HyBench 来源](docs/benchmarks/hybench.md)。并发度取原生参数：HyBench 的 `clients` / `xp_transaction_clients` / `xp_query_clients`，YCSB / sysbench 的 `threads`；每个线程一个后端会话，有重叠会话时整次采集按 PostgreSQL 事务完成计数器归并。完整步骤与证据见 [原生采集验证](docs/validation/capture-completeness.md)。
 
@@ -58,7 +62,7 @@ java -jar build/sibench/sibench.jar check-capture-completeness PROFILE LEDGER BE
 本轮完整输入分别保留在 `sibench_1 / 2 / 3` 的 `/data/sibench` 工作区，本地保存选定报告与小输入，详见 [验收证据](docs/validation/acceptance.md#证据与复现)。以下完整输入命令在对应来源主机执行；目标规模服务使用证据内的 600 秒保护配置，通用模板的默认期限另计。
 
 ```bash
-T=results/poc/acceptance-20261029T053122Z/hybench/trace
+T=results/poc/acceptance-20261029T181200Z/hybench/capture/trace
 java -Xmx24g -jar build/sibench/sibench.jar check-replay config/index_replay_128clients.yaml $T
 java -Xmx40g -jar build/sibench/sibench.jar replay config/index_replay_64clients.yaml $T REPORT
 java -Xmx40g -jar build/sibench/sibench.jar validate-snapshots config/index_replay.yaml $T REPORT
@@ -83,7 +87,7 @@ java -Xmx24g -jar build/sibench/sibench.jar check-relocation PROFILE $T OUTPUT_D
 
 ```bash
 java -Xmx24g -jar build/sibench/sibench.jar analyze-locality \
-  results/poc/acceptance-20261029T053122Z/hybench/trace config/update_locality.yaml results/poc/locality-example
+  results/poc/acceptance-20261029T181200Z/hybench/capture/trace config/update_locality.yaml results/poc/locality-example
 python3 scripts/plot_update_locality.py results/poc/locality-example --out results/poc/locality-example/plots
 ```
 
@@ -94,7 +98,7 @@ python3 scripts/plot_update_locality.py results/poc/locality-example --out resul
 驱动通过 [Index Service 协议](docs/contracts/index-service.md)（`src/main/proto/index_service.proto`）把规范 Trace 发给 KV 索引服务：每个 client 一条有序 gRPC 流，查询组整体发送，每个查询的返回条数必须等于原生期望数，并逐查询核对绑定查询身份与完整 `(PK, version, value)` 的 SHA-256 摘要。`--reference` 给出同一 Trace 的参考回放报告时复用其摘要 sidecar；没有时在回放前从同一 Trace 生成。
 
 ```bash
-T=results/poc/acceptance-20261029T053122Z/sysbench/trace
+T=results/poc/acceptance-20261029T170600Z/sysbench/capture/trace
 java -jar build/sibench/sibench.jar index-server config/index_service_rocksdb.yaml &      # RocksDB 服务，端口 50551
 java -jar build/sibench/sibench.jar replay-service config/service_replay_grpc.yaml $T REPORT --reference REFERENCE
 java -jar build/sibench/sibench.jar replay-service config/service_replay_rocksdb.yaml $T REPORT  # 进程内 RocksDB，无网络
@@ -108,7 +112,7 @@ java -jar build/sibench/sibench.jar replay-service config/service_replay_rocksdb
 java -jar build/sibench/sibench.jar verify-service REPLAY_CONFIG $T REPORT --reference REFERENCE
 ```
 
-`service.backend: rocksdb_cloud` 使用 rocksdb-cloud（JNI，语义与本地 RocksDB 共用），另需 `storage: config/storage.yaml`、`profile`（`local_s3` / `cos`）与 profile prefix 之下的 `object_path`；凭据只从 profile 指定的环境变量读取。JNI 库须在目标机（glibc 2.28）构建，以 root 运行 `scripts/build-rocksdb-cloud.sh`，产物 `build/index/librocksdb_cloud_jni.so`，运行时用 `-Dsibench.rocksdb_cloud.library=PATH` 指定。版本固定在 `index/versions.yaml`，语义见 [Index Service 契约](docs/contracts/index-service.md#rocksdb-cloud-后端)。
+`service.backend: rocksdb_cloud` 使用 rocksdb-cloud（JNI，语义与本地 RocksDB 共用），另需 `storage: config/storage.yaml`、`profile`（`local_s3` / `cos`）与 profile prefix 之下的 `object_path`；凭据只从 profile 指定的环境变量读取。JNI 库须在目标机（glibc 2.28）构建：先运行 `git submodule update --init --recursive -- index/rocksdb-cloud third_party/aws-sdk-cpp`，再以 root 运行 `scripts/build-rocksdb-cloud.sh`。脚本要求两个子模块均处于主仓库固定的提交且工作区干净；产物为 `build/index/librocksdb_cloud_jni.so`，运行时用 `-Dsibench.rocksdb_cloud.library=PATH` 指定。源码版本由子模块 gitlink 固定，构建要求与许可证见 [third_party/versions.yaml](third_party/versions.yaml)，语义见 [Index Service 契约](docs/contracts/index-service.md#rocksdb-cloud-后端)。
 
 jar 与 JNI 的请求统计格式须配套重建；云后端在每次 Flush 的 `*.engine-stats.jsonl` 中记录对象请求延迟桶和分位数上界。成功服务回放与同次运行的 RocksDB 事件日志可生成独立测量摘要（日志可重复指定；输出文件必须尚不存在）：
 
@@ -144,7 +148,8 @@ dry-run 只校验源码指纹、配置和 schema，不创建数据。去掉 `--d
 | `src/main/java/org/sibench/`、`src/test/java/org/sibench/` | Java 核心与测试，按职责组织 |
 | `src/main/native/postgres/` | PG 14.24 采集插桩（`sibench_capture.c` 加调用点补丁），作用于隔离构建副本 |
 | `src/main/native/index/` | 索引后端的薄 JNI 绑定（rocksdb-cloud），只转发字节 |
-| `index/` | 索引后端固定版本（`versions.yaml`）；上游源码由构建脚本克隆到其下，不纳入源码 |
+| `index/` | 被测索引引擎的固定上游源码子模块 |
+| `third_party/` | 通用第三方依赖子模块；`versions.yaml` 集中记录外部依赖的构建要求、许可证与服务二进制版本 |
 | `src/main/proto/` | Index Service 协议定义 |
 | `scripts/` | 串联已有 Java CLI 阶段的编排脚本，不含来源语义 |
 | `config/` | 长期维护的平铺配置，工作负载命名 `<benchmark>_<scale>.yaml`；单次有效配置随运行证据保存，测试夹具归测试资源 / 临时目录 |
@@ -154,6 +159,7 @@ dry-run 只校验源码指纹、配置和 schema，不创建数据。去掉 `--d
 - [计划](plan.md)：后续目标、依赖与验收。
 - [Trace 契约](docs/contracts/trace.md)：版本、操作、发送及完整性。
 - [Index Service 协议契约](docs/contracts/index-service.md)：gRPC 协议、驱动侧核对与 RocksDB 参照实现。
+- [管线核验职责](docs/contracts/pipeline-validation.md)：实现测试、输入证明与每次运行核验的区别、复用边界和计量范围。
 - [来源 Schema 契约](docs/contracts/source-schema.md)：三来源布局、PG 预检及失败边界。
 - [原生采集与完整性](docs/validation/capture-completeness.md)：并发执行、行审计、访问账本和计数器。
 - [三来源验收](docs/validation/acceptance.md)、[测量口径](docs/validation/measurement.md)、[采集环境](docs/validation/capture-performance.md)：最新完整输入、结果与资源边界。

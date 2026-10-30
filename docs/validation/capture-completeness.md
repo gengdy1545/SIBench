@@ -1,6 +1,6 @@
 # 原生采集与完整性验证
 
-更新：2026-10-29。三来源使用同一 `scripts/native-capture.sh` 入口，采集后再编译规范 Trace。当前应用、输入和完整结果统一见 [三来源验收](acceptance.md)，资源条件见 [采集环境](capture-performance.md)。
+更新：2026-10-30。三来源使用同一 `scripts/native-capture.sh` 入口，采集后再编译规范 Trace。当前应用、输入和完整结果统一见 [三来源验收](acceptance.md)，资源条件见 [采集环境](capture-performance.md)。
 
 ## 当前采集路径
 
@@ -23,7 +23,7 @@
 
 PG14 的 `idx_tup_read` 比较候选数；`idx_tup_fetch` 比较经 index heap fetch 可见的行，不包含 bitmap 堆检查和全可见 index-only 的可见行；`idx_scan` 比较从访问推导出的树下降上下界。PG14 统计通过 UDP 上报，丢失可能造成偏低；本轮没有人为丢统计事件的故障注入。
 
-本轮三来源均重新执行完整审计，`capture_completeness=consistent`、受支持投影完整、Trace 完成并生成新的认证。原生数据、会话、行审计、计数器和 manifest 在各来源主机 `results/poc/acceptance-20261029T053122Z/<source>/`，选定报告同步至本地同轮证据目录。不用既有认证代替本轮 full 审计。
+最新三来源均重新执行完整审计，`capture_completeness=consistent`、受支持投影完整、Trace 完成并生成新的认证；不以旧认证代替本次 full 审计。原生数据、会话、行审计、计数器和 manifest 在各来源主机 `/data/sibench/results/poc/<来源运行目录>/<source>/capture/`，具体目录、摘要和 YCSB Baseline 重试复用边界见 [最新完整验收](acceptance.md#输入与身份)，选定报告按相同运行目录同步本地。
 
 ## 当前格式与有界状态
 

@@ -12,13 +12,15 @@
 
 写入结果未知时不自动重试。`INVALID` 表示请求违反契约；`UNAVAILABLE` 表示执行失败，写入可能已经生效。首次错误、之后的排空与进程清理分别记录。
 
+实际 gRPC 请求的本地发送完成由 `ClientStreamTracer.outboundMessageSent` 确认序列化并交给 transport；`StreamObserver.onNext` 返回本身不作为发送完成依据。发送完成与服务响应分别等待；合批 / 成组前的逻辑成员不计作独立 RPC。驱动容量诊断复用原 Trace 的完整事务前缀和真实完整响应，并执行同一逐查询摘要核对；有限前缀不等于持续负载或索引吞吐上限，见 [发送端容量测量](../validation/measurement.md#发送端容量与优化对照)。
+
 ## 数据、事务与读取
 
 索引条目为 `(table, index, indexed_value, PK)`；主键索引 `index=0` 没有 indexed value。键组件使用 `IndexKey` 的保序编码。value 为 RowID，或两个完整 int64 的 Locator `(file, position)`；两种模式的能力分别核验。
 
 | 操作 | 约束 |
 | --- | --- |
-| Baseline `INSERT` | version 0；不写 WAL，到 Flush 才保证声明的持久化。允许 `WriteBatch`，整批先验证，非法成员使整批失败；在途额度和逻辑调用数仍按成员计。 |
+| Baseline `INSERT` | version 0；不写 WAL，到 Flush 才保证声明的持久化。允许 `WriteBatch`，整批先验证，非法成员使整批失败；共享批量完成状态时，在途额度、完成数和延迟仍按成员计，采用批内最早期限。 |
 | `UPSERT` / `LOGICAL_DELETE` | 按新版本写入；同键同版本按事务内位置覆盖。删除保留不可见版本，不能使旧值复活。 |
 | `RELOCATE` | 必须命中已有精确版本，改变物理位置而不创造逻辑版本；不表示完整 Rewrite / GC 协议已实现。 |
 | `Search` | 在 read_version 选择不高于读点的最新未删除版本；支持主键 / 二级范围、开闭界、方向、limit 及钉住 PK 的二级查找。结果按索引值、PK 排序，倒序时反转。 |
@@ -56,7 +58,7 @@
 
 ## rocksdb-cloud 后端
 
-薄 JNI 只转发字节，复用同一 Java 键布局、版本选择与发布逻辑。版本固定在 `index/versions.yaml`，构建入口为 `scripts/build-rocksdb-cloud.sh`；配置使用 `storage`、`profile` 和 profile prefix 下的独立 `object_path`，凭据只从环境读取。
+薄 JNI 只转发字节，复用同一 Java 键布局、版本选择与发布逻辑。上游源码由 `index/rocksdb-cloud` 和 `third_party/aws-sdk-cpp` 子模块 gitlink 固定，构建要求与许可证见 `third_party/versions.yaml`。先初始化子模块，再运行 `scripts/build-rocksdb-cloud.sh`；脚本要求两个子模块均处于固定提交且工作区干净。配置使用 `storage`、`profile` 和 profile prefix 下的独立 `object_path`，凭据只从环境读取。
 
 | 项目 | 语义 |
 | --- | --- |

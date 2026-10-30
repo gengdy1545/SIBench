@@ -1,6 +1,6 @@
 # 统一行状态审计
 
-更新：2026-10-29。
+更新：2026-10-30。
 
 ## 职责
 
@@ -36,7 +36,7 @@ Baseline 验证由采集编排的 `export` 阶段在导出后执行（`PgBaselin
 
 `RowStateAuditIntegrationIT` 在 PG14.24 插桩构建上使用三个随机临时库：HyBench 执行固定上游 DDL，YCSB / sysbench 使用独立声明的来源布局。基线 Parquet 与实际 JDBC 结果核对，变更通过 `CaptureDriver` 和 PG 行触发器采集；三来源各验证完整行状态与离线复用、回滚 PK 改写拒绝、提交 PK 改写拒绝。接受的变更覆盖所有配置表的普通列 / 二级索引列更新、同 PK 删除重插入、低于基线键的新增行和写入后回滚；HyBench 覆盖 REAL、CHAR、date 和微秒 timestamp，YCSB 保留主键尾部空格。
 
-本轮三个实际 PG 集成测试全部通过，证据在 `results/validation/acceptance-20261029T053122Z/pg-integration/`。测试夹具已改用当前 `.jsonl.zst` 文件和完整会话 manifest，并在复制文件前调用 `CaptureRun.awaitBackendExit`；原有状态和拒绝断言保持不变。等待缺失时可复制到尚未写完的空文件，不能把该竞态当作有效采集。
+冻结 `238fe58b…` 构建的三个实际 PG 集成测试全部通过（非本次重新运行），证据在 `results/validation/acceptance-20261029T053122Z/pg-integration/`。测试夹具已改用当前 `.jsonl.zst` 文件和完整会话 manifest，并在复制文件前调用 `CaptureRun.awaitBackendExit`；原有状态和拒绝断言保持不变。等待缺失时可复制到尚未写完的空文件，不能把该竞态当作有效采集。
 
 集成测试需要 PG 已启动，其 `SIBENCH_CAPTURE_DIR` 与测试提供的目录一致，并设置 `SIBENCH_CAPTURE_COMPRESS=zstd`。使用新证据目录运行：
 

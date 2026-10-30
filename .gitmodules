@@ -10,3 +10,9 @@
 	path = benchmark/YCSB
 	url = https://github.com/gengdy1545/YCSB.git
 	branch = master
+[submodule "third_party/aws-sdk-cpp"]
+	path = third_party/aws-sdk-cpp
+	url = https://github.com/aws/aws-sdk-cpp.git
+[submodule "index/rocksdb-cloud"]
+	path = index/rocksdb-cloud
+	url = https://github.com/rockset/rocksdb-cloud.git

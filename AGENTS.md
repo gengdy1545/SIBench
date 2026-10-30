@@ -7,8 +7,11 @@
   `new`, and `final` as organizational names.
 - Keep upstream benchmark sources in `benchmark/` submodules. Store generated
   builds under `build/benchmarks/` and local service state under `build/services/`.
-- Pin index-backend upstream versions in `index/versions.yaml`; their sources are
-  cloned under `index/` by the build script and built into `build/index/`.
+- Keep index-backend upstream sources in `index/` submodules, pinned by gitlinks,
+  and general third-party source dependencies in `third_party/` submodules.
+  Keep build/license metadata and service binary versions in
+  `third_party/versions.yaml`. Build index backends and their dependencies into
+  `build/index/`.
 - Keep maintained workload and service configurations directly in `config/`,
   without nested directories. Name workload files `<benchmark>_<scale>.yaml`;
   use descriptive filenames for trace examples and storage configuration.

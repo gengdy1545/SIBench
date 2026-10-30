@@ -12,6 +12,40 @@ import java.nio.file.*;
 import java.util.*;
 
 public class IndexOperationTraceTest {
+    @Test
+    public void decodingChecksHandEncodedLogicalIdentityAndRejectsAValidDifferentTrace() throws Exception {
+        Path file = Files.createTempDirectory("sibench-stream-digest-").resolve("trace.ops");
+        try {
+            var operation = IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0,
+                    IndexKey.ofInt(42), 0, 7, 0, 11);
+            try (var writer = new IndexOperationTrace.Writer(file)) { writer.append(operation); }
+            var payload = java.nio.ByteBuffer.allocate(137).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            payload.putLong(1).putInt(1).putInt(1).putInt(0).putInt(0)
+                    .putLong(0).putLong(7).putLong(0).putLong(11).putLong(0)
+                    .putLong(0).putLong(0).putLong(-1).putLong(0).putLong(0)
+                    .putInt(0).putInt(0).putInt(9).putInt(-1).putInt(-1).putInt(-1)
+                    .put(IndexKey.ofInt(42).bytes());
+            var crc = new java.util.zip.CRC32C(); crc.update(payload.array());
+            var plain = java.nio.ByteBuffer.allocate(16 + 12 + 137).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            plain.putInt(0x53494f50).putInt(9).putInt(128).putInt(4096)
+                    .putInt(137).putInt(1).putInt((int) crc.getValue()).put(payload.array());
+            String expected = HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(plain.array()));
+            var decoded = new ArrayList<Operation>();
+            assertEquals(1, IndexOperationTrace.Source.file(file, expected).read(decoded::add));
+            assertEquals(List.of(operation), decoded);
+            assertEquals(expected, IndexOperationTrace.sha256(file));
+            Files.delete(file);
+            try (var writer = new IndexOperationTrace.Writer(file)) {
+                writer.append(operation.withWorkUnitId(1));
+            }
+            var mismatch = assertThrows(IOException.class,
+                    () -> IndexOperationTrace.Source.file(file, expected).read(ignored -> {}));
+            assertTrue(mismatch.getMessage().contains("checksum mismatch"));
+        } finally {
+            Files.deleteIfExists(file); Files.delete(file.getParent());
+        }
+    }
+
     private static IndexKey text(String value) throws IOException {
         return IndexKey.ofText(value);
     }

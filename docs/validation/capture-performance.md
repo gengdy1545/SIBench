@@ -1,47 +1,69 @@
 # 采集环境与阶段计量
 
-更新：2026-10-29。当前单次采集为 `acceptance-20261029T053122Z`，完整结果与输入身份见 [三来源验收](acceptance.md)。本页报告来源生成管线，不把采集吞吐当作索引服务性能。
+更新：2026-10-30。本次只优化 YCSB；HyBench / sysbench 沿用 [最新选择集](acceptance.md) 中的完整证据。新 YCSB 从原生基库生成 / 装载开始到 Trace 编译输出完成 **142.39 分钟**，无旧输入复用、无采集中断。参考 / oracle 和服务执行单列。
 
 ## 执行环境
 
-开发机为 32 线程、约 62 GB 内存，工作区 `/mnt/disk1/SIBench`，用于构建、离线测试和证据整理。远程工作区 `/data/sibench`，TencentOS 3.2 / glibc 2.28、AMD EPYC 9K65；各 pod 配额 32 CPU，内存上限 64,000,000,000 B（59.60 GiB，含页缓存），`/data` 为 500 GiB xfs。宿主可见 96 个逻辑 CPU，JVM 按配额识别 32；不能把可见数量当作实验配额。原始环境快照见本轮 `environment/`。共享宿主可能存在其他负载，单样本不能排除宿主波动。
+远程 `/data/sibench`，TencentOS 3.2 / glibc 2.28、AMD EPYC 9K65；各容器 32 CPU、64,000,000,000 B（59.60 GiB，含页缓存）、500 GiB XFS，JDK 17、PG 14.24。本次获准七台加本机：3 / 4 做短诊断，5 固定原始 PG 做全量前后对照，6 从零生成新 YCSB，2 保存原始比较输入；1 / 7 无需启动新大实验。本机只构建、测试及离线分析。同机比较隔离竞争实验，未强制清页缓存，其他租户未独立控制。
 
-本轮 `sibench_1 / 2 / 3` 分别运行 HyBench / YCSB / sysbench；`sibench_4` 构建 JNI 并完成小输入恢复、存储和 PG 集成验证。完整本地 / COS 后端按来源依次运行，每一对使用同机同输入和相同资源预算，不并行竞争 COS。参考与 oracle 在各来源主机上先完成。
-
-使用 JDK 17.0.20 / 远程 17.0.20.1、PG 14.24，业务进程以 UID 1000 的 `sibench` 运行。PG 采用 [postgres_capture.conf](../../config/postgres_capture.conf)、read_committed、C collation、禁用 parallel worker，追踪格式为 summary + zstd；实际有效配置随运行保存。
-
-PG 二进制 SHA-256 `c5e02bffee01d18b6ba5a7b6bec19dd52c3a82e4887014ff47b982bc9638bbe1`，row_capture 库 SHA-256 `0c802b68cd168458c554023220cdc1164101397592f9f96ba57ce4b7503ddaa7`。应用、JNI 和来源提交以同轮身份文件为准。
+采集堆 32 GiB；参考 / oracle 顺序各 40 GiB；服务 / 驱动各 16 GiB。原生装载 ≤12h、后续各大阶段 ≤6h、来源合计 ≤24h；可用盘 <20 GiB 或首个正确性 / 资源失败即停，setup、执行、teardown 单独限时。原始授权及具体子实验预算保存在本批次 scope / command / status；短对照不自动扩大为完整规模重复实验。
 
 ## 本轮生成条件
 
-三组均从已验证、停机的静止 PG 基库 reflink 克隆，复用摘要匹配的 Baseline Parquet；重新执行原生 workload、全部会话审计、完整行状态审计、计数器核对、Trace 编译和新认证。**本轮没有重新测量初始原生 gendata / load / 建索引 / Baseline 全量导出成本**。prepare / export 的亚秒耗时是复用开销，不能写成从零建库或导出速率。
+| 来源 | Baseline 行数 | 原生并发 / 工作负载 | 证据边界 |
+| --- | --- | --- | --- |
+| HyBench SF10 | 87,060,000 | AP 1；TP 32；XP AT 32 / IQ 32；TP / XP 各 5 分钟 | 沿用 181200Z |
+| YCSB 87m | 87,060,000 | JDBC A / B / C / F / D / E；装载 16、运行 32 线程；10×100 字节字段 | 本次全新生成 |
+| sysbench 87m | 87,060,000 | 8 线程、8 表×10,882,500 行；六个固定 oltp 脚本 | 沿用 170600Z |
 
-| 来源 | 基线行数 | 原生并发与负载 |
-| --- | ---: | --- |
-| HyBench SF10 | 87,060,000 | AP 1；TP 32；XP AT 32 / IQ 32；TP / XP 各 5 分钟 |
-| YCSB | 87,060,000 | 32 线程，JDBC A / B / C / F / D / E，10 × 100 字节字段 |
-| sysbench | 87,060,000 | 8 线程，8 表 × 10,882,500 行，六个固定 oltp 脚本 |
+原生工作量、线程数、字段宽度、插桩与 512 MiB / 5% / EOF 尾文件规则保持。实际写比例由本次 Trace 决定，不删查询或截断事务。YCSB 基库生成使用 3fbd，之后生成 / 验证使用 5bd；当前 8bfb 的缓存交接另做完整受影响边界补测，构建角色见 [验收](acceptance.md#构建与实验条件)。
 
-负载量由当前 Java `plan-write-ratio` 根据同来源同规模校准输入推导；有效配置和校准 manifest 随运行保存。按时间停止的 HyBench 会有比例偏差，实际修改数以最终 Trace 为准；不删除查询或截断事务来凑 5%。
+| 来源 | base 客户端 wall 秒 | base CPU 秒 | 独立 PG CPU 秒 / 峰值 RSS GiB |
+| --- | --- | --- | --- |
+| HyBench SF10 | 459.56 | 170.09 | 258.86 / 7.41 |
+| YCSB 87m | 2,247.04 | 1,027.04 | 1,418.19 / 16.32 |
+| sysbench 87m | 272.12 | 78.64 | 607.71 / 16.32 |
+
+base 包含原生生成 / load、建索引和当前脚本的 count / VACUUM / ANALYZE；PG daemon 独立计量，其 wall 不与客户端相加。新 YCSB 的原生客户端 load 约 1,120.32 秒，和旧 1,126.30 秒接近，本次未声称装载优化；其余基库准备仍是可见成本。initdb 有原始日志但本轮没有独立 GNU time，CPU / RSS 为 N/A。
 
 ## 分阶段墙钟
 
-单位为秒，取同轮 `run-timing.json` 的阶段记录，保留两位小数。
+单位秒，取各来源本次 `run-timing.json`。编译初始化之后的 Baseline 派生和 workload 编译另列。应用计时不覆盖所有启动、PG 关闭和认证收尾，不能将组件之和当作总流程。
 
-| 来源 | 原生执行 | 行审计 | 编译初始化 | Baseline 派生 | workload 编译 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| HyBench SF10 | 727.85 | 483.55 | 2.14 | 58.34 | 315.21 |
-| YCSB 87m | 1,584.33 | 1,042.27 | 11.98 | 28.84 | 574.66 |
-| sysbench 87m | 411.64 | 202.80 | 2.56 | 36.21 | 245.79 |
+| 来源 | 新导出+PG验证+发布 | 原生执行 | 完整行审计 | 编译初始化 | Baseline 派生 | workload 编译 |
+| --- | --- | --- | --- | --- | --- | --- |
+| HyBench SF10 | 173.50 | 733.87 | 300.82 | 2.07 | 59.10 | 285.01 |
+| YCSB 87m | 2,845.22 | 1,627.32 | 1,157.32 | 12.15 | 30.35 | 572.44 |
+| sysbench 87m | 96.56 | 327.78 | 178.42 | 2.59 | 36.79 | 240.68 |
 
-阶段边界见原始 timing；workload 编译包含访问账本与计数器核对。上述子阶段不包含全部 JVM 启停与收尾，不能简单相加冒充端到端。认证后已审计的逐行变化文件按现有管线规则移除；保留原生事实、行审计报告、新认证和编译输入绑定，以自身认证重编。
+YCSB 原生开始 epoch `1793326410.620262`，编译输出完成 `1793334953.8874583`，间隔 **8543.267 秒 / 142.39 分钟**。终点为 compiler stdout 报告写完，manifest 已发布且 INCOMPLETE 已移除；后续认证 / PG 关闭至 `1793335058.0423636` 不混入编译完成时间。该次导出阶段仍包含后来已优化的重复 SHA 读取，未用补测节约数修改实测总时间。
 
-## 资源与保护边界
+完整参考 / oracle、采集 GNU time、产物及磁盘口径见 [测量](measurement.md#生成与正确性模型成本)。采集期间 PG daemon 总 CPU 未独立完整计时，为 N/A；基库和受控导出对照中的 PG 则有独立 GNU time。完整行审计的外排 / 归并、YCSB E workload 及基库准备仍占显著时间，本批没有叠加未经对照的新优化。
 
-采集 JVM 堆上限 32 GiB，参考 / 独立 oracle 40 GiB，局部性分析 24 GiB，服务与驱动各 16 GiB。大阶段独立上限 6 小时；后端 setup 600 秒、单请求 600 秒、replay 6 小时、teardown 30 秒分别计时，第一处错误与后续清理分开保存。600 秒是实验保护，不是服务性能验收目标。磁盘余量低于 20 GiB 时停止受影响采集。
+## 资源失败与重试边界
 
-每个命令保留 `/usr/bin/time -v` 与应用 timing。采集命令的 CPU 不含独立 PG daemon；其 max RSS 是 GNU time 记录的最大子进程值，不能把它当作 PG、客户端和 JVM 的内存总和。各 JVM 的进程 CPU / RSS 可单列。30 秒主机采样包含页缓存与其他进程；cgroup 历史 HWM 不能归因到本轮。共享 `/data` 的前后差值也不能当作单阶段临时空间。
+本轮新 YCSB 无采集资源失败；准备时发现 6 号机缺少服务 OS 用户，在输入生成前修正并保留原始 setup 失败及原截止。旧 Maven 首次检查与并发 test-compile 冲突导致测试类消失，原失败报告保留；纠正为顺序 clean test / package 后 338 项全部通过，不将无效检查算作通过。
 
-阶段 CPU / RSS、最终产物和服务端指标统一见 [测量口径与本轮结果](measurement.md)。原始采集目录为各来源主机 `results/poc/acceptance-20261029T053122Z/<source>/`；命令、配置和资源记录在同机 `results/validation/acceptance-20261029T053122Z/<source>/`。
+旧 YCSB 曾因 XFS reflink PG clone 的 CoW 预留触发 disk_reserve。该失败仍是当前 8 KiB CoW hint 的回归依据；旧同输入诊断分配约 −38%，clone+write+fsync wall 约 +34%，按容量修复保留。新运行沿用该采集脚本，未改引擎内部行为。旧失败 / 恢复原始证据在 `acceptance-20261029T170600Z/ycsb/failed-capture-evidence/`、`cow-allocation-summary.json` 及 `process-cleanup-check.json`，旧恢复开销不计入当前成功运行。
 
-本轮是一次代表输入验证，不是采集优化前后对照；不沿用旧构建的加速倍数，也未重新测量插桩开销、不同 PG 参数或不同线程数的因果影响。
+诊断曾将不同 JVM 的 JSON 对象字段序差异误判为 manifest 不同；纠正派生分析按 JSON 语义比较，同时独立核对全部 Parquet SHA，原始失败不改写。全量 PG 传输的 GNU tar 仅保留秒级 mtime，原纳秒断言失败原样保留；后续全列 PG 验证及 131 文件规范 SHA 证明值与文件内容一致，而非仅依赖传输元数据。
+
+## 优化结论与复现
+
+测得旧 YCSB 8 GiB 范围读取会反复扫描无序宽堆，非零 JDBC fetch count 又限制 PG 执行时并行。保留仅 YCSB 的整表主键有序 binary COPY，仍使用原 Parquet writer、快照和独立 PG 全列 / RowID 验证。8m ABBA 与原始 87m 同输入验证先后通过。
+
+| 同输入 87,060,000 行 / 同主机 | 旧 JDBC 范围读取 | 新 COPY |
+| --- | --- | --- |
+| 导出秒 | 5,717.84 | 1,925.88 |
+| 独立 PG 验证秒 | 668.85 | 670.85 |
+| 合计秒 | 6,386.73 | 2,596.76 |
+
+纯导出 **2.969×**，导出加独立 PG 验证 **−59.34%**；131 文件总字节均为 70,754,918,834 B，文件 SHA、语义文件边界、RowID 和 PG 行摘要与规范原输入一致。Java CPU 2255.38 → 1992.46 秒，PG CPU 1352.94 → 714.84 秒；Java 峰值 RSS 27.70 → 18.88 GiB。
+
+代价是 PG 临时文件逻辑峰值 **7.23 → 86.74 GiB**。XFS `st_blocks` 单次观测曾为约 145.31 GiB，随后收缩；它与逻辑长度不同，也不证明独占物理分配。新全链主机最小余量 **81.57 GiB**。必须按观测余量规划容量，不能将 86.74 GiB 当硬磁盘上限。为显著时间收益且资源在预算内而保留，未声称临时空间减少。
+
+另一个完整同输入对照只改变缓存交接：独立 PG 验证仍读取所有值和实际 SHA，发布后的重复读取从 **70,755,313,439 → 427,569 B rchar**，发布阶段 **193.721 → 0.016 秒**。整个验证 / 发布边界 859.19 → 666.24 秒；Java CPU 907.78 → 925.55 秒、峰值 RSS 18.57 → 19.28 GiB，未声称 CPU 或内存节省。rchar 是读系统调用字节，包含页缓存，不是物理磁盘 IO。131 文件实际 SHA 及全部 PG 值 / 行身份一致，故保留；缓存缺失回退完整读取，变化的文件仍拒绝。该补测不与新全链时间拼接。
+
+完整对照各一轮，顺序旧→新、fresh JVM、无强制清缓存；表大于主机内存，小输入 ABBA 的波动另保留。不将这一轮当正式排名或独立重复采集的稳定收益。profile 显示压缩 / 网络等待等热点，GC 暂停约 1%，没有据此新增 GC 调参或并行编码框架。
+
+入口：[COPY 同输入完整证据](../../results/validation/ycsb-optimization-20261030T010500Z/full-analysis.json)、[缓存交接完整证据](../../results/validation/ycsb-optimization-20261030T010500Z/checksum-analysis.json)、[新 YCSB 全链摘要](../../results/validation/ycsb-optimization-20261030T010500Z/ycsb/source-summary.json)。源码快照、有效配置、命令及 GNU time 同轮绑定，必要保留 / 清理见 `retention.json`。被测 index service 内部算法未修改；未测项目和后续研究见 [计划](../../plan.md)。

@@ -22,7 +22,7 @@ abstract class ServiceClient implements ReplayTarget {
     private final List<Operation> group = new ArrayList<>();
     private final List<CompletableFuture<Void>> groupResponses = new ArrayList<>();
     private final List<Operation> batch = new ArrayList<>();
-    private final List<CompletableFuture<Void>> batchResponses = new ArrayList<>();
+    private CompletableFuture<Void> batchResponse;
     private long batchId;
 
     ServiceClient(TraceRequests requests) {
@@ -35,6 +35,11 @@ abstract class ServiceClient implements ReplayTarget {
      */
     abstract CompletableFuture<Response> transmit(
             Request request, java.util.function.Consumer<Response> partial) throws IOException;
+
+    /** The last actual request reached its local transport; in-process targets execute immediately. */
+    CompletableFuture<Void> localSend() {
+        return CompletableFuture.completedFuture(null);
+    }
 
     private static final java.util.function.Consumer<Response> NO_CHUNKS =
             chunk -> {
@@ -50,9 +55,9 @@ abstract class ServiceClient implements ReplayTarget {
     private void sendBatch() throws IOException {
         if (batch.isEmpty()) return;
         var inserts = List.copyOf(batch);
-        var responses = List.copyOf(batchResponses);
+        var response = batchResponse;
         batch.clear();
-        batchResponses.clear();
+        batchResponse = null;
         transmit(requests.batch(batchId, inserts), NO_CHUNKS)
                 .whenComplete(
                         (result, error) -> {
@@ -64,9 +69,8 @@ abstract class ServiceClient implements ReplayTarget {
                                     failure = mismatch;
                                 }
                             }
-                            for (var member : responses)
-                                if (failure == null) member.complete(null);
-                                else member.completeExceptionally(failure);
+                            if (failure == null) response.complete(null);
+                            else response.completeExceptionally(failure);
                         });
     }
 
@@ -86,7 +90,7 @@ abstract class ServiceClient implements ReplayTarget {
                                 throw new java.util.concurrent.CompletionException(mismatch);
                             }
                         });
-        return new SendHandle(CompletableFuture.completedFuture(null), response);
+        return new SendHandle(localSend(), response);
     }
 
     @Override
@@ -94,13 +98,13 @@ abstract class ServiceClient implements ReplayTarget {
         int limit = requests.baselineBatch();
         if (limit > 1 && TraceRequests.baselineInsert(operation)) {
             if (!batch.isEmpty() && batch.get(0).workUnitId() != operation.workUnitId()) sendBatch();
-            var response = new CompletableFuture<Void>();
+            if (batch.isEmpty()) batchResponse = new CompletableFuture<>();
+            var response = batchResponse;
             batch.add(operation);
-            batchResponses.add(response);
             // The request takes the dispatch id of its last insert, unique on this stream.
             batchId = dispatchSequence;
             if (batch.size() == limit) sendBatch();
-            return new SendHandle(CompletableFuture.completedFuture(null), response);
+            return new SendHandle(localSend(), response);
         }
         sendBatch();
         if (operation.grouped()) {
@@ -130,7 +134,7 @@ abstract class ServiceClient implements ReplayTarget {
                     if (failure == null) member.complete(null);
                     else member.completeExceptionally(failure);
             });
-            return new SendHandle(CompletableFuture.completedFuture(null), response);
+            return new SendHandle(localSend(), response);
         }
         if (!group.isEmpty()) throw new IOException("Search group interrupted on its client");
         var request = requests.request(dispatchSequence, operation);
@@ -144,6 +148,6 @@ abstract class ServiceClient implements ReplayTarget {
                 throw new java.util.concurrent.CompletionException(mismatch);
             }
         });
-        return new SendHandle(CompletableFuture.completedFuture(null), response);
+        return new SendHandle(localSend(), response);
     }
 }

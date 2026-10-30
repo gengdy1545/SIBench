@@ -125,6 +125,7 @@ public final class BaselineGenerator {
                         Path temporary = directory.resolve(name + ".partial");
                         Path published = directory.resolve(name);
                         long firstOrdinal = index, count = 0;
+                        Map<String, Object> sizing;
                         ParquetMetadata footer;
                         try (ParquetDataFile writer =
                                 new ParquetDataFile(
@@ -144,6 +145,7 @@ public final class BaselineGenerator {
                                 if (full) break;
                             }
                             footer = writer.finish();
+                            sizing = writer.sizing();
                         }
                         long footerRows =
                                 footer.getBlocks().stream().mapToLong(b -> b.getRowCount()).sum();
@@ -158,6 +160,7 @@ public final class BaselineGenerator {
                         entry.put("bucket", bucket);
                         entry.put("rows", count);
                         entry.put("size_bytes", Files.size(published));
+                        entry.put("file_size", sizing);
                         entry.put("sha256", sha256(published));
                         entry.put("first_source_ordinal", firstOrdinal);
                         entry.put("source_ordinal_stride", config.buckets());
@@ -210,7 +213,7 @@ public final class BaselineGenerator {
         summary.put("row_id_scope", "dataset");
         summary.put(
                 "file_size_policy",
-                "close_after_group_when_written_bytes_reach_target; footer_in_actual_size");
+                GenerationConfig.FILE_SIZE_POLICY);
         summary.put("java_version", System.getProperty("java.version"));
         summary.put("java_vendor", System.getProperty("java.vendor"));
         summary.put("jvm_arguments", ManagementFactory.getRuntimeMXBean().getInputArguments());

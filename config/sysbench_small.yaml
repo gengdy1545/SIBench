@@ -42,7 +42,8 @@ capture:
   allow_event_loss: false
   statement_results: server_rows_and_consumed_rows
 data_layout:
-  target_file_size_bytes: 268435456
+  target_file_size_bytes: 536870912
+  file_size_max_overshoot_percent: 5
   row_group_max_rows: 1048576
   row_group_buffer_bytes: 67108864
   page_size_bytes: 1048576

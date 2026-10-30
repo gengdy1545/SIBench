@@ -32,7 +32,8 @@ public final class ServiceReplay {
             Path directory, ReplayConfig config, ServiceConfig service, Path reference, Path report)
             throws IOException {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
-        var preflight = ReferenceReplay.check(directory, config);
+        var input = ReferenceReplay.prepare(directory, config);
+        var preflight = input.preflight();
         String mode = service.value() == ValueKind.ROW_ID ? "rowid" : "locator";
         String binding = ReferenceReplay.binding(directory, config) + " mode=" + mode;
         Path expectedResults =
@@ -94,8 +95,8 @@ public final class ServiceReplay {
                         ReplayProjection.withClients(
                                 config, runtime, factory, true)) {
                     (runtime
-                                    ? IndexOperationTrace.Source.file(directory.resolve("workload.ops"))
-                                    : org.sibench.capture.BaselineOperations.of(directory))
+                                    ? input.workload()
+                                    : input.baseline())
                             .read(projection);
                     projection.finish();
                     if (runtime) projection.requireClientCoverage();
@@ -189,7 +190,7 @@ public final class ServiceReplay {
         if (Files.exists(report)) throw new IOException("Verification report already exists: " + report);
         if (reference == null)
             throw new IOException("Snapshot verification needs a reference report's digests");
-        var preflight = ReferenceReplay.check(directory, config);
+        var preflight = ReferenceReplay.prepare(directory, config).preflight();
         String mode = service.value() == ValueKind.ROW_ID ? "rowid" : "locator";
         String binding = ReferenceReplay.binding(directory, config) + " mode=" + mode;
         var requests =

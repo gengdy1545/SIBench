@@ -82,6 +82,11 @@ public class PgBaselineVerifyTest {
         System.setProperty("sibench.baseline.threads", Integer.toString(threads));
         try {
             PgBaselineVerify.verify(RowAuditTestSupport.connections(schema, pg, new int[1], correlation), schema, directory);
+            var recorded = BaselineDigests.of(directory);
+            for (var table : schema.tables()) {
+                Path data = directory.resolve(table.name() + ".parquet");
+                assertEquals(org.sibench.generation.BaselineGenerator.sha256(data), recorded.get(data));
+            }
         } finally {
             if (previous == null) System.clearProperty("sibench.baseline.threads");
             else System.setProperty("sibench.baseline.threads", previous);

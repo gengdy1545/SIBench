@@ -108,7 +108,13 @@ if [ ! -f "$STILL/READY" ]; then
   touch "$STILL/READY"
 fi
 cp -a --reflink=always "$STILL/data" "$CLUSTER"
-start_cluster "$CLUSTER" "$PG/server.log" "$SIBENCH_RAW"
+# PostgreSQL writes 8 KiB pages. XFS's default CoW reservations can approach another whole
+# relation's size under random writes, exhausting quota even while its visible size barely grows.
+# Set only this disposable clone's allocation hint; directories pass it to new relation segments.
+if [ "$(stat -f -c %T "$CLUSTER")" = xfs ]; then
+  xfs_io -c 'cowextsize -R 8192' "$CLUSTER" > /dev/null
+fi
+start_cluster "$CLUSTER" "$SIBENCH_ARTIFACTS/postgres.log" "$SIBENCH_RAW"
 trap '"$PG/runtime/bin/pg_ctl" -D "$CLUSTER" -m fast -t 3600 stop >/dev/null' EXIT
 stage prepare
 # A copy of the still cluster shares its blocks but not its page cache, so a native run on it starts

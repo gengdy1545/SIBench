@@ -1,6 +1,6 @@
 # 来源 Schema 预检实现验证
 
-更新：2026-10-29。范围以 [来源 Schema 契约](../contracts/source-schema.md) 为准。
+更新：2026-10-30。范围以 [来源 Schema 契约](../contracts/source-schema.md) 为准。
 
 ## 离线验证
 
@@ -28,9 +28,9 @@ CLI 提供 `check-schema`，Baseline dry-run 核对配置且不生成数据。�
 
 ## 实际 PG 集成验证
 
-当前验收在 `sibench_4` 的隔离 PG14.24 上运行，监听 `127.0.0.1:55433`。随机命名的测试数据库由测试创建并删除，结束后停止 PG。冻结应用构建和证据入口见 [三来源验收](acceptance.md)。
+保留的 `acceptance-20261029T053122Z` 集成验证在 `sibench_4` 的隔离 PG14.24 上运行，监听 `127.0.0.1:55433`，构建见其 [build.json](../../results/validation/acceptance-20261029T053122Z/build.json)。随机测试库由测试创建并删除，结束后停止 PG；该验证未在最新批次重跑，最新实际来源采集的 Schema 检查另见 [三来源验收](acceptance.md)。
 
-本轮 **50 项 catalog 检查全部通过**，证据在 `results/validation/acceptance-20261029T053122Z/pg-integration/`。本轮未提供可选的独立 SF1 数据库，因此不包含第 51 项 SF1 预检；真实 SF10 与两组 87m 预检由同轮原生采集另行覆盖。
+该固定验证 **50 项 catalog 检查全部通过**，证据在 `results/validation/acceptance-20261029T053122Z/pg-integration/`。本轮未提供可选的独立 SF1 数据库，因此不包含第 51 项 SF1 预检；真实 SF10 与两组 87m 预检由同轮原生采集另行覆盖。
 
 | 实际验证 | 结果 |
 | --- | --- |

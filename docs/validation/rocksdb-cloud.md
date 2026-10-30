@@ -1,10 +1,10 @@
 # rocksdb-cloud 构建、存储与恢复验证
 
-更新：2026-10-29。本轮证据为 `results/validation/acceptance-20261029T053122Z/`；完整输入的结果见 [三来源验收](acceptance.md)，计量边界见 [测量口径](measurement.md)。比较对象为 Rockset 的 rocksdb-cloud 嵌入式引擎，不是 Rockset 数据库服务。
+更新：2026-10-30。本页保留 `results/validation/acceptance-20261029T053122Z/` 的固定构建存储接口 / 小输入恢复证据，以下“本轮”均指该固定验证，未声称在最新驱动上重新执行。最新完整输入、分角色构建和计量边界分别见 [三来源验收](acceptance.md)、[测量口径](measurement.md)。JNI 二进制身份相同；小输入恢复不能替代目标规模恢复。对象为 Rockset 的 rocksdb-cloud 嵌入式引擎。
 
 ## 构建与运行条件
 
-版本固定在 [index/versions.yaml](../../index/versions.yaml)：rocksdb-cloud `20a0918820ef89d71f4a059da4864db66678c38b`，RocksDB 9.1.1 基线，AWS SDK C++ 1.8.8。本地参照使用 Maven rocksdbjni 9.1.1；云 fork 的非云层补丁差异未逐项排除，因此不是只改变存储介质的严格消融。
+本次验收使用 rocksdb-cloud `20a0918820ef89d71f4a059da4864db66678c38b`（RocksDB 9.1.1 基线）与 AWS SDK C++ 1.8.8；当前源码版本由 `index/` 与 `third_party/` 子模块 gitlink 固定，构建要求与许可证见 [third_party/versions.yaml](../../third_party/versions.yaml)。本地参照使用 Maven rocksdbjni 9.1.1；云 fork 的非云层补丁差异未逐项排除，因此不是只改变存储介质的严格消融。
 
 冻结应用提交 `bbff9a3`，jar SHA-256 `238fe58b51c17d7ad1f4c8b3d19b2a678af6c0bedf9f7232efd4a1907055e644`。本轮在 `sibench_4` 以 [构建脚本](../../scripts/build-rocksdb-cloud.sh) 重新构建 JNI，复用固定上游的静态依赖；剥离后 10,793,680 字节，SHA-256 `5f0e1f5409c90313ddebcd2a62b367883abad3587c08573c927705a1d4eb87ec`。原生延迟分桶和溢出测试通过。构建身份见 `build.json`、`native-build.json`。
 
@@ -43,7 +43,7 @@ JNI 只转发字节和引擎调用，键布局、版本选择、事务内读及�
 
 声明为“最后一次 Flush 之前远端持久”，不是每次 ACK 远端持久。COS 仍保留本地 SST 和 WAL；WAL 不上传，bucket 为恢复权威状态。同一 object path 不允许多个打开者并发使用。
 
-本轮 `durability/` 使用手算的小输入，调用当前 `PublishedIndex` 和后端 API：提交 version 1 / RowID 11 并 Flush，再提交 version 2 / RowID 22 而不 Flush；ready 标记确认现场后由父进程 SIGKILL。随后使用全新本地目录，直接从同一 bucket 打开，避免同目录 WAL 和前一次重开造成污染。
+本轮 `durability/` 使用手算的小输入，调用该冻结构建的 `PublishedIndex` 和后端 API：提交 version 1 / RowID 11 并 Flush，再提交 version 2 / RowID 22 而不 Flush；ready 标记确认现场后由父进程 SIGKILL。随后使用全新本地目录，直接从同一 bucket 打开，避免同目录 WAL 和前一次重开造成污染。
 
 `durability/check.json` 结果通过：恢复水位为 1，持久版本返回 RowID 11，对 version 2 的读取继续等待，底层也不存在未 Flush 的 version 2。`ready.json`、`kill.json`、writer / cold 日志记录同一次实验。该探针同时区分“最后 Flush 可恢复”和“Flush 后写入尚未远端持久”，没有在 kill 前执行隐式 close / Flush。
 

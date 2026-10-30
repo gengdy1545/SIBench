@@ -31,6 +31,29 @@ import java.util.concurrent.TimeUnit;
 public class IndexServerTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test(timeout = 10000)
+    public void grpcSerializationCompletesLocalSendWithoutWaitingForAResponse() throws Exception {
+        var server = ServerBuilder.forPort(0).addService(new IndexServiceGrpc.IndexServiceImplBase() {
+            @Override public StreamObserver<Request> execute(StreamObserver<Response> responses) {
+                return new StreamObserver<>() {
+                    public void onNext(Request request) {}
+                    public void onError(Throwable error) {}
+                    public void onCompleted() {}
+                };
+            }
+        }).build().start();
+        try (var grpc = new GrpcService("127.0.0.1:" + server.getPort(), new TraceRequests(ValueKind.ROW_ID))) {
+            var target = grpc.factory().open(0);
+            var operation = IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0,
+                    IndexKey.ofInt(7), 0, 1, 0, 70);
+            var handle = target.send(1, operation);
+            handle.sent().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            assertFalse(handle.response().toCompletableFuture().isDone());
+        } finally {
+            server.shutdownNow();
+        }
+    }
+
     @Test
     public void replayRejectsServicesWithoutTheCurrentPublicationProtocol() throws Exception {
         try (var backend = RocksDbBackend.create(temporary.getRoot().toPath().resolve("capabilities"), ValueKind.ROW_ID)) {

@@ -19,9 +19,8 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Clients of a remote index service over gRPC: each benchmark client has its own connection and
- * one ordered request stream, responses are matched by request id. A request counts as sent once
- * the gRPC stream accepted it for transmission; that is the local send the driver waits for, not
- * a delivery or execution acknowledgement.
+ * one ordered request stream, responses are matched by request id. Local send completes when
+ * gRPC reports serialization and handoff to its transport, independently of delivery/execution.
  */
 public final class GrpcService implements AutoCloseable {
     private final String endpoint;
@@ -82,13 +81,32 @@ public final class GrpcService implements AutoCloseable {
                 java.util.function.Consumer<Response> partial, CompletableFuture<Response> done) {}
 
         private final Map<Long, Pending> pending = new ConcurrentHashMap<>();
+        private final Map<Integer, CompletableFuture<Void>> sending = new ConcurrentHashMap<>();
+        private CompletableFuture<Void> lastSend = CompletableFuture.completedFuture(null);
+        private int messageSequence;
         private volatile Throwable failure;
         private boolean closed;
 
         Client(ManagedChannel channel) {
             super(requests);
             this.channel = channel;
-            this.stream = IndexServiceGrpc.newStub(channel).execute(new StreamObserver<>() {
+            io.grpc.ClientInterceptor serialized = new io.grpc.ClientInterceptor() {
+                @Override public <ReqT, RespT> io.grpc.ClientCall<ReqT, RespT> interceptCall(
+                        io.grpc.MethodDescriptor<ReqT, RespT> method, io.grpc.CallOptions options, io.grpc.Channel next) {
+                    return next.newCall(method, options.withStreamTracerFactory(new io.grpc.ClientStreamTracer.Factory() {
+                        @Override public io.grpc.ClientStreamTracer newClientStreamTracer(
+                                io.grpc.ClientStreamTracer.StreamInfo info, io.grpc.Metadata headers) {
+                            return new io.grpc.ClientStreamTracer() {
+                                @Override public void outboundMessageSent(int sequence, long wire, long plain) {
+                                    var sent = sending.remove(sequence);
+                                    if (sent != null) sent.complete(null);
+                                }
+                            };
+                        }
+                    }));
+                }
+            };
+            this.stream = IndexServiceGrpc.newStub(channel).withInterceptors(serialized).execute(new StreamObserver<>() {
                 @Override
                 public void onNext(Response response) {
                     var waiting =
@@ -117,6 +135,8 @@ public final class GrpcService implements AutoCloseable {
             failure = error;
             for (var waiting : pending.values()) waiting.done().completeExceptionally(error);
             pending.clear();
+            for (var sent : sending.values()) sent.completeExceptionally(error);
+            sending.clear();
         }
 
         @Override
@@ -126,8 +146,19 @@ public final class GrpcService implements AutoCloseable {
             var response = new CompletableFuture<Response>();
             if (pending.putIfAbsent(request.getId(), new Pending(partial, response)) != null)
                 throw new IOException("Duplicate request id " + request.getId());
-            stream.onNext(request);
+            lastSend = new CompletableFuture<>();
+            sending.put(messageSequence++, lastSend);
+            try {
+                stream.onNext(request);
+            } catch (RuntimeException error) {
+                fail(error);
+                throw error;
+            }
             return response;
+        }
+
+        @Override CompletableFuture<Void> localSend() {
+            return lastSend;
         }
 
         @Override
@@ -135,6 +166,7 @@ public final class GrpcService implements AutoCloseable {
             if (closed) return;
             closed = true;
             if (failure == null) stream.onCompleted();
+            if (failure == null) fail(new IOException("Service client closed"));
             // A stream may still be half-closed on the service side after a failed run, which
             // makes a graceful channel shutdown wait for its own timeout on every client.
             channel.shutdownNow();

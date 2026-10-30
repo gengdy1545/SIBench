@@ -141,7 +141,7 @@ replay:
 
 两种模式发送完全相同的操作序列，不合并同键修改，不移动查询，不跨事务重排。`transaction` 不是一组一个 client 或一次组 RPC，不要求原子执行、BEGIN/COMMIT RPC、回滚或索引事务缓存；分组统计属于驱动，不是 adapter 调用数。
 
-一个全局发送线程按 Trace 顺序调用 client，等待当前操作的 `sent` 确认后才发送下一项。`ReplayTarget.SendHandle.sent` 表示完整本地传输完成，不能只是提交到会被重排的客户端异步队列；`response` 表示 adapter 已关联、核对该请求的服务响应，错误或结果不符应异常完成。response 可以乱序完成；不同连接的远端到达、执行及可见顺序不是此本地发送契约。Index Service 自行处理跨 client 语义，benchmark 不增加可见性屏障、反向操作或自动重试。
+一个全局发送线程按 Trace 顺序调用 client，等待当前操作的 `sent` 确认后才发送下一项。`ReplayTarget.SendHandle.sent` 表示本地传输边界完成，不能只是提交到尚未序列化的客户端队列；gRPC 使用 `ClientStreamTracer.outboundMessageSent` 确认消息已序列化并交给本地 transport，不声明 socket 发送完成或远端收妥。Baseline 批量及查询组的未成组成员先在 client 内缓冲，最后一个成员触发实际 RPC 并等待该传输边界；逻辑成员数与 RPC 数分别解释。`response` 表示 adapter 已关联、核对该请求的服务响应，错误或结果不符应异常完成。response 可以乱序完成；不同连接的远端到达、执行及可见顺序不是此本地发送契约。Index Service 自行处理跨 client 语义，benchmark 不增加可见性屏障、反向操作或自动重试。
 
 全局 `max_in_flight` 限制未完成响应数量，默认 4096；达到上限等待响应腾出额度，结束时排空。超时从调用 send 前开始，覆盖本地发送和响应等待；`request_timeout_seconds` 默认 60，允许 1–86400。adapter 的 send 调用必须及时返回句柄，不能无界阻塞；真实 transport 超时与 close 取消资源由 adapter 实现。失败后停止后续发送并关闭已打开 client、取消未完成 future，不自动续接。初始加载完成并排空后才进入运行期，这是加载边界，不是运行期跨 client 可见性屏障。
 

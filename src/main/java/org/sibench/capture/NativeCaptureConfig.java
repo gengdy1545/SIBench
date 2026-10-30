@@ -88,6 +88,7 @@ public record NativeCaptureConfig(
                         benchmark,
                         0,
                         target,
+                        GenerationConfig.maxOvershootPercent(data),
                         maxRows,
                         buffer,
                         page,

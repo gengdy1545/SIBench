@@ -1,6 +1,6 @@
 # 更新局部性与静态文件重叠
 
-更新：2026-10-29。仅分析 **acceptance-20261029T053122Z** 的三份新 Trace，应用与输入身份见 [完整验收](acceptance.md)。输出为直接分布与静态模型估算；真实引擎 flush / compaction 的成本见 [测量结果](measurement.md)，不从本页推导引擎写放大。
+更新：2026-10-30。保留 **acceptance-20261029T053122Z** 的三份固定 Trace 静态分析，以下“本轮”仅指该输入；它采用旧文件布局，不是最新 512 MiB 数据的分析，也不与最新服务计时配对。构建 / 输入见其 [build.json](../../results/validation/acceptance-20261029T053122Z/build.json)、[cohort-summary.json](../../results/validation/acceptance-20261029T053122Z/cohort-summary.json) 和 [逐文件派生统计](../../results/validation/acceptance-20261029T053122Z/report-details.json)。输出为分布与静态模型估算，不推导引擎写放大；最新完整运行另见 [验收](acceptance.md)。
 
 ## 布局、窗口与计数
 

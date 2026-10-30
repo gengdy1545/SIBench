@@ -52,6 +52,10 @@ public class GenerationContractTest {
         for (String invalid :
                 new String[] {
                     text.replace("row_group_max_rows: 1048576", "row_group_max_rows: 0"),
+                    text.replace("file_size_max_overshoot_percent: 5", "file_size_max_overshoot_percent: 0"),
+                    text.replace("file_size_max_overshoot_percent: 5", "file_size_max_overshoot_percent: 101"),
+                    text.replace("file_size_max_overshoot_percent: 5", "file_size_max_overshoot_percent: 1.5"),
+                    text.replace("target_file_size_bytes: 536870912", "target_file_size_bytes: 9223372036854775807"),
                     text.replace("compression: zstd", "compression: gzip"),
                     text.replace("compression_level: 3", "compression_level: 30"),
                     text.replace("partitioning: none", "partitioning: date"),

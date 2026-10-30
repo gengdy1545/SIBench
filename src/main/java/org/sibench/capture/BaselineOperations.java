@@ -64,6 +64,17 @@ public final class BaselineOperations {
     /** Row groups read ahead: each is a group's index texts, so memory is bounded. */
     static final int GROUPS_AHEAD = 6;
 
+    record Window(int groups, int chunks, int encoders) {}
+
+    static Window window(long heap, long largestGroupBytes, int maximumIndexes, long maximumRows) {
+        // Reserve half the heap for decoders, the consumer and transport. Estimates include
+        // decoded strings and expanded operations; they are scheduling budgets, not JVM caps.
+        long chunkBytes = Math.max(1, Math.min(CHUNK_ROWS, maximumRows) * (80L + 384L * maximumIndexes));
+        int groups = (int) Math.max(1, Math.min(GROUPS_AHEAD, heap / 4 / Math.max(1, largestGroupBytes)));
+        int chunks = (int) Math.max(1, Math.min(CHUNKS_AHEAD, heap / 4 / chunkBytes));
+        return new Window(groups, chunks, Math.max(1, Math.min(threads(), chunks)));
+    }
+
     /** Threads that encode rows; their output still reaches the consumer in file order. */
     static int threads() {
         return Integer.getInteger("sibench.baseline.derive_threads", Runtime.getRuntime().availableProcessors());
@@ -86,14 +97,27 @@ public final class BaselineOperations {
         var types = new ArrayList<MessageType>();
         var groups = new ArrayList<Group>();
         long before = 0, maximumFileId = 0;
+        long largestGroupBytes = 1, maximumRows = 1;
+        int maximumIndexes = 1;
         for (int i = 0; i < files.size(); i++) {
             Path path = baseline.resolve(files.get(i).get("path").getAsString());
             try (ParquetFileReader reader = ParquetFileReader.open(HadoopInputFile.fromPath(
                     new org.apache.hadoop.fs.Path(path.toUri()), new org.apache.hadoop.conf.Configuration(false)))) {
                 types.add(reader.getFooter().getFileMetaData().getSchema());
                 var blocks = reader.getFooter().getBlocks();
+                String table = files.get(i).get("table").getAsString();
+                int indexes = indexed(catalog, catalog.tableId(table)).size();
+                maximumIndexes = Math.max(maximumIndexes, indexes);
+                var projected = projection(catalog, table, reader.getFooter().getFileMetaData().getSchema());
                 long position = 0;
                 for (int b = 0; b < blocks.size(); b++) {
+                    var block = blocks.get(b);
+                    long decodedBytes = block.getColumns().stream()
+                            .filter(c -> projected.containsField(c.getPath().toDotString()))
+                            .mapToLong(c -> c.getTotalUncompressedSize()).sum();
+                    maximumRows = Math.max(maximumRows, block.getRowCount());
+                    largestGroupBytes = Math.max(largestGroupBytes,
+                            block.getRowCount() * (16L + 96L * indexes) + 2 * decodedBytes);
                     long start = blocks.get(b).getStartingPos();
                     long end = b + 1 < blocks.size() ? blocks.get(b + 1).getStartingPos() : Files.size(path);
                     groups.add(new Group(i, start, end, blocks.get(b).getRowCount(), position, before + position));
@@ -104,11 +128,14 @@ public final class BaselineOperations {
                 before += position;
             }
         }
-        var readers = java.util.concurrent.Executors.newFixedThreadPool(GROUPS_AHEAD, daemon("baseline-read"));
-        var encoders = java.util.concurrent.Executors.newFixedThreadPool(Math.max(1, threads()), daemon("baseline-encode"));
+        var window = window(Runtime.getRuntime().maxMemory(), largestGroupBytes, maximumIndexes, maximumRows);
+        RunTiming.current().note("baseline_read_groups", window.groups())
+                .note("baseline_encoded_chunks", window.chunks()).note("baseline_encoders", window.encoders());
+        var readers = java.util.concurrent.Executors.newFixedThreadPool(window.groups(), daemon("baseline-read"));
+        var encoders = java.util.concurrent.Executors.newFixedThreadPool(window.encoders(), daemon("baseline-encode"));
         var reads = new ArrayList<java.util.concurrent.Future<Columns>>();
-        var readWindow = new java.util.concurrent.Semaphore(GROUPS_AHEAD);
-        var chunks = new java.util.concurrent.ArrayBlockingQueue<java.util.concurrent.Future<Chunk>>(CHUNKS_AHEAD);
+        var readWindow = new java.util.concurrent.Semaphore(window.groups());
+        var chunks = new java.util.concurrent.ArrayBlockingQueue<java.util.concurrent.Future<Chunk>>(window.chunks());
         var stopped = new java.util.concurrent.atomic.AtomicBoolean();
         // Reads go in group order behind a window; the submitter turns each read group into runs.
         for (int i = 0; i < groups.size(); i++) reads.add(new java.util.concurrent.CompletableFuture<>());

@@ -2,7 +2,8 @@ package org.sibench.capture;
 
 import com.github.luben.zstd.ZstdInputStream;
 import com.github.luben.zstd.ZstdOutputStream;
-import com.google.gson.JsonParser;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -74,13 +75,29 @@ public final class WorkUnits {
                         new BufferedReader(
                                 new InputStreamReader(input, StandardCharsets.UTF_8), 1 << 16)) {
             for (String line; (line = reader.readLine()) != null; ) {
-                var unit = JsonParser.parseString(line).getAsJsonObject();
-                long id = unit.get("work_unit_id").getAsLong(),
-                        event = unit.get("source_event").getAsLong();
+                long id = 0, event = 0;
+                int pid = 0, fields = 0;
+                String application = "";
+                // Hash all original bytes, but avoid a JSON tree for fields the catalog never retains.
+                try (var unit = new JsonReader(new java.io.StringReader(line))) {
+                    unit.beginObject();
+                    while (unit.hasNext()) {
+                        switch (unit.nextName()) {
+                            case "work_unit_id" -> { id = unit.nextLong(); fields |= 1; }
+                            case "source_event" -> { event = unit.nextLong(); fields |= 2; }
+                            case "pid" -> { pid = unit.nextInt(); fields |= 4; }
+                            case "application" -> { application = unit.nextString(); fields |= 8; }
+                            default -> unit.skipValue();
+                        }
+                    }
+                    unit.endObject();
+                    if (unit.peek() != JsonToken.END_DOCUMENT) throw new IOException("Extra work-unit JSON value");
+                } catch (IllegalStateException | NumberFormatException invalid) {
+                    throw new IOException("Invalid source work-unit JSON", invalid);
+                }
                 if (id != count + 1
                         || event <= lastEvent
-                        || unit.get("pid").getAsInt() < 1
-                        || unit.get("application").getAsString().isEmpty())
+                        || fields != 15 || pid < 1 || application.isEmpty())
                     throw new IOException("Invalid source work-unit catalog order/identity");
                 if (id > Integer.MAX_VALUE - 8)
                     throw new IOException("Source work-unit catalog exceeds the in-memory index range");

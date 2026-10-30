@@ -1,6 +1,7 @@
 package org.sibench.capture;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -51,16 +52,33 @@ public class SharedBaselineTest {
             Path built = RowAuditTestSupport.baseline(temporary.newFolder().toPath(), schema, rows);
             Files.move(built, layout.output());
             PgBaselineVerify.verify(RowAuditTestSupport.connections(schema, rows, new int[1]), schema, layout.output());
+            assertTrue(Files.exists(BaselineDigests.location(layout.output())));
         };
         GenerationConfig first = layout(root, "first");
         SharedBaseline.link(root, "base", first, export);
         SharedBaseline.link(root, "base", layout(root, "second"), export);
         assertEquals(1, exports[0]);
         Path shared = StillBase.directory(root, "base").resolve("baseline");
+        assertFalse(Files.exists(BaselineDigests.location(shared.resolveSibling("baseline.partial"))));
+        var publishedDigests = BaselineDigests.of(shared);
         try (var files = Files.list(shared)) {
-            for (Path file : files.toList())
+            for (Path file : files.toList()) {
                 assertTrue(Files.isSameFile(file, root.resolve("second").resolve(file.getFileName())));
+                if (file.toString().endsWith(".parquet")) assertTrue(publishedDigests.get(file) != null);
+            }
         }
+        // A mutation after PG verification but before publication invalidates the cached identity.
+        Files.createDirectories(StillBase.directory(root, "changed"));
+        assertThrows(java.io.IOException.class, () -> SharedBaseline.link(root, "changed", layout(root, "changed-output"), output -> {
+            export.into(output);
+            try (var paths = Files.list(output.output())) {
+                Path file = paths.filter(p -> p.toString().endsWith(".parquet")).findFirst().orElseThrow();
+                byte[] content = Files.readAllBytes(file);
+                content[content.length / 2] ^= 1;
+                Files.write(file, content);
+                Files.setLastModifiedTime(file, java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis() + 5_000));
+            }
+        }));
         // The second capture's check used what the first recorded, and records every data file.
         Path second = root.resolve("second");
         var recorded = BaselineDigests.of(second);
@@ -80,7 +98,7 @@ public class SharedBaselineTest {
         assertThrows(java.io.IOException.class, () -> PgBaselineVerify.verifyFiles(second));
 
         var other = CaptureConfig.read(Path.of(""), Path.of("config/hybench_sf1.yaml")).layout();
-        var changed = new GenerationConfig(other.root(), other.document(), other.benchmark(), other.seed(), other.targetBytes(),
+        var changed = new GenerationConfig(other.root(), other.document(), other.benchmark(), other.seed(), other.targetBytes(), other.maxOvershootPercent(),
                 other.maxRows() / 2, other.groupBytes(), other.pageBytes(), other.dictionaryBytes(), other.dictionary(),
                 other.codec(), other.codecLevel(), other.buckets(), other.baselineTimestamp(), root.resolve("third"), other.minFreeBytes());
         var failure = assertThrows(IllegalStateException.class, () -> SharedBaseline.link(root, "base", changed, export));

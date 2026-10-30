@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Map;
+import java.util.Objects;
 import java.util.TreeMap;
 
 /**
@@ -59,6 +60,15 @@ final class BaselineDigests {
         target.save();
     }
 
+    /** Keep the optional cache with a baseline directory when it is published. */
+    static void move(Path from, Path into) {
+        try {
+            Files.move(location(from), location(into), StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException | RuntimeException ignored) {
+            // A missing/unwritable cache only makes the next consumer read the files again.
+        }
+    }
+
     private static String identity(Path path) throws IOException {
         var attributes = Files.readAttributes(path, BasicFileAttributes.class);
         var modified = attributes.lastModifiedTime().toInstant();
@@ -71,6 +81,18 @@ final class BaselineDigests {
     String get(Path path) throws IOException {
         String identity = identity(path);
         return identity == null ? null : known.get(identity);
+    }
+
+    /** A fresh verification reads every byte; aliases may reuse that exact stable identity. */
+    String read(Path path) throws IOException {
+        String before = identity(path);
+        String digest = FileDigests.read(path);
+        if (!Objects.equals(before, identity(path)))
+            throw new IOException("Baseline changed while hashing: " + path);
+        if (before != null) synchronized (known) {
+            if (!digest.equals(known.put(before, digest))) changed = true;
+        }
+        return digest;
     }
 
     void put(Path path, String digest) throws IOException {

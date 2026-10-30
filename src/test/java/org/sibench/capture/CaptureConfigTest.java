@@ -11,7 +11,7 @@ public class CaptureConfigTest {
     public void profileUsesNativeHtapWithUpstreamTransactionWeights() throws Exception {
         Path root = Path.of("").toAbsolutePath();
         var c = CaptureConfig.read(root, Path.of("config/hybench_sf1.yaml"));
-        assertEquals(268435456, c.layout().targetBytes());
+        assertEquals(536870912, c.layout().targetBytes());
         assertEquals("sibench_sf1_baseline_check", c.cloneFrom());
         var p = c.nativeProperties();
         assertFalse(p.containsKey("tp3_percent"));

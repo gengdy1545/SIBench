@@ -425,6 +425,11 @@ public final class IndexOperationTrace {
         static Source file(Path file) {
             return consumer -> IndexOperationTrace.read(file, consumer);
         }
+
+        static Source file(Path file, String expectedSha256) {
+            java.util.Objects.requireNonNull(expectedSha256);
+            return consumer -> IndexOperationTrace.read(file, consumer, expectedSha256);
+        }
     }
 
     /**
@@ -602,26 +607,42 @@ public final class IndexOperationTrace {
      * The logical SHA256 of a trace: that of the plain file its operations form.
      */
     public static String sha256(Path file) throws IOException {
-        java.security.MessageDigest digest;
+        var digest = logicalDigest();
+        var header = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
+        blocks(file, (records, checksum, payload) -> digestBlock(digest, header, records, checksum, payload));
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    private static java.security.MessageDigest logicalDigest() {
         try {
-            digest = java.security.MessageDigest.getInstance("SHA-256");
+            var digest = java.security.MessageDigest.getInstance("SHA-256");
+            digest.update(Writer.header(MAGIC));
+            return digest;
         } catch (java.security.NoSuchAlgorithmException error) {
             throw new IllegalStateException(error);
         }
-        digest.update(Writer.header(MAGIC));
-        blocks(file, (records, checksum, payload) -> {
-            ByteBuffer header = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
-            header.putInt(payload.remaining()).putInt(records).putInt(checksum).flip();
-            digest.update(header);
-            digest.update(payload);
-        });
-        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    private static void digestBlock(java.security.MessageDigest digest, ByteBuffer header,
+            int records, int checksum, ByteBuffer payload) {
+        header.clear();
+        header.putInt(payload.remaining()).putInt(records).putInt(checksum).flip();
+        digest.update(header);
+        digest.update(payload.duplicate());
     }
 
     /** Reads a trace of the current record format, in zstd blocks. */
     public static long read(Path file, Consumer consumer) throws IOException {
+        return read(file, consumer, null);
+    }
+
+    /** Checks the logical identity in the same block traversal as decoding and CRC verification. */
+    private static long read(Path file, Consumer consumer, String expectedSha256) throws IOException {
         long[] count = {0};
+        var digest = expectedSha256 == null ? null : logicalDigest();
+        var header = expectedSha256 == null ? null : ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
         blocks(file, (records, checksum, block) -> {
+                if (digest != null) digestBlock(digest, header, records, checksum, block);
                 for (int i = 0; i < records; i++) {
                     if (block.remaining() < RECORD_BYTES)
                         throw new IOException("Truncated normalized operation prefix");
@@ -680,6 +701,8 @@ public final class IndexOperationTrace {
                 }
                 if (block.hasRemaining()) throw new IOException("Trailing operation block bytes");
         });
+        if (digest != null && !HexFormat.of().formatHex(digest.digest()).equals(expectedSha256))
+            throw new IOException("Trace checksum mismatch: " + file.getFileName());
         return count[0];
     }
 

@@ -55,4 +55,26 @@ public class WorkUnitsTest {
         for (String line : lines) digest.update(line.getBytes(StandardCharsets.UTF_8));
         return HexFormat.of().formatHex(digest.digest());
     }
+
+    @Test
+    public void skippedMetadataStillContributesToTheDigestAndRequiredFactsStayChecked() throws Exception {
+        Path directory = temporary.newFolder().toPath();
+        String line = "{\"metadata\":{\"nested\":[1,true,null,\"ignored\"]},\"pid\":7,\"application\":\"sibench:\\\"escaped\",\"source_event\":19,\"work_unit_id\":1}\n";
+        var output = WorkUnits.create(directory);
+        output.lines().write(line); output.lines().close();
+        var catalog = WorkUnits.read(directory);
+        assertEquals(19, catalog.firstEvent(1));
+        assertEquals(digest(List.of(line)), catalog.sha256());
+        for (String wrong : List.of(
+                unit(1, 7).replace("\"pid\":1", "\"pid\":0"),
+                unit(1, 7).replace("\"source_event\":7", "\"missing_event\":7"),
+                unit(1, 7).replace("sibench:test", ""),
+                unit(1, 7).stripTrailing() + " {}\n",
+                unit(1, 7).replace("\"work_unit_id\":1", "\"work_unit_id\":1.5"))) {
+            Path invalid = temporary.newFolder().toPath();
+            var written = WorkUnits.create(invalid);
+            written.lines().write(wrong); written.lines().close();
+            assertThrows(java.io.IOException.class, () -> WorkUnits.read(invalid));
+        }
+    }
 }

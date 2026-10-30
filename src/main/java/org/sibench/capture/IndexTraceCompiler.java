@@ -1209,16 +1209,15 @@ public final class IndexTraceCompiler {
         private void finish(String table, Output writer) throws IOException {
             var footer = writer.writer.finish();
             writer.close();
-            long decoded = 0;
-            try (ParquetReader<Group> check = reader(writer.path)) {
-                while (check.read() != null) decoded++;
-            }
-            if (decoded != writer.rows) throw new IOException("Incremental Parquet row mismatch");
+            long rows = footer.getBlocks().stream().mapToLong(block -> block.getRowCount()).sum();
+            if (rows != writer.rows) throw new IOException("Incremental Parquet row mismatch");
             var file = new LinkedHashMap<String, Object>();
             file.put("table", table);
             file.put("file_id", writer.fileId);
             file.put("path", writer.path.getFileName().toString());
             file.put("rows", writer.rows);
+            file.put("size_bytes", Files.size(writer.path));
+            file.put("file_size", writer.writer.sizing());
             file.put("sha256", BaselineGenerator.sha256(writer.path));
             file.put(
                     "row_groups", footer.getBlocks().stream().map(b -> b.getRowCount()).toList());

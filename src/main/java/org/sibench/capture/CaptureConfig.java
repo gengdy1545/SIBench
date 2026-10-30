@@ -97,6 +97,7 @@ public record CaptureConfig(
                         "hybench",
                         0,
                         target,
+                        GenerationConfig.maxOvershootPercent(data),
                         maxRows,
                         buffer,
                         page,

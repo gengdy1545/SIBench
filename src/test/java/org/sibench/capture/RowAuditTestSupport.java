@@ -46,6 +46,7 @@ final class RowAuditTestSupport {
                         original.benchmark(),
                         original.seed(),
                         original.targetBytes(),
+                        original.maxOvershootPercent(),
                         groupRows > 0 ? groupRows : original.maxRows(),
                         original.groupBytes(),
                         original.pageBytes(),

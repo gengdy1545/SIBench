@@ -17,6 +17,27 @@ import java.util.List;
 
 /** The members of one search group travel as one request, and its count is checked once. */
 public class ServiceClientTest {
+    @Test
+    public void sendWaitsForTheTransportSignalEvenWhenTheResponseIsImmediate() throws Exception {
+        var sent = new java.util.concurrent.CompletableFuture<Void>();
+        var client = new ServiceClient(new TraceRequests(org.sibench.adapters.proto.ValueKind.ROW_ID)) {
+            @Override java.util.concurrent.CompletableFuture<org.sibench.adapters.proto.Response> transmit(
+                    Request request, java.util.function.Consumer<org.sibench.adapters.proto.Response> partial) {
+                return java.util.concurrent.CompletableFuture.completedFuture(
+                        org.sibench.adapters.proto.Response.newBuilder().setId(request.getId())
+                                .setStatus(org.sibench.adapters.proto.Status.OK).build());
+            }
+            @Override java.util.concurrent.CompletableFuture<Void> localSend() { return sent; }
+        };
+        var operation = IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0,
+                IndexKey.ofInt(7), 0, 1, 0, 70);
+        var handle = client.send(1, operation);
+        assertTrue(handle.response().toCompletableFuture().isDone());
+        assertFalse(handle.sent().toCompletableFuture().isDone());
+        sent.complete(null);
+        handle.sent().toCompletableFuture().get();
+    }
+
     /** Records what reaches the transport; the backend answers with fixed counts. */
     private static final class Recorder extends ServiceClient {
         final List<Request> sent = new ArrayList<>();

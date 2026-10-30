@@ -22,20 +22,10 @@ import java.util.concurrent.*;
  * Export committed PG values in primary-key order. {@link PgBaselineVerify} then compares every
  * Parquet value with PG.
  *
- * <p>Every table is cut into files of exactly {@link GenerationConfig#maxRows()} rows in key order
- * (the last file holds the rest), so the identities of every file and row follow from the table
- * row counts before a single row is written: file ids run over tables in schema order and files in
- * key order, row ids likewise. Files are therefore written concurrently, all from one exported PG
- * snapshot, and the result depends only on the source data, never on the thread count or on how
- * rows were fetched:
- *
- * <ul>
- *   <li>a table whose heap follows its key order is read by key range, one range per file and
- *       connection, which reads the heap sequentially;
- *   <li>any other table (YCSB inserts in hashed order) is read as one key-ordered stream, which PG
- *       sorts once, while the files cut from the stream are encoded concurrently; reading it by key
- *       range would touch the whole heap once per file.
- * </ul>
+ * <p>Each table is read once in primary-key order from the exported snapshot. Tables are
+ * encoded concurrently; only the shared Parquet byte policy decides file boundaries. RowIDs
+ * follow schema/key order. FileIDs interleave tables deterministically, independently of worker
+ * scheduling and the number of files each table eventually produces.
  */
 public final class PgBaselineExport {
     /** Above this key/heap correlation (PG's planner statistic) key ranges read the heap in order. */
@@ -43,11 +33,9 @@ public final class PgBaselineExport {
 
     private PgBaselineExport() {}
 
-    /** One output file: a table's rows {@code index * rows .. } in key order. */
-    private record Part(Table table, int index, long fileId, long firstRowId, long rows) {}
 
     /** A table's shape, row count, and how it is read. */
-    private record Table(
+    record Table(
             SourceSchema.Table source,
             String key,
             boolean integerKey,
@@ -57,7 +45,7 @@ public final class PgBaselineExport {
             List<String> boundaries) {}
 
     /** What a written file contributes to the manifests. */
-    private record Written(Map<String, Object> file, byte[] digest) {}
+    record Written(Map<String, Object> file, byte[] digest) {}
 
     /**
      * PG's sort memory for a key-ordered stream, set for that read's transaction only: a table
@@ -75,6 +63,13 @@ public final class PgBaselineExport {
      */
     static int sortWorkers() {
         return Integer.getInteger("sibench.baseline.sort_workers", 8);
+    }
+
+    /** Bound one wide-row sort; read ranges do not define output file boundaries. */
+    static long sortRangeBytes() {
+        long bytes = Long.getLong("sibench.baseline.sort_range_bytes", 8L << 30);
+        if (bytes < 1) throw new IllegalArgumentException("sort_range_bytes must be positive");
+        return bytes;
     }
 
     static int threads() {
@@ -97,8 +92,6 @@ public final class PgBaselineExport {
                 StandardOpenOption.CREATE_NEW);
         PgBaselineVerify.Connections connections = () -> DriverManager.getConnection(jdbc, "postgres", "");
         var pool = Executors.newFixedThreadPool(threads());
-        // Stream readers wait for encoders, so they never take a pool thread the encoders need.
-        var readers = Executors.newCachedThreadPool();
         var opened = new ConcurrentLinkedQueue<Connection>();
         try (Connection coordinator = connections.open()) {
             coordinator.setAutoCommit(false);
@@ -111,45 +104,32 @@ public final class PgBaselineExport {
                 snapshot = rows.getString(1);
             }
             var session = new Session(connections, snapshot, opened);
-            // Shapes, counts and file boundaries, every table concurrently.
             var planned = new ArrayList<Future<Table>>();
             for (var table : source.tables())
-                planned.add(pool.submit(() -> session.run(pg -> plan(pg, table, config.maxRows()))));
+                planned.add(pool.submit(() -> session.run(pg -> {
+                    // YCSB's hashed keys otherwise make each range rescan the whole wide heap.
+                    if (config.benchmark().equals("ycsb")) sortSettings(pg);
+                    return plan(pg, table, config.benchmark().equals("ycsb")
+                            ? Long.MAX_VALUE : sortRangeBytes());
+                })));
             var tables = new ArrayList<Table>();
             for (var future : planned) tables.add(get(future));
-            var parts = new ArrayList<Part>();
-            long fileId = 1, rowId = 1;
-            for (Table table : tables) {
-                for (int index = 0; (long) index * config.maxRows() < table.rows(); index++) {
-                    long rows = Math.min(config.maxRows(), table.rows() - (long) index * config.maxRows());
-                    parts.add(new Part(table, index, fileId++, rowId, rows));
-                    rowId += rows;
-                }
-            }
-            var written = new ArrayList<Future<Written>>(Collections.nCopies(parts.size(), null));
-            // Key ranges first: each part is one task with its own connection.
-            for (int i = 0; i < parts.size(); i++) {
-                Part part = parts.get(i);
-                if (part.table().ordered())
-                    written.set(i, pool.submit(() -> session.run(pg -> range(pg, part, output, config))));
-            }
-            // Streams: one connection reads the table, its files are encoded on the same pool.
-            var streams = new ArrayList<Future<?>>();
-            for (Table table : tables) {
-                if (table.ordered()) continue;
-                var own = new ArrayList<Integer>();
-                for (int i = 0; i < parts.size(); i++) if (parts.get(i).table() == table) own.add(i);
-                streams.add(stream(session, table, own.stream().map(parts::get).toList(), output, config, pool, readers, written, own));
+            var written = new ArrayList<Future<List<Written>>>();
+            long nextRowId = 1;
+            for (int i = 0; i < tables.size(); i++) {
+                Table table = tables.get(i);
+                int tableIndex = i;
+                long firstRowId = nextRowId;
+                nextRowId = Math.addExact(nextRowId, table.rows());
+                written.add(pool.submit(() -> session.run(pg -> stream(
+                        pg, table, tableIndex, tables.size(), firstRowId, output, config))));
             }
             var results = new ArrayList<Written>();
-            for (var future : written) results.add(get(future));
-            // A stream fails after its last part too, when PG has rows beyond the count.
-            for (var future : streams) get(future);
+            for (var future : written) results.addAll(get(future));
             coordinator.commit();
-            finish(output, tables, parts, results);
+            finish(output, tables, results);
         } finally {
             pool.shutdownNow();
-            readers.shutdownNow();
             for (Connection pg : opened)
                 try {
                     pg.close();
@@ -204,17 +184,16 @@ public final class PgBaselineExport {
         return "\"" + identifier + "\"";
     }
 
-    /** A key literal; plain statements keep every value in PG's text format. */
-    private static String literal(Table table, String key) {
-        return table.integerKey() ? Long.toString(Long.parseLong(key)) : "'" + key.replace("'", "''") + "'";
-    }
-
     private static String order(Table table) {
         // Same C ordering PgBaselineVerify applies to text keys.
         return quoted(table.key()) + (table.integerKey() ? "" : " COLLATE \"C\"");
     }
 
-    private static Table plan(Connection pg, SourceSchema.Table table, long fileRows) throws Exception {
+    private static String literal(Table table, String key) {
+        return table.integerKey() ? Long.toString(Long.parseLong(key)) : "'" + key.replace("'", "''") + "'";
+    }
+
+    static Table plan(Connection pg, SourceSchema.Table table, long rangeBytes) throws Exception {
         String name = table.name(), key = SourceRow.primary(table).name();
         boolean integerKey = SourceRow.primary(table).type().equals("integer");
         MessageType schema;
@@ -240,19 +219,26 @@ public final class PgBaselineExport {
             }
         }
         var boundaries = new ArrayList<String>();
-        var shape = new Table(table, key, integerKey, schema, count, ordered, boundaries);
-        if (ordered && count > fileRows)
-            // The last key of every full file, counted in key order by PG over the key index alone.
-            try (Statement statement = pg.createStatement()) {
-                statement.setFetchSize(8192);
-                try (ResultSet rows = statement.executeQuery(
-                        "SELECT k FROM (SELECT " + quoted(key) + "::text AS k, row_number() OVER (ORDER BY "
-                                + order(shape) + ") AS n FROM " + quoted(name) + ") s WHERE n % " + fileRows
-                                + " = 0 ORDER BY n")) {
+        var result = new Table(table, key, integerKey, schema, count, ordered, boundaries);
+        if (!ordered && count > 0) {
+            long bytes;
+            try (PreparedStatement statement = pg.prepareStatement("SELECT pg_table_size(CAST(? AS regclass))")) {
+                statement.setString(1, quoted(name));
+                try (ResultSet rows = statement.executeQuery()) { rows.next(); bytes = rows.getLong(1); }
+            }
+            long ranges = Math.max(1, (bytes - 1) / rangeBytes + 1);
+            long rangeRows = (count - 1) / ranges + 1;
+            if (rangeRows < count)
+                // Sort only keys to find exact, disjoint ranges, even with a non-C database collation.
+                try (Statement statement = pg.createStatement();
+                        ResultSet rows = statement.executeQuery(
+                                "SELECT k FROM (SELECT " + quoted(key) + "::text AS k, row_number() OVER (ORDER BY "
+                                        + order(result) + ") AS n FROM " + quoted(name) + ") s WHERE n % "
+                                        + rangeRows + " = 0 AND n < " + count + " ORDER BY n")) {
                     while (rows.next()) boundaries.add(rows.getString(1));
                 }
-            }
-        return shape;
+        }
+        return result;
     }
 
     private static MessageType schema(String name, ResultSetMetaData columns) throws SQLException {
@@ -270,133 +256,110 @@ public final class PgBaselineExport {
         return MessageTypeParser.parseMessageType(text.toString());
     }
 
-    /** One part read by its key range: (previous boundary, own boundary]. */
-    private static Written range(Connection pg, Part part, Path output, GenerationConfig config) throws Exception {
-        Table table = part.table();
-        var sql = new StringBuilder("SELECT * FROM ").append(quoted(table.source().name()));
-        var bounds = new ArrayList<String>();
-        if (part.index() > 0)
-            bounds.add(order(table) + " > " + literal(table, table.boundaries().get(part.index() - 1)));
-        if (part.index() < table.boundaries().size())
-            bounds.add(order(table) + " <= " + literal(table, table.boundaries().get(part.index())));
-        if (!bounds.isEmpty()) sql.append(" WHERE ").append(String.join(" AND ", bounds));
-        sql.append(" ORDER BY ").append(order(table));
+    private static List<Written> stream(
+            Connection pg, Table table, int tableIndex, int tableCount, long firstRowId,
+            Path output, GenerationConfig config) throws Exception {
+        if (config.benchmark().equals("ycsb")) {
+            sortSettings(pg);
+            // A JDBC cursor's nonzero fetch count disables PG parallel workers at execution.
+            // The schema preflight guarantees that every YCSB column is varchar/text.
+            try (var copy = new org.postgresql.copy.PGCopyInputStream(
+                    pg.unwrap(org.postgresql.PGConnection.class),
+                    "COPY (SELECT * FROM " + quoted(table.source().name()) + " ORDER BY "
+                            + order(table) + ") TO STDOUT (FORMAT binary, ENCODING 'UTF8')")) {
+                var input = new PgTextCopyRows(copy, table.schema().getFieldCount() - 2);
+                return writeTable(table, tableIndex, tableCount, firstRowId, input, output, config);
+            }
+        }
+        if (!table.ordered()) sortSettings(pg);
         try (Statement statement = pg.createStatement()) {
             statement.setFetchSize(8192);
-            try (ResultSet rows = statement.executeQuery(sql.toString())) {
-                int width = rows.getMetaData().getColumnCount();
-                var writer = new PartWriter(part, output, config);
-                try {
-                    while (rows.next()) {
-                        String[] row = new String[width];
-                        for (int col = 0; col < width; col++) row[col] = rows.getString(col + 1);
-                        writer.add(row);
-                    }
-                    return writer.finish();
-                } finally {
-                    writer.close();
-                }
+            try (var input = new RangeRows(statement, table)) {
+                return writeTable(table, tableIndex, tableCount, firstRowId, input::next, output, config);
             }
         }
     }
 
-    /**
-     * A table read as one key-ordered stream. The reading task cuts it into the parts' row counts and
-     * hands each full part to the pool, keeping at most a few parts of rows in memory.
-     */
-    private static Future<?> stream(
-            Session session,
-            Table table,
-            List<Part> parts,
-            Path output,
-            GenerationConfig config,
-            ExecutorService pool,
-            ExecutorService readers,
-            List<Future<Written>> written,
-            List<Integer> positions)
-            throws Exception {
-        var futures = new ArrayList<CompletableFuture<Written>>();
-        for (int i = 0; i < parts.size(); i++) futures.add(new CompletableFuture<>());
-        for (int i = 0; i < parts.size(); i++) written.set(positions.get(i), futures.get(i));
-        Future<?> reader =
-                readers.submit(
-                        () ->
-                                session.run(
-                                        pg -> {
-                                            try (Statement statement = pg.createStatement()) {
-                                                statement.execute("SET LOCAL work_mem = '" + sortMemory() + "'");
-                                                statement.execute("SET LOCAL max_parallel_workers_per_gather = " + sortWorkers());
-                                                statement.setFetchSize(8192);
-                                                try (ResultSet rows = statement.executeQuery(
-                                                        "SELECT * FROM "
-                                                                + quoted(table.source().name()) + " ORDER BY " + order(table))) {
-                                                    int width = rows.getMetaData().getColumnCount();
-                                                    Semaphore inFlight = null;
-                                                    for (int i = 0; i < parts.size(); i++) {
-                                                        Part part = parts.get(i);
-                                                        var batch = new ArrayList<String[]>((int) part.rows());
-                                                        long chars = 0;
-                                                        while (batch.size() < part.rows() && rows.next()) {
-                                                            String[] row = new String[width];
-                                                            for (int col = 0; col < width; col++) {
-                                                                row[col] = rows.getString(col + 1);
-                                                                if (row[col] != null) chars += row[col].length();
-                                                            }
-                                                            batch.add(row);
-                                                        }
-                                                        // Parts held for encoding: as many as half the heap holds
-                                                        // at the first part's size, so memory stays bounded.
-                                                        if (inFlight == null)
-                                                            inFlight = new Semaphore(inFlight(batch.size(), width, chars));
-                                                        inFlight.acquire();
-                                                        Semaphore permits = inFlight;
-                                                        var target = futures.get(i);
-                                                        pool.submit(() -> {
-                                                            try {
-                                                                var writer = new PartWriter(part, output, config);
-                                                                try {
-                                                                    for (String[] row : batch) writer.add(row);
-                                                                    target.complete(writer.finish());
-                                                                } finally {
-                                                                    writer.close();
-                                                                }
-                                                            } catch (Throwable error) {
-                                                                target.completeExceptionally(error);
-                                                            } finally {
-                                                                permits.release();
-                                                            }
-                                                        });
-                                                    }
-                                                    // Rows beyond the count are a table that changed under the snapshot.
-                                                    if (rows.next())
-                                                        throw new IllegalStateException("More rows than counted: " + table.source().name());
-                                                }
-                                            }
-                                            return null;
-                                        }));
-        // A failed reader fails every part it did not hand over.
-        CompletableFuture.runAsync(() -> {
-            try {
-                reader.get();
-            } catch (Exception error) {
-                Throwable cause = error instanceof ExecutionException failed ? failed.getCause() : error;
-                for (var future : futures) future.completeExceptionally(cause);
+    private static void sortSettings(Connection pg) throws SQLException {
+        try (Statement statement = pg.createStatement()) {
+            statement.execute("SET LOCAL work_mem = '" + sortMemory() + "'");
+            statement.execute("SET LOCAL max_parallel_workers_per_gather = " + sortWorkers());
+        }
+    }
+
+    /** All ranges share the caller's snapshot and the table's single encoder. */
+    private static final class RangeRows implements AutoCloseable {
+        private final Statement statement;
+        private final Table table;
+        private ResultSet rows;
+        private int range;
+
+        RangeRows(Statement statement, Table table) { this.statement = statement; this.table = table; }
+
+        String[] next() throws SQLException {
+            while (true) {
+                if (rows != null && rows.next()) {
+                    String[] row = new String[table.schema().getFieldCount() - 2];
+                    for (int col = 0; col < row.length; col++) row[col] = rows.getString(col + 1);
+                    return row;
+                }
+                close();
+                if (range > table.boundaries().size()) return null;
+                var bounds = new ArrayList<String>();
+                if (range > 0) bounds.add(order(table) + " > " + literal(table, table.boundaries().get(range - 1)));
+                if (range < table.boundaries().size()) bounds.add(order(table) + " <= " + literal(table, table.boundaries().get(range)));
+                rows = statement.executeQuery("SELECT * FROM " + quoted(table.source().name())
+                        + (bounds.isEmpty() ? "" : " WHERE " + String.join(" AND ", bounds))
+                        + " ORDER BY " + order(table));
+                range++;
             }
-        });
-        return reader;
+        }
+
+        public void close() throws SQLException { if (rows != null) { rows.close(); rows = null; } }
     }
 
-    /** Parts of a stream held in memory at once: about half the heap at the measured row size. */
-    static int inFlight(long rows, int width, long chars) {
-        // A compact string costs its characters plus about 56 bytes of header and reference.
-        long bytes = chars + rows * (16L + 56L * width);
-        long fit = bytes == 0 ? threads() : Runtime.getRuntime().maxMemory() / 2 / bytes;
-        return (int) Math.max(1, Math.min(threads(), fit));
+    @FunctionalInterface
+    interface Rows {
+        String[] next() throws Exception;
     }
 
-    /** Writes one part: its Parquet file under its final name, and its digest. */
+    /** One semantic table stream: row groups and worker tasks never create extra tail files. */
+    static List<Written> writeTable(
+            Table table, int tableIndex, int tableCount, long firstRowId, Rows input,
+            Path output, GenerationConfig config) throws Exception {
+        var written = new ArrayList<Written>();
+        PartWriter writer = null;
+        long total = 0;
+        try {
+            String[] row;
+            while ((row = input.next()) != null) {
+                if (total >= table.rows())
+                    throw new IllegalStateException("More rows than counted: " + table.source().name());
+                if (writer == null) {
+                    long fileId = Math.addExact(tableIndex + 1L, Math.multiplyExact((long) written.size(), tableCount));
+                    writer = new PartWriter(table, fileId, firstRowId + total, output, config);
+                }
+                boolean full = writer.add(row);
+                total++;
+                if (full) {
+                    written.add(writer.finish());
+                    writer.close();
+                    writer = null;
+                }
+            }
+            if (total != table.rows())
+                throw new IllegalStateException("Fewer rows than counted: " + table.source().name());
+            if (writer != null) written.add(writer.finish());
+            return written;
+        } finally {
+            if (writer != null) writer.close();
+        }
+    }
+
+    /** Writes one byte-sized file and its row digest before the directory is published. */
     private static final class PartWriter implements AutoCloseable {
-        private final Part part;
+        private final Table table;
+        private final long fileId, firstRowId;
         private final MessageType schema;
         /** Per value column of a fetched row (after the tuple id): its Parquet type, and the key's. */
         private final PrimitiveType.PrimitiveTypeName[] types;
@@ -410,29 +373,29 @@ public final class PgBaselineExport {
         private long rows;
         private String first, last;
 
-        PartWriter(Part part, Path output, GenerationConfig config) throws Exception {
-            this.part = part;
+        PartWriter(Table table, long fileId, long firstRowId, Path output, GenerationConfig config) throws Exception {
+            this.table = table;
+            this.fileId = fileId;
+            this.firstRowId = firstRowId;
             this.output = output;
             this.config = config;
-            Table table = part.table();
             schema = table.schema();
             factory = new SimpleGroupFactory(schema);
             int columns = schema.getFieldCount() - 2;
             types = new PrimitiveType.PrimitiveTypeName[columns];
             for (int i = 0; i < columns; i++) types[i] = schema.getType(i).asPrimitiveType().getPrimitiveTypeName();
             keyColumn = schema.getFieldIndex(table.key());
-            path = output.resolve(String.format(Locale.ROOT, "%020d-%s.parquet", part.fileId(), table.source().name()));
+            path = output.resolve(String.format(Locale.ROOT, "%020d-%s.parquet", fileId, table.source().name()));
             writer = new ParquetDataFile(
                     path,
-                    new TableData(table.source().name(), 0, part.firstRowId(), table.key(), schema, null),
+                    new TableData(table.source().name(), 0, firstRowId, table.key(), schema, null),
                     config,
-                    Map.of("sibench.file_id", Long.toString(part.fileId()), "sibench.source", "postgresql"));
+                    Map.of("sibench.file_id", Long.toString(fileId), "sibench.source", "postgresql"));
             digest = MessageDigest.getInstance("SHA-256");
         }
 
         /** {@code row}: the table's columns in PG order, all as PG text. */
-        void add(String[] row) throws Exception {
-            if (rows == part.rows()) throw new IllegalStateException("More rows than counted: " + part.table().source().name());
+        boolean add(String[] row) throws Exception {
             if (row.length != types.length) throw new IllegalStateException("Row shape changed");
             Group group = factory.newGroup();
             for (int i = 0; i < types.length; i++) {
@@ -445,35 +408,35 @@ public final class PgBaselineExport {
                 }
             }
             String pk = row[keyColumn];
-            if (pk == null) throw new IllegalStateException("Null key in " + part.table().source().name());
-            group.add("_sib_row_id", part.firstRowId() + rows);
+            if (pk == null) throw new IllegalStateException("Null key in " + table.source().name());
+            group.add("_sib_row_id", firstRowId + rows);
             group.add("_sib_timestamp", 0L);
             updateDigest(digest, group, schema);
-            writer.write(group);
+            boolean full = writer.write(group);
             if (first == null) first = pk;
             last = pk;
             rows++;
             if (rows % 4096 == 0 && Files.getFileStore(output).getUsableSpace() < config.minFreeBytes())
                 throw new java.io.IOException("Disk reserve reached");
+            return full;
         }
 
         Written finish() throws Exception {
-            if (rows != part.rows())
-                throw new IllegalStateException(
-                        "Fewer rows than counted: " + part.table().source().name() + " part " + part.index());
             var footer = writer.finish();
             if (footer.getBlocks().stream().mapToLong(b -> b.getRowCount()).sum() != rows)
                 throw new IllegalStateException("Footer mismatch");
             for (var block : footer.getBlocks())
                 if (block.getRowCount() > config.maxRows()) throw new IllegalStateException("Row group limit");
-            Object firstKey = part.table().integerKey() ? (Object) Long.parseLong(first) : first;
-            Object lastKey = part.table().integerKey() ? (Object) Long.parseLong(last) : last;
+            Object firstKey = table.integerKey() ? (Object) Long.parseLong(first) : first;
+            Object lastKey = table.integerKey() ? (Object) Long.parseLong(last) : last;
             var file = new LinkedHashMap<String, Object>();
-            file.put("file_id", part.fileId());
+            file.put("file_id", fileId);
             file.put("path", path.getFileName().toString());
-            file.put("table", part.table().source().name());
-            file.put("key", part.table().key());
+            file.put("table", table.source().name());
+            file.put("key", table.key());
             file.put("rows", rows);
+            file.put("size_bytes", Files.size(path));
+            file.put("file_size", writer.sizing());
             file.put("first_key", firstKey);
             file.put("last_key", lastKey);
             file.put(
@@ -496,7 +459,7 @@ public final class PgBaselineExport {
     }
 
     /** Manifests in file order. */
-    private static void finish(Path output, List<Table> tables, List<Part> parts, List<Written> results)
+    private static void finish(Path output, List<Table> tables, List<Written> results)
             throws Exception {
         Gson json = new Gson();
         try (BufferedWriter files = Files.newBufferedWriter(output.resolve("files.jsonl"))) {
@@ -510,7 +473,8 @@ public final class PgBaselineExport {
         for (Table table : tables) {
             // The table digest folds its files' row digests in file order.
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            for (int i = 0; i < parts.size(); i++) if (parts.get(i).table() == table) digest.update(results.get(i).digest());
+            for (Written written : results)
+                if (written.file().get("table").equals(table.source().name())) digest.update(written.digest());
             var entry = new LinkedHashMap<String, Object>();
             entry.put("table", table.source().name());
             entry.put("rows", table.rows());
@@ -518,15 +482,17 @@ public final class PgBaselineExport {
             entry.put("schema", table.schema().toString());
             manifest.add(entry);
             System.out.println(table.source().name() + " exported rows=" + table.rows() + " files="
-                    + parts.stream().filter(p -> p.table() == table).count() + (table.ordered() ? " by key range" : " as one stream"));
+                    + results.stream().filter(w -> w.file().get("table").equals(table.source().name())).count() + " as one key-ordered stream");
             total += table.rows();
         }
-        // Ordered maps: the manifests of one still database are identical byte for byte.
+        // Preserve semantic table/file order; nested JSON object key order is immaterial.
         var result = new LinkedHashMap<String, Object>();
         result.put("status", "complete");
         result.put("rows", total);
         result.put("tables", manifest);
-        result.put("files", parts.size());
+        result.put("files", results.size());
+        result.put("file_size_policy", GenerationConfig.FILE_SIZE_POLICY);
+        result.put("target_file_size_bytes", results.isEmpty() ? null : ((Map<?, ?>) results.get(0).file().get("file_size")).get("target_bytes"));
         Files.writeString(output.resolve("manifest.json"), json.toJson(result));
     }
 

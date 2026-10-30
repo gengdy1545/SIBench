@@ -329,9 +329,10 @@ public final class SnapshotLookupValidation {
         if (rowIdModes.isEmpty()) throw new IOException("No value mode to check");
         if (Files.exists(report))
             throw new IOException("Snapshot report already exists: " + report);
-        var baseline = org.sibench.capture.BaselineOperations.of(directory);
+        var input = ReferenceReplay.prepare(directory, config);
+        var baseline = input.baseline();
         Path workload = directory.resolve("workload.ops");
-        var preflight = ReferenceReplay.check(directory, config);
+        var preflight = input.preflight();
         JsonObject manifest =
                 JsonParser.parseString(Files.readString(directory.resolve("manifest.json")))
                         .getAsJsonObject();

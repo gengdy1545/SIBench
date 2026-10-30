@@ -22,52 +22,57 @@ import java.util.Map;
 public final class ReferenceReplay {
     private ReferenceReplay() {}
 
-    public static Map<String, Object> check(Path directory, ReplayConfig config)
-            throws IOException {
+    /** Workload preflight plus a baseline source that verifies coverage while its caller loads it. */
+    public record Input(IndexOperationTrace.Source baseline, IndexOperationTrace.Source workload,
+            Map<String, Object> preflight) {}
+
+    public static Map<String, Object> check(Path directory, ReplayConfig config) throws IOException {
+        var input = prepare(directory, config);
+        var counts = checkStream(input.baseline(), config, false);
+        input.preflight().put("baseline", counts);
+        return input.preflight();
+    }
+
+    /** Checks supply before a backend is touched; baseline verification is fused with its load. */
+    public static Input prepare(Path directory, ReplayConfig config) throws IOException {
         if (Files.exists(directory.resolve("INCOMPLETE"))
                 || !Files.isRegularFile(directory.resolve("manifest.json")))
             throw new IOException("Incomplete normalized dataset");
-        var manifest =
-                JsonParser.parseString(Files.readString(directory.resolve("manifest.json")))
-                        .getAsJsonObject();
+        var manifest = JsonParser.parseString(Files.readString(directory.resolve("manifest.json"))).getAsJsonObject();
         for (String name : List.of("baseline", "workload")) {
-            String checksum = name + "_trace_sha256";
-            Path file = directory.resolve(name + ".ops");
-            // A derived baseline load is checked against its digest as it is read.
-            if (!manifest.has(checksum)
-                    || (Files.exists(file) || name.equals("workload"))
-                            && !IndexOperationTrace.sha256(file).equals(manifest.get(checksum).getAsString()))
-                throw new IOException("Trace checksum mismatch: " + name);
+            if (!manifest.has(name + "_trace_sha256") || !manifest.has(name + "_operations"))
+                throw new IOException("Trace identity/count missing: " + name);
         }
         if (!manifest.has("secondary_index_coverage")
-                || !manifest.get("secondary_index_coverage")
-                        .getAsString()
-                        .equals("all_source_definitions"))
+                || !manifest.get("secondary_index_coverage").getAsString().equals("all_source_definitions"))
             throw new IOException("Trace must declare complete source index coverage");
         var units = org.sibench.capture.WorkUnits.read(directory);
         if (!manifest.has("work_units_sha256")
                 || !units.sha256().equals(manifest.get("work_units_sha256").getAsString()))
             throw new IOException("Source work-unit identity checksum mismatch");
         var catalog = catalog(manifest, units);
-        var baselineCoverage = new Coverage("baseline", catalog, units);
-        var workloadCoverage = new Coverage("workload", catalog, units);
-        var checked =
-                checkFiles(
-                        tee(org.sibench.capture.BaselineOperations.of(directory), baselineCoverage),
-                        tee(
-                                IndexOperationTrace.Source.file(directory.resolve("workload.ops")),
-                                workloadCoverage),
-                        config);
-        baselineCoverage.finish(manifest);
-        workloadCoverage.finish(manifest);
-        for (String name : List.of("baseline", "workload")) {
-            var counts = (Map<?, ?>) checked.get(name);
-            String countKey = name + "_operations";
-            if (!manifest.has(countKey)
-                    || manifest.get(countKey).getAsLong() != (long) counts.get("encoded_records"))
-                throw new IOException("Trace record count mismatch: " + name);
-        }
-        return checked;
+        var coverage = new Coverage("workload", catalog, units);
+        var workload = IndexOperationTrace.Source.file(directory.resolve("workload.ops"),
+                manifest.get("workload_trace_sha256").getAsString());
+        var counts = checkStream(tee(workload, coverage), config, true);
+        coverage.finish(manifest);
+        if (manifest.get("workload_operations").getAsLong() != (long) counts.get("encoded_records"))
+            throw new IOException("Trace record count mismatch: workload");
+        var report = report(config, null, counts);
+        report.put("status", "workload_integrity_and_supply_valid");
+        IndexOperationTrace.Source baseline = consumer -> {
+            report.remove("baseline");
+            report.put("status", "workload_integrity_and_supply_valid");
+            var baselineCoverage = new Coverage("baseline", catalog, null);
+            long records = tee(org.sibench.capture.BaselineOperations.of(directory), baselineCoverage).read(consumer);
+            baselineCoverage.finish(manifest);
+            if (manifest.get("baseline_operations").getAsLong() != records)
+                throw new IOException("Trace record count mismatch: baseline");
+            report.put("baseline", Map.of("encoded_records", records));
+            report.put("status", "trace_integrity_and_supply_valid");
+            return records;
+        };
+        return new Input(baseline, workload, report);
     }
 
     /**
@@ -256,41 +261,42 @@ public final class ReferenceReplay {
     public static Map<String, Object> checkFiles(
             IndexOperationTrace.Source baseline, IndexOperationTrace.Source workload, ReplayConfig config)
             throws IOException {
+        var load = checkStream(baseline, config, false);
+        var runtime = checkStream(workload, config, true);
+        return report(config, load, runtime);
+    }
+
+    private static Map<String, Object> checkStream(
+            IndexOperationTrace.Source source, ReplayConfig config, boolean runtime) throws IOException {
         config.requireReferenceCapabilities();
-        try (var load = new ReplayProjection(config, false, operation -> {});
-                var runtime = new ReplayProjection(config, true, operation -> {})) {
-            RunTiming.current().phase("load");
-            long loadRecords = baseline.read(load);
-            load.finish();
-            RunTiming.current().phase("runtime");
-            long runtimeRecords = workload.read(runtime);
-            runtime.finish();
-            runtime.requireClientCoverage();
-            if (runtime.dispatched() < config.requiredOperations())
-                throw new IOException(
-                        "Insufficient single-pass trace: requires "
-                                + config.requiredOperations()
-                                + " effective workload operations, found "
-                                + runtime.dispatched()
-                                + "; continue native capture, trace repetition is not supported");
-            Map<String, Object> report = new LinkedHashMap<>();
-            report.put("status", "trace_integrity_and_supply_valid");
-            report.put("configuration", config.describe());
-            var loadCounts = load.describe();
-            loadCounts.put("encoded_records", loadRecords);
-            var runtimeCounts = runtime.describe();
-            runtimeCounts.put("encoded_records", runtimeRecords);
-            report.put("baseline", loadCounts);
-            report.put("workload", runtimeCounts);
-            report.put(
-                    "budget_scope", "input supply only; no rate scheduling or duration guarantee");
-            report.put(
-                    "validation_scope",
-                    "bare-file binary integrity and supply only; no source catalog/provenance"
-                        + " guarantee; directory check additionally validates complete source"
-                        + " catalog and maintenance units; state/results checked during replay");
-            return report;
+        try (var projection = new ReplayProjection(config, runtime, operation -> {})) {
+            RunTiming.current().phase(runtime ? "preflight-workload" : "preflight-baseline");
+            long records = source.read(projection);
+            projection.finish();
+            if (runtime) {
+                projection.requireClientCoverage();
+                if (projection.dispatched() < config.requiredOperations())
+                    throw new IOException("Insufficient single-pass trace: requires " + config.requiredOperations()
+                            + " effective workload operations, found " + projection.dispatched()
+                            + "; continue native capture, trace repetition is not supported");
+            }
+            var counts = projection.describe();
+            counts.put("encoded_records", records);
+            return counts;
         }
+    }
+
+    private static Map<String, Object> report(ReplayConfig config, Map<String, Object> baseline,
+            Map<String, Object> workload) {
+        var report = new LinkedHashMap<String, Object>();
+        report.put("status", "trace_integrity_and_supply_valid");
+        report.put("configuration", config.describe());
+        if (baseline != null) report.put("baseline", baseline);
+        report.put("workload", workload);
+        report.put("budget_scope", "input supply only; no rate scheduling or duration guarantee");
+        report.put("validation_scope", "binary integrity and supply; directory inputs additionally verify source catalog,"
+                + " work-unit binding and complete maintenance units; baseline verification completes during its load");
+        return report;
     }
 
     public static Map<String, Object> run(Path directory, ReplayConfig config, Path report)
@@ -303,14 +309,14 @@ public final class ReferenceReplay {
             Path directory, ReplayConfig config, List<Boolean> rowIdModes, Path report)
             throws IOException {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
-        var preflight = check(directory, config);
+        var input = prepare(directory, config);
         return runChecked(
                 binding(directory, config),
-                org.sibench.capture.BaselineOperations.of(directory),
-                IndexOperationTrace.Source.file(directory.resolve("workload.ops")),
+                input.baseline(),
+                input.workload(),
                 config,
                 rowIdModes,
-                preflight,
+                input.preflight(),
                 report);
     }
 

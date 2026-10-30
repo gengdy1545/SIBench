@@ -22,6 +22,103 @@ public class ReplayDispatcherTest {
         return IndexOperationTrace.search(unit, 3, 0, Range.equal(IndexKey.ofInt(1)), 0, 0, 0).withWorkUnitId(unit);
     }
 
+    private static Operation baseline(long event) {
+        return IndexOperationTrace.write(event, IndexOperationTrace.INSERT, 3, 0,
+                IndexKey.ofInt(event), 0, 1, event, event).withWorkUnitId(1);
+    }
+
+    @Test
+    public void sharedBaselineCompletionStillBoundsAndCountsEveryMember() throws Exception {
+        var batch = new CompletableFuture<Void>();
+        var next = new CompletableFuture<Void>();
+        var twoReturned = new CountDownLatch(1);
+        var thirdCalled = new CountDownLatch(1);
+        var error = new AtomicReference<Throwable>();
+        try (var dispatcher = new ReplayDispatcher(config(1, 2), client -> (sequence, operation) -> {
+            if (sequence == 3) thirdCalled.countDown();
+            return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null),
+                    sequence <= 2 ? batch : next);
+        })) {
+            var sender = new Thread(() -> {
+                try {
+                    dispatcher.send(baseline(1));
+                    dispatcher.send(baseline(2));
+                    twoReturned.countDown();
+                    dispatcher.send(baseline(3));
+                    dispatcher.drain();
+                } catch (Throwable failure) { error.set(failure); }
+            });
+            sender.start();
+            try {
+                assertTrue(twoReturned.await(1, TimeUnit.SECONDS));
+                assertEquals(2L, dispatcher.describe().get("pending_responses"));
+                assertEquals(1, dispatcher.describe().get("pending_completion_groups"));
+                assertFalse(thirdCalled.await(50, TimeUnit.MILLISECONDS));
+                batch.complete(null);
+                assertTrue(thirdCalled.await(1, TimeUnit.SECONDS));
+                next.complete(null);
+            } finally {
+                batch.complete(null); next.complete(null); sender.join(3000);
+            }
+            assertFalse(sender.isAlive());
+            assertNull(error.get());
+            var report = dispatcher.describe();
+            assertEquals(3L, report.get("target_calls"));
+            assertEquals(3L, report.get("completed_responses"));
+            assertEquals(0L, report.get("pending_responses"));
+            assertEquals(2L, report.get("peak_in_flight"));
+            assertEquals(1L, report.get("peak_completion_groups"));
+            assertEquals(3L, ((Map<?, ?>) report.get("write_latency")).get("count"));
+        }
+    }
+
+    @Test
+    public void aBatchMayCompleteInsideItsLastSendBeforeRegistration() throws Exception {
+        var response = new CompletableFuture<Void>();
+        try (var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation) -> {
+            if (sequence == 2) response.complete(null);
+            return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response);
+        })) {
+            dispatcher.send(baseline(1));
+            dispatcher.send(baseline(2));
+            dispatcher.drain();
+            var report = dispatcher.describe();
+            assertEquals(2L, report.get("completed_responses"));
+            assertEquals(0L, report.get("pending_responses"));
+            assertEquals(0, report.get("pending_completion_groups"));
+            assertEquals(2L, ((Map<?, ?>) report.get("write_latency")).get("count"));
+        }
+    }
+
+    @Test
+    public void sharedBaselineFailureDoesNotCountAnyMemberAsSuccessful() throws Exception {
+        var response = new CompletableFuture<Void>();
+        try (var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation) ->
+                new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response))) {
+            dispatcher.send(baseline(1));
+            dispatcher.send(baseline(2));
+            response.completeExceptionally(new IOException("injected batch failure"));
+            var failure = assertThrows(IOException.class, dispatcher::drain);
+            assertTrue(failure.getMessage(), failure.getMessage().contains("dispatch 1"));
+            assertEquals("injected batch failure", failure.getCause().getMessage());
+            assertEquals(0L, dispatcher.describe().get("completed_responses"));
+            assertEquals(0L, dispatcher.describe().get("pending_responses"));
+        }
+    }
+
+    @Test
+    public void closingSharedBaselineCompletionCancelsAndClearsAllMembers() throws Exception {
+        var response = new CompletableFuture<Void>();
+        var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation) ->
+                new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response));
+        dispatcher.send(baseline(1));
+        dispatcher.send(baseline(2));
+        dispatcher.close();
+        assertTrue(response.isCancelled());
+        assertEquals(0L, dispatcher.describe().get("pending_responses"));
+        assertEquals(0, dispatcher.describe().get("pending_completion_groups"));
+    }
+
     @Test
     public void measuredWindowStartsAfterTheWarmupCalls() throws Exception {
         try (var dispatcher =
@@ -228,7 +325,8 @@ public class ReplayDispatcherTest {
                 if (localTimeout) assertThrows(IOException.class, () -> dispatcher.send(search(1)));
                 else {
                     dispatcher.send(search(1));
-                    assertThrows(IOException.class, dispatcher::drain);
+                    var error = assertThrows(IOException.class, dispatcher::drain);
+                    assertTrue(error.getMessage(), error.getMessage().contains("source event 1, search, transaction 0, version 0"));
                 }
                 assertThrows(IOException.class, () -> dispatcher.send(search(2)));
             } finally {

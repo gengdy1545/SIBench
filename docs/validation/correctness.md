@@ -1,6 +1,6 @@
 # 正确性反例与验证依据
 
-更新：2026-10-29。本文保留能区分正确与错误行为的原生事实、手算反例和受控交错。读取语义见 [Trace 契约](../contracts/trace.md#身份与版本)，发布、结果摘要及持久化语义见 [Index Service 契约](../contracts/index-service.md)。本轮构建、测试数量和完整输入结果统一见 [完整验收](acceptance.md)。
+更新：2026-10-30。本文保留能区分正确与错误行为的原生事实、手算反例和受控交错。读取语义见 [Trace 契约](../contracts/trace.md#身份与版本)，发布、结果摘要及持久化语义见 [Index Service 契约](../contracts/index-service.md)。最新构建、测试数量和完整输入结果见 [完整验收](acceptance.md)；下述原生反例及组合矩阵保留其固定历史构建 / 输入，未声称由最新驱动重跑。
 
 ## 原生两会话反例
 
@@ -12,7 +12,7 @@
 
 规范查询为 `TRANSACTION_LOCAL_SEARCH`，`readTimestamp=0`、本事务 `version=2`、`mutationOrdinal=1`。正确读取保留原语句快照，只叠加本事务此前修改；若改用本事务提交版本作为读点，会错误返回 **id=2000001@v1**。两者条数同为 1，因此只核对结果数量不能发现问题。对应回归为 `IndexTraceCompilerTest.transactionLocalSearchKeepsItsSnapshotAndOnlyItsOwnWrites`。
 
-原始事实采集于 2026-10-27；本轮 `acceptance-20261029T053122Z` 使用冻结提交 `bbff9a3` 重新验证，未重跑原生 SQL。证据为 [native-read-counterexample](../../results/validation/acceptance-20261029T053122Z/native-read-counterexample/)：
+原始事实采集于 2026-10-27；保留验证 `acceptance-20261029T053122Z` 使用冻结提交 `bbff9a3` 重新验证，未重跑原生 SQL。证据为 [native-read-counterexample](../../results/validation/acceptance-20261029T053122Z/native-read-counterexample/)：
 
 | 证据 | 作用 |
 | --- | --- |
@@ -37,7 +37,7 @@
 | 普通查询分块、丢块、错 request id、最终状态失败 | 完整结果匹配才算完成，中途失败不能计为成功 | `IndexServerTest`、`PublishedIndexTest` |
 | 缺少摘要、旧协议或不支持的发布能力 / 配置 | 显式参考报告缺少当前摘要即拒绝；不支持的输入不能进入另一套执行路径 | `TraceRequestsTest`、`IndexServerTest`、`ServiceConfigTest` |
 
-组合矩阵除查询摘要外，分别核对最终状态、选中版本与操作顺序；覆盖范围及输入身份见 [完整验收](acceptance.md#参考oracle-与组合覆盖)。模型间一致不能替代原生事实或独立 oracle。
+组合矩阵除查询摘要外，分别核对最终状态、选中版本与操作顺序；固定构建与输入见 [保留矩阵证据](../../results/validation/acceptance-20261029T053122Z/matrices/) 及其 [build.json](../../results/validation/acceptance-20261029T053122Z/build.json)。模型间一致不能替代原生事实或独立 oracle。
 
 ## 发布边界的受控交错
 

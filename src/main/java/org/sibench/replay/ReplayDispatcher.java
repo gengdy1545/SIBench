@@ -9,8 +9,52 @@ import java.util.concurrent.*;
 
 /** One sender, deterministic work-unit routing, and bounded independently completed responses. */
 public final class ReplayDispatcher implements AutoCloseable {
-    private record Pending(
-            long deadline, CompletableFuture<Void> response, String description, long started, int kind) {}
+    private static final class Pending {
+        private final long deadline, started;
+        private final CompletableFuture<Void> response;
+        private final String commitDescription;
+        private final int clientId, kind;
+        private final Operation operation;
+        private int members = 1;
+        private long[] memberStarts;
+
+        Pending(long deadline, CompletableFuture<Void> response, String commitDescription,
+                int clientId, Operation operation, long started, int kind) {
+            this.deadline = deadline;
+            this.response = response;
+            this.commitDescription = commitDescription;
+            this.clientId = clientId;
+            this.operation = operation;
+            this.started = started;
+            this.kind = kind;
+        }
+
+        long deadline() { return deadline; }
+        CompletableFuture<Void> response() { return response; }
+
+        // The sender and response callback hold inFlight while adding or completing members.
+        void addMember(long start) {
+            if (memberStarts == null) {
+                memberStarts = new long[8];
+                memberStarts[0] = started;
+            }
+            if (members == memberStarts.length)
+                memberStarts = Arrays.copyOf(memberStarts, members * 2);
+            memberStarts[members++] = start;
+        }
+
+        void recordLatency(Latency latency, long completed) {
+            if (memberStarts == null) latency.add(completed - started);
+            else for (int i = 0; i < members; i++) latency.add(completed - memberStarts[i]);
+        }
+
+        String description() {
+            if (operation == null) return commitDescription;
+            return "client " + clientId + ", source event " + operation.sourceEvent()
+                    + ", " + IndexOperationTrace.kindName(operation.kind())
+                    + ", transaction " + operation.transactionId() + ", version " + operation.version();
+        }
+    }
 
     /** Millisecond response latency from send call (queue included) to response. */
     private static final class Latency {
@@ -69,8 +113,10 @@ public final class ReplayDispatcher implements AutoCloseable {
     private final BitSet workUnits = new BitSet();
     private final Map<Integer, long[]> counts = new TreeMap<>();
     private final Map<Long, Pending> inFlight = new LinkedHashMap<>();
+    private final Map<CompletableFuture<Void>, Pending> baselineResponses = new IdentityHashMap<>();
     private final Latency writeLatency = new Latency(), searchLatency = new Latency(), commitLatency = new Latency();
     private long sent, completed, workUnitCount, peakInFlight, orderChecksum, backpressureNanos, commitMarkers;
+    private long inFlightMembers, peakCompletionGroups;
     private IOException failure;
     private CompletableFuture<Void> localSend;
     private volatile boolean closed;
@@ -150,8 +196,8 @@ public final class ReplayDispatcher implements AutoCloseable {
         int clientId = route(operation);
         long started = System.nanoTime();
         synchronized (inFlight) {
-            long wait = inFlight.size() >= config.maxInFlight() ? System.nanoTime() : 0;
-            while (inFlight.size() >= config.maxInFlight()) {
+            long wait = inFlightMembers >= config.maxInFlight() ? System.nanoTime() : 0;
+            while (inFlightMembers >= config.maxInFlight()) {
                 checkFailure();
                 waitForResponse();
             }
@@ -173,30 +219,27 @@ public final class ReplayDispatcher implements AutoCloseable {
             localSend = handle.sent().toCompletableFuture();
             CompletableFuture<Void> response = handle.response().toCompletableFuture();
             int latencyKind = operation.kind() == IndexOperationTrace.SEARCH ? 1 : 0;
+            boolean baseline = operation.kind() == IndexOperationTrace.INSERT
+                    && operation.version() == 0 && operation.transactionId() == 0;
+            Pending added = null;
             synchronized (inFlight) {
-                inFlight.put(
-                        sequence,
-                        new Pending(
-                                deadline,
-                                response,
-                                "client "
-                                        + clientId
-                                        + ", source event "
-                                        + operation.sourceEvent()
-                                        + ", "
-                                        + IndexOperationTrace.kindName(operation.kind())
-                                        + ", transaction "
-                                        + operation.transactionId()
-                                        + ", version "
-                                        + operation.version(),
-                                started,
-                                latencyKind));
-                peakInFlight = Math.max(peakInFlight, inFlight.size());
+                Pending shared = baseline ? baselineResponses.get(response) : null;
+                if (shared == null) {
+                    added = new Pending(deadline, response, null, clientId, operation, started, latencyKind);
+                    inFlight.put(sequence, added);
+                    if (baseline) baselineResponses.put(response, added);
+                } else shared.addMember(started);
+                inFlightMembers++;
+                peakInFlight = Math.max(peakInFlight, inFlightMembers);
+                peakCompletionGroups = Math.max(peakCompletionGroups, inFlight.size());
             }
-            response.whenComplete(
+            Pending pending = added;
+            if (pending != null) response.whenComplete(
                     (unused, error) -> {
                         synchronized (inFlight) {
-                            inFlight.remove(sequence);
+                            Pending removed = inFlight.remove(sequence);
+                            if (removed != null) inFlightMembers -= removed.members;
+                            baselineResponses.remove(response, pending);
                             if (error != null && !closed)
                                 fail(
                                         new IOException(
@@ -214,10 +257,10 @@ public final class ReplayDispatcher implements AutoCloseable {
                                                             + ", client "
                                                             + clientId));
                                 else {
-                                    completed++;
+                                    completed += pending.members;
                                     lastCompletion = System.nanoTime();
-                                    (latencyKind == 1 ? searchLatency : writeLatency)
-                                            .add(lastCompletion - started);
+                                    pending.recordLatency(latencyKind == 1 ? searchLatency : writeLatency,
+                                            lastCompletion);
                                 }
                             }
                             inFlight.notifyAll();
@@ -286,7 +329,7 @@ public final class ReplayDispatcher implements AutoCloseable {
         int clientId = 0;
         long started = System.nanoTime();
         synchronized (inFlight) {
-            while (inFlight.size() >= config.maxInFlight()) {
+            while (inFlightMembers >= config.maxInFlight()) {
                 checkFailure();
                 waitForResponse();
             }
@@ -314,14 +357,19 @@ public final class ReplayDispatcher implements AutoCloseable {
                                 response,
                                 "client " + clientId + ", commit marker, transaction "
                                         + transactionId + ", version " + version,
+                                clientId,
+                                null,
                                 started,
                                 2));
-                peakInFlight = Math.max(peakInFlight, inFlight.size());
+                inFlightMembers++;
+                peakInFlight = Math.max(peakInFlight, inFlightMembers);
+                peakCompletionGroups = Math.max(peakCompletionGroups, inFlight.size());
             }
             response.whenComplete(
                     (unused, error) -> {
                         synchronized (inFlight) {
-                            inFlight.remove(sequence);
+                            Pending removed = inFlight.remove(sequence);
+                            if (removed != null) inFlightMembers -= removed.members;
                             if (error != null && !closed)
                                 fail(
                                         new IOException(
@@ -431,7 +479,9 @@ public final class ReplayDispatcher implements AutoCloseable {
         report.put("backpressure_seconds", backpressureNanos / 1e9);
         synchronized (inFlight) {
             report.put("completed_responses", completed);
-            report.put("pending_responses", inFlight.size());
+            report.put("pending_responses", inFlightMembers);
+            report.put("pending_completion_groups", inFlight.size());
+            report.put("peak_completion_groups", peakCompletionGroups);
             report.put("peak_in_flight", peakInFlight);
             report.put("measurement", measurement());
             report.put("search_latency", searchLatency.describe());
@@ -470,6 +520,8 @@ public final class ReplayDispatcher implements AutoCloseable {
                 pending.response().cancel(false);
             }
             inFlight.clear();
+            baselineResponses.clear();
+            inFlightMembers = 0;
             inFlight.notifyAll();
         }
         IOException error = null;

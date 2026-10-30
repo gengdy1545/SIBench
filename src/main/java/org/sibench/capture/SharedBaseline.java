@@ -80,6 +80,7 @@ public final class SharedBaseline {
             export.into(withOutput(layout, partial));
             if (Files.exists(shared)) throw new IllegalStateException("Shared baseline without its layout: " + shared);
             Files.move(partial, shared, StandardCopyOption.ATOMIC_MOVE);
+            BaselineDigests.move(partial, shared);
             Files.writeString(identity, expected.toString(), StandardOpenOption.CREATE_NEW);
             System.out.println("Exported the shared baseline of " + base);
         } else if (!JsonParser.parseString(Files.readString(identity)).equals(expected))
@@ -100,7 +101,7 @@ public final class SharedBaseline {
     /** The same layout written to another directory. */
     static GenerationConfig withOutput(GenerationConfig l, Path directory) {
         return new GenerationConfig(
-                l.root(), l.document(), l.benchmark(), l.seed(), l.targetBytes(), l.maxRows(), l.groupBytes(),
+                l.root(), l.document(), l.benchmark(), l.seed(), l.targetBytes(), l.maxOvershootPercent(), l.maxRows(), l.groupBytes(),
                 l.pageBytes(), l.dictionaryBytes(), l.dictionary(), l.codec(), l.codecLevel(), l.buckets(),
                 l.baselineTimestamp(), directory, l.minFreeBytes());
     }
@@ -108,7 +109,9 @@ public final class SharedBaseline {
     /** What decides the bytes of a Parquet file written with a layout, besides its rows. */
     static java.util.Map<String, Object> identity(GenerationConfig layout) {
         var result = new java.util.LinkedHashMap<String, Object>();
+        result.put("file_size_policy", GenerationConfig.FILE_SIZE_POLICY);
         result.put("target_bytes", layout.targetBytes());
+        result.put("max_overshoot_percent", layout.maxOvershootPercent());
         result.put("max_rows", layout.maxRows());
         result.put("group_bytes", layout.groupBytes());
         result.put("page_bytes", layout.pageBytes());

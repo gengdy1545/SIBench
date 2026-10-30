@@ -234,16 +234,18 @@ public final class PgBaselineVerify {
                 throw error;
             }
             // Whole-file digests are independent of the row comparison and run in the same pool.
+            var recorded = BaselineDigests.of(directory);
             var digests = new ArrayList<java.util.concurrent.Future<String>>();
             for (JsonObject file : files) {
                 Path path = directory.resolve(file.get("path").getAsString());
-                digests.add(pool.submit(() -> BaselineGenerator.sha256(path)));
+                digests.add(pool.submit(() -> recorded.read(path)));
             }
             for (int i = 0; i < files.size(); i++) {
                 JsonObject file = files.get(i);
                 file.addProperty("size_bytes", Files.size(directory.resolve(file.get("path").getAsString())));
                 file.addProperty("sha256", digests.get(i).get());
             }
+            recorded.save();
             return results;
         } finally {
             pool.shutdownNow();
