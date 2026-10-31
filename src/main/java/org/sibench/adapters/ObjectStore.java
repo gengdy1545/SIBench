@@ -9,7 +9,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Where an object-storage index keeps its objects: one profile of config/storage.yaml and the
+ * Where an object-storage index keeps its objects: one profile of config/index/storage.yaml and the
  * object path of this index below the profile's prefix. Credentials are read from the environment
  * variables the profile names and are never printed.
  */

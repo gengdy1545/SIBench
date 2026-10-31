@@ -28,9 +28,7 @@ import java.util.TreeMap;
  *
  * <p>Pinned runs are bulk-loaded, already sorted, below everything else and never merged; they
  * hold an immutable baseline whose size is not bounded by memory. Runs are files in one
- * directory, created when the first run is written; {@link #checkpoint()} makes the current state
- * a list of files that {@link #restore} reopens, and files a merge replaced stay on disk until
- * {@link #released()}, because a checkpoint may still name them.
+ * directory, created when the first run is written. Merges delete the runs they replace.
  *
  * <p>Scans and lookups see writes made before they started; a write while a scan is open
  * invalidates the scan.
@@ -46,9 +44,6 @@ public final class SpillingMap implements AutoCloseable {
     private static final long BLOOM_LIMIT = 1L << 25;
     /** A lookup reads one sparse-index span; a merge or scan streams a run in larger reads. */
     private static final int LOOKUP_BYTES = 1 << 13, STREAM_BYTES = 1 << 16;
-
-    /** One run as a checkpoint names it. */
-    public record RunFile(String name, int level, boolean pinned) {}
 
     /** Entries of a scan, one at a time. */
     public interface Entries extends Closeable {
@@ -69,10 +64,8 @@ public final class SpillingMap implements AutoCloseable {
     private final int memoryEntries, fanout;
     private final TreeMap<byte[], byte[]> table = new TreeMap<>(Arrays::compareUnsigned);
     private final List<Run> runs = new ArrayList<>();
-    private final List<Path> retired = new ArrayList<>();
     private ByteBuffer scratch = ByteBuffer.allocate(LOOKUP_BYTES).order(ByteOrder.LITTLE_ENDIAN);
     private boolean directoryCreated;
-    private Path restored;
     private Path resolved;
     private long nextRun, merges, flushes, lookups, runReads;
 
@@ -87,20 +80,6 @@ public final class SpillingMap implements AutoCloseable {
         this.directory = directory;
         this.memoryEntries = memoryEntries;
         this.fanout = fanout;
-    }
-
-    /** Reopens the runs a checkpoint named, oldest first; the in-memory table starts empty. */
-    public static SpillingMap restore(
-            Path directory, int memoryEntries, int fanout, List<RunFile> files) throws IOException {
-        var map = new SpillingMap(directory, memoryEntries, fanout);
-        map.directoryCreated = Files.isDirectory(directory);
-        map.restored = directory;
-        for (RunFile file : files) {
-            Run run = Run.open(directory.resolve(file.name()), file.level(), file.pinned());
-            map.runs.add(run);
-            map.nextRun = Math.max(map.nextRun, sequence(file.name()) + 1);
-        }
-        return map;
     }
 
     // ---- long values ----
@@ -259,25 +238,10 @@ public final class SpillingMap implements AutoCloseable {
         for (int i = last; i >= first; i--) {
             Run old = runs.remove(i);
             old.close();
-            retired.add(old.path);
+            Files.delete(old.path);
         }
         runs.add(first, merged);
         merges++;
-    }
-
-    /** The state as files: flushes the table, so a restore starts from exactly this content. */
-    public List<RunFile> checkpoint() throws IOException {
-        flush();
-        var files = new ArrayList<RunFile>();
-        for (Run run : runs)
-            files.add(new RunFile(run.path.getFileName().toString(), run.level, run.pinned));
-        return files;
-    }
-
-    /** Deletes the files merges replaced; call once no durable checkpoint names them. */
-    public void released() throws IOException {
-        for (Path path : retired) Files.deleteIfExists(path);
-        retired.clear();
     }
 
     public int runCount() {
@@ -327,16 +291,12 @@ public final class SpillingMap implements AutoCloseable {
     }
 
     private Path nextPath() throws IOException {
-        if (resolved == null) resolved = restored != null ? restored : directory.get();
+        if (resolved == null) resolved = directory.get();
         if (!directoryCreated) {
             Files.createDirectories(resolved);
             directoryCreated = true;
         }
         return resolved.resolve("run-%08d.spill".formatted(nextRun++));
-    }
-
-    private static long sequence(String name) {
-        return Long.parseLong(name.substring("run-".length(), name.length() - ".spill".length()));
     }
 
     // ---- scans ----

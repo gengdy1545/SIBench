@@ -179,76 +179,36 @@ public class SpillingMapTest {
     }
 
     @Test
-    public void aCheckpointRestoresExactlyThatStateAndKeepsReplacedFilesUntilReleased()
-            throws Exception {
-        Path directory = temporary.newFolder().toPath();
-        var atCheckpoint = new TreeMap<Long, Long>();
-        List<SpillingMap.RunFile> checkpoint;
-        try (var map = new SpillingMap(directory, 5, 2)) {
-            try (var bulk = map.bulk()) {
-                for (long k = 0; k < 300; k++) {
-                    bulk.append(key(k), k + 1);
-                    atCheckpoint.put(k, k + 1);
-                }
-                bulk.finish();
-            }
-            var random = new Random(3);
-            for (int i = 0; i < 300; i++) {
-                long k = random.nextInt(600), v = random.nextInt(1000);
-                map.put(key(k), v);
-                atCheckpoint.put(k, v);
-            }
-            checkpoint = map.checkpoint();
-            assertEquals(0, map.memoryEntries());
-            // Writes after the checkpoint merge runs the checkpoint names; their files stay.
-            for (int i = 0; i < 400; i++) map.put(key(10_000 + i), i);
-            assertTrue(map.merges() > 0);
-            for (var file : checkpoint) assertTrue(Files.exists(directory.resolve(file.name())));
-            // A copy taken from those files is the state at the checkpoint, nothing later.
-            Path copy = temporary.newFolder().toPath();
-            for (var file : checkpoint)
-                Files.copy(directory.resolve(file.name()), copy.resolve(file.name()));
-            try (var restored = SpillingMap.restore(copy, 5, 2, checkpoint)) {
-                for (long k = -5; k < 700; k++)
-                    assertEquals(
-                            (long) atCheckpoint.getOrDefault(k, SpillingMap.ABSENT),
-                            restored.get(key(k)));
-                assertEquals(SpillingMap.ABSENT, restored.get(key(10_000)));
-                // The restored map continues like the original would.
-                restored.put(key(10_000), 5);
-                assertEquals(5, restored.get(key(10_000)));
-            }
-            map.released();
-            for (long k = 0; k < 400; k++) assertEquals(k, map.get(key(10_000 + k)));
-        }
-    }
-
-    @Test
-    public void releasedDeletesOnlyReplacedFiles() throws Exception {
+    public void repeatedOverwritesKeepOnlyCurrentRuns() throws Exception {
         Path directory = temporary.newFolder().toPath();
         try (var map = new SpillingMap(directory, 2, 2)) {
-            for (long k = 0; k < 40; k++) map.put(key(k), k);
-            long files = files(directory);
-            assertTrue(map.merges() > 0);
-            map.released();
-            assertTrue(files(directory) < files);
-            assertEquals(map.runCount(), files(directory));
-            for (long k = 0; k < 40; k++) assertEquals(k, map.get(key(k)));
+            for (int round = 0; round < 256; round++) {
+                map.put(key(1), round);
+                map.put(key(2), round);
+                assertEquals(map.runCount(), files(directory));
+            }
+            assertEquals(2, map.runEntries());
+            assertEquals(255, map.get(key(1)));
+            assertEquals(255, map.get(key(2)));
         }
     }
 
     @Test
-    public void aTruncatedRunIsRejectedOnRestore() throws Exception {
+    public void readingATruncatedCurrentRunFails() throws Exception {
         Path directory = temporary.newFolder().toPath();
-        List<SpillingMap.RunFile> files;
         try (var map = new SpillingMap(directory, 4, 2)) {
-            for (long k = 0; k < 10; k++) map.put(key(k), k);
-            files = map.checkpoint();
+            try (var bulk = map.bulk()) {
+                bulk.append(key(1), 11);
+                bulk.append(key(2), 22);
+                bulk.finish();
+            }
+            Path run;
+            try (var paths = Files.list(directory)) { run = paths.findFirst().orElseThrow(); }
+            try (var channel = java.nio.channels.FileChannel.open(run, java.nio.file.StandardOpenOption.WRITE)) {
+                channel.truncate(1);
+            }
+            assertThrows(IOException.class, () -> map.get(key(1)));
         }
-        Path run = directory.resolve(files.get(0).name());
-        byte[] content = Files.readAllBytes(run);
-        Files.write(run, Arrays.copyOf(content, content.length - 5));
-        assertThrows(IOException.class, () -> SpillingMap.restore(directory, 4, 2, files));
     }
 
     private static byte[] bytes(String value) {

@@ -20,6 +20,18 @@ public final class ServerTrace {
 
     private ServerTrace() {}
 
+    static String detail(com.google.gson.JsonObject header) throws IOException {
+        if (header == null || !header.has("event")
+                || !header.get("event").getAsString().equals("capture_start"))
+            throw new IOException("Trace does not start with capture_start");
+        if (!header.has("pid") || header.get("pid").getAsInt() < 1)
+            throw new IOException("Capture header lacks its backend identity");
+        if (!header.has("detail") || !java.util.Set.of("rows", "summary")
+                .contains(header.get("detail").getAsString()))
+            throw new IOException("Unknown capture detail");
+        return header.get("detail").getAsString();
+    }
+
     public static boolean isServerTrace(String name) {
         return name.startsWith(PREFIX) && name.endsWith(ZSTD);
     }

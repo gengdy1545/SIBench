@@ -24,7 +24,7 @@ public class FinalStateTest {
     private record Table(SourceSchema.Table schema, List<Map<String, String>> rows, long blocks) {}
 
     private static SourceSchema.Table usertable() throws Exception {
-        var document = ConfigValues.parse(Files.readString(Path.of("config/ycsb_large.yaml")));
+        var document = ConfigValues.parse(Files.readString(Path.of("src/test/resources/config/ycsb_1b.yaml")));
         var nativeConfig = ConfigValues.object(document, "native");
         nativeConfig.put("fieldcount", 2);
         document.put("native", nativeConfig);

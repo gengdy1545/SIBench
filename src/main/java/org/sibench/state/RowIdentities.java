@@ -5,7 +5,6 @@ import org.sibench.trace.IndexKey;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
-import java.util.List;
 
 /**
  * The current RowID of every primary key, per table, in bounded memory: the baseline is bulk
@@ -20,16 +19,6 @@ public final class RowIdentities implements AutoCloseable {
 
     public RowIdentities(Path directory, int memoryEntries, int fanout) throws IOException {
         this.map = new SpillingMap(directory, memoryEntries, fanout);
-    }
-
-    private RowIdentities(SpillingMap map) {
-        this.map = map;
-    }
-
-    public static RowIdentities restore(
-            Path directory, int memoryEntries, int fanout, List<SpillingMap.RunFile> files)
-            throws IOException {
-        return new RowIdentities(SpillingMap.restore(directory, memoryEntries, fanout, files));
     }
 
     private static byte[] key(int table, IndexKey key) {

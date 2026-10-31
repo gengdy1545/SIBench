@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Summarize a successful service report and its RocksDB EVENT_LOG_v1 evidence.
+"""Summarize a service report and separately supplied RocksDB EVENT_LOG_v1 observations.
 
 This reads reports and engine logs, never Trace or workload configuration. Event durations
-are observations from the supplied logs; incomplete jobs prevent a claim of completed drain.
+are observations from the supplied logs. File hashes alone do not establish same-run provenance;
+combined measurements remain unverified. Incomplete jobs cannot establish completed drain.
 """
 
 import argparse
@@ -99,6 +100,7 @@ def summarize(report, logs, after_flush_millis=None):
             "target_calls", "commit_markers", "backpressure_seconds", "peak_in_flight", "measurement",
             "search_latency", "write_latency", "commit_latency")})
     engines = engine_events(logs)
+    engines["same_run_provenance"] = "unverified" if logs else "not_collected"
     if after_flush_millis is not None:
         cutoff = after_flush_millis * 1000
         after = [e for e in engines["events"] if e["kind"] == "compaction"
@@ -111,7 +113,8 @@ def summarize(report, logs, after_flush_millis=None):
             "scope": "last observed completion after Flush, not proof that future compaction is impossible"}
     return {"analysis_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "report": {"path": str(report), "sha256": hashlib.sha256(report.read_bytes()).hexdigest()},
-            "status": "passed", "service": result["service"], "phases": phases,
+            "status": "unverified_engine_provenance" if logs else "passed",
+            "correctness_status": "passed", "service": result["service"], "phases": phases,
             "queries": result["queries"], "digest_checks": result["per_query_digest_checks"],
             "checked_result_items": result["checked_result_items"], "engine": engines}
 

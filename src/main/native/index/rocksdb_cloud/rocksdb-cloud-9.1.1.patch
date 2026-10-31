@@ -1,0 +1,11 @@
+--- a/build_tools/build_detect_platform
++++ b/build_tools/build_detect_platform
+@@ -634,7 +634,7 @@
+ # that the AWS build is not triggered.
+ #
+ if [ "${USE_AWS}XXX" = "1XXX" ]; then
+-  AWS_SDK=/usr/local
++  AWS_SDK=${AWS_SDK:?set AWS_SDK to the built SDK prefix}
+   AWI=${AWS_SDK}/include/
+   S3_CCFLAGS="$S3_CCFLAGS -I$AWI -DUSE_AWS"
+   S3_LDFLAGS="$S3_LDFLAGS -laws-cpp-sdk-s3 -laws-cpp-sdk-kinesis -laws-cpp-sdk-core -laws-cpp-sdk-transfer"

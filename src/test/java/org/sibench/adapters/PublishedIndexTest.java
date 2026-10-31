@@ -19,6 +19,7 @@ import org.sibench.adapters.proto.Write;
 import org.sibench.trace.IndexKey;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -64,6 +65,18 @@ public class PublishedIndexTest {
         public void close() throws InterruptedException {
             executor.shutdownNow();
             assertTrue("request threads leaked", executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    public void flushCannotCertifyAnAcceptedFailedRequest() throws Exception {
+        Path path = temporary.newFolder().toPath().resolve("index");
+        try (var backend = RocksDbBackend.create(path, ValueKind.ROW_ID);
+                var published = new PublishedIndex(backend)) {
+            var invalid = insert(1, 1, 11).toBuilder().setWrite(
+                    insert(1, 1, 11).getWrite().toBuilder().setKey(EntryKey.getDefaultInstance())).build();
+            assertEquals(Status.INVALID, published.submit(invalid, response -> {}).get(3, TimeUnit.SECONDS).getStatus());
+            assertThrows(IOException.class, published::flush);
         }
     }
 

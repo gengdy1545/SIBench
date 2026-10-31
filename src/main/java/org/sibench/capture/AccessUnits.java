@@ -39,7 +39,6 @@ final class AccessUnits {
         SUMMARY
     }
 
-    static final int CAPTURE_FORMAT = 2;
 
     enum Source {
         EXECUTOR("executor"),
@@ -394,10 +393,8 @@ final class AccessUnits {
         switch (type) {
             case "capture_start" -> {
                 if (!first) throw new IOException("capture_start is not the first event of its trace");
-                if (e.get("format").getAsInt() != CAPTURE_FORMAT)
-                    throw new IOException("Unsupported capture format " + e.get("format"));
                 state.detail =
-                        switch (e.get("detail").getAsString()) {
+                        switch (ServerTrace.detail(e.json())) {
                             case "rows" -> Detail.ROWS;
                             case "summary" -> Detail.SUMMARY;
                             default -> throw new IOException("Unknown capture detail " + e.get("detail"));

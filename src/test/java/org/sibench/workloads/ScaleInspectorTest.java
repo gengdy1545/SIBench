@@ -14,9 +14,36 @@ import java.util.Map;
 
 public class ScaleInspectorTest {
     private static final Path ROOT = Path.of("").toAbsolutePath();
+    private static final java.util.List<String> DERIVED_PROFILES = java.util.List.of(
+            "src/test/resources/config/hybench_sf1000.yaml",
+            "src/test/resources/config/ycsb_1b.yaml",
+            "src/test/resources/config/sysbench_1b.yaml");
 
     private String ycsb() throws Exception {
-        return Files.readString(ROOT.resolve(ScaleInspector.DEFAULT_PROFILES.get(1)));
+        return Files.readString(ROOT.resolve(DERIVED_PROFILES.get(1)));
+    }
+
+    @Test
+    public void nativeDefaultsHaveTheSameHandCheckedRowCount() throws Exception {
+        for (String profile : ScaleInspector.DEFAULT_PROFILES) {
+            var report = ScaleInspector.inspect(ROOT, Path.of(profile));
+            assertEquals(87_060_000L, report.get("baseline_rows"));
+            assertEquals("native", report.get("generation_mode"));
+            assertFalse((Boolean) report.get("generation_verified"));
+        }
+    }
+
+    @Test
+    public void rejectsAnUnknownNativeProfileVersion() throws Exception {
+        Path profile = Files.createTempFile(ROOT.resolve("build/sibench"), "native-version-", ".yaml");
+        try {
+            String source = Files.readString(ROOT.resolve(ScaleInspector.DEFAULT_PROFILES.get(1)));
+            assertTrue(source.contains("schema_version: 1"));
+            Files.writeString(profile, source.replace("schema_version: 1", "schema_version: 2"));
+            assertThrows(IllegalArgumentException.class, () -> ScaleInspector.inspect(ROOT, profile));
+        } finally {
+            Files.delete(profile);
+        }
     }
 
     @Test
@@ -24,9 +51,9 @@ public class ScaleInspectorTest {
         long[] counts = {8706000000L, 1000000000L, 1000000000L};
         for (int i = 0; i < counts.length; i++) {
             Map<String, Object> report =
-                    ScaleInspector.inspect(ROOT, Path.of(ScaleInspector.DEFAULT_PROFILES.get(i)));
+                    ScaleInspector.inspect(ROOT, Path.of(DERIVED_PROFILES.get(i)));
             assertEquals(counts[i], report.get("baseline_rows"));
-            assertEquals(ScaleInspector.DEFAULT_PROFILES.get(i), report.get("profile"));
+            assertEquals(DERIVED_PROFILES.get(i), report.get("profile"));
             assertFalse((Boolean) report.get("generation_verified"));
             assertTrue(report.containsKey("estimated_parquet_bytes"));
             assertNull(report.get("estimated_parquet_bytes"));
@@ -70,13 +97,13 @@ public class ScaleInspectorTest {
 
     @Test
     public void rejectsSysbenchSeedAndIdMismatch() throws Exception {
-        String text = Files.readString(ROOT.resolve(ScaleInspector.DEFAULT_PROFILES.get(2)));
+        String text = Files.readString(ROOT.resolve(DERIVED_PROFILES.get(2)));
         assertThrows(
                 IllegalArgumentException.class,
                 () ->
                         ScaleInspector.validate(
                                 ScaleInspector.parse(
-                                        text.replace("rand-seed: 20261019", "rand-seed: 0"))));
+                                        text.replace("rand-seed: 7", "rand-seed: 0"))));
         String tooLarge =
                 text.replace("total_rows: 1000000000", "total_rows: 300000000000")
                         .replace("table-size: 10000000", "table-size: 3000000000");

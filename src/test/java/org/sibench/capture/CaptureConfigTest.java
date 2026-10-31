@@ -10,9 +10,9 @@ public class CaptureConfigTest {
     @Test
     public void profileUsesNativeHtapWithUpstreamTransactionWeights() throws Exception {
         Path root = Path.of("").toAbsolutePath();
-        var c = CaptureConfig.read(root, Path.of("config/hybench_sf1.yaml"));
+        var c = CaptureConfig.read(root, Path.of("src/test/resources/config/hybench_sf1.yaml"));
         assertEquals(536870912, c.layout().targetBytes());
-        assertEquals("sibench_sf1_baseline_check", c.cloneFrom());
+        assertEquals("fixture_hybench_base", c.cloneFrom());
         var p = c.nativeProperties();
         assertFalse(p.containsKey("tp3_percent"));
         assertEquals("1", p.getProperty("apclient"));
@@ -27,7 +27,7 @@ public class CaptureConfigTest {
     @Test
     public void rejectsUnsupportedClientCounts() throws Exception {
         Path root = Path.of("").toAbsolutePath();
-        Path config = root.resolve("config/hybench_sf1.yaml");
+        Path config = root.resolve("src/test/resources/config/hybench_sf1.yaml");
         Path invalid = Files.createTempFile(root.resolve("build/sibench"), "capture-", ".yaml");
         try {
             Files.writeString(

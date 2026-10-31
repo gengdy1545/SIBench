@@ -321,11 +321,10 @@ public final class IndexTraceCompiler {
                 .note("search_operations", state.partSearches);
         Map<String, Object> report = new LinkedHashMap<>();
         report.put("status", "complete_for_declared_projection");
-        report.put("operation_trace_version", IndexOperationTrace.VERSION);
         report.put("secondary_operations_explicit", true);
         report.putAll(catalog.provenance());
         report.put("secondary_index_coverage", "all_source_definitions");
-        report.put("key_encoding", "order_preserving_v1");
+        report.put("key_encoding", "order_preserving");
         report.put("text_intervals_ordered", cCollation);
         report.put("baseline_directory", baseline.toAbsolutePath().toString());
         report.put("baseline_operations", baselineCount);

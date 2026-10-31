@@ -27,7 +27,7 @@ public class SharedBaselineTest {
 
     @Test
     public void theFirstCaptureExportsAndEveryCaptureLinks() throws Exception {
-        var document = ConfigValues.parse(Files.readString(Path.of("config/sysbench_large.yaml")));
+        var document = ConfigValues.parse(Files.readString(Path.of("src/test/resources/config/sysbench_1b.yaml")));
         var nativeConfig = ConfigValues.object(document, "native");
         nativeConfig.put("tables", 1);
         document.put("native", nativeConfig);
@@ -97,7 +97,7 @@ public class SharedBaselineTest {
         Files.setLastModifiedTime(data, java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis() + 5_000));
         assertThrows(java.io.IOException.class, () -> PgBaselineVerify.verifyFiles(second));
 
-        var other = CaptureConfig.read(Path.of(""), Path.of("config/hybench_sf1.yaml")).layout();
+        var other = CaptureConfig.read(Path.of(""), Path.of("src/test/resources/config/hybench_sf1.yaml")).layout();
         var changed = new GenerationConfig(other.root(), other.document(), other.benchmark(), other.seed(), other.targetBytes(), other.maxOvershootPercent(),
                 other.maxRows() / 2, other.groupBytes(), other.pageBytes(), other.dictionaryBytes(), other.dictionary(),
                 other.codec(), other.codecLevel(), other.buckets(), other.baselineTimestamp(), root.resolve("third"), other.minFreeBytes());
@@ -106,6 +106,6 @@ public class SharedBaselineTest {
     }
 
     private static GenerationConfig layout(Path root, String output) throws Exception {
-        return SharedBaseline.withOutput(CaptureConfig.read(Path.of(""), Path.of("config/hybench_sf1.yaml")).layout(), root.resolve(output));
+        return SharedBaseline.withOutput(CaptureConfig.read(Path.of(""), Path.of("src/test/resources/config/hybench_sf1.yaml")).layout(), root.resolve(output));
     }
 }

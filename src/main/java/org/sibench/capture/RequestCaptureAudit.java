@@ -107,11 +107,16 @@ public final class RequestCaptureAudit {
         long commits = 0, aborts = 0, indexEvents = 0, unmatched = 0;
         boolean serverTransactionOpen = false;
         try (var input = ServerTrace.open(pg)) {
+            String first = input.readLine();
+            var header = first == null ? null : JsonParser.parseString(first).getAsJsonObject();
+            ServerTrace.detail(header);
+            if (header.get("pid").getAsInt() != backendPid)
+                throw new IOException("Capture header differs from the client backend identity");
             String line;
             while ((line = input.readLine()) != null) {
                 JsonObject e = JsonParser.parseString(line).getAsJsonObject();
                 String event = e.get("event").getAsString();
-                if (event.equals("capture_start")) continue;
+                if (event.equals("capture_start")) throw new IOException("Repeated capture_start");
                 if (e.get("pid").getAsInt() != backendPid)
                     throw new IOException("Backend PID differs from JDBC connection");
                 String app = e.get("application").getAsString();
@@ -142,7 +147,10 @@ public final class RequestCaptureAudit {
                     if (!started.contains(app))
                         throw new IOException("Execution return without start");
                     executed.add(app);
-                    if (e.has("row_hashes") && e.get("depth").getAsInt() <= 1) {
+                    if (!e.has("row_hashes") || !e.has("returned")
+                            || e.get("returned").getAsLong() != e.getAsJsonArray("row_hashes").size())
+                        throw new IOException("Executor return lacks its complete result hashes");
+                    if (e.get("depth").getAsInt() <= 1) {
                         var hashes = serverHashes.computeIfAbsent(app, k -> new ArrayList<>());
                         for (JsonElement hash : e.getAsJsonArray("row_hashes"))
                             hashes.add(hash.getAsString());
@@ -253,8 +261,8 @@ public final class RequestCaptureAudit {
                                     + " server_hash="
                                     + hashes.get(i));
                 boolean valued = i < server.size() && client.has("column_types");
-                if (!hashed && !valued)
-                    throw new IOException("Client row has nothing to compare: " + request.getKey());
+                if (!hashed)
+                    throw new IOException("Client row has no recorded server hash: " + request.getKey());
                 if (!valued) {
                     checkedRows++;
                     continue;
@@ -316,10 +324,11 @@ public final class RequestCaptureAudit {
 
     /**
      * The client's hash of a consumed row. A row that also kept its text must hash to what it
-     * recorded; a row from before hashes existed is hashed from its text.
+     * recorded.
      */
     static String clientHash(JsonObject client) throws IOException {
-        String recorded = client.has("row_hash") ? client.get("row_hash").getAsString() : null;
+        if (!client.has("row_hash")) throw new IOException("Consumed row without recorded hash");
+        String recorded = client.get("row_hash").getAsString();
         if (!client.has("column_types")) {
             if (recorded == null) throw new IOException("Consumed row without values or hash");
             return recorded;

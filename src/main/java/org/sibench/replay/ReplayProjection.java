@@ -384,11 +384,6 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         return dispatched;
     }
 
-    /** The version of the last source transaction committed in the stream, 0 for none. */
-    public long lastVersion() {
-        return lastVersion;
-    }
-
     public Map<String, Object> describe() {
         Map<String, Object> report = new LinkedHashMap<>();
         report.put("source_operations", source);
@@ -397,6 +392,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         report.put("dispatched_operations", dispatched);
         report.put("filtered_secondary_operations", filtered);
         report.put("committed_transactions", transactions);
+        report.put("last_commit_version", lastVersion);
         report.put("change_delivery", sourceTransactions ? "committed_only" : "baseline");
         report.put("transaction_control_records", controls);
         report.put("dispatch_mode", dispatchMode);

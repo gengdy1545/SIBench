@@ -20,13 +20,17 @@ public class PgBaselineExportIntegrationIT {
         String database = "sibench_layout_" + UUID.randomUUID().toString().replace("-", "");
         String jdbc = admin.substring(0, admin.lastIndexOf('/') + 1) + database;
         Path root = Path.of("").toAbsolutePath();
-        var document = ConfigValues.parse(Files.readString(root.resolve("config/ycsb_small.yaml")));
+        var document = ConfigValues.parse(Files.readString(root.resolve("src/test/resources/config/ycsb_1k.yaml")));
+        var nativeConfig = ConfigValues.object(document, "native");
+        nativeConfig.put("recordcount", 20000L);
+        nativeConfig.put("insertcount", 20000L);
+        document.put("native", nativeConfig);
         var pgConfig = ConfigValues.object(document, "postgres");
         pgConfig.put("database", database);
         int port = java.net.URI.create(admin.substring("jdbc:".length())).getPort();
         pgConfig.put("port", port < 0 ? 5432 : port);
         document.put("postgres", pgConfig);
-        var original = NativeCaptureConfig.read(root, Path.of("config/ycsb_small.yaml")).layout();
+        var original = NativeCaptureConfig.read(root, Path.of("src/test/resources/config/ycsb_1k.yaml")).layout();
         long target = 8L << 20;
         var config = new GenerationConfig(root, document, "ycsb", 71, target, 5,
                 128, 65536, 1024, 1024, true, original.codec(), 3, 1, 0, evidence.resolve("baseline"), 1);
@@ -43,6 +47,8 @@ public class PgBaselineExportIntegrationIT {
                 try (var insert = pg.prepareStatement("INSERT INTO usertable VALUES (" + String.join(",", Collections.nCopies(11, "?")) + ")")) {
                     for (int i = 0; i < 20000; i++) {
                         insert.setString(1, "user" + String.format(Locale.ROOT, "%08d", (i * 7919) % 20000));
+                        if (i == 1) insert.setString(1, "用户🙂");
+                        if (i == 2) insert.setString(1, "user'\\range");
                         for (int c = 0; c < 10; c++) {
                             byte[] bytes = new byte[75]; random.nextBytes(bytes);
                             insert.setString(c + 2, Base64.getEncoder().encodeToString(bytes));

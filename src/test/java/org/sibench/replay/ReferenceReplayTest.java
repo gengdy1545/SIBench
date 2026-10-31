@@ -17,15 +17,35 @@ import java.util.Map;
 
 public class ReferenceReplayTest {
     @Test
-    public void checksumOnlyReferenceReportsAreRejected() throws Exception {
+    public void referenceReportsRequireQueryDigestsForTheSelectedMode() throws Exception {
         Path report = Files.createTempFile("sibench-reference-", ".json");
         try {
-            Files.writeString(report, "{\"results\":[{\"mode\":\"rowid\",\"result_checksum\":0}]}");
+            Files.writeString(report, "{\"results\":[{\"mode\":\"rowid\"}]}");
             var error = assertThrows(IOException.class, () -> ReferenceReplay.queryDigestFile(report, "rowid"));
             assertTrue(error.getMessage().contains("no query digests"));
             Files.writeString(report, "{\"results\":[]}");
             assertThrows(IOException.class, () -> ReferenceReplay.queryDigestFile(report, "rowid"));
         } finally {
+            Files.delete(report);
+        }
+    }
+
+    @Test
+    public void referenceQueryFileMustStillMatchItsRecordedIdentity() throws Exception {
+        Path report = Files.createTempFile("sibench-reference-", ".json");
+        Path sidecar = Files.createTempFile("sibench-queries-", ".tsv");
+        try {
+            Files.writeString(sidecar, "# workload=a baseline=b\n");
+            Files.writeString(report, new com.google.gson.Gson().toJson(Map.of("results", List.of(Map.of(
+                    "mode", "rowid", "query_digest_file", sidecar.toString(),
+                    "query_digest_sha256", org.sibench.config.Digests.sha256(sidecar))))));
+            assertEquals(sidecar, ReferenceReplay.queryDigestFile(report, "rowid"));
+            Files.writeString(sidecar, "# workload=c baseline=b\n");
+            assertThrows(IOException.class, () -> ReferenceReplay.queryDigestFile(report, "rowid"));
+            Files.delete(sidecar);
+            assertThrows(IOException.class, () -> ReferenceReplay.queryDigestFile(report, "rowid"));
+        } finally {
+            Files.deleteIfExists(sidecar);
             Files.delete(report);
         }
     }
@@ -54,10 +74,10 @@ public class ReferenceReplayTest {
                 writer.append(search(0, 1, 1));
                 writer.append(search(1, 10, 1));
                 writer.append(search(2, 20, 1));
-                writer.append(IndexOperationTrace.transaction(3, 6, 3, 1, 0));
+                writer.append(IndexOperationTrace.transaction(3, 6, 3, 7, 0));
                 org.sibench.capture.TransferIndexFixtures.appendRow(
-                        writer, TestOps.op(3, 5, 5, 0, 0, 1, 1, 0, 0, 50, 10, 20, 0, 3, 1));
-                writer.append(IndexOperationTrace.transaction(3, 7, 3, 1, 1));
+                        writer, TestOps.op(3, 5, 5, 0, 0, 1, 7, 0, 0, 50, 10, 20, 0, 3, 1));
+                writer.append(IndexOperationTrace.transaction(3, 7, 3, 7, 1));
             }
             assertThrows(
                     IOException.class,
@@ -71,8 +91,15 @@ public class ReferenceReplayTest {
             var config = new ReplayConfig(false, "none", 1, 2, 0, 0);
             var checked = ReferenceReplay.checkFiles(baseline, workload, config);
             assertEquals("trace_integrity_and_supply_valid", checked.get("status"));
+            assertEquals(7L, ((Map<?, ?>) checked.get("workload")).get("last_commit_version"));
             var result = ReferenceReplay.runFiles(baseline, workload, config, report);
             assertEquals("passed", result.get("status"));
+            for (var item : (List<?>) result.get("results")) {
+                var mode = (Map<?, ?>) item;
+                Path sidecar = Path.of((String) mode.get("query_digest_file"));
+                assertEquals(org.sibench.config.Digests.sha256(sidecar), mode.get("query_digest_sha256"));
+                assertEquals(sidecar, ReferenceReplay.queryDigestFile(report, (String) mode.get("mode")));
+            }
             assertThrows(
                     IOException.class,
                     () -> ReferenceReplay.runFiles(baseline, workload, config, report));

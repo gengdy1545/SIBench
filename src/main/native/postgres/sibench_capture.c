@@ -1,8 +1,8 @@
 /*
  * PostgreSQL 14.24 capture instrumentation, linked into the backend (see sibench_capture.h).
  *
- * Every event is one JSON line in SIBENCH_CAPTURE_DIR/pg-<pid>.jsonl. The first line of a file is
- * capture_start, naming the format and whether per-row detail is kept.
+ * Every event is one JSON line in SIBENCH_CAPTURE_DIR/pg-<pid>.jsonl.zst. The first line of a file is
+ * capture_start, naming whether per-row detail is kept.
  *
  * An index access unit starts with a scan_rescan and ends before the next rescan, the scan's end,
  * a transaction abort or backend exit. Its facts are accumulated here and written as one
@@ -42,7 +42,6 @@
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
-#define SIB_FORMAT 2
 #define SIB_MAX_INPUTS 64
 #define SIB_PENDING_SETS 16
 
@@ -54,11 +53,7 @@ uint64		sibench_request = 0;
 static FILE *sib_stream = NULL;
 static int	sib_detail_mode = -1;
 
-/*
- * With SIBENCH_CAPTURE_COMPRESS=zstd the trace is one zstd stream, pg-<pid>.jsonl.zst. It is
- * flushed at every transaction end, like the plain file, and its frame is ended at backend exit; a
- * reader of a file whose backend is still running finds no frame end and fails.
- */
+/* Buffered zstd output ends its frame at backend exit; an incomplete frame fails the audit. */
 static ZSTD_CCtx *sib_zstd = NULL;
 static char *sib_zstd_out = NULL;
 static size_t sib_zstd_out_size = 0;
@@ -118,14 +113,8 @@ sib_zstd_feed(const char *data, size_t length, ZSTD_EndDirective directive)
 static void
 sib_write(const char *data, size_t length)
 {
-	if (sib_zstd)
-	{
-		sib_zstd_open_frame = true;
-		if (!sib_zstd_feed(data, length, ZSTD_e_continue))
-			elog(ERROR, "SIBench trace write failed");
-		return;
-	}
-	if (fwrite(data, 1, length, sib_stream) != length)
+	sib_zstd_open_frame = true;
+	if (!sib_zstd_feed(data, length, ZSTD_e_continue))
 		elog(ERROR, "SIBench trace write failed");
 }
 
@@ -137,10 +126,12 @@ sib_finish(void)
 		return;
 	if (sib_zstd && sib_zstd_open_frame)
 	{
-		sib_zstd_feed(NULL, 0, ZSTD_e_end);
+		if (!sib_zstd_feed(NULL, 0, ZSTD_e_end))
+			elog(ERROR, "SIBench trace finalization failed");
 		sib_zstd_open_frame = false;
 	}
-	fflush(sib_stream);
+	if (fflush(sib_stream) != 0)
+		elog(ERROR, "SIBench trace flush failed");
 }
 
 /* Open units and pending verdicts are still facts when the connection closes mid-request. */
@@ -170,21 +161,18 @@ sib_open(void)
 		return false;
 	{
 		const char *compress = getenv("SIBENCH_CAPTURE_COMPRESS");
-		bool		zstd = compress && strcmp(compress, "zstd") == 0;
-
-		snprintf(path, sizeof(path), "%s/pg-%d.jsonl%s", directory, MyProcPid, zstd ? ".zst" : "");
+		if (compress && strcmp(compress, "zstd") != 0)
+			elog(ERROR, "SIBench capture requires zstd compression");
+		snprintf(path, sizeof(path), "%s/pg-%d.jsonl.zst", directory, MyProcPid);
 		sib_stream = fopen(path, "a");
 		if (!sib_stream)
 			elog(ERROR, "SIBench cannot open trace file %s", path);
-		if (zstd)
-		{
-			sib_zstd = ZSTD_createCCtx();
-			/* The fastest regular level: compression runs inside every captured backend. */
-			if (!sib_zstd || ZSTD_isError(ZSTD_CCtx_setParameter(sib_zstd, ZSTD_c_compressionLevel, 1)))
-				elog(ERROR, "SIBench cannot start zstd for %s", path);
-			sib_zstd_out_size = ZSTD_CStreamOutSize();
-			sib_zstd_out = MemoryContextAlloc(TopMemoryContext, sib_zstd_out_size);
-		}
+		sib_zstd = ZSTD_createCCtx();
+		/* The fastest regular level: compression runs inside every captured backend. */
+		if (!sib_zstd || ZSTD_isError(ZSTD_CCtx_setParameter(sib_zstd, ZSTD_c_compressionLevel, 1)))
+			elog(ERROR, "SIBench cannot start zstd for %s", path);
+		sib_zstd_out_size = ZSTD_CStreamOutSize();
+		sib_zstd_out = MemoryContextAlloc(TopMemoryContext, sib_zstd_out_size);
 	}
 	/*
 	 * Written out only when buffers fill and at exit, where the zstd frame ends: the audit waits
@@ -201,7 +189,7 @@ sib_open(void)
 					 "\"application\":",
 					 MyProcPid, (unsigned long long) sibench_request, sibench_depth);
 	escape_json(&header, application_name);
-	appendStringInfo(&header, ",\"format\":%d,\"detail\":\"%s\"}\n", SIB_FORMAT,
+	appendStringInfo(&header, ",\"detail\":\"%s\"}\n",
 					 sib_detail() ? "rows" : "summary");
 	sib_write(header.data, header.len);
 	pfree(header.data);

@@ -37,10 +37,10 @@ public class RowStateAuditIntegrationIT {
                     ConfigValues.parse(
                             Files.readString(
                                     root.resolve(
-                                            "config/"
+                                            "src/test/resources/config/"
                                                     + (benchmark.equals("hybench")
                                                             ? "hybench_sf1"
-                                                            : benchmark + "_large")
+                                                            : benchmark + "_1b")
                                                     + ".yaml")));
             var nativeConfig = ConfigValues.object(document, "native");
             if (benchmark.equals("sysbench")) nativeConfig.put("tables", 2);
@@ -364,7 +364,8 @@ public class RowStateAuditIntegrationIT {
                                         + "(k)");
                 }
                 String library =
-                        root.resolve("build/services/postgresql-capture/row_capture.so")
+                        Path.of(System.getProperty("sibench.row.library",
+                                        root.resolve("build/services/postgresql-capture/row_capture.so").toString()))
                                 .toString()
                                 .replace("'", "''");
                 execute(

@@ -1,12 +1,12 @@
-// SIBench index service protocol, version 2.
+// SIBench index service protocol.
 //
 // A benchmark driver replays a canonical index trace against a KV index service through this
 // protocol. It carries logical index operations only; how a service lays them out physically
 // (key encoding, version suffix, column families, files) is its own. The semantics are those of
-// docs/contracts/index-service.md and docs/contracts/trace.md.
+// docs/index-service.md and docs/trace.md.
 syntax = "proto3";
 
-package sibench.index.v2;
+package sibench.index;
 
 option java_multiple_files = true;
 option java_package = "org.sibench.adapters.proto";
@@ -30,7 +30,6 @@ message DescribeRequest {}
 
 message DescribeResponse {
   string name = 1;
-  uint32 protocol_version = 2;  // 2
   ValueKind value_kind = 3;
   // Reads at a version select the newest version at or below it (required).
   bool versioned_reads = 4;

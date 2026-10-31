@@ -13,7 +13,7 @@ public class ServiceConfigTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     @Test
-    public void serverRejectsRemovedSchedulingSwitches() throws Exception {
+    public void serverRejectsUnknownServiceFields() throws Exception {
         Path config = temporary.getRoot().toPath().resolve("index.yaml");
         String current = """
                 schema_version: 1
@@ -26,19 +26,18 @@ public class ServiceConfigTest {
                 """;
         Files.writeString(config, current);
         assertEquals("rocksdb", ServiceConfig.ofServer(temporary.getRoot().toPath(), config).adapter());
-        for (String key : new String[] {"ordered", "publication"}) {
-            Files.writeString(config, current + "  " + key + ": true\n");
-            var error = assertThrows(IllegalArgumentException.class,
-                    () -> ServiceConfig.ofServer(temporary.getRoot().toPath(), config));
-            assertTrue(error.getMessage().contains("Unknown key: " + key));
-        }
+        Files.writeString(config, current + "  unknown_option: true\n");
+        var error = assertThrows(IllegalArgumentException.class,
+                () -> ServiceConfig.ofServer(temporary.getRoot().toPath(), config));
+        assertTrue(error.getMessage().contains("Unknown key: unknown_option"));
     }
 
     @Test
-    public void replayRejectsTheRemovedPublicationSwitch() {
+    public void replayRejectsUnknownServiceFields() {
         var document = Map.<String, Object>of("target", Map.of("service", Map.of(
-                "adapter", "rocksdb", "path", "index", "value", "row_id", "publication", false)));
-        assertThrows(IllegalArgumentException.class,
+                "adapter", "rocksdb", "path", "index", "value", "row_id", "unknown_option", false)));
+        var error = assertThrows(IllegalArgumentException.class,
                 () -> ServiceConfig.ofReplay(temporary.getRoot().toPath(), document));
+        assertTrue(error.getMessage().contains("Unknown key: unknown_option"));
     }
 }

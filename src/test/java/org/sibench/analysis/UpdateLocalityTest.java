@@ -26,6 +26,23 @@ import java.util.zip.GZIPInputStream;
 public class UpdateLocalityTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test
+    public void fusedWorkloadReadRejectsAChangedButWellFormedInput() throws Exception {
+        Path file = temporary.newFolder().toPath().resolve("workload.ops");
+        var original = new IndexOperationTrace.Writer(file);
+        try (var writer = original) {
+            writer.append(primary(1, IndexOperationTrace.BUSINESS_UPDATE, IndexOperationTrace.UPSERT, 1, 1));
+        }
+        String expected = original.sha256();
+        var source = IndexOperationTrace.Source.file(file, expected);
+        source.read(operation -> {});
+        Files.delete(file);
+        try (var writer = new IndexOperationTrace.Writer(file)) {
+            writer.append(primary(2, IndexOperationTrace.BUSINESS_UPDATE, IndexOperationTrace.UPSERT, 1, 1));
+        }
+        assertThrows(java.io.IOException.class, () -> source.read(operation -> {}));
+    }
+
     private static byte[] composite(int value, int key) {
         byte[] prefix = IndexKey.ofInt(value).bytes(), suffix = IndexKey.ofInt(key).bytes();
         byte[] result = Arrays.copyOf(prefix, prefix.length + suffix.length);

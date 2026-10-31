@@ -796,11 +796,21 @@ public final class SnapshotLookupValidation {
             throws IOException {
         String table = file.get("table").getAsString();
         long fileId = file.get("file_id").getAsLong(), position = 0;
+        var path = new org.apache.hadoop.fs.Path(
+                directory.resolve(file.get("path").getAsString()).toUri());
+        var configuration = new org.apache.hadoop.conf.Configuration(false);
+        try (var footer = org.apache.parquet.hadoop.ParquetFileReader.open(
+                org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(path, configuration))) {
+            configuration.set(
+                    org.apache.parquet.hadoop.api.ReadSupport.PARQUET_READ_SCHEMA,
+                    BaselineOperations.projection(
+                                    catalog, table, footer.getFooter().getFileMetaData().getSchema(),
+                                    "_sib_timestamp", "_sib_mutation_ordinal")
+                            .toString());
+        }
         try (ParquetReader<Group> reader =
-                ParquetReader.builder(
-                                new GroupReadSupport(),
-                                new org.apache.hadoop.fs.Path(
-                                        directory.resolve(file.get("path").getAsString()).toUri()))
+                ParquetReader.builder(new GroupReadSupport(), path)
+                        .withConf(configuration)
                         .build()) {
             Group group;
             while ((group = reader.read()) != null) {

@@ -46,7 +46,7 @@ public class CapturePlanTest {
                 writer.append(TestOps.op(i, IndexOperationTrace.SEARCH, 1, 0, 0, i, 0, 0, 0, 0, 0, 0, 1));
         }
         Files.writeString(root.resolve("replay.yaml"),
-                "schema_version: 1\npurpose: index_replay\ntarget:\n  secondary_indexes:\n    enabled: true\n"
+                "schema_version: 1\npurpose: sibench\ntarget:\n  secondary_indexes:\n    enabled: true\n"
                         + "replay:\n  strategy: single_pass\n  trace_budget:\n"
                         + "    duration_seconds: 10\n    planned_operations_per_second: 300\n    warmup_operations: 0\n    reserve_percent: 0\n"
                         + "versions:\n  gc:\n    owner: none\n");

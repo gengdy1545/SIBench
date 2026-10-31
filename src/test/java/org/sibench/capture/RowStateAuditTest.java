@@ -21,10 +21,10 @@ public class RowStateAuditTest {
     private SourceSchema schema(String benchmark, int count) throws Exception {
         Path profile =
                 Path.of(
-                        "config/"
+                        "src/test/resources/config/"
                                 + (benchmark.equals("hybench")
                                         ? "hybench_sf1"
-                                        : benchmark + "_large")
+                                        : benchmark + "_1b")
                                 + ".yaml");
         var document = ConfigValues.parse(Files.readString(profile));
         var nativeConfig = ConfigValues.object(document, "native");
@@ -301,16 +301,6 @@ public class RowStateAuditTest {
             Path client = directory.resolve("jdbc-fixture.jsonl.zst");
             Path pg = raw.resolve("pg-" + i + ".jsonl.zst"), jdbc = raw.resolve("jdbc-" + i + ".jsonl.zst");
             var pgLines = RowAuditTestSupport.readTrace(server);
-            pgLines.add(
-                    new Gson()
-                            .toJson(
-                                    Map.of(
-                                            "event",
-                                            "executor_run_end",
-                                            "application",
-                                            "fixture-0",
-                                            "pid",
-                                            1)));
             RowAuditTestSupport.writeTrace(pg, pgLines);
             RowAuditTestSupport.writeTrace(jdbc, RowAuditTestSupport.readTrace(client));
             sessions.add(

@@ -8,10 +8,12 @@ import org.sibench.trace.IndexKey;
 import java.io.BufferedWriter;
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.security.DigestOutputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
@@ -140,16 +142,18 @@ public final class QueryDigest {
         digest.update(bytes);
     }
 
+    private static final ThreadLocal<byte[]> INTEGER_BYTES = ThreadLocal.withInitial(() -> new byte[8]);
+
     private static void putInt(MessageDigest digest, int value) {
-        digest.update((byte) (value >>> 24));
-        digest.update((byte) (value >>> 16));
-        digest.update((byte) (value >>> 8));
-        digest.update((byte) value);
+        byte[] bytes = INTEGER_BYTES.get();
+        for (int i = 0; i < 4; i++) bytes[i] = (byte) (value >>> (24 - 8 * i));
+        digest.update(bytes, 0, 4);
     }
 
     private static void putLong(MessageDigest digest, long value) {
-        putInt(digest, (int) (value >>> 32));
-        putInt(digest, (int) value);
+        byte[] bytes = INTEGER_BYTES.get();
+        for (int i = 0; i < 8; i++) bytes[i] = (byte) (value >>> (56 - 8 * i));
+        digest.update(bytes, 0, 8);
     }
 
     /**
@@ -160,7 +164,9 @@ public final class QueryDigest {
     public static final class File implements Sink, Closeable {
         private final Path path, partial;
         private final BufferedWriter writer;
+        private final MessageDigest fileDigest = digest();
         private final boolean rowIds;
+        private String sha256;
         private long count;
         private boolean closed;
 
@@ -168,7 +174,7 @@ public final class QueryDigest {
             this(path, rowIds, null);
         }
 
-        /** {@code binding}: trace/baseline/version/mode/coverage identity written as a header. */
+        /** {@code binding}: trace/baseline/mode/coverage identity written as a header. */
         public File(Path path, boolean rowIds, String binding) throws IOException {
             this.path = path;
             this.rowIds = rowIds;
@@ -176,11 +182,9 @@ public final class QueryDigest {
             if (Files.exists(path) || Files.exists(partial))
                 throw new IOException("Query digest file already exists: " + path);
             writer =
-                    Files.newBufferedWriter(
-                            partial,
-                            StandardCharsets.UTF_8,
-                            StandardOpenOption.CREATE_NEW,
-                            StandardOpenOption.WRITE);
+                    new BufferedWriter(new OutputStreamWriter(new DigestOutputStream(
+                            Files.newOutputStream(partial, StandardOpenOption.CREATE_NEW,
+                                    StandardOpenOption.WRITE), fileDigest), StandardCharsets.UTF_8.newEncoder()));
             if (binding != null) {
                 writer.write("# " + binding);
                 writer.newLine();
@@ -209,6 +213,11 @@ public final class QueryDigest {
             return path;
         }
 
+        public String sha256() {
+            if (sha256 == null) throw new IllegalStateException("Query digest file has not been published");
+            return sha256;
+        }
+
         @Override
         public void close() throws IOException {
             if (closed) return;
@@ -218,6 +227,7 @@ public final class QueryDigest {
                     partial,
                     path,
                     java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            sha256 = HexFormat.of().formatHex(fileDigest.digest());
         }
     }
 }

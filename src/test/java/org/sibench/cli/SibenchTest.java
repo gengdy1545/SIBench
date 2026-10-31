@@ -45,24 +45,24 @@ public class SibenchTest {
             {"inspect-scale", "--unknown"},
             {"generate"},
             {"generate", "--help"},
-            {"replay", "config/index_replay.yaml"},
-            {"check-replay", "config/index_replay.yaml", "missing-trace"},
+            {"replay", "config/sibench.yaml"},
+            {"check-replay", "config/sibench.yaml", "missing-trace"},
             {"replay", "--repeat", "2"},
-            {"validate-snapshots", "config/index_replay.yaml"},
+            {"validate-snapshots", "config/sibench.yaml"},
             {
                 "validate-snapshots",
-                "config/index_replay.yaml",
+                "config/sibench.yaml",
                 "missing-trace",
                 "missing-report.json"
             },
-            {"check-schema", "config/ycsb_large.yaml"},
+            {"check-schema", "src/test/resources/config/ycsb_1b.yaml"},
             {"check-schema", "--jdbc"},
             {"check-schema", "--user"},
-            {"audit-rows", "config/ycsb_large.yaml"},
+            {"audit-rows", "src/test/resources/config/ycsb_1b.yaml"},
             {"audit-rows", "--jdbc"},
             {
                 "audit-rows",
-                "config/ycsb_large.yaml",
+                "src/test/resources/config/ycsb_1b.yaml",
                 "missing-baseline",
                 "missing-raw",
                 "--jdbc",
@@ -72,17 +72,17 @@ public class SibenchTest {
             },
             {
                 "check-schema",
-                "config/ycsb_large.yaml",
+                "src/test/resources/config/ycsb_1b.yaml",
                 "--jdbc",
                 "jdbc:mysql:localhost",
                 "--user",
                 "postgres"
             },
-            {"inspect-scale", "config/ycsb_large.yaml", "missing.yaml"},
+            {"inspect-scale", "src/test/resources/config/ycsb_1b.yaml", "missing.yaml"},
             {"compare-ledgers"},
-            {"compare-ledgers", "config/ycsb_large.yaml"},
-            {"snapshot-index-counters", "config/ycsb_large.yaml"},
-            {"check-capture-completeness", "config/ycsb_large.yaml"}
+            {"compare-ledgers", "src/test/resources/config/ycsb_1b.yaml"},
+            {"snapshot-index-counters", "src/test/resources/config/ycsb_1b.yaml"},
+            {"check-capture-completeness", "src/test/resources/config/ycsb_1b.yaml"}
         };
         for (String[] args : invalid) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();

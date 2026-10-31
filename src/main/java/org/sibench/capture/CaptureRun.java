@@ -127,11 +127,7 @@ final class CaptureRun implements AutoCloseable {
         if (error instanceof SQLException sql) {
             details.put("sqlstate", sql.getSQLState());
             details.put("error_code", sql.getErrorCode());
-            // Enough identity for a later classification to consume: the SQLSTATE, the driver error
-            // code and the request / transaction the recording driver was executing. The policy
-            // decides only what kind of failure this is; it does NOT relax the rule below, which
-            // keeps every JDBC exception fatal until the taxonomy has real-run evidence
-            // (plan.md: 完成分类和实跑验证前，当前 JDBC 异常使采集失败的策略不放宽).
+            // Classification adds diagnostics; every JDBC exception still makes the capture fail.
             var classification =
                     SourceFailurePolicy.classify(
                             SourceFailurePolicy.evidence(

@@ -38,6 +38,7 @@ public final class ServiceReplay {
         String binding = ReferenceReplay.binding(directory, config) + " mode=" + mode;
         Path expectedResults =
                 reference == null ? null : ReferenceReplay.queryDigestFile(reference, mode);
+        String generatedSha256 = null;
         Path generated = null;
         if (expectedResults == null) {
             Path directoryForDigests =
@@ -45,7 +46,7 @@ public final class ServiceReplay {
                             report.toAbsolutePath().getParent(), ".sibench-expected-");
             expectedResults = directoryForDigests.resolve("queries");
             generated = directoryForDigests;
-            ReferenceReplay.writeQueryDigests(
+            generatedSha256 = ReferenceReplay.writeQueryDigests(
                     directory,
                     config,
                     service.value() == ValueKind.ROW_ID,
@@ -58,18 +59,19 @@ public final class ServiceReplay {
         GrpcService remote = null;
         RocksDbBackend local = null;
         PublishedIndex published = null;
-        if (service.adapter().equals("grpc")) {
-            remote = new GrpcService(service.endpoint(), requests);
-            description = remote.describe();
-            factory = remote.factory();
-        } else {
-            local = RocksDbBackend.create(service.path(), service.value());
-            RunTiming.current().measure(service.path());
-            description = local.describe().toBuilder().setCompleteCommitPublication(true).build();
-            published = new PublishedIndex(local);
-            factory = InProcessService.factory(published, requests);
-        }
         try {
+            if (service.adapter().equals("grpc")) {
+                remote = new GrpcService(service.endpoint(), requests, binding, config.requestTimeoutSeconds());
+                description = remote.describe();
+                factory = remote.factory();
+            } else {
+                local = RocksDbBackend.create(service.path(), service.value());
+                RunTiming.current().measure(service.path());
+                description = local.describe().toBuilder().setCompleteCommitPublication(true).build();
+                published = new PublishedIndex(local);
+                local.bind(binding);
+                factory = InProcessService.factory(published, requests);
+            }
             require(description, service.value(), directory);
             // Held Baseline INSERTs stay below the in-flight bound, so some request is always sent.
             if (description.getBaselineWriteBatches())
@@ -105,6 +107,8 @@ public final class ServiceReplay {
                     long publishedVersion;
                     if (remote != null) {
                         var flushed = remote.flush(binding);
+                        requireFlush(flushed, binding,
+                                runtime ? lastCommit(preflight) : 0);
                         publishedVersion = flushed.getPublishedVersion();
                         location = flushed.getIndexLocation();
                     } else {
@@ -112,6 +116,8 @@ public final class ServiceReplay {
                         publishedVersion = published.flush();
                         location = local.location();
                     }
+                    if (publishedVersion != (runtime ? lastCommit(preflight) : 0))
+                        throw new IOException("Flush published an unexpected commit version: " + publishedVersion);
                     var phaseReport = new LinkedHashMap<String, Object>();
                     phaseReport.put("operations", projection.dispatched());
                     phaseReport.put("seconds", seconds);
@@ -149,7 +155,9 @@ public final class ServiceReplay {
                     generated == null ? "reference_report" : "generated_from_trace");
             result.put(
                     "expected_results_sha256",
-                    org.sibench.generation.BaselineGenerator.sha256(expectedResults));
+                    generatedSha256 == null
+                            ? org.sibench.generation.BaselineGenerator.sha256(expectedResults)
+                            : generatedSha256);
             if (reference != null)
                 result.put("reference", Map.of("report", reference.toString(), "mode", mode,
                         "status", "per_query_digests_matched"));
@@ -190,20 +198,15 @@ public final class ServiceReplay {
         if (Files.exists(report)) throw new IOException("Verification report already exists: " + report);
         if (reference == null)
             throw new IOException("Snapshot verification needs a reference report's digests");
-        var preflight = ReferenceReplay.prepare(directory, config).preflight();
+        var input = ReferenceReplay.prepare(directory, config);
+        var preflight = input.preflight();
         String mode = service.value() == ValueKind.ROW_ID ? "rowid" : "locator";
         String binding = ReferenceReplay.binding(directory, config) + " mode=" + mode;
         var requests =
                 new TraceRequests(
                         service.value(), ReferenceReplay.queryDigestFile(reference, mode), binding);
         requests.snapshotReads();
-        long[] lastCommit = {0};
-        IndexOperationTrace.read(
-                directory.resolve("workload.ops"),
-                operation -> {
-                    if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT)
-                        lastCommit[0] = operation.version();
-                });
+        long lastCommit = lastCommit(preflight);
         DescribeResponse description;
         ReplayTarget.Factory factory;
         GrpcService remote = null;
@@ -211,7 +214,7 @@ public final class ServiceReplay {
         PublishedIndex published = null;
         try {
             if (service.adapter().equals("grpc")) {
-                remote = new GrpcService(service.endpoint(), requests);
+                remote = new GrpcService(service.endpoint(), requests, binding, config.requestTimeoutSeconds());
                 description = remote.describe();
                 factory = remote.factory();
             } else {
@@ -222,22 +225,26 @@ public final class ServiceReplay {
             }
             require(description, service.value(), directory);
             long publishedVersion;
-            if (remote != null) publishedVersion = remote.flush(binding).getPublishedVersion();
+            if (remote != null) {
+                var flushed = remote.flush(binding);
+                requireFlush(flushed, binding, lastCommit);
+                publishedVersion = flushed.getPublishedVersion();
+            }
             else {
                 local.bind(binding);
                 publishedVersion = published.flush();
             }
-            if (publishedVersion != lastCommit[0])
+            if (publishedVersion != lastCommit)
                 throw new IOException(
                         "Index publishes version "
                                 + publishedVersion
                                 + ", the trace ends at "
-                                + lastCommit[0]);
+                                + lastCommit);
             RunTiming.current().phase("verify");
             long start = System.nanoTime();
             Map<String, Object> dispatch;
             try (var projection = ReplayProjection.snapshotSearches(config, factory, requests::skipExpected)) {
-                IndexOperationTrace.Source.file(directory.resolve("workload.ops")).read(projection);
+                input.workload().read(projection);
                 projection.finish();
                 dispatch = projection.describe();
             }
@@ -271,6 +278,17 @@ public final class ServiceReplay {
         }
     }
 
+    private static long lastCommit(Map<String, Object> preflight) {
+        return ((Number) ((Map<?, ?>) preflight.get("workload")).get("last_commit_version")).longValue();
+    }
+
+    static void requireFlush(org.sibench.adapters.proto.FlushResponse response, String binding, long version)
+            throws IOException {
+        if (!binding.equals(response.getIndexBinding())
+                || response.getPublishedVersion() != version || response.getIndexLocation().isBlank())
+            throw new IOException("Flush response differs from the trace binding, commit version or index location");
+    }
+
     /**
      * The minimal index manifest, next to the report: what the index holds (trace identity and
      * index definitions), up to which commit, where it lives, how it was checked, and with which
@@ -290,7 +308,6 @@ public final class ServiceReplay {
         manifest.put("index_binding", binding);
         manifest.put("workload_trace_sha256", trace.get("workload_trace_sha256").getAsString());
         manifest.put("baseline_trace_sha256", trace.get("baseline_trace_sha256").getAsString());
-        manifest.put("operation_trace_version", trace.get("operation_trace_version").getAsInt());
         manifest.put("commit_version", ((Map<?, ?>) result.get("workload")).get("published_version"));
         manifest.put("index_definitions", trace.get("index_definitions"));
         manifest.put("key_encoding", "IndexKey order-preserving components; table(u32) index(u32) [value] PK ~version(u64)");
@@ -327,7 +344,6 @@ public final class ServiceReplay {
     /** The service must implement every semantic the trace relies on. */
     static void require(DescribeResponse description, ValueKind value, Path directory)
             throws IOException {
-        if (description.getProtocolVersion() != 2) throw new IOException("Unsupported protocol version");
         if (!description.getCompleteCommitPublication())
             throw new IOException("Service must publish complete commits across client streams");
         if (description.getValueKind() != value)

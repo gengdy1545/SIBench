@@ -3,6 +3,7 @@
 #include "commands/trigger.h"
 #include "access/htup_details.h"
 #include "sibench_capture.h"
+#include "utils/json.h"
 
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(sibench_row_capture);

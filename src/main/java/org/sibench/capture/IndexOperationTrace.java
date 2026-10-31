@@ -13,7 +13,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.HexFormat;
 import java.util.zip.CRC32C;
 
-/** Versioned normalized operation blocks, separate from raw PG access facts. */
+/** Normalized operation blocks, separate from raw PG access facts. */
 public final class IndexOperationTrace {
     public static final int INSERT = 1, SEARCH = 2, UPSERT = 3, RELOCATE = 4, LOGICAL_DELETE = 5;
     public static final int TRANSACTION_BEGIN = 6, TRANSACTION_COMMIT = 7;
@@ -36,7 +36,6 @@ public final class IndexOperationTrace {
                     | INTERSECT_GROUP
                     | UNION_GROUP;
     public static final int RECORD_BYTES = 128, BLOCK_RECORDS = 4096;
-    public static final int VERSION = 9;
     public static final int MAX_TABLE = 65535, MAX_INDEX = 1024;
     private static final int MAGIC = 0x53494f50;
     /**
@@ -461,8 +460,8 @@ public final class IndexOperationTrace {
         }
 
         private static ByteBuffer header(int magic) {
-            ByteBuffer header = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
-            header.putInt(magic).putInt(VERSION).putInt(RECORD_BYTES).putInt(BLOCK_RECORDS).flip();
+            ByteBuffer header = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
+            header.putInt(magic).putInt(RECORD_BYTES).putInt(BLOCK_RECORDS).flip();
             return header;
         }
 
@@ -563,11 +562,11 @@ public final class IndexOperationTrace {
     private static void blocks(Path file, Blocks blocks) throws IOException {
         try (FileChannel channel = FileChannel.open(file)) {
             ByteBuffer header = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
+            header.limit(12);
             fill(channel, header);
             header.flip();
             int magic = header.getInt();
             if (magic != MAGIC_ZSTD
-                    || header.getInt() != VERSION
                     || header.getInt() != RECORD_BYTES
                     || header.getInt() != BLOCK_RECORDS)
                 throw new IOException("Unknown normalized trace header");

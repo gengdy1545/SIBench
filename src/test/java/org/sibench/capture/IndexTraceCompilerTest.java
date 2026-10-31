@@ -27,7 +27,7 @@ public class IndexTraceCompilerTest {
     /** A target size and row-group limit below zero keep the profile's own. */
     private CaptureConfig baseline(Path fixture, long targetBytes, long maxRows) throws Exception {
         Path root = Path.of("").toAbsolutePath();
-        var original = CaptureConfig.read(root, Path.of("config/hybench_sf1.yaml"));
+        var original = CaptureConfig.read(root, Path.of("src/test/resources/config/hybench_sf1.yaml"));
         Path baseline = Files.createDirectory(fixture.resolve("baseline"));
         var c = original.layout();
         var layout =
@@ -223,7 +223,9 @@ public class IndexTraceCompilerTest {
                                             "processed",
                                             0,
                                             "returned",
-                                            0)));
+                                            0,
+                                            "row_hashes",
+                                            List.of())));
             server.add(
                     new Gson()
                             .toJson(
@@ -391,7 +393,7 @@ public class IndexTraceCompilerTest {
                                         "req", ordinal,
                                         "depth", 1,
                                         "processed", 0,
-                                        "returned", 0)));
+                                        "returned", 0, "row_hashes", List.of())));
         result.add(
                 new Gson()
                         .toJson(
@@ -562,7 +564,7 @@ public class IndexTraceCompilerTest {
     private static String header(int pid, String detail) {
         return "{\"event\":\"capture_start\",\"pid\":"
                 + pid
-                + ",\"xid\":0,\"cid\":0,\"req\":0,\"depth\":0,\"format\":2,\"detail\":\""
+                + ",\"xid\":0,\"cid\":0,\"req\":0,\"depth\":0,\"detail\":\""
                 + detail
                 + "\"}";
     }
@@ -573,7 +575,7 @@ public class IndexTraceCompilerTest {
     private static List<String> summarized(int pid, List<String> rows) {
         var result = new ArrayList<String>();
         result.add("{\"event\":\"capture_start\",\"pid\":" + pid + ",\"xid\":0,\"cid\":0,\"req\":0,\"depth\":0,"
-                + "\"format\":2,\"detail\":\"summary\"}");
+                + "\"detail\":\"summary\"}");
         var counts = new LinkedHashMap<String, long[]>();
         for (String line : rows) {
             var event = JsonParser.parseString(line).getAsJsonObject();
@@ -1138,7 +1140,6 @@ public class IndexTraceCompilerTest {
         var manifest =
                 JsonParser.parseString(Files.readString(output.resolve("manifest.json")))
                         .getAsJsonObject();
-        assertEquals(9, manifest.get("operation_trace_version").getAsInt());
         assertEquals("hybench", manifest.get("benchmark").getAsString());
         assertEquals(21, manifest.get("baseline_operations").getAsLong());
         assertEquals(21, manifest.getAsJsonArray("index_definitions").size());
@@ -1203,6 +1204,17 @@ public class IndexTraceCompilerTest {
                 JsonParser.parseString(Files.readString(fixture.resolve("relocated/report.json")))
                         .getAsJsonObject();
         assertEquals(3, relocated.get("retained_index_entries").getAsLong());
+        Path payload = output.resolve(manifest.getAsJsonArray("incremental_files")
+                .get(0).getAsJsonObject().get("path").getAsString());
+        byte[] original = Files.readAllBytes(payload), corrupt = original.clone();
+        corrupt[corrupt.length / 2] ^= 1;
+        Files.write(payload, corrupt);
+        var corruptReport = fixture.resolve("corrupt-oracle.json");
+        var corruptFailure = assertThrows(java.io.IOException.class,
+                () -> SnapshotLookupValidation.run(output, ReplayConfig.defaults(), corruptReport));
+        assertTrue(corruptFailure.getMessage().contains("Parquet checksum mismatch"));
+        assertFalse(Files.exists(corruptReport));
+        Files.write(payload, original);
         var sourceManifest = manifest.deepCopy();
         sourceManifest.getAsJsonArray("index_definitions").remove(20);
         Files.writeString(output.resolve("manifest.json"), new Gson().toJson(sourceManifest));
@@ -1640,6 +1652,7 @@ public class IndexTraceCompilerTest {
         JsonObject build = new JsonObject();
         build.addProperty("sibench_jar_sha256", FileDigests.sha256(jar));
         build.addProperty("postgres_sha256", "postgres");
+        build.add("native_client", new Gson().toJsonTree(Map.of("benchmark", "hybench", "artifacts", Map.of("client", "fixture"))));
         manifest.add("build", build);
         Files.writeString(run, manifest.toString());
     }

@@ -199,6 +199,68 @@ public class NativeClientParsingTest {
         Files.writeString(pinned.resolve("src/one.c"), "int x;\n");
         Files.writeString(build.resolve("src/one.c"), "int x;\n");
         NativeBuildCheck.require(pinned, build, List.of("src/one.c"));
-        assertEquals(Map.of(), Map.of());
     }
+    @Test
+    public void nativeExecutableMustMatchItsRecordedBuild() throws Exception {
+        Path pinned = folder.newFolder("pinned-binary").toPath();
+        Path build = folder.getRoot().toPath().resolve("build/benchmarks/sysbench");
+        Files.createDirectories(build);
+        Files.createDirectories(pinned.resolve("src"));
+        Files.createDirectories(build.resolve("src"));
+        Files.writeString(pinned.resolve("src/a.c"), "int main() { return 0; }\n");
+        Files.copy(pinned.resolve("src/a.c"), build.resolve("src/a.c"));
+        Path executable = build.resolve("src/sysbench");
+        Files.writeString(executable, "compiled client");
+        assertTrue(executable.toFile().setExecutable(true));
+        assertThrows(IOException.class, () -> NativeBuildCheck.verify(
+                folder.getRoot().toPath(), "sysbench", pinned, build, "source-identity"));
+        var manifest = Map.of("benchmark", "sysbench", "source_commit", "source-identity",
+                "artifacts", Map.of("src/sysbench", FileDigests.sha256(executable)));
+        Files.writeString(build.resolve("native-build.json"), new com.google.gson.Gson().toJson(manifest));
+        NativeBuildCheck.verify(folder.getRoot().toPath(), "sysbench", pinned, build, "source-identity");
+        var nativeConfig = new java.util.LinkedHashMap<String, Object>();
+        nativeConfig.put("build_directory", "build/benchmarks/sysbench");
+        nativeConfig.put("binary", "src/sysbench");
+        var config = new NativeCaptureConfig(folder.getRoot().toPath(), "sysbench", null, null,
+                "test", 5432, "postgres", null,
+                Map.of("source", Map.of("path", "pinned-binary", "commit", "source-identity")), nativeConfig);
+        assertEquals(executable, SysbenchNativeRun.binary(config));
+        Path substitute = build.resolve("another-client");
+        Files.copy(executable, substitute);
+        assertTrue(substitute.toFile().setExecutable(true));
+        for (String selected : List.of("another-client", "/usr/bin/true", "../../../pinned-binary/client")) {
+            nativeConfig.put("binary", selected);
+            assertTrue(assertThrows(IOException.class, () -> SysbenchNativeRun.binary(config))
+                    .getMessage().contains("not part of the verified native build"));
+        }
+        nativeConfig.put("binary", executable.toString());
+        assertEquals(executable, SysbenchNativeRun.binary(config));
+        Files.writeString(executable, "#!/bin/sh\nexit 0\n");
+        assertTrue(assertThrows(IOException.class, () -> SysbenchNativeRun.binary(config))
+                .getMessage().contains("differs from its recorded build"));
+    }
+
+    @Test
+    public void persistedCommandsRedactPasswords() throws Exception {
+        Path logs = folder.newFolder("commands").toPath();
+        NativeProcess.run("redaction", List.of("/bin/true", "db.passwd=example-private-password"),
+                Map.of(), logs, logs, java.time.Duration.ofSeconds(2));
+        assertFalse(Files.readString(logs.resolve("redaction.command")).contains("example-private-password"));
+    }
+
+    @Test
+    public void shellAssignmentsPreserveQuotedPathsWithoutExecutingTheirContents() throws Exception {
+        String value = "path with spaces'$(printf injected)";
+        var buffer = new java.io.ByteArrayOutputStream();
+        var previous = System.out;
+        try (var output = new java.io.PrintStream(buffer, true, java.nio.charset.StandardCharsets.UTF_8)) {
+            System.setOut(output);
+            NativeProcess.assignment("CAPTURE_PATH", value);
+        } finally { System.setOut(previous); }
+        var process = new ProcessBuilder("/bin/sh", "-c", buffer.toString(java.nio.charset.StandardCharsets.UTF_8)
+                + "printf '%s' \"$CAPTURE_PATH\"").start();
+        assertEquals(value, new String(process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
+        assertEquals(0, process.waitFor());
+    }
+
 }

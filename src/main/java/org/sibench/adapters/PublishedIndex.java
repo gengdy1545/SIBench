@@ -40,6 +40,7 @@ import java.util.function.Consumer;
  * object's monitor, which is never held during a backend call or a response callback.
  */
 public final class PublishedIndex implements AutoCloseable, IndexExecution.Executor {
+    static final long FLUSH_TIMEOUT_SECONDS = 3600;
     private final IndexBackend backend;
     private final ExecutorService workers;
     /**
@@ -60,6 +61,8 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
     private final Map<Long, Long> owners = new HashMap<>();
     private long published, nextVersion = 1;
     private boolean closed;
+    private final Object flushLock = new Object();
+    private IOException flushFailure;
 
     public PublishedIndex(IndexBackend backend) throws IOException {
         this.backend = backend;
@@ -99,13 +102,18 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
         void respond(Task task, Response response) {
             actions.add(
                     () -> {
-                        open.remove(task);
+                        synchronized (PublishedIndex.this) {
+                            if (response.getStatus() != Status.OK && flushFailure == null)
+                                flushFailure = new IOException("Accepted request failed: " + response.getMessage());
+                            open.remove(task);
+                        }
                         task.response.complete(response);
                     });
         }
 
         void dispatch(Request request, Runnable call) {
-            var pool = request.getOperationCase() == Request.OperationCase.WRITE ? workers : readers;
+            var pool = request.getOperationCase() == Request.OperationCase.WRITE
+                    || request.getOperationCase() == Request.OperationCase.BATCH ? workers : readers;
             actions.add(
                     () -> {
                         try {
@@ -131,23 +139,12 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
     @Override
     public CompletableFuture<Response> submit(
             Request request, java.util.function.Consumer<Response> partial) {
-        // Baseline entries (version 0) need no ordering or publication; they load in parallel.
-        if (request.getOperationCase() == Request.OperationCase.BATCH
-                || request.getOperationCase() == Request.OperationCase.WRITE
-                        && request.getWrite().getVersion() == 0) {
-            try {
-                return CompletableFuture.supplyAsync(
-                        () -> IndexExecution.execute(backend, request), workers);
-            } catch (RejectedExecutionException closing) {
-                return CompletableFuture.completedFuture(closedResponse(request));
-            }
-        }
         var task = new Task(request, partial);
-        open.add(task);
         var effects = new Effects();
         synchronized (this) {
             try {
                 if (closed) throw new IOException("Published index is closed");
+                open.add(task);
                 accept(task, effects);
             } catch (IOException | RuntimeException error) {
                 effects.respond(task, failure(request, error));
@@ -159,6 +156,11 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
 
     private void accept(Task task, Effects effects) throws IOException {
         Request request = task.request;
+        // Baseline requests share Flush accounting but do not need transaction ordering.
+        if (request.hasBatch() || request.hasWrite() && request.getWrite().getVersion() == 0) {
+            effects.dispatch(request, () -> run(null, task));
+            return;
+        }
         switch (request.getOperationCase()) {
             case WRITE -> {
                 requireTransaction(request);
@@ -206,6 +208,7 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
         try {
             switch (request.getOperationCase()) {
                 case WRITE -> backend.write(request.getWrite());
+                case BATCH -> IndexExecution.batch(backend, request.getBatch());
                 case SEARCH ->
                         found = IndexExecution.search(backend, request, task.partial).getResultsList();
                 case GROUP -> found = IndexExecution.group(backend, request.getGroup());
@@ -216,7 +219,7 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
         }
         var effects = new Effects();
         synchronized (this) {
-            if (request.getOperationCase() == Request.OperationCase.WRITE) {
+            if (request.hasWrite() && request.getWrite().getVersion() > 0) {
                 long version = request.getWrite().getVersion();
                 if (error != null) release(version);
                 else {
@@ -258,10 +261,35 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
 
     /** Records the current watermark and flushes; returns the watermark now durable. */
     public long flush() throws IOException {
-        long version = publishedVersion();
-        backend.recordPublishedVersion(version);
-        backend.flush();
-        return version;
+        synchronized (flushLock) {
+            List<Task> pending;
+            synchronized (this) {
+                if (closed) throw new IOException("Published index is closed");
+                pending = List.copyOf(open);
+            }
+            long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS
+                    .toNanos(FLUSH_TIMEOUT_SECONDS);
+            for (Task task : pending) {
+                try {
+                    task.response.get(Math.max(1, deadline - System.nanoTime()),
+                            java.util.concurrent.TimeUnit.NANOSECONDS);
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Flush interrupted", error);
+                } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException error) {
+                    throw new IOException("Flush could not complete accepted requests", error);
+                }
+            }
+            long version;
+            synchronized (this) {
+                if (closed) throw new IOException("Published index is closed");
+                if (flushFailure != null) throw flushFailure;
+                version = published;
+            }
+            backend.recordPublishedVersion(version);
+            backend.flush();
+            return version;
+        }
     }
 
     @Override

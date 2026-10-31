@@ -27,7 +27,6 @@ public final class IndexServer implements AutoCloseable {
 
     public static IndexServer start(int port, IndexBackend backend) throws IOException {
         var published = new PublishedIndex(backend);
-        var publicationPending = new java.util.concurrent.atomic.AtomicInteger();
         var service = new IndexServiceGrpc.IndexServiceImplBase() {
             @Override
             public void describe(DescribeRequest request, StreamObserver<DescribeResponse> response) {
@@ -59,6 +58,7 @@ public final class IndexServer implements AutoCloseable {
 
             @Override
             public StreamObserver<Request> execute(StreamObserver<Response> responses) {
+                var publicationPending = new java.util.concurrent.atomic.AtomicInteger();
                 // Responses respect gRPC flow control: a sender waits while the client has not
                 // read earlier messages, so chunks of large results are not buffered unboundedly.
                 var call = (io.grpc.stub.ServerCallStreamObserver<Response>) responses;
@@ -122,8 +122,26 @@ public final class IndexServer implements AutoCloseable {
                 };
             }
         };
+        var bound = io.grpc.ServerInterceptors.intercept(service, new io.grpc.ServerInterceptor() {
+            @Override
+            public <Q, S> io.grpc.ServerCall.Listener<Q> interceptCall(
+                    io.grpc.ServerCall<Q, S> call, io.grpc.Metadata headers,
+                    io.grpc.ServerCallHandler<Q, S> next) {
+                if (call.getMethodDescriptor().getFullMethodName()
+                        .equals(IndexServiceGrpc.getExecuteMethod().getFullMethodName())) {
+                    try {
+                        backend.bind(headers.get(GrpcService.INDEX_BINDING));
+                    } catch (IOException | RuntimeException error) {
+                        call.close(io.grpc.Status.FAILED_PRECONDITION
+                                .withDescription(error.getMessage()), new io.grpc.Metadata());
+                        return new io.grpc.ServerCall.Listener<>() {};
+                    }
+                }
+                return next.startCall(call, headers);
+            }
+        });
         return new IndexServer(
-                ServerBuilder.forPort(port).addService(service).maxInboundMessageSize(Integer.MAX_VALUE).build().start(),
+                ServerBuilder.forPort(port).addService(bound).maxInboundMessageSize(Integer.MAX_VALUE).build().start(),
                 published);
     }
 

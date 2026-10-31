@@ -1,9 +1,10 @@
 # Links the rocksdb-cloud JNI binding from prebuilt static libraries (scripts/build-rocksdb-cloud.sh).
 # Only Java_* symbols are exported, so this RocksDB copy never interposes on another in the JVM.
-ROCKSDB_CLOUD ?= ../../../../../index/rocksdb-cloud
-AWS_PREFIX ?= /usr/local
-JAVA_HOME ?= /usr/lib/jvm/java-17-openjdk
-OUT ?= librocksdb_cloud_jni.so
+ROOT := $(abspath ../../../../..)
+ROCKSDB_CLOUD ?= $(ROOT)/build/index/rocksdb-cloud
+AWS_PREFIX ?= $(ROOT)/build/index/aws-sdk
+JAVA_HOME ?= $(shell dirname $$(dirname $$(readlink -f $$(command -v javac))))
+OUT ?= $(ROOT)/build/index/librocksdb_cloud_jni.so
 TEST_OUT ?= $(dir $(OUT))request_latency_test
 
 CXXFLAGS = -std=c++17 -O2 -fPIC -DROCKSDB_PLATFORM_POSIX -DOS_LINUX -DUSE_AWS \
@@ -16,6 +17,7 @@ LIBS = $(ROCKSDB_CLOUD)/librocksdb.a \
 	-lcurl -lssl -lcrypto -lsnappy -lz -lbz2 -llz4 -lzstd -lpthread -lrt -ldl
 
 $(OUT): rocksdb_cloud_jni.cc jni_exports.map
+	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -shared -o $@ rocksdb_cloud_jni.cc $(LIBS) \
 		-Wl,--version-script=jni_exports.map -Wl,--no-undefined
 
@@ -23,6 +25,7 @@ clean:
 	rm -f $(OUT) $(TEST_OUT)
 
 $(TEST_OUT): ../../../../test/native/request_latency_test.cc rocksdb_cloud_jni.cc
+	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -I. -o $@ $< $(LIBS)
 
 test: $(TEST_OUT)

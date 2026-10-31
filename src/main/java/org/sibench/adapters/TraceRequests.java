@@ -65,7 +65,7 @@ public final class TraceRequests {
 
     /**
      * {@code binding} must equal the digest stream's header: trace / baseline identity, operation
-     * trace version, value mode and secondary-index coverage. It stops a digest stream generated
+     * value mode and secondary-index coverage. It stops a digest stream generated
      * for another trace or filter setting from being accepted by query order alone.
      */
     public TraceRequests(ValueKind valueKind, Path expectedResults, String binding)

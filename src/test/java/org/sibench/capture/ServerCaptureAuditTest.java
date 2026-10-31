@@ -25,16 +25,19 @@ public class ServerCaptureAuditTest {
         var lines = new ArrayList<String>();
         lines.add(event("executor_start", req, 1, "\"sql\":\"" + sql + "\""));
         for (long i = 0; i < rows; i++) lines.add(event("result_row", req, 1, "\"values\":[\"x\"]"));
-        lines.add(event("executor_run_end", req, 1, "\"processed\":" + processed));
+        lines.add(event("executor_run_end", req, 1, "\"processed\":" + processed + ",\"returned\":" + rows + ",\"row_hashes\":["
+                + String.join(",", java.util.Collections.nCopies((int) rows, "\"0000000000000000\"")) + "]"));
         lines.add(event("executor_end", req, 1, "\"processed\":" + processed));
         return lines;
     }
 
     private int files;
 
-    private Path write(List<String> lines) throws IOException {
+    private Path writeBody(List<String> lines) throws IOException {
         Path file = folder.newFile("pg-" + (++files) + ".jsonl.zst").toPath();
         try (var out = new com.github.luben.zstd.ZstdOutputStream(Files.newOutputStream(file))) {
+            out.write((event("capture_start", 0, 0, "\"detail\":\"rows\"") + "\n")
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
             for (String line : lines) {
                 out.write(line.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                 out.write('\n');
@@ -54,7 +57,7 @@ public class ServerCaptureAuditTest {
         lines.add(event("transaction_commit", 2, 0, null));
         lines.addAll(statement(3, "UPDATE t SET c=$1 WHERE id=$2", 0, 1));
         lines.add(event("transaction_commit", 3, 0, null));
-        var report = ServerCaptureAudit.audit(write(lines));
+        var report = ServerCaptureAudit.audit(writeBody(lines));
         assertEquals(3L, report.get("requests"));
         assertEquals(3L, report.get("commits"));
         assertEquals(3L, report.get("setup_commits_before_first_execution"));
@@ -68,12 +71,12 @@ public class ServerCaptureAuditTest {
         lines.add(event("executor_start", 1, 1, "\"sql\":\"UPDATE t SET c=$1\""));
         lines.add(event("executor_start", 1, 2, "\"sql\":\"SELECT 1 FROM ONLY p\""));
         lines.add(event("result_row", 1, 2, "\"values\":[\"1\"]"));
-        lines.add(event("executor_run_end", 1, 2, "\"processed\":1"));
+        lines.add(event("executor_run_end", 1, 2, "\"processed\":1,\"returned\":1,\"row_hashes\":[\"0000000000000000\"]"));
         lines.add(event("executor_end", 1, 1, "\"processed\":1"));
-        lines.add(event("executor_run_end", 1, 1, "\"processed\":1"));
+        lines.add(event("executor_run_end", 1, 1, "\"processed\":1,\"returned\":0,\"row_hashes\":[]"));
         lines.add(event("executor_end", 1, 1, "\"processed\":1"));
         lines.add(event("transaction_commit", 1, 0, null));
-        var report = ServerCaptureAudit.audit(write(lines));
+        var report = ServerCaptureAudit.audit(writeBody(lines));
         assertEquals(1L, report.get("requests"));
         assertEquals(1L, report.get("nested_executions"));
         assertEquals(0L, report.get("result_rows"));
@@ -124,8 +127,23 @@ public class ServerCaptureAuditTest {
         assertTrue(message(lines).contains("never returned"));
     }
 
+    @Test
+    public void rejectsMissingHeaderAndMissingReturnHashes() throws Exception {
+        Path missing = folder.newFile("missing-header.jsonl.zst").toPath();
+        RowAuditTestSupport.writeTrace(missing, statement(1, "SELECT 1", 1, 1));
+        assertThrows(IOException.class, () -> ServerCaptureAudit.audit(missing));
+        var lines = new ArrayList<>(statement(1, "SELECT 1", 1, 1));
+        lines.set(2, event("executor_run_end", 1, 1, "\"processed\":1"));
+        assertTrue(message(lines).contains("complete result hashes"));
+        RowAuditTestSupport.writeTrace(missing, java.util.stream.Stream.concat(
+                java.util.stream.Stream.of(event("capture_start", 0, 0, "\"detail\":\"rows\"")
+                        .replace("\"pid\":9", "\"pid\":10")),
+                statement(1, "SELECT 1", 1, 1).stream()).toList());
+        assertThrows(IOException.class, () -> ServerCaptureAudit.audit(missing));
+    }
+
     private String message(List<String> lines) throws IOException {
-        Path file = write(lines);
+        Path file = writeBody(lines);
         return assertThrows(IOException.class, () -> ServerCaptureAudit.audit(file)).getMessage();
     }
 }

@@ -156,7 +156,7 @@ public class AccessLedgerTest {
 
         /** The first line of a capture that records summaries ("summary") or both ("rows"). */
         Trace header(String detail) {
-            return event("capture_start", null, "\"format\":2,\"detail\":\"" + detail + "\"");
+            return event("capture_start", null, "\"detail\":\"" + detail + "\"");
         }
 
         /** An execution's return with the rows it sent, as summaries record it. */

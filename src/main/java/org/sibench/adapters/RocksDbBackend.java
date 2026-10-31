@@ -113,7 +113,6 @@ public final class RocksDbBackend implements IndexBackend {
     public DescribeResponse describe() {
         return DescribeResponse.newBuilder()
                 .setName(store.name())
-                .setProtocolVersion(2)
                 .setValueKind(valueKind)
                 .setVersionedReads(true)
                 .setOrderedSameVersionOverwrite(true)
@@ -130,9 +129,7 @@ public final class RocksDbBackend implements IndexBackend {
     @Override
     public void write(Write write) throws IOException {
         var key = write.getKey();
-        if (key.getTable() < 1 || (key.getIndex() == 0) != key.getIndexedValue().isEmpty()
-                || key.getPrimaryKey().isEmpty())
-            throw new IllegalArgumentException("Invalid entry key");
+        IndexExecution.validateKey(key);
         byte[] entry = entry(key.getTable(), key.getIndex(), key.getIndexedValue(), key.getPrimaryKey());
         byte[] versioned = versioned(entry, write.getVersion());
         switch (write.getKind()) {

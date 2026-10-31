@@ -43,6 +43,27 @@ class IndexRunSummaryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Malformed engine event"):
                 summary.engine_events([path])
 
+    def test_foreign_engine_log_cannot_become_a_passed_combined_measurement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "service.json"
+            log = Path(directory) / "unrelated.LOG"
+            dispatch = dict.fromkeys(("pending_responses", "completed_responses", "target_calls",
+                "source_operations", "filtered_secondary_operations", "transaction_control_records",
+                "commit_markers", "backpressure_seconds", "peak_in_flight", "measurement",
+                "search_latency", "write_latency", "commit_latency"), 0)
+            phase = {**dict.fromkeys(("operations", "seconds", "operations_per_second", "request_bytes",
+                "result_bytes", "flush_seconds", "published_version"), 0), "dispatch": dispatch}
+            path.write_text(json.dumps({"status": "passed", "result": {
+                "per_query_digest_checks": 0, "per_query_digest_mismatches": 0, "search_requests": 0,
+                "service": "test", "baseline": phase, "workload": phase, "queries": 0,
+                "checked_result_items": 0}}))
+            log.write_text('prefix EVENT_LOG_v1 {"event":"compaction_finished","job":1,'
+                           '"time_micros":1000000,"total_output_size":999999}\n')
+            result = summary.summarize(path, [log])
+            self.assertEqual("unverified_engine_provenance", result["status"])
+            self.assertEqual("unverified", result["engine"]["same_run_provenance"])
+            self.assertEqual("passed", result["correctness_status"])
+
     def test_deliberately_wrong_result_and_partial_run_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "service.json"

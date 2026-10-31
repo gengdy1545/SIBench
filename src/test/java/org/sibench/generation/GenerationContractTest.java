@@ -18,6 +18,10 @@ import java.nio.file.Path;
 /** No test invokes a row producer, Parquet writer or generation command. */
 public class GenerationContractTest {
     private static final Path ROOT = Path.of("").toAbsolutePath();
+    private static final java.util.List<String> DERIVED_PROFILES = java.util.List.of(
+            "src/test/resources/config/hybench_sf1000.yaml",
+            "src/test/resources/config/ycsb_1b.yaml",
+            "src/test/resources/config/sysbench_1b.yaml");
 
     @Test
     public void dryRunResolvesAllSchemasWithoutCreatingOutput() throws Exception {
@@ -25,7 +29,7 @@ public class GenerationContractTest {
         for (int i = 0; i < counts.length; i++) {
             var prepared =
                     BaselineGenerator.prepare(
-                            ROOT, Path.of(ScaleInspector.DEFAULT_PROFILES.get(i)));
+                            ROOT, Path.of(DERIVED_PROFILES.get(i)));
             boolean before = Files.exists(prepared.config().output());
             assertEquals(counts[i], prepared.tables().size());
             assertEquals(
@@ -48,7 +52,7 @@ public class GenerationContractTest {
 
     @Test
     public void configurationRejectsUnsupportedAndEscapingOptions() throws Exception {
-        String text = Files.readString(ROOT.resolve(ScaleInspector.DEFAULT_PROFILES.get(1)));
+        String text = Files.readString(ROOT.resolve(DERIVED_PROFILES.get(1)));
         for (String invalid :
                 new String[] {
                     text.replace("row_group_max_rows: 1048576", "row_group_max_rows: 0"),
@@ -60,7 +64,7 @@ public class GenerationContractTest {
                     text.replace("compression_level: 3", "compression_level: 30"),
                     text.replace("partitioning: none", "partitioning: date"),
                     text.replace("bucket_function: ordinal_mod", "bucket_function: random"),
-                    text.replace("results/datasets/ycsb/large", "../outside"),
+                    text.replace("results/datasets/tests/ycsb_1b", "../outside"),
                     text.replace("mode: deterministic_derived", "mode: native")
                 }) {
             assertThrows(
@@ -105,7 +109,7 @@ public class GenerationContractTest {
                                 "--dry-run",
                                 "--root",
                                 ROOT.toString(),
-                                ScaleInspector.DEFAULT_PROFILES.get(1)
+                                DERIVED_PROFILES.get(1)
                             },
                             out,
                             err));

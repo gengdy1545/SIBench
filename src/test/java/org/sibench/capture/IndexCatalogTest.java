@@ -46,6 +46,15 @@ public class IndexCatalogTest {
     }
 
     @Test
+    public void rejectsChangedSourceIdentityEvenWithAnIdenticalSchema() throws Exception {
+        var catalog = IndexCatalog.fromSchema(org.sibench.schema.SourceSchema.hybench(Path.of("benchmark/HyBench-2024")));
+        var manifest = new com.google.gson.Gson().toJsonTree(catalog.provenance()).getAsJsonObject();
+        IndexCatalog.fromManifest(manifest);
+        manifest.addProperty("source_commit", "different-build-of-the-same-schema");
+        assertThrows(IOException.class, () -> IndexCatalog.fromManifest(manifest));
+    }
+
+    @Test
     public void genericMaintenanceSupportsNullLongKeysAndMoreThanTwoIndexes() throws Exception {
         for (boolean rowIds : new boolean[] {false, true}) {
             var model = new IndexReferenceReplay(rowIds);

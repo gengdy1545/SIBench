@@ -32,13 +32,8 @@ public final class SourceSchema {
         }
     }
 
-    private static final Map<String, String> PINS =
-            Map.of(
-                    "hybench", "eaad91b52956fddd3d48ce49f792928056b7b360",
-                    "ycsb", "66302f301b13f60d4bcb2f29f478586bb1d6f2e0",
-                    "sysbench", "3ceba0b1e115f8c50d1d045a4574d8ed643bd497");
-
     private final String benchmark;
+    private final String sourceCommit;
     private final Path source;
     private final List<Table> tables;
     private final Map<String, String> fingerprints;
@@ -50,7 +45,7 @@ public final class SourceSchema {
             Path source,
             List<Table> tables,
             Map<String, String> fingerprints,
-            Map<String, Object> nativeConfig) {
+            Map<String, Object> nativeConfig) throws IOException {
         this(
                 benchmark,
                 source,
@@ -69,8 +64,15 @@ public final class SourceSchema {
             List<Table> tables,
             Map<String, String> fingerprints,
             List<Index> secondaryOrder,
-            Map<String, Object> nativeConfig) {
+            Map<String, Object> nativeConfig) throws IOException {
         this.benchmark = benchmark;
+        try {
+            this.sourceCommit = Files.exists(source.resolve(".git"))
+                    ? git(source, "rev-parse", "HEAD") : "unverified";
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted reading source identity", interrupted);
+        }
         this.source = source;
         this.tables = List.copyOf(tables);
         // Insertion order is kept so that recorded provenance is byte-stable across runs.
@@ -86,11 +88,10 @@ public final class SourceSchema {
             throws IOException, InterruptedException {
         String benchmark = string(config, "benchmark");
         var declared = object(config, "source");
-        String pin = PINS.get(benchmark);
-        require(
-                pin != null && pin.equals(string(declared, "commit")),
-                "Schema adapter requires the reviewed source commit for " + benchmark);
+        require(Set.of("hybench", "ycsb", "sysbench").contains(benchmark), "Unsupported benchmark");
         root = root.toRealPath();
+        String pin = git(root, "rev-parse", ":" + string(declared, "path"));
+        require(pin.equals(string(declared, "commit")), "Source assertion differs from its submodule gitlink");
         Path source = root.resolve(string(declared, "path")).toRealPath();
         require(
                 source.startsWith(root.resolve("benchmark").toRealPath()),
@@ -241,7 +242,7 @@ public final class SourceSchema {
     }
 
     public String sourceCommit() {
-        return PINS.get(benchmark);
+        return sourceCommit;
     }
 
     public Path source() {

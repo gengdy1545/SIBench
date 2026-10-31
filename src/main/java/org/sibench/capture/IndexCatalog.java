@@ -154,6 +154,7 @@ public final class IndexCatalog {
                 List.of(
                         "benchmark",
                         "source_directory",
+                        "source_commit",
                         "source_schema_sha256",
                         "index_definitions"))
             if (!manifest.has(field)) throw new IOException("Missing pinned source provenance");
@@ -168,6 +169,8 @@ public final class IndexCatalog {
                                 benchmark,
                                 Path.of(manifest.get("source_directory").getAsString()),
                                 nativeConfig));
+        if (!catalog.schema.sourceCommit().equals(manifest.get("source_commit").getAsString()))
+            throw new IOException("Source commit differs from the trace provenance");
         Gson gson = new Gson();
         if (!gson.toJsonTree(catalog.schema.fingerprints())
                 .equals(manifest.get("source_schema_sha256")))

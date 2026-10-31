@@ -72,7 +72,7 @@ public class IndexReferenceSearchTest {
     }
 
     @Test
-    public void oldV9LocalSearchFormWithoutItsOwnVersionIsRejected() throws Exception {
+    public void transactionLocalSearchRequiresItsOwnCommitVersion() throws Exception {
         var model = new IndexReferenceReplay(true);
         IndexMutation.emit(
                 IndexOperationTrace.write(0, IndexOperationTrace.INSERT, 1, 0, key(1), 0, 1, 0, 1),
@@ -84,8 +84,7 @@ public class IndexReferenceSearchTest {
                                 1, IndexOperationTrace.UPSERT, 1, 0, key(1), 1, 1, 1, 1)
                         .withTransaction(1, 1);
         IndexMutation.emit(update, Map.of(1, key(0)), Map.of(1, key(0)), model::accept);
-        // Historical v9 form: no SEARCH.version, read point in readTimestamp.
-        var old =
+        var invalid =
                 IndexOperationTrace.search(
                                 2,
                                 1,
@@ -95,7 +94,7 @@ public class IndexReferenceSearchTest {
                                 1,
                                 IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
                         .withTransaction(1, 1);
-        assertThrows(IOException.class, () -> model.accept(old));
+        assertThrows(IOException.class, () -> model.accept(invalid));
         assertEquals(0, model.queries());
     }
 

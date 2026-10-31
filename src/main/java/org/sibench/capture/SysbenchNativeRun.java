@@ -25,9 +25,11 @@ final class SysbenchNativeRun {
 
     static Path binary(NativeCaptureConfig config) throws IOException {
         Path build = config.root().resolve(string(config.nativeConfig(), "build_directory"));
-        NativeBuildCheck.require(
-                config.source(), build, List.of("src/lua", "src/drivers/pgsql", "src/sb_lua.c"));
-        Path binary = build.resolve(string(config.nativeConfig(), "binary"));
+        var identity = NativeBuildCheck.verify(config.root(), config.benchmark(), config.source(), build,
+                string(object(config.document(), "source"), "commit"));
+        Path binary = build.resolve(string(config.nativeConfig(), "binary")).normalize();
+        if (!object(identity, "artifacts").containsKey(build.normalize().relativize(binary).toString()))
+            throw new IOException("sysbench executable is not part of the verified native build: " + binary);
         if (!Files.isExecutable(binary)) throw new IOException("sysbench is not built: " + binary);
         return binary;
     }

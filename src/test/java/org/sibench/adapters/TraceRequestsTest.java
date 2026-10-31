@@ -265,7 +265,7 @@ public class TraceRequestsTest {
         Operation operation = query(3, 1, 1);
         Path file = temporary.newFile().toPath();
         Files.delete(file);
-        try (var writer = new QueryDigest.File(file, true, "workload=a baseline=b version=9 secondary=true mode=rowid")) {
+        try (var writer = new QueryDigest.File(file, true, "workload=a baseline=b secondary=true mode=rowid")) {
             writer.accept(List.of(operation), List.of(result(1, 1, 1)));
         }
         assertThrows(
@@ -274,12 +274,12 @@ public class TraceRequestsTest {
                         new TraceRequests(
                                 ValueKind.ROW_ID,
                                 file,
-                                "workload=a baseline=b version=9 secondary=false mode=rowid"));
+                                "workload=a baseline=b secondary=false mode=rowid"));
         var accepted =
                 new TraceRequests(
                         ValueKind.ROW_ID,
                         file,
-                        "workload=a baseline=b version=9 secondary=true mode=rowid");
+                        "workload=a baseline=b secondary=true mode=rowid");
         accepted.request(51, operation);
     }
 

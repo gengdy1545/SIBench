@@ -17,6 +17,10 @@ import java.util.concurrent.TimeUnit;
 
 /** Starts upstream native clients as separate processes and waits for their sessions to drain. */
 final class NativeProcess {
+    /** Assignments consumed by the shell entry points, including paths containing quotes. */
+    static void assignment(String name, Object value) {
+        System.out.println(name + "='" + value.toString().replace("'", "'\\''") + "'");
+    }
     private NativeProcess() {}
 
     record Result(int exit, Path out, Path err) {
@@ -38,7 +42,8 @@ final class NativeProcess {
         Path out = logs.resolve(name + ".out"), err = logs.resolve(name + ".err");
         Files.writeString(
                 logs.resolve(name + ".command"),
-                String.join(" ", command) + "\n",
+                String.join(" ", command.stream().map(argument ->
+                        argument.startsWith("db.passwd=") ? "db.passwd=<redacted>" : argument).toList()) + "\n",
                 StandardOpenOption.CREATE_NEW);
         var builder = new ProcessBuilder(command).directory(directory.toFile());
         builder.environment().putAll(environment);

@@ -20,13 +20,14 @@ final class CaptureBuild {
     private CaptureBuild() {}
 
     /** The build of this process under {@code root}; a missing part is absent from the map. */
-    static Map<String, Object> identity(Path root) throws IOException {
+    static Map<String, Object> identity(Path root, Map<String, Object> client) throws IOException {
         var result = new LinkedHashMap<String, Object>();
         Path jar = codeSource();
         if (jar != null) result.put("sibench_jar_sha256", FileDigests.sha256(jar));
         Path postgres = root.resolve(POSTGRES), library = root.resolve(ROW_CAPTURE);
         if (Files.isRegularFile(postgres)) result.put("postgres_sha256", FileDigests.sha256(postgres));
         if (Files.isRegularFile(library)) result.put("row_capture_sha256", FileDigests.sha256(library));
+        result.put("native_client", client);
         return result;
     }
 
@@ -44,6 +45,9 @@ final class CaptureBuild {
 
     /** A build that names every part: the jar and the server. */
     static boolean complete(Map<?, ?> build) {
-        return build != null && build.containsKey("sibench_jar_sha256") && build.containsKey("postgres_sha256");
+        return build != null && build.containsKey("sibench_jar_sha256")
+                && build.containsKey("postgres_sha256")
+                && build.get("native_client") instanceof Map<?, ?> client
+                && client.get("artifacts") instanceof Map<?, ?> artifacts && !artifacts.isEmpty();
     }
 }

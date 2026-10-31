@@ -283,7 +283,7 @@ public final class DriverCapacityCheck {
         var requests = new TraceRequests(ValueKind.ROW_ID, fixture.resolve("queries.tsv"), manifest.get("binding").getAsString());
         long started = System.nanoTime();
         Map<String, Object> dispatch;
-        try (var remote = new GrpcService(endpoint, requests);
+        try (var remote = new GrpcService(endpoint, requests, manifest.get("binding").getAsString(), 60);
                 var replay = ReplayProjection.withClients(config(clients), true, remote.factory(), true)) {
             prefix(trace, manifest.get("records").getAsLong(), replay);
             replay.finish();

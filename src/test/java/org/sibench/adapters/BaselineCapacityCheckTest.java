@@ -24,7 +24,7 @@ public class BaselineCapacityCheckTest {
                     .withIndex(1,IndexKey.ofInt(20),IndexOperationTrace.INSERT);
             expected.operation(first);expected.operation(second);
             var requests=new TraceRequests(ValueKind.ROW_ID);requests.baselineBatch(2);
-            try(var server=IndexServer.start(0,sink);var remote=new GrpcService("127.0.0.1:"+server.port(),requests)) {
+            try(var server=IndexServer.start(0,sink);var remote=new GrpcService("127.0.0.1:"+server.port(),requests, "independent baseline test", 5)) {
               var before=sink.received.summary();
               for(int round=0;round<2;round++) {
                 var client=remote.factory().open(0);

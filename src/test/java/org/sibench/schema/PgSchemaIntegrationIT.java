@@ -53,19 +53,19 @@ public class PgSchemaIntegrationIT {
         if (sf1 != null) {
             var report =
                     PgSchemaCheck.check(
-                            root, SourceSchemaTest.config("config/hybench_sf1.yaml"), sf1, user);
+                            root, SourceSchemaTest.config("src/test/resources/config/hybench_sf1.yaml"), sf1, user);
             save("hybench-sf1", report);
             assertEquals(8, ((List<?>) report.get("actual_tables")).size());
             assertEquals(
                     21,
-                    SourceSchemaTest.read("config/hybench_sf1.yaml").tables().stream()
+                    SourceSchemaTest.read("src/test/resources/config/hybench_sf1.yaml").tables().stream()
                             .mapToInt(t -> t.indexes().size())
                             .sum());
         }
         try (Database hybench = new Database(adminJdbc, "hybench");
                 Database ycsb = new Database(adminJdbc, "ycsb");
                 Database sysbench = new Database(adminJdbc, "sysbench")) {
-            var hyConfig = SourceSchemaTest.config("config/hybench_sf1.yaml");
+            var hyConfig = SourceSchemaTest.config("src/test/resources/config/hybench_sf1.yaml");
             SourceSchema hySchema = SourceSchema.read(root, hyConfig);
             hybenchFixture(hybench);
             verified("hybench-source-ddl", hybench, hySchema);
@@ -89,7 +89,7 @@ public class PgSchemaIntegrationIT {
             configuredEnvironment(hybench, hyConfig);
             captureAndCliBoundaries(hybench, hyConfig);
 
-            var ycConfig = SourceSchemaTest.config("config/ycsb_large.yaml");
+            var ycConfig = SourceSchemaTest.config("src/test/resources/config/ycsb_1b.yaml");
             ycsbFixture(ycsb, ycConfig);
             verified("ycsb-ten-text-fields", ycsb, SourceSchema.read(root, ycConfig));
             rejected(
@@ -105,7 +105,7 @@ public class PgSchemaIntegrationIT {
             ycsbFixture(ycsb, ycConfig);
             verified("ycsb-configured-three-fields", ycsb, SourceSchema.read(root, ycConfig));
 
-            var sbConfig = SourceSchemaTest.config("config/sysbench_large.yaml");
+            var sbConfig = SourceSchemaTest.config("src/test/resources/config/sysbench_1b.yaml");
             sysbenchFixture(sysbench, sbConfig);
             verified("sysbench-hundred-tables-serial", sysbench, SourceSchema.read(root, sbConfig));
             rejected(

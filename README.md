@@ -1,170 +1,134 @@
 # SIBench
 
-通过原生 benchmark、真实 Parquet 和确定性索引 Trace 评估 KV Index Service。HyBench、YCSB JDBC、sysbench PG 的已验证输入保留真实索引访问、语句快照与事务内写入前缀。当前 Trace v9 使用保序键编码；Index Service 协议 2 统一完整提交发布，逐查询核对原生条数及完整有序 SHA-256。
+SIBench 从 HyBench、YCSB JDBC 和 sysbench PostgreSQL 的原生执行中采集索引访问，生成 Parquet 与确定性 Trace，用于分析更新局部性和评估 KV Index Service。支持本地 RocksDB 和 rocksdb-cloud，服务回放逐查询核对条数及完整有序 SHA-256。
 
-三来源从零原生生成 / PG 装载、512 MiB 目标文件策略、新采集 / 编译、完整参考 / 独立 oracle 和最新驱动的 COS 全量回放已通过，重试复用边界、分阶段构建及结果见 [最新完整验收](docs/validation/acceptance.md)。文件大小和发送端受控优化见 [测量报告](docs/validation/measurement.md)，小输入恢复保留其 [固定构建证据](docs/validation/rocksdb-cloud.md)。持续饱和容量、正式后端性能排名、数据文件 Rewrite / 版本 GC 和目标规模崩溃恢复仍未验收。
+流程为原生生成与装载 → Baseline 导出与核验 → 原生执行采集 → Trace 编译 → 分析或回放。Trace 表示固定 PG 执行计划下的索引访问，不代表 SQL 端到端性能或原始会话到达时序。
 
 ## 构建
 
+需要 JDK 17、Maven 和 Git；`JAVA_HOME` 指向所用 JDK。
+
 ```bash
-export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 git submodule update --init --recursive
 mvn package
+java -jar build/sibench/sibench.jar --help
+```
+
+生成带依赖的 `build/sibench/sibench.jar`。命令默认使用当前仓库，可用 `--root PATH` 指定；失败返回非零状态。配置中的输出目录、报告文件和新索引目录必须尚不存在，不覆盖失败现场。
+
+### 原生采集组件
+
+需要 C/C++、make、zstd 开发库，以及支持 reflink 的文件系统；XFS 还需 `xfsprogs`。把干净的 PostgreSQL 14.24 源码解压到 `build/benchmarks/postgresql-14.24` 后构建插桩版本：
+
+```bash
+make -C src/main/native/postgres install extension
+```
+
+补丁改变 PG 内部结构，旧源码树 / 对象文件应重新解压后构建。产物位于 `build/services/postgresql-capture/`。来源客户端另需 patch、tar，以及 Maven（HyBench / YCSB）或 autotools、pkg-config、libtool 与 libpq 开发库（sysbench）。从干净子模块构建所需客户端：
+
+```bash
+scripts/build-benchmarks.sh config/benchmark/hybench.yaml
+scripts/build-benchmarks.sh config/benchmark/ycsb.yaml
+scripts/build-benchmarks.sh config/benchmark/sysbench.yaml
+```
+
+构建在 `build/benchmarks/` 的新副本中进行，拒绝覆盖已有构建；`native-build.json` 固定来源提交和实际执行文件 / 类 / 依赖 JAR 的 SHA。采集前核对该记录，采集及认证身份也包含实际客户端。sysbench 的 `native.binary` 必须指向清单内的文件，标准构建为 `src/sysbench`。旧构建缺少记录时须从源码重新构建，不能用事后补写记录代替来源证明。HyBench 的依赖由其 POM 解析，构建副本应用 `scripts/patches/hybench-1.0-snapshot.patch`，排除 `PowerDist` 不使用的 dsol XML 模拟器；实际 POM 也参与构建摘要。YCSB 的 distribution 路径由构建结果确定。
+
+### rocksdb-cloud JNI
+
+仅使用云后端时需要。源码由 `index/rocksdb-cloud` 和 `third_party/aws-sdk-cpp` 子模块 gitlink 固定；Java 依赖版本由 `pom.xml` 固定。构建脚本要求两个子模块处于固定提交且工作区干净。
+
+脚本面向 yum 系统，需要 patch、C/C++、CMake、make 和 JDK 17，以 root 安装 curl、OpenSSL 及压缩库开发依赖，构建副本应用随 JNI 交付的 SDK 路径补丁，确保使用本次 SDK 的头文件。所有 SDK、RocksDB 构建副本和 JNI 产物均放在 `build/index/`，AWS SDK 安装到其中的 `aws-sdk/`。SDK 构建 core、s3、transfer、kinesis 组件，具体选项以脚本为准；构建环境须与运行主机 ABI 兼容。
+
+```bash
+scripts/build-rocksdb-cloud.sh
+```
+
+产物为 `build/index/librocksdb_cloud_jni.so`，运行时以 `-Dsibench.rocksdb_cloud.library=PATH` 指定。上游许可证保留在各自子模块：[rocksdb-cloud](index/rocksdb-cloud/COPYING)、[AWS SDK](third_party/aws-sdk-cpp/LICENSE.txt)。
+
+## 原生采集
+
+```bash
+scripts/native-capture.sh config/benchmark/ycsb.yaml
+```
+
+以能运行自身 PG 集群的非 root 用户执行。Java 优先取 `SIBENCH_JAVA_HOME`、`JAVA_HOME`，否则取 PATH；`SIBENCH_HEAP` 默认 `-Xmx12g`。
+
+默认三来源均为 **87,060,000 行**，HyBench 为 SF10。文件名保持稳定，规模、表数和并发度以文件内容为准：
+
+| 配置 | 职责 |
+| --- | --- |
+| `config/benchmark/hybench.yaml`、`ycsb.yaml`、`sysbench.yaml` | 原生负载、采集库身份与来源执行约束 |
+| `config/sibench.yaml` | PG 服务器参数、参考 / 服务回放驱动及局部性分析 |
+| `config/index/rocksdb.yaml`、`storage.yaml` | 索引服务与对象存储后端 |
+
+每份原生配置声明静止基库，脚本原生装载、核验后停库，以 reflink 克隆后采集；HyBench 各阶段不恢复数据。脚本管理的专用 PG 集群使用本地 trust 认证，原生客户端使用空密码；不会把继承的 `PGPASSWORD` 写入命令行或日志。运行前检查来源、客户端构建与实际 Schema，运行后核对请求、行状态、访问账本和 PG 索引计数器，输出 Baseline、raw、Trace、认证及计时，并把 benchmark / SIBench 有效配置固定到本次目录。PG 原生 `.conf` 从该配置快照生成，不再维护另一份参数文件。成功删除克隆，`SIBENCH_KEEP_DATABASE=1` 可保留；失败产物保留供诊断，不能续写。调整规模或运行参数时保存本次有效配置，并使用新的输出路径。
+
+原生运行的标准输出保存为 `native-run.log`；结构化采集状态和构建身份见 `raw/capture-run.json`。
+
+采集数据目录所在文件系统须支持 reflink。YCSB 的哈希装载数据在导出时做宽行排序，PG 临时空间随输入增长；磁盘容量需覆盖基库、克隆的文件系统额度、Parquet／Trace 产物和临时排序。
+
+## 回放与服务
+
+以下命令复用生成的 Trace，不连接 PG：
+
+```bash
+T=results/poc/ycsb/trace
+java -jar build/sibench/sibench.jar replay config/sibench.yaml "$T" results/reference.json
+```
+
+`replay` 是进程内参考检查，为服务生成逐查询期望。同一 Trace、value 模式及二级过滤配置可复用参考报告与摘要文件；改变客户端数、调度模式或后端时无需重新生成答案。参考配置可调整 `client_count`、`dispatch_mode` 和二级开关，不需要为每种组合保存一份模板。
+
+回放入口自带输入预检、加载核验和结果检查。`check-replay CONFIG TRACE` 用于单独诊断输入，会完整消费 Baseline；无需在每次回放前另跑。修改编译或读取语义、接入后端及正式验收时，按受影响边界显式运行 `validate-snapshots CONFIG TRACE REPORT`，以独立 Parquet 行历史 oracle 核对结果。
+
+启动真实服务，再在另一个终端回放：
+
+```bash
+java -jar build/sibench/sibench.jar index-server config/index/rocksdb.yaml
+```
+
+```bash
+T=results/poc/ycsb/trace
+java -jar build/sibench/sibench.jar replay-service config/sibench.yaml \
+  "$T" results/service.json --reference results/reference.json
+```
+
+参考和服务回放共用 `config/sibench.yaml`，命令决定运行目标。默认模板使用 row_id、64 client 和完整提交发布。已有索引以 `service.reopen: true` 打开，再用 `verify-service` 核对持久化后的快照查询。JNI 构建见上文；存储配置和确认层级见 [Index Service 契约](docs/index-service.md)。COS bucket 是占位值，运行前配置自己的存储及环境凭据。
+
+## 分析与派生生成
+
+```bash
+java -jar build/sibench/sibench.jar analyze-locality \
+  results/poc/ycsb/trace config/sibench.yaml results/locality
+python3 scripts/plot_update_locality.py results/locality --out results/locality/plots
 java -jar build/sibench/sibench.jar inspect-scale
 ```
 
-使用 JDK 17，`mvn package` 包含测试并生成带依赖 JAR。`--root PATH` 指定仓库，默认为当前目录。配置和运行失败返回非零状态。
+绘图需要 Python 3、pandas 和 matplotlib；静态 block / 文件重叠不等于真实 SST 或 compaction 成本。`inspect-scale` 只核对默认来源配置并显示行数，不生成数据。`prepare --dry-run PROFILE` 是独立的派生生成入口，不能使用原生采集配置；派生样例属于开发 / 测试输入，规模不表示压缩文件大小。
 
-原生采集需要支持 reflink 的文件系统。XFS 环境还需安装 `xfsprogs`：脚本在采集库副本上设置 8 KiB CoW 分配提示，限制随机页写产生的未使用预分配；静止基库不变。这是空间容量设置，不能据此推断数据库吞吐提高。
-
-## 原生采集与回放
-
-流程：原生数据生成与 PG Load/建索引 → 静止边界导出并独立验证 Baseline → 原生采集与同次请求/结果核对 → 最终状态审计（完整核验时）→ 规范 Trace 编译（同遍构建访问账本并核对 PG 索引计数器）→ 认证（完整核验时）。三来源同一入口 `scripts/native-capture.sh`；HyBench 的 AP/TP/XP 阶段之间不重新加载或恢复数据。
-
-维护配置的数据文件目标统一为 512 MiB。原生采集配置在已有 `data_layout` 中设置 `target_file_size_bytes: 536870912` 和 `file_size_max_overshoot_percent: 5`；派生生成配置对应 `data_layout.parquet`。目标可改为其它正整数字节数，允许超量可设为 1–100 的整数百分比。基线与增量共用完整压缩文件字节控制，尾文件及拒绝规则见 [存储契约](docs/contracts/storage.md#数据文件)。增量 Parquet 在编译 Trace 时生成，replay 复用它们；改变布局需新输出目录和相应 Physical Trace，共享基线拒绝复用不匹配的旧布局。索引 SST 的大小由后端单独控制。
-
-[hybench_sf1.yaml](config/hybench_sf1.yaml) 是默认 HTAP 配置。每个采集配置以 `postgres.clone_from` 声明静止库：它在 `build/services/postgresql-still/<clone_from>/` 的单独 PG 集群中由脚本的 `base` 阶段只建一次（HyBench 按上游 README 原生 gendata、`ddl_pg.sql`、`load_data_pg.sql` 并建上游二级索引；YCSB / sysbench 以原生客户端装载；随后安装行变化触发器并 `VACUUM (ANALYZE)`），之后停机不再写入。每次采集以 `cp --reflink` 复制停机的集群（需支持 reflink 的文件系统，如 xfs）、把库改名为采集库，成功后删除副本；失败时副本保留以便诊断，下次运行前需手工删除。HyBench 在 `native.work_dir`（含原生 `Data_<sf>`）下运行，装载后只保留运行时读取的两个文件，见 [HyBench 来源](docs/benchmarks/hybench.md)。并发度取原生参数：HyBench 的 `clients` / `xp_transaction_clients` / `xp_query_clients`，YCSB / sysbench 的 `threads`；每个线程一个后端会话，有重叠会话时整次采集按 PostgreSQL 事务完成计数器归并。完整步骤与证据见 [原生采集验证](docs/validation/capture-completeness.md)。
-
-采集与 Baseline export 前自动核对实际 PG 表、完整列和全部索引与固定源码及配置一致；不一致拒绝，不自动补建。三来源可独立检查：
+## 测试
 
 ```bash
-java -jar build/sibench/sibench.jar check-schema config/hybench_sf1.yaml \
-  --jdbc jdbc:postgresql://127.0.0.1:55433/sibench_htap_sf1_capture --user postgres
+mvn test
+python3 -m unittest discover -s src/test/python -p 'test_*.py'
+bash -n scripts/native-capture.sh scripts/build-benchmarks.sh scripts/build-rocksdb-cloud.sh
 ```
 
-支持范围与 YCSB / sysbench 用法见 [来源 Schema 契约](docs/contracts/source-schema.md)。代表规模按 HyBench SF10 与 YCSB / sysbench 各 87,060,000 行对齐，另有较小配置；不支持额外索引类型或运行期动态 DDL。
+云 JNI 的独立 native 计量测试使用 `make -C src/main/native/index/rocksdb_cloud test`，需要先完成上述云后端构建和相同的编译依赖，不连接云服务。
 
-```bash
-make -C src/main/native/postgres install extension   # 补丁改了 PGPROC，源码树已编过时先 clean
-scripts/native-capture.sh config/hybench_sf1.yaml    # 并发 HTAP
-scripts/native-capture.sh config/ycsb_8m.yaml
-scripts/native-capture.sh config/sysbench_8m.yaml
-java -jar build/sibench/sibench.jar compile-trace PROFILE OUTPUT [ROW_AUDIT] [--certification CERT] [--counters BEFORE AFTER]
-java -jar build/sibench/sibench.jar certify-capture PROFILE
-java -jar build/sibench/sibench.jar access-ledger PROFILE RAW REPORT     # 编译失败时诊断全部拒绝
-java -jar build/sibench/sibench.jar compare-ledgers REPORT_A REPORT_B [OUTPUT]
-java -jar build/sibench/sibench.jar snapshot-index-counters PROFILE OUTPUT --jdbc URL --user ROLE
-java -jar build/sibench/sibench.jar check-capture-completeness PROFILE LEDGER BEFORE AFTER
-```
+默认 Maven 运行 Java 单元测试，不执行 `*IT` 或容量诊断的 `main`。Python 检查脚本行为与报告分析，不启动外部服务。集成测试用 `mvn -Dtest=类名 test` 显式选择，连接已有隔离 PG14.24，并使用新的证据目录：
 
-后端追踪统一写成 zstd 流（`pg-<pid>.jsonl.zst`，需要 `libzstd-dev` 构建 PG），所有读取方透明解压。插桩默认按访问记录汇总（`capture.detail: summary`）：每个索引访问结束时一条 `scan_summary`，bitmap 堆判定按输入集合聚合，结果行记为哈希。`capture.detail: rows` 另保留全部逐行事件，账本逐条核对汇总与逐行事件相等，用于在同一次原生执行上验收汇总格式；两种格式编出的 Trace 除原始文件行号外完全相同，见 [采集完整性验证](docs/validation/capture-completeness.md)。
-
-脚本以 `compute_query_id = on` 启停本地 PG，依次执行建库加载、预检、Baseline 导出、原生执行（结束后并行审计全部会话）、行状态审计与认证（仅完整核验）和 `compile-trace`（输出 `<产物目录>/trace`，内含 `access-ledger.json` 与 `capture-completeness.json`）。核验方式由 `capture.verification` 决定：`full`（默认）做行状态审计，编译后 `certify-capture` 写出 `<产物目录>/certification.json`，记录构建（jar、PG 二进制、触发器库）、来源与索引定义、采集格式及覆盖的访问路径与提交变化类别；`certified` 以 `capture.certification` 指定的认证代替行状态审计，构建或来源不同、出现认证未覆盖的路径或类别即编译失败，见 [Trace 契约](docs/contracts/trace.md)。原生执行前后各取一次 PG 索引计数器快照（等其它会话退出、两次相隔一个统计周期的读数一致后才记录），编译（`--counters`）按 PG14 计数位置核对同遍构建的账本，一致才提交 Trace：`idx_tup_read` 等于候选数，`idx_tup_fetch` 等于经堆判定可见的行（不含 bitmap 与全可见 index-only），`idx_scan` 落在账本推出的树下降上下界内，不一致则编译失败、Trace 保持未完成；`check-capture-completeness` 可对已有账本单独核对。已有采集集群或输出目录会被拒绝；采集结束时删除采集集群副本（终态已由审计读过，`SIBENCH_KEEP_DATABASE=1` 保留以便诊断），完整核验在认证后删除已审计的行变化文件，此后该采集以自己的认证（`--certification`）重编。每个阶段把墙钟、事件数和本次运行的关键事实追加到 `<产物目录>/run-timing.json`，长阶段按秒输出速率，便于比较两次运行并定位热点。任何命令都可用 `--timing FILE` 追加到同一份计时产物。账本按 PG 追踪把索引事件划分为访问单元并给出每个单元的投影决定，模板为 PG `query_id`，不连接 PG；`compile-trace` 对任一不能投影的访问失败，此时独立的 `access-ledger`（REPORT 必须是新文件）给出全部拒绝。`config/*_small.yaml` 是约 15 秒的冒烟配置。回放量以“已提交行写入 ÷ 基线行数”衡量，每个 Trace 的 manifest 给出 `row_write_ratio`；`plan-operations PROFILE CALIBRATION_TRACE REPLAY_CONFIG` 由同来源、同规模的一次校准采集，按回放配置的操作预算（如 `long_replay.yaml` 的 6.66 亿有效运行期操作，与 `check-replay` 同一计数）按同一倍数换算 sysbench 的 `events`、YCSB 的 `operationcount` 或 HyBench 的 TP / XP 阶段时长，用于大数据量（如 SF1000）的正式采集；SF10 等规模的正式采集用 `plan-write-ratio PROFILE CALIBRATION_TRACE RATIO` 按已提交行写入比例（5%）换算。实际结果以按计划采集的 Trace 为准。证据见 [原生采集验证](docs/validation/capture-completeness.md) 与 [完整验收](docs/validation/acceptance.md)。
-
-并发 HTAP 按 PostgreSQL 事务完成计数器编译：写事务在持锁自增时记录精确位置，只读事务排在同位置写事务之后，事务大小的片段据此 k 路归并；查询读取其语句快照所见的最后一个写事务，并用快照自己的 xip 逐条交叉验证，计数器或快照缺失、冲突时拒绝，不按 PID、XID 大小、文件顺序或墙钟推断。
-
-源行核验统一由 `RowStateAudit` 完成：完整旧 / 新行和最终 PG 状态在同一次审计中核对。默认在 raw 目录保存 `row-state-audit.json` 及已审计变化；相同报告与输入重复调用只复核摘要，不重查 PG。编译必须先有匹配报告或匹配的认证。三来源 PK 值 UPDATE（包括回滚尝试）固定拒绝，不影响普通列 / 二级索引列 UPDATE 或同主键删除重插入。
-
-三来源通用入口为 `audit-rows PROFILE BASELINE RAW [REPORT] --jdbc URL --user ROLE`；指定自定义报告时，`compile-trace PROFILE OUTPUT ROW_AUDIT` 显式引用它。审计前业务库必须处于原采集结束的静止状态；历史报告不改写，详情见 [统一行状态审计](docs/validation/row-state-audit.md)。
-
-[index_replay.yaml](config/index_replay.yaml) 控制下游发送。参考模型的内存有界：基线条目超过预算时外部排序为磁盘 run，版本历史落入可落盘的有序 map；可用 `-Dsibench.reference.baseline_entries=N`（默认 64,000,000）、`-Dsibench.reference.overlay_entries=N`（默认 500,000）、`-Dsibench.reference.sort_bytes=N`、`-Dsibench.reference.directory=DIR`（每个模型在其下建独占的子目录，关闭时删除）调整，结果与预算无关。`-Dsibench.trace=1` 在失败时打印堆栈。以下回放规范 Trace，不执行 SQL、不连接 PG：
-
-本轮完整输入分别保留在 `sibench_1 / 2 / 3` 的 `/data/sibench` 工作区，本地保存选定报告与小输入，详见 [验收证据](docs/validation/acceptance.md#证据与复现)。以下完整输入命令在对应来源主机执行；目标规模服务使用证据内的 600 秒保护配置，通用模板的默认期限另计。
-
-```bash
-T=results/poc/acceptance-20261029T181200Z/hybench/capture/trace
-java -Xmx24g -jar build/sibench/sibench.jar check-replay config/index_replay_128clients.yaml $T
-java -Xmx40g -jar build/sibench/sibench.jar replay config/index_replay_64clients.yaml $T REPORT
-java -Xmx40g -jar build/sibench/sibench.jar validate-snapshots config/index_replay.yaml $T REPORT
-java -Xmx24g -jar build/sibench/sibench.jar validate-replay-matrix SMALL_TRACE_DIRECTORY OUTPUT_DIRECTORY
-java -Xmx24g -jar build/sibench/sibench.jar check-relocation PROFILE $T OUTPUT_DIRECTORY
-```
-
-回放和快照报告必须是新文件。以上是通用调用形式；精确复现本轮使用证据中的有效配置及 `*-command.json`，包括参考模型内存参数和 value 选择。组合矩阵使用小输入，完整输入只跑代表配置。`check-replay` 检查 Trace 完整性、工作单元身份摘要、过滤后的 client 覆盖与有效操作预算；`replay` 是两种 value 的进程内正确性检查，不代表真实网络 client；`validate-snapshots` 使用独立行历史 oracle，派生探针不计入原生负载或性能；`validate-replay-matrix` 跑 1/64/128 client × 两种输入模式 × 二级开 / 关，要求操作顺序、状态与结果完全等价；`check-relocation` 搬迁实际修改表的最新存活行，核对精确版本 Locator 搬迁、RowID 不变。
-
-- `target.secondary_indexes.enabled` 默认 true；false 过滤全部二级加载、查询和维护，完整 Trace/Parquet 不变。
-- `target.value`（`locator` / `row_id`）只让 `replay` 与 `validate-snapshots` 运行该 value 模式；缺省两种都运行。服务回放的 value 在 `target.service.value`，两者不能同时出现。
-- `replay.dispatch_mode` 默认 `operation`，以操作为驱动输入单位；[index_replay_transaction.yaml](config/index_replay_transaction.yaml) 使用 `transaction` 按已提交源事务组织输入。两者最终均逐操作路由、单线程保序发送，不合并修改，不向索引发送事务控制，也不要求下游事务 API。
-- `replay.client_count` 默认 1；[64 client](config/index_replay_64clients.yaml) 和 [128 client](config/index_replay_128clients.yaml) 使用同一份 Trace。按源 SQL 请求分配 `workUnitId`，固定路由为 `(workUnitId - 1) % client_count`；同请求的主键/二级展开共用 client，同事务可跨 client。不按索引键或事务绑定，不增加其他路由策略。数量可超过 128，但过滤后的运行期操作必须覆盖全部配置 client，不足则拒绝并继续原生采集。
-- 本地发送完成后即可发下一项，不等待执行完成或跨 client 可见。`sent`/`response` 分开确认；`max_in_flight` 默认 4096，`request_timeout_seconds` 默认 60。驱动只在背压及最终排空时等待响应，遇到错误停止并清理，不通过屏障、重试或补偿修复服务端可见性。
-- 默认只向下游发送已提交变更，不限定 Index Service 场景。源 commit 后保留事务内查询与修改的原始顺序；写后查询携带原语句快照、本事务 CommitVersion 及此前修改位置，读取时只叠加本事务的这部分写入。回滚修改及修改后的查询排除，修改前的受支持查询保留；原始事实不变，无反向操作或回撤开关。
-- [long_replay.yaml](config/long_replay.yaml) 要求 single_pass、666,000,000 个有效操作；SF1 短输入会在预检失败。持续调度和分段供应尚未实现。
-- 异常运行保留诊断并拒绝编译；修复后从明确初始状态换新目录重跑。
-
-## 更新局部性
-
-静态分析只读已有 Trace / Baseline，不重采 PG：
-
-```bash
-java -Xmx24g -jar build/sibench/sibench.jar analyze-locality \
-  results/poc/acceptance-20261029T181200Z/hybench/capture/trace config/update_locality.yaml results/poc/locality-example
-python3 scripts/plot_update_locality.py results/poc/locality-example --out results/poc/locality-example/plots
-```
-
-绘图需要 Python 3、pandas 和 matplotlib。`config/update_locality.yaml` 固定 block / 文件布局、业务窗口和 L0 批次参数；输出窗口、block、L0 重叠和热力图。静态估算不是真实 SST / compaction 字节，方法和边界见 [更新局部性验证](docs/validation/update-locality.md)。
-
-## Index Service 回放
-
-驱动通过 [Index Service 协议](docs/contracts/index-service.md)（`src/main/proto/index_service.proto`）把规范 Trace 发给 KV 索引服务：每个 client 一条有序 gRPC 流，查询组整体发送，每个查询的返回条数必须等于原生期望数，并逐查询核对绑定查询身份与完整 `(PK, version, value)` 的 SHA-256 摘要。`--reference` 给出同一 Trace 的参考回放报告时复用其摘要 sidecar；没有时在回放前从同一 Trace 生成。
-
-```bash
-T=results/poc/acceptance-20261029T170600Z/sysbench/capture/trace
-java -jar build/sibench/sibench.jar index-server config/index_service_rocksdb.yaml &      # RocksDB 服务，端口 50551
-java -jar build/sibench/sibench.jar replay-service config/service_replay_grpc.yaml $T REPORT --reference REFERENCE
-java -jar build/sibench/sibench.jar replay-service config/service_replay_rocksdb.yaml $T REPORT  # 进程内 RocksDB，无网络
-```
-
-索引目录已存在即拒绝；一个索引只加载一份 Trace 的 Baseline。服务与进程内 adapter 都按事务位置执行，以 `Commit` 标记连续推进完整发布水位，查询等待 `read_version` 发布；没有调度模式开关。`Flush` 持久化水位、Trace binding 与数据。示例统一使用 row_id，Locator 需同时修改服务与回放的 value。
-
-重启或冷启动后，`service.reopen: true` 打开同一索引，再用 `verify-service` 按原读点核对 workload 的全部快照查询（不发送写入，事务内查询不核对并单列）：
-
-```bash
-java -jar build/sibench/sibench.jar verify-service REPLAY_CONFIG $T REPORT --reference REFERENCE
-```
-
-`service.backend: rocksdb_cloud` 使用 rocksdb-cloud（JNI，语义与本地 RocksDB 共用），另需 `storage: config/storage.yaml`、`profile`（`local_s3` / `cos`）与 profile prefix 之下的 `object_path`；凭据只从 profile 指定的环境变量读取。JNI 库须在目标机（glibc 2.28）构建：先运行 `git submodule update --init --recursive -- index/rocksdb-cloud third_party/aws-sdk-cpp`，再以 root 运行 `scripts/build-rocksdb-cloud.sh`。脚本要求两个子模块均处于主仓库固定的提交且工作区干净；产物为 `build/index/librocksdb_cloud_jni.so`，运行时用 `-Dsibench.rocksdb_cloud.library=PATH` 指定。源码版本由子模块 gitlink 固定，构建要求与许可证见 [third_party/versions.yaml](third_party/versions.yaml)，语义见 [Index Service 契约](docs/contracts/index-service.md#rocksdb-cloud-后端)。
-
-jar 与 JNI 的请求统计格式须配套重建；云后端在每次 Flush 的 `*.engine-stats.jsonl` 中记录对象请求延迟桶和分位数上界。成功服务回放与同次运行的 RocksDB 事件日志可生成独立测量摘要（日志可重复指定；输出文件必须尚不存在）：
-
-```bash
-python3 scripts/summarize_index_run.py RUN/service.json --engine-log RUN/index/LOG --output RUN/index-measurement.json
-```
-
-该脚本只分析报告和引擎日志，不解码 Trace。重开后的 `LOG` 与原加载进程的 `LOG.old.*` 分开选择；缺日志写 N/A，缺少结束边界的 job 单列，不把日志采集缺口写成零工作量。观测范围与实例见 [测量口径](docs/validation/measurement.md)。
-
-## Baseline 生成配置
-
-此入口使用 `deterministic_derived`，与原生采集分开。规模不是压缩文件大小，三套配置均待容量校准。
-
-| 来源 | 配置 | 初始规模 |
-| --- | --- | ---: |
-| HyBench | [hybench_sf1000.yaml](config/hybench_sf1000.yaml) | 1000x，8,706,000,000 行 |
-| YCSB | [ycsb_large.yaml](config/ycsb_large.yaml) | 1,000,000,000 行，10 × 100 字节字段 |
-| sysbench | [sysbench_large.yaml](config/sysbench_large.yaml) | 100 表 × 10,000,000 行 |
-
-```bash
-java -jar build/sibench/sibench.jar prepare --dry-run config/hybench_sf1000.yaml
-java -jar build/sibench/sibench.jar prepare --dry-run config/ycsb_large.yaml
-java -jar build/sibench/sibench.jar prepare --dry-run config/sysbench_large.yaml
-```
-
-dry-run 只校验源码指纹、配置和 schema，不创建数据。去掉 `--dry-run` 会真实生成，输出目录必须不存在；当前无续写，不覆盖中断产物。
-
-## 目录与文档
-
-| 路径 | 用途 |
+| 集成测试 | 必需配置 |
 | --- | --- |
-| `benchmark/` | 固定上游子模块，不直接修改 |
-| `src/main/java/org/sibench/`、`src/test/java/org/sibench/` | Java 核心与测试，按职责组织 |
-| `src/main/native/postgres/` | PG 14.24 采集插桩（`sibench_capture.c` 加调用点补丁），作用于隔离构建副本 |
-| `src/main/native/index/` | 索引后端的薄 JNI 绑定（rocksdb-cloud），只转发字节 |
-| `index/` | 被测索引引擎的固定上游源码子模块 |
-| `third_party/` | 通用第三方依赖子模块；`versions.yaml` 集中记录外部依赖的构建要求、许可证与服务二进制版本 |
-| `src/main/proto/` | Index Service 协议定义 |
-| `scripts/` | 串联已有 Java CLI 阶段的编排脚本，不含来源语义 |
-| `config/` | 长期维护的平铺配置，工作负载命名 `<benchmark>_<scale>.yaml`；单次有效配置随运行证据保存，测试夹具归测试资源 / 临时目录 |
-| `build/sibench/`、`build/benchmarks/`、`build/index/`、`build/services/` | 核心构建、上游构建、索引后端构建、本地服务状态 |
-| `results/` | 本地数据与实验证据，不纳入源码 |
+| `PgSchemaIntegrationIT` | `SIBENCH_SCHEMA_TEST_JDBC`；`-Dsibench.schema.evidence=目录` |
+| `PgBaselineExportIntegrationIT` | 同一 JDBC 变量，当前夹具使用 postgres / 空密码；`-Dsibench.layout.evidence=目录` |
+| `RowStateAuditIntegrationIT` | `SIBENCH_ROW_TEST_JDBC`、`SIBENCH_ROW_CAPTURE_DIR`；`-Dsibench.row.evidence=目录` |
+| `IndexKeyOrderIT` | `SIBENCH_KEY_TEST_JDBC`，仅创建临时表 |
 
-- [计划](plan.md)：后续目标、依赖与验收。
-- [Trace 契约](docs/contracts/trace.md)：版本、操作、发送及完整性。
-- [Index Service 协议契约](docs/contracts/index-service.md)：gRPC 协议、驱动侧核对与 RocksDB 参照实现。
-- [管线核验职责](docs/contracts/pipeline-validation.md)：实现测试、输入证明与每次运行核验的区别、复用边界和计量范围。
-- [来源 Schema 契约](docs/contracts/source-schema.md)：三来源布局、PG 预检及失败边界。
-- [原生采集与完整性](docs/validation/capture-completeness.md)：并发执行、行审计、访问账本和计数器。
-- [三来源验收](docs/validation/acceptance.md)、[测量口径](docs/validation/measurement.md)、[采集环境](docs/validation/capture-performance.md)：最新完整输入、结果与资源边界。
-- [正确性验证依据](docs/validation/correctness.md)：原生两会话反例、结果校验负例与发布边界的受控交错。
-- [存储契约](docs/contracts/storage.md)：布局、Rewrite、GC 和测量边界。
-- [rocksdb-cloud 验证](docs/validation/rocksdb-cloud.md)：构建、对象存储核验、功能 / 重启 / 冷启动与边界。
-- [能力矩阵](docs/benchmarks/capability-matrix.md)：各来源当前覆盖。
-- 来源差异：[HyBench](docs/benchmarks/hybench.md)、[YCSB](docs/benchmarks/ycsb.md)、[sysbench](docs/benchmarks/sysbench.md)。
+Schema / 行审计 / 键序测试的用户分别由 `SIBENCH_SCHEMA_TEST_USER` / `SIBENCH_ROW_TEST_USER` / `SIBENCH_KEY_TEST_USER` 指定，默认 postgres，密码为 `PGPASSWORD`。前三类会创建并删除自己的随机测试库，证据目录的父目录须存在。行审计的触发器库默认在 `build/services/postgresql-capture/row_capture.so`，独立构建可用 `-Dsibench.row.library=文件` 指定。行审计还需插桩 PG 在启动前设置 `SIBENCH_CAPTURE_DIR` 为同一采集目录、`SIBENCH_CAPTURE_COMPRESS=zstd`、`SIBENCH_CAPTURE_DETAIL=summary`，并启用 `compute_query_id=on`。
+
+## 支持边界
+
+当前 [Trace](docs/trace.md) 和 [Index Service](docs/index-service.md) 只适配固定来源布局，拒绝额外索引类型、动态 DDL 与主键值 UPDATE。YCSB 没有二级索引；sysbench 标准脚本不按 k 查询；HyBench 默认不运行 freshness DELETE。数据文件目标默认 512 MiB，布局改变需重建相应物理输入。
+
+数据文件 Rewrite、物理版本 GC、分段续编和未知写入的自动恢复尚未实现。默认测试与短输入不证明持续饱和容量、巨大查询组、目标规模崩溃恢复、断电耐久性或后端性能排名。

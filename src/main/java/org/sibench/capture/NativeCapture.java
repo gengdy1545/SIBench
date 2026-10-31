@@ -17,11 +17,6 @@ public final class NativeCapture {
 
     private NativeCapture() {}
 
-    /**
-     * How the instrumented PG records index accesses: one summary per access ({@code summary}, the
-     * default), or also every row ({@code rows}), which the access ledger checks the summaries
-     * against. The script passes it to PG and the native clients as SIBENCH_CAPTURE_DETAIL.
-     */
     /** Backend traces are always zstd streams; the script passes this to PG. */
     static String compression(java.util.Map<String, Object> document) {
         var capture = org.sibench.config.ConfigValues.object(document, "capture");
@@ -32,6 +27,7 @@ public final class NativeCapture {
         return "zstd";
     }
 
+    /** One summary per access, or also every row to cross-check the summaries. */
     static String detail(java.util.Map<String, Object> document) {
         var capture = org.sibench.config.ConfigValues.object(document, "capture");
         if (!capture.containsKey("detail")) return "summary";
@@ -69,8 +65,8 @@ public final class NativeCapture {
         System.out.println("SIBENCH_VERIFICATION=" + verification(document));
         var capture = org.sibench.config.ConfigValues.object(document, "capture");
         if (capture.containsKey("certification"))
-            System.out.println(
-                    "SIBENCH_CERTIFICATION='" + org.sibench.config.ConfigValues.string(capture, "certification") + "'");
+            NativeProcess.assignment("SIBENCH_CERTIFICATION",
+                    org.sibench.config.ConfigValues.string(capture, "certification"));
     }
 
     public static void main(String[] args) throws Exception {
@@ -109,11 +105,11 @@ public final class NativeCapture {
                 .note("capture_compression", compression(config.document()));
         switch (args[0]) {
             case "paths" -> {
-                System.out.println("SIBENCH_RAW='" + config.raw() + "'");
+                NativeProcess.assignment("SIBENCH_RAW", config.raw());
                 System.out.println("SIBENCH_PORT=" + config.port());
-                System.out.println("SIBENCH_DATABASE='" + config.database() + "'");
-                System.out.println("SIBENCH_ARTIFACTS='" + config.artifacts() + "'");
-                System.out.println("SIBENCH_BASE='" + config.cloneFrom() + "'");
+                NativeProcess.assignment("SIBENCH_DATABASE", config.database());
+                NativeProcess.assignment("SIBENCH_ARTIFACTS", config.artifacts());
+                NativeProcess.assignment("SIBENCH_BASE", config.cloneFrom());
                 paths(config.document());
             }
             case "base" -> StillBase.build(config);
@@ -136,17 +132,18 @@ public final class NativeCapture {
             throws Exception {
         switch (stage) {
             case "paths" -> {
-                System.out.println("SIBENCH_RAW='" + config.raw() + "'");
+                NativeProcess.assignment("SIBENCH_RAW", config.raw());
                 System.out.println(
                         "SIBENCH_PORT="
                                 + org.sibench.config.ConfigValues.positive(
                                         org.sibench.config.ConfigValues.object(
                                                 config.document(), "postgres"),
                                         "port"));
-                System.out.println("SIBENCH_DATABASE='" + config.database() + "'");
-                System.out.println("SIBENCH_ARTIFACTS='" + config.artifacts() + "'");
-                System.out.println("SIBENCH_WORKDIR='" + config.workDir() + "'");
-                System.out.println("SIBENCH_BASE='" + config.cloneFrom() + "'");
+                NativeProcess.assignment("SIBENCH_DATABASE", config.database());
+                NativeProcess.assignment("SIBENCH_ARTIFACTS", config.artifacts());
+                NativeProcess.assignment("SIBENCH_HYBENCH", root.resolve(NativeBuildCheck.HYBENCH_DIRECTORY));
+                NativeProcess.assignment("SIBENCH_WORKDIR", config.workDir());
+                NativeProcess.assignment("SIBENCH_BASE", config.cloneFrom());
                 paths(config.document());
             }
             case "base" -> HybenchNativeBase.build(config);
@@ -178,11 +175,14 @@ public final class NativeCapture {
             try {
                 CaptureRun.requireQueryIdentity(config.jdbc(), config.user());
                 var settings = PgSettings.read(config.jdbc(), config.user());
-                run.build(PgSettings.identity(CaptureBuild.identity(config.root()), settings));
-                run.postgresSettings(settings.all());
                 run.schemaPreflight(
                         PgSchemaCheck.check(
                                 config.root(), config.document(), config.jdbc(), config.user()));
+                run.build(PgSettings.identity(CaptureBuild.identity(config.root(), NativeBuildCheck.verify(config.root(),
+                        config.benchmark(), config.source(), config.root().resolve(org.sibench.config.ConfigValues.string(
+                                config.nativeConfig(), "build_directory")), org.sibench.config.ConfigValues.string(
+                                org.sibench.config.ConfigValues.object(config.document(), "source"), "commit"))), settings));
+                run.postgresSettings(settings.all());
                 var summary = ycsb ? YcsbNativeRun.run(config, logs) : SysbenchNativeRun.run(config, logs);
                 run.completeExternal(ycsb, summary);
                 System.out.println(

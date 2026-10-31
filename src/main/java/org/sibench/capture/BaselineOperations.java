@@ -252,12 +252,14 @@ public final class BaselineOperations {
     }
 
     /**
-     * The columns the load needs of a table's rows, those of them the file has: the row identity
-     * and every indexed column. A column the file lacks stays absent, so it fails as before.
+     * The row identity, every indexed column and the caller's metadata, in file order.
+     * A column the file lacks stays absent, so it fails when consumed.
      */
-    private static MessageType projection(IndexCatalog catalog, String table, MessageType type) {
+    public static MessageType projection(
+            IndexCatalog catalog, String table, MessageType type, String... metadata) {
         var needed = new java.util.LinkedHashSet<String>();
         needed.add("_sib_row_id");
+        java.util.Collections.addAll(needed, metadata);
         for (var definition : catalog.definitions())
             if (definition.table().equals(table)) needed.add(definition.column());
         var fields = new ArrayList<org.apache.parquet.schema.Type>();

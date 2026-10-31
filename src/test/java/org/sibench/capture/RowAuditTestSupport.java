@@ -37,7 +37,7 @@ final class RowAuditTestSupport {
             throws Exception {
         Path directory = Files.createDirectory(fixture.resolve("baseline"));
         var original =
-                CaptureConfig.read(Path.of(""), Path.of("config/hybench_sf1.yaml"))
+                CaptureConfig.read(Path.of(""), Path.of("src/test/resources/config/hybench_sf1.yaml"))
                         .layout();
         var config =
                 new GenerationConfig(
@@ -372,6 +372,7 @@ final class RowAuditTestSupport {
             throws Exception {
         var client = new ArrayList<String>();
         var server = new ArrayList<String>();
+        server.add(JSON.toJson(Map.of("event", "capture_start", "pid", 1, "detail", "rows")));
         client.add(JSON.toJson(Map.of("event", "connection", "pid", 1)));
         for (int i = 0; i < transactions.size(); i++) {
             String app = "fixture-" + i;
@@ -405,7 +406,8 @@ final class RowAuditTestSupport {
                 server.add(JSON.toJson(event));
             }
             server.add(
-                    JSON.toJson(Map.of("event", "executor_run_end", "application", app, "pid", 1)));
+                    JSON.toJson(Map.of("event", "executor_run_end", "application", app, "pid", 1,
+                            "depth", 1, "returned", 0, "row_hashes", List.of())));
             server.add(JSON.toJson(Map.of("event", "executor_end", "application", app, "pid", 1)));
             client.add(
                     JSON.toJson(

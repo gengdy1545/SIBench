@@ -22,9 +22,9 @@ import java.util.Set;
 public final class ScaleInspector {
     public static final List<String> DEFAULT_PROFILES =
             List.of(
-                    "config/hybench_sf1000.yaml",
-                    "config/ycsb_large.yaml",
-                    "config/sysbench_large.yaml");
+                    "config/benchmark/hybench.yaml",
+                    "config/benchmark/ycsb.yaml",
+                    "config/benchmark/sysbench.yaml");
 
     // Reviewed against the pinned HyBench resource and generation loops.
     private static final Map<String, Long> HYBENCH_SF1000_ROWS =
@@ -54,6 +54,34 @@ public final class ScaleInspector {
         Path path = inside(root, profile);
         byte[] bytes = Files.readAllBytes(path);
         Map<String, Object> config = parse(new String(bytes, StandardCharsets.UTF_8));
+        require(integer(config, "schema_version") == 1, "Unsupported profile schema");
+        if (string(config, "purpose").equals("native_capture_poc")) {
+            var schema = org.sibench.schema.SourceSchema.read(root, config);
+            var nativeConfig = object(config, "native");
+            long rows;
+            switch (schema.benchmark()) {
+                case "hybench" -> {
+                    Path source = inside(root, Path.of(string(object(config, "source"), "path")));
+                    var parameters = new com.moandjiezana.toml.Toml()
+                            .read(source.resolve("src/main/resources/parameters.toml").toFile())
+                            .getTable(string(nativeConfig, "sf"));
+                    require(parameters != null, "Unknown HyBench scale");
+                    rows = Math.multiplyExact(3, Math.addExact(parameters.getLong("customer_number"),
+                            parameters.getLong("company_number")));
+                    for (String table : List.of("transfer", "checking", "loanapps", "loantrans"))
+                        rows = Math.addExact(rows, parameters.getLong(table + "_number"));
+                }
+                case "ycsb" -> rows = positive(nativeConfig, "insertcount");
+                case "sysbench" -> rows = Math.multiplyExact(positive(nativeConfig, "tables"),
+                        positive(nativeConfig, "table-size"));
+                default -> throw new IllegalArgumentException("Unknown benchmark");
+            }
+            return new LinkedHashMap<>(Map.of(
+                    "benchmark", schema.benchmark(), "baseline_rows", rows,
+                    "generation_mode", "native", "generation_verified", false,
+                    "capacity_calibrated", false, "source_commit", string(object(config, "source"), "commit"),
+                    "profile", root.relativize(path).toString(), "profile_sha256", sha256(bytes)));
+        }
         Map<String, Object> report = validate(config);
         Map<String, Object> source = object(config, "source");
         Path sourcePath = inside(root, Path.of(string(source, "path")));
@@ -112,8 +140,6 @@ public final class ScaleInspector {
         require(
                 string(scale, "basis").equals("native_parameters"),
                 "Expected native_parameters scale basis");
-        String calibration = string(scale, "calibration_status");
-        require(Set.of("pending", "measured").contains(calibration), "Invalid calibration_status");
         String benchmark = string(config, "benchmark");
         Map<String, Object> nativeConfig = object(config, "native");
         long rows = positive(scale, "total_rows");
@@ -186,7 +212,6 @@ public final class ScaleInspector {
         }
         Map<String, Object> report = new LinkedHashMap<>();
         report.put("benchmark", benchmark);
-        report.put("calibration_status", calibration);
         report.put("basis", scale.get("basis"));
         report.put("baseline_rows", rows);
         report.put("table_count", tableCount);

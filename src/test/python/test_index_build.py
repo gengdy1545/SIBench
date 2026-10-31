@@ -21,13 +21,21 @@ class IndexBuildTest(unittest.TestCase):
         self.git(self.root, "init", "-q")
         (self.root / "scripts").mkdir()
         shutil.copyfile(SCRIPT, self.root / "scripts" / SCRIPT.name)
+        native = self.root / "src/main/native/index/rocksdb_cloud"
+        native.mkdir(parents=True)
+        shutil.copyfile(SCRIPT.parent.parent / "src/main/native/index/rocksdb_cloud/rocksdb-cloud-9.1.1.patch",
+                        native / "rocksdb-cloud-9.1.1.patch")
         self.sources = [self.root / "third_party/aws-sdk-cpp", self.root / "index/rocksdb-cloud"]
         self.pins = {}
         for source in self.sources:
             source.mkdir(parents=True)
             self.git(source, "init", "-q")
             (source / "source.txt").write_text("pinned source\n")
-            self.git(source, "add", "source.txt")
+            if source.name == "rocksdb-cloud":
+                (source / "build_tools").mkdir()
+                shutil.copyfile(SCRIPT.parent.parent / "index/rocksdb-cloud/build_tools/build_detect_platform",
+                                source / "build_tools/build_detect_platform")
+            self.git(source, "add", ".")
             self.git(source, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
                      "-c", "commit.gpgsign=false", "commit", "-qm", "pinned source")
             self.pins[source] = self.git(source, "rev-parse", "HEAD")
@@ -54,6 +62,26 @@ class IndexBuildTest(unittest.TestCase):
         result = self.run_build()
         self.assertEqual(73, result.returncode, result.stderr)
         self.assertIn("dependency installation reached", result.stdout)
+
+    def test_generated_files_stay_under_build_index(self):
+        (self.root / "src/main/native/index/rocksdb_cloud").mkdir(parents=True, exist_ok=True)
+        for command in ("yum", "cmake", "make", "strip"):
+            executable = self.root / "bin" / command
+            executable.write_text('#!/bin/sh\nprintf "%s %s %s\\n" "$PWD" "$0" "$* SDK=${AWS_SDK:-}" >> "' +
+                                  str(self.root / "build.log") + '"\n'
+                                  'for arg in "$@"; do case "$arg" in OUT=*) '
+                                  'printf "native fixture" > "${arg#OUT=}";; esac; done\n')
+            executable.chmod(0o755)
+        result = self.run_build()
+        self.assertEqual(0, result.returncode, result.stderr)
+        log = (self.root / "build.log").read_text()
+        self.assertIn(f"-DCMAKE_INSTALL_PREFIX={self.root}/build/index/aws-sdk", log)
+        self.assertIn(f"{self.root}/build/index/rocksdb-cloud", log)
+        self.assertNotIn("-DCMAKE_INSTALL_PREFIX=/usr/local", log)
+        self.assertIn(f"SDK={self.root}/build/index/aws-sdk", log)
+        self.assertTrue((self.root / "build/index/librocksdb_cloud_jni.so").is_file())
+        for source in self.sources:
+            self.assertEqual("", self.git(source, "status", "--porcelain"))
 
     def test_missing_sources_are_rejected(self):
         for source in self.sources:

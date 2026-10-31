@@ -39,6 +39,7 @@ public final class Sibench {
     private Sibench() {}
 
     private static void printServiceHelp(PrintStream out) {
+        out.println("       java -jar build/sibench/sibench.jar postgres-config CONFIG OUTPUT");
         out.println(
                 "       java -jar build/sibench/sibench.jar plan-write-ratio PROFILE CALIBRATION_TRACE"
                         + " RATIO   (native parameters for committed row writes = RATIO x baseline)");
@@ -76,6 +77,7 @@ public final class Sibench {
         try {
             if (!List.of(
                             "inspect-scale",
+                            "postgres-config",
                             "prepare",
                             "replay",
                             "check-replay",
@@ -361,6 +363,14 @@ public final class Sibench {
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(plan));
                 return 0;
             }
+            if (args[0].equals("postgres-config")) {
+                if (profiles.size() != 2)
+                    throw new IllegalArgumentException("postgres-config requires CONFIG OUTPUT");
+                org.sibench.config.SibenchConfig.writePostgres(
+                        root.resolve(profiles.get(0)), root.resolve(profiles.get(1)));
+                out.println("PostgreSQL config written: " + profiles.get(1));
+                return 0;
+            }
             if (args[0].equals("index-server")) {
                 if (profiles.size() != 1)
                     throw new IllegalArgumentException("index-server requires SERVICE_CONFIG");
@@ -378,7 +388,7 @@ public final class Sibench {
                 if (profiles.size() != 3)
                     throw new IllegalArgumentException(
                             "replay-service requires REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT [--reference REPORT]");
-                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
+                var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
                 ReplayConfig config = ReplayConfig.from(document);
                 ServiceConfig service = ServiceConfig.ofReplay(root, document);
                 if (service == null)
@@ -397,7 +407,7 @@ public final class Sibench {
                 if (profiles.size() != 3 || reference == null)
                     throw new IllegalArgumentException(
                             "verify-service requires REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT --reference REPORT");
-                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
+                var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
                 ServiceConfig service = ServiceConfig.ofReplay(root, document);
                 if (service == null)
                     throw new IllegalArgumentException("verify-service needs target.service in its config");
@@ -429,7 +439,7 @@ public final class Sibench {
                             args[0]
                                     + " requires REPLAY_CONFIG NORMALIZED_DIRECTORY"
                                     + (check ? "" : " REPORT"));
-                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
+                var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
                 ReplayConfig config = ReplayConfig.from(document);
                 var modes = ReplayConfig.rowIdModes(document);
                 Path directory = root.resolve(profiles.get(1));

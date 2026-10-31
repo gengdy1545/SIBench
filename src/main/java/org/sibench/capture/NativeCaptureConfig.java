@@ -34,6 +34,9 @@ public record NativeCaptureConfig(
         // Verifies the pinned source commit and a clean worktree.
         SourceSchema.read(root, doc);
         var nativeConfig = object(doc, "native");
+        if (benchmark.equals("ycsb"))
+            require(positive(nativeConfig, "insertcount") == positive(nativeConfig, "recordcount"),
+                    "YCSB capture requires insertcount to equal recordcount");
         // Each client thread is one backend session; several overlap and are merged by PG's
         // transaction completion counter.
         require(positive(nativeConfig, "threads") <= 256, "threads must be at most 256");

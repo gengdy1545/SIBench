@@ -30,7 +30,7 @@ public class PgBaselineVerifyTest {
 
     /** One integer-keyed (sysbench) and one text-keyed (YCSB) schema. */
     private static SourceSchema schema(String benchmark) throws Exception {
-        var document = ConfigValues.parse(Files.readString(Path.of("config/" + benchmark + "_large.yaml")));
+        var document = ConfigValues.parse(Files.readString(Path.of("src/test/resources/config/" + benchmark + "_1b.yaml")));
         var nativeConfig = ConfigValues.object(document, "native");
         if (benchmark.equals("ycsb")) nativeConfig.put("fieldcount", 2);
         if (benchmark.equals("sysbench")) nativeConfig.put("tables", 2);

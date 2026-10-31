@@ -48,7 +48,9 @@ public class ReplayProjectionTest {
                 List<Operation> received = new ArrayList<>();
                 var config = new ReplayConfig(secondary, "none", 0, 0, 0, 0, mode);
                 var projection = new ReplayProjection(config, true, received::add);
+                assertEquals(0L, projection.describe().get("last_commit_version"));
                 projection.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
+                assertEquals(0L, projection.describe().get("last_commit_version"));
                 org.sibench.capture.TransferIndexFixtures.expandRow(
                         mutation(5, 1, 1, 10, 1, 3), projection);
                 org.sibench.capture.TransferIndexFixtures.expandRow(
@@ -59,6 +61,7 @@ public class ReplayProjectionTest {
                 projection.accept(mutation(3, 1, 1, 10, 5, 5));
                 assertTrue(received.isEmpty());
                 projection.accept(IndexOperationTrace.transaction(10, 7, 10, 1, 5));
+                assertEquals(1L, projection.describe().get("last_commit_version"));
                 projection.finish();
                 var writes = received.stream().filter(IndexOperationTrace::isMutation).toList();
                 int transferWidth = secondary ? 3 : 1;
@@ -69,10 +72,12 @@ public class ReplayProjectionTest {
                 assertTrue(received.stream().noneMatch(IndexOperationTrace::isControl));
                 assertEquals((long) writes.size(), projection.describe().get("target_calls"));
                 projection.accept(IndexOperationTrace.transaction(11, 6, 11, 2, 0));
+                assertEquals(1L, projection.describe().get("last_commit_version"));
                 projection.accept(mutation(3, 1, 2, 11, 1, 3));
                 projection.accept(IndexOperationTrace.transaction(11, 7, 11, 2, 1));
                 assertEquals(writes.size() + 1L, projection.dispatched());
                 assertEquals(2L, projection.describe().get("committed_transactions"));
+                assertEquals(2L, projection.describe().get("last_commit_version"));
                 assertEquals("committed_only", projection.describe().get("change_delivery"));
             }
         }
@@ -270,8 +275,7 @@ public class ReplayProjectionTest {
         for (Operation invalid :
                 List.of(
                         local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 0, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 1),
-                        // The former v9 form put the local read point in readTimestamp and left
-                        // SEARCH.version=0; it must not be accepted as the current form.
+                        // A transaction-local search must name its own commit version.
                         local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 1),
                         local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 11, 1),
                         local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 2))) {

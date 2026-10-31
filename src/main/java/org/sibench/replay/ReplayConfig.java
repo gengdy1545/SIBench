@@ -7,6 +7,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.sibench.config.SibenchConfig;
 
 /** Dispatch policy is independent of capture and never changes the source trace. */
 public record ReplayConfig(
@@ -85,11 +86,7 @@ public record ReplayConfig(
     }
 
     public static ReplayConfig from(Map<String, Object> document) {
-        keys(document, Set.of("schema_version", "purpose", "target", "replay", "versions"));
-        require(integer(document, "schema_version") == 1, "Expected replay config v1");
-        require(
-                string(document, "purpose").equals("index_replay"),
-                "Expected index_replay purpose");
+        SibenchConfig.validate(document);
         var target = object(document, "target");
         keys(target, Set.of("secondary_indexes", "service", "value"));
         require(
@@ -152,12 +149,13 @@ public record ReplayConfig(
     }
 
     /**
-     * The value modes a reference replay or oracle runs, as row-id flags: {@code target.value}
-     * ({@code locator} or {@code row_id}) selects one, its absence both.
+     * The service's value mode is also the reference/oracle mode; a standalone reference may
+     * select {@code target.value}, or leave it absent to exercise both modes.
      */
     public static List<Boolean> rowIdModes(Map<String, Object> document) {
         var target = object(document, "target");
-        if (!target.containsKey("value")) return List.of(false, true);
+        if (target.containsKey("service")) target = object(target, "service");
+        else if (!target.containsKey("value")) return List.of(false, true);
         return switch (string(target, "value")) {
             case "locator" -> List.of(false);
             case "row_id" -> List.of(true);

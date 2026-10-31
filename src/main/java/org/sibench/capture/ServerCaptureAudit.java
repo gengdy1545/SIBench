@@ -26,12 +26,15 @@ public final class ServerCaptureAudit {
         long[] zeroRowModifications = {0};
         long lastRequest = 0, returned = 0, processed = -1, failed = 0;
         boolean running = false, ranToEnd = false, executorEnded = true, transaction = false;
-        // Captures before summaries, and ROWS captures, have every result row as an event.
-        boolean perRowResults = true;
+        boolean perRowResults;
         String sql = "";
         int pid = 0;
         var statements = new TreeMap<String, Long>();
         try (var input = ServerTrace.open(server)) {
+            String first = input.readLine();
+            var header = first == null ? null : JsonParser.parseString(first).getAsJsonObject();
+            perRowResults = ServerTrace.detail(header).equals("rows");
+            pid = header.get("pid").getAsInt();
             String line;
             while ((line = input.readLine()) != null) {
                 JsonObject e = JsonParser.parseString(line).getAsJsonObject();
@@ -73,7 +76,10 @@ public final class ServerCaptureAudit {
                             ranToEnd = true;
                             processed = e.get("processed").getAsLong();
                             // A summary capture counts the rows at the return, not one by one.
-                            if (e.has("returned") && !perRowResults) {
+                            if (!e.has("returned") || !e.has("row_hashes")
+                                    || e.get("returned").getAsLong() != e.getAsJsonArray("row_hashes").size())
+                                throw new IOException("Executor return lacks its complete result hashes");
+                            if (!perRowResults) {
                                 returned += e.get("returned").getAsLong();
                                 resultRows += e.get("returned").getAsLong();
                             }
@@ -111,7 +117,7 @@ public final class ServerCaptureAudit {
                             "bitmap_heap_lossy", "plan_bitmap_heap", "scan_end", "plan_scan",
                             "index_insert_attempt", "scan_summary", "bitmap_verdicts" ->
                             indexEvents++;
-                    case "capture_start" -> perRowResults = e.get("detail").getAsString().equals("rows");
+                    case "capture_start" -> throw new IOException("Repeated capture_start");
                     case "row_change", "index_build_start", "index_build_end" -> {}
                     default -> throw new IOException("Unclassified raw event: " + type);
                 }

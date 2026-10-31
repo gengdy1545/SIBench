@@ -27,10 +27,9 @@ final class YcsbNativeRun {
 
     static Path libraries(NativeCaptureConfig config) throws IOException {
         Path build = config.root().resolve(string(config.nativeConfig(), "build_directory"));
-        Path libraries = build.resolve(string(config.nativeConfig(), "client_libraries"));
-        NativeBuildCheck.require(
-                config.source(), build, List.of("core/src/main/java", "jdbc/src/main/java"));
-        if (!Files.isDirectory(libraries)) throw new IOException("YCSB client libraries are not built");
+        NativeBuildCheck.verify(config.root(), config.benchmark(), config.source(), build,
+                string(object(config.document(), "source"), "commit"));
+        Path libraries = NativeBuildCheck.ycsbLibraries(build);
         return libraries;
     }
 
@@ -70,7 +69,7 @@ final class YcsbNativeRun {
                                 "db.driver", "org.postgresql.Driver",
                                 "db.url", driverUrl,
                                 "db.user", config.user(),
-                                "db.passwd", System.getenv().getOrDefault("PGPASSWORD", ""),
+                                "db.passwd", "",
                                 "table", string(nativeConfig, "table"),
                                 "recordcount", Long.toString(recordCount),
                                 "fieldcount", Long.toString(positive(nativeConfig, "fieldcount")),
@@ -103,7 +102,7 @@ final class YcsbNativeRun {
                         "-p", "db.driver=org.postgresql.Driver",
                         "-p", "db.url=" + config.jdbc(),
                         "-p", "db.user=" + config.user(),
-                        "-p", "db.passwd=" + System.getenv().getOrDefault("PGPASSWORD", ""),
+                        "-p", "db.passwd=",
                         "-n", string(nativeConfig, "table"),
                         "-f", Long.toString(positive(nativeConfig, "fieldcount")));
         require(NativeProcess.run("create-table", create, Map.of(), config.root(), logs, Duration.ofMinutes(5)).exit() == 0,

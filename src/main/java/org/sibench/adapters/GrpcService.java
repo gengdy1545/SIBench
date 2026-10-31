@@ -25,11 +25,18 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class GrpcService implements AutoCloseable {
     private final String endpoint;
     private final TraceRequests requests;
+    private final String binding;
+    private final long requestTimeoutSeconds;
+    static final io.grpc.Metadata.Key<String> INDEX_BINDING =
+            io.grpc.Metadata.Key.of("sibench-index-binding", io.grpc.Metadata.ASCII_STRING_MARSHALLER);
     private final Map<Integer, Client> clients = new ConcurrentHashMap<>();
 
-    public GrpcService(String endpoint, TraceRequests requests) {
+    public GrpcService(String endpoint, TraceRequests requests, String binding, long requestTimeoutSeconds) {
+        if (binding == null || binding.isBlank()) throw new IllegalArgumentException("An Execute stream needs its trace binding");
         this.endpoint = endpoint;
         this.requests = requests;
+        this.binding = binding;
+        this.requestTimeoutSeconds = requestTimeoutSeconds;
     }
 
     private static ManagedChannel channel(String endpoint) {
@@ -39,7 +46,9 @@ public final class GrpcService implements AutoCloseable {
     public DescribeResponse describe() {
         ManagedChannel channel = channel(endpoint);
         try {
-            return IndexServiceGrpc.newBlockingStub(channel).describe(DescribeRequest.getDefaultInstance());
+            return IndexServiceGrpc.newBlockingStub(channel)
+                    .withDeadlineAfter(requestTimeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
+                    .describe(DescribeRequest.getDefaultInstance());
         } finally {
             channel.shutdownNow();
         }
@@ -53,6 +62,7 @@ public final class GrpcService implements AutoCloseable {
         ManagedChannel channel = channel(endpoint);
         try {
             return IndexServiceGrpc.newBlockingStub(channel)
+                    .withDeadlineAfter(PublishedIndex.FLUSH_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
                     .flush(FlushRequest.newBuilder().setIndexBinding(binding).build());
         } finally {
             channel.shutdownNow();
@@ -106,7 +116,10 @@ public final class GrpcService implements AutoCloseable {
                     }));
                 }
             };
-            this.stream = IndexServiceGrpc.newStub(channel).withInterceptors(serialized).execute(new StreamObserver<>() {
+            var headers = new io.grpc.Metadata();
+            headers.put(INDEX_BINDING, binding);
+            this.stream = IndexServiceGrpc.newStub(channel).withInterceptors(serialized,
+                    io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers)).execute(new StreamObserver<>() {
                 @Override
                 public void onNext(Response response) {
                     var waiting =

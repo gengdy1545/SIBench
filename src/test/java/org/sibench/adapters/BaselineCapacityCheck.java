@@ -43,7 +43,7 @@ public final class BaselineCapacityCheck {
     static final class Sink implements IndexBackend {
         final Fingerprint received=new Fingerprint();final Path report;final boolean dropFirst;final AtomicBoolean dropped=new AtomicBoolean();String binding="";
         Sink(Path report,boolean dropFirst) { this.report=report;this.dropFirst=dropFirst; }
-        public DescribeResponse describe() { return DescribeResponse.newBuilder().setName("baseline-transport-field-check-sink").setProtocolVersion(2).setValueKind(ValueKind.ROW_ID).setBaselineWriteBatches(true).setWriteAck(Acknowledgement.ACK_MEMORY).setDurability("diagnostic field receiver; no index storage").build(); }
+        public DescribeResponse describe() { return DescribeResponse.newBuilder().setName("baseline-transport-field-check-sink").setValueKind(ValueKind.ROW_ID).setBaselineWriteBatches(true).setWriteAck(Acknowledgement.ACK_MEMORY).setDurability("diagnostic field receiver; no index storage").build(); }
         public void write(Write write) throws IOException { if (dropFirst && dropped.compareAndSet(false,true)) return;received.write(write); }
         public void search(Search search,ResultSink output) throws IOException { throw new IOException("Baseline-only diagnostic receiver"); }
         public void flush() throws IOException { Files.writeString(report,JSON.toJson(received.summary())+"\n"); }
@@ -72,7 +72,7 @@ public final class BaselineCapacityCheck {
         double setupSeconds=(System.nanoTime()-preparing)/1e9;
         long memberLimit=Long.getLong("sibench.capacity.members",Long.MAX_VALUE);
         long started=System.nanoTime();Files.writeString(report.resolveSibling(report.getFileName()+".started"),Long.toString(System.currentTimeMillis()));
-        try(var remote=new GrpcService(endpoint,requests);var projection=ReplayProjection.withClients(config,false,remote.factory(),true)) {
+        try(var remote=new GrpcService(endpoint,requests, "baseline-capacity " + trace.toAbsolutePath(), 60);var projection=ReplayProjection.withClients(config,false,remote.factory(),true)) {
             try { input.baseline().read(op -> {
                 if (expected.count.sum()>=memberLimit || windowSeconds>0 && (expected.count.sum()&4095)==0 && System.nanoTime()-started>=windowSeconds*1_000_000_000L) throw new EndWindow();
                 expected.operation(op);projection.accept(op);

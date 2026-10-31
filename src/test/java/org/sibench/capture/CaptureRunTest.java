@@ -116,8 +116,9 @@ public class CaptureRunTest {
             RowAuditTestSupport.writeTrace(
                     pg,
                     List.of(
+                            event("capture_start", application, ",\"detail\":\"rows\""),
                             event("executor_start", application, ",\"sql\":\"SELECT 1\""),
-                            event("executor_run_end", application, ""),
+                            event("executor_run_end", application, ",\"depth\":1,\"returned\":0,\"row_hashes\":[]"),
                             event("executor_end", application, ""),
                             event("transaction_commit", application, "")));
             run.complete();
@@ -152,8 +153,9 @@ public class CaptureRunTest {
             RowAuditTestSupport.writeTrace(
                     pg,
                     List.of(
+                            event("capture_start", application, ",\"detail\":\"rows\""),
                             event("executor_start", application, ",\"sql\":\"SELECT 1\""),
-                            event("executor_run_end", application, ""),
+                            event("executor_run_end", application, ",\"depth\":1,\"returned\":0,\"row_hashes\":[]"),
                             event("executor_end", application, ""),
                             event("transaction_commit", application, "")));
             run.complete();
@@ -250,9 +252,10 @@ public class CaptureRunTest {
                 RowAuditTestSupport.writeTrace(
                         directory.resolve("pg-" + pid + ".jsonl.zst"),
                         List.of(
+                                "{\"event\":\"capture_start\",\"pid\":" + pid + ",\"detail\":\"rows\"}",
                                 "{\"event\":\"executor_start\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\",\"sql\":\"SELECT 1\"}",
                                 "{\"event\":\"executor_end\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\"}",
-                                "{\"event\":\"executor_run_end\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\"}",
+                                "{\"event\":\"executor_run_end\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\",\"depth\":1,\"returned\":0,\"row_hashes\":[]}",
                                 "{\"event\":\"transaction_abort\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\"}"));
                 CaptureRun.sessionClosed(jdbc);
             }

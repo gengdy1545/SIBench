@@ -1,0 +1,42 @@
+schema_version: 1
+purpose: native_capture_poc
+benchmark: hybench
+source:
+  path: benchmark/HyBench-2024
+  commit: eaad91b52956fddd3d48ce49f792928056b7b360
+native:
+  sf: 10x
+  work_dir: results/poc/hybench/native
+  clients: 32
+  ap_clients: 1
+  xp_transaction_clients: 32
+  xp_query_clients: 32
+  duration_minutes: 1
+  phase_duration_minutes:
+    tp: 5
+    xp: 5
+postgres:
+  schema: public
+  version: '14.24'
+  port: 55433
+  database: sibench_hybench_capture
+  clone_from: sibench_hybench_base
+  user: postgres
+  isolation: read_committed
+  max_parallel_workers_per_gather: 0
+capture:
+  mode: instrumented_native_execution
+  application_prefix: 'sibench:'
+  raw_directory: results/poc/hybench/raw
+  allow_event_loss: false
+  statement_results: server_rows_and_consumed_rows
+data_layout:
+  target_file_size_bytes: 536870912
+  file_size_max_overshoot_percent: 5
+  row_group_max_rows: 1048576
+  row_group_buffer_bytes: 67108864
+  page_size_bytes: 1048576
+  compression: zstd
+  compression_level: 3
+artifacts:
+  directory: results/poc/hybench

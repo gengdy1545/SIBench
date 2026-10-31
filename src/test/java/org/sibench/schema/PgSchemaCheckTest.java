@@ -135,9 +135,9 @@ public class PgSchemaCheckTest {
     public void allThreeReviewedLayoutsMatchIncludingNonPublicSequenceNamespace() throws Exception {
         for (String path :
                 List.of(
-                        "config/hybench_sf1.yaml",
-                        "config/ycsb_large.yaml",
-                        "config/sysbench_large.yaml")) {
+                        "src/test/resources/config/hybench_sf1.yaml",
+                        "src/test/resources/config/ycsb_1b.yaml",
+                        "src/test/resources/config/sysbench_1b.yaml")) {
             SourceSchema schema = SourceSchemaTest.read(path);
             assertTrue(PgSchemaCheck.compare(schema, matching(schema, "public")).isEmpty());
             assertTrue(PgSchemaCheck.compare(schema, matching(schema, "bench"), "bench").isEmpty());
@@ -146,7 +146,7 @@ public class PgSchemaCheckTest {
 
     @Test
     public void missingExtraOrWrongTableShapeFails() throws Exception {
-        SourceSchema schema = SourceSchemaTest.read("config/ycsb_large.yaml");
+        SourceSchema schema = SourceSchemaTest.read("src/test/resources/config/ycsb_1b.yaml");
         List<ActualTable> valid = matching(schema, "public");
         assertDifference(schema, List.of(), "Missing table");
         assertDifference(
@@ -209,7 +209,7 @@ public class PgSchemaCheckTest {
 
     @Test
     public void everyColumnPropertyAndFullColumnListAreChecked() throws Exception {
-        SourceSchema schema = SourceSchemaTest.read("config/ycsb_large.yaml");
+        SourceSchema schema = SourceSchemaTest.read("src/test/resources/config/ycsb_1b.yaml");
         ActualTable table = matching(schema, "public").get(0);
         var column = table.columns().get(0);
         List<ActualColumn> variants =
@@ -308,7 +308,7 @@ public class PgSchemaCheckTest {
 
     @Test
     public void sequenceDefaultsCannotBeReplacedOrBorrowedFromAnotherSchema() throws Exception {
-        SourceSchema schema = SourceSchemaTest.read("config/sysbench_large.yaml");
+        SourceSchema schema = SourceSchemaTest.read("src/test/resources/config/sysbench_1b.yaml");
         var tables = new ArrayList<>(matching(schema, "public"));
         ActualTable table = tables.get(0);
         var id = table.columns().get(0);
@@ -345,7 +345,7 @@ public class PgSchemaCheckTest {
 
     @Test
     public void allIndexSemanticsAndLifecycleFlagsAreCheckedNotJustNames() throws Exception {
-        SourceSchema schema = SourceSchemaTest.read("config/sysbench_large.yaml");
+        SourceSchema schema = SourceSchemaTest.read("src/test/resources/config/sysbench_1b.yaml");
         var tables = new ArrayList<>(matching(schema, "public"));
         ActualTable table = tables.get(0);
         ActualIndex index = table.indexes().get(1);

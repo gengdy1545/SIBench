@@ -341,9 +341,9 @@ public final class ReferenceReplay {
 
     /**
      * A one-time expected-result stream for a service replay. It is generated from the same
-     * canonical trace and value mode, and can be reused by any number of service runs.
+     * canonical trace and value mode. Returns the published file's SHA-256.
      */
-    public static Path writeQueryDigests(
+    public static String writeQueryDigests(
             Path directory, ReplayConfig config, boolean rowIds, Path output, String binding)
             throws IOException {
         if (Files.exists(output))
@@ -361,8 +361,9 @@ public final class ReferenceReplay {
             load.finish();
             IndexOperationTrace.read(directory.resolve("workload.ops"), runtime);
             runtime.finish();
+            digest.close();
+            return digest.sha256();
         }
-        return output;
     }
 
     /** Binds a digest stream to the trace and replay settings that produced it. */
@@ -375,8 +376,6 @@ public final class ReferenceReplay {
                 + manifest.get("workload_trace_sha256").getAsString()
                 + " baseline="
                 + manifest.get("baseline_trace_sha256").getAsString()
-                + " version="
-                + manifest.get("operation_trace_version").getAsInt()
                 + " secondary="
                 + config.secondaryIndexes();
     }
@@ -417,7 +416,6 @@ public final class ReferenceReplay {
             Path digests =
                     report.toAbsolutePath()
                             .resolveSibling(report.getFileName() + "." + mode + ".queries");
-            long[] digestCount = {0};
             try (var digest =
                             new QueryDigest.File(
                                     digests,
@@ -440,7 +438,6 @@ public final class ReferenceReplay {
                 start = System.nanoTime();
                 workload.read(runtime);
                 runtime.finish();
-                digestCount[0] = digest.count();
                 digest.close();
                 double seconds = (System.nanoTime() - start) / 1e9;
                 Map<String, Object> result = new LinkedHashMap<>();
@@ -461,9 +458,9 @@ public final class ReferenceReplay {
                 result.put("retained_index_versions", index.retainedVersions());
                 result.put("skipped_entry_histories", index.skippedHistories());
                 result.put("read_model", "statement_snapshot_plus_transaction_local_prefix");
-                result.put("query_digests", digestCount[0]);
+                result.put("query_digests", digest.count());
                 result.put("query_digest_file", digests.toString());
-                result.put("query_digest_sha256", BaselineGenerator.sha256(digests));
+                result.put("query_digest_sha256", digest.sha256());
                 results.add(result);
             }
         }

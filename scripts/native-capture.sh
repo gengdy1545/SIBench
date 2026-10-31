@@ -4,9 +4,9 @@
 # All semantics live in the Java CLI; this script only starts and stops the local service and
 # chains the stages. It refuses to reuse a database, baseline or raw directory.
 #
-#   scripts/native-capture.sh config/hybench_sf1.yaml
-#   scripts/native-capture.sh config/ycsb_small.yaml
-#   scripts/native-capture.sh config/sysbench_small.yaml
+#   scripts/native-capture.sh config/benchmark/hybench.yaml
+#   scripts/native-capture.sh config/benchmark/ycsb.yaml
+#   scripts/native-capture.sh config/benchmark/sysbench.yaml
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
@@ -15,19 +15,27 @@ if [ "$#" -ne 1 ]; then
 fi
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PROFILE=$1
-export JAVA_HOME=${SIBENCH_JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}
-# HyBench runs in-process through reflection, so its build is added to the classpath.
-HYBENCH=$ROOT/build/benchmarks/HyBench-2024
+if [ -n "${SIBENCH_JAVA_HOME:-}" ]; then
+  export JAVA_HOME=$SIBENCH_JAVA_HOME
+fi
 # The row audit keeps one open Parquet reader per baseline file; large tables need a larger heap.
 HEAP=${SIBENCH_HEAP:--Xmx12g}
-JAVA=$JAVA_HOME/bin/java
+JAVA=${JAVA_HOME:+$JAVA_HOME/bin/}java
 PG=$ROOT/build/services/postgresql-capture
 CORE=$ROOT/build/sibench/sibench.jar
 
 cd "$ROOT"
-eval "$("$JAVA" -cp "$CORE" org.sibench.capture.NativeCapture paths "$ROOT" "$PROFILE")"
+ASSIGNMENTS=$("$JAVA" -cp "$CORE" org.sibench.capture.NativeCapture paths "$ROOT" "$PROFILE")
+eval "$ASSIGNMENTS"
 # PG and the native clients read the detail level and trace encoding from the environment.
 export SIBENCH_CAPTURE_DETAIL SIBENCH_CAPTURE_COMPRESS
+# Only HyBench needs upstream classes in the orchestrator JVM.
+NATIVE_CP=
+if [ -n "${SIBENCH_HYBENCH:-}" ]; then
+  NATIVE_CP=:$SIBENCH_HYBENCH/target/classes:$SIBENCH_HYBENCH/lib/\*
+fi
+CAPTURE_CP="$CORE$NATIVE_CP"
+"$JAVA" -cp "$CAPTURE_CP" org.sibench.capture.NativeBuildCheck verify "$ROOT" "$PROFILE"
 if [ "$SIBENCH_VERIFICATION" = certified ] && [ ! -f "$SIBENCH_CERTIFICATION" ]; then
   echo "certification not found: $SIBENCH_CERTIFICATION" >&2
   exit 1
@@ -42,12 +50,15 @@ TIMING=$SIBENCH_ARTIFACTS/run-timing.json
 # The running JAR is an immutable copy; rebuilding sibench.jar never changes a run in flight.
 JAR=$SIBENCH_ARTIFACTS/native/sibench-run.jar
 cp "$CORE" "$JAR"
+CAPTURE_CP="$JAR$NATIVE_CP"
 sha256sum "$JAR" > "$JAR.sha256"
+cp "$PROFILE" "$SIBENCH_ARTIFACTS/native/benchmark.yaml"
+PROFILE=$SIBENCH_ARTIFACTS/native/benchmark.yaml
+cp "$ROOT/config/sibench.yaml" "$SIBENCH_ARTIFACTS/native/sibench.yaml"
+PG_CONFIG=$SIBENCH_ARTIFACTS/native/postgres.conf
+"$JAVA" -cp "$JAR" org.sibench.cli.Sibench postgres-config \
+  "$SIBENCH_ARTIFACTS/native/sibench.yaml" "$PG_CONFIG" > /dev/null
 
-# HyBench keeps its own classes next to the build; absent classes simply leave the path empty.
-HYBENCH_CLASSES=$HYBENCH/target/classes
-[ -d "$HYBENCH_CLASSES" ] || HYBENCH_CLASSES=
-HYBENCH_CP="$JAR:$HYBENCH_CLASSES:$HYBENCH/lib/*"
 # HyBench runs from its work directory, where its base stage generates Data_<sf> on first use.
 WORKDIR=${SIBENCH_WORKDIR:-$ROOT}
 mkdir -p "$WORKDIR"
@@ -65,11 +76,13 @@ if [ -e "$CLUSTER" ]; then
     "stop its server if one runs and remove the directory" >&2
   exit 1
 fi
-# The server parameters are versioned in config/; only the machine-specific ones are added here.
+# The server parameters are owned by config/sibench.yaml; only the machine-specific ones are added here.
 # start_cluster DATA LOG [CAPTURE_DIR]: the instrumented server traces only with a capture directory.
 start_cluster() {
+  # pg_ctl passes -o through /bin/sh; preserve literal quotes in the config path there too.
+  local quoted_config=${PG_CONFIG//\'/\'\\\'\'}
   SIBENCH_CAPTURE_DIR=${3:-} "$PG/runtime/bin/pg_ctl" -D "$1" \
-    -o "-c config_file=$ROOT/config/postgres_capture.conf -c port=$SIBENCH_PORT -c unix_socket_directories=$1" \
+    -o "-c config_file='$quoted_config' -c port=$SIBENCH_PORT -c unix_socket_directories=" \
     -l "$2" -w start >/dev/null
 }
 
@@ -79,9 +92,9 @@ stage() {
   # HyBench resolves Data_1x relative to the working directory, so every stage runs from there.
   if [ "$1" = export ]; then
     # The baseline is the still database's, exported and verified once and linked per capture.
-    ( cd "$WORKDIR" && "$JAVA" $HEAP -cp "$HYBENCH_CP" org.sibench.capture.SharedBaseline "$ROOT" "$PROFILE" "$TIMING" )
+    ( cd "$WORKDIR" && "$JAVA" $HEAP -cp "$CAPTURE_CP" org.sibench.capture.SharedBaseline "$ROOT" "$PROFILE" "$TIMING" )
   else
-    ( cd "$WORKDIR" && "$JAVA" $HEAP -cp "$HYBENCH_CP" org.sibench.capture.NativeCapture \
+    ( cd "$WORKDIR" && "$JAVA" $HEAP -cp "$CAPTURE_CP" org.sibench.capture.NativeCapture \
         "$1" "$ROOT" "$PROFILE" "$TIMING" )
   fi
   ended=$(date +%s%N)
@@ -117,11 +130,7 @@ fi
 start_cluster "$CLUSTER" "$SIBENCH_ARTIFACTS/postgres.log" "$SIBENCH_RAW"
 trap '"$PG/runtime/bin/pg_ctl" -D "$CLUSTER" -m fast -t 3600 stop >/dev/null' EXIT
 stage prepare
-# A copy of the still cluster shares its blocks but not its page cache, so a native run on it starts
-# cold. SIBENCH_PREWARM=1 reads its relation files sequentially first: it pays off for short,
-# read-heavy runs (a sysbench 87m calibration: 284 s cold, 97 s after 123 s of reading), but a long
-# write-heavy run then competes with a full page cache (sysbench 87m 5%: 754 s cold, 831 s after
-# reading), and HyBench wrote as much cold as warm, so it is off by default.
+# Optional sequential prewarm is measured separately and defaults to off.
 if [ "${SIBENCH_PREWARM:-0}" = 1 ]; then
   started=$(date +%s%N)
   find "$CLUSTER/base" -type f -print0 | xargs -0 -P 8 -n 32 cat > /dev/null
@@ -132,16 +141,16 @@ stage export > "$SIBENCH_ARTIFACTS/baseline.log"
 # PG's own index counters bracket only the native run: an independent check that the ledger saw
 # every index access, including ones the instrumentation might never have emitted.
 counters() {
-  "$JAVA" -cp "$HYBENCH_CP" org.sibench.cli.Sibench snapshot-index-counters "$PROFILE" "$1" \
+  "$JAVA" -cp "$CAPTURE_CP" org.sibench.cli.Sibench snapshot-index-counters "$PROFILE" "$1" \
     --jdbc "$URL" --user postgres > /dev/null
 }
 counters "$SIBENCH_ARTIFACTS/index-counters-before.json"
-stage run > "$SIBENCH_ARTIFACTS/run-summary.json"
+stage run > "$SIBENCH_ARTIFACTS/native-run.log"
 counters "$SIBENCH_ARTIFACTS/index-counters-after.json"
 # A full capture audits its row changes against the baseline and PG's final state, then certifies
 # its build and coverage; a certified capture relies on such a certificate instead.
 if [ "$SIBENCH_VERIFICATION" = full ]; then
-  "$JAVA" $HEAP -cp "$HYBENCH_CP" org.sibench.cli.Sibench audit-rows "$PROFILE" "$SIBENCH_ARTIFACTS/baseline" "$SIBENCH_RAW" \
+  "$JAVA" $HEAP -cp "$CAPTURE_CP" org.sibench.cli.Sibench audit-rows "$PROFILE" "$SIBENCH_ARTIFACTS/baseline" "$SIBENCH_RAW" \
     --jdbc "$URL" --user postgres --timing "$TIMING" > "$SIBENCH_ARTIFACTS/row-state-audit-summary.json"
   VERIFY=()
 else
@@ -149,13 +158,13 @@ else
 fi
 # One pass compiles the trace and builds the access ledger; the trace is committed only when the
 # ledger matches PG's index counters (and, when certified, stays inside the certificate).
-"$JAVA" $HEAP -cp "$HYBENCH_CP" org.sibench.cli.Sibench compile-trace "$PROFILE" "$SIBENCH_ARTIFACTS/trace" \
+"$JAVA" $HEAP -cp "$CAPTURE_CP" org.sibench.cli.Sibench compile-trace "$PROFILE" "$SIBENCH_ARTIFACTS/trace" \
   "${VERIFY[@]}" --counters "$SIBENCH_ARTIFACTS/index-counters-before.json" "$SIBENCH_ARTIFACTS/index-counters-after.json" \
   --timing "$TIMING" > "$SIBENCH_ARTIFACTS/trace-summary.json"
 cp "$SIBENCH_ARTIFACTS/trace/access-ledger.json" "$SIBENCH_ARTIFACTS/access-ledger-summary.json"
 cp "$SIBENCH_ARTIFACTS/trace/capture-completeness.json" "$SIBENCH_ARTIFACTS/capture-completeness.json"
 if [ "$SIBENCH_VERIFICATION" = full ]; then
-  "$JAVA" -cp "$HYBENCH_CP" org.sibench.cli.Sibench certify-capture "$PROFILE" > "$SIBENCH_ARTIFACTS/certification-summary.json"
+  "$JAVA" -cp "$CAPTURE_CP" org.sibench.cli.Sibench certify-capture "$PROFILE" > "$SIBENCH_ARTIFACTS/certification-summary.json"
   # The audited row transitions served the audit and the certificate; the capture is recompiled
   # with its own certificate from now on, which does not read them.
   rm -f "$SIBENCH_RAW/row-state-audit.json.changes.jsonl"

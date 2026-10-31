@@ -8,7 +8,7 @@ import java.nio.file.*;
 import java.util.*;
 
 /**
- * Configuration contract for native SF1 runHTAP capture. Transaction ratios are the upstream
+ * Configuration contract for native HyBench runHTAP capture. Transaction ratios are the upstream
  * ones: the profile sets client counts and phase durations, never workload weights.
  */
 public record CaptureConfig(
@@ -31,14 +31,8 @@ public record CaptureConfig(
                 "Expected capture config v1");
         require(string(doc, "benchmark").equals("hybench"), "Only HyBench capture is implemented");
         var source = object(doc, "source");
+        org.sibench.schema.SourceSchema.read(root, doc);
         Path directory = root.resolve(string(source, "path")).toRealPath();
-        require(directory.startsWith(root.resolve("benchmark")), "Source must be inside benchmark");
-        require(
-                runGit(directory, "rev-parse", "HEAD").equals(string(source, "commit")),
-                "Source commit mismatch");
-        require(
-                runGit(directory, "status", "--porcelain=v1", "--untracked-files=all").isEmpty(),
-                "Source worktree must be clean");
         var nativeConfig = object(doc, "native");
         require(string(nativeConfig, "sf").matches("[1-9][0-9]*x"), "sf must be a native HyBench scale such as 1x or 10x");
         int clients = Math.toIntExact(positive(nativeConfig, "clients"));
@@ -133,19 +127,6 @@ public record CaptureConfig(
         while (!Files.exists(parent)) parent = parent.getParent();
         require(parent.toRealPath().startsWith(root), "Symlink escape in output path");
         return result;
-    }
-
-    private static String runGit(Path source, String... args) throws Exception {
-        List<String> command = new ArrayList<>(List.of("git", "-C", source.toString()));
-        command.addAll(List.of(args));
-        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
-        String value =
-                new String(
-                                process.getInputStream().readAllBytes(),
-                                java.nio.charset.StandardCharsets.UTF_8)
-                        .trim();
-        if (process.waitFor() != 0) throw new IllegalArgumentException("git failed: " + value);
-        return value;
     }
 
     public Properties nativeProperties() {

@@ -26,8 +26,8 @@ public class IndexOperationTraceTest {
                     .putInt(0).putInt(0).putInt(9).putInt(-1).putInt(-1).putInt(-1)
                     .put(IndexKey.ofInt(42).bytes());
             var crc = new java.util.zip.CRC32C(); crc.update(payload.array());
-            var plain = java.nio.ByteBuffer.allocate(16 + 12 + 137).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-            plain.putInt(0x53494f50).putInt(9).putInt(128).putInt(4096)
+            var plain = java.nio.ByteBuffer.allocate(12 + 12 + 137).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            plain.putInt(0x53494f50).putInt(128).putInt(4096)
                     .putInt(137).putInt(1).putInt((int) crc.getValue()).put(payload.array());
             String expected = HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(plain.array()));
             var decoded = new ArrayList<Operation>();
@@ -279,7 +279,7 @@ public class IndexOperationTraceTest {
     }
 
     @Test
-    public void rejectsEveryFormatVersionExceptTheCurrentOne() throws Exception {
+    public void rejectsUnknownFileTypesAndRecordLayouts() throws Exception {
         Path file = Files.createTempFile("sibench-format-", ".ops");
         Files.delete(file);
         try {
@@ -289,11 +289,16 @@ public class IndexOperationTraceTest {
                                 1, 3, 0, Range.equal(IndexKey.ofInt(1)), 5, 1, 0));
             }
             byte[] bytes = Files.readAllBytes(file);
-            for (int version : new int[] {1, 3, 6, 7, 8, 10}) {
-                java.nio.ByteBuffer.wrap(bytes)
+            var header = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            assertEquals(0x53494f5a, header.getInt());
+            assertEquals(128, header.getInt());
+            assertEquals(4096, header.getInt());
+            for (int offset : new int[] {0, 4, 8}) {
+                byte[] invalid = bytes.clone();
+                java.nio.ByteBuffer.wrap(invalid)
                         .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                        .putInt(4, version);
-                Files.write(file, bytes);
+                        .putInt(offset, 0);
+                Files.write(file, invalid);
                 assertThrows(IOException.class, () -> IndexOperationTrace.read(file, o -> {}));
             }
         } finally {

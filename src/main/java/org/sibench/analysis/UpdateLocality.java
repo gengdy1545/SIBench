@@ -31,7 +31,7 @@ import java.util.TreeMap;
 import java.util.zip.GZIPOutputStream;
 
 /**
- * Static update-locality analysis over a v9 trace. A baseline is placed in declared sorted runs of
+ * Static update-locality analysis over a trace. A baseline is placed in declared sorted runs of
  * {@code entries_per_block} entries and {@code blocks_per_file} blocks per file; committed workload
  * modifications are then mapped to those runs. The layout is an equal-entry-count approximation,
  * not a Parquet row group or a real SST byte layout.
@@ -50,7 +50,7 @@ public final class UpdateLocality {
             long sortBytes,
             int l0IndexModifications) {
         public static Config read(Path path) throws IOException {
-            var document = ConfigValues.parse(Files.readString(path));
+            var document = ConfigValues.object(org.sibench.config.SibenchConfig.read(path), "analysis");
             var layout = ConfigValues.object(document, "layout");
             var window = ConfigValues.object(document, "window");
             int entries = Math.toIntExact(ConfigValues.positive(layout, "entries_per_block"));
@@ -134,13 +134,8 @@ public final class UpdateLocality {
         var manifest =
                 JsonParser.parseString(Files.readString(trace.resolve("manifest.json")))
                         .getAsJsonObject();
-        if (manifest.has("operation_trace_version")
-                && manifest.get("operation_trace_version").getAsInt() != IndexOperationTrace.VERSION)
-            throw new IOException("Locality analysis requires the current operation trace version");
-        if (!manifest.has("workload_trace_sha256")
-                || !IndexOperationTrace.sha256(trace.resolve("workload.ops"))
-                        .equals(manifest.get("workload_trace_sha256").getAsString()))
-            throw new IOException("Workload trace digest differs from its manifest");
+        if (!manifest.has("workload_trace_sha256"))
+            throw new IOException("Workload trace identity missing from its manifest");
         var catalog = IndexCatalog.fromManifest(manifest);
         long baselineRows = manifest.has("baseline_rows") ? manifest.get("baseline_rows").getAsLong() : -1;
         long baselineOperations =
@@ -261,7 +256,8 @@ public final class UpdateLocality {
                         layouts,
                         baselineRows,
                         config,
-                        IndexOperationTrace.Source.file(trace.resolve("workload.ops")),
+                        IndexOperationTrace.Source.file(trace.resolve("workload.ops"),
+                                manifest.get("workload_trace_sha256").getAsString()),
                         output);
         long encoded = ((Number) report.get("encoded_records")).longValue();
         long expected = manifest.get("workload_operations").getAsLong();

@@ -15,6 +15,8 @@ import java.util.Map;
 import java.sql.Types;
 
 public class RequestCaptureAuditTest {
+    private static final String HEADER = "{\"event\":\"capture_start\",\"pid\":42,\"detail\":\"summary\"}\n";
+
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     @Test
@@ -49,14 +51,14 @@ public class RequestCaptureAuditTest {
                 {"event":"request_return","application":"b"}
                 {"event":"close","application":"b"}
                 """);
-        String pg =
+        String pg = HEADER +
                 """
                 {"event":"executor_start","pid":42,"application":"a","sql":"SELECT 1"}
-                {"event":"executor_run_end","pid":42,"application":"a"}
+                {"event":"executor_run_end","pid":42,"application":"a","depth":1,"returned":0,"row_hashes":[]}
                 {"event":"executor_end","pid":42,"application":"a"}
                 {"event":"transaction_abort","pid":42,"application":"a"}
                 {"event":"executor_start","pid":42,"application":"b","sql":"SELECT 2"}
-                {"event":"executor_run_end","pid":42,"application":"b"}
+                {"event":"executor_run_end","pid":42,"application":"b","depth":1,"returned":0,"row_hashes":[]}
                 {"event":"executor_end","pid":42,"application":"b"}
                 """;
         write(
@@ -96,7 +98,7 @@ public class RequestCaptureAuditTest {
                 {"event":"commit","application":"a"}
                 {"event":"close","application":"a"}
                 """;
-        String pg =
+        String pg = HEADER +
                 """
                 {"event":"executor_start","pid":42,"application":"a","sql":"SELECT balance FROM t","depth":1}
                 {"event":"executor_run_end","pid":42,"application":"a","depth":1,"returned":1,"row_hashes":["%s"]}
@@ -110,6 +112,8 @@ public class RequestCaptureAuditTest {
         String text = "{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"%s\",\"1\":\"2000.0\",\"column_types\":{\"1\":7}}";
         write(client, requests.formatted(text.formatted(hash)));
         assertEquals(1L, RequestCaptureAudit.audit(client, server, false).get("client_consumed_rows_checked"));
+        write(client, requests.formatted("{\"event\":\"consumed_row\",\"application\":\"a\",\"1\":\"2000.0\",\"column_types\":{\"1\":7}}"));
+        assertThrows(IOException.class, () -> RequestCaptureAudit.audit(client, server, false));
         write(client, requests.formatted(text.formatted("0000000000000000")));
         assertTrue(assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, false))
                 .getMessage().contains("hash differs from its values"));
@@ -147,9 +151,9 @@ public class RequestCaptureAuditTest {
             """;
 
     private static String server(int commits, String scan) {
-        return "{\"event\":\"executor_start\",\"pid\":42,\"application\":\"a\",\"sql\":\"SELECT c FROM t WHERE id = $1\"}\n"
+        return HEADER + "{\"event\":\"executor_start\",\"pid\":42,\"application\":\"a\",\"sql\":\"SELECT c FROM t WHERE id = $1\"}\n"
                 + scan
-                + "{\"event\":\"executor_run_end\",\"pid\":42,\"application\":\"a\"}\n"
+                + "{\"event\":\"executor_run_end\",\"pid\":42,\"application\":\"a\",\"depth\":1,\"returned\":0,\"row_hashes\":[]}\n"
                 + "{\"event\":\"transaction_commit\",\"pid\":42,\"application\":\"a\"}\n".repeat(commits);
     }
 

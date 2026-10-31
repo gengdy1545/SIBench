@@ -15,9 +15,9 @@ public class PgSchemaJdbcTest {
     public void jdbcCatalogReadsAllThreeLayoutsAndEmitsSourceAndActualEvidence() throws Exception {
         for (String path :
                 List.of(
-                        "config/hybench_sf1.yaml",
-                        "config/ycsb_large.yaml",
-                        "config/sysbench_large.yaml")) {
+                        "src/test/resources/config/hybench_sf1.yaml",
+                        "src/test/resources/config/ycsb_1b.yaml",
+                        "src/test/resources/config/sysbench_1b.yaml")) {
             SourceSchema schema = SourceSchemaTest.read(path);
             Fixture fixture = new Fixture(PgSchemaCheckTest.matching(schema, "public"), "public");
             var report = PgSchemaCheck.check(fixture.connection(), schema, "public");
@@ -33,7 +33,7 @@ public class PgSchemaJdbcTest {
 
     @Test
     public void shadowingTableFailsEvenWhenTargetSchemaItselfMatches() throws Exception {
-        SourceSchema schema = SourceSchemaTest.read("config/ycsb_large.yaml");
+        SourceSchema schema = SourceSchemaTest.read("src/test/resources/config/ycsb_1b.yaml");
         Fixture fixture = new Fixture(PgSchemaCheckTest.matching(schema, "public"), "shadow");
         Mismatch mismatch =
                 assertThrows(
@@ -47,7 +47,7 @@ public class PgSchemaJdbcTest {
     @Test
     public void driftAndReadFailuresKeepDiagnosticsAndRollbackWithoutChangingSource()
             throws Exception {
-        SourceSchema schema = SourceSchemaTest.read("config/ycsb_large.yaml");
+        SourceSchema schema = SourceSchemaTest.read("src/test/resources/config/ycsb_1b.yaml");
         Fixture empty = new Fixture(List.of(), "public");
         assertTrue(
                 assertThrows(
@@ -123,7 +123,7 @@ public class PgSchemaJdbcTest {
 
     @Test
     public void cleanupFailuresDoNotReplaceOriginalSchemaOrCatalogDiagnostics() throws Exception {
-        SourceSchema schema = SourceSchemaTest.read("config/ycsb_large.yaml");
+        SourceSchema schema = SourceSchemaTest.read("src/test/resources/config/ycsb_1b.yaml");
         Fixture mismatch = new Fixture(List.of(), "public");
         mismatch.cleanupFailure = new SQLException("cannot restore connection");
         Mismatch original =

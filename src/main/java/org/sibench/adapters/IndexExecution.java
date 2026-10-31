@@ -62,10 +62,18 @@ public final class IndexExecution {
 
     /** A batch of Baseline INSERTs; any other write refuses the whole batch before applying it. */
     static void batch(IndexBackend backend, org.sibench.adapters.proto.WriteBatch batch) throws IOException {
-        for (var write : batch.getWritesList())
+        for (var write : batch.getWritesList()) {
             if (write.getKind() != org.sibench.adapters.proto.Write.Kind.INSERT || write.getVersion() != 0)
                 throw new IllegalArgumentException("A write batch holds Baseline INSERTs only");
+            validateKey(write.getKey());
+        }
         for (var write : batch.getWritesList()) backend.write(write);
+    }
+
+    static void validateKey(org.sibench.adapters.proto.EntryKey key) {
+        if (key.getTable() < 1 || (key.getIndex() == 0) != key.getIndexedValue().isEmpty()
+                || key.getPrimaryKey().isEmpty())
+            throw new IllegalArgumentException("Invalid entry key");
     }
 
     /**

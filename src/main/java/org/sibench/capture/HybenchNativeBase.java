@@ -53,6 +53,8 @@ final class HybenchNativeBase {
 
     /** Builds the still database in its own, freshly initialized cluster (see {@link StillBase}). */
     static void build(CaptureConfig config) throws Exception {
+        NativeBuildCheck.verify(config.root(), "hybench", config.source(),
+                config.root().resolve(NativeBuildCheck.HYBENCH_DIRECTORY), config.sourceCommit());
         String sf = config.scaleFactor();
         Path data = config.workDir().resolve("Data_" + sf);
         Path manifest = manifest(config);
