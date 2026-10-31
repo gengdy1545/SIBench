@@ -1,12 +1,18 @@
 [submodule "HyBench-2024"]
-	path = HyBench-2024
+	path = benchmark/HyBench-2024
 	url = https://github.com/gengdy1545/HyBench-2024.git
 	branch = master
 [submodule "sysbench"]
-	path = sysbench
+	path = benchmark/sysbench
 	url = https://github.com/gengdy1545/sysbench.git
 	branch = master
 [submodule "YCSB"]
-	path = YCSB
+	path = benchmark/YCSB
 	url = https://github.com/gengdy1545/YCSB.git
 	branch = master
+[submodule "third_party/aws-sdk-cpp"]
+	path = third_party/aws-sdk-cpp
+	url = https://github.com/aws/aws-sdk-cpp.git
+[submodule "index/rocksdb-cloud"]
+	path = index/rocksdb-cloud
+	url = https://github.com/rockset/rocksdb-cloud.git

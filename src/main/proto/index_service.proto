@@ -1,0 +1,209 @@
+// SIBench index service protocol.
+//
+// A benchmark driver replays a canonical index trace against a KV index service through this
+// protocol. It carries logical index operations only; how a service lays them out physically
+// (key encoding, version suffix, column families, files) is its own. The semantics are those of
+// docs/index-service.md and docs/trace.md.
+syntax = "proto3";
+
+package sibench.index;
+
+option java_multiple_files = true;
+option java_package = "org.sibench.adapters.proto";
+option java_outer_classname = "IndexServiceProto";
+
+service IndexService {
+  // What the service implements; the driver refuses a service that lacks a semantic it needs.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+
+  // One stream per client. The service orders a transaction by transaction_operation and waits
+  // for complete commits before reading a version. Responses carry the request id and may arrive
+  // out of order across requests and streams.
+  rpc Execute(stream Request) returns (stream Response);
+
+  // Completes after every request received before it on any stream is durable to the level the
+  // service declares. Used between load, measurement and drain phases, never as a read barrier.
+  rpc Flush(FlushRequest) returns (FlushResponse);
+}
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  string name = 1;
+  ValueKind value_kind = 3;
+  // Reads at a version select the newest version at or below it (required).
+  bool versioned_reads = 4;
+  // Writes of one key at one version overwrite in stream order (required for
+  // transaction-local searches).
+  bool ordered_same_version_overwrite = 5;
+  // A search with local_version > 0 reads its read_version snapshot and then the exact writes of
+  // that one version received earlier; other versions between them stay invisible.
+  bool transaction_local_reads = 9;
+  // SearchGroup executes on the service; otherwise the driver must not send groups.
+  bool search_groups = 6;
+  reserved 8;
+  // Free text: durability level of an acknowledged write, cache and WAL placement.
+  string durability = 7;
+  // Machine-checkable acknowledgement level for workload writes; free text above explains it.
+  Acknowledgement write_ack = 10;
+  // Baseline INSERTs are memory-only until Flush; workload writes still follow write_ack.
+  bool baseline_durable_only_at_flush = 11;
+  // Flush returns only after the declared durable level is reached.
+  bool flush_makes_durable = 12;
+  // The service accepts Commit markers and exposes a complete-publication watermark. A search
+  // waits for its read_version to be published, not merely for the highest version seen.
+  bool complete_commit_publication = 13;
+  // WriteBatch requests of Baseline INSERTs (version 0) are accepted.
+  bool baseline_write_batches = 14;
+}
+
+enum Acknowledgement {
+  ACK_UNSPECIFIED = 0;
+  ACK_MEMORY = 1;  // acknowledged before durable state
+  ACK_WAL = 2;     // acknowledged in a write-ahead log, not necessarily fsynced
+  ACK_FSYNC = 3;   // acknowledged after fsync
+}
+
+enum ValueKind {
+  VALUE_KIND_UNSPECIFIED = 0;
+  LOCATOR = 1;  // (file id, row position) of the row version in a data file
+  ROW_ID = 2;   // logical row identity
+}
+
+// An index entry is (table, index, indexed value, primary key); the primary key index (index 0)
+// has no indexed value. Components are order-preserving encodings: their unsigned byte order is
+// the source order, and each component delimits itself.
+message EntryKey {
+  uint32 table = 1;
+  uint32 index = 2;
+  bytes indexed_value = 3;  // empty for index 0
+  bytes primary_key = 4;
+}
+
+message Value {
+  // LOCATOR uses file and position; ROW_ID uses row_id.
+  int64 file = 1;
+  int64 position = 2;
+  int64 row_id = 3;
+}
+
+message Request {
+  uint64 id = 1;  // unique per stream
+  reserved 5;
+  // Source transaction identity and 1-based position among actually sent transaction requests
+  // (writes, searches and groups, after secondary filtering). Zero for baseline loads and
+  // non-transactional snapshot searches.
+  uint64 transaction_id = 6;
+  uint64 transaction_operation = 7;
+  oneof operation {
+    Write write = 2;
+    Search search = 3;
+    SearchGroup group = 4;
+    Commit commit = 8;
+    WriteBatch batch = 9;
+  }
+}
+
+// Baseline INSERTs (version 0) applied in order as one request: they carry no versions, ordering
+// or publication, so a batch only saves per-request cost. A batch with any other write is refused
+// before any of it is applied.
+message WriteBatch {
+  repeated Write writes = 1;
+}
+
+message Commit {
+  uint64 version = 1;
+  uint64 writes = 2;      // index write requests in this transaction
+  uint64 operations = 3;  // all requests in this transaction, writes + searches + groups
+}
+
+message Write {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    INSERT = 1;          // baseline load at version 0
+    UPSERT = 2;          // a new version of the entry
+    LOGICAL_DELETE = 3;  // the entry does not exist from this version on; no value
+    RELOCATE = 4;        // replace the value of this exact, existing version
+  }
+  Kind kind = 1;
+  EntryKey key = 2;
+  uint64 version = 3;
+  Value value = 4;
+}
+
+// An ordered search over one index. The bounds apply to the leading component: the primary key
+// for index 0, the indexed value otherwise. Results are entries in (indexed value, primary key)
+// order, descending when asked, each at the newest version <= read_version that is not deleted.
+message Search {
+  uint32 table = 1;
+  uint32 index = 2;
+  Bound lower = 3;  // absent: unbounded
+  Bound upper = 4;  // absent: unbounded
+  bool descending = 5;
+  uint64 limit = 6;  // 0: no limit
+  uint64 read_version = 7;
+  // A pinned search names exactly one secondary entry: lower == upper == the indexed value, and
+  // this primary key.
+  bytes pinned_primary_key = 8;
+  // Transaction-local read: the statement snapshot is read_version; the search also sees this
+  // exact version's writes at earlier transaction_operation positions. 0: snapshot only. A service advertising
+  // transaction_local_reads selects max(read_version, an existing local_version), without
+  // exposing any version strictly between them.
+  uint64 local_version = 9;
+}
+
+message Bound {
+  bytes key = 1;
+  bool inclusive = 2;
+}
+
+// The searches of one source access, combined by primary key on the service.
+message SearchGroup {
+  enum Mode {
+    MODE_UNSPECIFIED = 0;
+    INTERSECTION = 1;
+    UNION = 2;
+  }
+  Mode mode = 1;
+  repeated Search members = 2;  // all of one table, at one read_version
+}
+
+message Response {
+  uint64 id = 1;
+  Status status = 2;
+  string message = 3;
+  // Searches and groups: the result entries, in result order (group: first member's order, then
+  // entries only later members added).
+  repeated Result results = 4;
+  // More responses with this id follow. A large result is sent in chunks whose results
+  // concatenate in order; only the last chunk (more = false) carries the final status.
+  bool more = 5;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  OK = 1;
+  INVALID = 2;      // the request breaks the protocol (no such version to relocate, ...)
+  UNAVAILABLE = 3;  // the service could not execute it; the outcome of a write is unknown
+}
+
+message Result {
+  bytes primary_key = 1;
+  uint64 version = 2;
+  Value value = 3;
+}
+
+message FlushRequest {
+  // The trace this index holds (Trace / Baseline digests, format, secondary coverage, value mode).
+  // The index records it at its first Flush and refuses a Flush naming another trace.
+  string index_binding = 1;
+}
+
+message FlushResponse {
+  // Highest version whose complete commit was received and whose writes were applied before this
+  // Flush. It is not the highest version merely seen; a partial or missing commit does not advance.
+  uint64 published_version = 1;
+  // The binding the index holds, and where the index lives (a directory or an object location).
+  string index_binding = 2;
+  string index_location = 3;
+}

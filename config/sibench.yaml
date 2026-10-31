@@ -1,0 +1,44 @@
+# SIBench runtime settings; benchmark database identities stay with their workload.
+schema_version: 1
+purpose: sibench
+target:
+  secondary_indexes:
+    enabled: true
+  service:
+    adapter: grpc
+    endpoint: 127.0.0.1:50551
+    value: row_id
+replay:
+  strategy: single_pass
+  dispatch_mode: operation
+  client_count: 64
+  max_in_flight: 4096
+  request_timeout_seconds: 60
+versions:
+  gc:
+    owner: none
+postgres:
+  listen_addresses: 127.0.0.1
+  timezone: UTC
+  log_statement: none
+  compute_query_id: 'on'
+  max_parallel_workers_per_gather: '0'
+  max_parallel_maintenance_workers: '0'
+  autovacuum: 'off'
+  shared_buffers: 16GB
+  max_wal_size: 32GB
+  min_wal_size: 4GB
+  checkpoint_timeout: 30min
+  checkpoint_completion_target: '0.9'
+  wal_buffers: 64MB
+  synchronous_commit: 'off'
+  maintenance_work_mem: 2GB
+analysis:
+  layout:
+    entries_per_block: 256
+    blocks_per_file: 4096
+    sort_memory_bytes: 1073741824
+  window:
+    business_changes: 10000
+    l0_index_modifications: 10000
+    heatmap_bins: 1000

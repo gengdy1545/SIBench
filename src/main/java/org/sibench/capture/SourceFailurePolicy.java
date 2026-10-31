@@ -1,0 +1,271 @@
+package org.sibench.capture;
+
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+
+/**
+ * Decides what a failure the native source produced itself means, from the pinned source behaviour
+ * rather than from one observed run. Three different things reach the same "the client did not
+ * succeed" signal, and only the third may invalidate a capture:
+ *
+ * <ol>
+ *   <li>a business rollback the source does by design;</li>
+ *   <li>an SQL or API failure the source expects (a duplicate key, a deadlock, a serialization
+ *       failure, a read of an absent key, a reconnect);</li>
+ *   <li>a failure of the capture machinery, or a failure no pinned source behaviour explains.</li>
+ * </ol>
+ *
+ * The classifier is pure: it decides a {@link Category} from explicit evidence and never infers one
+ * from a message text. Missing evidence stays {@link Category#UNEXPECTED}.
+ */
+public final class SourceFailurePolicy {
+    private SourceFailurePolicy() {}
+
+    public enum Category {
+        /** The source abandoned its own request; the workload defines that outcome. */
+        BUSINESS_ROLLBACK,
+        /** An SQLSTATE the pinned client treats as an expected outcome of its workload. */
+        EXPECTED_SQL_FAILURE,
+        /** A client-reported status the pinned client returns as an ordinary outcome. */
+        EXPECTED_API_FAILURE,
+        /** The source reconnected or restarted the attempt itself. */
+        NATIVE_RETRY,
+        /** Nothing in the pinned source explains the failure: the capture is invalid. */
+        UNEXPECTED;
+
+        /** Only a failure of the capture machinery invalidates a capture. */
+        public boolean invalidatesCapture() {
+            return this == UNEXPECTED;
+        }
+    }
+
+    /**
+     * The SQLSTATEs the pinned sysbench pgsql driver treats as {@code DB_ERROR_IGNORABLE}: it rolls
+     * the statement back and the run continues. Every other SQLSTATE is {@code LOG_FATAL} and ends
+     * the process. See {@code benchmark/sysbench/src/drivers/pgsql/drv_pgsql.c}, the
+     * {@code PGRES_FATAL_ERROR} branch of {@code pgsql_check_status}.
+     *
+     * <p>YCSB's JDBC binding reaches the same states: an INSERT onto an existing primary key is
+     * SQLSTATE 23505 and surfaces as {@code Status.ERROR}, not as an exception the client handles.
+     */
+    public static final Set<String> IGNORABLE_SQL_STATES = Set.of("23505", "40P01", "40001");
+
+    /**
+     * Client-reported statuses the pinned YCSB binding produces as an ordinary outcome rather than
+     * as a broken request: {@code Status.NOT_FOUND} (a read of an absent key,
+     * {@code JdbcDBClient.read}) and {@code Status.BATCHED_OK} (an insert queued into a batch).
+     */
+    public static final Set<String> EXPECTED_CLIENT_STATUSES = Set.of("NOT_FOUND", "BATCHED_OK");
+
+    /**
+     * Driver-reported outcome of the pinned sysbench pgsql driver for a statement it decided to
+     * ignore: the statement's own counter is {@code SB_CNT_ERROR}
+     * ({@code drv_pgsql.c}), {@code db_driver.c} increments that counter, and {@code sysbench.c}
+     * reports it as "ignored errors". A run that still exits 0 only ever counted ignorable
+     * statements, because every other SQLSTATE is fatal.
+     */
+    public static final String DRIVER_IGNORED_ERROR = "pgsql_ignored_error";
+
+    private static final Set<String> IGNORED_DRIVER_STATUSES = Set.of(DRIVER_IGNORED_ERROR);
+
+    /**
+     * The evidence one attempt of a failed request leaves behind. Everything is what the source or
+     * the pinned driver stated; nothing is parsed out of a free-text message.
+     *
+     * @param attempt 1-based ordinal of this attempt
+     * @param attempts how many attempts the source made for this request
+     */
+    public record Evidence(
+            String sqlState,
+            Integer errorCode,
+            String clientStatus,
+            String driverStatus,
+            boolean rolledBackBySource,
+            boolean retriedBySource,
+            String request,
+            String transaction,
+            int attempt,
+            int attempts) {
+        public Evidence {
+            if (attempt < 1) attempt = 1;
+            if (attempts < attempt) attempts = attempt;
+        }
+
+        public static Evidence of(
+                String sqlState,
+                String clientStatus,
+                String driverStatus,
+                boolean rolledBackBySource,
+                boolean retriedBySource,
+                String request,
+                String transaction) {
+            return new Evidence(
+                    sqlState,
+                    null,
+                    clientStatus,
+                    driverStatus,
+                    rolledBackBySource,
+                    retriedBySource,
+                    request,
+                    transaction,
+                    1,
+                    1);
+        }
+
+        /** The identity a report records, so a later classification can consume it. */
+        public Map<String, Object> describe() {
+            var result = new LinkedHashMap<String, Object>();
+            result.put("sql_state", sqlState);
+            result.put("error_code", errorCode);
+            result.put("client_status", clientStatus);
+            result.put("driver_status", driverStatus);
+            result.put("rolled_back_by_source", rolledBackBySource);
+            result.put("retried_by_source", retriedBySource);
+            result.put("request", request);
+            result.put("transaction", transaction);
+            return result;
+        }
+
+        /** Groups the attempts of one request, independent of how each attempt was classified. */
+        private String identity() {
+            return String.join(
+                    "\u0000",
+                    String.valueOf(sqlState),
+                    String.valueOf(errorCode),
+                    String.valueOf(clientStatus),
+                    String.valueOf(driverStatus),
+                    String.valueOf(rolledBackBySource),
+                    String.valueOf(retriedBySource),
+                    String.valueOf(request),
+                    String.valueOf(transaction));
+        }
+    }
+
+    /** @param basis the pinned source behaviour that decided the category */
+    public record Classification(Category category, String basis, Evidence evidence) {
+        public Map<String, Object> describe() {
+            var result = evidence.describe();
+            result.put("category", category.name());
+            result.put("basis", basis);
+            result.put("attempt", evidence.attempt());
+            result.put("attempts", evidence.attempts());
+            return result;
+        }
+    }
+
+    /**
+     * Classifies one attempt from the most specific evidence available. An explicit SQLSTATE
+     * outranks a client status, which outranks a source-side rollback, which outranks a retry;
+     * without evidence of any kind the failure is {@link Category#UNEXPECTED}.
+     */
+    public static Classification classify(Evidence evidence) {
+        Objects.requireNonNull(evidence, "evidence");
+        String sqlState = evidence.sqlState();
+        if (sqlState != null && IGNORABLE_SQL_STATES.contains(sqlState))
+            return new Classification(
+                    Category.EXPECTED_SQL_FAILURE,
+                    "the pinned driver treats SQLSTATE " + sqlState + " as an expected outcome",
+                    evidence);
+        String driverStatus = evidence.driverStatus();
+        if (driverStatus != null && IGNORED_DRIVER_STATUSES.contains(driverStatus))
+            return new Classification(
+                    Category.EXPECTED_SQL_FAILURE,
+                    "the pinned driver counted the statement as an ignored error",
+                    evidence);
+        String clientStatus = evidence.clientStatus();
+        if (clientStatus != null && EXPECTED_CLIENT_STATUSES.contains(clientStatus))
+            return new Classification(
+                    Category.EXPECTED_API_FAILURE,
+                    "the pinned client reports " + clientStatus + " as an ordinary outcome",
+                    evidence);
+        if (evidence.rolledBackBySource())
+            return new Classification(
+                    Category.BUSINESS_ROLLBACK,
+                    "the source rolled its own request back",
+                    evidence);
+        if (evidence.retriedBySource())
+            return new Classification(
+                    Category.NATIVE_RETRY, "the source retried the attempt itself", evidence);
+        return new Classification(
+                Category.UNEXPECTED, "no pinned source behaviour explains this failure", evidence);
+    }
+
+    /** The evidence a recording JDBC driver sees, for a failure that still ends the capture. */
+    public static Evidence evidence(SQLException error, String request, String transaction) {
+        return new Evidence(
+                error.getSQLState(),
+                error.getErrorCode(),
+                null,
+                null,
+                false,
+                false,
+                request,
+                transaction,
+                1,
+                1);
+    }
+
+    /** Accumulates the failure attempts of one run or of one workload of a run. */
+    public static final class Tally {
+        private final EnumMap<Category, Long> counts = new EnumMap<>(Category.class);
+        private final List<Classification> history = new ArrayList<>();
+        private final Map<String, List<Classification>> grouped = new LinkedHashMap<>();
+
+        public Classification record(Evidence evidence) {
+            Classification classification = classify(evidence);
+            counts.merge(classification.category(), 1L, Long::sum);
+            history.add(classification);
+            grouped.computeIfAbsent(evidence.identity(), ignored -> new ArrayList<>())
+                    .add(classification);
+            return classification;
+        }
+
+        public long count(Category category) {
+            return counts.getOrDefault(category, 0L);
+        }
+
+        public boolean invalidatesCapture() {
+            return counts.getOrDefault(Category.UNEXPECTED, 0L) != 0L;
+        }
+
+        public List<Classification> attempts() {
+            return List.copyOf(history);
+        }
+
+        /**
+         * Counts per category, and one occurrence per request identity listing every attempt and
+         * the outcome of the last one.
+         */
+        public Map<String, Object> report() {
+            var byCategory = new LinkedHashMap<String, Object>();
+            for (Category category : Category.values()) byCategory.put(category.name(), count(category));
+            var occurrences = new ArrayList<Map<String, Object>>();
+            for (List<Classification> attempts : grouped.values()) {
+                Classification last = attempts.get(attempts.size() - 1);
+                var occurrence = new LinkedHashMap<String, Object>(last.evidence().describe());
+                occurrence.put("final_outcome", last.category().name());
+                occurrence.put("basis", last.basis());
+                var recorded = new ArrayList<Map<String, Object>>();
+                for (Classification attempt : attempts) {
+                    var item = new LinkedHashMap<String, Object>();
+                    item.put("attempt", attempt.evidence().attempt());
+                    item.put("of", attempt.evidence().attempts());
+                    item.put("outcome", attempt.category().name());
+                    recorded.add(item);
+                }
+                occurrence.put("attempts", recorded);
+                occurrences.add(occurrence);
+            }
+            var result = new LinkedHashMap<String, Object>();
+            result.put("counts", byCategory);
+            result.put("occurrences", occurrences);
+            return result;
+        }
+    }
+}

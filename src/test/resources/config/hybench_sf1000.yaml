@@ -1,0 +1,43 @@
+schema_version: 1
+purpose: baseline_generation
+benchmark: hybench
+source:
+  path: benchmark/HyBench-2024
+  commit: eaad91b52956fddd3d48ce49f792928056b7b360
+  definition: src/main/resources/parameters.toml
+  definition_sha256: 663ac0c2559720fd75044391510a75620ccbdc37f56c1c05fc49d5d3371ae900
+scale:
+  basis: native_parameters
+  total_rows: 8706000000
+  table_rows:
+    customer: 300000000
+    company: 2000000
+    savingaccount: 302000000
+    checkingaccount: 302000000
+    transfer: 6000000000
+    checking: 600000000
+    loanapps: 600000000
+    loantrans: 600000000
+native:
+  sf: 1000x
+data_layout:
+  partitioning: none
+  buckets: 1
+  bucket_function: ordinal_mod
+  parquet:
+    target_file_size_bytes: 536870912
+    file_size_max_overshoot_percent: 5
+    row_group_max_rows: 1048576
+    row_group_buffer_bytes: 67108864
+    page_size_bytes: 1048576
+    dictionary_page_size_bytes: 1048576
+    dictionary_enabled: true
+    compression: zstd
+    compression_level: 3
+generation:
+  adapter: sibench-baseline-v1
+  mode: deterministic_derived
+  seed: 7
+  baseline_timestamp: 0
+  output_directory: results/datasets/tests/hybench_sf1000
+  min_free_disk_bytes: 21474836480
