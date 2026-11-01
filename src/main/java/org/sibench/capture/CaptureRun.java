@@ -29,6 +29,8 @@ final class CaptureRun implements AutoCloseable {
     private final Map<String, Object> phases = new LinkedHashMap<>();
     private volatile String phase;
     private final java.util.Set<Path> closed = new java.util.HashSet<>();
+    private record ServerAudit(String sha256, Map<String, Object> report) {}
+    private final Map<Path, ServerAudit> serverAudits = new java.util.concurrent.ConcurrentHashMap<>();
 
     private CaptureRun(Path directory, String mode) throws IOException {
         this.directory = directory.toAbsolutePath().normalize();
@@ -373,6 +375,26 @@ final class CaptureRun implements AutoCloseable {
      */
     private record Pair(Path client, Path server, boolean bindings, boolean external, Object workload) {}
 
+    /** Shares a drained sysbench session's audit between workload totals and run completion. */
+    static Map<String, Object> auditServer(Path server) throws IOException {
+        CaptureRun run = active;
+        Path path = server.toAbsolutePath().normalize();
+        if (run == null || !path.getParent().equals(run.directory))
+            throw new IOException("Server audit must belong to the active capture");
+        String digest = FileDigests.sha256(path);
+        ServerAudit previous = run.serverAudits.get(path);
+        if (previous != null) {
+            if (!digest.equals(previous.sha256()))
+                throw new IOException("Server trace changed after its session audit: " + path);
+            return previous.report();
+        }
+        var report = ServerCaptureAudit.audit(path);
+        if (!digest.equals(FileDigests.sha256(path)))
+            throw new IOException("Server trace changed during its session audit: " + path);
+        run.serverAudits.put(path, new ServerAudit(digest, report));
+        return report;
+    }
+
     /** Session audits running at once: they are independent, and each reads two whole files. */
     private static final int AUDIT_THREADS = 8;
 
@@ -446,7 +468,7 @@ final class CaptureRun implements AutoCloseable {
                 "audit",
                 pair.client() != null
                         ? RequestCaptureAudit.audit(pair.client(), pair.server(), pair.bindings())
-                        : ServerCaptureAudit.audit(pair.server()));
+                        : auditServer(pair.server()));
         return record;
     }
 

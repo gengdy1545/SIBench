@@ -3,16 +3,15 @@ package org.sibench.capture;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.google.gson.JsonSyntaxException;
 
 import java.util.HashMap;
 import java.util.Map;
 
 /**
- * One backend trace event: its top-level fields by name in a hash map. The compiler reads a few
- * fields of every event many times on its single ordered thread, where Gson's tree-ordered member
- * lookup was a third of the time; parser threads build this form ({@link ParsedTrace}). Nested
- * values (row images, scan keys) stay Gson elements.
+ * One backend trace event, with top-level fields in a hash map for repeated compiler lookups.
+ * Parser threads build this form ({@link ParsedTrace}); nested row images and scan keys stay Gson
+ * elements.
  *
  * <p>Field names are the interned strings, as the compiler's literals are, so a lookup matches by
  * identity without reading the name; the event type and backend pid every event is asked for are
@@ -80,40 +79,35 @@ public final class Event {
         return hasPid ? pid : fields.get("pid").getAsInt();
     }
 
-    /**
-     * One trace line, as {@code of(JsonParser.parseString(line).getAsJsonObject())} gives it,
-     * without building the top-level object first: its fields go straight into the map (a later
-     * duplicate replaces an earlier one, as in a JsonObject). A line this does not read is parsed
-     * that way instead, so it fails exactly as it did.
-     */
+    /** One JSON object per trace line, parsed directly into the top-level field map. */
     public static Event parse(String line) {
-        try {
-            var reader = new com.google.gson.stream.JsonReader(new java.io.StringReader(line));
-            reader.setStrictness(com.google.gson.Strictness.LENIENT);
-            if (reader.peek() == com.google.gson.stream.JsonToken.BEGIN_OBJECT) {
-                var fields = new HashMap<String, JsonElement>(64);
-                reader.beginObject();
-                while (reader.hasNext()) {
-                    String name = name(reader.nextName());
-                    fields.put(
-                            name,
-                            reader.peek() == com.google.gson.stream.JsonToken.NUMBER
-                                    ? number(reader.nextString())
-                                    : com.google.gson.internal.bind.TypeAdapters.JSON_ELEMENT.read(reader));
-                }
-                reader.endObject();
-                if (reader.peek() == com.google.gson.stream.JsonToken.END_DOCUMENT) return new Event(fields);
+        try (var reader = new com.google.gson.stream.JsonReader(new java.io.StringReader(line))) {
+            reader.setStrictness(com.google.gson.Strictness.STRICT);
+            if (reader.peek() != com.google.gson.stream.JsonToken.BEGIN_OBJECT)
+                throw new JsonSyntaxException("Trace event must be a JSON object");
+            var fields = new HashMap<String, JsonElement>(64);
+            reader.beginObject();
+            while (reader.hasNext()) {
+                String name = name(reader.nextName());
+                fields.put(
+                        name,
+                        reader.peek() == com.google.gson.stream.JsonToken.NUMBER
+                                ? number(reader.nextString())
+                                : com.google.gson.internal.bind.TypeAdapters.JSON_ELEMENT.read(reader));
             }
-        } catch (java.io.IOException | RuntimeException | StackOverflowError unread) {
-            // Parsed again below, failing as it always did.
+            reader.endObject();
+            if (reader.peek() != com.google.gson.stream.JsonToken.END_DOCUMENT)
+                throw new JsonSyntaxException("Trailing data after trace event");
+            return new Event(fields);
+        } catch (java.io.IOException invalid) {
+            throw new JsonSyntaxException("Invalid trace event JSON", invalid);
         }
-        return of(JsonParser.parseString(line).getAsJsonObject());
     }
 
     /**
      * A top-level number. Gson keeps a number as its text and parses it again on every read; the
-     * compiler reads the same few counters of every event, so a canonical integer is parsed once
-     * here. Any other text stays as Gson keeps it, so it reads and prints as before.
+     * compiler reads the same few counters of every event, so a canonical integer is parsed once.
+     * Other numeric forms retain their JSON spelling.
      */
     private static JsonElement number(String text) {
         int length = text.length();

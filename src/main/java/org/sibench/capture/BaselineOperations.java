@@ -86,8 +86,7 @@ public final class BaselineOperations {
      * thread of its own and only for the row identity and the indexed columns; their rows are then
      * encoded in runs by a pool, a bounded number of runs ahead, and handed over in order. A row's
      * position, row identity and work unit follow from the rows before it, so the stream is the
-     * one a single reader produces. (Decoding a whole group per task with a bounded queue each
-     * stalled every group but the one being consumed: the load was derived by one thread.)
+     * one a single reader produces.
      */
     static Extent derive(Path baseline, IndexCatalog catalog, IndexOperationTrace.Consumer consumer, Rows rows)
             throws IOException {

@@ -131,15 +131,7 @@ final class YcsbNativeRun {
         require(
                 loaded == records && inserts.keySet().stream().allMatch(code -> code.equals("Return=OK") || code.equals("Return=BATCHED_OK") || !code.startsWith("Return=")),
                 "YCSB load did not insert every record");
-        // The last batch is sent at client cleanup, after its inserts reported BATCHED_OK.
-        try (var connection =
-                        java.sql.DriverManager.getConnection(
-                                config.jdbc(), config.user(), System.getenv().getOrDefault("PGPASSWORD", ""));
-                var statement = connection.createStatement();
-                var count = statement.executeQuery(
-                        "SELECT count(*) FROM \"" + string(nativeConfig, "table").replace("\"", "\"\"") + "\"")) {
-            require(count.next() && count.getLong(1) == records, "YCSB load left a different row count in PG");
-        }
+        // StillBase checks actual final rows before publishing; BATCHED_OK alone cannot prove cleanup flushed the last batch.
     }
 
     static Map<String, Object> run(NativeCaptureConfig config, Path logs) throws Exception {

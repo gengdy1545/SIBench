@@ -797,11 +797,12 @@ public class IndexTraceCompilerTest {
                         output,
                         ReplayConfig.defaults(),
                         service,
-                        null,
+                        fixture.resolve("snapshots.json"),
                         fixture.resolve("service.json"));
         assertEquals("passed", served.get("status"));
         var servedResult = (Map<?, ?>) served.get("result");
         assertEquals(1L, ((Number) servedResult.get("per_query_digest_checks")).longValue());
+        assertEquals("reference_report", servedResult.get("expected_results_source"));
         var referenceRowId = com.google.gson.JsonParser.parseString(
                         Files.readString(fixture.resolve("replay.json")))
                 .getAsJsonObject().getAsJsonArray("results").get(1).getAsJsonObject();
@@ -891,7 +892,7 @@ public class IndexTraceCompilerTest {
      */
     private static void verifyReopenedPublishedIndex(Path fixture, Path output) throws Exception {
         var reference = fixture.resolve("verify-reference.json");
-        assertEquals("passed", ReferenceReplay.run(output, ReplayConfig.defaults(), reference).get("status"));
+        assertEquals("passed", SnapshotLookupValidation.run(output, ReplayConfig.defaults(), reference).get("status"));
         var service = publishedInProcess(fixture.resolve("verify-index"));
         assertEquals(
                 "passed",
@@ -1448,6 +1449,42 @@ public class IndexTraceCompilerTest {
         assertEquals("consumer failed", aborted.getMessage());
         assertEquals("workload_integrity_and_supply_valid", input.preflight().get("status"));
         assertFalse(input.preflight().containsKey("baseline"));
+    }
+
+    @Test
+    public void replayRequiresCurrentManifestCoverageCounts() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        var config = baseline(fixture);
+        Path output = fixture.resolve("compiled");
+        compile(config, nonPrefixCapture(fixture, config, "1"), output);
+        Path path = output.resolve("manifest.json");
+        String original = Files.readString(path);
+        int analysisCase = 0;
+        for (String name : List.of("baseline_rows", "source_work_units",
+                "baseline_operations", "workload_operations")) {
+            for (String invalid : List.of("missing", "null", "\"1\"", "-1", "1.5", "9223372036854775808")) {
+                var manifest = com.google.gson.JsonParser.parseString(original).getAsJsonObject();
+                if (invalid.equals("missing")) manifest.remove(name);
+                else manifest.add(name, com.google.gson.JsonParser.parseString(invalid));
+                Files.writeString(path, manifest.toString());
+                var failure = assertThrows(java.io.IOException.class,
+                        () -> ReferenceReplay.prepare(output, ReplayConfig.defaults()));
+                assertTrue(failure.getMessage(), failure.getMessage().contains(name));
+                Path analysis = fixture.resolve("locality-invalid-" + analysisCase++);
+                var analysisFailure = assertThrows(java.io.IOException.class,
+                        () -> org.sibench.analysis.UpdateLocality.run(output,
+                                Path.of("config/sibench.yaml"), analysis));
+                assertTrue(analysisFailure.getMessage(), analysisFailure.getMessage().contains(name));
+            }
+        }
+        Files.writeString(path, original);
+        assertEquals("trace_integrity_and_supply_valid",
+                ReferenceReplay.check(output, ReplayConfig.defaults()).get("status"));
+        Path analysis = fixture.resolve("locality-valid");
+        org.sibench.analysis.UpdateLocality.run(output, Path.of("config/sibench.yaml"), analysis);
+        assertEquals("complete_for_declared_layout",
+                com.google.gson.JsonParser.parseString(Files.readString(analysis.resolve("summary.json")))
+                        .getAsJsonObject().get("status").getAsString());
     }
 
     @Test

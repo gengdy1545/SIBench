@@ -27,6 +27,52 @@ public class CaptureRunTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     @Test
+    public void serverSessionAuditIsReusedOnlyWithinItsUnchangedCapture() throws Exception {
+        Path directory = temporary.newFolder().toPath(), server = directory.resolve("pg-123.jsonl.zst");
+        try (CaptureRun run = CaptureRun.beginExternal(directory, "sysbench")) {
+            writeServerSession(server);
+            var first = CaptureRun.auditServer(server);
+            assertSame(first, CaptureRun.auditServer(server));
+            run.completeExternal(false, serverClient());
+            assertEquals(1, manifest(directory).getAsJsonArray("sessions").size());
+            assertEquals(1L, manifest(directory).getAsJsonArray("sessions").get(0)
+                    .getAsJsonObject().getAsJsonObject("audit").get("requests").getAsLong());
+        }
+        CaptureRun.verifyInput(directory);
+        Path another = temporary.newFolder().toPath();
+        try (CaptureRun run = CaptureRun.beginExternal(another, "sysbench")) {
+            assertThrows(IOException.class, () -> CaptureRun.auditServer(server));
+        }
+    }
+
+    @Test
+    public void changingAnAuditedServerTracePreventsRunCompletion() throws Exception {
+        Path directory = temporary.newFolder().toPath(), server = directory.resolve("pg-123.jsonl.zst");
+        try (CaptureRun run = CaptureRun.beginExternal(directory, "sysbench")) {
+            writeServerSession(server);
+            CaptureRun.auditServer(server);
+            Files.write(server, new byte[] {0}, java.nio.file.StandardOpenOption.APPEND);
+            assertTrue(assertThrows(IOException.class, () -> run.completeExternal(false, serverClient()))
+                    .getMessage().contains("changed after its session audit"));
+            assertEquals("failed", manifest(directory).get("status").getAsString());
+        }
+    }
+
+    private static Map<String, Object> serverClient() {
+        return Map.of("workloads", List.of(Map.of("script", "oltp_point_select", "sessions",
+                List.of(Map.of("pg_file", "pg-123.jsonl.zst")))));
+    }
+
+    private static void writeServerSession(Path path) throws Exception {
+        RowAuditTestSupport.writeTrace(path, List.of(
+                event("capture_start", "fixture", ",\"req\":0,\"depth\":0,\"detail\":\"summary\""),
+                event("executor_start", "fixture", ",\"req\":1,\"depth\":1,\"sql\":\"SELECT 1\""),
+                event("executor_run_end", "fixture", ",\"req\":1,\"depth\":1,\"processed\":0,\"returned\":0,\"row_hashes\":[]"),
+                event("executor_end", "fixture", ",\"req\":1,\"depth\":1"),
+                event("transaction_commit", "fixture", ",\"req\":1,\"depth\":0")));
+    }
+
+    @Test
     public void preflightMismatchKeepsEvidenceAndStartsNoNativeSession() throws Exception {
         Path directory = temporary.newFolder().toPath();
         try (CaptureRun run = CaptureRun.begin(directory)) {

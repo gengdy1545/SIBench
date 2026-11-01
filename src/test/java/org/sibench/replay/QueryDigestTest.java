@@ -44,6 +44,30 @@ public class QueryDigestTest {
     }
 
     @Test
+    public void growingScratchPreservesTheIndependentWireEncoding() throws Exception {
+        var rows = List.of(
+                new LookupResult(IndexKey.ofText("Ω🙂".repeat(2048)), 1L << 40, 1L << 48, 1L << 56),
+                new LookupResult(IndexKey.ofInt(-7), Long.MIN_VALUE, -1, Long.MAX_VALUE),
+                new LookupResult(IndexKey.ofText("x"), 3, 4, 5));
+        for (boolean rowIds : new boolean[] {false, true, false}) {
+            var bytes = new java.io.ByteArrayOutputStream();
+            var wire = new java.io.DataOutputStream(bytes);
+            wire.writeInt(rows.size());
+            for (var row : rows) {
+                byte[] key = row.key().bytes();
+                wire.writeInt(key.length);
+                wire.write(key);
+                wire.writeLong(row.commitVersion());
+                wire.writeLong(row.value());
+                if (!rowIds) wire.writeLong(row.position());
+            }
+            String expected = HexFormat.of().formatHex(java.security.MessageDigest
+                    .getInstance("SHA-256").digest(bytes.toByteArray()));
+            assertEquals(expected, QueryDigest.results(rows, rowIds));
+        }
+    }
+
+    @Test
     public void publishedHashCoversEmptyFilesHeadersAndBufferedQueryRecords() throws Exception {
         var query = IndexOperationTrace.search(7, 1, 0,
                 IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 0, 1, 0);

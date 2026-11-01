@@ -131,7 +131,7 @@ final class SysbenchNativeRun {
             long serverRequests = 0, serverCommits = 0, setupCommits = 0, zeroRows = 0;
             var sessions = new ArrayList<Map<String, Object>>();
             for (Path trace : added) {
-                var audit = ServerCaptureAudit.audit(trace);
+                var audit = CaptureRun.auditServer(trace);
                 serverRequests += (Long) audit.get("requests");
                 serverCommits += (Long) audit.get("commits");
                 setupCommits += (Long) audit.get("setup_commits_before_first_execution");

@@ -84,6 +84,12 @@
 - Integrate updates into the relevant current sections; remove completed tasks
   from remaining work. Separate implemented behavior, unverified choices and
   historical evidence. Keep the input/build identities needed by retained facts.
+- Give each maintained fact one current home. Consolidate overlapping local
+  guides, update their consumers, and remove superseded prose instead of adding
+  an archive. Retain experiment configurations and helper scripts only for a
+  named current use or necessary evidence; verify recoverable copies before
+  removing unique inputs. Keep proposed workflow changes distinct from behavior
+  already implemented and validated.
 - README and contracts describe current behavior; local development guides
   describe detailed checks and measurement procedures. Do not link delivered
   documentation to ignored local notes or results. Publish experiment claims only
@@ -127,6 +133,14 @@
 
 ## Documentation responsibilities
 
+- Use English for all project-owned documentation, code comments, docstrings,
+  configuration explanations, CLI help, and other maintained prose. Translate
+  existing non-English prose when bringing the repository into compliance;
+  update affected links and anchors together. Preserve program identifiers,
+  required Unicode test data, upstream content, and recorded raw evidence.
+- Keep Chinese reading notes only in the ignored `develop/` directory. Do not
+  stage or commit those notes, force-add them, or link delivered documentation
+  to them.
 - Use `README.md` for build, usage, supported inputs and test entry points.
   Keep only externally relevant format and service semantics in `docs/`.
   Put source investigations, detailed validation procedures, performance studies
@@ -157,6 +171,11 @@
 
 - For documentation-only changes, check links, cross-references and consistency;
   do not run a Benchmark merely to validate prose.
+- Document production generation, backend evaluation and independent acceptance
+  as explicit workflows with their own triggers and costs. Do not attach a
+  development-only reference, oracle or recovery suite to every generation run.
+  Normal generation stops on failure and retains diagnostics; cross-host fault
+  migration is not part of that workflow.
 - Review validation across benchmark data generation, capture, index-operation
   extraction, Trace compilation and Index Service replay. For each production
   check, identify the failure it detects, the boundary responsible for it, its

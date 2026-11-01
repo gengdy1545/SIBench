@@ -589,7 +589,12 @@ public final class SnapshotLookupValidation {
         }
         List<Map<String, Object>> modes = new ArrayList<>();
         for (boolean rowIds : rowIdModes) {
-            try (var model = new IndexReferenceReplay(rowIds, config.secondaryIndexes());
+            String mode = rowIds ? "rowid" : "locator";
+            Path digests = report.toAbsolutePath().resolveSibling(report.getFileName() + "." + mode + ".queries");
+            try (var digest = new QueryDigest.File(digests, rowIds,
+                            ReferenceReplay.binding(directory, config) + " mode=" + mode);
+                    var model = new IndexReferenceReplay(rowIds, config.secondaryIndexes(),
+                            IndexReferenceReplay.Settings.defaults(), digest);
                     var load = new ReplayProjection(config, false, model::accept);
                     var runtime = new ReplayProjection(config, true, model::accept)) {
                 baseline.read(load);
@@ -703,24 +708,20 @@ public final class SnapshotLookupValidation {
                         rangeProbes++;
                         items += actual.size();
                     }
-                modes.add(
-                        Map.of(
-                                "mode",
-                                rowIds ? "rowid" : "locator",
-                                "native_queries",
-                                model.queries(),
-                                "derived_primary_probes",
-                                primaryProbes,
-                                "derived_secondary_probes",
-                                secondaryProbes,
-                                "derived_range_probes",
-                                rangeProbes,
-                                "derived_checked_result_items",
-                                items,
-                                "retained_index_versions",
-                                model.retainedVersions(),
-                                "workload_dispatch",
-                                runtime.describe()));
+                digest.close();
+                var result = new LinkedHashMap<String, Object>();
+                result.put("mode", mode);
+                result.put("native_queries", model.queries());
+                result.put("derived_primary_probes", primaryProbes);
+                result.put("derived_secondary_probes", secondaryProbes);
+                result.put("derived_range_probes", rangeProbes);
+                result.put("derived_checked_result_items", items);
+                result.put("retained_index_versions", model.retainedVersions());
+                result.put("workload_dispatch", runtime.describe());
+                result.put("query_digests", digest.count());
+                result.put("query_digest_file", digests.toString());
+                result.put("query_digest_sha256", digest.sha256());
+                modes.add(result);
             }
         }
         Map<String, Object> output = new LinkedHashMap<>();

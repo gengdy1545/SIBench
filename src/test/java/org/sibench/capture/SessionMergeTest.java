@@ -267,7 +267,7 @@ public class SessionMergeTest {
 
     private static List<String> byScanner(Path file) throws IOException {
         var result = new ArrayList<String>();
-        try (var scanner = new SessionMerge.Boundaries(file)) {
+        try (var scanner = new ServerTrace.Records(file)) {
             for (String line; (line = scanner.next()) != null; ) result.add(scanner.lines() + " " + line);
             result.add(scanner.lines() + " end");
         }
@@ -277,7 +277,7 @@ public class SessionMergeTest {
     /**
      * Chunk ends and line counts are those readLine gives: LF, CR and CRLF ends, empty and short
      * lines, near-miss prefixes, lines and records across the scanner's buffer, a last line without
-     * an end, in a plain and a zstd file.
+     * an end, in the supported zstd stream.
      */
     @Test
     public void boundariesSplitLinesAsReadLineDoes() throws Exception {

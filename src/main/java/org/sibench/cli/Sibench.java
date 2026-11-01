@@ -51,11 +51,11 @@ public final class Sibench {
                         + "   (serves a new or reopened RocksDB / rocksdb-cloud index over the SIBench index protocol)");
         out.println(
                 "       java -jar build/sibench/sibench.jar replay-service REPLAY_CONFIG"
-                        + " NORMALIZED_DIRECTORY REPORT [--reference REFERENCE_REPORT]"
+                        + " TRACE_DIRECTORY REPORT --reference REFERENCE_REPORT"
                         + "   (target.service: grpc endpoint or in-process rocksdb path)");
         out.println(
                 "       java -jar build/sibench/sibench.jar verify-service REPLAY_CONFIG"
-                        + " NORMALIZED_DIRECTORY REPORT --reference REFERENCE_REPORT"
+                        + " TRACE_DIRECTORY REPORT --reference REFERENCE_REPORT"
                         + "   (snapshot searches against an index already holding the trace)");
         out.println(
                 "       java -jar build/sibench/sibench.jar analyze-locality TRACE CONFIG OUTPUT"
@@ -257,7 +257,7 @@ public final class Sibench {
             if (args[0].equals("validate-replay-matrix")) {
                 if (profiles.size() != 2)
                     throw new IllegalArgumentException(
-                            "validate-replay-matrix requires NORMALIZED_DIRECTORY OUTPUT_DIRECTORY");
+                            "validate-replay-matrix requires TRACE_DIRECTORY OUTPUT_DIRECTORY");
                 ReplayMatrixValidation.validate(
                         root.resolve(profiles.get(0)), root.resolve(profiles.get(1)));
                 out.println(Files.readString(root.resolve(profiles.get(1)).resolve("matrix.json")));
@@ -266,7 +266,7 @@ public final class Sibench {
             if (args[0].equals("check-relocation")) {
                 if (profiles.size() != 3)
                     throw new IllegalArgumentException(
-                            "check-relocation requires PROFILE NORMALIZED_DIRECTORY OUTPUT_DIRECTORY");
+                            "check-relocation requires PROFILE TRACE_DIRECTORY OUTPUT_DIRECTORY");
                 Path output = root.resolve(profiles.get(2));
                 RelocationCheck.validate(
                         CaptureProfile.read(root, Path.of(profiles.get(0))).layout(),
@@ -385,9 +385,9 @@ public final class Sibench {
                 return 0;
             }
             if (args[0].equals("replay-service")) {
-                if (profiles.size() != 3)
+                if (profiles.size() != 3 || reference == null)
                     throw new IllegalArgumentException(
-                            "replay-service requires REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT [--reference REPORT]");
+                            "replay-service requires REPLAY_CONFIG TRACE_DIRECTORY REPORT --reference REPORT");
                 var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
                 ReplayConfig config = ReplayConfig.from(document);
                 ServiceConfig service = ServiceConfig.ofReplay(root, document);
@@ -398,7 +398,7 @@ public final class Sibench {
                                 root.resolve(profiles.get(1)),
                                 config,
                                 service,
-                                reference == null ? null : root.resolve(reference),
+                                root.resolve(reference),
                                 root.resolve(profiles.get(2)));
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result.get("result")));
                 return 0;
@@ -406,7 +406,7 @@ public final class Sibench {
             if (args[0].equals("verify-service")) {
                 if (profiles.size() != 3 || reference == null)
                     throw new IllegalArgumentException(
-                            "verify-service requires REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT --reference REPORT");
+                            "verify-service requires REPLAY_CONFIG TRACE_DIRECTORY REPORT --reference REPORT");
                 var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
                 ServiceConfig service = ServiceConfig.ofReplay(root, document);
                 if (service == null)
@@ -437,7 +437,7 @@ public final class Sibench {
                 if (profiles.size() != (check ? 2 : 3))
                     throw new IllegalArgumentException(
                             args[0]
-                                    + " requires REPLAY_CONFIG NORMALIZED_DIRECTORY"
+                                    + " requires REPLAY_CONFIG TRACE_DIRECTORY"
                                     + (check ? "" : " REPORT"));
                 var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
                 ReplayConfig config = ReplayConfig.from(document);
@@ -562,13 +562,13 @@ public final class Sibench {
                         + " audit and counter check passed.");
         out.println(
                 "       java -jar build/sibench/sibench.jar validate-replay-matrix [--root PATH]"
-                        + " NORMALIZED_DIRECTORY OUTPUT_DIRECTORY");
+                        + " TRACE_DIRECTORY OUTPUT_DIRECTORY");
         out.println(
                 "validate-replay-matrix replays 1/64/128 clients x both dispatch modes x secondary"
                     + " indexes on/off and requires identical operation order, state and results.");
         out.println(
                 "       java -jar build/sibench/sibench.jar check-relocation [--root PATH]"
-                        + " PROFILE NORMALIZED_DIRECTORY OUTPUT_DIRECTORY");
+                        + " PROFILE TRACE_DIRECTORY OUTPUT_DIRECTORY");
         out.println(
                 "check-relocation rewrites the latest live rows of modified tables and checks exact"
                     + " Locator relocation with RowIDs unchanged.");
@@ -583,15 +583,15 @@ public final class Sibench {
                         + " schemas.");
         out.println(
                 "       java -jar build/sibench/sibench.jar check-replay [--root PATH]"
-                        + " REPLAY_CONFIG NORMALIZED_DIRECTORY");
+                        + " REPLAY_CONFIG TRACE_DIRECTORY");
         out.println(
                 "       java -jar build/sibench/sibench.jar replay [--root PATH]"
-                        + " REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT");
+                        + " REPLAY_CONFIG TRACE_DIRECTORY REPORT");
         out.println(
                 "replay runs the in-process reference once; no real backend or trace repetition.");
         out.println(
                 "       java -jar build/sibench/sibench.jar validate-snapshots [--root PATH]"
-                        + " REPLAY_CONFIG NORMALIZED_DIRECTORY REPORT");
+                        + " REPLAY_CONFIG TRACE_DIRECTORY REPORT");
         out.println(
                 "validate-snapshots runs derived history correctness probes, not native workload or"
                         + " performance.");

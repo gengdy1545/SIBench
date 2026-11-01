@@ -6,7 +6,9 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 import org.sibench.schema.SourceSchema;
+import org.sibench.config.ConfigValues;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -57,6 +59,7 @@ final class StillBase {
      * Autovacuum is off in capture clusters; VACUUM moves no live tuple and changes no value.
      */
     static void captureReady(String jdbc, String user, Path library, SourceSchema schema) throws Exception {
+        long started = System.nanoTime();
         try (Connection connection = DriverManager.getConnection(jdbc, user, password());
                 Statement statement = connection.createStatement()) {
             statement.execute(
@@ -68,7 +71,10 @@ final class StillBase {
                         "CREATE TRIGGER sibench_row_capture AFTER INSERT OR UPDATE OR DELETE ON \""
                                 + table.name()
                                 + "\" FOR EACH ROW EXECUTE FUNCTION public.sibench_row_capture()");
+            RunTiming.current().note("base_triggers_millis", (System.nanoTime() - started) / 1_000_000L);
+            long vacuumStarted = System.nanoTime();
             statement.execute("VACUUM (ANALYZE)");
+            RunTiming.current().note("base_vacuum_analyze_millis", (System.nanoTime() - vacuumStarted) / 1_000_000L);
         }
     }
 
@@ -84,6 +90,13 @@ final class StillBase {
                 }
         }
         return result;
+    }
+
+    static void requireRows(NativeCaptureConfig config, Map<String, Long> rows) throws IOException {
+        if (config.benchmark().equals("ycsb")
+                && !rows.equals(Map.of(ConfigValues.string(config.nativeConfig(), "table"),
+                        ConfigValues.positive(config.nativeConfig(), "recordcount"))))
+            throw new IOException("YCSB load left a different row count in PG: " + rows);
     }
 
     /** Loads a YCSB or sysbench still database with the benchmark's own client, once. */
@@ -102,8 +115,10 @@ final class StillBase {
                 Statement statement = admin.createStatement()) {
             statement.execute("CREATE DATABASE " + base + " LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0");
         }
+        long loadStarted = System.nanoTime();
         if (config.benchmark().equals("ycsb")) YcsbNativeRun.load(still, logs);
         else SysbenchNativeRun.prepare(still, logs);
+        RunTiming.current().note("base_native_load_millis", (System.nanoTime() - loadStarted) / 1_000_000L);
         var schema = SourceSchema.read(config.root(), config.document());
         captureReady(still.jdbc(), config.user(), library, schema);
         var report = new LinkedHashMap<String, Object>();
@@ -111,7 +126,11 @@ final class StillBase {
         report.put("database", base);
         report.put("source_commit", string(config.document(), "source", "commit"));
         report.put("load", config.loadConfig());
-        report.put("loaded_rows", rows(still.jdbc(), config.user(), schema));
+        long countStarted = System.nanoTime();
+        var loadedRows = rows(still.jdbc(), config.user(), schema);
+        requireRows(still, loadedRows);
+        RunTiming.current().note("base_final_count_millis", (System.nanoTime() - countStarted) / 1_000_000L);
+        report.put("loaded_rows", loadedRows);
         report.put("load_seconds", (System.nanoTime() - started) / 1e9);
         Files.writeString(manifest, new GsonBuilder().setPrettyPrinting().create().toJson(report), StandardOpenOption.CREATE_NEW);
         System.out.println(config.benchmark() + " still database " + base + ": " + report.get("loaded_rows"));

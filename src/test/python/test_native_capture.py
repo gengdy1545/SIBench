@@ -113,6 +113,7 @@ class NativeCapturePostgresTest(unittest.TestCase):
                 pg = "build/services/postgresql-capture/runtime/bin/"
                 executable(pg + "pg_isready", "#!/bin/sh\nexit 1\n")
                 executable(pg + "initdb", '#!/bin/sh\nmkdir -p "$2"\n')
+                executable(pg + "postgres", '#!/bin/sh\nprintf "4096\\n"\n')
                 # pg_ctl inserts post_opts into /bin/sh -c before starting postgres.
                 executable(pg + "pg_ctl", """\
                     #!/usr/bin/env python3
@@ -137,7 +138,8 @@ class NativeCapturePostgresTest(unittest.TestCase):
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(73, result.returncode, result.stderr)
                 self.assertEqual(["-c", "config_file=" + str(config), "-c", "port=5544",
-                                  "-c", "unix_socket_directories="], json.loads(log.read_text()))
+                                  "-c", "unix_socket_directories=", "-c", "max_wal_size=4096"],
+                                 json.loads(log.read_text()))
                 self.assertTrue(config.is_file())
                 self.assertFalse((root / "injected").exists())
                 self.assertFalse((root / "build/services/postgresql-capture/data").exists())

@@ -4,9 +4,6 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -42,12 +39,10 @@ final class SessionMerge implements AutoCloseable {
      */
     record Chunk(int session, long csn, boolean writer, boolean committed, long lineCount) {}
 
-    private static final String COMMIT = "{\"event\":\"transaction_commit\"";
-    private static final String ABORT = "{\"event\":\"transaction_abort\"";
 
     private final List<Path> files;
     /** Per session: the scanner that finds chunk ends, and the reader that streams chunk events. */
-    private final List<Boundaries> scanners = new ArrayList<>();
+    private final List<ServerTrace.Records> scanners = new ArrayList<>();
     /** Per session: the chunks its scanner thread found and the merge has not taken yet. */
     private final List<java.util.concurrent.BlockingQueue<Object>> ahead = new ArrayList<>();
     private final List<Thread> scannerThreads = new ArrayList<>();
@@ -77,8 +72,8 @@ final class SessionMerge implements AutoCloseable {
 
     /**
      * Threads that parse backend events ahead of the merge; the order of events never depends on
-     * it, and the memory is bounded per trace. Parsing a long analytical chunk outpaced 8 threads,
-     * and the compiler runs alone on its host, so every processor parses.
+     * it, and memory is bounded per trace. Concurrency defaults to the available processors and
+     * can be bounded explicitly for the capture environment.
      */
     static int parseThreads() {
         return Integer.getInteger("sibench.compile.parse_threads", Runtime.getRuntime().availableProcessors());
@@ -93,7 +88,7 @@ final class SessionMerge implements AutoCloseable {
         var merge = new SessionMerge(files);
         try {
             for (Path file : files) {
-                merge.scanners.add(new Boundaries(file));
+                merge.scanners.add(new ServerTrace.Records(file));
                 merge.contents.add(new ParsedTrace(file, merge.parsers));
             }
             merge.fillAll();
@@ -193,7 +188,7 @@ final class SessionMerge implements AutoCloseable {
     }
 
     private Chunk read(int session) throws IOException {
-        Boundaries scanner = scanners.get(session);
+        ServerTrace.Records scanner = scanners.get(session);
         String line = scanner.next();
         long lines = scanner.lines();
         if (line != null) {
@@ -217,7 +212,7 @@ final class SessionMerge implements AutoCloseable {
             if (writer && !writerPositions.add(csn))
                 throw new IOException("Two writers share completion position " + csn);
             lastCsn[session] = csn;
-            return new Chunk(session, csn, writer, line.startsWith(COMMIT), lines);
+            return new Chunk(session, csn, writer, line.startsWith(ServerTrace.COMMIT), lines);
         }
         if (lines == 0) return null;
         throw new IOException(
@@ -234,7 +229,7 @@ final class SessionMerge implements AutoCloseable {
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
             }
-        for (Boundaries scanner : scanners)
+        for (ServerTrace.Records scanner : scanners)
             try {
                 scanner.close();
             } catch (IOException ignored) {
@@ -244,130 +239,4 @@ final class SessionMerge implements AutoCloseable {
         parsers.shutdownNow();
     }
 
-    /**
-     * The transaction records of one trace, found without decoding the lines between them: the
-     * bytes are searched for line ends exactly as {@link java.io.BufferedReader#readLine} splits
-     * lines (LF, CR or CRLF; a last line without one still counts), and only a line that starts
-     * with a commit or abort record is decoded. A session can be one multi-gigabyte chunk, which
-     * its first scan reads whole before the merge starts.
-     */
-    static final class Boundaries implements AutoCloseable {
-        private static final byte[] COMMIT_BYTES = COMMIT.getBytes(StandardCharsets.UTF_8);
-        private static final byte[] ABORT_BYTES = ABORT.getBytes(StandardCharsets.UTF_8);
-        private static final int HEAD = Math.max(COMMIT_BYTES.length, ABORT_BYTES.length);
-
-        private final InputStream input;
-        private final byte[] buffer = new byte[1 << 20];
-        private int position, limit;
-        private boolean eof;
-        /** The previous byte ended a line with CR, so an LF right after it ends nothing. */
-        private boolean afterCr;
-        private long lines;
-        /** The current line's first bytes, and whether it has any byte at all. */
-        private final byte[] head = new byte[HEAD];
-        private int headLength;
-        private boolean inLine;
-        /** -1 undecided, 0 not a transaction record, 1 a transaction record being kept whole. */
-        private int record = -1;
-        private final java.io.ByteArrayOutputStream kept = new java.io.ByteArrayOutputStream();
-
-        Boundaries(Path file) throws IOException {
-            InputStream stream = new java.io.BufferedInputStream(Files.newInputStream(file), 1 << 20);
-            input = file.getFileName().toString().endsWith(".zst")
-                    ? new com.github.luben.zstd.ZstdInputStream(stream)
-                    : stream;
-        }
-
-        /** Lines the last {@link #next} read, the record it returned included. */
-        long lines() {
-            return lines;
-        }
-
-        /** The next commit or abort line, or null at the end of the trace. */
-        String next() throws IOException {
-            lines = 0;
-            while (true) {
-                if (position == limit) {
-                    if (eof || !fill()) {
-                        eof = true;
-                        if (!inLine) return null;
-                        return endLine();
-                    }
-                }
-                byte b = buffer[position++];
-                if (afterCr) {
-                    afterCr = false;
-                    if (b == '\n') continue;
-                }
-                if (b == '\n' || b == '\r') {
-                    afterCr = b == '\r';
-                    String line = endLine();
-                    if (line != null) return line;
-                    continue;
-                }
-                inLine = true;
-                if (record == 1) {
-                    kept.write(b);
-                    continue;
-                }
-                if (record == 0) {
-                    skipLine();
-                    continue;
-                }
-                head[headLength++] = b;
-                decide();
-            }
-        }
-
-        /** Classifies the line once its head can tell, keeping a transaction record whole. */
-        private void decide() {
-            boolean commit = startsWith(COMMIT_BYTES), abort = startsWith(ABORT_BYTES);
-            if (!commit && !abort) {
-                record = 0;
-                return;
-            }
-            if (headLength >= COMMIT_BYTES.length && commit || headLength >= ABORT_BYTES.length && abort) {
-                record = 1;
-                kept.reset();
-                kept.write(head, 0, headLength);
-            }
-        }
-
-        /** Whether the head read so far is consistent with the prefix. */
-        private boolean startsWith(byte[] prefix) {
-            int n = Math.min(headLength, prefix.length);
-            for (int i = 0; i < n; i++) if (head[i] != prefix[i]) return false;
-            return true;
-        }
-
-        /** Moves to the current line's end without looking at its bytes. */
-        private void skipLine() {
-            int i = position;
-            while (i < limit && buffer[i] != '\n' && buffer[i] != '\r') i++;
-            position = i;
-        }
-
-        /** Ends the current line; its text when it is a transaction record. */
-        private String endLine() {
-            lines++;
-            String line = record == 1 ? kept.toString(StandardCharsets.UTF_8) : null;
-            inLine = false;
-            headLength = 0;
-            record = -1;
-            return line;
-        }
-
-        private boolean fill() throws IOException {
-            int n = input.read(buffer, 0, buffer.length);
-            if (n <= 0) return false;
-            position = 0;
-            limit = n;
-            return true;
-        }
-
-        @Override
-        public void close() throws IOException {
-            input.close();
-        }
-    }
 }

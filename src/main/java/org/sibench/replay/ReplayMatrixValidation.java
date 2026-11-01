@@ -12,7 +12,7 @@ import java.util.*;
 public final class ReplayMatrixValidation {
     private ReplayMatrixValidation() {}
 
-    public static void validate(Path normalized, Path output) throws IOException {
+    public static void validate(Path trace, Path output) throws IOException {
         Files.createDirectory(output);
         Files.writeString(output.resolve("INCOMPLETE"), "Replay matrix not verified\n");
         var reports = new ArrayList<Map<String, Object>>();
@@ -25,7 +25,7 @@ public final class ReplayMatrixValidation {
                             new ReplayConfig(
                                     secondary, "none", 0, 0, 0, 0, dispatch, clients, 4096, 60);
                     var report =
-                            ReferenceReplay.run(normalized, config, output.resolve(name + ".json"));
+                            ReferenceReplay.run(trace, config, output.resolve(name + ".json"));
                     for (var item : (List<?>) report.get("results")) {
                         Map<?, ?> result = (Map<?, ?>) item;
                         Map<?, ?> workload = (Map<?, ?>) result.get("workload_dispatch");
@@ -56,7 +56,7 @@ public final class ReplayMatrixValidation {
                 }
         for (boolean secondary : new boolean[] {false, true})
             SnapshotLookupValidation.run(
-                    normalized,
+                    trace,
                     new ReplayConfig(secondary, "none", 0, 0, 0, 0),
                     output.resolve("parquet-oracle-secondary-" + secondary + ".json"));
         Files.writeString(

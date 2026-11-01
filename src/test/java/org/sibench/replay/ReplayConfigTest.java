@@ -21,7 +21,12 @@ public class ReplayConfigTest {
         assertEquals(java.util.List.of(false), ReplayConfig.rowIdModes(parse(template.replace("value: row_id", "value: locator"))));
         assertEquals(64, simple.clientCount());
         assertEquals(4096, simple.maxInFlight());
-        assertEquals(60, simple.requestTimeoutSeconds());
+        assertEquals(600, simple.requestTimeoutSeconds());
+        var omittedTimeout = parse(template);
+        var omittedReplay = object(omittedTimeout, "replay");
+        omittedReplay.remove("request_timeout_seconds");
+        omittedTimeout.put("replay", omittedReplay);
+        assertEquals(60, ReplayConfig.from(omittedTimeout).requestTimeoutSeconds());
         for (int clients : new int[] {64, 128})
             assertEquals(clients, ReplayConfig.from(parse(template.replace(
                     "client_count: 64", "client_count: " + clients))).clientCount());
@@ -74,7 +79,7 @@ public class ReplayConfigTest {
                     text.replace("dispatch_mode: operation", "dispatch_mode: parallel"),
                     text.replace("client_count: 64", "client_count: 0"),
                     text.replace("max_in_flight: 4096", "max_in_flight: 0"),
-                    text.replace("request_timeout_seconds: 60", "request_timeout_seconds: 86401"),
+                    text.replace("request_timeout_seconds: 600", "request_timeout_seconds: 86401"),
                     text.replace("client_count: 64", "client_count: 64\n  routing: index_key"),
                     text.replace(
                             "secondary_indexes:",

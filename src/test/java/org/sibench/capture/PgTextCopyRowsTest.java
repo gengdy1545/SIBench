@@ -28,7 +28,9 @@ public class PgTextCopyRowsTest {
     private static void checkRows(InputStream stream) throws IOException {
         var rows = new PgTextCopyRows(stream, 3);
         assertArrayEquals(new String[] {"user0", null, ""}, rows.next());
+        assertEquals(19, rows.rowBytes());
         assertArrayEquals(new String[] {"user1", "中文🙂", "\t\n\\"}, rows.next());
+        assertEquals(32, rows.rowBytes());
         assertNull(rows.next()); assertNull(rows.next());
     }
 

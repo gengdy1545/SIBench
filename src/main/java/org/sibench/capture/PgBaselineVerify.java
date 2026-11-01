@@ -12,7 +12,6 @@ import org.sibench.schema.SourceSchema;
 
 import java.io.IOException;
 import java.nio.file.*;
-import java.security.MessageDigest;
 import java.sql.*;
 import java.util.*;
 
@@ -37,8 +36,6 @@ public final class PgBaselineVerify {
             long firstRowId,
             Object after,
             Object through) {}
-
-    private record Result(long rows, byte[] digest) {}
 
     /** Opens a fresh autocommit connection to the source database. */
     @FunctionalInterface
@@ -67,6 +64,8 @@ public final class PgBaselineVerify {
             if (!expectedTables.contains(file.get("table").getAsString()))
                 throw new IOException("Unknown baseline manifest table");
         List<Task> tasks = tasks(schema, files, directory);
+        var covered = tasks.stream().filter(task -> task.rows() > 0)
+                .map(task -> task.table().name()).collect(java.util.stream.Collectors.toSet());
         try (Connection coordinator = connections.open()) {
             if (!coordinator.getAutoCommit())
                 throw new IOException("Baseline verification requires a fresh autocommit connection");
@@ -79,6 +78,16 @@ public final class PgBaselineVerify {
                         ResultSet rows = statement.executeQuery("SELECT pg_export_snapshot()")) {
                     rows.next();
                     snapshot = rows.getString(1);
+                }
+                for (var table : schema.tables()) {
+                    if (covered.contains(table.name())) continue;
+                    String key = SourceRow.primary(table).name().replace("\"", "\"\"");
+                    String name = table.name().replace("\"", "\"\"");
+                    try (Statement statement = coordinator.createStatement();
+                            ResultSet rows = statement.executeQuery(
+                                    "SELECT \"" + key + "\" FROM \"" + name + "\" LIMIT 1")) {
+                        if (rows.next()) throw new IOException("Missing baseline rows for table: " + table.name());
+                    }
                 }
                 var results = run(connections, coordinator, snapshot, tasks, files, directory);
                 coordinator.commit();
@@ -166,7 +175,7 @@ public final class PgBaselineVerify {
     }
 
     /** The result of every task, in task order. */
-    private static List<Result> run(
+    private static List<Long> run(
             Connections connections,
             Connection coordinator,
             String snapshot,
@@ -194,9 +203,11 @@ public final class PgBaselineVerify {
             }
             return pg;
         };
+        var recorded = BaselineDigests.of(directory);
+        var fileDigests = new java.util.concurrent.ConcurrentHashMap<Path, String>();
         try {
-            // By position: a task names its manifest entry, which gains its digest while it runs.
-            var futures = new ArrayList<java.util.concurrent.Future<Result>>(java.util.Collections.nCopies(tasks.size(), null));
+            // Preserve task order while comparisons execute concurrently.
+            var futures = new ArrayList<java.util.concurrent.Future<Long>>(java.util.Collections.nCopies(tasks.size(), null));
             var streamed = new java.util.LinkedHashMap<SourceSchema.Table, List<Integer>>();
             var ordered = new java.util.HashMap<SourceSchema.Table, Boolean>();
             for (int i = 0; i < tasks.size(); i++) {
@@ -222,8 +233,9 @@ public final class PgBaselineVerify {
                 streams.add(
                         Boolean.getBoolean(ORDERED_STREAM)
                                 ? stream(open, entry.getKey(), entry.getValue(), tasks, futures, pool, readers)
-                                : unordered(connections, coordinator, entry.getKey(), entry.getValue(), tasks, futures, pool, readers));
-            var results = new ArrayList<Result>();
+                                : unordered(connections, coordinator, entry.getKey(), entry.getValue(), tasks, futures, pool, readers,
+                                        recorded, fileDigests));
+            var results = new ArrayList<Long>();
             try {
                 for (var future : futures) results.add(future.get());
                 // A stream fails after its last group too, when PG has rows beyond them.
@@ -233,12 +245,13 @@ public final class PgBaselineVerify {
                 if (error.getCause() instanceof Exception cause) throw cause;
                 throw error;
             }
-            // Whole-file digests are independent of the row comparison and run in the same pool.
-            var recorded = BaselineDigests.of(directory);
+            // Files not hashed with their row groups retain the final parallel integrity pass.
             var digests = new ArrayList<java.util.concurrent.Future<String>>();
             for (JsonObject file : files) {
                 Path path = directory.resolve(file.get("path").getAsString());
-                digests.add(pool.submit(() -> recorded.read(path)));
+                String known = fileDigests.get(path);
+                digests.add(known == null ? pool.submit(() -> recorded.read(path))
+                        : java.util.concurrent.CompletableFuture.completedFuture(known));
             }
             for (int i = 0; i < files.size(); i++) {
                 JsonObject file = files.get(i);
@@ -348,12 +361,12 @@ public final class PgBaselineVerify {
             SourceSchema.Table table,
             List<Integer> positions,
             List<Task> tasks,
-            List<java.util.concurrent.Future<Result>> futures,
+            List<java.util.concurrent.Future<Long>> futures,
             java.util.concurrent.ExecutorService pool,
             java.util.concurrent.ExecutorService readers) {
-        var own = new ArrayList<java.util.concurrent.CompletableFuture<Result>>();
+        var own = new ArrayList<java.util.concurrent.CompletableFuture<Long>>();
         for (int position : positions) {
-            var future = new java.util.concurrent.CompletableFuture<Result>();
+            var future = new java.util.concurrent.CompletableFuture<Long>();
             own.add(future);
             futures.set(position, future);
         }
@@ -424,18 +437,29 @@ public final class PgBaselineVerify {
             SourceSchema.Table table,
             List<Integer> positions,
             List<Task> tasks,
-            List<java.util.concurrent.Future<Result>> futures,
+            List<java.util.concurrent.Future<Long>> futures,
             java.util.concurrent.ExecutorService pool,
-            java.util.concurrent.ExecutorService readers) {
+            java.util.concurrent.ExecutorService readers,
+            BaselineDigests recorded,
+            Map<Path, String> fileDigests) {
         var digests = new FinalState.Digest[positions.size()];
-        var groups = new ArrayList<java.util.concurrent.Future<Result>>();
+        var groups = new ArrayList<java.util.concurrent.Future<Long>>();
+        boolean textKey = !SourceRow.primary(table).type().equals("integer");
+        var remaining = new HashMap<Path, java.util.concurrent.atomic.AtomicInteger>();
+        if (textKey)
+            for (int position : positions)
+                remaining.computeIfAbsent(tasks.get(position).path(),
+                        ignored -> new java.util.concurrent.atomic.AtomicInteger()).incrementAndGet();
         for (int i = 0; i < positions.size(); i++) {
             Task task = tasks.get(positions.get(i));
             int own = i;
             var future = pool.submit(() -> {
                 var digest = new FinalState.Digest();
-                Result result = group(task, digest);
+                long result = group(task, digest);
                 digests[own] = digest;
+                // Hash YCSB's wide files while their just-checked pages are still cached.
+                if (textKey && remaining.get(task.path()).decrementAndGet() == 0)
+                    fileDigests.put(task.path(), recorded.read(task.path()));
                 return result;
             });
             groups.add(future);
@@ -467,15 +491,14 @@ public final class PgBaselineVerify {
     /**
      * One row group's rows into {@code digest}, normalized as {@link #compare} compares them, with
      * the checks that comparison made through PG's order: required values present, keys strictly
-     * increasing, consecutive row identities; and the group's own digest, as {@link #compare}.
+     * increasing, consecutive row identities; and the verified row count.
      */
-    private static Result group(Task task, FinalState.Digest digest) throws Exception {
+    private static long group(Task task, FinalState.Digest digest) throws Exception {
         var table = task.table();
         var columns = table.columns();
         var primary = SourceRow.primary(table);
         boolean integerKey = primary.type().equals("integer");
         int keyIndex = columns.indexOf(primary);
-        MessageDigest rowsDigest = MessageDigest.getInstance("SHA-256");
         long count = 0, rowId = task.firstRowId();
         String previous = null;
         try (ParquetReader<Group> reader =
@@ -512,14 +535,11 @@ public final class PgBaselineVerify {
                 digest.add(table, values);
                 if (actual.getLong("_sib_row_id", 0) != rowId++ || actual.getLong("_sib_timestamp", 0) != 0)
                     throw new IllegalStateException("Baseline identity mismatch");
-                byte[] data = actual.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                rowsDigest.update(java.nio.ByteBuffer.allocate(4).putInt(data.length).array());
-                rowsDigest.update(data);
                 count++;
             }
         }
         if (count != task.rows()) throw new IllegalStateException("File count mismatch");
-        return new Result(count, rowsDigest.digest());
+        return count;
     }
 
     /**
@@ -540,10 +560,9 @@ public final class PgBaselineVerify {
     }
 
     /** One row group against the PG rows of its key range, row by row and in order. */
-    private static Result compare(Task task, java.util.Iterator<String[]> expected) throws Exception {
+    private static long compare(Task task, java.util.Iterator<String[]> expected) throws Exception {
         var table = task.table();
         var columns = table.columns();
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
         long count = 0, rowId = task.firstRowId();
         try (ParquetReader<Group> reader =
                 ParquetReader.builder(new GroupReadSupport(), new org.apache.hadoop.fs.Path(task.path().toUri()))
@@ -574,15 +593,12 @@ public final class PgBaselineVerify {
                 }
                 if (actual.getLong("_sib_row_id", 0) != rowId++ || actual.getLong("_sib_timestamp", 0) != 0)
                     throw new IllegalStateException("Baseline identity mismatch");
-                byte[] data = actual.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                digest.update(java.nio.ByteBuffer.allocate(4).putInt(data.length).array());
-                digest.update(data);
                 count++;
             }
             if (expected.hasNext()) throw new IllegalStateException("Missing Parquet rows: " + table.name());
         }
         if (count != task.rows()) throw new IllegalStateException("File count mismatch");
-        return new Result(count, digest.digest());
+        return count;
     }
 
     private static void finish(
@@ -590,24 +606,19 @@ public final class PgBaselineVerify {
             List<JsonObject> files,
             Path directory,
             List<Task> tasks,
-            List<Result> results)
+            List<Long> results)
             throws Exception {
         List<Map<String, Object>> tables = new ArrayList<>();
         long total = 0;
         for (var table : schema.tables()) {
-            // The table digest folds the row-group digests in baseline order.
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
             long count = 0;
             for (int i = 0; i < tasks.size(); i++) {
                 if (tasks.get(i).table() != table) continue;
-                Result result = results.get(i);
-                count += result.rows();
-                digest.update(result.digest());
+                count += results.get(i);
             }
             var entry = new LinkedHashMap<String, Object>();
             entry.put("table", table.name());
             entry.put("rows", count);
-            entry.put("row_digest", HexFormat.of().formatHex(digest.digest()));
             entry.put("verified", true);
             tables.add(entry);
             total += count;

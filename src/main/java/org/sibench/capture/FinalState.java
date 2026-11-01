@@ -16,9 +16,8 @@ import java.util.Map;
  * The final rows of a source table as an order-independent digest: their count and the sum of
  * each row's SHA256 in four 64-bit lanes, over the comparable values {@link SourceRow#values}
  * gives (column order, nulls marked, lengths prefixed). The row audit compares the rows the
- * capture says the table now holds with PostgreSQL's table this way, so the table is read in
- * physical order by block ranges in parallel: an ordered scan of a table whose key does not follow
- * its heap (YCSB's hashed keys) was an external sort of the whole table.
+ * capture says the table now holds with PostgreSQL's table this way. Parallel physical block
+ * ranges avoid a full-table key sort when key order differs from heap order, as in YCSB.
  */
 final class FinalState {
     private FinalState() {}

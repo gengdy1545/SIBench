@@ -11,14 +11,19 @@ import org.sibench.state.ExternalSort;
 import org.sibench.trace.IndexKey;
 
 import java.io.IOException;
+import java.io.BufferedWriter;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.io.Writer;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.security.DigestOutputStream;
+import java.security.MessageDigest;
 import java.sql.*;
 import java.util.*;
 
-/** One source-state audit per capture; consumers reuse its digest-bound row transitions. */
+/** One source-state audit per capture; consumers reuse its report bound to the exact inputs. */
 public final class RowStateAudit {
     private static final Gson JSON =
             new GsonBuilder().serializeNulls().setPrettyPrinting().create();
@@ -41,10 +46,7 @@ public final class RowStateAudit {
             String jdbc, String user, SourceSchema schema, Path baseline, Path raw, Path report)
             throws Exception {
         if (Files.exists(report)) return reuse(schema, baseline, raw, report);
-        Path transitions =
-                report.toAbsolutePath().resolveSibling(report.getFileName() + ".changes.jsonl");
-        if (Files.exists(transitions)
-                || Files.exists(report.resolveSibling(report.getFileName() + ".partial")))
+        if (Files.exists(report.resolveSibling(report.getFileName() + ".partial")))
             throw new IOException("Unfinished row audit output exists; use a fresh report path");
         String password = System.getenv().getOrDefault("PGPASSWORD", "");
         try (Connection connection = DriverManager.getConnection(jdbc, user, password)) {
@@ -102,11 +104,13 @@ public final class RowStateAudit {
             long sortMemory)
             throws Exception {
         if (Files.exists(report)) return reuse(schema, baseline, raw, report);
+        long inputStarted = System.nanoTime();
         CaptureRun.verifyInput(resolveRaw(raw));
         PgBaselineVerify.verifyFiles(baseline);
         if (!connection.getAutoCommit())
             throw new IOException("Row audit requires a fresh autocommit connection");
         Map<String, String> inputs = inputHashes(raw, false);
+        RunTiming.current().note("audit_input_millis", (System.nanoTime() - inputStarted) / 1_000_000L);
         var tables = new LinkedHashMap<String, SourceSchema.Table>();
         var tableOrder = new HashMap<String, Integer>();
         for (var table : schema.tables()) {
@@ -115,14 +119,12 @@ public final class RowStateAudit {
         }
         long committed = 0, discarded = 0, commits = 0, aborts = 0;
         List<Path> sources = sourceFiles(raw);
-        Path transitions =
-                report.toAbsolutePath().resolveSibling(report.getFileName() + ".changes.jsonl");
-        Path transitionsPartial =
-                transitions.resolveSibling(transitions.getFileName() + ".partial");
         Path work = report.toAbsolutePath().resolveSibling(report.getFileName() + ".work");
-        if (Files.exists(transitionsPartial) || Files.exists(work))
+        if (Files.exists(report.resolveSibling(report.getFileName() + ".partial")) || Files.exists(work))
             throw new IOException("Unfinished row audit output exists; use a fresh report path");
         try (var sort = new ExternalSort(work, sortMemory)) {
+            RunTiming.current().measure(work);
+            long collectStarted = System.nanoTime();
             // Sessions are read concurrently; every sort key is distinct, so the sorted changes do
             // not depend on the order they were added in.
             var pool = java.util.concurrent.Executors.newFixedThreadPool(
@@ -149,6 +151,9 @@ public final class RowStateAudit {
             } finally {
                 pool.shutdownNow();
             }
+            RunTiming.current().note("audit_collect_millis", (System.nanoTime() - collectStarted) / 1_000_000L)
+                    .note("audit_initial_sort_runs", sort.runs())
+                    .note("audit_baseline_reader_limit", 1);
             List<JsonObject> files =
                     Files.readAllLines(baseline.resolve("files.jsonl")).stream()
                             .map(line -> JsonParser.parseString(line).getAsJsonObject())
@@ -157,16 +162,19 @@ public final class RowStateAudit {
                 if (!tables.containsKey(file.get("table").getAsString()))
                     throw new IOException("Unknown baseline table");
             var tableReports = new ArrayList<Map<String, Object>>();
-            boolean complete = false;
+            var changesDigest = MessageDigest.getInstance("SHA-256");
+            long mergeStarted = System.nanoTime();
             try (var groups = new Groups(sort.sorted(), tables, tableOrder, sources);
-                    var output =
-                            Files.newBufferedWriter(
-                                    transitionsPartial, StandardOpenOption.CREATE_NEW)) {
+                    var output = new BufferedWriter(new OutputStreamWriter(
+                            new DigestOutputStream(OutputStream.nullOutputStream(), changesDigest),
+                            StandardCharsets.UTF_8))) {
+                RunTiming.current().note("audit_merge_init_millis", (System.nanoTime() - mergeStarted) / 1_000_000L);
                 connection.setReadOnly(true);
                 connection.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
                 connection.setAutoCommit(false);
                 try {
                     for (var table : schema.tables()) {
+                        long tableStarted = System.nanoTime();
                         var counts =
                                 compareFinal(
                                         connection,
@@ -177,6 +185,8 @@ public final class RowStateAudit {
                                         sources.size() == 1,
                                         output,
                                         workers);
+                        RunTiming.current().note("audit_table_" + table.name() + "_millis",
+                                (System.nanoTime() - tableStarted) / 1_000_000L);
                         tableReports.add(
                                 Map.of(
                                         "table",
@@ -193,7 +203,6 @@ public final class RowStateAudit {
                     if (groups.hasNext())
                         throw new IOException("Committed changes of an unknown table or key");
                     connection.commit();
-                    complete = true;
                 } catch (Exception error) {
                     try {
                         connection.rollback();
@@ -202,11 +211,7 @@ public final class RowStateAudit {
                     }
                     throw error;
                 }
-            } finally {
-                if (!complete) Files.deleteIfExists(transitionsPartial);
             }
-            // Publish transitions first; only the final report makes the audit consumable.
-            Files.move(transitionsPartial, transitions, StandardCopyOption.ATOMIC_MOVE);
             if (!inputs.equals(inputHashes(raw, true)))
                 throw new IOException("Source changed during row audit");
             var result = new LinkedHashMap<String, Object>();
@@ -219,8 +224,7 @@ public final class RowStateAudit {
             result.put(
                     "baseline_verified_manifest_sha256",
                     BaselineGenerator.sha256(baseline.resolve("verified-manifest.json")));
-            result.put("changes_file", transitions.getFileName().toString());
-            result.put("changes_sha256", BaselineGenerator.sha256(transitions));
+            result.put("changes_sha256", HexFormat.of().formatHex(changesDigest.digest()));
             result.put("commits", commits);
             result.put("aborts", aborts);
             result.put("committed_row_changes", committed);
@@ -240,8 +244,6 @@ public final class RowStateAudit {
         }
     }
 
-    private static final String EVENT = "{\"event\":\"";
-
     /**
      * One session's committed row changes into the sort; {committed, discarded, commits, aborts}.
      * Only row changes and transaction records are parsed: a line naming another event type in
@@ -257,15 +259,10 @@ public final class RowStateAudit {
         long committed = 0, discarded = 0, commits = 0, aborts = 0;
         var pending = new ArrayList<Change>();
         long xid = 0, position = 0;
-        try (var reader = ServerTrace.open(source)) {
+        try (var reader = ServerTrace.Records.rowChanges(source)) {
             String line;
-            while ((line = reader.readLine()) != null) {
-                position++;
-                if (line.startsWith(EVENT)
-                        && !line.startsWith("row_change\"", EVENT.length())
-                        && !line.startsWith("transaction_commit\"", EVENT.length())
-                        && !line.startsWith("transaction_abort\"", EVENT.length()))
-                    continue;
+            while ((line = reader.next()) != null) {
+                position += reader.lines();
                 JsonObject event = JsonParser.parseString(line).getAsJsonObject();
                 String type = event.get("event").getAsString();
                 if (type.equals("row_change")) {
@@ -485,7 +482,7 @@ public final class RowStateAudit {
     }
 
     /**
-     * Merges the table's baseline rows (files may interleave; each is in key order) and the
+     * Merges the table's baseline rows in verified manifest order and the
      * committed changes of its keys. Every key in either input yields the row the capture says it
      * should now be; PostgreSQL's final table must hold exactly those rows, which its digest shows
      * (or, with {@link #EXACT}, its ordered scan row by row).
@@ -509,27 +506,13 @@ public final class RowStateAudit {
                                 Arrays.compareUnsigned(
                                         a.getBytes(StandardCharsets.UTF_8),
                                         b.getBytes(StandardCharsets.UTF_8));
-        var cursors = new ArrayList<Cursor>();
-        var queue = new PriorityQueue<Cursor>((a, b) -> keys.compare(a.key, b.key));
-        Throwable original = null;
-        try {
-            for (var file : files) {
-                if (!file.get("table").getAsString().equals(table.name())) continue;
-                Cursor cursor =
-                        new Cursor(
-                                table,
-                                reader(baseline.resolve(file.get("path").getAsString())),
-                                keys,
-                                file.get("rows").getAsLong());
-                cursors.add(cursor);
-                if (cursor.advance()) queue.add(cursor);
-            }
+        try (var cursor = new Cursor(table, baseline, files, keys)) {
+            cursor.advance();
             int tableIndex = tableIndex(groups, table);
             String order =
                     quote(primary.name())
                             + (primary.type().equals("integer") ? "" : " COLLATE \"C\"");
             long count = 0, mutations = 0, changedKeys = 0, baselineRows = 0;
-            String previous = null;
             boolean exact = Boolean.getBoolean(EXACT);
             var captured = new FinalState.Digest();
             try (Statement statement = connection.createStatement()) {
@@ -543,25 +526,21 @@ public final class RowStateAudit {
                                                 + " t ORDER BY "
                                                 + order)
                                 : null) {
-                    while (!queue.isEmpty() || groups.nextTable() == tableIndex) {
+                    while (cursor.row != null || groups.nextTable() == tableIndex) {
                         boolean hasGroup = groups.nextTable() == tableIndex;
                         KeyChanges changes = null;
-                        JsonObject expected;
+                        Map<String, String> expected;
                         String key;
                         if (hasGroup
-                                && (queue.isEmpty()
-                                        || keys.compare(groups.peek().key(), queue.peek().key)
+                                && (cursor.row == null
+                                        || keys.compare(groups.peek().key(), cursor.key)
                                                 <= 0)) {
                             changes = groups.take();
                             key = changes.key();
                             JsonObject initial = null;
-                            if (!queue.isEmpty() && keys.compare(key, queue.peek().key) == 0) {
-                                Cursor cursor = queue.remove();
-                                if (key.equals(previous))
-                                    throw new IOException("Duplicate baseline primary key");
-                                previous = key;
-                                initial = cursor.row;
-                                if (cursor.advance()) queue.add(cursor);
+                            if (cursor.row != null && keys.compare(key, cursor.key) == 0) {
+                                initial = SourceRow.json(cursor.row);
+                                cursor.advance();
                             }
                             Chain chain = chain(table, initial, changes.changes(), sourceOrdered);
                             for (var change : chain.changes()) {
@@ -573,21 +552,16 @@ public final class RowStateAudit {
                             }
                             mutations += chain.changes().size();
                             changedKeys++;
-                            expected = chain.last();
+                            expected = SourceRow.values(table, chain.last());
                         } else {
-                            Cursor cursor = queue.remove();
                             key = cursor.key;
-                            if (key.equals(previous))
-                                throw new IOException("Duplicate baseline primary key");
-                            previous = key;
-                            expected = cursor.row;
-                            if (cursor.advance()) queue.add(cursor);
+                            expected = cursor.values();
+                            cursor.advance();
                         }
                         if (expected == null) continue;
-                        if (!exact) captured.add(table, SourceRow.values(table, expected));
+                        if (!exact) captured.add(table, expected);
                         else if (!actual.next()
-                                || !Objects.equals(
-                                        SourceRow.values(table, expected), finalRow(table, actual)))
+                                || !Objects.equals(expected, finalRow(table, actual)))
                             throw new IOException(
                                     "Final source row mismatch: " + table.name() + "/" + key);
                         count++;
@@ -597,7 +571,10 @@ public final class RowStateAudit {
                 }
             }
             if (!exact) {
+                long scanStarted = System.nanoTime();
                 var postgres = FinalState.scan(connection, workers, table);
+                RunTiming.current().note("audit_pg_scan_" + table.name() + "_millis",
+                        (System.nanoTime() - scanStarted) / 1_000_000L);
                 if (!captured.same(postgres))
                     throw new IOException(
                             "Final source rows differ from the captured state: "
@@ -610,29 +587,8 @@ public final class RowStateAudit {
                                     + EXACT
                                     + "=true to name the first differing row");
             }
-            for (var cursor : cursors) {
-                if (cursor.count != cursor.expectedRows)
-                    throw new IOException("Baseline row count mismatch");
-                baselineRows += cursor.count;
-            }
+            baselineRows = cursor.count;
             return new TableCounts(baselineRows, count, mutations, changedKeys);
-        } catch (Exception error) {
-            original = error;
-            throw error;
-        } finally {
-            IOException failure = null;
-            for (var cursor : cursors) {
-                try {
-                    cursor.reader.close();
-                } catch (IOException error) {
-                    if (failure == null) failure = error;
-                    else failure.addSuppressed(error);
-                }
-            }
-            if (failure != null) {
-                if (original != null) original.addSuppressed(failure);
-                else throw failure;
-            }
         }
     }
 
@@ -654,37 +610,79 @@ public final class RowStateAudit {
         return groups.indexOf(table.name());
     }
 
-    private static final class Cursor {
+    private static final class Cursor implements AutoCloseable {
         final SourceSchema.Table table;
-        final ParquetReader<Group> reader;
+        final Path baseline;
+        final Iterator<JsonObject> files;
         final Comparator<String> keys;
-        final long expectedRows;
-        long count;
+        ParquetReader<Group> reader;
+        long count, fileRows, expectedRows;
         String key;
-        JsonObject row;
+        Group row;
 
         Cursor(
                 SourceSchema.Table table,
-                ParquetReader<Group> reader,
-                Comparator<String> keys,
-                long expectedRows) {
+                Path baseline,
+                List<JsonObject> files,
+                Comparator<String> keys) {
             this.table = table;
-            this.reader = reader;
+            this.baseline = baseline;
+            this.files = files.stream().filter(f -> f.get("table").getAsString().equals(table.name())).iterator();
             this.keys = keys;
-            this.expectedRows = expectedRows;
         }
 
         boolean advance() throws IOException {
-            Group group = reader.read();
-            if (group == null) return false;
-            count++;
-            row = SourceRow.json(group);
-            String next = SourceRow.key(table, row);
-            if (key != null && keys.compare(key, next) >= 0)
-                throw new IOException(
-                        "Baseline file primary keys are not ordered: " + table.name());
-            key = next;
-            return true;
+            while (true) {
+                if (reader == null) {
+                    if (!files.hasNext()) {
+                        row = null;
+                        return false;
+                    }
+                    JsonObject file = files.next();
+                    reader = RowStateAudit.reader(baseline.resolve(file.get("path").getAsString()));
+                    expectedRows = file.get("rows").getAsLong();
+                    fileRows = 0;
+                }
+                Group group = reader.read();
+                if (group == null) {
+                    if (fileRows != expectedRows) throw new IOException("Baseline row count mismatch");
+                    reader.close();
+                    reader = null;
+                    continue;
+                }
+                // Parquet fixes one schema per file; validate its complete source shape once.
+                if (fileRows == 0) SourceRow.values(table, SourceRow.json(group));
+                count++;
+                fileRows++;
+                row = group;
+                var primary = SourceRow.primary(table);
+                int index = row.getType().getFieldIndex(primary.name());
+                if (row.getFieldRepetitionCount(index) == 0)
+                    throw new IOException("Missing primary key for " + table.name());
+                String next = SourceRow.normalize(primary, row.getValueToString(index, 0));
+                if (key != null && keys.compare(key, next) >= 0)
+                    throw new IOException("Baseline file primary keys are not ordered: " + table.name());
+                key = next;
+                return true;
+            }
+        }
+
+        Map<String, String> values() throws IOException {
+            var values = new LinkedHashMap<String, String>();
+            for (var column : table.columns()) {
+                int index = row.getType().getFieldIndex(column.name());
+                String text = row.getFieldRepetitionCount(index) == 0
+                        ? null : row.getValueToString(index, 0);
+                if (text == null && !column.nullable())
+                    throw new IOException("Null required column: " + table.name() + "." + column.name());
+                values.put(column.name(), SourceRow.normalize(column, text));
+            }
+            return values;
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (reader != null) reader.close();
         }
     }
 
@@ -704,19 +702,12 @@ public final class RowStateAudit {
                         .equals(value.get("baseline_verified_manifest_sha256").getAsString()))
             throw new IOException("Row audit does not match source/baseline/schema");
         PgBaselineVerify.verifyFiles(baseline);
-        Path changes = changesFile(report, value);
-        if (!FileDigests.sha256(changes).equals(value.get("changes_sha256").getAsString()))
-            throw new IOException("Audited row transitions changed");
+        if (value.has("changes_file") || !value.has("changes_sha256")
+                || !value.get("changes_sha256").getAsString().matches("[0-9a-f]{64}"))
+            throw new IOException("Unsupported row audit receipt; audit again with a fresh report path");
         var result = new LinkedHashMap<String, Object>();
         for (var entry : value.entrySet()) result.put(entry.getKey(), entry.getValue());
         return result;
-    }
-
-    static Path changesFile(Path report, JsonObject value) throws IOException {
-        String name = value.get("changes_file").getAsString();
-        if (!Path.of(name).getFileName().toString().equals(name))
-            throw new IOException("Invalid audited row transitions path");
-        return report.toAbsolutePath().resolveSibling(name);
     }
 
     static Path resolveRaw(Path raw) throws IOException {

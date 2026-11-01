@@ -24,7 +24,7 @@ import java.util.Map;
  * across logs.
  *
  * <p>A run may also register output directories. A low-frequency sampler records their peak
- * allocated bytes, and the final sample is kept with the process CPU, peak RSS and thread count.
+ * logical bytes, and the final sample is kept with the process CPU, peak RSS and thread count.
  * Sampling is deliberately simple and bounded; it is evidence about this process, not a
  * monitoring system.
  *

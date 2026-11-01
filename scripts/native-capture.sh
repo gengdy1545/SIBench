@@ -18,7 +18,7 @@ PROFILE=$1
 if [ -n "${SIBENCH_JAVA_HOME:-}" ]; then
   export JAVA_HOME=$SIBENCH_JAVA_HOME
 fi
-# The row audit keeps one open Parquet reader per baseline file; large tables need a larger heap.
+# Heap budgets cover capture, row auditing, and Trace compilation.
 HEAP=${SIBENCH_HEAP:--Xmx12g}
 JAVA=${JAVA_HOME:+$JAVA_HOME/bin/}java
 PG=$ROOT/build/services/postgresql-capture
@@ -76,13 +76,21 @@ if [ -e "$CLUSTER" ]; then
     "stop its server if one runs and remove the directory" >&2
   exit 1
 fi
-# The server parameters are owned by config/sibench.yaml; only the machine-specific ones are added here.
+# Server parameters come from the effective snapshot; the base WAL cap is derived from its minimum.
 # start_cluster DATA LOG [CAPTURE_DIR]: the instrumented server traces only with a capture directory.
 start_cluster() {
   # pg_ctl passes -o through /bin/sh; preserve literal quotes in the config path there too.
   local quoted_config=${PG_CONFIG//\'/\'\\\'\'}
+  local base_wal_options=
+  if [ -z "${3:-}" ]; then
+    # Loading need not retain the workload's WAL allowance in every reusable base and clone.
+    local base_wal
+    base_wal=$("$PG/runtime/bin/postgres" -D "$1" -C min_wal_size -c "config_file=$PG_CONFIG")
+    base_wal_options=" -c max_wal_size=$base_wal"
+    printf 'base WAL cap: max_wal_size=%s (from min_wal_size)\n' "$base_wal" >&2
+  fi
   SIBENCH_CAPTURE_DIR=${3:-} "$PG/runtime/bin/pg_ctl" -D "$1" \
-    -o "-c config_file='$quoted_config' -c port=$SIBENCH_PORT -c unix_socket_directories=" \
+    -o "-c config_file='$quoted_config' -c port=$SIBENCH_PORT -c unix_socket_directories=$base_wal_options" \
     -l "$2" -w start >/dev/null
 }
 
@@ -156,6 +164,9 @@ if [ "$SIBENCH_VERIFICATION" = full ]; then
 else
   VERIFY=(--certification "$SIBENCH_CERTIFICATION")
 fi
+# Compilation needs the recorded facts; retain the stopped clone until success for diagnostics.
+"$PG/runtime/bin/pg_ctl" -D "$CLUSTER" -m fast -t 3600 stop >/dev/null
+trap - EXIT
 # One pass compiles the trace and builds the access ledger; the trace is committed only when the
 # ledger matches PG's index counters (and, when certified, stays inside the certificate).
 "$JAVA" $HEAP -cp "$CAPTURE_CP" org.sibench.cli.Sibench compile-trace "$PROFILE" "$SIBENCH_ARTIFACTS/trace" \
@@ -165,14 +176,9 @@ cp "$SIBENCH_ARTIFACTS/trace/access-ledger.json" "$SIBENCH_ARTIFACTS/access-ledg
 cp "$SIBENCH_ARTIFACTS/trace/capture-completeness.json" "$SIBENCH_ARTIFACTS/capture-completeness.json"
 if [ "$SIBENCH_VERIFICATION" = full ]; then
   "$JAVA" -cp "$CAPTURE_CP" org.sibench.cli.Sibench certify-capture "$PROFILE" > "$SIBENCH_ARTIFACTS/certification-summary.json"
-  # The audited row transitions served the audit and the certificate; the capture is recompiled
-  # with its own certificate from now on, which does not read them.
-  rm -f "$SIBENCH_RAW/row-state-audit.json.changes.jsonl"
 fi
 # The capture cluster holds the workload's final state, which the audit has already read; the next
 # capture copies the still cluster again. SIBENCH_KEEP_DATABASE=1 keeps it for diagnosis.
-"$PG/runtime/bin/pg_ctl" -D "$CLUSTER" -m fast -t 3600 stop >/dev/null
-trap - EXIT
 if [ "${SIBENCH_KEEP_DATABASE:-0}" != 1 ]; then
   rm -rf "$CLUSTER"
 fi
