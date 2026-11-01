@@ -2,7 +2,7 @@
 
 SIBench captures index accesses from native HyBench, YCSB JDBC, and sysbench PostgreSQL executions. It generates Parquet data and deterministic Trace artifacts for update-locality analysis and KV Index Service evaluation. It supports local RocksDB and rocksdb-cloud, with service replay checking each query's result count and complete ordered SHA-256 digest.
 
-The pipeline is native generation and loading → Baseline export and verification → native execution capture → Trace compilation → analysis or replay. Trace represents index accesses under fixed PG execution plans; it does not represent end-to-end SQL performance or the original session arrival timing.
+The pipeline is native generation and loading → Baseline export and identity checks → native execution capture → Trace compilation → analysis or replay. Trace represents index accesses under fixed PG execution plans; it does not represent end-to-end SQL performance or the original session arrival timing.
 
 ## Build
 
@@ -18,7 +18,7 @@ The build produces `build/sibench/sibench.jar` with its dependencies. Commands u
 
 ### Native capture components
 
-C/C++, make, zstd development libraries, and a filesystem supporting reflink are required. XFS also requires `xfsprogs`. Extract clean PostgreSQL 14.24 sources into `build/benchmarks/postgresql-14.24`, then build the instrumented server:
+C/C++, make, and zstd development libraries are required. Extract clean PostgreSQL 14.24 sources into `build/benchmarks/postgresql-14.24`, then build the instrumented server:
 
 ```bash
 make -C src/main/native/postgres install extension
@@ -32,7 +32,7 @@ scripts/build-benchmarks.sh config/benchmark/ycsb.yaml
 scripts/build-benchmarks.sh config/benchmark/sysbench.yaml
 ```
 
-Builds use fresh copies under `build/benchmarks/` and reject existing build destinations. `native-build.json` pins the source commit and SHA digests of the actual executable, classes, and dependency JARs. Capture verifies this record; capture and certification identities also include the actual client. sysbench's `native.binary` must select a file in that inventory; the standard build uses `src/sysbench`. A missing build-time inventory requires rebuilding the client from source. HyBench resolves dependencies through its POM. Its build copy applies `scripts/patches/hybench-1.0-snapshot.patch` to exclude the dsol XML simulator unused by `PowerDist`; the actual POM also contributes to the build digest. YCSB's distribution path is determined by the build output.
+Builds use fresh copies under `build/benchmarks/` and reject existing build destinations. `native-build.json` pins the source commit and SHA digests of the actual executable, classes, and dependency JARs. Capture verifies this record; capture identities also include the actual client. sysbench's `native.binary` must select a file in that inventory; the standard build uses `src/sysbench`. A missing build-time inventory requires rebuilding the client from source. HyBench resolves dependencies through its POM. Its build copy applies `scripts/patches/hybench-1.0-snapshot.patch` to exclude the dsol XML simulator unused by `PowerDist`; the actual POM also contributes to the build digest. YCSB's distribution path is determined by the build output.
 
 ### rocksdb-cloud JNI
 
@@ -62,17 +62,19 @@ All three sources default to **87,060,000 rows**, corresponding to HyBench SF10.
 | `config/sibench.yaml` | PG server settings, reference / service replay drivers, and locality analysis |
 | `config/index/rocksdb.yaml`, `storage.yaml` | Index service and object storage backends |
 
-Each native configuration declares a quiescent base database. The script loads it with the native client, verifies it, stops it, and captures against a reflink clone. HyBench does not restore data between phases. The dedicated PG clusters managed by the script use local trust authentication, and native clients use an empty password. An inherited `PGPASSWORD` is never written to command lines or logs. Before execution, the script checks source provenance, client builds, and the actual schema. After execution, it checks requests, row state, the access ledger, and PG index counters. It writes Baseline, raw capture, Trace, certification, timing, and effective benchmark / SIBench configuration snapshots into the run directory. PG's native `.conf` is generated from that snapshot rather than maintained as another settings file. Successful runs remove the clone unless `SIBENCH_KEEP_DATABASE=1` is set. Failed artifacts remain for diagnosis and cannot be resumed. Changes to scale or runtime parameters require a saved effective configuration and a fresh output path.
+All three sources use the same generation entry point: native baseline loading, initial-state export, native workload capture, and Trace compilation. Source adapters retain their own native clients and loading methods. Each run creates one fresh database, exports its initial state, and executes the native workloads in that same database. HyBench does not restore data between workload phases. Dedicated clusters use local trust authentication and empty client passwords; inherited `PGPASSWORD` is never written to command lines or logs.
 
-Base loading derives `max_wal_size` from the effective `min_wal_size`, reducing retained WAL in reusable inputs. Capture startup uses the configured workload limit. These PostgreSQL checkpoint targets are not hard disk limits. After the row audit, the script stops PG before compiling the recorded capture; it keeps the stopped clone until compilation and certification succeed.
+Generation PostgreSQL is disposable. Source tables and their indexes are unlogged, and the default settings disable `fsync` and `full_page_writes`. Native table creation is converted while tables are empty, before loading. Failed or crashed state must be rebuilt; existing database directories are never reused. This policy does not change Index Service durability. WAL and checkpoint settings remain targets, not hard disk limits.
+
+Production checks source provenance, client builds, schema, input files, request/session completion, transaction semantics, and the access ledger against PostgreSQL index counters. Baseline file identity is recorded in `baseline-manifest.json`; this is not an independent value-audit claim. Full baseline/row-state comparisons are explicit acceptance commands. Production writes Baseline, raw capture, Trace, timing and effective configurations, stops PG before compilation, and removes the database after success unless `SIBENCH_KEEP_DATABASE=1`. Failed artifacts remain for diagnosis and cannot be resumed. Use a fresh output path for each run.
 
 Native execution stdout is saved as `native-run.log`. Structured capture status and build identities are recorded in `raw/capture-run.json`.
 
-The filesystem containing the capture data directory must support reflink. Provision disk capacity for the base database, filesystem quota consumed by the clone, Parquet / Trace artifacts, and audit / compiler workspaces.
+Provision disk capacity for one working database, Parquet / Trace artifacts, and compiler workspaces. Generation does not retain a reusable initial database or copy it into a capture database. Explicit acceptance needs additional audit workspace.
 
 For YCSB databases with `C` or `POSIX` collation, Baseline export reads ordered primary-index ranges from one snapshot and forbids PG temporary spills in those transactions. Two read windows share 128 MiB of encoded-row queue credit; a row must fit one reader's share of a 64 MiB window. This bounds the queues, not total JVM memory or all pipeline disk use. Other database collations use explicit `C` sorting and still require temporary space proportional to the input.
 
-Baseline verification reads all column values, checks row identities and coverage against PG, and records each data file's SHA-256.
+Baseline export checks planned row coverage and file boundaries and records file SHA-256 identities. To independently compare every Parquet value with the unchanged initial database, run `audit-baseline PROFILE BASELINE --jdbc URL --user ROLE`. To check captured changes against the final database, run `audit-rows PROFILE BASELINE RAW --jdbc URL --user ROLE`. For a complete native acceptance run, `scripts/native-capture.sh --audit-baseline PROFILE` performs the initial comparison immediately after export, before any workload changes. It records the audit command, timing and result separately and stops on failure. This opt-in run includes audit overhead and is not a normal-generation performance measurement. Use a separate normal run for unmodified production timing; subtracting audit time does not remove its cache effects. Preserve the final database with `SIBENCH_KEEP_DATABASE=1` for `audit-rows`; it must have stopped cleanly and remain on the same host boot. Initial and final database states are different audit inputs, and a final-state audit cannot replace the initial comparison.
 
 ## Replay and service
 
@@ -137,9 +139,11 @@ Maven runs Java unit tests by default, excluding `*IT` and capacity-diagnostic `
 | `RowStateAuditIntegrationIT` | `SIBENCH_ROW_TEST_JDBC`, `SIBENCH_ROW_CAPTURE_DIR`; `-Dsibench.row.evidence=DIR` |
 | `IndexKeyOrderIT` | `SIBENCH_KEY_TEST_JDBC`; creates temporary tables only |
 
+`NativeLoadIntegrationIT` uses `SIBENCH_SCHEMA_TEST_JDBC`, `SIBENCH_SCHEMA_TEST_USER` and `PGPASSWORD` to check the common unlogged loading policy against actual native DDL. The isolated `native_capture_it.py` check also verifies that a backend crash stops the disposable server and that the same disposable database survives a clean in-place restart.
+
 Schema, row-audit, and key-order tests select users through `SIBENCH_SCHEMA_TEST_USER`, `SIBENCH_ROW_TEST_USER`, and `SIBENCH_KEY_TEST_USER` respectively, defaulting to postgres; the password comes from `PGPASSWORD`. The first three test classes create and remove their own randomly named databases; the evidence directory's parent must exist. The row-audit trigger library defaults to `build/services/postgresql-capture/row_capture.so`; select a separately built library with `-Dsibench.row.library=FILE`. Row-audit tests also require the instrumented PG server to start with `SIBENCH_CAPTURE_DIR` set to that same capture directory, `SIBENCH_CAPTURE_COMPRESS=zstd`, and `SIBENCH_CAPTURE_DETAIL=summary`, with `compute_query_id=on` enabled.
 
-Check the capture script's base WAL limit, clean restart, and clone startup explicitly as a non-root service user on a reflink filesystem. This creates isolated PG clusters, needs an unused port and at least 20 GiB free, and has a three-minute execution limit:
+Check the capture script's load WAL limit, clean in-place restart, and backend-crash shutdown explicitly as a non-root service user. This creates isolated PG clusters, needs an unused port and at least 20 GiB free, and has a three-minute execution limit:
 
 ```bash
 python3 src/test/python/native_capture_it.py \

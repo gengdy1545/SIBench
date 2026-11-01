@@ -1,9 +1,8 @@
-"""Explicit real-PG check of base WAL limits and capture startup; not a default unit test."""
+"""Explicit real-PG check of disposable storage, in-place restart and crash shutdown; not a default unit test."""
 import argparse
 import json
 import os
 from pathlib import Path
-import shutil
 import signal
 import subprocess
 import time
@@ -23,9 +22,10 @@ def main():
     root.mkdir(parents=True, exist_ok=False)
     binary = args.postgres_bin.resolve()
     source = args.capture_script.read_text()
-    function = "start_cluster() {\n" + source.split("start_cluster() {\n", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+    function = "".join(name + "() {\n" + source.split(name + "() {\n", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+                       for name in ("start_cluster",))
     config = root / "postgres.conf"
-    config.write_text("listen_addresses='127.0.0.1'\nshared_buffers='32MB'\nmin_wal_size='64MB'\nmax_wal_size='2GB'\ncheckpoint_timeout='1h'\nautovacuum=off\n")
+    config.write_text("listen_addresses='127.0.0.1'\nshared_buffers='32MB'\nmin_wal_size='64MB'\nmax_wal_size='2GB'\ncheckpoint_timeout='1h'\nautovacuum=off\nfsync=off\nfull_page_writes=off\nsynchronous_commit=off\nrestart_after_crash=off\n")
     report = {"status": "running", "cases": [], "stop_seconds": 180}
     active = None
 
@@ -74,7 +74,7 @@ def main():
         usage = os.statvfs(str(root))
         if usage.f_bavail * usage.f_frsize < 20 << 30:
             raise RuntimeError("Disk reserve below 20 GiB")
-        for name, capture in [("control", True), ("base", False)]:
+        for name, capture in [("control", True), ("disposable", False)]:
             case = root / name
             case.mkdir()
             data = case / "data"
@@ -84,24 +84,57 @@ def main():
             startup = start(data, raw if capture else None)
             settings = sql("SELECT current_setting('max_wal_size'),current_setting('min_wal_size')")
             assert settings == ("2GB|64MB" if capture else "64MB|64MB"), settings
-            sql("CREATE TABLE sample(id int PRIMARY KEY,value text); INSERT INTO sample SELECT i,repeat('x',100) FROM generate_series(1,10000) i; CREATE TABLE filler(counter int); INSERT INTO filler VALUES(0)")
-            sql("DO $$ BEGIN FOR i IN 1..40 LOOP UPDATE filler SET counter=counter+1; PERFORM pg_switch_wal(); END LOOP; END $$")
+            assert sql("SELECT current_setting('fsync'),current_setting('full_page_writes'),current_setting('restart_after_crash')") == "off|off|off"
+            persistence = "" if capture else "UNLOGGED "
+            sql("CREATE " + persistence + "TABLE sample(id int PRIMARY KEY,value text)")
+            before = sql("SELECT pg_current_wal_insert_lsn()")
+            sql("INSERT INTO sample SELECT i,repeat('x',100) FROM generate_series(1,100000) i")
+            written = int(sql("SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(),'" + before + "')"))
             sql("CHECKPOINT")
             rows = sql(digest)
             stop()
-            report["cases"].append({"name": name, "settings": settings, "wal_bytes": wal(data),
+            report["cases"].append({"name": name, "settings": settings, "wal_bytes": wal(data), "insert_wal_bytes": written,
                                      "rows": rows, "startup": startup})
-        clone = root / "clone"
-        command(["cp", "-a", "--reflink=always", root / "base/data", clone])
-        raw = root / "clone-raw"
-        raw.mkdir()
-        start(clone, raw)
-        report["clone_rows"] = sql(digest)
-        report["clone_settings"] = sql("SELECT current_setting('max_wal_size'),current_setting('min_wal_size')")
-        stop()
-        assert report["cases"][0]["rows"] == report["cases"][1]["rows"] == report["clone_rows"]
-        assert report["clone_settings"] == "2GB|64MB", report["clone_settings"]
-        assert report["cases"][1]["wal_bytes"] < report["cases"][0]["wal_bytes"]
+        data = root / "disposable/data"
+        original_inode = data.stat().st_ino
+        raw = root / "disposable/raw"
+        start(data, raw)
+        report["restarted_rows"] = sql(digest)
+        report["restarted_settings"] = sql("SELECT current_setting('max_wal_size'),current_setting('min_wal_size')")
+        assert data.stat().st_ino == original_inode
+        assert report["cases"][0]["rows"] == report["cases"][1]["rows"] == report["restarted_rows"]
+        assert report["restarted_settings"] == "2GB|64MB", report["restarted_settings"]
+        assert report["cases"][1]["insert_wal_bytes"] < report["cases"][0]["insert_wal_bytes"] / 100
+        report["same_cluster_restart_preserves_rows"] = True
+        client = subprocess.Popen([str(binary / "psql"), "-X", "-A", "-t", "-h", "127.0.0.1",
+                                   "-p", str(args.port), "-U", "postgres", "-d", "postgres",
+                                   "-c", "SELECT pg_sleep(60)"],
+                                  env=dict(os.environ, PGAPPNAME="sibench_crash_probe"),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            backend = ""
+            while not backend and time.monotonic() < deadline:
+                backend = sql("SELECT pid FROM pg_stat_activity WHERE application_name='sibench_crash_probe'")
+                if not backend:
+                    time.sleep(0.05)
+            assert backend, "Crash probe backend did not connect"
+            os.kill(int(backend), signal.SIGKILL)
+            client.communicate(timeout=10)
+            while time.monotonic() < deadline:
+                status = subprocess.run([str(binary / "pg_ctl"), "-D", str(data), "status"],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                if status.returncode != 0:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("PostgreSQL restarted after a backend crash")
+        finally:
+            if client.poll() is None:
+                client.terminate()
+                client.communicate(timeout=5)
+        active = None
+        report["backend_crash_stops_server"] = True
         report["status"] = "passed"
     except BaseException:
         report["status"] = "failed"

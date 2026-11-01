@@ -66,8 +66,8 @@ final class SessionMerge implements AutoCloseable {
                                     : a.writer() != b.writer()
                                             ? a.writer() ? -1 : 1
                                             : Integer.compare(a.session(), b.session()));
-    /** Counter positions writers took; two writers can never share one. */
-    private final java.util.Set<Long> writerPositions = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** Writers emerge in counter order, so only their last position is needed for uniqueness. */
+    private long lastWriterCsn;
     private final long[] lastCsn;
 
     /**
@@ -111,6 +111,11 @@ final class SessionMerge implements AutoCloseable {
         if (remaining != 0) throw new IOException("Previous chunk was not read to its end");
         Chunk chunk = heads.poll();
         if (chunk == null) throw new IOException("Merged session stream is exhausted");
+        if (chunk.writer()) {
+            if (chunk.csn() == lastWriterCsn)
+                throw new IOException("Two writers share completion position " + chunk.csn());
+            lastWriterCsn = chunk.csn();
+        }
         fill(chunk.session());
         current = chunk;
         remaining = chunk.lineCount();
@@ -209,8 +214,6 @@ final class SessionMerge implements AutoCloseable {
                                 + csn
                                 + " after "
                                 + lastCsn[session]);
-            if (writer && !writerPositions.add(csn))
-                throw new IOException("Two writers share completion position " + csn);
             lastCsn[session] = csn;
             return new Chunk(session, csn, writer, line.startsWith(ServerTrace.COMMIT), lines);
         }

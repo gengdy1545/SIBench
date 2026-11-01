@@ -146,7 +146,28 @@ public class IndexKeyTest {
                     {1, (byte) 0xc3, 0},
                     {3, 0},
                     {1, 0, 0, 0, 0, 0, 0, 0, 0, 0}
-                })
+                }) {
             assertThrows(IOException.class, () -> IndexKey.decode(bad));
+            assertThrows(IOException.class,
+                    () -> IndexKey.decode(java.nio.ByteBuffer.wrap(bad), bad.length));
+        }
+    }
+
+    @Test
+    public void decodingFromABufferOwnsItsBytesAndConsumesOnlyOneComponent() throws Exception {
+        var expected = List.of(IndexKey.ofInt(-5), IndexKey.ofText("中"), IndexKey.NULL);
+        var source = java.nio.ByteBuffer.allocate(64);
+        for (var key : expected) key.writeTo(source);
+        source.flip();
+        var actual = new ArrayList<IndexKey>();
+        for (var key : expected) actual.add(IndexKey.decode(source, key.length()));
+        assertFalse(source.hasRemaining());
+        Arrays.fill(source.array(), (byte) 0);
+        assertEquals(expected, actual);
+        assertThrows(IOException.class, () -> IndexKey.decode(source, 1));
+        assertThrows(IOException.class,
+                () -> IndexKey.decode(java.nio.ByteBuffer.allocate(1), -1));
+        assertThrows(IOException.class,
+                () -> IndexKey.decode(java.nio.ByteBuffer.allocate(IndexKey.MAX_BYTES + 1), IndexKey.MAX_BYTES + 1));
     }
 }

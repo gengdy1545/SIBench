@@ -16,9 +16,8 @@ import java.util.TreeMap;
  * SHA256 of baseline data files kept beside the baseline directory ({@code <baseline>.digests.json})
  * across processes, by the identity {@link FileDigests} trusts within one: the file (device and
  * inode), its size and its modification time. A baseline is written once and then only read and
- * hard-linked, which keeps all three, so every stage of a capture and every capture linking the
- * same still baseline no longer reads tens of GB again to check it. A file that changed has
- * another size or time and is read; an entry for it is replaced.
+ * hard-linked, which keeps all three, so later stages need not reread unchanged data files.
+ * A file that changed has another size or time and is read; its cache entry is replaced.
  */
 final class BaselineDigests {
     private final Path file;
@@ -47,26 +46,6 @@ final class BaselineDigests {
             digests.known.clear();
         }
         return digests;
-    }
-
-    /**
-     * Adds what one baseline directory recorded to another's record: entries name files, not
-     * paths, so they hold for hard links of the same files.
-     */
-    static void merge(Path from, Path into) {
-        var target = of(into);
-        for (var entry : of(from).known.entrySet())
-            if (!entry.getValue().equals(target.known.put(entry.getKey(), entry.getValue()))) target.changed = true;
-        target.save();
-    }
-
-    /** Keep the optional cache with a baseline directory when it is published. */
-    static void move(Path from, Path into) {
-        try {
-            Files.move(location(from), location(into), StandardCopyOption.REPLACE_EXISTING);
-        } catch (IOException | RuntimeException ignored) {
-            // A missing/unwritable cache only makes the next consumer read the files again.
-        }
     }
 
     private static String identity(Path path) throws IOException {

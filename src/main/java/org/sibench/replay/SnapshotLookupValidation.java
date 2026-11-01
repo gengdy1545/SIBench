@@ -338,17 +338,17 @@ public final class SnapshotLookupValidation {
                         .getAsJsonObject();
         IndexCatalog catalog = IndexCatalog.fromManifest(manifest);
         Path sourceBaseline = Path.of(manifest.get("baseline_directory").getAsString());
-        if (!BaselineGenerator.sha256(sourceBaseline.resolve("verified-manifest.json"))
-                .equals(manifest.get("baseline_verified_manifest_sha256").getAsString()))
-            throw new IOException("Baseline verification provenance mismatch");
+        if (!BaselineGenerator.sha256(sourceBaseline.resolve("baseline-manifest.json"))
+                .equals(manifest.get("baseline_manifest_sha256").getAsString()))
+            throw new IOException("Baseline identity mismatch");
         JsonObject verification =
                 JsonParser.parseString(
-                                Files.readString(sourceBaseline.resolve("verified-manifest.json")))
+                                Files.readString(sourceBaseline.resolve("baseline-manifest.json")))
                         .getAsJsonObject();
-        if (!verification.get("status").getAsString().equals("verified_complete")
+        if (!verification.get("status").getAsString().equals("complete")
                 || !BaselineGenerator.sha256(sourceBaseline.resolve("files.jsonl"))
                         .equals(verification.get("files_manifest_sha256").getAsString()))
-            throw new IOException("Independent baseline manifests changed or are incomplete");
+            throw new IOException("Baseline manifests changed or are incomplete");
         for (var item : verification.getAsJsonArray("files"))
             verifyFile(sourceBaseline, item.getAsJsonObject());
         Map<Key, History> histories = new LinkedHashMap<>();

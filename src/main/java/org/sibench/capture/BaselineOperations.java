@@ -371,14 +371,14 @@ public final class BaselineOperations {
     public static IndexOperationTrace.Source of(Path trace) {
         return consumer -> {
             JsonObject manifest = JsonParser.parseString(Files.readString(trace.resolve("manifest.json"))).getAsJsonObject();
-            for (String field : java.util.List.of("baseline_directory", "baseline_trace_sha256", "baseline_operations", "baseline_verified_manifest_sha256"))
+            for (String field : java.util.List.of("baseline_directory", "baseline_trace_sha256", "baseline_operations", "baseline_manifest_sha256"))
                 if (!manifest.has(field)) throw new IOException("Trace manifest cannot derive its baseline load: " + field);
             Path baseline = Path.of(manifest.get("baseline_directory").getAsString());
-            if (!FileDigests.sha256(baseline.resolve("verified-manifest.json"))
-                    .equals(manifest.get("baseline_verified_manifest_sha256").getAsString()))
+            if (!FileDigests.sha256(baseline.resolve("baseline-manifest.json"))
+                    .equals(manifest.get("baseline_manifest_sha256").getAsString()))
                 throw new IOException("The baseline is not the one the trace was compiled with: " + baseline);
             try {
-                PgBaselineVerify.verifyFiles(baseline);
+                BaselineManifest.verifyFiles(baseline);
             } catch (IOException error) {
                 throw error;
             } catch (Exception error) {

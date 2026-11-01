@@ -43,7 +43,7 @@ public final class PgBaselineVerify {
         Connection open() throws SQLException;
     }
 
-    static void verify(String jdbc, String user, SourceSchema schema, Path directory)
+    public static void verify(String jdbc, String user, SourceSchema schema, Path directory)
             throws Exception {
         String password = System.getenv().getOrDefault("PGPASSWORD", "");
         verify(() -> DriverManager.getConnection(jdbc, user, password), schema, directory);
@@ -648,37 +648,4 @@ public final class PgBaselineVerify {
                 StandardCopyOption.ATOMIC_MOVE);
     }
 
-    static void verifyFiles(Path baseline) throws Exception {
-        Path verified = baseline.resolve("verified-manifest.json");
-        if (!Files.exists(verified))
-            throw new IOException("Independent verified baseline manifest required");
-        JsonObject verification =
-                JsonParser.parseString(Files.readString(verified)).getAsJsonObject();
-        if (!verification.get("status").getAsString().equals("verified_complete"))
-            throw new IOException("Baseline is not verified");
-        if (!FileDigests.sha256(baseline.resolve("files.jsonl"))
-                .equals(verification.get("files_manifest_sha256").getAsString()))
-            throw new IOException("Baseline file manifest changed");
-        var data = new java.util.ArrayList<Path>();
-        for (JsonElement item : verification.getAsJsonArray("files")) {
-            Path path = baseline.resolve(item.getAsJsonObject().get("path").getAsString()).normalize();
-            if (!path.startsWith(baseline.normalize())) throw new IOException("Baseline data changed");
-            data.add(path);
-        }
-        // A large baseline is tens of GB: files with a recorded digest are not read again
-        // (BaselineDigests), the rest are read concurrently.
-        var recorded = BaselineDigests.of(baseline);
-        var unread = new java.util.ArrayList<Path>();
-        for (Path path : data) if (recorded.get(path) == null) unread.add(path);
-        FileDigests.prefetch(unread);
-        var files = verification.getAsJsonArray("files");
-        for (int i = 0; i < data.size(); i++) {
-            String digest = recorded.get(data.get(i));
-            if (digest == null) digest = FileDigests.sha256(data.get(i));
-            if (!digest.equals(files.get(i).getAsJsonObject().get("sha256").getAsString()))
-                throw new IOException("Baseline data changed");
-            recorded.put(data.get(i), digest);
-        }
-        recorded.save();
-    }
 }

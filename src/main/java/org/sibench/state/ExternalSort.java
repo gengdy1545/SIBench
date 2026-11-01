@@ -152,8 +152,9 @@ public final class ExternalSort implements AutoCloseable {
             }
             for (Path path : group) Files.delete(path);
             runs.subList(0, MERGE_FANIN).clear();
-            // The merged run holds the oldest records, so it stays first.
-            runs.add(0, merged);
+            // Append so a growing run is not rewritten with every following group. The stored
+            // insertion order, rather than run order, preserves ties across merge passes.
+            runs.add(merged);
         }
     }
 

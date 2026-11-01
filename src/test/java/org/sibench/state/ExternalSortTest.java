@@ -87,6 +87,12 @@ public class ExternalSortTest {
             assertEquals(2_000, sort.runs());
             try (var sorted = sort.sorted()) {
                 assertTrue("runs " + sort.runs(), sort.runs() <= 64);
+                // One reduction level is enough: no record needs to be rewritten twice.
+                try (var files = Files.list(directory)) {
+                    for (Path run : files.toList())
+                        assertTrue("unbalanced merged run " + run,
+                                Files.size(run) <= 64L * (16 + 3 + 29));
+                }
                 assertSame(expected(input), drain(sorted));
             }
         }

@@ -20,8 +20,8 @@ import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * Export committed PG values in primary-key order. {@link PgBaselineVerify} then compares every
- * Parquet value with PG.
+ * Export committed PG values in primary-key order. Independent value comparisons are an
+ * explicit acceptance step through {@link PgBaselineVerify}.
  *
  * <p>Each table is read once in primary-key order from the exported snapshot. Tables are
  * encoded concurrently; only the shared Parquet byte policy decides file boundaries. RowIDs
@@ -135,7 +135,7 @@ public final class PgBaselineExport {
             var results = new ArrayList<Written>();
             for (var future : written) results.addAll(get(future));
             coordinator.commit();
-            finish(output, tables, results);
+            finish(source, output, tables, results);
         } finally {
             pool.shutdownNow();
             for (Connection pg : opened)
@@ -672,7 +672,7 @@ public final class PgBaselineExport {
     }
 
     /** Manifests in file order. */
-    private static void finish(Path output, List<Table> tables, List<Written> results)
+    private static void finish(SourceSchema source, Path output, List<Table> tables, List<Written> results)
             throws Exception {
         Gson json = new Gson();
         try (BufferedWriter files = Files.newBufferedWriter(output.resolve("files.jsonl"))) {
@@ -702,6 +702,9 @@ public final class PgBaselineExport {
         result.put("file_size_policy", GenerationConfig.FILE_SIZE_POLICY);
         result.put("target_file_size_bytes", results.isEmpty() ? null : ((Map<?, ?>) results.get(0).file().get("file_size")).get("target_bytes"));
         Files.writeString(output.resolve("manifest.json"), json.toJson(result));
+        var expected = new LinkedHashMap<String, Long>();
+        for (Table table : tables) expected.put(table.source().name(), table.rows());
+        BaselineManifest.publish(source, output, expected);
     }
 
 }

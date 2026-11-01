@@ -642,6 +642,8 @@ public final class IndexOperationTrace {
         var header = expectedSha256 == null ? null : ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
         blocks(file, (records, checksum, block) -> {
                 if (digest != null) digestBlock(digest, header, records, checksum, block);
+                int[] lengths = new int[4];
+                IndexKey[] parts = new IndexKey[4];
                 for (int i = 0; i < records; i++) {
                     if (block.remaining() < RECORD_BYTES)
                         throw new IOException("Truncated index operation prefix");
@@ -654,7 +656,6 @@ public final class IndexOperationTrace {
                     long mutationOrdinal = block.getLong(), readTimestamp = block.getLong();
                     long workUnitId = block.getLong(), limit = block.getLong();
                     int expansionPosition = block.getInt(), expansionSize = block.getInt();
-                    int[] lengths = new int[4];
                     long variable = 0;
                     for (int part = 0; part < 4; part++) {
                         lengths[part] = block.getInt();
@@ -664,12 +665,9 @@ public final class IndexOperationTrace {
                     }
                     if (variable > block.remaining() - (long) (records - i - 1) * RECORD_BYTES)
                         throw new IOException("Invalid key length");
-                    IndexKey[] parts = new IndexKey[4];
                     for (int part = 0; part < 4; part++) {
-                        if (lengths[part] < 0) continue;
-                        byte[] value = new byte[lengths[part]];
-                        block.get(value);
-                        parts[part] = IndexKey.decode(value);
+                        parts[part] = lengths[part] < 0
+                                ? null : IndexKey.decode(block, lengths[part]);
                     }
                     Operation o =
                             new Operation(

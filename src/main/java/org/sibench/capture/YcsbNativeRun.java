@@ -131,7 +131,7 @@ final class YcsbNativeRun {
         require(
                 loaded == records && inserts.keySet().stream().allMatch(code -> code.equals("Return=OK") || code.equals("Return=BATCHED_OK") || !code.startsWith("Return=")),
                 "YCSB load did not insert every record");
-        // StillBase checks actual final rows before publishing; BATCHED_OK alone cannot prove cleanup flushed the last batch.
+        // NativeLoad checks actual final rows before publishing; BATCHED_OK alone cannot prove cleanup flushed the last batch.
     }
 
     static Map<String, Object> run(NativeCaptureConfig config, Path logs) throws Exception {

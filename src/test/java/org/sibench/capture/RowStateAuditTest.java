@@ -128,6 +128,7 @@ public class RowStateAuditTest {
         assertTrue(written.size() > 1);
         Files.write(baseline.resolve("files.jsonl"), written.stream()
                 .map(w -> new com.google.gson.Gson().toJson(w.file())).toList());
+        BaselineManifest.publish(schema, baseline, Map.of(table.name(), (long) initial.size()));
         PgBaselineVerify.verify(RowAuditTestSupport.connections(schema, Map.of(table.name(), initial), new int[1]),
                 schema, baseline);
         String boundary = (String) written.get(1).file().get("first_key");

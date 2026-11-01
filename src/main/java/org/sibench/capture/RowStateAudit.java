@@ -106,7 +106,7 @@ public final class RowStateAudit {
         if (Files.exists(report)) return reuse(schema, baseline, raw, report);
         long inputStarted = System.nanoTime();
         CaptureRun.verifyInput(resolveRaw(raw));
-        PgBaselineVerify.verifyFiles(baseline);
+        BaselineManifest.verifyFiles(baseline);
         if (!connection.getAutoCommit())
             throw new IOException("Row audit requires a fresh autocommit connection");
         Map<String, String> inputs = inputHashes(raw, false);
@@ -222,8 +222,8 @@ public final class RowStateAudit {
             result.put("source_schema_sha256", schema.fingerprints());
             result.put("source_inputs_sha256", inputs);
             result.put(
-                    "baseline_verified_manifest_sha256",
-                    BaselineGenerator.sha256(baseline.resolve("verified-manifest.json")));
+                    "baseline_manifest_sha256",
+                    BaselineGenerator.sha256(baseline.resolve("baseline-manifest.json")));
             result.put("changes_sha256", HexFormat.of().formatHex(changesDigest.digest()));
             result.put("commits", commits);
             result.put("aborts", aborts);
@@ -268,7 +268,7 @@ public final class RowStateAudit {
                 if (type.equals("row_change")) {
                     var table = tables.get(event.get("relation").getAsString());
                     if (table == null) throw new IOException("Unknown source row table");
-                    validateChange(table, event);
+                    SourceRow.validateChange(table, event);
                     long current = event.get("xid").getAsLong();
                     if (!pending.isEmpty() && xid != current)
                         throw new IOException("Interleaved row transactions in one session");
@@ -440,17 +440,6 @@ public final class RowStateAudit {
 
     private record TableCounts(long baselineRows, long finalRows, long mutations, long changedKeys) {}
 
-    static void validateChange(SourceSchema.Table table, JsonObject change) throws IOException {
-        SourceRow.requireStablePrimaryKey(table, change);
-        JsonObject before = SourceRow.image(change, "old"), after = SourceRow.image(change, "new");
-        String operation = change.get("operation").getAsString();
-        if (!(operation.equals("insert") && before == null && after != null
-                || operation.equals("update") && before != null && after != null
-                || operation.equals("delete") && before != null && after == null))
-            throw new IOException("Invalid source row operation/images: " + operation);
-        SourceRow.values(table, before);
-        SourceRow.values(table, after);
-    }
 
     static Chain chain(
             SourceSchema.Table table, JsonObject initial, List<Change> input, boolean sourceOrdered)
@@ -698,10 +687,10 @@ public final class RowStateAudit {
                 || !JSON.toJsonTree(schema.tables()).equals(value.get("source_schema"))
                 || !JSON.toJsonTree(schema.fingerprints()).equals(value.get("source_schema_sha256"))
                 || !JSON.toJsonTree(inputHashes(raw, false)).equals(value.get("source_inputs_sha256"))
-                || !BaselineGenerator.sha256(baseline.resolve("verified-manifest.json"))
-                        .equals(value.get("baseline_verified_manifest_sha256").getAsString()))
+                || !BaselineGenerator.sha256(baseline.resolve("baseline-manifest.json"))
+                        .equals(value.get("baseline_manifest_sha256").getAsString()))
             throw new IOException("Row audit does not match source/baseline/schema");
-        PgBaselineVerify.verifyFiles(baseline);
+        BaselineManifest.verifyFiles(baseline);
         if (value.has("changes_file") || !value.has("changes_sha256")
                 || !value.get("changes_sha256").getAsString().matches("[0-9a-f]{64}"))
             throw new IOException("Unsupported row audit receipt; audit again with a fresh report path");

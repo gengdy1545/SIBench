@@ -389,11 +389,11 @@ WHERE i.indrelid=CAST(? AS oid) ORDER BY ic.relname
             }
             String prefix = table.name() + ": ";
             if (!found.kind().equals("r")
-                    || !found.persistence().equals("p")
+                    || !(found.persistence().equals("p") || found.persistence().equals("u"))
                     || found.inherited()
                     || found.rowSecurity())
                 differences.add(
-                        prefix + "expected ordinary persistent table without inheritance/RLS");
+                        prefix + "expected ordinary logged or unlogged table without inheritance/RLS");
             if (!found.otherConstraints().isEmpty())
                 differences.add(prefix + "unexpected constraints " + found.otherConstraints());
             if (table.columns().size() != found.columns().size())

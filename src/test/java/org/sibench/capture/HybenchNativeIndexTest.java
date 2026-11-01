@@ -12,7 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
-public class HybenchNativePrepareTest {
+public class HybenchNativeIndexTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     @Test
@@ -27,15 +27,15 @@ public class HybenchNativePrepareTest {
 
                 create index idx_loanapps_2 on loanapps ( timestamp );
                 """);
-        List<String> statements = HybenchNativePrepare.statements(script);
+        List<String> statements = HybenchNativeLoad.indexStatements(script);
         assertEquals(
                 List.of(
                         "create index idx_loanapps_1 on loanapps ( applicantid )",
                         "create index idx_loanapps_2 on loanapps ( timestamp )"),
                 statements);
         // The pinned script carries the 13 upstream secondary indexes, the four identity
-        // sequences and their setvals; all of them must reach the cloned database.
-        var upstream = HybenchNativePrepare.statements(upstream());
+        // sequences and their setvals; all of them must reach the loaded database.
+        var upstream = HybenchNativeLoad.indexStatements(upstream());
         assertEquals(13, upstream.stream().filter(sql -> sql.startsWith("create index ")).count());
         assertEquals(
                 4, upstream.stream().filter(sql -> sql.startsWith("CREATE SEQUENCE IF NOT EXISTS")).count());
@@ -44,7 +44,7 @@ public class HybenchNativePrepareTest {
 
     @Test
     public void noStatementKeepsItsTerminatorOrRunsEmpty() throws Exception {
-        for (String sql : HybenchNativePrepare.statements(upstream())) {
+        for (String sql : HybenchNativeLoad.indexStatements(upstream())) {
             assertFalse(sql, sql.isBlank());
             assertFalse(sql, sql.contains(";"));
         }

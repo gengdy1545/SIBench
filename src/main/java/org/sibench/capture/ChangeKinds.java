@@ -82,7 +82,7 @@ public final class ChangeKinds {
 
     /**
      * Counts the raw server traces of one workload, in file order. The traces are read concurrently,
-     * a bounded number ahead, keeping only the lines {@link Counter#accept} acts on: a line whose
+     * with bounded batches per reader, keeping only the lines {@link Counter#accept} acts on: a line whose
      * first field names another event type is passed over without being parsed, as accept ignores
      * it. The kept lines are applied in file order, so the counts are those of reading every line.
      * (Parsing every line of every trace on one thread held up each workload of a native run.)
@@ -96,28 +96,43 @@ public final class ChangeKinds {
             thread.setDaemon(true);
             return thread;
         });
-        var window = new java.util.concurrent.Semaphore(threads * 2);
         try {
-            var reads = new ArrayList<java.util.concurrent.Future<List<Item>>>();
-            for (Path trace : traces)
-                reads.add(pool.submit(() -> {
-                    window.acquire();
-                    return items(counter, trace);
-                }));
+            var reads = new ArrayList<java.util.concurrent.BlockingQueue<Object>>();
+            for (Path trace : traces) {
+                var queue = new java.util.concurrent.ArrayBlockingQueue<Object>(2);
+                reads.add(queue);
+                pool.submit(() -> {
+                    try {
+                        items(counter, trace, queue);
+                        queue.put(END);
+                    } catch (InterruptedException closed) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException | RuntimeException | Error failure) {
+                        try {
+                            queue.put(failure);
+                        } catch (InterruptedException closed) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                });
+            }
             for (var read : reads) {
-                List<Item> items;
-                try {
-                    items = read.get();
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted while counting change kinds", interrupted);
-                } catch (java.util.concurrent.ExecutionException failed) {
-                    if (failed.getCause() instanceof IOException io) throw io;
-                    if (failed.getCause() instanceof RuntimeException runtime) throw runtime;
-                    throw new IOException(failed.getCause());
+                while (true) {
+                    Object batch;
+                    try {
+                        batch = read.take();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Interrupted while counting change kinds", interrupted);
+                    }
+                    if (batch == END) break;
+                    if (batch instanceof IOException io) throw io;
+                    if (batch instanceof RuntimeException runtime) throw runtime;
+                    if (batch instanceof Error error) throw error;
+                    @SuppressWarnings("unchecked")
+                    var items = (List<Item>) batch;
+                    for (Item item : items) counter.accept(item);
                 }
-                window.release();
-                for (Item item : items) counter.accept(item);
             }
         } finally {
             pool.shutdownNow();
@@ -126,13 +141,16 @@ public final class ChangeKinds {
     }
 
     private static final String EVENT = "{\"event\":\"";
+    private static final Object END = new Object();
+    static final int BATCH_ITEMS = 4096;
 
     /**
      * The trace's events the counter acts on, in order and already classified, without the lines
      * that name an event type it ignores; runs on the reading threads.
      */
-    private static List<Item> items(Counter counter, Path trace) throws IOException {
-        var kept = new ArrayList<Item>();
+    private static void items(Counter counter, Path trace,
+            java.util.concurrent.BlockingQueue<Object> output) throws IOException, InterruptedException {
+        var kept = new ArrayList<Item>(BATCH_ITEMS);
         try (var lines = ServerTrace.open(trace)) {
             String line;
             while ((line = lines.readLine()) != null) {
@@ -142,10 +160,16 @@ public final class ChangeKinds {
                         && !line.startsWith("transaction_abort\"", EVENT.length()))
                     continue;
                 Item item = counter.item(JsonParser.parseString(line).getAsJsonObject());
-                if (item != null) kept.add(item);
+                if (item != null) {
+                    kept.add(item);
+                    if (kept.size() == BATCH_ITEMS) {
+                        output.put(kept);
+                        kept = new ArrayList<>(BATCH_ITEMS);
+                    }
+                }
             }
         }
-        return kept;
+        if (!kept.isEmpty()) output.put(kept);
     }
 
     /**

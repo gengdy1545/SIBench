@@ -97,6 +97,15 @@
 
 ## Current design and compatibility
 
+- Treat generation PostgreSQL as disposable, rebuildable working state. Do not
+  add crash recovery or durable-cache requirements to generation without an
+  explicit need. Use one fresh database for loading, export and native workload;
+  do not keep a reusable initial database or clone it. Reject existing database
+  directories, preserve normal transaction/snapshot semantics, and remove the
+  working database after success unless explicitly retained for diagnosis.
+  This policy does not weaken Index Service durability or successful
+  Trace publication. Keep independent full-data acceptance separate from normal
+  generation, whose input integrity and source-completeness checks remain required.
 - Maintain the current design by default. Do not add or retain superseded APIs,
   format readers, compatibility flags, fallback implementations or transition
   branches for backward compatibility that has not been explicitly required.

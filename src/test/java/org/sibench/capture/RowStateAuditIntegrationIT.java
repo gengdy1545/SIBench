@@ -333,6 +333,7 @@ public class RowStateAuditIntegrationIT {
 
         void install(String benchmark, SourceSchema schema) throws Exception {
             try (var c = connect()) {
+                NativeLoad.unloggedTables(c);
                 if (benchmark.equals("hybench")) {
                     execute(
                             c,
@@ -363,6 +364,8 @@ public class RowStateAuditIntegrationIT {
                                         + i
                                         + "(k)");
                 }
+                execute(c, "DROP EVENT TRIGGER sibench_unlogged_tables");
+                execute(c, "DROP FUNCTION public.sibench_unlogged_tables()");
                 String library =
                         Path.of(System.getProperty("sibench.row.library",
                                         root.resolve("build/services/postgresql-capture/row_capture.so").toString()))

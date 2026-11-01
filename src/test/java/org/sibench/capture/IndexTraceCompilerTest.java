@@ -119,19 +119,10 @@ public class IndexTraceCompilerTest {
         Files.writeString(
                 baseline.resolve("schema-preflight.json"),
                 "{\"status\":\"schema_verified\",\"environment\":{\"lc_collate\":\"C\"}}");
-        Files.writeString(
-                baseline.resolve("verified-manifest.json"),
-                new Gson()
-                        .toJson(
-                                Map.of(
-                                        "status",
-                                        "verified_complete",
-                                        "rows",
-                                        8,
-                                        "files_manifest_sha256",
-                                        BaselineGenerator.sha256(baseline.resolve("files.jsonl")),
-                                        "files",
-                                        hashes)));
+        var source = SourceSchema.hybench(original.source());
+        var expected = new LinkedHashMap<String, Long>();
+        for (var table : source.tables()) expected.put(table.name(), 1L);
+        BaselineManifest.publish(source, baseline, expected);
         return new CaptureConfig(
                 root,
                 original.source(),
@@ -1676,49 +1667,8 @@ public class IndexTraceCompilerTest {
                 concurrentCapture(
                         fixture,
                         summary ? List.of(summarized(101, sessions.get(0)), summarized(102, sessions.get(1))) : sessions);
-        // A packaged run records its build; the fixture names one so it can be certified.
-        Path jar = runJar(fixture.resolve("artifacts"), "compiler", false);
-        recordBuild(raw, jar);
         audit(config, raw, after);
         return raw;
-    }
-
-    private static void recordBuild(Path raw, Path jar) throws Exception {
-        Path run = raw.resolve("capture-run.json");
-        JsonObject manifest = json(run);
-        JsonObject build = new JsonObject();
-        build.addProperty("sibench_jar_sha256", FileDigests.sha256(jar));
-        build.addProperty("postgres_sha256", "postgres");
-        build.add("native_client", new Gson().toJsonTree(Map.of("benchmark", "hybench", "artifacts", Map.of("client", "fixture"))));
-        manifest.add("build", build);
-        Files.writeString(run, manifest.toString());
-    }
-
-    /**
-     * The run jar of a capture under {@code artifacts}: the real capture roots, one compiler class
-     * with the given content, and a library entry. {@code changedDriver} alters the capture
-     * driver's class file after its constant pool, which changes its digest but not its references.
-     */
-    private static Path runJar(Path artifacts, String compiler, boolean changedDriver) throws Exception {
-        Path jar = Certification.runJar(artifacts);
-        Files.createDirectories(jar.getParent());
-        try (var out = new java.util.zip.ZipOutputStream(Files.newOutputStream(jar))) {
-            for (Class<?> type : CaptureCode.ROOTS) {
-                String name = type.getName().replace('.', '/') + ".class";
-                byte[] bytes;
-                try (var in = type.getClassLoader().getResourceAsStream(name)) {
-                    bytes = in.readAllBytes();
-                }
-                if (changedDriver && type == CaptureDriver.class) bytes = Arrays.copyOf(bytes, bytes.length + 1);
-                out.putNextEntry(new java.util.zip.ZipEntry(name));
-                out.write(bytes);
-            }
-            out.putNextEntry(new java.util.zip.ZipEntry("org/sibench/capture/IndexTraceCompiler.class"));
-            out.write(compiler.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            out.putNextEntry(new java.util.zip.ZipEntry("com/example/Library.class"));
-            out.write(new byte[] {1, 2, 3});
-        }
-        return jar;
     }
 
     /** PG counter snapshots that agree with a ledger: zero before, the ledger's tallies after. */
@@ -1808,7 +1758,7 @@ public class IndexTraceCompilerTest {
         Path output = fixture.resolve("checked");
         IndexTraceCompiler.compile(
                 schema, config.layout(), raw, output,
-                new IndexTraceCompiler.Checks(RowStateAudit.defaultReport(raw), null, agree[0], agree[1]));
+                new IndexTraceCompiler.Checks(RowStateAudit.defaultReport(raw), agree[0], agree[1]));
         assertEquals("consistent", json(output.resolve("manifest.json")).get("capture_completeness").getAsString());
         Path rejected = fixture.resolve("rejected");
         var failure =
@@ -1816,98 +1766,70 @@ public class IndexTraceCompilerTest {
                         java.io.IOException.class,
                         () -> IndexTraceCompiler.compile(
                                 schema, config.layout(), raw, rejected,
-                                new IndexTraceCompiler.Checks(RowStateAudit.defaultReport(raw), null, disagree[0], disagree[1])));
+                                new IndexTraceCompiler.Checks(RowStateAudit.defaultReport(raw), disagree[0], disagree[1])));
         assertTrue(failure.getMessage(), failure.getMessage().contains("disagree"));
         assertTrue(Files.exists(rejected.resolve("INCOMPLETE")));
         assertEquals("inconsistent", json(rejected.resolve("capture-completeness.json")).get("status").getAsString());
     }
 
     @Test
-    public void aCertificationReplacesTheRowAuditOnlyForTheSameBuildAndCoverage() throws Exception {
+    public void runtimeCompilationNeedsNoIndependentAuditButStillRejectsCounterMismatch() throws Exception {
         Path fixture = temporary.newFolder().toPath();
         CaptureConfig config = baseline(fixture);
         var schema = SourceSchema.hybench(config.source());
         Path raw = auditedConcurrentCapture(fixture, config, true);
-        Path artifacts = fixture.resolve("artifacts");
-        Files.createDirectories(artifacts);
-        compile(config, raw, fixture.resolve("first"));
-        Path[] agree = counters(fixture, json(fixture.resolve("first/access-ledger.json")), 0);
-        Path trace = artifacts.resolve("trace");
-        IndexTraceCompiler.compile(
-                schema, config.layout(), raw, trace,
-                new IndexTraceCompiler.Checks(RowStateAudit.defaultReport(raw), null, agree[0], agree[1]));
-        var profile = new CaptureProfile(schema, config.layout(), raw, artifacts);
-        var certificate = Certification.certify(profile);
-        assertEquals("certified", certificate.get("status"));
-        Path certification = artifacts.resolve(Certification.FILE);
-        assertThrows(java.io.IOException.class, () -> Certification.certify(profile));
-
-        assertFalse(json(certification).getAsJsonObject("build").has("sibench_jar_sha256"));
-        assertTrue(json(certification).getAsJsonObject("build").getAsJsonObject("capture_code")
-                .getAsJsonObject("classes").has("org/sibench/capture/CaptureDriver.class"));
-
-        // The same capture, relying on the certificate instead of its row audit; a run with
-        // another compiler in its jar is still the certified capture build.
-        Path jar = runJar(fixture.resolve("recompiled"), "another compiler", false);
-        recordBuild(raw, jar);
-        Path certified = fixture.resolve("certified");
-        IndexTraceCompiler.compile(
-                schema, config.layout(), raw, certified,
-                new IndexTraceCompiler.Checks(null, certification, agree[0], agree[1], jar));
-        JsonObject manifest = json(certified.resolve("manifest.json"));
-        assertEquals("certified", manifest.getAsJsonObject("verification").get("mode").getAsString());
-        assertEquals(
-                json(trace.resolve("manifest.json")).get("workload_trace_sha256"),
+        compile(config, raw, fixture.resolve("audited"));
+        Path[] agree = counters(fixture, json(fixture.resolve("audited/access-ledger.json")), 0);
+        Files.delete(RowStateAudit.defaultReport(raw));
+        Path runtime = fixture.resolve("runtime");
+        IndexTraceCompiler.compile(schema, config.layout(), raw, runtime,
+                new IndexTraceCompiler.Checks(null, agree[0], agree[1]));
+        var manifest = json(runtime.resolve("manifest.json"));
+        assertEquals("runtime", manifest.getAsJsonObject("verification").get("mode").getAsString());
+        assertFalse(manifest.has("row_state_audit_sha256"));
+        assertEquals(json(fixture.resolve("audited/manifest.json")).get("workload_trace_sha256"),
                 manifest.get("workload_trace_sha256"));
-
-        // An access path the certifying capture never exercised.
-        JsonObject narrowed = json(certification);
-        var paths = narrowed.getAsJsonObject("coverage").getAsJsonArray("access_paths");
-        String dropped = paths.remove(0).getAsString();
-        Path narrow = fixture.resolve("narrow.json");
-        Files.writeString(narrow, narrowed.toString());
-        Path outside = fixture.resolve("outside");
-        var failure =
-                assertThrows(
-                        java.io.IOException.class,
-                        () -> IndexTraceCompiler.compile(
-                                schema, config.layout(), raw, outside,
-                                new IndexTraceCompiler.Checks(null, narrow, agree[0], agree[1], jar)));
-        assertTrue(failure.getMessage(), failure.getMessage().contains("outside its certification"));
-        assertTrue(failure.getMessage(), failure.getMessage().contains(dropped));
-        assertTrue(Files.exists(outside.resolve("INCOMPLETE")));
-
-        // Another build is not vouched for, whatever it exercised.
-        JsonObject rebuilt = json(certification);
-        rebuilt.getAsJsonObject("build").addProperty("postgres_sha256", "another");
-        Path other = fixture.resolve("other-build.json");
-        Files.writeString(other, rebuilt.toString());
-        failure =
-                assertThrows(
-                        java.io.IOException.class,
-                        () -> IndexTraceCompiler.compile(
-                                schema, config.layout(), raw, fixture.resolve("other"),
-                                new IndexTraceCompiler.Checks(null, other, agree[0], agree[1], jar)));
-        assertTrue(failure.getMessage(), failure.getMessage().contains("postgres_sha256"));
-        assertFalse(Files.exists(fixture.resolve("other")));
-
-        // A changed capture driver is another capture build, and the message names it.
-        Path changed = runJar(fixture.resolve("driver"), "another compiler", true);
-        recordBuild(raw, changed);
-        failure =
-                assertThrows(
-                        java.io.IOException.class,
-                        () -> IndexTraceCompiler.compile(
-                                schema, config.layout(), raw, fixture.resolve("changed"),
-                                new IndexTraceCompiler.Checks(null, certification, agree[0], agree[1], changed)));
-        assertTrue(failure.getMessage(), failure.getMessage().contains("org/sibench/capture/CaptureDriver.class"));
-        // A jar that is not the one the capture recorded is refused before it is compared.
-        failure =
-                assertThrows(
-                        java.io.IOException.class,
-                        () -> IndexTraceCompiler.compile(
-                                schema, config.layout(), raw, fixture.resolve("unrecorded"),
-                                new IndexTraceCompiler.Checks(null, certification, agree[0], agree[1], jar)));
-        assertTrue(failure.getMessage(), failure.getMessage().contains("not the one the capture ran"));
+        Path[] wrong = counters(Files.createDirectory(fixture.resolve("wrong")), json(runtime.resolve("access-ledger.json")), 1);
+        assertThrows(java.io.IOException.class, () -> IndexTraceCompiler.compile(schema, config.layout(), raw,
+                fixture.resolve("rejected-runtime"), new IndexTraceCompiler.Checks(null, wrong[0], wrong[1])));
     }
+    @Test
+    public void runtimeCompilationRejectsMalformedImagesEvenWhenTheTransactionAborts() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        CaptureConfig config = baseline(fixture);
+        var schema = SourceSchema.hybench(config.source());
+        int example = 0;
+        for (boolean aborted : List.of(false, true)) {
+            for (String operation : List.of("insert", "update", "delete")) {
+                for (boolean oldImage : List.of(false, true)) {
+                    if (oldImage && operation.equals("insert") || !oldImage && operation.equals("delete")) continue;
+                    for (String defect : List.of("missing", "extra", "invalid_integer", "invalid_timestamp", "null_key")) {
+                        JsonObject before = operation.equals("insert") ? null
+                                : JsonParser.parseString(row("2024-01-01 00:00:00")).getAsJsonObject();
+                        JsonObject after = operation.equals("delete") ? null
+                                : JsonParser.parseString(row("2024-01-02 00:00:00")).getAsJsonObject();
+                        if (operation.equals("insert")) after.addProperty("id", 2);
+                        JsonObject broken = oldImage ? before : after;
+                        switch (defect) {
+                            case "missing" -> broken.remove("amount");
+                            case "extra" -> broken.addProperty("unexpected", "ignored");
+                            case "invalid_integer" -> broken.addProperty("appid", "not-an-integer");
+                            case "invalid_timestamp" -> broken.addProperty("contract_timestamp", "not-a-timestamp");
+                            case "null_key" -> broken.add("id", JsonNull.INSTANCE);
+                        }
+                        Path directory = Files.createDirectory(fixture.resolve("image-" + example++));
+                        Path raw = capture(directory, List.of(rowChange("loantrans", 9, operation, before, after)
+                                + "\n{\"event\":\"transaction_" + (aborted ? "abort" : "commit") + "\",\"xid\":9}\n"));
+                        Path output = directory.resolve("trace");
+                        assertThrows(operation + " " + defect + " old=" + oldImage + " aborted=" + aborted,
+                                java.io.IOException.class,
+                                () -> IndexTraceCompiler.compile(schema, config.layout(), raw, output,
+                                        new IndexTraceCompiler.Checks(null, null, null)));
+                        assertFalse(Files.exists(output.resolve("manifest.json")));
+                    }
+                }
+            }
+        }
+    }
+
 }

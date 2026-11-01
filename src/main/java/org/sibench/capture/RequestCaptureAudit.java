@@ -15,9 +15,9 @@ public final class RequestCaptureAudit {
      * the client: true for point-access workloads, false for joins whose keys come from rows.
      */
     static Map<String, Object> audit(Path jdbc, Path pg, boolean bindings) throws Exception {
-        Map<String, JsonObject> requests = new LinkedHashMap<>();
+        Map<String, Request> requests = new LinkedHashMap<>();
         Set<String> returned = new HashSet<>();
-        Map<String, List<JsonObject>> consumed = new HashMap<>();
+        Map<String, Consumed> consumed = new HashMap<>();
         Map<String, Long> clientCommitRequests = new HashMap<>(),
                 rollbackRequests = new HashMap<>();
         Map<String, Long> serverCommitRequests = new HashMap<>(), abortRequests = new HashMap<>();
@@ -45,7 +45,12 @@ public final class RequestCaptureAudit {
                     throw new IOException("Client event without connection or request identity");
                 switch (event) {
                     case "request_start" -> {
-                        if (requests.put(app, e) != null)
+                        var parameters = e.getAsJsonObject("parameters");
+                        List<String> bound = !bindings || parameters == null ? List.of()
+                                : parameters.entrySet().stream()
+                                        .filter(p -> !p.getValue().isJsonNull())
+                                        .map(p -> p.getValue().getAsString()).toList();
+                        if (requests.put(app, new Request(e.get("sql").getAsString(), bound)) != null)
                             throw new IOException("Duplicate request identity");
                         clientTransactionOpen = true;
                     }
@@ -57,7 +62,7 @@ public final class RequestCaptureAudit {
                     case "consumed_row" -> {
                         if (!returned.contains(app))
                             throw new IOException("Consumed row before request return");
-                        consumed.computeIfAbsent(app, k -> new ArrayList<>()).add(e);
+                        consumed.computeIfAbsent(app, k -> new Consumed()).add(e);
                     }
                     case "commit" -> {
                         if (!returned.contains(app))
@@ -101,9 +106,6 @@ public final class RequestCaptureAudit {
                 finished = new HashSet<>(),
                 executed = new HashSet<>(),
                 writeRequests = new HashSet<>();
-        Map<String, List<JsonArray>> serverResults = new HashMap<>();
-        // Row hashes from each top-level return, in result order.
-        Map<String, List<String>> serverHashes = new HashMap<>();
         long commits = 0, aborts = 0, indexEvents = 0, unmatched = 0;
         boolean serverTransactionOpen = false;
         try (var input = ServerTrace.open(pg)) {
@@ -120,7 +122,7 @@ public final class RequestCaptureAudit {
                 if (e.get("pid").getAsInt() != backendPid)
                     throw new IOException("Backend PID differs from JDBC connection");
                 String app = e.get("application").getAsString();
-                JsonObject request = requests.get(app);
+                Request request = requests.get(app);
                 if (request == null) {
                     unmatched++;
                     continue;
@@ -129,7 +131,7 @@ public final class RequestCaptureAudit {
                     serverTransactionOpen = true;
                     if (!started.add(app))
                         throw new IOException("Multiple executions for one request");
-                    String sql = request.get("sql").getAsString();
+                    String sql = request.sql();
                     StringBuilder expanded = new StringBuilder();
                     int bind = 0;
                     // Known HyBench templates have no question marks in literals.
@@ -151,14 +153,14 @@ public final class RequestCaptureAudit {
                             || e.get("returned").getAsLong() != e.getAsJsonArray("row_hashes").size())
                         throw new IOException("Executor return lacks its complete result hashes");
                     if (e.get("depth").getAsInt() <= 1) {
-                        var hashes = serverHashes.computeIfAbsent(app, k -> new ArrayList<>());
-                        for (JsonElement hash : e.getAsJsonArray("row_hashes"))
-                            hashes.add(hash.getAsString());
+                        Consumed rows = consumed.get(app);
+                        if (rows != null)
+                            for (JsonElement hash : e.getAsJsonArray("row_hashes"))
+                                rows.checkHash(app, hash.getAsString());
                     }
                 } else if (event.equals("result_row")) {
-                    serverResults
-                            .computeIfAbsent(app, k -> new ArrayList<>())
-                            .add(e.getAsJsonArray("values"));
+                    Consumed rows = consumed.get(app);
+                    if (rows != null) rows.checkValues(app, e.getAsJsonArray("values"));
                 } else if (event.equals("transaction_commit")) {
                     commits++;
                     serverCommitRequests.merge(app, 1L, Long::sum);
@@ -172,15 +174,10 @@ public final class RequestCaptureAudit {
                     serverTransactionOpen = false;
                 }
                 if (event.equals("scan_rescan") && bindings && !isPlannerProbe(e)) {
-                    List<String> bound =
-                            request.getAsJsonObject("parameters").entrySet().stream()
-                                    .filter(p -> !p.getValue().isJsonNull())
-                                    .map(p -> p.getValue().getAsString())
-                                    .toList();
                     for (JsonElement item : e.getAsJsonArray("keys")) {
                         JsonObject key = item.getAsJsonObject();
                         if (key.get("value").isJsonNull()) continue;
-                        if (!bound.contains(key.get("value").getAsString()))
+                        if (!request.bound().contains(key.get("value").getAsString()))
                             throw new IOException(
                                     "Runtime search key is not a bound template value");
                     }
@@ -244,54 +241,10 @@ public final class RequestCaptureAudit {
                     "Server abort is not associated with an open transaction at close");
         long checkedRows = 0;
         for (var request : consumed.entrySet()) {
-            List<JsonArray> server = serverResults.getOrDefault(request.getKey(), List.of());
-            List<String> hashes = serverHashes.getOrDefault(request.getKey(), List.of());
-            int consumedRows = request.getValue().size();
-            if (consumedRows > Math.max(server.size(), hashes.size()))
+            Consumed rows = request.getValue();
+            if (rows.hashesChecked < rows.size)
                 throw new IOException("Client consumed uncaptured row: " + request.getKey());
-            for (int i = 0; i < consumedRows; i++) {
-                JsonObject client = request.getValue().get(i);
-                boolean hashed = i < hashes.size();
-                if (hashed && !hashes.get(i).equals(clientHash(client)))
-                    throw new IOException(
-                            "Client result differs from same-execution server result: "
-                                    + request.getKey()
-                                    + " row="
-                                    + (i + 1)
-                                    + " server_hash="
-                                    + hashes.get(i));
-                boolean valued = i < server.size() && client.has("column_types");
-                if (!hashed)
-                    throw new IOException("Client row has no recorded server hash: " + request.getKey());
-                if (!valued) {
-                    checkedRows++;
-                    continue;
-                }
-                for (int j = 0; j < server.get(i).size(); j++) {
-                    JsonElement expected = server.get(i).get(j),
-                            actual = client.get(Integer.toString(j + 1));
-                    boolean same = Objects.equals(expected, actual);
-                    if (!same)
-                        same =
-                                equalResult(
-                                        expected,
-                                        actual,
-                                        client.getAsJsonObject("column_types")
-                                                .get(Integer.toString(j + 1))
-                                                .getAsInt());
-                    if (!same)
-                        throw new IOException(
-                                "Client result differs from same-execution server result: "
-                                        + request.getKey()
-                                        + " column="
-                                        + (j + 1)
-                                        + " server="
-                                        + expected
-                                        + " client="
-                                        + actual);
-                }
-                checkedRows++;
-            }
+            checkedRows += rows.size;
         }
         var report = new LinkedHashMap<String, Object>();
         // The two tolerances, named so a run's report shows them instead of hiding them.
@@ -320,6 +273,61 @@ public final class RequestCaptureAudit {
         report.put("executor_returns", executed.size());
         report.put("executor_cleanup_events", finished.size());
         return report;
+    }
+
+    private record Request(String sql, List<String> bound) {}
+
+    /** Exact 64-bit row hashes; summary captures retain no per-row JSON or server-side copies. */
+    private static final class Consumed {
+        private long[] hashes = new long[4];
+        private int size;
+        private long hashesChecked, valuesChecked;
+        private Map<Integer, JsonObject> detailed;
+
+        void add(JsonObject client) throws IOException {
+            long hash = hashBits(clientHash(client));
+            if (size == hashes.length) hashes = Arrays.copyOf(hashes, Math.multiplyExact(size, 2));
+            hashes[size] = hash;
+            if (client.has("column_types")) {
+                if (detailed == null) detailed = new HashMap<>();
+                detailed.put(size, client);
+            }
+            size++;
+        }
+
+        void checkHash(String request, String hash) throws IOException {
+            if (hashesChecked < size && hashes[(int) hashesChecked] != hashBits(hash))
+                throw new IOException("Client result differs from same-execution server result: "
+                        + request + " row=" + (hashesChecked + 1) + " server_hash=" + hash);
+            hashesChecked++;
+        }
+
+        void checkValues(String request, JsonArray server) throws IOException {
+            JsonObject client = detailed == null || valuesChecked >= size
+                    ? null : detailed.remove((int) valuesChecked);
+            valuesChecked++;
+            if (client == null) return;
+            for (int j = 0; j < server.size(); j++) {
+                JsonElement expected = server.get(j), actual = client.get(Integer.toString(j + 1));
+                if (!Objects.equals(expected, actual)
+                        && !equalResult(expected, actual,
+                                client.getAsJsonObject("column_types")
+                                        .get(Integer.toString(j + 1)).getAsInt()))
+                    throw new IOException("Client result differs from same-execution server result: "
+                            + request + " column=" + (j + 1)
+                            + " server=" + expected + " client=" + actual);
+            }
+        }
+
+        private static long hashBits(String hash) throws IOException {
+            if (hash.length() != 16) throw new IOException("Invalid recorded row hash: " + hash);
+            for (int i = 0; i < hash.length(); i++) {
+                char c = hash.charAt(i);
+                if (!(c >= '0' && c <= '9' || c >= 'a' && c <= 'f'))
+                    throw new IOException("Invalid recorded row hash: " + hash);
+            }
+            return Long.parseUnsignedLong(hash, 16);
+        }
     }
 
     /**

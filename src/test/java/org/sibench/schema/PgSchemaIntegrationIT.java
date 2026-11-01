@@ -217,10 +217,6 @@ public class PgSchemaIntegrationIT {
                         "ALTER TABLE customer ADD CONSTRAINT age_check CHECK(age>0)",
                         "unexpected constraints"),
                 new Mutation(
-                        "unlogged-table",
-                        "ALTER TABLE customer SET UNLOGGED",
-                        "ordinary persistent"),
-                new Mutation(
                         "row-security",
                         "ALTER TABLE customer ENABLE ROW LEVEL SECURITY",
                         "inheritance/RLS"),

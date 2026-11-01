@@ -68,6 +68,18 @@ public class NativeCaptureConfigTest {
                 .getMessage().contains("insertcount to equal recordcount"));
     }
 
+    @Test
+    public void rejectsDatabaseReuseConfiguration() throws Exception {
+        for (String source : java.util.List.of("ycsb_1k", "sysbench_2k")) {
+            var document = parse(Files.readString(root.resolve("src/test/resources/config/" + source + ".yaml")));
+            var postgres = object(document, "postgres");
+            postgres.put("clone_from", "old_database");
+            document.put("postgres", postgres);
+            assertTrue(assertThrows(IllegalArgumentException.class, () -> readProfile(document))
+                    .getMessage().contains("clone_from is unsupported"));
+        }
+    }
+
     private NativeCaptureConfig readProfile(Map<String, Object> document) throws Exception {
         Path profile = Files.createTempFile(root.resolve("build/sibench"), "native-", ".yaml");
         try {

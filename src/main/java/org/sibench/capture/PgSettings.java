@@ -10,7 +10,7 @@ import java.util.TreeMap;
 /**
  * The capture server's effective non-default parameters. Every one is recorded with the run; the
  * subset that can change a query plan, and with it the index accesses a workload performs, is part
- * of the build identity, so a certification never vouches for a capture planned differently.
+ * of the build identity, so comparisons identify captures planned differently.
  * Parameters that only change speed (memory, WAL, checkpoint, durability) are recorded alone.
  */
 final class PgSettings {

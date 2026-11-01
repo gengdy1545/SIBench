@@ -9,9 +9,8 @@ import java.util.Map;
 
 /**
  * The code a capture ran: the SIBench jar (the run's immutable copy, which also compiles it), the
- * instrumented PostgreSQL server and the row-capture trigger library. A certification holds only
- * for captures whose build is identical, so a capture run from unpackaged classes has no
- * identity and can never be certified or rely on one.
+ * instrumented PostgreSQL server and the row-capture trigger library. Unpackaged test classes
+ * have no JAR identity; production captures record their immutable run JAR.
  */
 final class CaptureBuild {
     static final String POSTGRES = "build/services/postgresql-capture/runtime/bin/postgres";
@@ -43,11 +42,4 @@ final class CaptureBuild {
         }
     }
 
-    /** A build that names every part: the jar and the server. */
-    static boolean complete(Map<?, ?> build) {
-        return build != null && build.containsKey("sibench_jar_sha256")
-                && build.containsKey("postgres_sha256")
-                && build.get("native_client") instanceof Map<?, ?> client
-                && client.get("artifacts") instanceof Map<?, ?> artifacts && !artifacts.isEmpty();
-    }
 }

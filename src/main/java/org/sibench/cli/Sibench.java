@@ -84,12 +84,12 @@ public final class Sibench {
                             "validate-snapshots",
                             "check-schema",
                             "audit-rows",
+                            "audit-baseline",
                             "access-ledger",
                             "compare-ledgers",
                             "snapshot-index-counters",
                             "check-capture-completeness",
                             "compile-trace",
-                            "certify-capture",
                             "validate-replay-matrix",
                             "check-relocation",
                             "index-server",
@@ -104,7 +104,7 @@ public final class Sibench {
             Path root = Path.of("").toAbsolutePath();
             List<String> profiles = new ArrayList<>();
             boolean dryRun = false;
-            String jdbc = null, user = null, reference = null, certification = null;
+            String jdbc = null, user = null, reference = null;
             String countersBefore = null, countersAfter = null;
             for (int i = 1; i < args.length; i++) {
                 if (args[i].equals("--help") || args[i].equals("-h")) {
@@ -112,22 +112,18 @@ public final class Sibench {
                     return 0;
                 } else if (args[i].equals("--dry-run") && args[0].equals("prepare")) {
                     dryRun = true;
-                } else if (List.of("check-schema", "audit-rows", "snapshot-index-counters")
+                } else if (List.of("check-schema", "audit-rows", "audit-baseline", "snapshot-index-counters")
                                 .contains(args[0])
                         && args[i].equals("--jdbc")) {
                     if (++i == args.length)
                         throw new IllegalArgumentException("--jdbc requires a URL");
                     jdbc = args[i];
-                } else if (List.of("check-schema", "audit-rows", "snapshot-index-counters")
+                } else if (List.of("check-schema", "audit-rows", "audit-baseline", "snapshot-index-counters")
                                 .contains(args[0])
                         && args[i].equals("--user")) {
                     if (++i == args.length)
                         throw new IllegalArgumentException("--user requires a role");
                     user = args[i];
-                } else if (args[0].equals("compile-trace") && args[i].equals("--certification")) {
-                    if (++i == args.length)
-                        throw new IllegalArgumentException("--certification requires a certificate");
-                    certification = args[i];
                 } else if (args[0].equals("compile-trace") && args[i].equals("--counters")) {
                     if (i + 2 >= args.length)
                         throw new IllegalArgumentException("--counters requires BEFORE AFTER snapshots");
@@ -154,6 +150,14 @@ public final class Sibench {
                 }
             }
             root = root.toRealPath();
+            if (args[0].equals("audit-baseline")) {
+                if (profiles.size() != 2 || jdbc == null || user == null || !jdbc.startsWith("jdbc:postgresql:"))
+                    throw new IllegalArgumentException("audit-baseline requires PROFILE BASELINE --jdbc URL --user ROLE");
+                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
+                org.sibench.capture.PgBaselineVerify.verify(jdbc, user, SourceSchema.read(root, document), root.resolve(profiles.get(1)));
+                out.println(Files.readString(root.resolve(profiles.get(1)).resolve("verified-manifest.json")));
+                return 0;
+            }
             if (args[0].equals("audit-rows")) {
                 if ((profiles.size() != 3 && profiles.size() != 4) || jdbc == null || user == null)
                     throw new IllegalArgumentException(
@@ -278,12 +282,10 @@ public final class Sibench {
             if (args[0].equals("compile-trace")) {
                 if (profiles.size() != 2 && profiles.size() != 3)
                     throw new IllegalArgumentException(
-                            "compile-trace requires PROFILE OUTPUT [ROW_AUDIT] [--certification"
-                                + " CERTIFICATE] [--counters BEFORE AFTER]");
+                            "compile-trace requires PROFILE OUTPUT [ROW_AUDIT] [--counters BEFORE AFTER]");
                 var checks =
                         new IndexTraceCompiler.Checks(
                                 profiles.size() == 3 ? root.resolve(profiles.get(2)) : null,
-                                certification == null ? null : root.resolve(certification),
                                 countersBefore == null ? null : root.resolve(countersBefore),
                                 countersAfter == null ? null : root.resolve(countersAfter));
                 var report =
@@ -308,17 +310,6 @@ public final class Sibench {
                                 "verification",
                                 "capture_completeness"))
                     summary.put(key, report.get(key));
-                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(summary));
-                return 0;
-            }
-            if (args[0].equals("certify-capture")) {
-                if (profiles.size() != 1)
-                    throw new IllegalArgumentException("certify-capture requires PROFILE");
-                var report =
-                        org.sibench.capture.Certification.certify(
-                                org.sibench.capture.CaptureProfile.read(root, Path.of(profiles.get(0))));
-                var summary = new LinkedHashMap<String, Object>(report);
-                summary.remove("coverage");
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(summary));
                 return 0;
             }
@@ -548,18 +539,15 @@ public final class Sibench {
                     + " deltas of two snapshots; it never touches PG and exits 1 when they disagree.");
         out.println(
                 "       java -jar build/sibench/sibench.jar compile-trace [--root PATH]"
-                        + " PROFILE OUTPUT [ROW_AUDIT] [--certification CERTIFICATE]"
+                        + " PROFILE OUTPUT [ROW_AUDIT]"
                         + " [--counters BEFORE AFTER]");
         out.println(
                 "compile-trace turns a completed capture into baseline/workload traces and its access"
                         + " ledger in one pass; any access it cannot project fails the compilation."
-                        + " --counters requires the ledger to match PG's index counters;"
-                        + " --certification replaces the row audit by a certified build's coverage.");
-        out.println(
-                "       java -jar build/sibench/sibench.jar certify-capture [--root PATH] PROFILE");
-        out.println(
-                "certify-capture writes ARTIFACTS/certification.json for a compiled capture whose row"
-                        + " audit and counter check passed.");
+                        + " --counters requires the ledger to match PG's index counters.");
+        out.println("       java -jar build/sibench/sibench.jar audit-baseline [--root PATH]"
+                + " PROFILE BASELINE --jdbc URL --user ROLE");
+        out.println("audit-baseline independently compares Parquet values with the unchanged initial PostgreSQL database.");
         out.println(
                 "       java -jar build/sibench/sibench.jar validate-replay-matrix [--root PATH]"
                         + " TRACE_DIRECTORY OUTPUT_DIRECTORY");

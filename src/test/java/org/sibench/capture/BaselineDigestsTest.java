@@ -13,21 +13,16 @@ import java.nio.file.attribute.FileTime;
 public class BaselineDigestsTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
-    /** A record holds across processes and hard links, and not for a file that changed. */
+    /** A record holds across processes, and not for a file that changed. */
     @Test
     public void aRecordNamesFilesAsTheyAre() throws Exception {
         Path a = Files.createDirectory(temporary.getRoot().toPath().resolve("a"));
-        Path b = Files.createDirectory(temporary.getRoot().toPath().resolve("b"));
         Path file = Files.writeString(a.resolve("1.parquet"), "one");
         var digests = BaselineDigests.of(a);
         assertNull(digests.get(file));
         digests.put(file, "d1");
         digests.save();
         assertEquals("d1", BaselineDigests.of(a).get(file));
-        Path link = Files.createLink(b.resolve("1.parquet"), file);
-        assertNull(BaselineDigests.of(b).get(link));
-        BaselineDigests.merge(a, b);
-        assertEquals("d1", BaselineDigests.of(b).get(link));
         Files.writeString(file, "two!");
         assertNull(BaselineDigests.of(a).get(file));
         Files.writeString(file, "one");

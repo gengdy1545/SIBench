@@ -1,9 +1,6 @@
 package org.sibench.capture;
 
-import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 
 import org.sibench.schema.SourceSchema;
 import org.sibench.config.ConfigValues;
@@ -19,31 +16,15 @@ import java.sql.Statement;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/**
- * The still database a capture starts from, kept in a PostgreSQL cluster of its own that is
- * stopped between captures ({@code build/services/postgresql-still/<clone_from>}). It is built once:
- * the benchmark's own load, then everything a capture needs before it runs (HyBench's upstream
- * secondary indexes, the row-capture triggers, {@code VACUUM (ANALYZE)}). Each capture runs on a
- * reflink copy of the stopped cluster, which takes no time and shares every block the capture
- * does not change, and is deleted afterwards; the still cluster itself is never written again.
- *
- * <p>Statistics are therefore taken once per still database, so every capture of it plans from the
- * same statistics. A still database of a native client source records the parameters it was
- * loaded with, and a profile whose load parameters differ cannot clone it.
- */
-final class StillBase {
-    static final String DIRECTORY = "build/services/postgresql-still";
+/** Loads one disposable database through the benchmark's native client. */
+final class NativeLoad {
     static final String LIBRARY = "build/services/postgresql-capture/row_capture.so";
 
-    private StillBase() {}
+    private NativeLoad() {}
 
-    static Path directory(Path root, String base) {
-        return root.resolve(DIRECTORY).resolve(base);
-    }
-
-    /** What the still database holds and how it was produced. */
-    static Path manifest(Path root, String base) {
-        return directory(root, base).resolve("base.json");
+    /** The input identity and actual row counts retained after the database is removed. */
+    static Path manifest(Path artifacts) {
+        return artifacts.resolve("native/load.json");
     }
 
     static Path library(Path root) {
@@ -51,6 +32,28 @@ final class StillBase {
         if (!Files.isRegularFile(library))
             throw new IllegalStateException("Row capture library is not built: " + library);
         return library;
+    }
+
+    /** Native loaders create their own tables; change persistence while those tables are empty. */
+    static void unloggedTables(Connection connection) throws Exception {
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("""
+                    CREATE FUNCTION public.sibench_unlogged_tables() RETURNS event_trigger
+                    LANGUAGE plpgsql AS $$
+                    DECLARE command record;
+                    BEGIN
+                      FOR command IN
+                        SELECT d.object_identity FROM pg_event_trigger_ddl_commands() d
+                        JOIN pg_class c ON d.classid = 'pg_class'::regclass AND d.objid = c.oid
+                        WHERE d.schema_name = 'public' AND c.relkind = 'r' AND c.relpersistence = 'p'
+                      LOOP
+                        EXECUTE 'ALTER TABLE ' || command.object_identity || ' SET UNLOGGED';
+                      END LOOP;
+                    END $$
+                    """);
+            statement.execute("CREATE EVENT TRIGGER sibench_unlogged_tables ON ddl_command_end"
+                    + " WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION public.sibench_unlogged_tables()");
+        }
     }
 
     /**
@@ -62,6 +65,13 @@ final class StillBase {
         long started = System.nanoTime();
         try (Connection connection = DriverManager.getConnection(jdbc, user, password());
                 Statement statement = connection.createStatement()) {
+            statement.execute("DROP EVENT TRIGGER sibench_unlogged_tables");
+            statement.execute("DROP FUNCTION public.sibench_unlogged_tables()");
+            try (ResultSet rows = statement.executeQuery(
+                    "SELECT relname FROM pg_class WHERE relnamespace = 'public'::regnamespace"
+                            + " AND relkind = 'r' AND relpersistence <> 'u'")) {
+                if (rows.next()) throw new IllegalStateException("Native table is not unlogged: " + rows.getString(1));
+            }
             statement.execute(
                     "CREATE FUNCTION public.sibench_row_capture() RETURNS trigger AS '"
                             + library.toString().replace("'", "''")
@@ -71,14 +81,14 @@ final class StillBase {
                         "CREATE TRIGGER sibench_row_capture AFTER INSERT OR UPDATE OR DELETE ON \""
                                 + table.name()
                                 + "\" FOR EACH ROW EXECUTE FUNCTION public.sibench_row_capture()");
-            RunTiming.current().note("base_triggers_millis", (System.nanoTime() - started) / 1_000_000L);
+            RunTiming.current().note("load_triggers_millis", (System.nanoTime() - started) / 1_000_000L);
             long vacuumStarted = System.nanoTime();
             statement.execute("VACUUM (ANALYZE)");
-            RunTiming.current().note("base_vacuum_analyze_millis", (System.nanoTime() - vacuumStarted) / 1_000_000L);
+            RunTiming.current().note("load_vacuum_analyze_millis", (System.nanoTime() - vacuumStarted) / 1_000_000L);
         }
     }
 
-    /** Rows of every source table, as the still database holds them. */
+    /** Rows of every source table, after native loading. */
     static Map<String, Long> rows(String jdbc, String user, SourceSchema schema) throws Exception {
         var result = new LinkedHashMap<String, Long>();
         try (Connection connection = DriverManager.getConnection(jdbc, user, password());
@@ -99,64 +109,44 @@ final class StillBase {
             throw new IOException("YCSB load left a different row count in PG: " + rows);
     }
 
-    /** Loads a YCSB or sysbench still database with the benchmark's own client, once. */
+    /** Loads YCSB or sysbench into this run's database with the benchmark's own client. */
     static void build(NativeCaptureConfig config) throws Exception {
-        String base = config.cloneFrom();
-        Path manifest = manifest(config.root(), base);
-        if (Files.exists(manifest)) throw new IllegalStateException("Still database already built: " + manifest);
+        String database = config.database();
+        Path manifest = manifest(config.artifacts());
+        if (Files.exists(manifest)) throw new IllegalStateException("Native load already recorded: " + manifest);
         Path library = library(config.root());
         // Fail before any database exists when the native client is not the pinned build.
         if (config.benchmark().equals("ycsb")) YcsbNativeRun.libraries(config);
         else SysbenchNativeRun.binary(config);
-        var still = config.withDatabase(base);
-        Path logs = Files.createDirectories(directory(config.root(), base).resolve("load"));
+        Path logs = Files.createDirectories(config.artifacts().resolve("native/load"));
         long started = System.nanoTime();
         try (Connection admin = DriverManager.getConnection(config.adminJdbc(), config.user(), password());
                 Statement statement = admin.createStatement()) {
-            statement.execute("CREATE DATABASE " + base + " LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0");
+            statement.execute("CREATE DATABASE " + database + " LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0");
+        }
+        try (Connection connection = DriverManager.getConnection(config.jdbc(), config.user(), password())) {
+            unloggedTables(connection);
         }
         long loadStarted = System.nanoTime();
-        if (config.benchmark().equals("ycsb")) YcsbNativeRun.load(still, logs);
-        else SysbenchNativeRun.prepare(still, logs);
-        RunTiming.current().note("base_native_load_millis", (System.nanoTime() - loadStarted) / 1_000_000L);
+        if (config.benchmark().equals("ycsb")) YcsbNativeRun.load(config, logs);
+        else SysbenchNativeRun.prepare(config, logs);
+        RunTiming.current().note("load_native_load_millis", (System.nanoTime() - loadStarted) / 1_000_000L);
         var schema = SourceSchema.read(config.root(), config.document());
-        captureReady(still.jdbc(), config.user(), library, schema);
+        captureReady(config.jdbc(), config.user(), library, schema);
         var report = new LinkedHashMap<String, Object>();
         report.put("benchmark", config.benchmark());
-        report.put("database", base);
+        report.put("database", database);
+        report.put("table_persistence", "unlogged");
         report.put("source_commit", string(config.document(), "source", "commit"));
-        report.put("load", config.loadConfig());
+        report.put("native", config.nativeConfig());
         long countStarted = System.nanoTime();
-        var loadedRows = rows(still.jdbc(), config.user(), schema);
-        requireRows(still, loadedRows);
-        RunTiming.current().note("base_final_count_millis", (System.nanoTime() - countStarted) / 1_000_000L);
+        var loadedRows = rows(config.jdbc(), config.user(), schema);
+        requireRows(config, loadedRows);
+        RunTiming.current().note("load_final_count_millis", (System.nanoTime() - countStarted) / 1_000_000L);
         report.put("loaded_rows", loadedRows);
         report.put("load_seconds", (System.nanoTime() - started) / 1e9);
         Files.writeString(manifest, new GsonBuilder().setPrettyPrinting().create().toJson(report), StandardOpenOption.CREATE_NEW);
-        System.out.println(config.benchmark() + " still database " + base + ": " + report.get("loaded_rows"));
-    }
-
-    /**
-     * Turns this capture's clone of the still database into the capture database: it is renamed to
-     * the profile's database, after checking that the still database is the one the profile names
-     * and, for a native client source, that it was loaded with the profile's parameters.
-     */
-    static JsonObject attach(Path root, String adminJdbc, String user, String base, String database, Map<String, Object> load)
-            throws Exception {
-        Path manifest = manifest(root, base);
-        if (!Files.exists(manifest)) throw new IllegalStateException("Still database has no manifest: " + manifest);
-        JsonObject value = JsonParser.parseString(Files.readString(manifest)).getAsJsonObject();
-        if (!value.get("database").getAsString().equals(base))
-            throw new IllegalStateException("Still manifest names another database: " + manifest);
-        if (load != null && !new Gson().toJsonTree(new java.util.TreeMap<>(load)).equals(value.get("load")))
-            throw new IllegalStateException(
-                    "The profile's load parameters differ from those the still database " + base
-                            + " was loaded with; name another postgres.clone_from to build a new one");
-        try (Connection admin = DriverManager.getConnection(adminJdbc, user, password());
-                Statement statement = admin.createStatement()) {
-            statement.execute("ALTER DATABASE " + base + " RENAME TO " + database);
-        }
-        return value;
+        System.out.println(config.benchmark() + " loaded database " + database + ": " + report.get("loaded_rows"));
     }
 
     private static String string(Map<String, Object> document, String object, String field) {
