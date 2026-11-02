@@ -137,6 +137,8 @@ python3 -m unittest discover -s src/test/python -p 'test_*.py'
 bash -n scripts/native-capture.sh
 bash -n scripts/build-benchmarks.sh
 bash -n scripts/build-rocksdb-cloud.sh
+bash -n scripts/build-tidb-capture.sh
+bash -n scripts/tidb-capture-cluster.sh
 ```
 
 Run standalone native measurement tests for the cloud JNI with `make -C src/main/native/index/rocksdb_cloud test`. They require the cloud backend build above and the same build dependencies, and do not connect to cloud services.
@@ -166,3 +168,17 @@ python3 src/test/python/native_capture_it.py \
 The current [Trace](docs/trace.md) and [Index Service](docs/index-service.md) support fixed source layouts and reject additional index types, dynamic DDL, and primary-key value UPDATEs. YCSB has no secondary indexes; standard sysbench scripts do not query by k; HyBench does not run freshness DELETE by default. The default data-file target is 512 MiB. Layout changes require rebuilding the corresponding physical inputs.
 
 Data-file Rewrite, physical version GC, resumable segmented compilation, and automatic recovery of writes with unknown outcomes are not implemented. Default tests and short inputs do not establish sustained saturation capacity, support for huge query groups, crash recovery at the target scale, power-loss durability, or backend performance rankings.
+
+## Experimental TiDB capture
+
+A proof of concept that captures storage-level index reads and index maintenance from TiDB v8.5.8 / TiKV v8.5.8 (TiKV row store only) and converts them to canonical index operations. It is not a production source: HyBench, TiFlash, unique or composite indexes, non-clustered primary keys, and non-integer/non-text key columns are unsupported, and the conversion is not yet compiled into a full Trace directory with Parquet baselines.
+
+```bash
+scripts/build-tidb-capture.sh        # pinned sources + src/main/native/tidb/*.patch -> build/capture/tidb-v8.5.8
+RUN=/data/run PD_HOST=h1 TIKV_HOSTS="h2 h3 h4" TIDB_HOSTS="h1 h5" CAPTURE=1 \
+  scripts/tidb-capture-cluster.sh start TAG          # writes RUN/capture/{tidbN,tikv}-TAG.jsonl
+python3 scripts/tidb_capture_schema.py --host HOST:4000 --db DB --out schema.json
+java -jar build/sibench/sibench.jar convert-tidb-capture CAPTURE_DIR schema.json BASELINE_TS OUTPUT
+```
+
+Every host needs `RUN/bin` (tidb-server, tikv-server-capture, official pd-server) and `RUN/conf/{tidb,tikv}.toml`; the TiDB coprocessor cache must be disabled (`[tikv-client.copr-cache] capacity-mb = 0`), because a cache hit is answered without a TiKV read. The baseline is a read-only transaction whose start_ts is `BASELINE_TS` and that scans every record and index space of the captured tables. The converter rejects reads it cannot express (for example an autocommit point-get miss read at TiDB's maximum timestamp, or a range bound between entries of one indexed value) and checks every converted read against an independent MVCC model; the report's `status` is `consistent` only with no rejection and no mismatch. `src/test/python/tidb_capture_cases.py` drives the controlled semantic cases against two TiDB instances.

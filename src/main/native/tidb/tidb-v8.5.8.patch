@@ -1,0 +1,569 @@
+diff --git a/pkg/distsql/distsql.go b/pkg/distsql/distsql.go
+index 55613ffa05..63dd13a919 100644
+--- a/pkg/distsql/distsql.go
++++ b/pkg/distsql/distsql.go
+@@ -15,6 +15,7 @@
+ package distsql
+ 
+ import (
++	"github.com/pingcap/tidb/pkg/sibenchcapture"
+ 	"context"
+ 	"fmt"
+ 	"strconv"
+@@ -64,6 +65,11 @@ func Select(ctx context.Context, dctx *distsqlctx.DistSQLContext, kvReq *kv.Requ
+ 		hook.(func(*kv.Request))(kvReq)
+ 	}
+ 
++	if sibenchcapture.Enabled() {
++		sibenchcapture.Emit("cop", "task", kvReq.TaskID, "start_ts", kvReq.StartTs, "tp", kvReq.Tp,
++			"ranges", sibenchcapture.Ranges(kvReq.KeyRanges.AppendSelfTo(nil)), "keep_order", kvReq.KeepOrder,
++			"desc", kvReq.Desc, "paging", kvReq.Paging.Enable, "store", kvReq.StoreType.Name())
++	}
+ 	enabledRateLimitAction := dctx.EnabledRateLimitAction
+ 	originalSQL := dctx.OriginalSQL
+ 	eventCb := func(event trxevents.TransactionEvent) {
+diff --git a/pkg/executor/adapter.go b/pkg/executor/adapter.go
+index a86f1955d8..4cc36ea7b8 100644
+--- a/pkg/executor/adapter.go
++++ b/pkg/executor/adapter.go
+@@ -15,6 +15,7 @@
+ package executor
+ 
+ import (
++	"github.com/pingcap/tidb/pkg/sibenchcapture"
+ 	"context"
+ 	"fmt"
+ 	"math"
+@@ -499,6 +500,13 @@ func IsFastPlan(p base.Plan) bool {
+ // like the INSERT, UPDATE statements, it executes in this function. If the Executor returns
+ // result, execution is done after this function returns, in the returned sqlexec.RecordSet Next method.
+ func (a *ExecStmt) Exec(ctx context.Context) (_ sqlexec.RecordSet, err error) {
++	if sibenchcapture.Enabled() && !a.Ctx.GetSessionVars().InRestrictedSQL {
++		vars := a.Ctx.GetSessionVars()
++		sibenchcapture.SetTask(vars.ConnectionID, vars.StmtCtx.TaskID)
++		sibenchcapture.Emit("stmt_begin", "conn", vars.ConnectionID, "task", vars.StmtCtx.TaskID,
++			"in_txn", vars.InTxn(), "autocommit", vars.IsAutocommit(), "pessimistic", vars.TxnCtx.IsPessimistic,
++			"iso", vars.TxnCtx.Isolation, "sql", vars.StmtCtx.OriginalSQL, "plan", plannercore.ToString(a.Plan))
++	}
+ 	defer func() {
+ 		r := recover()
+ 		if r == nil {
+@@ -1359,8 +1367,15 @@ func (a *ExecStmt) handlePessimisticLockError(ctx context.Context, lockErr error
+ 	}
+ 	// Rollback the statement change before retry it.
+ 	a.Ctx.StmtRollback(ctx, true)
++	oldTask := a.Ctx.GetSessionVars().StmtCtx.TaskID
+ 	a.Ctx.GetSessionVars().StmtCtx.ResetForRetry()
+ 	a.Ctx.GetSessionVars().RetryInfo.ResetOffset()
++	if sibenchcapture.Enabled() {
++		vars := a.Ctx.GetSessionVars()
++		sibenchcapture.SetTask(vars.ConnectionID, vars.StmtCtx.TaskID)
++		sibenchcapture.Emit("stmt_retry", "conn", vars.ConnectionID, "old_task", oldTask, "task", vars.StmtCtx.TaskID,
++			"for_update_ts", vars.TxnCtx.GetForUpdateTS(), "err", lockErr.Error())
++	}
+ 
+ 	failpoint.Inject("assertTxnManagerAfterPessimisticLockErrorRetry", func() {
+ 		sessiontxn.RecordAssert(a.Ctx, "assertTxnManagerAfterPessimisticLockErrorRetry", true)
+@@ -1565,6 +1580,16 @@ func (a *ExecStmt) observePhaseDurations(internal bool, commitDetails *util.Comm
+ // 5. reset `DurationParse` in session variable.
+ func (a *ExecStmt) FinishExecuteStmt(txnTS uint64, err error, hasMoreResults bool) {
+ 	a.checkPlanReplayerCapture(txnTS)
++	if sibenchcapture.Enabled() && !a.Ctx.GetSessionVars().InRestrictedSQL {
++		vars := a.Ctx.GetSessionVars()
++		errText := ""
++		if err != nil {
++			errText = err.Error()
++		}
++		sibenchcapture.Emit("stmt_end", "conn", vars.ConnectionID, "task", vars.StmtCtx.TaskID,
++			"txn_ts", txnTS, "for_update_ts", vars.TxnCtx.GetForUpdateTS(), "retries", a.retryCount,
++			"affected", vars.StmtCtx.AffectedRows(), "err", errText)
++	}
+ 
+ 	sessVars := a.Ctx.GetSessionVars()
+ 	execDetail := sessVars.StmtCtx.GetExecDetails()
+diff --git a/pkg/executor/batch_point_get.go b/pkg/executor/batch_point_get.go
+index 982f1d7211..9df614413c 100644
+--- a/pkg/executor/batch_point_get.go
++++ b/pkg/executor/batch_point_get.go
+@@ -15,6 +15,7 @@
+ package executor
+ 
+ import (
++	"github.com/pingcap/tidb/pkg/sibenchcapture"
+ 	"context"
+ 	"errors"
+ 	"fmt"
+@@ -311,6 +312,7 @@ func (e *BatchPointGetExec) initialize(ctx context.Context) error {
+ 		if err != nil {
+ 			return err
+ 		}
++		e.sibenchBatchResult(toFetchIndexKeys, handleVals)
+ 
+ 		e.handles = make([]kv.Handle, 0, len(toFetchIndexKeys))
+ 		if e.tblInfo.Partition != nil {
+@@ -437,6 +439,7 @@ func (e *BatchPointGetExec) initialize(ctx context.Context) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	e.sibenchBatchResult(keys, values)
+ 	handles := make([]kv.Handle, 0, len(values))
+ 	var existKeys []kv.Key
+ 	if e.lock && rc {
+@@ -579,3 +582,18 @@ func (b *cacheBatchGetter) BatchGet(ctx context.Context, keys []kv.Key, options
+ func newCacheBatchGetter(ctx sessionctx.Context, tid int64, snapshot kv.Snapshot) *cacheBatchGetter {
+ 	return &cacheBatchGetter{ctx, tid, snapshot}
+ }
++
++func (e *BatchPointGetExec) sibenchBatchResult(keys []kv.Key, values map[string]kv.ValueEntry) {
++	if !sibenchcapture.Enabled() {
++		return
++	}
++	found := make(map[string]any, len(values))
++	for k, v := range values {
++		found[sibenchcapture.Hex([]byte(k))] = sibenchcapture.Value(v.Value)
++	}
++	hexKeys := make([]string, len(keys))
++	for i, k := range keys {
++		hexKeys[i] = sibenchcapture.Hex(k)
++	}
++	sibenchcapture.Emit("batch_get_result", "task", e.Ctx().GetSessionVars().StmtCtx.TaskID, "keys", hexKeys, "found", found)
++}
+diff --git a/pkg/executor/point_get.go b/pkg/executor/point_get.go
+index 9731033ce1..61e1422352 100644
+--- a/pkg/executor/point_get.go
++++ b/pkg/executor/point_get.go
+@@ -15,6 +15,7 @@
+ package executor
+ 
+ import (
++	"github.com/pingcap/tidb/pkg/sibenchcapture"
+ 	"context"
+ 	"fmt"
+ 	"sort"
+@@ -657,6 +658,10 @@ func (e *PointGetExecutor) get(ctx context.Context, key kv.Key) ([]byte, error)
+ 		// different for pessimistic transaction.
+ 		val, err = kv.GetValue(ctx, e.txn.GetMemBuffer(), key)
+ 		if err == nil {
++			if sibenchcapture.Enabled() {
++				sibenchcapture.Emit("local_get", "task", e.Ctx().GetSessionVars().StmtCtx.TaskID, "key", sibenchcapture.Hex(key),
++					"src", "membuffer", "value", sibenchcapture.Value(val))
++			}
+ 			return val, err
+ 		}
+ 		if !kv.IsErrNotFound(err) {
+@@ -667,6 +672,10 @@ func (e *PointGetExecutor) get(ctx context.Context, key kv.Key) ([]byte, error)
+ 			var ok bool
+ 			val, ok = e.Ctx().GetSessionVars().TxnCtx.GetKeyInPessimisticLockCache(key)
+ 			if ok {
++				if sibenchcapture.Enabled() {
++					sibenchcapture.Emit("local_get", "task", e.Ctx().GetSessionVars().StmtCtx.TaskID, "key", sibenchcapture.Hex(key),
++						"src", "lock_cache", "value", sibenchcapture.Value(val))
++				}
+ 				return val, nil
+ 			}
+ 		}
+diff --git a/pkg/executor/select.go b/pkg/executor/select.go
+index d953a737fe..5e8cb87a99 100644
+--- a/pkg/executor/select.go
++++ b/pkg/executor/select.go
+@@ -15,6 +15,7 @@
+ package executor
+ 
+ import (
++	"github.com/pingcap/tidb/pkg/sibenchcapture"
+ 	"context"
+ 	stderrors "errors"
+ 	"runtime/pprof"
+@@ -415,6 +416,24 @@ func doLockKeys(ctx context.Context, se sessionctx.Context, lockCtx *tikvstore.L
+ 	var lockKeyStats *tikvutil.LockKeysDetails
+ 	ctx = context.WithValue(ctx, tikvutil.LockKeysDetailCtxKey, &lockKeyStats)
+ 	err = txn.LockKeys(tikvutil.SetSessionID(ctx, se.GetSessionVars().ConnectionID), lockCtx, keys...)
++	if sibenchcapture.Enabled() {
++		hexKeys := make([]string, len(keys))
++		for i, k := range keys {
++			hexKeys[i] = sibenchcapture.Hex(k)
++		}
++		values := make(map[string]any, len(lockCtx.Values))
++		for k, v := range lockCtx.Values {
++			values[sibenchcapture.Hex([]byte(k))] = map[string]any{"exists": v.Exists, "value": sibenchcapture.Value(v.Value),
++				"already_locked": v.AlreadyLocked, "conflict_ts": v.LockedWithConflictTS}
++		}
++		errText := ""
++		if err != nil {
++			errText = err.Error()
++		}
++		sibenchcapture.Emit("lock", "conn", sessVars.ConnectionID, "task", sctx.TaskID, "start_ts", txn.StartTS(),
++			"for_update_ts", lockCtx.ForUpdateTS, "keys", hexKeys, "return_values", lockCtx.ReturnValues,
++			"only_if_exists", lockCtx.LockOnlyIfExists, "values", values, "err", errText)
++	}
+ 	if lockKeyStats != nil {
+ 		sctx.MergeLockKeysExecDetails(lockKeyStats)
+ 	}
+diff --git a/pkg/executor/union_scan.go b/pkg/executor/union_scan.go
+index f367406f5c..d19c3d0333 100644
+--- a/pkg/executor/union_scan.go
++++ b/pkg/executor/union_scan.go
+@@ -15,6 +15,7 @@
+ package executor
+ 
+ import (
++	"github.com/pingcap/tidb/pkg/sibenchcapture"
+ 	"context"
+ 	"fmt"
+ 	"runtime/trace"
+@@ -73,6 +74,9 @@ type UnionScanExec struct {
+ 
+ // Open implements the Executor Open interface.
+ func (us *UnionScanExec) Open(ctx context.Context) error {
++	if sibenchcapture.Enabled() {
++		sibenchcapture.Emit("union_scan", "task", us.Ctx().GetSessionVars().StmtCtx.TaskID, "table", us.table.Meta().ID)
++	}
+ 	r, ctx := tracing.StartRegionEx(ctx, "UnionScanExec.Open")
+ 	defer r.End()
+ 
+diff --git a/pkg/session/session.go b/pkg/session/session.go
+index 77713784c3..0d0c019484 100644
+--- a/pkg/session/session.go
++++ b/pkg/session/session.go
+@@ -19,6 +19,7 @@
+ package session
+ 
+ import (
++	"github.com/pingcap/tidb/pkg/sibenchcapture"
+ 	"bytes"
+ 	"context"
+ 	"crypto/tls"
+@@ -930,7 +931,21 @@ func (s *session) CommitTxn(ctx context.Context) error {
+ 
+ 	var commitDetail *tikvutil.CommitDetails
+ 	ctx = context.WithValue(ctx, tikvutil.CommitDetailCtxKey, &commitDetail)
++	var sibenchStart uint64
++	sibenchReadOnly := true
++	if sibenchcapture.Enabled() && s.txn.Valid() && !s.sessionVars.InRestrictedSQL {
++		sibenchStart, sibenchReadOnly = s.txn.StartTS(), s.txn.IsReadOnly()
++		s.sessionVars.LastTxnInfo = ""
++	}
+ 	err := s.doCommitWithRetry(ctx)
++	if sibenchStart != 0 {
++		errText := ""
++		if err != nil {
++			errText = err.Error()
++		}
++		sibenchcapture.Emit("commit", "conn", s.sessionVars.ConnectionID, "start_ts", sibenchStart,
++			"read_only", sibenchReadOnly, "info", s.sessionVars.LastTxnInfo, "err", errText)
++	}
+ 	if commitDetail != nil {
+ 		s.sessionVars.StmtCtx.MergeExecDetails(nil, commitDetail)
+ 	}
+@@ -954,6 +969,10 @@ func (s *session) RollbackTxn(ctx context.Context) {
+ 	defer r.End()
+ 
+ 	if s.txn.Valid() {
++		if sibenchcapture.Enabled() && !s.sessionVars.InRestrictedSQL {
++			sibenchcapture.Emit("rollback", "conn", s.sessionVars.ConnectionID, "start_ts", s.txn.StartTS(),
++				"read_only", s.txn.IsReadOnly())
++		}
+ 		terror.Log(s.txn.Rollback())
+ 	}
+ 	if ctx.Value(inCloseSession{}) == nil {
+diff --git a/pkg/session/txn.go b/pkg/session/txn.go
+index 79aa131a86..3009651d2e 100644
+--- a/pkg/session/txn.go
++++ b/pkg/session/txn.go
+@@ -15,6 +15,7 @@
+ package session
+ 
+ import (
++	"github.com/pingcap/tidb/pkg/sibenchcapture"
+ 	"bytes"
+ 	"context"
+ 	"fmt"
+@@ -729,6 +730,10 @@ func (s *session) StmtCommit(ctx context.Context) {
+ 
+ // StmtRollback implements the sessionctx.Context interface.
+ func (s *session) StmtRollback(ctx context.Context, isForPessimisticRetry bool) {
++	if sibenchcapture.Enabled() && !s.sessionVars.InRestrictedSQL {
++		sibenchcapture.Emit("stmt_rollback", "conn", s.sessionVars.ConnectionID, "task", s.sessionVars.StmtCtx.TaskID,
++			"for_retry", isForPessimisticRetry)
++	}
+ 	txnManager := sessiontxn.GetTxnManager(s)
+ 	err := txnManager.OnStmtRollback(ctx, isForPessimisticRetry)
+ 	if err != nil {
+diff --git a/pkg/sessionctx/stmtctx/stmtctx.go b/pkg/sessionctx/stmtctx/stmtctx.go
+index 8defe19f0e..94d7db6396 100644
+--- a/pkg/sessionctx/stmtctx/stmtctx.go
++++ b/pkg/sessionctx/stmtctx/stmtctx.go
+@@ -15,6 +15,7 @@
+ package stmtctx
+ 
+ import (
++	"github.com/pingcap/tidb/pkg/sibenchcapture"
+ 	"bytes"
+ 	"context"
+ 	"fmt"
+@@ -55,7 +56,7 @@ import (
+ 	"golang.org/x/sync/singleflight"
+ )
+ 
+-var taskIDAlloc uint64
++var taskIDAlloc = sibenchcapture.TaskIDBase()
+ 
+ // AllocateTaskID allocates a new unique ID for a statement execution
+ func AllocateTaskID() uint64 {
+diff --git a/pkg/sibenchcapture/capture.go b/pkg/sibenchcapture/capture.go
+new file mode 100644
+index 0000000000..71904c0bb6
+--- /dev/null
++++ b/pkg/sibenchcapture/capture.go
+@@ -0,0 +1,136 @@
++// Package sibenchcapture records the statement, transaction, lock and row/index
++// mutation facts that SIBench joins with TiKV's read records. It is enabled only
++// when SIBENCH_TIDB_CAPTURE names a new output file; one JSON object per line.
++package sibenchcapture
++
++import (
++	"bufio"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"os"
++	"strconv"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/pingcap/tidb/pkg/kv"
++	"github.com/pingcap/tidb/pkg/types"
++)
++
++var (
++	enabled bool
++	mu      sync.Mutex
++	out     *bufio.Writer
++	flushed time.Time
++	tasks   sync.Map // connection ID -> *atomic.Uint64 current statement task ID
++)
++
++func init() {
++	path := os.Getenv("SIBENCH_TIDB_CAPTURE")
++	if path == "" {
++		return
++	}
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|os.O_APPEND, 0o644)
++	if err != nil {
++		panic(fmt.Sprintf("SIBENCH_TIDB_CAPTURE %s: %v", path, err))
++	}
++	out = bufio.NewWriterSize(f, 1<<20)
++	enabled = true
++	go func() {
++		for range time.Tick(100 * time.Millisecond) {
++			mu.Lock()
++			_ = out.Flush()
++			mu.Unlock()
++		}
++	}()
++}
++
++// TaskIDBase offsets this instance's statement task IDs so TiKV records from
++// several TiDB instances stay distinct; 0 when unset.
++func TaskIDBase() uint64 {
++	v, err := strconv.ParseUint(os.Getenv("SIBENCH_TIDB_TASK_BASE"), 10, 64)
++	if err != nil {
++		return 0
++	}
++	return v
++}
++
++// Enabled reports whether capture is on.
++func Enabled() bool { return enabled }
++
++// Emit writes one record; fields keep insertion order for readability.
++func Emit(event string, fields ...any) {
++	if !enabled {
++		return
++	}
++	b := make([]byte, 0, 256)
++	b = append(b, `{"ev":`...)
++	b = strconv.AppendQuote(b, event)
++	b = append(b, `,"ns":`...)
++	b = strconv.AppendInt(b, time.Now().UnixNano(), 10)
++	for i := 0; i+1 < len(fields); i += 2 {
++		b = append(b, ',')
++		b = strconv.AppendQuote(b, fields[i].(string))
++		b = append(b, ':')
++		v, err := json.Marshal(fields[i+1])
++		if err != nil {
++			v = []byte(strconv.Quote(err.Error()))
++		}
++		b = append(b, v...)
++	}
++	b = append(b, '}', '\n')
++	mu.Lock()
++	_, _ = out.Write(b)
++	mu.Unlock()
++}
++
++// SetTask records the statement task ID now running on a connection.
++func SetTask(conn, task uint64) {
++	v, _ := tasks.LoadOrStore(conn, new(atomic.Uint64))
++	v.(*atomic.Uint64).Store(task)
++}
++
++// Task returns the statement task ID running on a connection.
++func Task(conn uint64) uint64 {
++	if v, ok := tasks.Load(conn); ok {
++		return v.(*atomic.Uint64).Load()
++	}
++	return 0
++}
++
++// Datums renders values as strings with NULL as null.
++func Datums(ds []types.Datum) []any {
++	r := make([]any, len(ds))
++	for i := range ds {
++		if ds[i].IsNull() {
++			continue
++		}
++		s, err := ds[i].ToString()
++		if err != nil {
++			s = "!" + err.Error()
++		}
++		r[i] = s
++	}
++	return r
++}
++
++// Hex renders a key.
++func Hex(k []byte) string { return hex.EncodeToString(k) }
++
++// Value renders a value: hex when short, otherwise its length.
++func Value(v []byte) any {
++	if len(v) <= 64 {
++		return hex.EncodeToString(v)
++	}
++	return map[string]int{"len": len(v)}
++}
++
++// Ranges renders key ranges as [lower, upper) hex pairs.
++func Ranges(rs []kv.KeyRange) [][2]string {
++	r := make([][2]string, len(rs))
++	for i, kr := range rs {
++		r[i] = [2]string{hex.EncodeToString(kr.StartKey), hex.EncodeToString(kr.EndKey)}
++	}
++	return r
++}
+diff --git a/pkg/table/tables/index.go b/pkg/table/tables/index.go
+index 064c29a096..dc3b14ec2e 100644
+--- a/pkg/table/tables/index.go
++++ b/pkg/table/tables/index.go
+@@ -15,6 +15,7 @@
+ package tables
+ 
+ import (
++	"github.com/pingcap/tidb/pkg/sibenchcapture"
+ 	"context"
+ 	"sync"
+ 	"time"
+@@ -280,6 +281,20 @@ func (c *index) Create(sctx table.MutateContext, txn kv.Transaction, indexedValu
+ }
+ 
+ func (c *index) create(sctx table.MutateContext, txn kv.Transaction, indexedValue []types.Datum, h kv.Handle, handleRestoreData []types.Datum, untouched bool, opt *table.CreateIdxOpt) (kv.Handle, error) {
++	dup, err := c.createIndexEntry(sctx, txn, indexedValue, h, handleRestoreData, untouched, opt)
++	if sibenchcapture.Enabled() {
++		errText := ""
++		if err != nil {
++			errText = err.Error()
++		}
++		sibenchcapture.Emit("index_put", "conn", sctx.ConnectionID(), "task", sibenchcapture.Task(sctx.ConnectionID()),
++			"start_ts", txn.StartTS(), "table", c.phyTblID, "index", c.idxInfo.ID, "unique", c.idxInfo.Unique,
++			"values", sibenchcapture.Datums(indexedValue), "handle", h.String(), "untouched", untouched, "err", errText)
++	}
++	return dup, err
++}
++
++func (c *index) createIndexEntry(sctx table.MutateContext, txn kv.Transaction, indexedValue []types.Datum, h kv.Handle, handleRestoreData []types.Datum, untouched bool, opt *table.CreateIdxOpt) (kv.Handle, error) {
+ 	if c.Meta().Unique {
+ 		txn.CacheTableInfo(c.phyTblID, c.tblInfo)
+ 	}
+@@ -538,6 +553,20 @@ func (c *index) create(sctx table.MutateContext, txn kv.Transaction, indexedValu
+ 
+ // Delete removes the entry for handle h and indexedValues from KV index.
+ func (c *index) Delete(ctx table.MutateContext, txn kv.Transaction, indexedValue []types.Datum, h kv.Handle) error {
++	err := c.deleteIndexEntry(ctx, txn, indexedValue, h)
++	if sibenchcapture.Enabled() {
++		errText := ""
++		if err != nil {
++			errText = err.Error()
++		}
++		sibenchcapture.Emit("index_delete", "conn", ctx.ConnectionID(), "task", sibenchcapture.Task(ctx.ConnectionID()),
++			"start_ts", txn.StartTS(), "table", c.phyTblID, "index", c.idxInfo.ID, "unique", c.idxInfo.Unique,
++			"values", sibenchcapture.Datums(indexedValue), "handle", h.String(), "err", errText)
++	}
++	return err
++}
++
++func (c *index) deleteIndexEntry(ctx table.MutateContext, txn kv.Transaction, indexedValue []types.Datum, h kv.Handle) error {
+ 	indexedValues := c.getIndexedValue(indexedValue)
+ 	evalCtx := ctx.GetExprCtx().GetEvalCtx()
+ 	loc, ec := evalCtx.Location(), evalCtx.ErrCtx()
+diff --git a/pkg/table/tables/tables.go b/pkg/table/tables/tables.go
+index 1a27ea55aa..36f4e17b62 100644
+--- a/pkg/table/tables/tables.go
++++ b/pkg/table/tables/tables.go
+@@ -19,6 +19,7 @@
+ package tables
+ 
+ import (
++	"github.com/pingcap/tidb/pkg/sibenchcapture"
+ 	"context"
+ 	"fmt"
+ 	"math"
+@@ -435,7 +436,25 @@ func (t *TableCommon) RecordKey(h kv.Handle) kv.Key {
+ // Length of `oldData` and `newData` equals to length of `t.WritableCols()`.
+ func (t *TableCommon) UpdateRecord(ctx table.MutateContext, txn kv.Transaction, h kv.Handle, oldData, newData []types.Datum, touched []bool, opts ...table.UpdateRecordOption) error {
+ 	opt := table.NewUpdateRecordOpt(opts...)
+-	return t.updateRecord(ctx, txn, h, oldData, newData, touched, opt)
++	err := t.updateRecord(ctx, txn, h, oldData, newData, touched, opt)
++	sibenchRow(ctx, txn, "update", t.physicalTableID, h, oldData, newData, err)
++	return err
++}
++
++func sibenchRow(ctx table.MutateContext, txn kv.Transaction, op string, table int64, h kv.Handle, oldData, newData []types.Datum, err error) {
++	if !sibenchcapture.Enabled() {
++		return
++	}
++	errText, handle := "", ""
++	if err != nil {
++		errText = err.Error()
++	}
++	if h != nil {
++		handle = h.String()
++	}
++	sibenchcapture.Emit("row", "conn", ctx.ConnectionID(), "task", sibenchcapture.Task(ctx.ConnectionID()),
++		"start_ts", txn.StartTS(), "op", op, "table", table, "handle", handle,
++		"old", sibenchcapture.Datums(oldData), "new", sibenchcapture.Datums(newData), "err", errText)
+ }
+ 
+ func (t *TableCommon) updateRecord(sctx table.MutateContext, txn kv.Transaction, h kv.Handle, oldData, newData []types.Datum, touched []bool, opt *table.UpdateRecordOpt) error {
+@@ -738,7 +757,9 @@ func checkTempTableSize(tmpTable tblctx.TemporaryTableHandler, sizeLimit int64)
+ func (t *TableCommon) AddRecord(sctx table.MutateContext, txn kv.Transaction, r []types.Datum, opts ...table.AddRecordOption) (recordID kv.Handle, err error) {
+ 	// TODO: optimize the allocation (and calculation) of opt.
+ 	opt := table.NewAddRecordOpt(opts...)
+-	return t.addRecord(sctx, txn, r, opt)
++	recordID, err = t.addRecord(sctx, txn, r, opt)
++	sibenchRow(sctx, txn, "insert", t.physicalTableID, recordID, nil, r, err)
++	return recordID, err
+ }
+ 
+ func (t *TableCommon) addRecord(sctx table.MutateContext, txn kv.Transaction, r []types.Datum, opt *table.AddRecordOpt) (recordID kv.Handle, err error) {
+@@ -1175,7 +1196,9 @@ func GetChangingColVal(ctx exprctx.BuildContext, cols []*table.Column, col *tabl
+ // RemoveRecord implements table.Table RemoveRecord interface.
+ func (t *TableCommon) RemoveRecord(ctx table.MutateContext, txn kv.Transaction, h kv.Handle, r []types.Datum, opts ...table.RemoveRecordOption) error {
+ 	opt := table.NewRemoveRecordOpt(opts...)
+-	return t.removeRecord(ctx, txn, h, r, opt)
++	err := t.removeRecord(ctx, txn, h, r, opt)
++	sibenchRow(ctx, txn, "delete", t.physicalTableID, h, r, nil, err)
++	return err
+ }
+ 
+ func (t *TableCommon) removeRecord(ctx table.MutateContext, txn kv.Transaction, h kv.Handle, r []types.Datum, opt *table.RemoveRecordOpt) error {

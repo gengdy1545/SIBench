@@ -1,0 +1,672 @@
+diff --git a/src/coprocessor/dag/mod.rs b/src/coprocessor/dag/mod.rs
+index 9c151f6f9..ff6cfd29e 100644
+--- a/src/coprocessor/dag/mod.rs
++++ b/src/coprocessor/dag/mod.rs
+@@ -43,6 +43,7 @@ where
+     is_cache_enabled: bool,
+     paging_size: Option<u64>,
+     quota_limiter: Arc<QuotaLimiter>,
++    sibench_capture: Option<String>,
+     _phantom: PhantomData<F>,
+ }
+ 
+@@ -76,10 +77,17 @@ where
+             is_cache_enabled,
+             paging_size,
+             quota_limiter,
++            sibench_capture: None,
+             _phantom: PhantomData,
+         }
+     }
+ 
++    #[must_use]
++    pub fn sibench_capture(mut self, header: Option<String>) -> Self {
++        self.sibench_capture = header;
++        self
++    }
++
+     #[must_use]
+     pub fn data_version(mut self, data_version: Option<u64>) -> Self {
+         self.data_version = data_version;
+@@ -100,6 +108,7 @@ where
+             self.is_streaming,
+             self.paging_size,
+             self.quota_limiter,
++            self.sibench_capture,
+         )?
+         .into_boxed())
+     }
+@@ -142,7 +151,15 @@ where
+             .get_local_region_storage(region, key_ranges)
+             .await?;
+         let check_can_be_cached = store.is_check_has_newer_ts_data();
+-        Ok(Self::Storage::new(store, check_can_be_cached))
++        // A secondary-region read inside one coprocessor task; its parent task's
++        // identity is not available here, so the converter must reject it.
++        let capture = crate::sibench_capture::enabled().then(|| {
++            format!(
++                "\"kind\":\"cop_extra_region\",\"region\":{}",
++                region.get_id()
++            )
++        });
++        Ok(Self::Storage::new(store, check_can_be_cached).with_capture(capture))
+     }
+ }
+ 
+@@ -164,6 +181,7 @@ impl BatchDagHandler {
+         is_streaming: bool,
+         paging_size: Option<u64>,
+         quota_limiter: Arc<QuotaLimiter>,
++        sibench_capture: Option<String>,
+     ) -> Result<Self> {
+         let extra_storage_accessor =
+             extra_storage_accessor.map(ExtraTiKVStorageAccessor::from_store_accessor);
+@@ -171,7 +189,7 @@ impl BatchDagHandler {
+             runner: tidb_query_executors::runner::BatchExecutorsRunner::from_request::<_, F>(
+                 req,
+                 ranges,
+-                TikvStorage::new(store, is_cache_enabled),
++                TikvStorage::new(store, is_cache_enabled).with_capture(sibench_capture),
+                 extra_storage_accessor,
+                 deadline,
+                 streaming_batch_limit,
+diff --git a/src/coprocessor/dag/storage_impl.rs b/src/coprocessor/dag/storage_impl.rs
+index 370d683eb..eda25aebe 100644
+--- a/src/coprocessor/dag/storage_impl.rs
++++ b/src/coprocessor/dag/storage_impl.rs
+@@ -16,6 +16,7 @@ pub struct TikvStorage<S: Store> {
+     scanner: Option<S::Scanner>,
+     cf_stats_backlog: Statistics,
+     met_newer_ts_data_backlog: NewerTsCheckState,
++    capture: Option<crate::sibench_capture::CopCapture>,
+ }
+ 
+ impl<S: Store> TikvStorage<S> {
+@@ -29,8 +30,14 @@ impl<S: Store> TikvStorage<S> {
+             } else {
+                 NewerTsCheckState::Unknown
+             },
++            capture: None,
+         }
+     }
++
++    pub fn with_capture(mut self, header: Option<String>) -> Self {
++        self.capture = header.map(crate::sibench_capture::CopCapture::new);
++        self
++    }
+ }
+ 
+ impl<S: Store> Storage for TikvStorage<S> {
+@@ -50,6 +57,13 @@ impl<S: Store> Storage for TikvStorage<S> {
+                 self.met_newer_ts_data_backlog = NewerTsCheckState::Met;
+             }
+         }
++        if let Some(capture) = self.capture.as_mut() {
++            capture.begin_scan(
++                &range.lower_inclusive,
++                &range.upper_exclusive,
++                is_backward_scan,
++            );
++        }
+         let lower = Some(Key::from_raw(&range.lower_inclusive));
+         let upper = Some(Key::from_raw(&range.upper_exclusive));
+         self.scanner = Some(
+@@ -72,12 +86,25 @@ impl<S: Store> Storage for TikvStorage<S> {
+     fn scan_next_entry(&mut self) -> QeResult<Option<OwnedKvPairEntry>> {
+         // Unwrap is fine because we must have called `reset_range` before calling
+         // `scan_next`.
++        if self.capture.is_some() {
++            crate::sibench_capture::reset_version();
++        }
+         let kv = self
+             .scanner
+             .as_mut()
+             .unwrap()
+             .next_entry()
+             .map_err(Error::from)?;
++        if let Some(capture) = self.capture.as_mut() {
++            let version = crate::sibench_capture::take_version();
++            capture.scanned(kv.as_ref().map(|(k, v)| {
++                crate::sibench_capture::entry_json(
++                    &k.to_raw().unwrap(),
++                    Some(v.value.as_slice()),
++                    version,
++                )
++            }));
++        }
+         Ok(kv.map(|(k, v)| OwnedKvPairEntry {
+             key: k.into_raw().unwrap(),
+             value: v.value,
+@@ -94,10 +121,21 @@ impl<S: Store> Storage for TikvStorage<S> {
+         // TODO: Default CF does not need to be accessed if KeyOnly.
+         // TODO: No need to check newer ts data if self.scanner has met newer ts data.
+         let key = range.0;
++        if self.capture.is_some() {
++            crate::sibench_capture::reset_version();
++        }
+         let entry = self
+             .store
+             .incremental_get_entry(&Key::from_raw(&key), load_commit_ts)
+             .map_err(Error::from)?;
++        if let Some(capture) = self.capture.as_mut() {
++            let version = crate::sibench_capture::take_version();
++            capture.get(crate::sibench_capture::entry_json(
++                &key,
++                entry.as_ref().map(|e| e.value.as_slice()),
++                version,
++            ));
++        }
+         Ok(entry.map(move |e| OwnedKvPairEntry {
+             key,
+             value: e.value,
+diff --git a/src/coprocessor/endpoint.rs b/src/coprocessor/endpoint.rs
+index b28882220..462bb8b83 100644
+--- a/src/coprocessor/endpoint.rs
++++ b/src/coprocessor/endpoint.rs
+@@ -307,6 +307,22 @@ impl<E: Engine> Endpoint<E> {
+                         i => Some(i),
+                     };
+ 
++                    let sibench_capture = crate::sibench_capture::enabled().then(|| {
++                        format!(
++                            "{},\"paging\":{},\"executors\":\"{}\"",
++                            crate::sibench_capture::request_json(
++                                "cop_dag",
++                                &req_ctx.context,
++                                start_ts
++                            ),
++                            paging_size.unwrap_or(0),
++                            dag.get_executors()
++                                .iter()
++                                .map(|e| format!("{:?}", e.get_tp()))
++                                .collect::<Vec<_>>()
++                                .join(">")
++                        )
++                    });
+                     let extra_store_accessor =
+                         ExtraSnapStoreAccessor::<E>::new(req_ctx.clone(), concurrency_manager);
+                     dag::DagHandlerBuilder::<_, _, F>::new(
+@@ -322,6 +338,7 @@ impl<E: Engine> Endpoint<E> {
+                         quota_limiter,
+                     )
+                     .data_version(data_version)
++                    .sibench_capture(sibench_capture)
+                     .build()
+                 });
+             }
+diff --git a/src/lib.rs b/src/lib.rs
+index 72a98fd34..da08b9465 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -49,6 +49,7 @@ pub mod coprocessor_v2;
+ pub mod import;
+ pub mod read_pool;
+ pub mod server;
++pub mod sibench_capture;
+ pub mod storage;
+ 
+ /// Returns the tikv version information.
+diff --git a/src/sibench_capture.rs b/src/sibench_capture.rs
+new file mode 100644
+index 000000000..d2d494668
+--- /dev/null
++++ b/src/sibench_capture.rs
+@@ -0,0 +1,209 @@
++// SIBench index-access capture: records the MVCC entries TiKV actually read for
++// coprocessor scans and point gets, one JSON line per request, when
++// SIBENCH_TIKV_CAPTURE names an output file. Disabled capture costs one
++// atomic load per hook and changes no read, lock or response behavior.
++
++use std::{
++    cell::{Cell, RefCell},
++    fs::{File, OpenOptions},
++    io::{BufWriter, Write},
++    sync::atomic::{AtomicBool, Ordering},
++    time::Instant,
++};
++
++use lazy_static::lazy_static;
++use parking_lot::Mutex;
++
++/// No version observed, a committed write's commit_ts, or a lock's start_ts
++/// for a value read through a committed (access) lock.
++pub const VERSION_NONE: u8 = 0;
++pub const VERSION_COMMIT: u8 = 1;
++pub const VERSION_LOCK: u8 = 2;
++
++struct Output {
++    writer: BufWriter<File>,
++    flushed: Instant,
++}
++
++lazy_static! {
++    static ref OUTPUT: Option<Mutex<Output>> = std::env::var("SIBENCH_TIKV_CAPTURE")
++        .ok()
++        .filter(|p| !p.is_empty())
++        .map(|path| {
++            let file = OpenOptions::new()
++                .create_new(true)
++                .append(true)
++                .open(&path)
++                .unwrap_or_else(|e| panic!("SIBENCH_TIKV_CAPTURE {}: {}", path, e));
++            Mutex::new(Output {
++                writer: BufWriter::with_capacity(1 << 20, file),
++                flushed: Instant::now(),
++            })
++        });
++    static ref ENABLED: AtomicBool = AtomicBool::new(OUTPUT.is_some());
++}
++
++thread_local! {
++    static VERSION: Cell<(u8, u64)> = const { Cell::new((VERSION_NONE, 0)) };
++    static POINTS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
++}
++
++#[inline]
++pub fn enabled() -> bool {
++    ENABLED.load(Ordering::Relaxed)
++}
++
++/// Called by the MVCC readers where they settle the version they return.
++#[inline]
++pub fn note_commit(ts: u64) {
++    VERSION.with(|v| v.set((VERSION_COMMIT, ts)));
++}
++
++#[inline]
++pub fn note_lock(start_ts: u64) {
++    VERSION.with(|v| v.set((VERSION_LOCK, start_ts)));
++}
++
++#[inline]
++pub fn reset_version() {
++    VERSION.with(|v| v.set((VERSION_NONE, 0)));
++}
++
++#[inline]
++pub fn take_version() -> (u8, u64) {
++    VERSION.with(|v| v.replace((VERSION_NONE, 0)))
++}
++
++/// Writes one complete line; flushed at least every 100 ms of activity.
++pub fn emit(line: &str) {
++    if let Some(output) = OUTPUT.as_ref() {
++        let mut out = output.lock();
++        out.writer.write_all(line.as_bytes()).unwrap();
++        out.writer.write_all(b"\n").unwrap();
++        if out.flushed.elapsed().as_millis() >= 100 {
++            out.writer.flush().unwrap();
++            out.flushed = Instant::now();
++        }
++    }
++}
++
++/// One read entry: key, value (hex when short), and the version it came from.
++pub fn entry_json(key: &[u8], value: Option<&[u8]>, version: (u8, u64)) -> String {
++    let value = match value {
++        None => "null".to_owned(),
++        Some(v) if v.len() <= 64 => format!("\"{}\"", hex::encode(v)),
++        Some(v) => format!("{{\"len\":{}}}", v.len()),
++    };
++    format!(
++        "{{\"k\":\"{}\",\"v\":{},\"vk\":{},\"vt\":{}}}",
++        hex::encode(key),
++        value,
++        version.0,
++        version.1
++    )
++}
++
++/// Collects batch-get entries on this thread between begin and finish.
++pub fn begin_points() {
++    POINTS.with(|p| *p.borrow_mut() = Some(Vec::new()));
++}
++
++pub fn push_point(entry: String) {
++    POINTS.with(|p| {
++        if let Some(points) = p.borrow_mut().as_mut() {
++            points.push(entry);
++        }
++    });
++}
++
++pub fn finish_points() -> Vec<String> {
++    POINTS.with(|p| p.borrow_mut().take().unwrap_or_default())
++}
++
++/// The request identity shared by every record of one RPC.
++pub fn request_json(
++    kind: &str,
++    ctx: &kvproto::kvrpcpb::Context,
++    start_ts: u64,
++) -> String {
++    format!(
++        "\"kind\":\"{}\",\"start_ts\":{},\"task_id\":{},\"region\":{},\"region_ver\":{},\"store\":{},\"source\":\"{}\",\"iso\":\"{:?}\",\"committed_locks\":{}",
++        kind,
++        start_ts,
++        ctx.get_task_id(),
++        ctx.get_region_id(),
++        ctx.get_region_epoch().get_version(),
++        ctx.get_peer().get_store_id(),
++        ctx.get_request_source().replace('"', "'"),
++        ctx.get_isolation_level(),
++        ctx.get_committed_locks().len()
++    )
++}
++
++/// The scans and point reads one coprocessor handler made through its storage.
++pub struct CopCapture {
++    pub header: String,
++    pub reads: Vec<String>,
++    current: Option<(String, Vec<String>)>,
++}
++
++impl CopCapture {
++    pub fn new(header: String) -> Self {
++        CopCapture {
++            header,
++            reads: Vec::new(),
++            current: None,
++        }
++    }
++
++    pub fn begin_scan(&mut self, lower: &[u8], upper: &[u8], desc: bool) {
++        self.close_scan(false);
++        self.current = Some((
++            format!(
++                "\"lo\":\"{}\",\"hi\":\"{}\",\"desc\":{}",
++                hex::encode(lower),
++                hex::encode(upper),
++                desc
++            ),
++            Vec::new(),
++        ));
++    }
++
++    pub fn scanned(&mut self, entry: Option<String>) {
++        match entry {
++            Some(e) => {
++                if let Some((_, entries)) = self.current.as_mut() {
++                    entries.push(e);
++                }
++            }
++            None => self.close_scan(true),
++        }
++    }
++
++    pub fn get(&mut self, entry: String) {
++        self.close_scan(false);
++        self.reads.push(format!("{{\"get\":{}}}", entry));
++    }
++
++    fn close_scan(&mut self, exhausted: bool) {
++        if let Some((range, entries)) = self.current.take() {
++            self.reads.push(format!(
++                "{{\"scan\":{{{},\"exhausted\":{},\"entries\":[{}]}}}}",
++                range,
++                exhausted,
++                entries.join(",")
++            ));
++        }
++    }
++}
++
++impl Drop for CopCapture {
++    fn drop(&mut self) {
++        self.close_scan(false);
++        emit(&format!(
++            "{{{},\"reads\":[{}]}}",
++            self.header,
++            self.reads.join(",")
++        ));
++    }
++}
+diff --git a/src/storage/mod.rs b/src/storage/mod.rs
+index d3753d7aa..3dc20ca08 100644
+--- a/src/storage/mod.rs
++++ b/src/storage/mod.rs
+@@ -715,14 +715,36 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
+                             access_locks,
+                             false,
+                         );
+-                        snap_store
++                        if crate::sibench_capture::enabled() {
++                            crate::sibench_capture::reset_version();
++                        }
++                        let result = snap_store
+                             .get_entry(&key, load_commit_ts, &mut statistics)
+                             // map storage::txn::Error -> storage::Error
+                             .map_err(Error::from)
+                             .map(|r| {
+                                 KV_COMMAND_KEYREAD_HISTOGRAM_STATIC.get(CMD).observe(1_f64);
+                                 r
+-                            })
++                            });
++                        if crate::sibench_capture::enabled() {
++                            let version = crate::sibench_capture::take_version();
++                            if let Ok(entry) = &result {
++                                crate::sibench_capture::emit(&format!(
++                                    "{{{},\"reads\":[{{\"get\":{}}}]}}",
++                                    crate::sibench_capture::request_json(
++                                        "kv_get",
++                                        &ctx,
++                                        start_ts.into_inner()
++                                    ),
++                                    crate::sibench_capture::entry_json(
++                                        &key.to_raw().unwrap(),
++                                        entry.as_ref().map(|e| e.value.as_slice()),
++                                        version
++                                    )
++                                ));
++                            }
++                        }
++                        result
+                     });
+                     metrics::tls_collect_scan_details(CMD, &statistics);
+                     metrics::tls_collect_read_flow(
+@@ -863,6 +885,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
+                     set_tls_tracker_token(tracker);
+                     let need_commit_ts = req.get_need_commit_ts();
+                     let mut ctx = req.take_context();
++                    let sibench_request = crate::sibench_capture::enabled().then(|| {
++                        crate::sibench_capture::request_json(
++                            "kv_get_batched",
++                            &ctx,
++                            req.get_version(),
++                        )
++                    });
+                     let deadline = Self::get_deadline(&ctx);
+                     let source = ctx.take_request_source();
+                     let region_id = ctx.get_region_id();
+@@ -925,6 +954,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
+                         source,
+                         tracker,
+                         deadline,
++                        sibench_request,
+                     ));
+                 }
+                 Self::with_tls_engine(|engine| engine.release_snapshot());
+@@ -943,6 +973,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
+                         source,
+                         tracker,
+                         deadline,
++                        sibench_request,
+                     ) = req_snap;
+                     let snap_res = snap.await;
+                     if let Err(e) = deadline.check() {
+@@ -968,7 +999,22 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
+                                 .build()
+                             {
+                                 Ok(mut point_getter) => {
++                                    if sibench_request.is_some() {
++                                        crate::sibench_capture::reset_version();
++                                    }
+                                     let v = point_getter.get_entry(&key, need_commit_ts);
++                                    if let (Some(request), Ok(entry)) = (&sibench_request, &v) {
++                                        let version = crate::sibench_capture::take_version();
++                                        crate::sibench_capture::emit(&format!(
++                                            "{{{},\"reads\":[{{\"get\":{}}}]}}",
++                                            request,
++                                            crate::sibench_capture::entry_json(
++                                                &key.to_raw().unwrap(),
++                                                entry.as_ref().map(|e| e.value.as_slice()),
++                                                version
++                                            )
++                                        ));
++                                    }
+                                     let stat = point_getter.take_statistics();
+                                     metrics::tls_collect_read_flow(
+                                         region_id,
+@@ -1332,6 +1378,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
+                             false,
+                         );
+                         let mut stats = Statistics::default();
++                        if crate::sibench_capture::enabled() {
++                            crate::sibench_capture::begin_points();
++                        }
+                         let result = snap_store
+                             .batch_get(&keys, load_commit_ts, &mut statistics)
+                             .map_err(Error::from)
+@@ -1366,6 +1415,20 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
+                                 }));
+                                 kv_pairs
+                             });
++                        if crate::sibench_capture::enabled() {
++                            let points = crate::sibench_capture::finish_points();
++                            if result.is_ok() {
++                                crate::sibench_capture::emit(&format!(
++                                    "{{{},\"reads\":[{}]}}",
++                                    crate::sibench_capture::request_json(
++                                        "kv_batch_get",
++                                        &ctx,
++                                        start_ts.into_inner()
++                                    ),
++                                    points.join(",")
++                                ));
++                            }
++                        }
+                         (result, stats)
+                     });
+                     metrics::tls_collect_scan_details(CMD, &stats);
+diff --git a/src/storage/mvcc/reader/point_getter.rs b/src/storage/mvcc/reader/point_getter.rs
+index 248b9d042..9d063061a 100644
+--- a/src/storage/mvcc/reader/point_getter.rs
++++ b/src/storage/mvcc/reader/point_getter.rs
+@@ -197,6 +197,9 @@ impl<S: Snapshot> PointGetter<S> {
+             if let Some(lock) = self.load_and_check_lock(user_key, !load_commit_ts)? {
+                 // When commit timestamp is required, we should not load data from lock.
+                 debug_assert!(!load_commit_ts);
++                if crate::sibench_capture::enabled() {
++                    crate::sibench_capture::note_lock(lock.ts.into_inner());
++                }
+                 return self
+                     .load_data_from_lock(user_key, lock)
+                     .map(|o| o.map(ValueEntry::from_value));
+@@ -343,6 +346,15 @@ impl<S: Snapshot> PointGetter<S> {
+ 
+             match write.write_type {
+                 WriteType::Put => {
++                    if crate::sibench_capture::enabled() {
++                        let ts = match loaded_write_commit_ts {
++                            Some(ts) => ts,
++                            None => Key::decode_ts_from(
++                                self.write_cursor.key(&mut self.statistics.write),
++                            )?,
++                        };
++                        crate::sibench_capture::note_commit(ts.into_inner());
++                    }
+                     let key_commit_ts = if load_commit_ts {
+                         if let Some(ts) = loaded_write_commit_ts {
+                             Some(ts)
+diff --git a/src/storage/mvcc/reader/scanner/backward.rs b/src/storage/mvcc/reader/scanner/backward.rs
+index 439415ea2..862279d82 100644
+--- a/src/storage/mvcc/reader/scanner/backward.rs
++++ b/src/storage/mvcc/reader/scanner/backward.rs
+@@ -177,6 +177,9 @@ impl<S: Snapshot> BackwardKvScanner<S> {
+                             .expect("Err result only for single lock");
+                         self.statistics.lock.processed_keys += 1;
+                         if !self.cfg.load_commit_ts && self.cfg.access_locks.contains(lock.ts) {
++                            if crate::sibench_capture::enabled() {
++                                crate::sibench_capture::note_lock(lock.ts.into_inner());
++                            }
+                             self.ensure_default_cursor()?;
+                             result = super::load_data_by_lock(
+                                 &current_user_key,
+@@ -290,6 +293,9 @@ impl<S: Snapshot> BackwardKvScanner<S> {
+             match write.write_type {
+                 WriteType::Put | WriteType::Delete => {
+                     last_version = Some(write.to_owned());
++                    if crate::sibench_capture::enabled() {
++                        crate::sibench_capture::note_commit(last_checked_commit_ts.into_inner());
++                    }
+                     if self.cfg.load_commit_ts {
+                         loaded_commit_ts = Some(last_checked_commit_ts);
+                     }
+@@ -381,6 +387,9 @@ impl<S: Snapshot> BackwardKvScanner<S> {
+ 
+             match write.write_type {
+                 WriteType::Put => {
++                    if crate::sibench_capture::enabled() {
++                        crate::sibench_capture::note_commit(current_ts.into_inner());
++                    }
+                     if self.cfg.load_commit_ts {
+                         loaded_commit_ts = Some(current_ts);
+                     }
+diff --git a/src/storage/mvcc/reader/scanner/forward.rs b/src/storage/mvcc/reader/scanner/forward.rs
+index b67a569ce..5b9f9fbd5 100644
+--- a/src/storage/mvcc/reader/scanner/forward.rs
++++ b/src/storage/mvcc/reader/scanner/forward.rs
+@@ -412,6 +412,9 @@ impl<S: Snapshot> ScanPolicy<S> for LatestKvPolicy {
+             // Skip current_user_key because this key is either blocked or handled.
+             cursors.move_write_cursor_to_next_user_key(&current_user_key, statistics)?;
+             if !cfg.load_commit_ts && cfg.access_locks.contains(lock.ts) {
++                if crate::sibench_capture::enabled() {
++                    crate::sibench_capture::note_lock(lock.ts.into_inner());
++                }
+                 cursors.ensure_default_cursor(cfg)?;
+                 return super::load_data_by_lock(
+                     &current_user_key,
+@@ -447,6 +450,12 @@ impl<S: Snapshot> ScanPolicy<S> for LatestKvPolicy {
+ 
+             match write.write_type {
+                 WriteType::Put => {
++                    if crate::sibench_capture::enabled() {
++                        crate::sibench_capture::note_commit(
++                            Key::decode_ts_from(cursors.write.key(&mut statistics.write))?
++                                .into_inner(),
++                        );
++                    }
+                     let commit_ts = if cfg.load_commit_ts {
+                         Some(Key::decode_ts_from(
+                             cursors.write.key(&mut statistics.write),
+diff --git a/src/storage/txn/store.rs b/src/storage/txn/store.rs
+index e6bd44a27..02c1ec56d 100644
+--- a/src/storage/txn/store.rs
++++ b/src/storage/txn/store.rs
+@@ -418,9 +418,26 @@ impl<S: Snapshot> Store for SnapshotStore<S> {
+ 
+         let mut values = Vec::with_capacity(keys.len());
+         for key in keys {
++            let capture = crate::sibench_capture::enabled();
++            if capture {
++                crate::sibench_capture::reset_version();
++            }
+             let value = point_getter
+                 .get_entry(key, load_commit_ts)
+                 .map_err(Error::from);
++            if capture {
++                let version = crate::sibench_capture::take_version();
++                if let Ok(entry) = &value {
++                    crate::sibench_capture::push_point(format!(
++                        "{{\"get\":{}}}",
++                        crate::sibench_capture::entry_json(
++                            &key.to_raw().unwrap(),
++                            entry.as_ref().map(|e| e.value.as_slice()),
++                            version
++                        )
++                    ));
++                }
++            }
+             values.push(value);
+             statistics.push(point_getter.take_statistics());
+         }

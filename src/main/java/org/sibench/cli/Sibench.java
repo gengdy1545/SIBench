@@ -60,6 +60,9 @@ public final class Sibench {
         out.println(
                 "       java -jar build/sibench/sibench.jar analyze-locality TRACE CONFIG OUTPUT"
                         + "   (static baseline layout, update windows and overlap estimate)");
+        out.println(
+                "       java -jar build/sibench/sibench.jar convert-tidb-capture CAPTURE_DIR SCHEMA BASELINE_TS OUTPUT"
+                        + "   (TiDB/TiKV capture PoC: canonical operations checked by an MVCC oracle)");
     }
 
     public static void main(String[] args) {
@@ -97,11 +100,21 @@ public final class Sibench {
                             "verify-service",
                             "plan-write-ratio",
                             "plan-operations",
-                            "analyze-locality")
+                            "analyze-locality",
+                            "convert-tidb-capture")
                     .contains(args[0])) {
                 throw new IllegalArgumentException("Unknown command: " + args[0]);
             }
             Path root = Path.of("").toAbsolutePath();
+            if (args[0].equals("convert-tidb-capture")) {
+                if (args.length != 5)
+                    throw new IllegalArgumentException(
+                            "convert-tidb-capture requires CAPTURE_DIR SCHEMA BASELINE_TS OUTPUT");
+                var report = org.sibench.capture.TidbCapture.convert(
+                        root.resolve(args[1]), root.resolve(args[2]), Long.parseUnsignedLong(args[3]), root.resolve(args[4]));
+                out.println(new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(report));
+                return report.get("status").equals("consistent") ? 0 : 1;
+            }
             List<String> profiles = new ArrayList<>();
             boolean dryRun = false;
             String jdbc = null, user = null, reference = null;
