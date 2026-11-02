@@ -27,6 +27,57 @@ public class CaptureRunTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     @Test
+    public void serverSessionAuditIsReusedOnlyWithinItsUnchangedCapture() throws Exception {
+        Path directory = temporary.newFolder().toPath(), server = directory.resolve("pg-123.jsonl.zst");
+        try (CaptureRun run = CaptureRun.beginExternal(directory, "sysbench")) {
+            writeServerSession(server);
+            var first = CaptureRun.auditServer(server);
+            assertSame(first, CaptureRun.auditServer(server));
+            run.completeExternal(false, serverClient());
+            assertEquals(1, manifest(directory).getAsJsonArray("sessions").size());
+            assertEquals(1L, manifest(directory).getAsJsonArray("sessions").get(0)
+                    .getAsJsonObject().getAsJsonObject("audit").get("requests").getAsLong());
+        }
+        CaptureRun.verifyInput(directory);
+        Path another = temporary.newFolder().toPath();
+        try (CaptureRun run = CaptureRun.beginExternal(another, "sysbench")) {
+            assertThrows(IOException.class, () -> CaptureRun.auditServer(server));
+        }
+    }
+
+    @Test
+    public void changingAnAuditedServerTracePreventsRunCompletion() throws Exception {
+        Path directory = temporary.newFolder().toPath(), server = directory.resolve("pg-123.jsonl.zst");
+        Path timingPath = temporary.getRoot().toPath().resolve("failed-audit-timing.json");
+        try (RunTiming timing = RunTiming.open(timingPath);
+                CaptureRun run = CaptureRun.beginExternal(directory, "sysbench")) {
+            writeServerSession(server);
+            CaptureRun.auditServer(server);
+            Files.write(server, new byte[] {0}, java.nio.file.StandardOpenOption.APPEND);
+            assertTrue(assertThrows(IOException.class, () -> run.completeExternal(false, serverClient()))
+                    .getMessage().contains("changed after its session audit"));
+            assertEquals("failed", manifest(directory).get("status").getAsString());
+        }
+        JsonObject timing = JsonParser.parseString(Files.readString(timingPath)).getAsJsonObject();
+        assertTrue(timing.get("capture_session_audit_wall_millis").getAsLong() >= 0);
+        assertFalse(timing.has("capture_session_audit_worker_millis"));
+    }
+
+    private static Map<String, Object> serverClient() {
+        return Map.of("workloads", List.of(Map.of("script", "oltp_point_select", "sessions",
+                List.of(Map.of("pg_file", "pg-123.jsonl.zst")))));
+    }
+
+    private static void writeServerSession(Path path) throws Exception {
+        RowAuditTestSupport.writeTrace(path, List.of(
+                event("capture_start", "fixture", ",\"req\":0,\"depth\":0,\"detail\":\"summary\""),
+                event("executor_start", "fixture", ",\"req\":1,\"depth\":1,\"sql\":\"SELECT 1\""),
+                event("executor_run_end", "fixture", ",\"req\":1,\"depth\":1,\"processed\":0,\"returned\":0,\"row_hashes\":[]"),
+                event("executor_end", "fixture", ",\"req\":1,\"depth\":1"),
+                event("transaction_commit", "fixture", ",\"req\":1,\"depth\":0")));
+    }
+
+    @Test
     public void preflightMismatchKeepsEvidenceAndStartsNoNativeSession() throws Exception {
         Path directory = temporary.newFolder().toPath();
         try (CaptureRun run = CaptureRun.begin(directory)) {
@@ -236,7 +287,9 @@ public class CaptureRunTest {
     @Test
     public void htapAuditsAllSessionsAndAcceptsMatchedBusinessRollback() throws Exception {
         Path directory = temporary.newFolder().toPath();
-        try (CaptureRun run = CaptureRun.begin(directory)) {
+        Path timingPath = temporary.getRoot().toPath().resolve("parallel-audit-timing.json");
+        try (RunTiming timing = RunTiming.open(timingPath);
+                CaptureRun run = CaptureRun.begin(directory)) {
             run.phase("xp", null);
             for (int pid : new int[] {123, 124}) {
                 Path jdbc = directory.resolve("jdbc-" + pid + ".jsonl.zst");
@@ -262,6 +315,16 @@ public class CaptureRunTest {
             run.complete();
         }
         assertEquals(2, manifest(directory).getAsJsonArray("sessions").size());
+        JsonObject timing = JsonParser.parseString(Files.readString(timingPath)).getAsJsonObject();
+        for (String key : List.of("capture_session_hash_worker_millis",
+                "capture_session_audit_worker_millis", "capture_session_audit_wall_millis")) {
+            assertTrue(key, timing.get(key).getAsLong() >= 0);
+            assertFalse(manifest(directory).has(key));
+        }
+        for (var session : manifest(directory).getAsJsonArray("sessions")) {
+            assertEquals("passed", session.getAsJsonObject().getAsJsonObject("audit").get("status").getAsString());
+            assertEquals(1L, session.getAsJsonObject().getAsJsonObject("audit").get("requests").getAsLong());
+        }
         CaptureRun.verifyInput(directory);
         // Concurrent sessions are no longer rejected outright; they are ordered by PostgreSQL's
         // transaction completion counter, which these fixture traces do not carry.

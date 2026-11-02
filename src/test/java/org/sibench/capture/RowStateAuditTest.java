@@ -53,6 +53,104 @@ public class RowStateAuditTest {
         return directory;
     }
 
+    private static String transitionDigest(List<JsonObject> changes) throws Exception {
+        var sha = java.security.MessageDigest.getInstance("SHA-256");
+        var json = new com.google.gson.GsonBuilder().serializeNulls().create();
+        for (JsonObject change : changes)
+            sha.update((json.toJson(change) + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return java.util.HexFormat.of().formatHex(sha.digest());
+    }
+
+    @Test
+    public void receiptDigestUsesTypedKeyOrderAndBindsSourcePositions() throws Exception {
+        for (String benchmark : List.of("sysbench", "ycsb")) {
+            var schema = schema(benchmark, 1);
+            var table = schema.tables().get(0);
+            Path fixture = temporary.newFolder().toPath();
+            Path baseline = baseline(fixture, schema, Map.of(table.name(), List.of()));
+            String prefix = benchmark.equals("ycsb") ? "user" : "";
+            var rows = List.of(row(table, prefix + "2"), row(table, prefix + "10"), row(table, prefix + "1"));
+            Path raw = RowAuditTestSupport.capture(fixture, List.of(rows.stream()
+                    .map(value -> RowAuditTestSupport.change(table.name(), "insert", null, value)).toList()), Set.of());
+            Path report = RowStateAudit.defaultReport(raw);
+            var result = RowStateAudit.audit(RowAuditTestSupport.connection(schema, Map.of(table.name(), rows), new int[1]),
+                    schema, baseline, raw, report);
+            var byKey = new LinkedHashMap<String, JsonObject>();
+            var lines = RowAuditTestSupport.readTrace(raw);
+            for (int position = 0; position < lines.size(); position++) {
+                var event = JsonParser.parseString(lines.get(position)).getAsJsonObject();
+                if (!event.get("event").getAsString().equals("row_change")) continue;
+                String key = event.getAsJsonObject("new").get(SourceRow.primary(table).name()).getAsString();
+                event.addProperty("source_session", raw.getFileName().toString());
+                event.addProperty("source_position", position + 1L);
+                byKey.put(key, event);
+            }
+            var expectedOrder = benchmark.equals("sysbench") ? List.of("1", "2", "10")
+                    : List.of("user1", "user10", "user2");
+            assertEquals(transitionDigest(expectedOrder.stream().map(byKey::get).toList()), result.get("changes_sha256"));
+            assertFalse(Files.exists(Path.of(report + ".changes.jsonl")));
+            var recorded = JsonParser.parseString(Files.readString(report)).getAsJsonObject();
+            for (String unsupported : List.of("changes_file", "changes_sha256")) {
+                var invalid = recorded.deepCopy();
+                invalid.addProperty(unsupported, unsupported.equals("changes_file") ? "obsolete.jsonl" : "bad-digest");
+                Files.writeString(report, invalid.toString());
+                assertTrue(assertThrows(IOException.class, () -> RowStateAudit.reuse(schema, baseline, raw, report))
+                        .getMessage().contains("Unsupported row audit receipt"));
+            }
+        }
+    }
+
+    @Test
+    public void mergesChangesAcrossMultipleOrderedBaselineFiles() throws Exception {
+        var schema = schema("ycsb", 1);
+        var table = schema.tables().get(0);
+        Path fixture = temporary.newFolder().toPath();
+        Path baseline = Files.createDirectory(fixture.resolve("baseline"));
+        var layout = org.sibench.generation.ParquetDataFileTest.layout(baseline, 192 * 1024, 5);
+        var parquet = org.apache.parquet.schema.MessageTypeParser.parseMessageType(
+                "message usertable { optional binary ycsb_key (UTF8); optional binary field0 (UTF8);"
+                        + " required int64 _sib_row_id; required int64 _sib_timestamp; }");
+        var initial = new java.util.ArrayList<JsonObject>();
+        var encoded = new java.util.ArrayList<String[]>();
+        var random = new java.util.Random(19);
+        for (int i = 0; i < 3000; i++) {
+            JsonObject value = row(table, "user%06d".formatted(i));
+            byte[] payload = new byte[256];
+            random.nextBytes(payload);
+            value.addProperty("field0", java.util.Base64.getEncoder().encodeToString(payload));
+            initial.add(value);
+            encoded.add(new String[] {SourceRow.key(table, value), value.get("field0").getAsString()});
+        }
+        var iterator = encoded.iterator();
+        var written = PgBaselineExport.writeTable(
+                new PgBaselineExport.Table(table, "ycsb_key", false, parquet, initial.size(), true, List.of()),
+                0, 1, 1, () -> iterator.hasNext() ? iterator.next() : null, baseline, layout);
+        assertTrue(written.size() > 1);
+        Files.write(baseline.resolve("files.jsonl"), written.stream()
+                .map(w -> new com.google.gson.Gson().toJson(w.file())).toList());
+        BaselineManifest.publish(schema, baseline, Map.of(table.name(), (long) initial.size()));
+        PgBaselineVerify.verify(RowAuditTestSupport.connections(schema, Map.of(table.name(), initial), new int[1]),
+                schema, baseline);
+        String boundary = (String) written.get(1).file().get("first_key");
+        JsonObject before = initial.stream().filter(r -> r.get("ycsb_key").getAsString().equals(boundary))
+                .findFirst().orElseThrow();
+        JsonObject after = before.deepCopy();
+        after.addProperty("field0", "updated at the next file boundary");
+        JsonObject inserted = row(table, "user-1");
+        var actual = new java.util.ArrayList<JsonObject>();
+        actual.add(inserted);
+        for (JsonObject value : initial)
+            if (value != initial.get(0)) actual.add(value == before ? after : value);
+        Path raw = RowAuditTestSupport.capture(fixture, List.of(List.of(
+                RowAuditTestSupport.change(table.name(), "delete", initial.get(0), null),
+                RowAuditTestSupport.change(table.name(), "update", before, after),
+                RowAuditTestSupport.change(table.name(), "insert", null, inserted))), Set.of());
+        var result = RowStateAudit.audit(RowAuditTestSupport.connection(schema, Map.of(table.name(), actual), new int[1]),
+                schema, baseline, raw, RowStateAudit.defaultReport(raw));
+        assertEquals(3L, result.get("committed_row_changes"));
+        assertEquals(3000L, ((Map<?, ?>) ((List<?>) result.get("tables")).get(0)).get("final_rows"));
+    }
+
     @Test
     public void threeSchemasAuditAllTablesAndReuseWithoutAnotherPgQuery() throws Exception {
         for (String benchmark : List.of("hybench", "ycsb", "sysbench")) {
@@ -88,8 +186,7 @@ public class RowStateAuditTest {
             RowStateAudit.audit(connection, schema, baseline, raw, report);
             assertEquals(schema.tables().size(), queries[0]);
             assertEquals(size, Files.size(report));
-            assertEquals(
-                    changes.size(), Files.readAllLines(Path.of(report + ".changes.jsonl")).size());
+            assertFalse(Files.exists(Path.of(report + ".changes.jsonl")));
             Files.writeString(raw, "\n", StandardOpenOption.APPEND);
             assertThrows(
                     IOException.class, () -> RowStateAudit.reuse(schema, baseline, raw, report));
@@ -340,19 +437,26 @@ public class RowStateAuditTest {
                         report);
         assertEquals("per_key_causal", result.get("ordering"));
         assertEquals(2L, result.get("committed_row_changes"));
-        var transitions =
-                Files.readAllLines(Path.of(report + ".changes.jsonl")).stream()
-                        .map(line -> JsonParser.parseString(line).getAsJsonObject())
-                        .toList();
-        assertEquals("pg-1.jsonl.zst", transitions.get(0).get("source_session").getAsString());
-        assertEquals("pg-0.jsonl.zst", transitions.get(1).get("source_session").getAsString());
+        var expected = new ArrayList<JsonObject>();
+        for (int session : new int[] {1, 0}) {
+            Path pg = raw.resolve("pg-" + session + ".jsonl.zst");
+            var lines = RowAuditTestSupport.readTrace(pg);
+            for (int position = 0; position < lines.size(); position++) {
+                var event = JsonParser.parseString(lines.get(position)).getAsJsonObject();
+                if (!event.get("event").getAsString().equals("row_change")) continue;
+                event.addProperty("source_session", pg.getFileName().toString());
+                event.addProperty("source_position", position + 1L);
+                expected.add(event);
+            }
+        }
+        assertEquals(transitionDigest(expected), result.get("changes_sha256"));
         assertEquals(
                 new JsonPrimitive("passed_source_row_state"),
                 RowStateAudit.reuse(schema, baseline, raw, report).get("status"));
     }
 
     @Test
-    public void rejectsFinalMismatchAndChangedAuditTransitions() throws Exception {
+    public void rejectsFinalMismatchAndChangedSourceInputs() throws Exception {
         var schema = schema("sysbench", 1);
         var table = schema.tables().get(0);
         var a = row(table, "7");
@@ -384,7 +488,7 @@ public class RowStateAuditTest {
                 baseline,
                 raw,
                 report);
-        Files.writeString(Path.of(report + ".changes.jsonl"), "\n", StandardOpenOption.APPEND);
+        Files.write(raw, new byte[] {0}, StandardOpenOption.APPEND);
         assertThrows(IOException.class, () -> RowStateAudit.reuse(schema, baseline, raw, report));
     }
 
@@ -483,26 +587,14 @@ public class RowStateAuditTest {
             assertEquals(benchmark, inMemory.get("committed_row_changes"), outOfCore.get("committed_row_changes"));
             assertEquals(benchmark, inMemory.get("changes_sha256"), outOfCore.get("changes_sha256"));
             assertEquals(benchmark, inMemory.get("tables"), outOfCore.get("tables"));
-            assertEquals(
-                    Files.readAllLines(Path.of(memoryReport + ".changes.jsonl")),
-                    Files.readAllLines(Path.of(spilledReport + ".changes.jsonl")));
+            assertFalse(Files.exists(Path.of(memoryReport + ".changes.jsonl")));
+            assertFalse(Files.exists(Path.of(spilledReport + ".changes.jsonl")));
             // No working files remain beside the report.
             try (var siblings = Files.list(spilledReport.getParent())) {
                 assertTrue(siblings.noneMatch(p -> p.getFileName().toString().contains(".work")
                         || p.getFileName().toString().endsWith(".partial")));
             }
-            // The transitions are grouped by key in key order, each key's chain in order.
-            var keys = new ArrayList<String>();
-            for (String line : Files.readAllLines(Path.of(spilledReport + ".changes.jsonl"))) {
-                var event = JsonParser.parseString(line).getAsJsonObject();
-                var image = event.get("new").isJsonNull() ? event.getAsJsonObject("old") : event.getAsJsonObject("new");
-                String key = image.get(SourceRow.primary(schema.tables().get(0)).name()).getAsString();
-                if (keys.isEmpty() || !keys.get(keys.size() - 1).equals(key)) keys.add(key);
-            }
-            var sorted = new ArrayList<>(keys);
-            sorted.sort(RowStateAuditTest::byKey);
-            assertEquals(sorted, keys);
-            assertEquals(new LinkedHashSet<>(keys).size(), keys.size());
+
         }
     }
 

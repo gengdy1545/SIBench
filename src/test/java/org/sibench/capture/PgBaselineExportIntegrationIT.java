@@ -14,6 +14,36 @@ import org.sibench.schema.SourceSchema;
 /** Opt-in against an existing PG service; creates and drops only its own disposable database. */
 public class PgBaselineExportIntegrationIT {
     @Test
+    public void primaryReadForbidsSpillsWithoutChangingLaterTransactions() throws Exception {
+        String jdbc = Objects.requireNonNull(System.getenv("SIBENCH_SCHEMA_TEST_JDBC"));
+        try (var pg = DriverManager.getConnection(jdbc, "postgres", ""); var sql = pg.createStatement()) {
+            String original;
+            try (var value = sql.executeQuery("SHOW temp_file_limit")) {
+                value.next();
+                original = value.getString(1);
+            }
+            pg.setAutoCommit(false);
+            var settings = PgBaselineExport.class.getDeclaredMethod("primarySettings", Connection.class);
+            settings.setAccessible(true);
+            settings.invoke(null, pg);
+            sql.execute("SET LOCAL work_mem = '64kB'");
+            sql.execute("SET LOCAL enable_sort = on");
+            SQLException rejected = assertThrows(SQLException.class, () -> {
+                try (var rows = sql.executeQuery("SELECT repeat(md5(g::text),128) AS value"
+                        + " FROM generate_series(1,10000) AS g ORDER BY value")) {
+                    while (rows.next()) {}
+                }
+            });
+            assertEquals("53400", rejected.getSQLState());
+            pg.rollback();
+            try (var value = sql.executeQuery("SHOW temp_file_limit")) {
+                value.next();
+                assertEquals(original, value.getString(1));
+            }
+        }
+    }
+
+    @Test
     public void actualPgExportUsesBytesAndIndependentVerificationRejectsChangedData() throws Exception {
         String admin = Objects.requireNonNull(System.getenv("SIBENCH_SCHEMA_TEST_JDBC"));
         Path evidence = Files.createDirectory(Path.of(System.getProperty("sibench.layout.evidence")));
@@ -22,8 +52,9 @@ public class PgBaselineExportIntegrationIT {
         Path root = Path.of("").toAbsolutePath();
         var document = ConfigValues.parse(Files.readString(root.resolve("src/test/resources/config/ycsb_1k.yaml")));
         var nativeConfig = ConfigValues.object(document, "native");
-        nativeConfig.put("recordcount", 20000L);
-        nativeConfig.put("insertcount", 20000L);
+        int records = 140_000;
+        nativeConfig.put("recordcount", (long) records);
+        nativeConfig.put("insertcount", (long) records);
         document.put("native", nativeConfig);
         var pgConfig = ConfigValues.object(document, "postgres");
         pgConfig.put("database", database);
@@ -45,8 +76,8 @@ public class PgBaselineExportIntegrationIT {
                         java.util.stream.IntStream.range(0, 10).mapToObj(i -> "field" + i + " TEXT").toList()) + ")");
                 var random = new Random(71);
                 try (var insert = pg.prepareStatement("INSERT INTO usertable VALUES (" + String.join(",", Collections.nCopies(11, "?")) + ")")) {
-                    for (int i = 0; i < 20000; i++) {
-                        insert.setString(1, "user" + String.format(Locale.ROOT, "%08d", (i * 7919) % 20000));
+                    for (int i = 0; i < records; i++) {
+                        insert.setString(1, "user" + String.format(Locale.ROOT, "%08d", (i * 7919) % records));
                         if (i == 1) insert.setString(1, "用户🙂");
                         if (i == 2) insert.setString(1, "user'\\range");
                         for (int c = 0; c < 10; c++) {
@@ -105,7 +136,7 @@ public class PgBaselineExportIntegrationIT {
                 if (i + 1 < files.size()) assertTrue(size >= target);
                 rows += file.get("rows").getAsLong();
             }
-            assertEquals(20000, rows);
+            assertEquals(records, rows);
             Files.move(config.output().resolve("verified-manifest.json"), evidence.resolve("verified-original.json"));
             try (var pg = DriverManager.getConnection(jdbc, "postgres", ""); var sql = pg.createStatement()) {
                 sql.execute("UPDATE usertable SET field0='deliberately wrong' WHERE ycsb_key='user00000000'");
@@ -114,7 +145,8 @@ public class PgBaselineExportIntegrationIT {
             String causes = "";
             for (Throwable error = rejected; error != null; error = error.getCause()) causes += error.getMessage() + "\n";
             assertTrue(causes, causes.contains("Baseline rows differ from the source") || causes.contains("Baseline row mismatch"));
-            Files.writeString(evidence.resolve("result.json"), "{\"status\":\"passed\",\"rows\":20000,\"copy_and_jdbc_byte_identical\":true,\"wrong_pg_value_rejected\":true}\n");
+            Files.writeString(evidence.resolve("result.json"), new Gson().toJson(Map.of("status", "passed",
+                    "rows", records, "copy_and_jdbc_byte_identical", true, "wrong_pg_value_rejected", true)) + "\n");
         } finally {
             if (previousRange == null) System.clearProperty(rangeProperty);
             else System.setProperty(rangeProperty, previousRange);

@@ -157,6 +157,9 @@ public class PgSchemaCheckTest {
                                 "extra", "v", "p", false, false, List.of(), List.of(), List.of())),
                 "Unexpected tables/views");
         var table = valid.get(0);
+        assertTrue(PgSchemaCheck.compare(schema, List.of(new ActualTable(
+                table.name(), "r", "u", false, false, table.columns(), table.indexes(),
+                table.otherConstraints()))).isEmpty());
         for (ActualTable invalid :
                 List.of(
                         new ActualTable(
@@ -171,7 +174,7 @@ public class PgSchemaCheckTest {
                         new ActualTable(
                                 table.name(),
                                 "r",
-                                "u",
+                                "t",
                                 false,
                                 false,
                                 table.columns(),

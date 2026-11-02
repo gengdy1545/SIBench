@@ -13,7 +13,10 @@ import org.sibench.adapters.proto.Result;
 import org.sibench.adapters.proto.Search;
 import org.sibench.adapters.proto.SearchGroup;
 import org.sibench.adapters.proto.Status;
+import org.sibench.adapters.proto.EntryKey;
+import org.sibench.adapters.proto.Value;
 import org.sibench.adapters.proto.ValueKind;
+import org.sibench.adapters.proto.Write;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexOperationTrace.Range;
@@ -220,6 +223,78 @@ public class RocksDbBackendTest {
             same("new identity in secondary", reinsertedResult, backend.search(request.getSearch()), true);
             same("new identity in primary", reinsertedResult,
                     backend.search(requests.request(8, localPrimary).getSearch()), true);
+        }
+    }
+
+    private static void put(RocksDbBackend backend, int index, int value, int pk,
+            long version, long rowId, boolean deleted) throws Exception {
+        var key = EntryKey.newBuilder().setTable(TABLE).setIndex(index)
+                .setPrimaryKey(ByteString.copyFrom(IndexKey.ofInt(pk).bytes()));
+        if (index != 0) key.setIndexedValue(ByteString.copyFrom(IndexKey.ofInt(value).bytes()));
+        backend.write(Write.newBuilder().setKey(key).setVersion(version)
+                .setKind(deleted ? Write.Kind.LOGICAL_DELETE : version == 0 ? Write.Kind.INSERT : Write.Kind.UPSERT)
+                .setValue(Value.newBuilder().setRowId(rowId)).build());
+    }
+
+    private static LookupResult row(int pk, long version, long rowId) {
+        return new LookupResult(IndexKey.ofInt(pk), version, rowId, 0);
+    }
+
+    @Test
+    public void rangesSkipInvisibleEntriesWithoutSkippingTheirVisibleSuccessors() throws Exception {
+        try (var backend = load(List.of(), ValueKind.ROW_ID)) {
+            put(backend, 0, 0, 1, 0, 11, false);
+            put(backend, 0, 0, 1, 2, 12, false);
+            put(backend, 0, 0, 1, 4, 12, true);
+            put(backend, 0, 0, 1, 7, 17, false);
+            put(backend, 0, 0, 2, 5, 25, false); // Entire entry is invisible at version zero.
+            put(backend, 0, 0, 3, 0, 30, false);
+            put(backend, 0, 0, 3, 6, 36, false);
+            put(backend, 0, 0, 4, 0, 40, false);
+            put(backend, 0, 0, 4, 5, 45, false);
+            for (boolean descending : new boolean[] {false, true}) {
+                Range bounds = new Range(IndexKey.ofInt(1), true, IndexKey.ofInt(4), true, descending, 0);
+                var initial = new ArrayList<>(List.of(row(1, 0, 11), row(3, 0, 30), row(4, 0, 40)));
+                var deleted = new ArrayList<>(List.of(row(3, 0, 30), row(4, 0, 40)));
+                var reinserted = new ArrayList<>(List.of(row(1, 7, 17), row(2, 5, 25), row(3, 6, 36), row(4, 5, 45)));
+                // Only our exact version 6 may override the version-zero snapshot.
+                var local = new ArrayList<>(List.of(row(1, 0, 11), row(3, 6, 36), row(4, 0, 40)));
+                if (descending) {
+                    java.util.Collections.reverse(initial); java.util.Collections.reverse(deleted);
+                    java.util.Collections.reverse(reinserted); java.util.Collections.reverse(local);
+                }
+                same("initial", initial, backend.search(search(0, bounds, 0)), true);
+                same("tombstone hides older rows", deleted, backend.search(search(0, bounds, 4)), true);
+                same("reinserted identity", reinserted, backend.search(search(0, bounds, 7)), true);
+                same("local overlay", local, backend.search(search(0, bounds, 0).toBuilder().setLocalVersion(6).build()), true);
+                same("limit counts visible rows", initial.subList(0, 2),
+                        backend.search(search(0, bounds, 0).toBuilder().setLimit(2).build()), true);
+                Range exclusive = new Range(IndexKey.ofInt(1), false, IndexKey.ofInt(4), false, descending, 0);
+                same("invisible lower entry then visible successor", List.of(row(3, 0, 30)),
+                        backend.search(search(0, exclusive, 0)), true);
+            }
+        }
+    }
+
+    @Test
+    public void secondaryVersionSkippingKeepsValueAndPrimaryKeyTogether() throws Exception {
+        try (var backend = load(List.of(), ValueKind.ROW_ID)) {
+            put(backend, 1, 10, 1, 0, 11, false);
+            put(backend, 1, 10, 1, 4, 11, true);
+            put(backend, 1, 20, 1, 7, 17, false);
+            put(backend, 1, 10, 2, 5, 25, false);
+            put(backend, 1, 10, 3, 0, 30, false);
+            put(backend, 1, 20, 4, 0, 40, false);
+            for (boolean descending : new boolean[] {false, true}) {
+                Range all = new Range(IndexKey.ofInt(10), true, IndexKey.ofInt(20), true, descending, 0);
+                var initial = new ArrayList<>(List.of(row(1, 0, 11), row(3, 0, 30), row(4, 0, 40)));
+                var latest = new ArrayList<>(List.of(row(2, 5, 25), row(3, 0, 30), row(1, 7, 17), row(4, 0, 40)));
+                if (descending) { java.util.Collections.reverse(initial); java.util.Collections.reverse(latest); }
+                same("initial secondary", initial, backend.search(search(1, all, 0)), true);
+                same("same PK moves between secondary entries", latest, backend.search(search(1, all, 7)), true);
+                same("secondary limit", latest.subList(0, 2),
+                        backend.search(search(1, all, 7).toBuilder().setLimit(2).build()), true);
+            }
         }
     }
 

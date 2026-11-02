@@ -86,8 +86,7 @@ public final class BaselineOperations {
      * thread of its own and only for the row identity and the indexed columns; their rows are then
      * encoded in runs by a pool, a bounded number of runs ahead, and handed over in order. A row's
      * position, row identity and work unit follow from the rows before it, so the stream is the
-     * one a single reader produces. (Decoding a whole group per task with a bounded queue each
-     * stalled every group but the one being consumed: the load was derived by one thread.)
+     * one a single reader produces.
      */
     static Extent derive(Path baseline, IndexCatalog catalog, IndexOperationTrace.Consumer consumer, Rows rows)
             throws IOException {
@@ -372,14 +371,14 @@ public final class BaselineOperations {
     public static IndexOperationTrace.Source of(Path trace) {
         return consumer -> {
             JsonObject manifest = JsonParser.parseString(Files.readString(trace.resolve("manifest.json"))).getAsJsonObject();
-            for (String field : java.util.List.of("baseline_directory", "baseline_trace_sha256", "baseline_operations", "baseline_verified_manifest_sha256"))
+            for (String field : java.util.List.of("baseline_directory", "baseline_trace_sha256", "baseline_operations", "baseline_manifest_sha256"))
                 if (!manifest.has(field)) throw new IOException("Trace manifest cannot derive its baseline load: " + field);
             Path baseline = Path.of(manifest.get("baseline_directory").getAsString());
-            if (!FileDigests.sha256(baseline.resolve("verified-manifest.json"))
-                    .equals(manifest.get("baseline_verified_manifest_sha256").getAsString()))
+            if (!FileDigests.sha256(baseline.resolve("baseline-manifest.json"))
+                    .equals(manifest.get("baseline_manifest_sha256").getAsString()))
                 throw new IOException("The baseline is not the one the trace was compiled with: " + baseline);
             try {
-                PgBaselineVerify.verifyFiles(baseline);
+                BaselineManifest.verifyFiles(baseline);
             } catch (IOException error) {
                 throw error;
             } catch (Exception error) {

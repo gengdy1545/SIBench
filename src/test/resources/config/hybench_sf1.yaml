@@ -19,7 +19,6 @@ postgres:
   version: '14.24'
   port: 5432
   database: fixture_hybench_capture
-  clone_from: fixture_hybench_base
   user: postgres
   isolation: read_committed
   max_parallel_workers_per_gather: 0

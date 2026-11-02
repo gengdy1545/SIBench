@@ -36,7 +36,6 @@ postgres:
   version: '14.24'
   port: 55433
   database: sibench_sysbench_capture
-  clone_from: sibench_sysbench_base
   user: postgres
   isolation: read_committed
   max_parallel_workers_per_gather: 0

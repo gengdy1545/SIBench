@@ -192,7 +192,7 @@ public class ChangeKindsTest {
         long k = 0;
         for (int t = 0; t < 40; t++) {
             var lines = new ArrayList<String>();
-            for (int i = 0; i < 200; i++) {
+            for (int i = 0; i < (t < 2 ? ChangeKinds.BATCH_ITEMS * 2 + 3 : 200); i++) {
                 long id = random.nextInt(50);
                 JsonObject change =
                         switch (random.nextInt(3)) {
@@ -226,5 +226,16 @@ public class ChangeKindsTest {
         assertEquals(0L, ChangeKinds.countTraces(sysbench(), List.of(aborted)).total().ordinaryColumnUpdates());
         Path committed = RowAuditTestSupport.writeTrace(directory.resolve("pg-2.jsonl.zst"), List.of(rewrite.toString(), event("transaction_commit").toString()));
         assertThrows(IOException.class, () -> ChangeKinds.countTraces(sysbench(), List.of(committed)));
+    }
+
+    @Test(timeout = 10_000)
+    public void aReaderFailureDoesNotLeaveTheConsumerWaitingForABatch() throws Exception {
+        Path directory = folder.newFolder("broken").toPath();
+        Path trace = RowAuditTestSupport.writeTrace(directory.resolve("pg-1.jsonl.zst"),
+                List.of("{\"event\":\"row_change\",broken"));
+        assertThrows(com.google.gson.JsonParseException.class,
+                () -> ChangeKinds.countTraces(sysbench(), List.of(trace)));
+        assertThrows(IOException.class,
+                () -> ChangeKinds.countTraces(sysbench(), List.of(directory.resolve("missing.zst"))));
     }
 }

@@ -31,6 +31,16 @@ public class SibenchConfigTest {
     }
 
     @Test
+    public void publicPostgresConfigurationSupportsDisposableGeneration() throws Exception {
+        Path output = temporary.getRoot().toPath().resolve("postgres.conf");
+        SibenchConfig.writePostgres(Path.of("config/sibench.yaml"), output);
+        String settings = Files.readString(output);
+        assertTrue(settings.contains("fsync = 'off'\n"));
+        assertTrue(settings.contains("full_page_writes = 'off'\n"));
+        assertTrue(settings.contains("restart_after_crash = 'off'\n"));
+    }
+
+    @Test
     public void postgresSettingsAreEscapedAndNeverOverwriteAnExistingFile() throws Exception {
         var settings = new LinkedHashMap<String, Object>();
         settings.put("timezone", "O'Reilly\\Lab");

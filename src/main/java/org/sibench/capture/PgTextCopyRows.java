@@ -13,6 +13,7 @@ final class PgTextCopyRows implements PgBaselineExport.Rows {
     private final DataInputStream input;
     private final int columns;
     private boolean ended;
+    private long rowBytes;
 
     PgTextCopyRows(InputStream input, int columns) throws IOException {
         this.input = new DataInputStream(input);
@@ -32,16 +33,22 @@ final class PgTextCopyRows implements PgBaselineExport.Rows {
             return null;
         }
         if (count != columns) throw new IOException("PG binary COPY column count changed");
+        rowBytes = 2L + columns * 4L;
         String[] row = new String[columns];
         for (int column = 0; column < columns; column++) {
             int length = input.readInt();
             if (length == -1) continue;
             if (length < 0 || length >= 1 << 30)
                 throw new IOException("Invalid PG binary COPY text length");
+            rowBytes += length;
             byte[] bytes = input.readNBytes(length);
             if (bytes.length != length) throw new EOFException("Truncated PG binary COPY value");
             row[column] = new String(bytes, StandardCharsets.UTF_8);
         }
         return row;
+    }
+
+    long rowBytes() {
+        return rowBytes;
     }
 }

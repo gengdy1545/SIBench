@@ -1,83 +1,83 @@
-# Index Service 契约
+# Index Service contract
 
-协议命名空间为 `sibench.index`，定义在 `src/main/proto/index_service.proto`。驱动和服务由同一提交统一构建；服务按事务位置执行并连续发布完整提交，输入使用规范 Trace。
+The protocol namespace is `sibench.index`, defined in `src/main/proto/index_service.proto`. The driver and service are built together from the same commit. The service executes operations by transaction position and publishes complete commits as a contiguous sequence, using canonical Trace inputs.
 
-## 接口与确认边界
+## Interfaces and acknowledgment boundaries
 
-| 接口 | 语义 |
+| Interface | Semantics |
 | --- | --- |
-| `Describe` | 声明 value 种类、按版本读取、同版本覆盖、事务内读、查询组、完整提交发布、Baseline 批量写及确认 / Flush 持久化层级。驱动拒绝缺少完整提交发布或不支持输入所需能力的服务。 |
-| `Execute` | 每个 client 一条双向流；初始 metadata `sibench-index-binding` 必须携带本次 Trace / value / 二级配置的 binding，服务在接收请求前核对并绑定索引；请求 id 在流内唯一，响应按 id 配对，可以乱序完成。服务按 `transaction_id` / `transaction_operation` 执行同一事务，不同事务可并行；连接到达顺序不能决定版本可见性。 |
-| `Flush` | 等待已接受请求到达声明的持久化层级，记录完整发布水位与 Trace binding，返回索引位置。用作加载、workload 和恢复边界，不作为驱动补救查询顺序的逐请求屏障。 |
+| `Describe` | Declares value types, versioned reads, overwrites at the same version, transaction-local reads, query groups, complete-commit publication, Baseline batch writes, and acknowledgment / Flush durability levels. The driver rejects services that lack complete-commit publication or capabilities required by the input. |
+| `Execute` | One bidirectional stream per client. Initial metadata `sibench-index-binding` must carry the binding for this Trace, value mode, and secondary-index configuration. The service checks it and binds the index before accepting requests. Request IDs are unique within a stream; responses match by ID and may complete out of order. Operations within a transaction execute according to `transaction_id` / `transaction_operation`; different transactions may run in parallel. Connection arrival order cannot determine version visibility. |
+| `Flush` | Waits for accepted requests to reach the declared durability level, records the complete publication watermark and Trace binding, and returns the index location. It defines load, workload, and recovery boundaries; the driver does not use it as a per-request barrier to repair query ordering. |
 
-`Describe` 使用 `replay.request_timeout_seconds`；`Flush` 的客户端期限与服务端请求排空期限均为 3,600 秒。任何已接受请求失败都会使 Flush 失败；驱动另核对返回 binding、精确发布水位和非空索引位置。
+`Describe` uses `replay.request_timeout_seconds`. Both the client deadline for `Flush` and the server's request-drain deadline are 3,600 seconds. Any failed accepted request makes Flush fail. The driver also checks the returned binding, exact publication watermark, and nonempty index location.
 
-写入结果未知时不自动重试。`INVALID` 表示请求违反契约；`UNAVAILABLE` 表示执行失败，写入可能已经生效。首次错误、之后的排空与进程清理分别记录。
+Writes with unknown outcomes are not retried automatically. `INVALID` means the request violates the contract; `UNAVAILABLE` means execution failed and a write may already have taken effect. The first error, subsequent drain, and process cleanup are recorded separately.
 
-实际 gRPC 请求的本地发送完成由 `ClientStreamTracer.outboundMessageSent` 确认序列化并交给 transport；`StreamObserver.onNext` 返回本身不作为发送完成依据。发送完成与服务响应分别等待；合批 / 成组前的逻辑成员不计作独立 RPC。驱动容量诊断复用原 Trace 的完整事务前缀和真实完整响应，并执行同一逐查询摘要核对；有限前缀不等于持续负载或索引吞吐上限。
+For actual gRPC requests, `ClientStreamTracer.outboundMessageSent` confirms local send completion after serialization and handoff to the transport. A return from `StreamObserver.onNext` alone does not establish send completion. Send completion and service responses are awaited separately. Logical members awaiting batching or grouping are not counted as separate RPCs. Driver capacity diagnostics reuse a transaction-complete prefix of the original Trace and actual complete responses, applying the same per-query digest checks. A finite prefix does not establish sustained load or the index throughput limit.
 
-## 数据、事务与读取
+## Data, transactions, and reads
 
-索引条目为 `(table, index, indexed_value, PK)`；主键索引 `index=0` 没有 indexed value。键组件使用 `IndexKey` 的保序编码。value 为 RowID，或两个完整 int64 的 Locator `(file, position)`；两种模式的能力分别核验。
+An index entry is `(table, index, indexed_value, PK)`; the primary index, `index=0`, has no indexed value. Key components use `IndexKey`'s order-preserving encoding. Values are either RowIDs or Locators `(file, position)` containing two full int64 values. Capabilities are checked separately for each mode.
 
-| 操作 | 约束 |
+| Operation | Constraints |
 | --- | --- |
-| Baseline `INSERT` | version 0；不写 WAL，到 Flush 才保证声明的持久化。允许 `WriteBatch`，整批先验证，非法成员使整批失败；共享批量完成状态时，在途额度、完成数和延迟仍按成员计，采用批内最早期限。 |
-| `UPSERT` / `LOGICAL_DELETE` | 按新版本写入；同键同版本按事务内位置覆盖。删除保留不可见版本，不能使旧值复活。 |
-| `RELOCATE` | 必须命中已有精确版本，改变物理位置而不创造逻辑版本；不表示完整 Rewrite / GC 协议已实现。 |
-| `Search` | 在 read_version 选择不高于读点的最新未删除版本；支持主键 / 二级范围、开闭界、方向、limit 及钉住 PK 的二级查找。结果按索引值、PK 排序，倒序时反转。 |
-| 事务内 `Search` | read_version 保留原语句快照，local_version 指定本事务的精确版本，只叠加更早 transaction_operation 的本事务写入；其它中间提交不可见。 |
-| `SearchGroup` | 同一源访问的成员在服务端按 PK 求交或并；交集沿首成员顺序，并集保留首出现顺序。成员必须有相同 table、读取点和组身份。 |
-| `Commit` | 声明事务版本、实际已发送写入数与操作数；操作数包含查询、组和写入，过滤后的空事务也有提交标记。 |
+| Baseline `INSERT` | Version 0; bypasses WAL, with declared durability guaranteed only after Flush. `WriteBatch` is allowed. The entire batch is validated first, and an invalid member fails the batch. When a batch shares completion state, in-flight budgets, completion counts, and latency remain per member, using the earliest deadline in the batch. |
+| `UPSERT` / `LOGICAL_DELETE` | Writes at a new version. Operations on the same key and version overwrite according to transaction position. Deletion retains an invisible version and must not resurrect older values. |
+| `RELOCATE` | Must match an existing exact version. Changes its physical location without creating a logical version. This does not imply that the full Rewrite / GC protocol is implemented. |
+| `Search` | At read_version, selects the latest version at or below the read point, omitting entries whose selected version is deleted. Supports primary / secondary ranges, inclusive and exclusive bounds, direction, limit, and secondary lookups pinned to a PK. Results are ordered by indexed value and PK, reversed for descending queries. |
+| Transaction-local `Search` | read_version preserves the original statement snapshot; local_version identifies this transaction's exact version. Only writes from earlier transaction_operation positions in the same transaction are overlaid. Other intervening commits remain invisible. |
+| `SearchGroup` | The server intersects or unions members of the same source access by PK. Intersection follows the first member's order; union preserves first-occurrence order. Members must share the table, read point, and group identity. |
+| `Commit` | Declares the transaction version and actual sent write and operation counts. Operations include queries, groups, and writes. Transactions made empty by filtering still have commit markers. |
 
-发布版本 V 必须同时满足：提交标记已收到、该事务所有操作完成、写入数一致、V−1 已发布。最大已见版本不能替代连续完整水位。快照读等待 read_version 发布；事务内读还等待同一事务更早的位置。
+Publishing version V requires its commit marker, completion of all its operations, matching write counts, and publication of V−1. The maximum observed version cannot replace the contiguous complete watermark. Snapshot reads wait for publication of read_version; transaction-local reads also wait for earlier positions in the same transaction.
 
-已发布版本的迟到写入、跨事务复用版本、pending / executing 重复位置在接触后端前拒绝，不允许返回失败后仍改变状态。已完成事务 lane 释放，用位图保留拒绝迟到请求所需的身份；位图仍随最大 transaction_id 增长，未实现前缀回收。
+Late writes to published versions, version reuse across transactions, and duplicate pending / executing positions are rejected before reaching the backend. Requests must not change state after returning such a failure. Completed transaction lanes are released, retaining the identities needed to reject late requests in a bitmap. The bitmap still grows with the maximum transaction_id; prefix reclamation is not implemented.
 
-## 结果与校验
+## Results and validation
 
-普通查询每 16,384 条结果分块返回，`more=true` 表示后续仍有同 id 的块；仅最后一块携带最终状态。服务遵守 gRPC 流控，驱动逐块累积摘要，不保留整个普通查询结果。查询组仍整体物化，其大规模容量未证明。
+Ordinary queries return chunks of 16,384 results. `more=true` indicates another chunk with the same ID; only the last chunk carries the final status. The service respects gRPC flow control, and the driver accumulates digests chunk by chunk without retaining the entire ordinary query result. Query groups are fully materialized, so their memory requirements grow with member results and require capacity validation for the intended workload.
 
-每个查询校验原生期望条数及有序 SHA-256，摘要包含源查询身份、范围 / 钉住键、读取点、事务位置和完整 `(PK, version, value)`；Locator 的两个 int64 都参与。错键、错版本、错 value、顺序变化、跨查询交换、丢块和未核对响应都必须失败。
+Each query checks the native expected count and an ordered SHA-256 digest. The digest includes source query identity, range / pinned key, read point, transaction position, and complete `(PK, version, value)` results, including both int64 fields of a Locator. Wrong keys, versions, or values, changed order, results swapped between queries, missing chunks, and unchecked responses must all fail.
 
-参考 sidecar 的头部绑定 Baseline / workload Trace、value 和二级过滤配置，文件 SHA-256 与参考报告一致。显式提供的参考报告必须包含当前逐查询摘要；缺失时拒绝，不退回全局 XOR。未提供参考报告时，可调用同一 Java 参考回放生成期望。组合矩阵比较 `query_digest_sha256`，另保留最终状态、选中版本和操作顺序的独立校验职责。
+Service replay requires an explicit reference report from `replay` or `validate-snapshots`, including its per-query digest sidecar. The sidecar header binds the Baseline / workload Trace, value mode, and secondary-index filtering configuration; its file SHA-256 must match the report. Missing reports or per-query digests are rejected before replay. Configuration matrices compare `query_digest_sha256` while retaining independent checks of final state, selected versions, and operation order.
 
-`request_bytes` 累计 `Request.getSerializedSize()`（含批请求）；`result_bytes` 累计 `Result.getSerializedSize()`，在收到最终响应并核对条数后计入。不包含响应外层、重复字段标签 / 长度、空响应、gRPC / HTTP2 / TCP 开销或重传，不作为网络字节。
+`request_bytes` sums `Request.getSerializedSize()`, including batch requests. `result_bytes` sums `Result.getSerializedSize()`, accounted after the final response arrives and its count is verified. These counters exclude response envelopes, repeated-field tags / lengths, empty responses, gRPC / HTTP2 / TCP overhead, and retransmissions; they do not measure network bytes.
 
-## 发布执行与恢复
+## Publication, execution, and recovery
 
-`IndexServer` 和进程内 adapter 均使用 `PublishedIndex`。未就绪请求挂在事务 lane 或按版本索引的等待表上，不占工作线程；就绪后写入 / commit 交给固定 worker 池，查询使用独立线程池，后端调用与响应回调不持有排序锁。Baseline 无需事务排序，可并行加载。
+`IndexServer` and the in-process adapter both use `PublishedIndex`. Requests that are not ready wait on transaction lanes or version-indexed wait tables without occupying workers. Ready writes / commits use a fixed worker pool; queries use a separate pool. Backend calls and response callbacks do not hold the ordering lock. Baseline needs no transaction ordering and may load in parallel.
 
-`Flush` 等待调用开始时已接受的请求完成，再将发布水位与 Trace binding 写入索引，与数据一起持久化。相同索引拒绝另一份 Trace 或 value / 二级配置的 binding。最小 index manifest 与报告同目录，包含输入身份、版本覆盖、键 / value 编码、后端位置、构建与摘要依据；source snapshot 未接入时为 N/A。
+`Flush` waits for requests accepted before the call began, then writes the publication watermark and Trace binding into the index and persists them with the data. An index rejects a binding for another Trace, value mode, or secondary-index configuration. A minimal index manifest beside the report records input identity, version coverage, key / value encoding, backend location, build identity, and digest provenance. Source snapshot is N/A until integrated.
 
-`reopen: true` 打开已有索引并恢复最后一次 Flush 的水位；该水位以上的版本不可见。`verify-service` 按原读点核对全部可重放快照查询，事务内查询单列不核对；它们依赖运行中的事务前缀，不能在事务结束后伪造重放。
+`reopen: true` opens an existing index and restores the last Flush watermark; versions above it remain invisible. `verify-service` checks all replayable snapshot queries at their original read points. Transaction-local queries are reported separately and excluded from this check because they depend on live transaction prefixes that cannot be reconstructed by replay after the transaction has ended.
 
-## RocksDB 实现
+## RocksDB implementation
 
-`RocksDbBackend` 的键布局为 `table(u32) ++ index(u32) ++ [indexed_value] ++ PK ++ ~version(u64)`，同一 entry 的版本从新到旧相邻。按版本定位到不高于读点的最新版本；事务内读先取该精确 local_version，不存在才回退快照。Baseline 不写 WAL，其余写入走本地 WAL、不 fsync。
+`RocksDbBackend` uses the key layout `table(u32) ++ index(u32) ++ [indexed_value] ++ PK ++ ~version(u64)`, placing an entry's versions next to each other from newest to oldest. Reads locate the latest version at or below the read point. Transaction-local reads first select the exact local_version, falling back to the snapshot only when it does not exist. Baseline bypasses WAL; other writes use the local WAL without fsync.
 
-服务与回放模板为 [rocksdb.yaml](../config/index/rocksdb.yaml) 和 [sibench.yaml](../config/sibench.yaml)，默认 row_id。进程内回放使用 `target.service.adapter: rocksdb` 和新的 `target.service.path`。Locator 是另一种 value，双方配置必须一致。
+Service and replay templates are [rocksdb.yaml](../config/index/rocksdb.yaml) and [sibench.yaml](../config/sibench.yaml), defaulting to row_id. In-process replay uses `target.service.adapter: rocksdb` and a fresh `target.service.path`. Locator is another value mode; both sides must agree on the configuration.
 
-## rocksdb-cloud 后端
+## rocksdb-cloud backend
 
-薄 JNI 只转发字节，复用同一 Java 键布局、版本选择与发布逻辑。构建与加载方法见 [README](../README.md#rocksdb-cloud-jni)。
+The thin JNI layer forwards bytes and reuses the same Java key layout, version selection, and publication logic. See [README](../README.md#rocksdb-cloud-jni) for build and loading instructions.
 
-服务配置选择 `service.backend: rocksdb_cloud`，并设置 `service.storage: config/index/storage.yaml`、`service.profile` 和 profile prefix 下的独立 `service.object_path`，凭据只从环境读取。云后端通过索引服务接入，进程内 adapter 当前仅支持本地 RocksDB。COS bucket 是占位值，运行前替换为自己的 bucket、endpoint 和 region；服务不自动建桶，local_s3 与 COS 需分别核验。
+Select `service.backend: rocksdb_cloud` and set `service.storage: config/index/storage.yaml`, `service.profile`, and an independent `service.object_path` under the profile prefix. Credentials come only from the environment. The cloud backend is accessed through the index service; the in-process adapter currently supports only local RocksDB. The COS bucket is a placeholder; replace the bucket, endpoint, and region before running. The service does not create buckets automatically. Validate local_s3 and COS separately.
 
-| 项目 | 语义 |
+| Item | Semantics |
 | --- | --- |
-| 写确认 | memtable + 本地 WAL，不 fsync；Baseline 不写 WAL。 |
-| Flush | SST / MANIFEST 上传并确认后返回，保证最后一次 Flush 前远端持久；之后的写入可能只在本地。 |
-| 冷启动 | `keep_local_sst_files=true`；丢失本地目录后从 bucket 下载所需 SST，未上传的 WAL 不可恢复。 |
-| 删除 | 不自动建桶；`run_purger=false`，普通过期 / 不可见文件删除默认延迟 1 h；桶字节可暂时高于本地。不是逻辑版本 GC。 |
-| 计量 | 每次 Flush 写入 `<index>.engine-stats.jsonl`；本地后端对象请求为 N/A。 |
+| Write acknowledgment | memtable + local WAL, without fsync; Baseline bypasses WAL. |
+| Flush | Returns after SST / MANIFEST uploads are acknowledged, guaranteeing remote durability through the last Flush. Later writes may exist only locally. |
+| Cold start | `keep_local_sst_files=true`. After loss of the local directory, required SSTs are downloaded from the bucket. WAL that was not uploaded cannot be recovered. |
+| Deletion | No automatic bucket creation. `run_purger=false`; ordinary expired / invisible file deletion is delayed by 1 h by default. Bucket bytes may temporarily exceed local bytes. This is not logical version GC. |
+| Measurement | Each Flush writes `<index>.engine-stats.jsonl`. Object requests are N/A for the local backend. |
 
-对象请求按类型记录次数、失败数、字节、累计微秒及固定 32 桶直方图，上界为 1、2、4…2^30 μs，最后一桶溢出；`overflow_after=2^30`、溢出上界 `Long.MAX_VALUE`。p50 / p95 / p99 为最近秩所在桶的上界；成功、失败都计入，samples=0 不解释分位数。并发快照不是事务性的，分位数按直方图自身 samples 计算。回调不单列 SDK 内部 HTTP 重试，累计并行时间不能加到 wall。
+Object requests record counts, failures, bytes, cumulative microseconds, and a fixed 32-bucket histogram by request type. Upper bounds are 1, 2, 4…2^30 μs, with the final bucket handling overflow: `overflow_after=2^30`, with overflow upper bound `Long.MAX_VALUE`. p50 / p95 / p99 are the upper bounds of the buckets containing their nearest ranks. Both successes and failures contribute; percentiles are not interpreted when samples=0. Concurrent snapshots are not transactional, and percentiles use each histogram's own sample count. Callbacks do not separately report SDK-internal HTTP retries. Cumulative parallel time cannot be added to wall time.
 
-Java / JNI 的统计格式必须配套，缺少直方图的 JNI 在打开时拒绝；不保留旧格式分支。`summarize_index_run.py` 分别汇总通过核对的服务报告和所提供 `EVENT_LOG_v1` 的 flush / compaction 观测，记录文件与脚本 SHA。它无法证明日志属于报告的同一次运行：带日志的合并分析标为 `unverified_engine_provenance`，不可据此宣称性能验收通过；需要独立的同次运行记录。job 时间不等于进程 CPU，sequence number 不等于用户键范围，缺少日志为 N/A。
+Java and JNI statistics formats must match. JNI builds without the required histograms are rejected at open. `summarize_index_run.py` separately summarizes verified service reports and flush / compaction observations from supplied `EVENT_LOG_v1` logs, recording file and script SHA digests. It cannot establish that a log belongs to the report's run: combined analysis with logs is marked `unverified_engine_provenance` and cannot establish performance acceptance without independent same-run records. Job time is not process CPU time, sequence numbers are not user-key ranges, and missing logs are N/A.
 
-## 验证边界
+## Validation boundaries
 
-基础检查入口见 [README](../README.md#测试)。服务验收须在相同 Trace 上执行加载、完整回放、逐查询核对及 Flush，再检查重开后的原快照查询。云后端另检查本地目录丢失后的 bucket 冷启动、Flush 前后故障的正反例。资源与正确性报告必须来自同次运行；短测或存储接口检查不证明恢复与容量上限。
+See [README](../README.md#tests) for basic check entry points. Service acceptance requires loading, complete replay, per-query checking, and Flush on the same Trace, followed by checks of the original snapshot queries after reopening. Cloud backends additionally require bucket cold-start checks after local-directory loss and positive / negative failure cases around Flush. Resource and correctness reports must come from the same run. Short tests or storage-interface checks do not establish recovery behavior or capacity limits.
 
-尚未实现数据文件 Rewrite、物理版本 GC、未知写入的恢复重试和完整 source snapshot 生命周期；目标规模崩溃恢复、巨大查询组和正式后端性能排名尚未验收。测试、短输入和存储接口检查不能替代这些范围的独立验证。
+Data-file Rewrite, physical version GC, recovery retries for writes with unknown outcomes, and the complete source-snapshot lifecycle are not implemented. Target-scale crash recovery, query-group capacity, and backend performance comparisons require separate validation with matching input, configuration and build identities. Unit tests, short inputs, and storage-interface checks do not establish those guarantees.

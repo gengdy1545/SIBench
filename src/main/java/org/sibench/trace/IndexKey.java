@@ -103,6 +103,15 @@ public final class IndexKey implements Comparable<IndexKey> {
         return checked(bytes.clone());
     }
 
+    /** Reads one component into owned storage without copying a temporary byte array. */
+    public static IndexKey decode(ByteBuffer source, int length) throws IOException {
+        if (length < 1 || length > MAX_BYTES || length > source.remaining())
+            throw new IOException("Invalid key length");
+        byte[] bytes = new byte[length];
+        source.get(bytes);
+        return checked(bytes);
+    }
+
     private static IndexKey checked(byte[] bytes) throws IOException {
         if (bytes.length > MAX_BYTES) throw new IOException("Key exceeds " + MAX_BYTES + " bytes");
         boolean valid =

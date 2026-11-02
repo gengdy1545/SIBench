@@ -2,7 +2,6 @@ package org.sibench.analysis;
 
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 
 import org.sibench.capture.BaselineOperations;
 import org.sibench.capture.IndexCatalog;
@@ -13,6 +12,7 @@ import org.sibench.config.ConfigValues;
 import org.sibench.state.ExternalSort;
 import org.sibench.trace.IndexKey;
 import org.sibench.trace.KeyHash;
+import org.sibench.trace.TraceManifest;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -131,21 +131,16 @@ public final class UpdateLocality {
         Files.createDirectories(output);
         Files.writeString(output.resolve("INCOMPLETE"), "analysis not committed\n");
         var config = Config.read(configFile);
-        var manifest =
-                JsonParser.parseString(Files.readString(trace.resolve("manifest.json")))
-                        .getAsJsonObject();
-        if (!manifest.has("workload_trace_sha256"))
-            throw new IOException("Workload trace identity missing from its manifest");
+        var manifest = TraceManifest.read(trace);
         var catalog = IndexCatalog.fromManifest(manifest);
-        long baselineRows = manifest.has("baseline_rows") ? manifest.get("baseline_rows").getAsLong() : -1;
-        long baselineOperations =
-                manifest.has("baseline_operations") ? manifest.get("baseline_operations").getAsLong() : -1;
+        long baselineRows = manifest.get("baseline_rows").getAsLong();
+        long baselineOperations = manifest.get("baseline_operations").getAsLong();
         RunTiming.current().measure(output);
         var layouts = buildLayout(trace, catalog, config, output.resolve("sort"), baselineOperations);
         var analysis = analyze(trace, manifest, catalog, layouts, baselineRows, config, output);
         var summary = new LinkedHashMap<String, Object>();
         summary.put("status", "complete_for_declared_layout");
-        summary.put("benchmark", manifest.has("benchmark") ? manifest.get("benchmark").getAsString() : "unknown");
+        summary.put("benchmark", manifest.get("benchmark").getAsString());
         summary.put("trace", trace.toAbsolutePath().normalize().toString());
         summary.put("manifest_workload_operations", manifest.get("workload_operations").getAsLong());
         summary.put("manifest_baseline_operations", baselineOperations);
@@ -192,7 +187,7 @@ public final class UpdateLocality {
                                 System.arraycopy(key, 0, record, 8, key.length);
                                 sort.add(record, new byte[0]);
                             });
-            if (expectedOperations >= 0 && sort.count() != expectedOperations)
+            if (sort.count() != expectedOperations)
                 throw new IOException(
                         "Baseline operation count differs from manifest: "
                                 + sort.count()

@@ -18,6 +18,78 @@ public class PgBaselineExportTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     @Test
+    public void prefetchByteBudgetRejectsRowsOverTheCreditLimit() throws Exception {
+        assertEquals(28, PgBaselineExport.prefetchCost(28, 28));
+        assertThrows(java.io.IOException.class, () -> PgBaselineExport.prefetchCost(28, 27));
+        assertThrows(java.io.IOException.class,
+                () -> PgBaselineExport.prefetchCost(1L + Integer.MAX_VALUE, Integer.MAX_VALUE));
+    }
+
+    @Test(timeout = 10_000)
+    public void failedPrefetchWakesAWaitingConsumerAndPreservesTheFirstError() throws Exception {
+        var sessionClass = Class.forName("org.sibench.capture.PgBaselineExport$Session");
+        var sessionConstructor = sessionClass.getDeclaredConstructors()[0];
+        sessionConstructor.setAccessible(true);
+        var rowsClass = Class.forName("org.sibench.capture.PgBaselineExport$PrefetchRows");
+        var rowsConstructor = rowsClass.getDeclaredConstructors()[0];
+        rowsConstructor.setAccessible(true);
+        var rangeClass = Class.forName("org.sibench.capture.PgBaselineExport$PrefetchRows$Range");
+        var rangeConstructor = rangeClass.getDeclaredConstructors()[0];
+        rangeConstructor.setAccessible(true);
+        var read = rangeClass.getDeclaredMethod("read");
+        var take = rangeClass.getDeclaredMethod("take");
+        read.setAccessible(true);
+        take.setAccessible(true);
+        for (boolean failFirst : List.of(false, true)) {
+            var error = new java.sql.SQLException("deliberate source connection failure");
+            PgBaselineVerify.Connections connections = () -> { throw error; };
+            Object session = sessionConstructor.newInstance(connections, "unused", new java.util.concurrent.ConcurrentLinkedQueue<>());
+            try (var rows = (AutoCloseable) rowsConstructor.newInstance(session, null, 1)) {
+                Object range = rangeConstructor.newInstance(rows, null, "user2", 2, 128);
+                var consumer = java.util.concurrent.Executors.newSingleThreadExecutor();
+                try {
+                    if (failFirst) read.invoke(range);
+                    var started = new java.util.concurrent.CountDownLatch(1);
+                    var thread = new java.util.concurrent.atomic.AtomicReference<Thread>();
+                    var result = consumer.submit(() -> {
+                        thread.set(Thread.currentThread());
+                        started.countDown();
+                        return take.invoke(range);
+                    });
+                    assertTrue(started.await(1, java.util.concurrent.TimeUnit.SECONDS));
+                    if (!failFirst) {
+                        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
+                        while (thread.get().getState() != Thread.State.WAITING && System.nanoTime() < deadline)
+                            Thread.yield();
+                        assertEquals(Thread.State.WAITING, thread.get().getState());
+                        assertFalse(result.isDone());
+                        read.invoke(range);
+                    }
+                    var failed = assertThrows(java.util.concurrent.ExecutionException.class,
+                            () -> result.get(3, java.util.concurrent.TimeUnit.SECONDS));
+                    assertSame(error, failed.getCause().getCause());
+                } finally {
+                    consumer.shutdownNow();
+                }
+            }
+        }
+    }
+
+    @Test
+    public void primaryReadRejectsSortsAndOtherIndexes() throws Exception {
+        PgBaselineExport.requirePrimaryPlan(com.google.gson.JsonParser.parseString(
+                "{\"Node Type\":\"Index Scan\",\"Index Name\":\"usertable_pkey\"}").getAsJsonObject(), "usertable_pkey");
+        for (String plan : List.of(
+                "{}",
+                "{\"Node Type\":\"Seq Scan\"}",
+                "{\"Node Type\":\"Bitmap Heap Scan\"}",
+                "{\"Node Type\":\"Sort\",\"Plans\":[{\"Node Type\":\"Index Scan\",\"Index Name\":\"usertable_pkey\"}]}",
+                "{\"Node Type\":\"Index Scan\",\"Index Name\":\"another_index\"}"))
+            assertThrows(java.io.IOException.class, () -> PgBaselineExport.requirePrimaryPlan(
+                    com.google.gson.JsonParser.parseString(plan).getAsJsonObject(), "usertable_pkey"));
+    }
+
+    @Test
     public void groupsDoNotBecomeFilesAndFileIdsDoNotDependOnWorkerOrder() throws Exception {
         Path output = temporary.newFolder().toPath();
         var config = ParquetDataFileTest.layout(output, 192 * 1024, 5);

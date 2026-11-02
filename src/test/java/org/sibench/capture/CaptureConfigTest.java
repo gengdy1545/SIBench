@@ -12,7 +12,6 @@ public class CaptureConfigTest {
         Path root = Path.of("").toAbsolutePath();
         var c = CaptureConfig.read(root, Path.of("src/test/resources/config/hybench_sf1.yaml"));
         assertEquals(536870912, c.layout().targetBytes());
-        assertEquals("fixture_hybench_base", c.cloneFrom());
         var p = c.nativeProperties();
         assertFalse(p.containsKey("tp3_percent"));
         assertEquals("1", p.getProperty("apclient"));
@@ -37,4 +36,18 @@ public class CaptureConfigTest {
             Files.delete(invalid);
         }
     }
+    @Test
+    public void rejectsDatabaseReuseConfiguration() throws Exception {
+        Path root = Path.of("").toAbsolutePath();
+        Path invalid = Files.createTempFile(root.resolve("build/sibench"), "capture-", ".yaml");
+        try {
+            Files.writeString(invalid, Files.readString(root.resolve("src/test/resources/config/hybench_sf1.yaml"))
+                    .replace("postgres:", "postgres:\n  clone_from: old_database"));
+            assertTrue(assertThrows(IllegalArgumentException.class, () -> CaptureConfig.read(root, invalid))
+                    .getMessage().contains("clone_from is unsupported"));
+        } finally {
+            Files.delete(invalid);
+        }
+    }
+
 }

@@ -338,17 +338,17 @@ public final class SnapshotLookupValidation {
                         .getAsJsonObject();
         IndexCatalog catalog = IndexCatalog.fromManifest(manifest);
         Path sourceBaseline = Path.of(manifest.get("baseline_directory").getAsString());
-        if (!BaselineGenerator.sha256(sourceBaseline.resolve("verified-manifest.json"))
-                .equals(manifest.get("baseline_verified_manifest_sha256").getAsString()))
-            throw new IOException("Baseline verification provenance mismatch");
+        if (!BaselineGenerator.sha256(sourceBaseline.resolve("baseline-manifest.json"))
+                .equals(manifest.get("baseline_manifest_sha256").getAsString()))
+            throw new IOException("Baseline identity mismatch");
         JsonObject verification =
                 JsonParser.parseString(
-                                Files.readString(sourceBaseline.resolve("verified-manifest.json")))
+                                Files.readString(sourceBaseline.resolve("baseline-manifest.json")))
                         .getAsJsonObject();
-        if (!verification.get("status").getAsString().equals("verified_complete")
+        if (!verification.get("status").getAsString().equals("complete")
                 || !BaselineGenerator.sha256(sourceBaseline.resolve("files.jsonl"))
                         .equals(verification.get("files_manifest_sha256").getAsString()))
-            throw new IOException("Independent baseline manifests changed or are incomplete");
+            throw new IOException("Baseline manifests changed or are incomplete");
         for (var item : verification.getAsJsonArray("files"))
             verifyFile(sourceBaseline, item.getAsJsonObject());
         Map<Key, History> histories = new LinkedHashMap<>();
@@ -589,7 +589,12 @@ public final class SnapshotLookupValidation {
         }
         List<Map<String, Object>> modes = new ArrayList<>();
         for (boolean rowIds : rowIdModes) {
-            try (var model = new IndexReferenceReplay(rowIds, config.secondaryIndexes());
+            String mode = rowIds ? "rowid" : "locator";
+            Path digests = report.toAbsolutePath().resolveSibling(report.getFileName() + "." + mode + ".queries");
+            try (var digest = new QueryDigest.File(digests, rowIds,
+                            ReferenceReplay.binding(directory, config) + " mode=" + mode);
+                    var model = new IndexReferenceReplay(rowIds, config.secondaryIndexes(),
+                            IndexReferenceReplay.Settings.defaults(), digest);
                     var load = new ReplayProjection(config, false, model::accept);
                     var runtime = new ReplayProjection(config, true, model::accept)) {
                 baseline.read(load);
@@ -703,24 +708,20 @@ public final class SnapshotLookupValidation {
                         rangeProbes++;
                         items += actual.size();
                     }
-                modes.add(
-                        Map.of(
-                                "mode",
-                                rowIds ? "rowid" : "locator",
-                                "native_queries",
-                                model.queries(),
-                                "derived_primary_probes",
-                                primaryProbes,
-                                "derived_secondary_probes",
-                                secondaryProbes,
-                                "derived_range_probes",
-                                rangeProbes,
-                                "derived_checked_result_items",
-                                items,
-                                "retained_index_versions",
-                                model.retainedVersions(),
-                                "workload_dispatch",
-                                runtime.describe()));
+                digest.close();
+                var result = new LinkedHashMap<String, Object>();
+                result.put("mode", mode);
+                result.put("native_queries", model.queries());
+                result.put("derived_primary_probes", primaryProbes);
+                result.put("derived_secondary_probes", secondaryProbes);
+                result.put("derived_range_probes", rangeProbes);
+                result.put("derived_checked_result_items", items);
+                result.put("retained_index_versions", model.retainedVersions());
+                result.put("workload_dispatch", runtime.describe());
+                result.put("query_digests", digest.count());
+                result.put("query_digest_file", digests.toString());
+                result.put("query_digest_sha256", digest.sha256());
+                modes.add(result);
             }
         }
         Map<String, Object> output = new LinkedHashMap<>();

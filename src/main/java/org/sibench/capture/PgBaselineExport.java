@@ -7,20 +7,21 @@ import org.apache.parquet.example.data.simple.SimpleGroupFactory;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.MessageTypeParser;
 import org.apache.parquet.schema.PrimitiveType;
+import org.sibench.config.ConfigValues;
 import org.sibench.generation.*;
 import org.sibench.schema.PgSchemaCheck;
 import org.sibench.schema.SourceSchema;
 
 import java.io.BufferedWriter;
+import java.io.IOException;
 import java.nio.file.*;
-import java.security.MessageDigest;
 import java.sql.*;
 import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * Export committed PG values in primary-key order. {@link PgBaselineVerify} then compares every
- * Parquet value with PG.
+ * Export committed PG values in primary-key order. Independent value comparisons are an
+ * explicit acceptance step through {@link PgBaselineVerify}.
  *
  * <p>Each table is read once in primary-key order from the exported snapshot. Tables are
  * encoded concurrently; only the shared Parquet byte policy decides file boundaries. RowIDs
@@ -45,7 +46,7 @@ public final class PgBaselineExport {
             List<String> boundaries) {}
 
     /** What a written file contributes to the manifests. */
-    record Written(Map<String, Object> file, byte[] digest) {}
+    record Written(Map<String, Object> file) {}
 
     /**
      * PG's sort memory for a key-ordered stream, set for that read's transaction only: a table
@@ -81,6 +82,10 @@ public final class PgBaselineExport {
         Map<String, Object> document = config.document();
         var source = SourceSchema.read(config.root(), document);
         var preflight = PgSchemaCheck.check(config.root(), document, jdbc, "postgres");
+        // The schema check requires default column/index collations; these databases order text as C.
+        boolean primaryOrder = config.benchmark().equals("ycsb")
+                && Set.of("C", "POSIX").contains(
+                        ConfigValues.string(ConfigValues.object(preflight, "environment"), "lc_collate"));
         Files.createDirectory(output);
         Files.writeString(
                 output.resolve("schema-preflight.json"),
@@ -108,7 +113,10 @@ public final class PgBaselineExport {
             for (var table : source.tables())
                 planned.add(pool.submit(() -> session.run(pg -> {
                     // YCSB's hashed keys otherwise make each range rescan the whole wide heap.
-                    if (config.benchmark().equals("ycsb")) sortSettings(pg);
+                    if (config.benchmark().equals("ycsb")) {
+                        if (primaryOrder) primarySettings(pg);
+                        else sortSettings(pg);
+                    }
                     return plan(pg, table, config.benchmark().equals("ycsb")
                             ? Long.MAX_VALUE : sortRangeBytes());
                 })));
@@ -122,12 +130,12 @@ public final class PgBaselineExport {
                 long firstRowId = nextRowId;
                 nextRowId = Math.addExact(nextRowId, table.rows());
                 written.add(pool.submit(() -> session.run(pg -> stream(
-                        pg, table, tableIndex, tables.size(), firstRowId, output, config))));
+                        pg, table, tableIndex, tables.size(), firstRowId, output, config, primaryOrder, session))));
             }
             var results = new ArrayList<Written>();
             for (var future : written) results.addAll(get(future));
             coordinator.commit();
-            finish(output, tables, results);
+            finish(source, output, tables, results);
         } finally {
             pool.shutdownNow();
             for (Connection pg : opened)
@@ -258,15 +266,30 @@ public final class PgBaselineExport {
 
     private static List<Written> stream(
             Connection pg, Table table, int tableIndex, int tableCount, long firstRowId,
-            Path output, GenerationConfig config) throws Exception {
+            Path output, GenerationConfig config, boolean primaryOrder, Session session) throws Exception {
         if (config.benchmark().equals("ycsb")) {
-            sortSettings(pg);
+            String query = "SELECT * FROM " + quoted(table.source().name()) + " ORDER BY "
+                    + (primaryOrder ? quoted(table.key()) : order(table));
+            if (primaryOrder) {
+                primarySettings(pg);
+                int readers;
+                try (Statement statement = pg.createStatement();
+                        ResultSet result = statement.executeQuery("SHOW max_connections")) {
+                    result.next();
+                    // Leave control and health-check connections available in the capture service.
+                    readers = Math.max(1, Math.min(result.getInt(1) - 8,
+                            (int) Math.min(64L, Runtime.getRuntime().availableProcessors() * 2L)));
+                }
+                try (var input = new PrefetchRows(session, table, readers)) {
+                    RunTiming.current().note("baseline_" + table.source().name() + "_prefetch_readers", readers);
+                    return writeTable(table, tableIndex, tableCount, firstRowId, input, output, config);
+                }
+            } else sortSettings(pg);
             // A JDBC cursor's nonzero fetch count disables PG parallel workers at execution.
             // The schema preflight guarantees that every YCSB column is varchar/text.
             try (var copy = new org.postgresql.copy.PGCopyInputStream(
                     pg.unwrap(org.postgresql.PGConnection.class),
-                    "COPY (SELECT * FROM " + quoted(table.source().name()) + " ORDER BY "
-                            + order(table) + ") TO STDOUT (FORMAT binary, ENCODING 'UTF8')")) {
+                    "COPY (" + query + ") TO STDOUT (FORMAT binary, ENCODING 'UTF8')")) {
                 var input = new PgTextCopyRows(copy, table.schema().getFieldCount() - 2);
                 return writeTable(table, tableIndex, tableCount, firstRowId, input, output, config);
             }
@@ -284,6 +307,199 @@ public final class PgBaselineExport {
         try (Statement statement = pg.createStatement()) {
             statement.execute("SET LOCAL work_mem = '" + sortMemory() + "'");
             statement.execute("SET LOCAL max_parallel_workers_per_gather = " + sortWorkers());
+        }
+    }
+
+    private static void primarySettings(Connection pg) throws SQLException {
+        try (Statement statement = pg.createStatement()) {
+            statement.execute("SET LOCAL work_mem = '" + sortMemory() + "'");
+            statement.execute("SET LOCAL max_parallel_workers_per_gather = 0");
+            statement.execute("SET LOCAL enable_indexscan = on");
+            statement.execute("SET LOCAL enable_indexonlyscan = on");
+            statement.execute("SET LOCAL enable_seqscan = off");
+            statement.execute("SET LOCAL enable_bitmapscan = off");
+            statement.execute("SET LOCAL enable_sort = off");
+            statement.execute("SET LOCAL temp_file_limit = 0");
+        }
+    }
+
+    static void requirePrimaryPlan(com.google.gson.JsonObject plan, String index) throws IOException {
+        if (!plan.has("Node Type") || !plan.get("Node Type").getAsString().equals("Index Scan")
+                || !plan.has("Index Name") || !plan.get("Index Name").getAsString().equals(index))
+            throw new IOException("YCSB baseline export requires an ordered primary index scan: " + plan);
+    }
+
+    static int prefetchCost(long bytes, int budget) throws IOException {
+        if (bytes > budget)
+            throw new IOException("YCSB row exceeds the per-reader prefetch byte budget");
+        return (int) bytes;
+    }
+
+    /** Disjoint key ranges hide random-read latency; only the writer consumes them in key order. */
+    private static final class PrefetchRows implements Rows, AutoCloseable {
+        private static final int WINDOW_ROWS = 65_536;
+        private static final int BUFFER_BYTES = 128 << 20;
+        private static final Object END = new Object();
+        private record Slot(String[] row, int bytes) {}
+        private record Window(List<Range> ranges, String after) {}
+
+        private final Session session;
+        private final Table table;
+        private final int readers;
+        private final ExecutorService pool;
+        private List<Range> ranges = List.of();
+        private Future<Window> ahead;
+        private int range;
+        private Slot held;
+        private Range heldRange;
+
+        PrefetchRows(Session session, Table table, int readers) {
+            this.session = session;
+            this.table = table;
+            this.readers = readers;
+            pool = Executors.newFixedThreadPool(readers);
+        }
+
+        private Window window(String after) throws Exception {
+            return session.run(pg -> {
+                primarySettings(pg);
+                return planWindow(pg, after);
+            });
+        }
+
+        private Window planWindow(Connection pg, String after) throws Exception {
+            var keys = new ArrayList<String>();
+            String key = quoted(table.key());
+            try (Statement statement = pg.createStatement()) {
+                statement.setFetchSize(8192);
+                try (ResultSet rows = statement.executeQuery("SELECT " + key + " FROM " + quoted(table.source().name())
+                        + (after == null ? "" : " WHERE " + key + " > " + literal(table, after))
+                        + " ORDER BY " + key + " LIMIT " + WINDOW_ROWS)) {
+                    while (rows.next()) keys.add(rows.getString(1));
+                }
+            }
+            if (keys.isEmpty()) return new Window(List.of(), after);
+            var ownRanges = new ArrayList<Range>();
+            int workers = Math.min(readers, keys.size());
+            String lower = after;
+            for (int i = 0; i < workers; i++) {
+                int start = keys.size() * i / workers, end = keys.size() * (i + 1) / workers;
+                var own = new Range(lower, keys.get(end - 1), end - start, BUFFER_BYTES / 2 / workers);
+                ownRanges.add(own);
+                lower = keys.get(end - 1);
+                pool.submit(own::read);
+            }
+            return new Window(ownRanges, keys.get(keys.size() - 1));
+        }
+
+        @Override
+        public String[] next() throws Exception {
+            release();
+            while (true) {
+                if (range == ranges.size()) {
+                    if (ahead == null) ahead = pool.submit(() -> window(null));
+                    Window next = get(ahead);
+                    if (next.ranges().isEmpty()) return null;
+                    ranges = next.ranges();
+                    range = 0;
+                    // One window encodes while the next reads; their byte credits share the bound.
+                    ahead = pool.submit(() -> window(next.after()));
+                }
+                Range own = ranges.get(range);
+                Object item = own.take();
+                if (item == END) {
+                    range++;
+                    continue;
+                }
+                held = (Slot) item;
+                heldRange = own;
+                return held.row();
+            }
+        }
+
+        private void release() {
+            if (held != null) {
+                heldRange.credit.release(held.bytes());
+                held = null;
+            }
+        }
+
+        private final class Range {
+            private final String lower, upper;
+            private final int budget;
+            private final Semaphore credit;
+            private final BlockingQueue<Object> ahead;
+            private volatile Throwable failed;
+
+            Range(String lower, String upper, int rows, int budget) {
+                this.lower = lower;
+                this.upper = upper;
+                this.budget = budget;
+                credit = new Semaphore(budget);
+                ahead = new ArrayBlockingQueue<>(rows + 1);
+            }
+
+            void read() {
+                try {
+                    session.run(pg -> {
+                        primarySettings(pg);
+                        String key = quoted(table.key());
+                        String query = "SELECT * FROM " + quoted(table.source().name()) + " WHERE "
+                                + (lower == null ? "" : key + " > " + literal(table, lower) + " AND ")
+                                + key + " <= " + literal(table, upper) + " ORDER BY " + key;
+                        String index = table.source().indexes().stream()
+                                .filter(SourceSchema.Index::primary).findFirst().orElseThrow().name();
+                        try (Statement statement = pg.createStatement();
+                                ResultSet result = statement.executeQuery("EXPLAIN (FORMAT JSON) " + query)) {
+                            result.next();
+                            requirePrimaryPlan(com.google.gson.JsonParser.parseString(result.getString(1))
+                                    .getAsJsonArray().get(0).getAsJsonObject().getAsJsonObject("Plan"), index);
+                        }
+                        try (var copy = new org.postgresql.copy.PGCopyInputStream(
+                                pg.unwrap(org.postgresql.PGConnection.class),
+                                "COPY (" + query + ") TO STDOUT (FORMAT binary, ENCODING 'UTF8')")) {
+                            var rows = new PgTextCopyRows(copy, table.schema().getFieldCount() - 2);
+                            String[] row;
+                            while ((row = rows.next()) != null) {
+                                int cost = prefetchCost(rows.rowBytes(), budget);
+                                credit.acquire(cost);
+                                boolean queued = false;
+                                try {
+                                    ahead.put(new Slot(row, cost));
+                                    queued = true;
+                                } finally {
+                                    if (!queued) credit.release(cost);
+                                }
+                            }
+                        }
+                        return null;
+                    });
+                    ahead.put(END);
+                } catch (Throwable error) {
+                    failed = error;
+                    ahead.offer(END);
+                }
+            }
+
+            Object take() throws Exception {
+                check();
+                Object item = ahead.take();
+                check();
+                return item;
+            }
+
+            private void check() throws Exception {
+                if (failed instanceof Exception error) throw error;
+                if (failed instanceof Error error) throw error;
+                if (failed != null) throw new IOException(failed);
+            }
+        }
+
+        @Override
+        public void close() {
+            release();
+            pool.shutdownNow();
+            ranges = List.of();
         }
     }
 
@@ -356,7 +572,7 @@ public final class PgBaselineExport {
         }
     }
 
-    /** Writes one byte-sized file and its row digest before the directory is published. */
+    /** Writes one byte-sized file before the directory is published. */
     private static final class PartWriter implements AutoCloseable {
         private final Table table;
         private final long fileId, firstRowId;
@@ -366,7 +582,6 @@ public final class PgBaselineExport {
         private final int keyColumn;
         private final SimpleGroupFactory factory;
         private final ParquetDataFile writer;
-        private final MessageDigest digest;
         private final Path path;
         private final Path output;
         private final GenerationConfig config;
@@ -391,7 +606,6 @@ public final class PgBaselineExport {
                     new TableData(table.source().name(), 0, firstRowId, table.key(), schema, null),
                     config,
                     Map.of("sibench.file_id", Long.toString(fileId), "sibench.source", "postgresql"));
-            digest = MessageDigest.getInstance("SHA-256");
         }
 
         /** {@code row}: the table's columns in PG order, all as PG text. */
@@ -411,7 +625,6 @@ public final class PgBaselineExport {
             if (pk == null) throw new IllegalStateException("Null key in " + table.source().name());
             group.add("_sib_row_id", firstRowId + rows);
             group.add("_sib_timestamp", 0L);
-            updateDigest(digest, group, schema);
             boolean full = writer.write(group);
             if (first == null) first = pk;
             last = pk;
@@ -449,7 +662,7 @@ public final class PgBaselineExport {
                                 return group;
                             })
                             .toList());
-            return new Written(file, digest.digest());
+            return new Written(file);
         }
 
         @Override
@@ -459,7 +672,7 @@ public final class PgBaselineExport {
     }
 
     /** Manifests in file order. */
-    private static void finish(Path output, List<Table> tables, List<Written> results)
+    private static void finish(SourceSchema source, Path output, List<Table> tables, List<Written> results)
             throws Exception {
         Gson json = new Gson();
         try (BufferedWriter files = Files.newBufferedWriter(output.resolve("files.jsonl"))) {
@@ -471,14 +684,9 @@ public final class PgBaselineExport {
         var manifest = new ArrayList<Map<String, Object>>();
         long total = 0;
         for (Table table : tables) {
-            // The table digest folds its files' row digests in file order.
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            for (Written written : results)
-                if (written.file().get("table").equals(table.source().name())) digest.update(written.digest());
             var entry = new LinkedHashMap<String, Object>();
             entry.put("table", table.source().name());
             entry.put("rows", table.rows());
-            entry.put("written_sha256", HexFormat.of().formatHex(digest.digest()));
             entry.put("schema", table.schema().toString());
             manifest.add(entry);
             System.out.println(table.source().name() + " exported rows=" + table.rows() + " files="
@@ -494,19 +702,9 @@ public final class PgBaselineExport {
         result.put("file_size_policy", GenerationConfig.FILE_SIZE_POLICY);
         result.put("target_file_size_bytes", results.isEmpty() ? null : ((Map<?, ?>) results.get(0).file().get("file_size")).get("target_bytes"));
         Files.writeString(output.resolve("manifest.json"), json.toJson(result));
+        var expected = new LinkedHashMap<String, Long>();
+        for (Table table : tables) expected.put(table.source().name(), table.rows());
+        BaselineManifest.publish(source, output, expected);
     }
 
-    private static void updateDigest(MessageDigest digest, Group group, MessageType schema) {
-        for (int i = 0; i < schema.getFieldCount(); i++) {
-            if (group.getFieldRepetitionCount(i) == 0) {
-                digest.update((byte) 0);
-                continue;
-            }
-            digest.update((byte) 1);
-            byte[] value =
-                    group.getValueToString(i, 0).getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            digest.update(java.nio.ByteBuffer.allocate(4).putInt(value.length).array());
-            digest.update(value);
-        }
-    }
 }

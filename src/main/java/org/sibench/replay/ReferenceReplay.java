@@ -8,6 +8,7 @@ import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexReferenceReplay;
 import org.sibench.capture.RunTiming;
 import org.sibench.generation.BaselineGenerator;
+import org.sibench.trace.TraceManifest;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -35,14 +36,7 @@ public final class ReferenceReplay {
 
     /** Checks supply before a backend is touched; baseline verification is fused with its load. */
     public static Input prepare(Path directory, ReplayConfig config) throws IOException {
-        if (Files.exists(directory.resolve("INCOMPLETE"))
-                || !Files.isRegularFile(directory.resolve("manifest.json")))
-            throw new IOException("Incomplete normalized dataset");
-        var manifest = JsonParser.parseString(Files.readString(directory.resolve("manifest.json"))).getAsJsonObject();
-        for (String name : List.of("baseline", "workload")) {
-            if (!manifest.has(name + "_trace_sha256") || !manifest.has(name + "_operations"))
-                throw new IOException("Trace identity/count missing: " + name);
-        }
+        var manifest = TraceManifest.read(directory);
         if (!manifest.has("secondary_index_coverage")
                 || !manifest.get("secondary_index_coverage").getAsString().equals("all_source_definitions"))
             throw new IOException("Trace must declare complete source index coverage");
@@ -217,7 +211,6 @@ public final class ReferenceReplay {
             if (primary != null) throw new IOException("Unfinished index maintenance unit");
             if (group > 0) throw new IOException("Unfinished search group");
             if (name.equals("baseline")
-                    && manifest.has("baseline_rows")
                     && (manifest.get("baseline_rows").getAsLong() != rows
                             || !loadedTables.equals(catalog.keySet())))
                 throw new IOException("Baseline row/table coverage mismatch");
@@ -228,8 +221,7 @@ public final class ReferenceReplay {
             com.google.gson.JsonObject manifest, org.sibench.capture.WorkUnits.Catalog units)
             throws IOException {
         IndexCatalog.fromManifest(manifest);
-        if (manifest.has("source_work_units")
-                && manifest.get("source_work_units").getAsLong() != units.count())
+        if (manifest.get("source_work_units").getAsLong() != units.count())
             throw new IOException("Source work-unit count mismatch");
         Map<Integer, java.util.Set<Integer>> catalog = new LinkedHashMap<>();
         for (var item : manifest.getAsJsonArray("index_definitions")) {
@@ -253,12 +245,12 @@ public final class ReferenceReplay {
                         });
     }
 
-    public static Map<String, Object> checkFiles(Path baseline, Path workload, ReplayConfig config)
+    static Map<String, Object> checkFiles(Path baseline, Path workload, ReplayConfig config)
             throws IOException {
         return checkFiles(IndexOperationTrace.Source.file(baseline), IndexOperationTrace.Source.file(workload), config);
     }
 
-    public static Map<String, Object> checkFiles(
+    static Map<String, Object> checkFiles(
             IndexOperationTrace.Source baseline, IndexOperationTrace.Source workload, ReplayConfig config)
             throws IOException {
         var load = checkStream(baseline, config, false);
@@ -320,12 +312,12 @@ public final class ReferenceReplay {
                 report);
     }
 
-    public static Map<String, Object> runFiles(Path baseline, Path workload, ReplayConfig config, Path report)
+    static Map<String, Object> runFiles(Path baseline, Path workload, ReplayConfig config, Path report)
             throws IOException {
         return runFiles(IndexOperationTrace.Source.file(baseline), IndexOperationTrace.Source.file(workload), config, report);
     }
 
-    public static Map<String, Object> runFiles(
+    static Map<String, Object> runFiles(
             IndexOperationTrace.Source baseline, IndexOperationTrace.Source workload, ReplayConfig config, Path report)
             throws IOException {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
@@ -337,33 +329,6 @@ public final class ReferenceReplay {
                 List.of(false, true),
                 checkFiles(baseline, workload, config),
                 report);
-    }
-
-    /**
-     * A one-time expected-result stream for a service replay. It is generated from the same
-     * canonical trace and value mode. Returns the published file's SHA-256.
-     */
-    public static String writeQueryDigests(
-            Path directory, ReplayConfig config, boolean rowIds, Path output, String binding)
-            throws IOException {
-        if (Files.exists(output))
-            throw new IOException("Query digest file already exists: " + output);
-        try (var digest = new QueryDigest.File(output, rowIds, binding);
-                var index =
-                        new IndexReferenceReplay(
-                                rowIds,
-                                config.secondaryIndexes(),
-                                IndexReferenceReplay.Settings.defaults(),
-                                digest);
-                var load = new ReplayProjection(config, false, index::accept);
-                var runtime = new ReplayProjection(config, true, index::accept)) {
-            org.sibench.capture.BaselineOperations.of(directory).read(load);
-            load.finish();
-            IndexOperationTrace.read(directory.resolve("workload.ops"), runtime);
-            runtime.finish();
-            digest.close();
-            return digest.sha256();
-        }
     }
 
     /** Binds a digest stream to the trace and replay settings that produced it. */

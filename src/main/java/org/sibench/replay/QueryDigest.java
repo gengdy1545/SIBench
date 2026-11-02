@@ -9,6 +9,7 @@ import java.io.BufferedWriter;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -47,13 +48,7 @@ public final class QueryDigest {
         query(digest, members);
         putInt(digest, results.size());
         for (LookupResult result : results) {
-            putBytes(digest, result.key().bytes());
-            putLong(digest, result.commitVersion());
-            if (rowIds) putLong(digest, result.value());
-            else {
-                putLong(digest, result.value());
-                putLong(digest, result.position());
-            }
+            result(digest, result.key().bytes(), result.commitVersion(), result.value(), result.position(), rowIds);
         }
         return HexFormat.of().formatHex(digest.digest());
     }
@@ -63,13 +58,7 @@ public final class QueryDigest {
         MessageDigest digest = digest();
         putInt(digest, results.size());
         for (LookupResult result : results) {
-            putBytes(digest, result.key().bytes());
-            putLong(digest, result.commitVersion());
-            if (rowIds) putLong(digest, result.value());
-            else {
-                putLong(digest, result.value());
-                putLong(digest, result.position());
-            }
+            result(digest, result.key().bytes(), result.commitVersion(), result.value(), result.position(), rowIds);
         }
         return HexFormat.of().formatHex(digest.digest());
     }
@@ -96,13 +85,9 @@ public final class QueryDigest {
         }
 
         public void add(Result result) {
-            putBytes(digest, result.getPrimaryKey().toByteArray());
-            putLong(digest, result.getVersion());
-            if (rowIds) putLong(digest, result.getValue().getRowId());
-            else {
-                putLong(digest, result.getValue().getFile());
-                putLong(digest, result.getValue().getPosition());
-            }
+            var value = result.getValue();
+            result(digest, result.getPrimaryKey().toByteArray(), result.getVersion(),
+                    rowIds ? value.getRowId() : value.getFile(), value.getPosition(), rowIds);
         }
 
         public String hex() {
@@ -140,6 +125,23 @@ public final class QueryDigest {
     private static void putBytes(MessageDigest digest, byte[] bytes) {
         putInt(digest, bytes.length);
         digest.update(bytes);
+    }
+
+    private static final ThreadLocal<ByteBuffer> RESULT_BYTES =
+            ThreadLocal.withInitial(() -> ByteBuffer.allocate(64));
+
+    private static void result(MessageDigest digest, byte[] key, long version, long value,
+            long position, boolean rowIds) {
+        var bytes = RESULT_BYTES.get();
+        int required = key.length + (rowIds ? 20 : 28);
+        if (bytes.capacity() < required) {
+            bytes = ByteBuffer.allocate(Math.max(required, bytes.capacity() * 2));
+            RESULT_BYTES.set(bytes);
+        }
+        bytes.clear();
+        bytes.putInt(key.length).put(key).putLong(version).putLong(value);
+        if (!rowIds) bytes.putLong(position);
+        digest.update(bytes.array(), 0, bytes.position());
     }
 
     private static final ThreadLocal<byte[]> INTEGER_BYTES = ThreadLocal.withInitial(() -> new byte[8]);

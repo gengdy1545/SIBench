@@ -9,8 +9,13 @@
 #   scripts/native-capture.sh config/benchmark/sysbench.yaml
 set -euo pipefail
 
+AUDIT_BASELINE=0
+if [ "${1:-}" = --audit-baseline ]; then
+  AUDIT_BASELINE=1
+  shift
+fi
 if [ "$#" -ne 1 ]; then
-  echo "usage: $0 PROFILE" >&2
+  echo "usage: $0 [--audit-baseline] PROFILE" >&2
   exit 2
 fi
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -18,7 +23,7 @@ PROFILE=$1
 if [ -n "${SIBENCH_JAVA_HOME:-}" ]; then
   export JAVA_HOME=$SIBENCH_JAVA_HOME
 fi
-# The row audit keeps one open Parquet reader per baseline file; large tables need a larger heap.
+# Heap budgets cover capture and Trace compilation.
 HEAP=${SIBENCH_HEAP:--Xmx12g}
 JAVA=${JAVA_HOME:+$JAVA_HOME/bin/}java
 PG=$ROOT/build/services/postgresql-capture
@@ -36,10 +41,7 @@ if [ -n "${SIBENCH_HYBENCH:-}" ]; then
 fi
 CAPTURE_CP="$CORE$NATIVE_CP"
 "$JAVA" -cp "$CAPTURE_CP" org.sibench.capture.NativeBuildCheck verify "$ROOT" "$PROFILE"
-if [ "$SIBENCH_VERIFICATION" = certified ] && [ ! -f "$SIBENCH_CERTIFICATION" ]; then
-  echo "certification not found: $SIBENCH_CERTIFICATION" >&2
-  exit 1
-fi
+
 if [ -e "$SIBENCH_ARTIFACTS" ]; then
   echo "artifacts already exist: $SIBENCH_ARTIFACTS (move or archive them first)" >&2
   exit 1
@@ -59,7 +61,7 @@ PG_CONFIG=$SIBENCH_ARTIFACTS/native/postgres.conf
 "$JAVA" -cp "$JAR" org.sibench.cli.Sibench postgres-config \
   "$SIBENCH_ARTIFACTS/native/sibench.yaml" "$PG_CONFIG" > /dev/null
 
-# HyBench runs from its work directory, where its base stage generates Data_<sf> on first use.
+# HyBench generates Data_<sf> in this run's work directory.
 WORKDIR=${SIBENCH_WORKDIR:-$ROOT}
 mkdir -p "$WORKDIR"
 
@@ -67,69 +69,63 @@ if "$PG/runtime/bin/pg_isready" -q -h 127.0.0.1 -p "$SIBENCH_PORT"; then
   echo "a PostgreSQL server already listens on port $SIBENCH_PORT; stop it first" >&2
   exit 1
 fi
-# The still database lives in a cluster of its own, stopped between captures; each capture runs on
-# a reflink copy of it (see StillBase), which shares every block the capture does not change.
-STILL=$ROOT/build/services/postgresql-still/$SIBENCH_BASE
 CLUSTER=$PG/data
 if [ -e "$CLUSTER" ]; then
   echo "a capture cluster already exists: $CLUSTER (left by a failed capture, kept for diagnosis);" \
     "stop its server if one runs and remove the directory" >&2
   exit 1
 fi
-# The server parameters are owned by config/sibench.yaml; only the machine-specific ones are added here.
+# Server parameters come from the effective snapshot; the load WAL cap derives from its minimum.
 # start_cluster DATA LOG [CAPTURE_DIR]: the instrumented server traces only with a capture directory.
 start_cluster() {
   # pg_ctl passes -o through /bin/sh; preserve literal quotes in the config path there too.
   local quoted_config=${PG_CONFIG//\'/\'\\\'\'}
+  local load_wal_options=
+  if [ -z "${3:-}" ]; then
+    # Loading needs no extra WAL reserve for later workloads.
+    local load_wal
+    load_wal=$("$PG/runtime/bin/postgres" -D "$1" -C min_wal_size -c "config_file=$PG_CONFIG")
+    load_wal_options=" -c max_wal_size=$load_wal"
+    printf 'load WAL cap: max_wal_size=%s (from min_wal_size)\n' "$load_wal" >&2
+  fi
   SIBENCH_CAPTURE_DIR=${3:-} "$PG/runtime/bin/pg_ctl" -D "$1" \
-    -o "-c config_file='$quoted_config' -c port=$SIBENCH_PORT -c unix_socket_directories=" \
+    -o "-c config_file='$quoted_config' -c port=$SIBENCH_PORT -c unix_socket_directories=$load_wal_options" \
     -l "$2" -w start >/dev/null
+}
+
+# Preserve the first failure even if stopping the disposable server also fails.
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if "$PG/runtime/bin/pg_ctl" -D "$CLUSTER" status >/dev/null 2>&1; then
+    if ! "$PG/runtime/bin/pg_ctl" -D "$CLUSTER" -m fast -t 3600 stop >/dev/null; then
+      echo "failed to stop disposable PostgreSQL; retained $CLUSTER" >&2
+      if [ "$status" -eq 0 ]; then status=1; fi
+    fi
+  fi
+  exit "$status"
 }
 
 stage() {
   local started ended
   started=$(date +%s%N)
   # HyBench resolves Data_1x relative to the working directory, so every stage runs from there.
-  if [ "$1" = export ]; then
-    # The baseline is the still database's, exported and verified once and linked per capture.
-    ( cd "$WORKDIR" && "$JAVA" $HEAP -cp "$CAPTURE_CP" org.sibench.capture.SharedBaseline "$ROOT" "$PROFILE" "$TIMING" )
-  else
-    ( cd "$WORKDIR" && "$JAVA" $HEAP -cp "$CAPTURE_CP" org.sibench.capture.NativeCapture \
-        "$1" "$ROOT" "$PROFILE" "$TIMING" )
-  fi
+  ( cd "$WORKDIR" && "$JAVA" $HEAP -cp "$CAPTURE_CP" org.sibench.capture.NativeCapture \
+      "$1" "$ROOT" "$PROFILE" "$TIMING" )
   ended=$(date +%s%N)
   printf 'stage %-8s %d ms\n' "$1" "$(( (ended - started) / 1000000 ))" >&2
 }
 URL=jdbc:postgresql://127.0.0.1:$SIBENCH_PORT/$SIBENCH_DATABASE
 
-# The still database is built once: the benchmark's own load, then what every capture needs before
-# it runs. No capture directory is set, so the instrumented server writes no trace while it loads.
-if [ ! -f "$STILL/READY" ]; then
-  if [ -e "$STILL" ]; then
-    echo "incomplete still cluster: $STILL (its build failed); remove it to build it again" >&2
-    exit 1
-  fi
-  mkdir -p "$STILL"
-  "$PG/runtime/bin/initdb" -D "$STILL/data" -U postgres --locale=C -E UTF8 --auth=trust > "$STILL/initdb.log"
-  start_cluster "$STILL/data" "$STILL/server.log"
-  trap '"$PG/runtime/bin/pg_ctl" -D "$STILL/data" -m fast -t 3600 stop >/dev/null' EXIT
-  stage base
-  # A clean shutdown checkpoints, so a copy of the stopped cluster needs no recovery; flushing 16 GB
-  # of shared buffers can take longer than pg_ctl's default minute.
-  "$PG/runtime/bin/pg_ctl" -D "$STILL/data" -m fast -t 3600 stop >/dev/null
-  trap - EXIT
-  touch "$STILL/READY"
-fi
-cp -a --reflink=always "$STILL/data" "$CLUSTER"
-# PostgreSQL writes 8 KiB pages. XFS's default CoW reservations can approach another whole
-# relation's size under random writes, exhausting quota even while its visible size barely grows.
-# Set only this disposable clone's allocation hint; directories pass it to new relation segments.
-if [ "$(stat -f -c %T "$CLUSTER")" = xfs ]; then
-  xfs_io -c 'cowextsize -R 8192' "$CLUSTER" > /dev/null
-fi
+# Load once into this run's database. No PG state is reused by another capture.
+"$PG/runtime/bin/initdb" -D "$CLUSTER" -U postgres --locale=C -E UTF8 --auth=trust > "$SIBENCH_ARTIFACTS/native/initdb.log"
+trap cleanup EXIT
+start_cluster "$CLUSTER" "$SIBENCH_ARTIFACTS/postgres.log"
+stage load
+# The capture directory is inherited by PG at startup. Restart this same cluster before export,
+# so baseline reads warm the very database and shared buffers used by the native workload.
+"$PG/runtime/bin/pg_ctl" -D "$CLUSTER" -m fast -t 3600 stop >/dev/null
 start_cluster "$CLUSTER" "$SIBENCH_ARTIFACTS/postgres.log" "$SIBENCH_RAW"
-trap '"$PG/runtime/bin/pg_ctl" -D "$CLUSTER" -m fast -t 3600 stop >/dev/null' EXIT
-stage prepare
 # Optional sequential prewarm is measured separately and defaults to off.
 if [ "${SIBENCH_PREWARM:-0}" = 1 ]; then
   started=$(date +%s%N)
@@ -138,6 +134,26 @@ if [ "${SIBENCH_PREWARM:-0}" = 1 ]; then
 fi
 stage check > "$SIBENCH_ARTIFACTS/schema-preflight.json"
 stage export > "$SIBENCH_ARTIFACTS/baseline.log"
+# Independent initial-state acceptance must run before the native workload changes this database.
+if [ "$AUDIT_BASELINE" = 1 ]; then
+  ACCEPTANCE=$SIBENCH_ARTIFACTS/acceptance
+  mkdir -p "$ACCEPTANCE"
+  AUDIT_COMMAND=("$JAVA" $HEAP -cp "$CAPTURE_CP" org.sibench.cli.Sibench audit-baseline
+    "$PROFILE" "$SIBENCH_ARTIFACTS/baseline" --jdbc "$URL" --user postgres)
+  printf '%q ' "${AUDIT_COMMAND[@]}" > "$ACCEPTANCE/baseline-audit-command.sh"
+  printf '\n' >> "$ACCEPTANCE/baseline-audit-command.sh"
+  started=$(date +%s%N)
+  if "${AUDIT_COMMAND[@]}" > "$ACCEPTANCE/baseline-audit.json"; then
+    audit_status=0
+  else
+    audit_status=$?
+  fi
+  ended=$(date +%s%N)
+  printf '{"started_epoch_ns":%s,"ended_epoch_ns":%s,"wall_millis":%d,"exit_code":%d}\n' \
+    "$started" "$ended" "$(( (ended - started) / 1000000 ))" "$audit_status" \
+    > "$ACCEPTANCE/baseline-audit-timing.json"
+  if [ "$audit_status" -ne 0 ]; then exit "$audit_status"; fi
+fi
 # PG's own index counters bracket only the native run: an independent check that the ledger saw
 # every index access, including ones the instrumentation might never have emitted.
 counters() {
@@ -147,32 +163,18 @@ counters() {
 counters "$SIBENCH_ARTIFACTS/index-counters-before.json"
 stage run > "$SIBENCH_ARTIFACTS/native-run.log"
 counters "$SIBENCH_ARTIFACTS/index-counters-after.json"
-# A full capture audits its row changes against the baseline and PG's final state, then certifies
-# its build and coverage; a certified capture relies on such a certificate instead.
-if [ "$SIBENCH_VERIFICATION" = full ]; then
-  "$JAVA" $HEAP -cp "$CAPTURE_CP" org.sibench.cli.Sibench audit-rows "$PROFILE" "$SIBENCH_ARTIFACTS/baseline" "$SIBENCH_RAW" \
-    --jdbc "$URL" --user postgres --timing "$TIMING" > "$SIBENCH_ARTIFACTS/row-state-audit-summary.json"
-  VERIFY=()
-else
-  VERIFY=(--certification "$SIBENCH_CERTIFICATION")
-fi
+# Compilation needs the recorded facts; retain the stopped database until success for diagnostics.
+"$PG/runtime/bin/pg_ctl" -D "$CLUSTER" -m fast -t 3600 stop >/dev/null
+trap - EXIT
 # One pass compiles the trace and builds the access ledger; the trace is committed only when the
-# ledger matches PG's index counters (and, when certified, stays inside the certificate).
+# ledger matches PG's index counters.
 "$JAVA" $HEAP -cp "$CAPTURE_CP" org.sibench.cli.Sibench compile-trace "$PROFILE" "$SIBENCH_ARTIFACTS/trace" \
-  "${VERIFY[@]}" --counters "$SIBENCH_ARTIFACTS/index-counters-before.json" "$SIBENCH_ARTIFACTS/index-counters-after.json" \
+  --counters "$SIBENCH_ARTIFACTS/index-counters-before.json" "$SIBENCH_ARTIFACTS/index-counters-after.json" \
   --timing "$TIMING" > "$SIBENCH_ARTIFACTS/trace-summary.json"
 cp "$SIBENCH_ARTIFACTS/trace/access-ledger.json" "$SIBENCH_ARTIFACTS/access-ledger-summary.json"
 cp "$SIBENCH_ARTIFACTS/trace/capture-completeness.json" "$SIBENCH_ARTIFACTS/capture-completeness.json"
-if [ "$SIBENCH_VERIFICATION" = full ]; then
-  "$JAVA" -cp "$CAPTURE_CP" org.sibench.cli.Sibench certify-capture "$PROFILE" > "$SIBENCH_ARTIFACTS/certification-summary.json"
-  # The audited row transitions served the audit and the certificate; the capture is recompiled
-  # with its own certificate from now on, which does not read them.
-  rm -f "$SIBENCH_RAW/row-state-audit.json.changes.jsonl"
-fi
-# The capture cluster holds the workload's final state, which the audit has already read; the next
-# capture copies the still cluster again. SIBENCH_KEEP_DATABASE=1 keeps it for diagnosis.
-"$PG/runtime/bin/pg_ctl" -D "$CLUSTER" -m fast -t 3600 stop >/dev/null
-trap - EXIT
+
+# The next capture loads fresh data. Explicit acceptance can retain the final database for audit.
 if [ "${SIBENCH_KEEP_DATABASE:-0}" != 1 ]; then
   rm -rf "$CLUSTER"
 fi

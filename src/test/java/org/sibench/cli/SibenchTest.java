@@ -97,6 +97,20 @@ public class SibenchTest {
     }
 
     @Test
+    public void serviceReplayRequiresReferenceBeforeReadingInputs() {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        try (PrintStream out = new PrintStream(output, true, StandardCharsets.UTF_8);
+                PrintStream err = new PrintStream(errors, true, StandardCharsets.UTF_8)) {
+            assertEquals(1, Sibench.run(new String[] {
+                    "replay-service", "missing-config.yaml", "missing-trace", "missing-report.json"
+            }, out, err));
+            assertEquals(0, output.size());
+            assertTrue(errors.toString(StandardCharsets.UTF_8).contains("--reference REPORT"));
+        }
+    }
+
+    @Test
     public void showsGlobalAndCommandHelp() {
         for (String[] args : new String[][] {{}, {"--help"}, {"inspect-scale", "-h"}}) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();

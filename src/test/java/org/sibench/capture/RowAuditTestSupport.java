@@ -120,6 +120,9 @@ final class RowAuditTestSupport {
                                             fileId++)));
         }
         Files.write(directory.resolve("files.jsonl"), files);
+        var expected = new LinkedHashMap<String, Long>();
+        for (var table : schema.tables()) expected.put(table.name(), (long) rows.getOrDefault(table.name(), List.of()).size());
+        BaselineManifest.publish(schema, directory, expected);
         return directory;
     }
 

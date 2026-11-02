@@ -90,44 +90,21 @@ public final class IndexTraceCompiler {
         }
     }
 
-    /**
-     * What vouches for a capture beyond the compilation's own checks. The row changes: either the
-     * capture's row-state audit ({@code rowAudit}) or a certification from a fully verified
-     * capture of the same build ({@code certification}, see {@link Certification}). The index
-     * accesses: PostgreSQL's index counters before and after the native run, which the ledger
-     * built in the same pass must match; without them the completeness check is left to a
-     * separate {@code check-capture-completeness}.
-     */
-    public record Checks(
-            Path rowAudit, Path certification, Path countersBefore, Path countersAfter, Path runJar) {
+    /** Optional independent row audit and source-side counter snapshots for this capture. */
+    public record Checks(Path rowAudit, Path countersBefore, Path countersAfter) {
         public Checks {
-            if (rowAudit != null && certification != null)
-                throw new IllegalArgumentException("A capture is verified by its row audit or a certification, not both");
             if ((countersBefore == null) != (countersAfter == null))
                 throw new IllegalArgumentException("Index counters come as a before and after pair");
         }
 
-        /** Checks without the capture's run jar, which only a certified compilation reads. */
-        public Checks(Path rowAudit, Path certification, Path countersBefore, Path countersAfter) {
-            this(rowAudit, certification, countersBefore, countersAfter, null);
-        }
-
         public static Checks rowAudit(Path report) {
-            return new Checks(report, null, null, null);
+            return new Checks(report, null, null);
         }
     }
 
-    /** Resolves a HyBench or native-client capture profile; a null row audit uses the default. */
     public static Map<String, Object> compileProfile(Path root, Path profile, Path output, Checks checks)
             throws Exception {
         var capture = CaptureProfile.read(root, profile);
-        if (checks.certification() == null && checks.rowAudit() == null)
-            checks = new Checks(
-                    RowStateAudit.defaultReport(capture.raw()), null, checks.countersBefore(), checks.countersAfter());
-        else if (checks.certification() != null && checks.runJar() == null)
-            checks = new Checks(
-                    null, checks.certification(), checks.countersBefore(), checks.countersAfter(),
-                    Certification.runJar(capture.artifacts()));
         return compile(capture.schema(), capture.layout(), capture.raw(), output, checks);
     }
 
@@ -196,20 +173,9 @@ public final class IndexTraceCompiler {
         boolean concurrent = sessions.order().equals("concurrent");
         Path baseline = layout.output();
         Path auditReport = checks.rowAudit();
-        JsonObject certificate = null;
-        if (checks.certification() != null) {
-            // The certification vouches for the row changes; the baseline is still checked here.
-            certificate =
-                    Certification.require(
-                            checks.certification(),
-                            raw,
-                            checks.runJar(),
-                            IndexCatalog.fromSchema(sourceSchema).provenance());
-            PgBaselineVerify.verifyFiles(baseline);
-        } else RowStateAudit.reuse(sourceSchema, baseline, raw, auditReport);
-        Path verified = baseline.resolve("verified-manifest.json");
-        JsonObject verification =
-                JsonParser.parseString(Files.readString(verified)).getAsJsonObject();
+        if (auditReport != null) RowStateAudit.reuse(sourceSchema, baseline, raw, auditReport);
+        JsonObject verification = BaselineManifest.verify(sourceSchema, baseline);
+        Path verified = baseline.resolve(BaselineManifest.FILE);
         Path preflightFile = baseline.resolve("schema-preflight.json");
         boolean cCollation =
                 AccessLedger.cCollation(
@@ -310,7 +276,6 @@ public final class IndexTraceCompiler {
                                 + result.get("inconsistent_indexes")
                                 + "; see capture-completeness.json");
         }
-        if (certificate != null) Certification.requireCovered(certificate, ledger, state.changesByTable);
         RunTiming.current()
                 .phase("report")
                 .note("session_order", sessions.order())
@@ -385,15 +350,11 @@ public final class IndexTraceCompiler {
         report.put("secondary_index_scope", "all secondary indexes in pinned source DDL");
         report.put("raw_index_insert_attempts", state.rawInserts);
         report.put("incremental_files", state.files);
-        report.put("baseline_verified_manifest_sha256", BaselineGenerator.sha256(verified));
+        report.put("baseline_manifest_sha256", BaselineGenerator.sha256(verified));
         report.put("baseline_schema_preflight_sha256", BaselineGenerator.sha256(preflightFile));
         var verificationReport = new LinkedHashMap<String, Object>();
-        if (certificate != null) {
-            verificationReport.put("mode", "certified");
-            verificationReport.put("certification", checks.certification().toAbsolutePath().toString());
-            verificationReport.put("certification_sha256", BaselineGenerator.sha256(checks.certification()));
-        } else {
-            verificationReport.put("mode", "row_audit");
+        verificationReport.put("mode", auditReport == null ? "runtime" : "row_audit");
+        if (auditReport != null) {
             verificationReport.put("row_state_audit_sha256", BaselineGenerator.sha256(auditReport));
             report.put("row_state_audit_sha256", verificationReport.get("row_state_audit_sha256"));
         }
@@ -853,7 +814,7 @@ public final class IndexTraceCompiler {
                             .orElseThrow(() -> new IOException("Unknown source row table"));
             // Row changes are few next to index events; they keep the Gson form SourceRow reads.
             JsonObject row = e.json();
-            SourceRow.requireStablePrimaryKey(table, row);
+            SourceRow.validateChange(table, row);
             long xid = e.get("xid").getAsLong();
             if (pendingMutations != 0 && pendingXid != xid)
                 throw new IOException("Interleaved transactions unsupported");

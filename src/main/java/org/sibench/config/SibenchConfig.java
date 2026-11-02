@@ -36,7 +36,8 @@ public final class SibenchConfig {
                     "max_parallel_workers_per_gather", "max_parallel_maintenance_workers",
                     "autovacuum", "shared_buffers", "max_wal_size", "min_wal_size",
                     "checkpoint_timeout", "checkpoint_completion_target", "wal_buffers",
-                    "synchronous_commit", "maintenance_work_mem").contains(setting.getKey()),
+                    "synchronous_commit", "fsync", "full_page_writes", "restart_after_crash",
+                    "maintenance_work_mem").contains(setting.getKey()),
                     "Unsupported PostgreSQL setting: " + setting.getKey());
             Object value = setting.getValue();
             require(value instanceof String || value instanceof Boolean || value instanceof Number,

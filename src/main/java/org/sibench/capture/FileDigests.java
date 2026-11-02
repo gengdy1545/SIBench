@@ -14,7 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * that changed while it was being read) uses {@link #read} directly.
  *
  * <p>Capture code digests files here rather than through the baseline generator, so the generator
- * and its Parquet writer stay outside the capture code a certification covers ({@link CaptureCode}).
+ * and its Parquet writer share immutable file identities across pipeline stages.
  */
 public final class FileDigests {
     private record Identity(Path path, Object key, long size, long modified) {}

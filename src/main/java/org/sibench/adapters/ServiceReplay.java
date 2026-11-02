@@ -31,28 +31,14 @@ public final class ServiceReplay {
     public static Map<String, Object> run(
             Path directory, ReplayConfig config, ServiceConfig service, Path reference, Path report)
             throws IOException {
+        if (reference == null)
+            throw new IOException("Service replay requires an explicit reference report; run replay first");
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
         var input = ReferenceReplay.prepare(directory, config);
         var preflight = input.preflight();
         String mode = service.value() == ValueKind.ROW_ID ? "rowid" : "locator";
         String binding = ReferenceReplay.binding(directory, config) + " mode=" + mode;
-        Path expectedResults =
-                reference == null ? null : ReferenceReplay.queryDigestFile(reference, mode);
-        String generatedSha256 = null;
-        Path generated = null;
-        if (expectedResults == null) {
-            Path directoryForDigests =
-                    Files.createTempDirectory(
-                            report.toAbsolutePath().getParent(), ".sibench-expected-");
-            expectedResults = directoryForDigests.resolve("queries");
-            generated = directoryForDigests;
-            generatedSha256 = ReferenceReplay.writeQueryDigests(
-                    directory,
-                    config,
-                    service.value() == ValueKind.ROW_ID,
-                    expectedResults,
-                    binding);
-        }
+        Path expectedResults = ReferenceReplay.queryDigestFile(reference, mode);
         var requests = new TraceRequests(service.value(), expectedResults, binding);
         DescribeResponse description;
         ReplayTarget.Factory factory;
@@ -150,17 +136,12 @@ public final class ServiceReplay {
             result.put("max_group_members", requests.maxGroupMembers());
             result.put("per_query_digest_checks", requests.digestChecks());
             result.put("per_query_digest_mismatches", requests.digestMismatches());
-            result.put(
-                    "expected_results_source",
-                    generated == null ? "reference_report" : "generated_from_trace");
+            result.put("expected_results_source", "reference_report");
             result.put(
                     "expected_results_sha256",
-                    generatedSha256 == null
-                            ? org.sibench.generation.BaselineGenerator.sha256(expectedResults)
-                            : generatedSha256);
-            if (reference != null)
-                result.put("reference", Map.of("report", reference.toString(), "mode", mode,
-                        "status", "per_query_digests_matched"));
+                    org.sibench.generation.BaselineGenerator.sha256(expectedResults));
+            result.put("reference", Map.of("report", reference.toString(), "mode", mode,
+                    "status", "per_query_digests_matched"));
             var output = new LinkedHashMap<String, Object>();
             output.put("status", "passed");
             output.put("preflight", preflight);
@@ -177,12 +158,6 @@ public final class ServiceReplay {
             if (remote != null) remote.close();
             if (published != null) published.close();
             if (local != null) local.close();
-            if (generated != null) {
-                try (var paths = Files.walk(generated)) {
-                    for (Path path : paths.sorted(java.util.Comparator.reverseOrder()).toList())
-                        Files.deleteIfExists(path);
-                }
-            }
         }
     }
 

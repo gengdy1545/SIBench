@@ -49,6 +49,7 @@ public record CaptureConfig(
             }
         }
         var pg = object(doc, "postgres");
+        require(!pg.containsKey("clone_from"), "postgres.clone_from is unsupported; each capture loads a fresh database");
         require(string(pg, "version").equals("14.24"), "Capture patch requires PG 14.24");
         require(string(pg, "isolation").equals("read_committed"), "Only read_committed supported");
         require(
@@ -161,14 +162,9 @@ public record CaptureConfig(
         return p;
     }
 
-    /** The database a native run reads; the capture database is cloned from a verified one. */
+    /** The database loaded and updated by this capture. */
     public String database() {
         return string(object(document, "postgres"), "database");
-    }
-
-    /** The still database the capture database is cloned from. */
-    public String cloneFrom() {
-        return string(object(document, "postgres"), "clone_from");
     }
 
     /** HyBench's scale factor as its configuration names it, e.g. {@code 10x}. */

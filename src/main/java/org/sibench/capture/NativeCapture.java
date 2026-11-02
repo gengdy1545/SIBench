@@ -9,9 +9,9 @@ import java.nio.file.Path;
 import java.util.LinkedHashMap;
 
 /**
- * The stages of one native capture of HyBench, YCSB or sysbench. Stages are explicit: nothing
- * starts PG, and a stage never reuses a database, baseline or raw directory left by an earlier
- * one.
+ * Stages of one native capture of HyBench, YCSB or sysbench. The shell manages PostgreSQL;
+ * load, export and run share that capture's fresh database. Inputs from earlier captures are
+ * not reused.
  */
 public final class NativeCapture {
 
@@ -38,41 +38,20 @@ public final class NativeCapture {
         return detail;
     }
 
-    /**
-     * How a capture's row changes are vouched for: {@code full} (the default) runs the row-state
-     * audit and certifies the capture; {@code certified} relies on {@code capture.certification},
-     * the certificate of a full capture of the same build, see {@link Certification}.
-     */
-    static String verification(java.util.Map<String, Object> document) {
-        var capture = org.sibench.config.ConfigValues.object(document, "capture");
-        String verification =
-                capture.containsKey("verification")
-                        ? org.sibench.config.ConfigValues.string(capture, "verification")
-                        : "full";
-        org.sibench.config.ConfigValues.require(
-                verification.equals("full") || verification.equals("certified"),
-                "capture.verification must be full or certified");
-        org.sibench.config.ConfigValues.require(
-                verification.equals("certified") == capture.containsKey("certification"),
-                "capture.certification is required by, and only by, capture.verification: certified");
-        return verification;
-    }
-
     /** The paths and capture settings the script reads, as shell assignments. */
     private static void paths(java.util.Map<String, Object> document) {
         System.out.println("SIBENCH_CAPTURE_DETAIL=" + detail(document));
         System.out.println("SIBENCH_CAPTURE_COMPRESS=" + compression(document));
-        System.out.println("SIBENCH_VERIFICATION=" + verification(document));
         var capture = org.sibench.config.ConfigValues.object(document, "capture");
-        if (capture.containsKey("certification"))
-            NativeProcess.assignment("SIBENCH_CERTIFICATION",
-                    org.sibench.config.ConfigValues.string(capture, "certification"));
+        org.sibench.config.ConfigValues.require(
+                !capture.containsKey("verification") && !capture.containsKey("certification"),
+                "Capture certification is unsupported; run independent audits explicitly");
     }
 
     public static void main(String[] args) throws Exception {
         if (args.length != 3 && args.length != 4)
             throw new IllegalArgumentException(
-                    "NativeCapture paths|base|prepare|check|run ROOT CONFIG [TIMING]");
+                    "NativeCapture paths|load|check|export|run ROOT CONFIG [TIMING]");
         var timing = RunTiming.open(args.length == 4 ? Path.of(args[3]).toAbsolutePath() : null);
         try {
             timing.phase(args[0]);
@@ -109,11 +88,10 @@ public final class NativeCapture {
                 System.out.println("SIBENCH_PORT=" + config.port());
                 NativeProcess.assignment("SIBENCH_DATABASE", config.database());
                 NativeProcess.assignment("SIBENCH_ARTIFACTS", config.artifacts());
-                NativeProcess.assignment("SIBENCH_BASE", config.cloneFrom());
                 paths(config.document());
             }
-            case "base" -> StillBase.build(config);
-            case "prepare" -> prepare(config);
+            case "load" -> NativeLoad.build(config);
+            case "export" -> PgBaselineExport.export(config.jdbc(), config.layout().output(), config.layout());
             case "check" ->
                     System.out.println(
                             PgSchemaCheck.json(
@@ -127,7 +105,7 @@ public final class NativeCapture {
         }
     }
 
-    /** HyBench stages: the same contract, against the cloned still database. */
+    /** HyBench stages follow the same disposable-database contract. */
     private static void hybench(String stage, Path root, String profile, CaptureConfig config)
             throws Exception {
         switch (stage) {
@@ -143,29 +121,23 @@ public final class NativeCapture {
                 NativeProcess.assignment("SIBENCH_ARTIFACTS", config.artifacts());
                 NativeProcess.assignment("SIBENCH_HYBENCH", root.resolve(NativeBuildCheck.HYBENCH_DIRECTORY));
                 NativeProcess.assignment("SIBENCH_WORKDIR", config.workDir());
-                NativeProcess.assignment("SIBENCH_BASE", config.cloneFrom());
                 paths(config.document());
             }
-            case "base" -> HybenchNativeBase.build(config);
-            case "prepare" -> HybenchNativePrepare.prepare(root, config);
+            case "load" -> HybenchNativeLoad.build(config);
+            case "export" -> PgBaselineExport.export(config.jdbc(), config.layout().output(), config.layout());
             case "check" ->
                     System.out.println(
                             org.sibench.schema.PgSchemaCheck.json(
                                     org.sibench.schema.PgSchemaCheck.check(
                                             root, config.document(), config.jdbc(), config.user())));
             case "run" -> {
+                HybenchNativeLoad.requireRuntimeInputs(config.workDir().resolve("Data_" + config.scaleFactor()),
+                        HybenchNativeLoad.manifest(config));
                 java.nio.file.Files.createDirectories(config.artifacts().resolve("native"));
                 HybenchNativeRun.run(root, Path.of(profile));
             }
             default -> throw new IllegalArgumentException("Unknown stage: " + stage);
         }
-    }
-
-    /** This capture's clone of the still database becomes the profile's database. */
-    static void prepare(NativeCaptureConfig config) throws Exception {
-        StillBase.library(config.root());
-        StillBase.attach(
-                config.root(), config.adminJdbc(), config.user(), config.cloneFrom(), config.database(), config.loadConfig());
     }
 
     static void run(NativeCaptureConfig config) throws Exception {

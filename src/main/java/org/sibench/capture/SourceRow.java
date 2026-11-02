@@ -103,6 +103,19 @@ final class SourceRow {
                             + primary(table).name());
     }
 
+    /** Checks each captured image, including changes later rolled back; it does not rebuild state. */
+    static void validateChange(SourceSchema.Table table, JsonObject change) throws IOException {
+        requireStablePrimaryKey(table, change);
+        JsonObject before = image(change, "old"), after = image(change, "new");
+        String operation = change.get("operation").getAsString();
+        if (!(operation.equals("insert") && before == null && after != null
+                || operation.equals("update") && before != null && after != null
+                || operation.equals("delete") && before != null && after == null))
+            throw new IOException("Invalid source row operation/images: " + operation);
+        values(table, before);
+        values(table, after);
+    }
+
     static JsonObject image(JsonObject change, String field) throws IOException {
         JsonElement value = change.get(field);
         if (value == null) throw new IOException("Missing " + field + " row image");

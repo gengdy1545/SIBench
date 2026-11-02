@@ -13,7 +13,7 @@ replay:
   dispatch_mode: operation
   client_count: 64
   max_in_flight: 4096
-  request_timeout_seconds: 60
+  request_timeout_seconds: 600
 versions:
   gc:
     owner: none
@@ -26,8 +26,12 @@ postgres:
   max_parallel_maintenance_workers: '0'
   autovacuum: 'off'
   shared_buffers: 16GB
-  max_wal_size: 32GB
-  min_wal_size: 4GB
+  # Generation databases are disposable; completed Trace artifacts are the retained output.
+  fsync: 'off'
+  full_page_writes: 'off'
+  restart_after_crash: 'off'
+  max_wal_size: 1GB
+  min_wal_size: 80MB
   checkpoint_timeout: 30min
   checkpoint_completion_target: '0.9'
   wal_buffers: 64MB

@@ -100,6 +100,26 @@ public class PgBaselineVerifyTest {
         return result;
     }
 
+    @Test(timeout = 10_000)
+    public void omittingAWholeTableCannotCertifyItsRows() throws Exception {
+        for (String benchmark : List.of("sysbench", "ycsb")) {
+            var schema = schema(benchmark);
+            var source = rows(schema, 10);
+            String omitted = schema.tables().get(schema.tables().size() - 1).name();
+            Path directory = RowAuditTestSupport.baseline(temporary.newFolder().toPath(), schema, source, 3);
+            var remaining = Files.readAllLines(directory.resolve("files.jsonl")).stream()
+                    .filter(line -> !JsonParser.parseString(line).getAsJsonObject()
+                            .get("table").getAsString().equals(omitted)).toList();
+            Files.write(directory.resolve("files.jsonl"), remaining);
+            assertThrows(java.io.IOException.class, () -> PgBaselineVerify.verify(
+                    RowAuditTestSupport.connections(schema, source, new int[1]), schema, directory));
+            assertTrue(!Files.exists(directory.resolve("verified-manifest.json")));
+            var empty = copy(source);
+            empty.put(omitted, List.of());
+            PgBaselineVerify.verify(RowAuditTestSupport.connections(schema, empty, new int[1]), schema, directory);
+        }
+    }
+
     @Test
     public void rowGroupsVerifiedConcurrentlyGiveTheSerialReport() throws Exception {
         for (String benchmark : List.of("sysbench", "ycsb")) {
@@ -128,7 +148,7 @@ public class PgBaselineVerifyTest {
     }
 
     /** Parquet keys out of order fail, though PG holds the same rows (an unordered comparison). */
-    @Test
+    @Test(timeout = 10_000)
     public void baselineKeysOutOfOrderFail() throws Exception {
         for (String benchmark : List.of("sysbench", "ycsb")) {
             var schema = schema(benchmark);

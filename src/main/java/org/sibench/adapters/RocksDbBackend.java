@@ -175,22 +175,30 @@ public final class RocksDbBackend implements IndexBackend {
         if (end == null) end = successor(prefix);
         if (end != null && Arrays.compareUnsigned(start, end) >= 0) return;
         long limit = search.getLimit();
-        try (var versions = store.cursor(null, null);
-                var iterator = store.cursor(start, end)) {
+        try (var iterator = store.cursor(start, end)) {
             if (!search.getDescending()) {
                 iterator.seek(start);
                 while (iterator.valid() && (limit == 0 || found < limit)) {
-                    byte[] entry = logical(iterator.key());
-                    Result result = visible(versions, entry, search.getReadVersion(), search.getLocalVersion());
+                    byte[] key = iterator.key();
+                    byte[] entry = logical(key);
+                    long version = ~ByteBuffer.wrap(key, entry.length, VERSION).getLong();
+                    long selected = Math.max(search.getReadVersion(), search.getLocalVersion());
+                    if (version > selected) iterator.seek(versioned(entry, selected));
+                    Result result = visibleAt(iterator, entry, search.getReadVersion(), search.getLocalVersion());
                     if (result != null) {
                         sink.accept(result);
                         found++;
                     }
-                    // Past the oldest possible version of this entry.
-                    iterator.seek(versioned(entry, 0));
-                    if (iterator.valid() && Arrays.equals(logical(iterator.key()), entry)) iterator.next();
+                    // Most entries have one version. Keep long histories bounded by one skip seek.
+                    if (iterator.valid() && sameEntry(iterator.key(), entry)) {
+                        iterator.next();
+                        if (iterator.valid() && sameEntry(iterator.key(), entry)) {
+                            iterator.seek(versioned(entry, 0));
+                            if (iterator.valid() && sameEntry(iterator.key(), entry)) iterator.next();
+                        }
+                    }
                 }
-            } else {
+            } else try (var versions = store.cursor(null, null)) {
                 if (end == null) iterator.seekToLast();
                 else iterator.seekForPrev(end);
                 while (iterator.valid() && end != null && Arrays.compareUnsigned(iterator.key(), end) >= 0)
@@ -218,18 +226,27 @@ public final class RocksDbBackend implements IndexBackend {
             throws IOException {
         byte[] selected = versioned(entry, Math.max(readVersion, localVersion));
         versions.seek(selected);
+        return visibleAt(versions, entry, readVersion, localVersion);
+    }
+
+    private static boolean sameEntry(byte[] key, byte[] entry) {
+        return key.length == entry.length + VERSION
+                && Arrays.equals(key, 0, entry.length, entry, 0, entry.length);
+    }
+
+    private static Result visibleAt(
+            RocksStore.Cursor versions, byte[] entry, long readVersion, long localVersion)
+            throws IOException {
         if (!versions.valid()) return null;
         byte[] key = versions.key();
-        if (key.length != entry.length + VERSION || !Arrays.equals(key, 0, entry.length, entry, 0, entry.length))
-            return null;
+        if (!sameEntry(key, entry)) return null;
         if (localVersion > readVersion
                 && ~ByteBuffer.wrap(key, entry.length, VERSION).getLong() != localVersion) {
             // The transaction did not write this entry; read the statement snapshot instead.
             versions.seek(versioned(entry, readVersion));
             if (!versions.valid()) return null;
             key = versions.key();
-            if (key.length != entry.length + VERSION
-                    || !Arrays.equals(key, 0, entry.length, entry, 0, entry.length)) return null;
+            if (!sameEntry(key, entry)) return null;
         }
         ByteBuffer value = ByteBuffer.wrap(versions.value());
         if (value.get(0) == 0) return null;
