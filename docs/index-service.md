@@ -36,7 +36,7 @@ Late writes to published versions, version reuse across transactions, and duplic
 
 ## Results and validation
 
-Ordinary queries return chunks of 16,384 results. `more=true` indicates another chunk with the same ID; only the last chunk carries the final status. The service respects gRPC flow control, and the driver accumulates digests chunk by chunk without retaining the entire ordinary query result. Query groups are still fully materialized; their large-scale capacity is unproven.
+Ordinary queries return chunks of 16,384 results. `more=true` indicates another chunk with the same ID; only the last chunk carries the final status. The service respects gRPC flow control, and the driver accumulates digests chunk by chunk without retaining the entire ordinary query result. Query groups are fully materialized, so their memory requirements grow with member results and require capacity validation for the intended workload.
 
 Each query checks the native expected count and an ordered SHA-256 digest. The digest includes source query identity, range / pinned key, read point, transaction position, and complete `(PK, version, value)` results, including both int64 fields of a Locator. Wrong keys, versions, or values, changed order, results swapped between queries, missing chunks, and unchecked responses must all fail.
 
@@ -80,4 +80,4 @@ Java and JNI statistics formats must match. JNI builds without the required hist
 
 See [README](../README.md#tests) for basic check entry points. Service acceptance requires loading, complete replay, per-query checking, and Flush on the same Trace, followed by checks of the original snapshot queries after reopening. Cloud backends additionally require bucket cold-start checks after local-directory loss and positive / negative failure cases around Flush. Resource and correctness reports must come from the same run. Short tests or storage-interface checks do not establish recovery behavior or capacity limits.
 
-Data-file Rewrite, physical version GC, recovery retries for writes with unknown outcomes, and the complete source-snapshot lifecycle are not implemented. Crash recovery at the target scale, huge query groups, and formal backend performance rankings have not passed acceptance. Tests, short inputs, and storage-interface checks cannot replace independent validation of those scopes.
+Data-file Rewrite, physical version GC, recovery retries for writes with unknown outcomes, and the complete source-snapshot lifecycle are not implemented. Target-scale crash recovery, query-group capacity, and backend performance comparisons require separate validation with matching input, configuration and build identities. Unit tests, short inputs, and storage-interface checks do not establish those guarantees.

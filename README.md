@@ -74,7 +74,18 @@ Provision disk capacity for one working database, Parquet / Trace artifacts, and
 
 For YCSB databases with `C` or `POSIX` collation, Baseline export reads ordered primary-index ranges from one snapshot and forbids PG temporary spills in those transactions. Two read windows share 128 MiB of encoded-row queue credit; a row must fit one reader's share of a 64 MiB window. This bounds the queues, not total JVM memory or all pipeline disk use. Other database collations use explicit `C` sorting and still require temporary space proportional to the input.
 
-Baseline export checks planned row coverage and file boundaries and records file SHA-256 identities. To independently compare every Parquet value with the unchanged initial database, run `audit-baseline PROFILE BASELINE --jdbc URL --user ROLE`. To check captured changes against the final database, run `audit-rows PROFILE BASELINE RAW --jdbc URL --user ROLE`. For a complete native acceptance run, `scripts/native-capture.sh --audit-baseline PROFILE` performs the initial comparison immediately after export, before any workload changes. It records the audit command, timing and result separately and stops on failure. This opt-in run includes audit overhead and is not a normal-generation performance measurement. Use a separate normal run for unmodified production timing; subtracting audit time does not remove its cache effects. Preserve the final database with `SIBENCH_KEEP_DATABASE=1` for `audit-rows`; it must have stopped cleanly and remain on the same host boot. Initial and final database states are different audit inputs, and a final-state audit cannot replace the initial comparison.
+### Independent source acceptance
+
+Normal generation checks Baseline row coverage, file boundaries and file SHA-256 identities. Independent value and row-state audits are separate workflows:
+
+| Check | Entry point | Required source state |
+| --- | --- | --- |
+| Initial Parquet values | `java -jar build/sibench/sibench.jar audit-baseline PROFILE BASELINE --jdbc URL --user ROLE` | The unchanged initial database, before workload execution. |
+| Captured row changes and final values | `java -jar build/sibench/sibench.jar audit-rows PROFILE BASELINE RAW --jdbc URL --user ROLE` | The same run's final database, with business clients stopped. |
+
+Use `scripts/native-capture.sh --audit-baseline PROFILE` to run the initial comparison immediately after export. It records the audit command, timing and result separately and stops on failure. To retain the final database for `audit-rows`, set `SIBENCH_KEEP_DATABASE=1`; restart the cleanly stopped database on the same host boot before auditing. A final-state audit cannot replace the initial comparison.
+
+These audits read full inputs and require additional workspace. Measure normal generation in a separate run: subtracting audit time does not remove its cache effects. Trace conversion and service acceptance are described below and in the [Trace](docs/trace.md#validation-responsibilities) and [Index Service](docs/index-service.md#validation-boundaries) contracts.
 
 ## Replay and service
 
@@ -138,8 +149,7 @@ Maven runs Java unit tests by default, excluding `*IT` and capacity-diagnostic `
 | `PgBaselineExportIntegrationIT` | The same JDBC variable; the current fixture uses postgres / an empty password; `-Dsibench.layout.evidence=DIR` |
 | `RowStateAuditIntegrationIT` | `SIBENCH_ROW_TEST_JDBC`, `SIBENCH_ROW_CAPTURE_DIR`; `-Dsibench.row.evidence=DIR` |
 | `IndexKeyOrderIT` | `SIBENCH_KEY_TEST_JDBC`; creates temporary tables only |
-
-`NativeLoadIntegrationIT` uses `SIBENCH_SCHEMA_TEST_JDBC`, `SIBENCH_SCHEMA_TEST_USER` and `PGPASSWORD` to check the common unlogged loading policy against actual native DDL. The isolated `native_capture_it.py` check also verifies that a backend crash stops the disposable server and that the same disposable database survives a clean in-place restart.
+| `NativeLoadIntegrationIT` | `SIBENCH_SCHEMA_TEST_JDBC`, `SIBENCH_SCHEMA_TEST_USER`, and `PGPASSWORD`; checks unlogged loading against native DDL. |
 
 Schema, row-audit, and key-order tests select users through `SIBENCH_SCHEMA_TEST_USER`, `SIBENCH_ROW_TEST_USER`, and `SIBENCH_KEY_TEST_USER` respectively, defaulting to postgres; the password comes from `PGPASSWORD`. The first three test classes create and remove their own randomly named databases; the evidence directory's parent must exist. The row-audit trigger library defaults to `build/services/postgresql-capture/row_capture.so`; select a separately built library with `-Dsibench.row.library=FILE`. Row-audit tests also require the instrumented PG server to start with `SIBENCH_CAPTURE_DIR` set to that same capture directory, `SIBENCH_CAPTURE_COMPRESS=zstd`, and `SIBENCH_CAPTURE_DETAIL=summary`, with `compute_query_id=on` enabled.
 
