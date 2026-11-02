@@ -16,11 +16,6 @@ public final class RequestCaptureAudit {
      */
     static Map<String, Object> audit(Path jdbc, Path pg, boolean bindings) throws Exception {
         Map<String, Request> requests = new LinkedHashMap<>();
-        Set<String> returned = new HashSet<>();
-        Map<String, Consumed> consumed = new HashMap<>();
-        Map<String, Long> clientCommitRequests = new HashMap<>(),
-                rollbackRequests = new HashMap<>();
-        Map<String, Long> serverCommitRequests = new HashMap<>(), abortRequests = new HashMap<>();
         String closeApplication = null;
         boolean clientTransactionOpen = false;
         long clientCommits = 0, clientRollbacks = 0;
@@ -57,35 +52,39 @@ public final class RequestCaptureAudit {
                     case "request_return" -> {
                         if (!requests.containsKey(app))
                             throw new IOException("Return without request start");
-                        if (!returned.add(app)) throw new IOException("Duplicate request return");
+                        Request request = requests.get(app);
+                        if (request.returned) throw new IOException("Duplicate request return");
+                        request.returned = true;
                     }
                     case "consumed_row" -> {
-                        if (!returned.contains(app))
+                        if (!requests.containsKey(app) || !requests.get(app).returned)
                             throw new IOException("Consumed row before request return");
-                        consumed.computeIfAbsent(app, k -> new Consumed()).add(e);
+                        Request request = requests.get(app);
+                        if (request.consumed == null) request.consumed = new Consumed();
+                        request.consumed.add(e);
                     }
                     case "commit" -> {
-                        if (!returned.contains(app))
+                        if (!requests.containsKey(app) || !requests.get(app).returned)
                             throw new IOException("Commit without completed request");
                         clientCommits++;
-                        clientCommitRequests.merge(app, 1L, Long::sum);
+                        requests.get(app).clientCommits++;
                         clientTransactionOpen = false;
                     }
                     case "rollback" -> {
-                        if (!returned.contains(app))
+                        if (!requests.containsKey(app) || !requests.get(app).returned)
                             throw new IOException("Rollback without completed request");
                         clientRollbacks++;
-                        rollbackRequests.merge(app, 1L, Long::sum);
+                        requests.get(app).clientRollbacks++;
                         clientTransactionOpen = false;
                     }
                     case "autocommit" -> {
                         // An autocommit connection ends every request with an implicit commit; the
                         // server also commits the label statement that names the request.
-                        if (!returned.contains(app))
+                        if (!requests.containsKey(app) || !requests.get(app).returned)
                             throw new IOException("Autocommit without completed request");
                         long implicit = e.get("implicit_commits").getAsLong();
                         clientCommits += implicit;
-                        clientCommitRequests.merge(app, implicit, Long::sum);
+                        requests.get(app).clientCommits += implicit;
                         clientTransactionOpen = false;
                     }
                     case "close" -> {
@@ -100,12 +99,8 @@ public final class RequestCaptureAudit {
         }
         if (connections != 1 || closes != 1 || requests.isEmpty())
             throw new IOException("JDBC capture has no complete runtime");
-        if (!requests.keySet().equals(returned))
+        if (requests.values().stream().anyMatch(request -> !request.returned))
             throw new IOException("Missing client request completion");
-        Set<String> started = new HashSet<>(),
-                finished = new HashSet<>(),
-                executed = new HashSet<>(),
-                writeRequests = new HashSet<>();
         long commits = 0, aborts = 0, indexEvents = 0, unmatched = 0;
         boolean serverTransactionOpen = false;
         try (var input = ServerTrace.open(pg)) {
@@ -129,9 +124,10 @@ public final class RequestCaptureAudit {
                 }
                 if (event.equals("executor_start")) {
                     serverTransactionOpen = true;
-                    if (!started.add(app))
+                    if (request.started)
                         throw new IOException("Multiple executions for one request");
-                    String sql = request.sql();
+                    request.started = true;
+                    String sql = request.sql;
                     StringBuilder expanded = new StringBuilder();
                     int bind = 0;
                     // Known HyBench templates have no question marks in literals.
@@ -143,41 +139,42 @@ public final class RequestCaptureAudit {
                             .equals(normalize(e.get("sql").getAsString())))
                         throw new IOException("Client/server SQL mismatch");
                 } else if (event.equals("executor_end")) {
-                    if (!started.contains(app)) throw new IOException("Executor end without start");
-                    if (!finished.add(app)) throw new IOException("Duplicate executor completion");
+                    if (!request.started) throw new IOException("Executor end without start");
+                    if (request.finished) throw new IOException("Duplicate executor completion");
+                    request.finished = true;
                 } else if (event.equals("executor_run_end")) {
-                    if (!started.contains(app))
+                    if (!request.started)
                         throw new IOException("Execution return without start");
-                    executed.add(app);
+                    request.executed = true;
                     if (!e.has("row_hashes") || !e.has("returned")
                             || e.get("returned").getAsLong() != e.getAsJsonArray("row_hashes").size())
                         throw new IOException("Executor return lacks its complete result hashes");
                     if (e.get("depth").getAsInt() <= 1) {
-                        Consumed rows = consumed.get(app);
+                        Consumed rows = request.consumed;
                         if (rows != null)
                             for (JsonElement hash : e.getAsJsonArray("row_hashes"))
                                 rows.checkHash(app, hash.getAsString());
                     }
                 } else if (event.equals("result_row")) {
-                    Consumed rows = consumed.get(app);
+                    Consumed rows = request.consumed;
                     if (rows != null) rows.checkValues(app, e.getAsJsonArray("values"));
                 } else if (event.equals("transaction_commit")) {
                     commits++;
-                    serverCommitRequests.merge(app, 1L, Long::sum);
+                    request.serverCommits++;
                     serverTransactionOpen = false;
                 } else if (event.equals("row_change")
                         || event.equals("index_insert_attempt")) {
-                    writeRequests.add(app);
+                    request.wrote = true;
                 } else if (event.equals("transaction_abort")) {
                     aborts++;
-                    abortRequests.merge(app, 1L, Long::sum);
+                    request.aborts++;
                     serverTransactionOpen = false;
                 }
                 if (event.equals("scan_rescan") && bindings && !isPlannerProbe(e)) {
                     for (JsonElement item : e.getAsJsonArray("keys")) {
                         JsonObject key = item.getAsJsonObject();
                         if (key.get("value").isJsonNull()) continue;
-                        if (!request.bound().contains(key.get("value").getAsString()))
+                        if (!request.bound.contains(key.get("value").getAsString()))
                             throw new IOException(
                                     "Runtime search key is not a bound template value");
                     }
@@ -190,62 +187,45 @@ public final class RequestCaptureAudit {
         // A request that is still running when a connection closes has no ExecutorEnd: the
         // executor cleanup event is missing, while the execution itself returned. Reported, not
         // tolerated away, and it never excuses a request whose execution did not return.
-        var withoutExecutorEnd = new ArrayList<String>(started);
-        withoutExecutorEnd.removeAll(finished);
-        withoutExecutorEnd.sort(null);
-        // A read-only transaction the client commits can end at the server as an abort instead:
-        // PostgreSQL never assigned it an XID, so nothing is written and the abort discards
-        // nothing. Anything else - a request that changed rows, or one whose transaction ended
-        // neither in a commit nor in an abort - is a lost server commit and fails the audit.
+        var withoutExecutorEnd = new ArrayList<String>();
         var abortedCommits = new LinkedHashMap<String, Long>();
-        for (var entry : clientCommitRequests.entrySet()) {
-            long server = serverCommitRequests.getOrDefault(entry.getKey(), 0L);
-            if (server >= entry.getValue()) continue;
-            if (writeRequests.contains(entry.getKey())
-                    || abortRequests.getOrDefault(entry.getKey(), 0L) == 0)
-                throw new IOException(
-                        "Client commit has no server commit, and the request neither changed rows"
-                                + " nor ended in a server abort: "
-                                + entry.getKey());
-            abortedCommits.put(entry.getKey(), entry.getValue() - server);
+        long checkedRows = 0, noop = 0;
+        int executorReturns = 0, executorCleanup = 0;
+        if (clientTransactionOpen && closeApplication != null && !requests.containsKey(closeApplication))
+            throw new IOException("Close has no matching open request");
+        for (var entry : requests.entrySet()) {
+            String app = entry.getKey();
+            Request request = entry.getValue();
+            if (request.started && !request.finished) withoutExecutorEnd.add(app);
+            if (!request.started || !request.executed)
+                throw new IOException("Incomplete client/server event association");
+            executorReturns++;
+            if (request.finished) executorCleanup++;
+            long missingCommits = request.clientCommits - request.serverCommits;
+            if (missingCommits > 0) {
+                if (request.wrote || request.aborts == 0)
+                    throw new IOException(
+                            "Client commit has no server commit, and the request neither changed rows"
+                                    + " nor ended in a server abort: " + app);
+                abortedCommits.put(app, missingCommits);
+                noop += missingCommits;
+            } else if (missingCommits < 0) {
+                throw new IOException("Commit request identities differ");
+            }
+            long closeAbort = clientTransactionOpen && Objects.equals(app, closeApplication) ? 1 : 0;
+            if (request.aborts - request.clientRollbacks != closeAbort)
+                throw new IOException("Server abort is not associated with rollback or an open transaction at close");
+            Consumed rows = request.consumed;
+            if (rows != null) {
+                if (rows.hashesChecked < rows.size)
+                    throw new IOException("Client consumed uncaptured row: " + app);
+                checkedRows += rows.size;
+            }
         }
-        long noop = abortedCommits.values().stream().mapToLong(Long::longValue).sum();
-        if (unmatched != 0
-                || !started.equals(requests.keySet())
-                || !executed.equals(requests.keySet())
-                || commits + noop != clientCommits
-                || serverTransactionOpen
-                || aborts < clientRollbacks
-                || aborts > clientRollbacks + 1)
+        withoutExecutorEnd.sort(null);
+        if (unmatched != 0 || commits + noop != clientCommits || serverTransactionOpen
+                || aborts < clientRollbacks || aborts > clientRollbacks + 1)
             throw new IOException("Incomplete client/server event association");
-        var expectedCommits = new LinkedHashMap<>(clientCommitRequests);
-        for (var entry : abortedCommits.entrySet())
-            expectedCommits.merge(entry.getKey(), -entry.getValue(), Long::sum);
-        expectedCommits.values().removeIf(v -> v == 0);
-        if (!expectedCommits.equals(serverCommitRequests))
-            throw new IOException("Commit request identities differ");
-        Map<String, Long> remainingAborts = new HashMap<>(abortRequests);
-        for (var rollback : rollbackRequests.entrySet()) {
-            long remaining =
-                    remainingAborts.getOrDefault(rollback.getKey(), 0L) - rollback.getValue();
-            if (remaining < 0) throw new IOException("Rollback has no matching server abort");
-            if (remaining == 0) remainingAborts.remove(rollback.getKey());
-            else remainingAborts.put(rollback.getKey(), remaining);
-        }
-        Map<String, Long> expectedCloseAbort =
-                clientTransactionOpen && closeApplication != null
-                        ? Map.of(closeApplication, 1L)
-                        : Map.of();
-        if (!remainingAborts.equals(expectedCloseAbort))
-            throw new IOException(
-                    "Server abort is not associated with an open transaction at close");
-        long checkedRows = 0;
-        for (var request : consumed.entrySet()) {
-            Consumed rows = request.getValue();
-            if (rows.hashesChecked < rows.size)
-                throw new IOException("Client consumed uncaptured row: " + request.getKey());
-            checkedRows += rows.size;
-        }
         var report = new LinkedHashMap<String, Object>();
         // The two tolerances, named so a run's report shows them instead of hiding them.
         report.put("requests_without_executor_end", withoutExecutorEnd);
@@ -270,12 +250,24 @@ public final class RequestCaptureAudit {
         report.put("explicit_rollbacks", clientRollbacks);
         report.put("server_aborts", aborts);
         report.put("close_aborts", aborts - clientRollbacks);
-        report.put("executor_returns", executed.size());
-        report.put("executor_cleanup_events", finished.size());
+        report.put("executor_returns", executorReturns);
+        report.put("executor_cleanup_events", executorCleanup);
         return report;
     }
 
-    private record Request(String sql, List<String> bound) {}
+    /** One state per request; late result consumption can refer to an earlier request. */
+    private static final class Request {
+        final String sql;
+        final List<String> bound;
+        boolean returned, started, finished, executed, wrote;
+        long clientCommits, clientRollbacks, serverCommits, aborts;
+        Consumed consumed;
+
+        Request(String sql, List<String> bound) {
+            this.sql = sql;
+            this.bound = bound;
+        }
+    }
 
     /** Exact 64-bit row hashes; summary captures retain no per-row JSON or server-side copies. */
     private static final class Consumed {

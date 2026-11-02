@@ -274,6 +274,50 @@ public class RequestCaptureAuditTest {
         return "{\"event\":\"transaction_abort\",\"pid\":42,\"application\":\"a\"}\n";
     }
 
+    @Test
+    public void delayedConsumptionOfEarlierRequestRemainsChecked() throws Exception {
+        var directory = temporary.newFolder().toPath();
+        var client = directory.resolve("client.jsonl.zst");
+        var server = directory.resolve("server.jsonl.zst");
+        String rows = """
+                {"event":"connection","pid":42}
+                {"event":"request_start","application":"a","sql":"SELECT 1","parameters":{}}
+                {"event":"request_return","application":"a"}
+                {"event":"request_start","application":"b","sql":"SELECT 2","parameters":{}}
+                {"event":"request_return","application":"b"}
+                {"event":"consumed_row","application":"a","row_hash":"0000000000000001"}
+                {"event":"consumed_row","application":"b","row_hash":"0000000000000002"}
+                {"event":"commit","application":"b"}
+                {"event":"close","application":"b"}
+                """;
+        write(client, rows);
+        write(server, HEADER + """
+                {"event":"executor_start","pid":42,"application":"a","sql":"SELECT 1"}
+                {"event":"executor_run_end","pid":42,"application":"a","depth":1,"returned":1,"row_hashes":["0000000000000001"]}
+                {"event":"executor_end","pid":42,"application":"a"}
+                {"event":"executor_start","pid":42,"application":"b","sql":"SELECT 2"}
+                {"event":"executor_run_end","pid":42,"application":"b","depth":1,"returned":1,"row_hashes":["0000000000000002"]}
+                {"event":"executor_end","pid":42,"application":"b"}
+                {"event":"transaction_commit","pid":42,"application":"b"}
+                """);
+        assertEquals(2L, RequestCaptureAudit.audit(client, server, false).get("client_consumed_rows_checked"));
+        write(client, rows.replace("0000000000000001", "0000000000000003"));
+        assertThrows(IOException.class, () -> RequestCaptureAudit.audit(client, server, false));
+    }
+
+    @Test
+    public void rejectsCloseWhoseOpenRequestWasNeverRecorded() throws Exception {
+        var directory = temporary.newFolder().toPath();
+        var client = directory.resolve("client.jsonl.zst");
+        var server = directory.resolve("server.jsonl.zst");
+        write(client, AUTOCOMMIT_CLIENT.replace(
+                "{\"event\":\"autocommit\",\"application\":\"a\",\"implicit_commits\":2}\n", "")
+                .replace("{\"event\":\"close\",\"application\":\"a\"}",
+                        "{\"event\":\"close\",\"application\":\"unknown\"}"));
+        write(server, server(0, ""));
+        assertThrows(IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
+    }
+
     private static Path write(Path file, String text) throws IOException {
         try (var out = new com.github.luben.zstd.ZstdOutputStream(Files.newOutputStream(file))) {
             out.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));

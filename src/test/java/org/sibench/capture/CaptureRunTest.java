@@ -48,7 +48,9 @@ public class CaptureRunTest {
     @Test
     public void changingAnAuditedServerTracePreventsRunCompletion() throws Exception {
         Path directory = temporary.newFolder().toPath(), server = directory.resolve("pg-123.jsonl.zst");
-        try (CaptureRun run = CaptureRun.beginExternal(directory, "sysbench")) {
+        Path timingPath = temporary.getRoot().toPath().resolve("failed-audit-timing.json");
+        try (RunTiming timing = RunTiming.open(timingPath);
+                CaptureRun run = CaptureRun.beginExternal(directory, "sysbench")) {
             writeServerSession(server);
             CaptureRun.auditServer(server);
             Files.write(server, new byte[] {0}, java.nio.file.StandardOpenOption.APPEND);
@@ -56,6 +58,9 @@ public class CaptureRunTest {
                     .getMessage().contains("changed after its session audit"));
             assertEquals("failed", manifest(directory).get("status").getAsString());
         }
+        JsonObject timing = JsonParser.parseString(Files.readString(timingPath)).getAsJsonObject();
+        assertTrue(timing.get("capture_session_audit_wall_millis").getAsLong() >= 0);
+        assertFalse(timing.has("capture_session_audit_worker_millis"));
     }
 
     private static Map<String, Object> serverClient() {
@@ -282,7 +287,9 @@ public class CaptureRunTest {
     @Test
     public void htapAuditsAllSessionsAndAcceptsMatchedBusinessRollback() throws Exception {
         Path directory = temporary.newFolder().toPath();
-        try (CaptureRun run = CaptureRun.begin(directory)) {
+        Path timingPath = temporary.getRoot().toPath().resolve("parallel-audit-timing.json");
+        try (RunTiming timing = RunTiming.open(timingPath);
+                CaptureRun run = CaptureRun.begin(directory)) {
             run.phase("xp", null);
             for (int pid : new int[] {123, 124}) {
                 Path jdbc = directory.resolve("jdbc-" + pid + ".jsonl.zst");
@@ -308,6 +315,16 @@ public class CaptureRunTest {
             run.complete();
         }
         assertEquals(2, manifest(directory).getAsJsonArray("sessions").size());
+        JsonObject timing = JsonParser.parseString(Files.readString(timingPath)).getAsJsonObject();
+        for (String key : List.of("capture_session_hash_worker_millis",
+                "capture_session_audit_worker_millis", "capture_session_audit_wall_millis")) {
+            assertTrue(key, timing.get(key).getAsLong() >= 0);
+            assertFalse(manifest(directory).has(key));
+        }
+        for (var session : manifest(directory).getAsJsonArray("sessions")) {
+            assertEquals("passed", session.getAsJsonObject().getAsJsonObject("audit").get("status").getAsString());
+            assertEquals(1L, session.getAsJsonObject().getAsJsonObject("audit").get("requests").getAsLong());
+        }
         CaptureRun.verifyInput(directory);
         // Concurrent sessions are no longer rejected outright; they are ordered by PostgreSQL's
         // transaction completion counter, which these fixture traces do not carry.

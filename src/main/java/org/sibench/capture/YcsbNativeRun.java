@@ -135,6 +135,7 @@ final class YcsbNativeRun {
     }
 
     static Map<String, Object> run(NativeCaptureConfig config, Path logs) throws Exception {
+        long runStarted = System.nanoTime();
         Path libraries = libraries(config);
         var nativeConfig = config.nativeConfig();
         Path self = NativeProcess.self();
@@ -143,6 +144,8 @@ final class YcsbNativeRun {
         var reports = new ArrayList<Map<String, Object>>();
         for (var entry : object(nativeConfig, "workloads").entrySet()) {
             String workload = entry.getKey();
+            String timingPrefix = "ycsb_" + workload + "_";
+            long workloadStarted = System.nanoTime();
             var entryConfig = object(object(nativeConfig, "workloads"), workload);
             long operations = positive(entryConfig, "operationcount");
             Map<String, Object> overrides =
@@ -166,11 +169,15 @@ final class YcsbNativeRun {
                                             operations,
                                             config.jdbc().replace("jdbc:postgresql:", "jdbc:sibench:"),
                                             overrides)));
+            long nativeStarted = System.nanoTime();
             var result =
                     NativeProcess.run(workload, command, Map.of(), config.root(), logs, config.timeout());
+            RunTiming.current().note(timingPrefix + "native_process_millis", (System.nanoTime() - nativeStarted) / 1_000_000L);
+            long drainStarted = System.nanoTime();
             NativeProcess.drain(config.adminJdbc(), config.user());
             CaptureRun.checkFailure();
             require(result.exit() == 0, "YCSB client exited with " + result.exit() + ": " + workload);
+            RunTiming.current().note(timingPrefix + "drain_failure_checks_millis", (System.nanoTime() - drainStarted) / 1_000_000L);
             var measured = parse(result.stdout());
             long executed = 0, inserted = 0;
             var returns = new LinkedHashMap<String, Object>();
@@ -194,7 +201,9 @@ final class YcsbNativeRun {
             var added = new ArrayList<>(jdbcTraces(config));
             added.removeAll(before);
             long clientRequests = 0;
+            long countStarted = System.nanoTime();
             for (Path trace : added) clientRequests += countRequests(trace);
+            RunTiming.current().note(timingPrefix + "request_count_millis", (System.nanoTime() - countStarted) / 1_000_000L);
             // One JDBC connection per client thread.
             if (added.size() != config.threads() || clientRequests != executed)
                 throw new IOException(
@@ -239,17 +248,21 @@ final class YcsbNativeRun {
             report.put("read_modify_write", observed.get("read_modify_write"));
             if (!overrides.isEmpty()) report.put("native_property_overrides", overrides);
             report.put("source_failures", failures.report());
+            long changesStarted = System.nanoTime();
             report.put("change_kinds", ChangeKinds.countTraces(schema, addedServers).describe());
+            RunTiming.current().note(timingPrefix + "change_kinds_millis", (System.nanoTime() - changesStarted) / 1_000_000L);
             reports.add(report);
             requests += clientRequests;
             // Later workloads continue on the grown table: inserted keys are existing records.
             records += inserted;
+            RunTiming.current().note(timingPrefix + "wall_millis", (System.nanoTime() - workloadStarted) / 1_000_000L);
         }
         var summary = new LinkedHashMap<String, Object>();
         summary.put("client", "YCSB JdbcDBClient, pinned commit, " + config.threads() + " thread(s)");
         summary.put("workloads", reports);
         summary.put("jdbc_requests", requests);
         summary.put("final_recordcount", records);
+        RunTiming.current().note("ycsb_native_run_wall_millis", (System.nanoTime() - runStarted) / 1_000_000L);
         return summary;
     }
 

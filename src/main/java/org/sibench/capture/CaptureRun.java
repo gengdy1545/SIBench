@@ -398,6 +398,8 @@ final class CaptureRun implements AutoCloseable {
     /** Session audits running at once: they are independent, and each reads two whole files. */
     private static final int AUDIT_THREADS = 8;
 
+    private record AuditedSession(Map<String, Object> record, long hashNanos, long auditNanos) {}
+
     /**
      * Audits every session, in parallel. Sessions are independent, so only the records' order is
      * fixed: the run's session order. The longest backend traces start first; each audit holds
@@ -405,6 +407,7 @@ final class CaptureRun implements AutoCloseable {
      * trace, and one that needs more than the budget runs alone.
      */
     private static List<Map<String, Object>> audit(List<Pair> pairs) throws Exception {
+        long started = System.nanoTime();
         int threads = Math.max(1, Math.min(AUDIT_THREADS, Runtime.getRuntime().availableProcessors() / 2));
         int budget = (int) Math.max(1, Math.min(Integer.MAX_VALUE, Runtime.getRuntime().maxMemory() * 6 / 10 >> 20));
         var heap = new java.util.concurrent.Semaphore(budget, true);
@@ -417,7 +420,7 @@ final class CaptureRun implements AutoCloseable {
         order.sort((a, b) -> Long.compare(sizes[b], sizes[a]));
         var executor = java.util.concurrent.Executors.newFixedThreadPool(threads);
         try {
-            var results = new java.util.ArrayList<java.util.concurrent.Future<Map<String, Object>>>();
+            var results = new java.util.ArrayList<java.util.concurrent.Future<AuditedSession>>();
             for (int i = 0; i < pairs.size(); i++) results.add(null);
             for (int i : order) {
                 Pair pair = pairs.get(i);
@@ -438,23 +441,33 @@ final class CaptureRun implements AutoCloseable {
                 }));
             }
             var records = new java.util.ArrayList<Map<String, Object>>();
+            long hashNanos = 0, auditNanos = 0;
             for (var result : results) {
                 try {
-                    records.add(result.get());
+                    var session = result.get();
+                    records.add(session.record());
+                    hashNanos += session.hashNanos();
+                    auditNanos += session.auditNanos();
                 } catch (java.util.concurrent.ExecutionException failed) {
                     if (failed.getCause() instanceof Exception error) throw error;
                     if (failed.getCause() instanceof Error error) throw error;
                     throw failed;
                 }
             }
+            // Worker durations overlap; only the outer wall includes scheduling and heap waits.
+            // RunTiming notes are written by this caller, never by the parallel audit workers.
+            RunTiming.current().note("capture_session_hash_worker_millis", hashNanos / 1_000_000L);
+            RunTiming.current().note("capture_session_audit_worker_millis", auditNanos / 1_000_000L);
             return records;
         } finally {
             executor.shutdownNow();
+            RunTiming.current().note("capture_session_audit_wall_millis", (System.nanoTime() - started) / 1_000_000L);
         }
     }
 
     /** One audited session as the run manifest records it. */
-    private static Map<String, Object> audited(Pair pair) throws Exception {
+    private static AuditedSession audited(Pair pair) throws Exception {
+        long hashStarted = System.nanoTime();
         var record = new LinkedHashMap<String, Object>();
         if (pair.client() != null) {
             record.put("jdbc_file", pair.client().getFileName().toString());
@@ -464,12 +477,14 @@ final class CaptureRun implements AutoCloseable {
         record.put("pg_file", pair.server().getFileName().toString());
         record.put("pg_sha256", FileDigests.sha256(pair.server()));
         record.put("bindings", pair.bindings());
+        long hashNanos = System.nanoTime() - hashStarted;
+        long auditStarted = System.nanoTime();
         record.put(
                 "audit",
                 pair.client() != null
                         ? RequestCaptureAudit.audit(pair.client(), pair.server(), pair.bindings())
                         : auditServer(pair.server()));
-        return record;
+        return new AuditedSession(record, hashNanos, System.nanoTime() - auditStarted);
     }
 
     /**
