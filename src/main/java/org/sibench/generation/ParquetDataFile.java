@@ -51,11 +51,11 @@ public final class ParquetDataFile implements AutoCloseable {
     private final List<List<OffsetIndex>> offsetIndexes = new ArrayList<>();
 
     public ParquetDataFile(
-            Path path, TableData table, GenerationConfig config, Map<String, String> metadata)
+            Path path, MessageType schema, GenerationConfig config, Map<String, String> metadata)
             throws IOException {
         this.config = config;
         this.path = path;
-        this.schema = table.schema();
+        this.schema = schema;
         this.metadata = new java.util.TreeMap<>(metadata);
         Configuration hadoop = new Configuration(false);
         hadoop.setInt("parquet.compression.codec.zstd.level", config.codecLevel());

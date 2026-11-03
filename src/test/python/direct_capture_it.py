@@ -19,7 +19,7 @@ def main():
     parser.add_argument("--work-directory", required=True, type=Path)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--native-clients", action="store_true",
-                        help="Run 64-row sysbench/YCSB production stages using freshly built pinned clients")
+                        help="Run two-table sysbench (1024 rows) and YCSB (64 rows) production stages using freshly built pinned clients")
     mode.add_argument("--generation-budgets", action="store_true",
                       help="Check transaction-safe operation/output targets with 64 rows and 2/32 native clients")
     args = parser.parse_args()
@@ -49,8 +49,8 @@ def main():
                SIBENCH_DIRECT_PG_JDBC=f"jdbc:postgresql://127.0.0.1:{port}/postgres",
                MAVEN_OPTS="-Xmx512m")
     report = {"status": "running", "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              "input": ("64 rows; 2 clients target 40 Trace records or baseline proto + 64 bytes; 32 clients target one record; 50000 requested native operations"
-                        if args.generation_budgets else "64 rows each; 1 client; 4 events/operations per pinned workload"
+              "input": ("sysbench: 2 tables x 64 rows; YCSB: 64 rows; 2 clients target 40 Trace records or 4096 proto bytes; 32 clients target one record; 50000 requested native operations"
+                        if args.generation_budgets else "sysbench: 2 tables x 512 rows; YCSB: 64 rows; 1 client; 4 events/operations per pinned workload"
                         if args.native_clients else "3 rows each in reviewed sysbench/YCSB schemas; 2 sessions; controlled SQL"),
               "scope": "native generation and local service correctness, not benchmark performance",
               "budgets": {"setup_seconds": 60, "execution_seconds": execution_seconds, "teardown_seconds": 25,
@@ -90,7 +90,7 @@ def main():
     finally:
         if started:
             try:
-                run([binary / "pg_ctl", "-D", data, "-m", "immediate", "-w", "-t", "20", "stop"], "stop", 25)
+                run([binary / "pg_ctl", "-D", data, "-m", "fast", "-w", "-t", "20", "stop"], "stop", 25)
             except Exception as cleanup:
                 report["cleanup_error"] = str(cleanup)
                 if error is None:

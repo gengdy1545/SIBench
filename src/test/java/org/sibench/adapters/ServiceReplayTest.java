@@ -15,14 +15,14 @@ public class ServiceReplayTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     @Test
-    public void missingReferenceDoesNotReadTraceOrCreateIndex() {
+    public void missingTraceDoesNotCreateIndex() {
         Path root = temporary.getRoot().toPath();
         Path index = root.resolve("index");
         Path report = root.resolve("report.json");
         var service = new ServiceConfig("rocksdb", null, index, 0, ValueKind.ROW_ID, null, false);
         var error = assertThrows(IOException.class, () -> ServiceReplay.run(
-                root.resolve("missing-trace"), ReplayConfig.defaults(), service, null, report));
-        assertTrue(error.getMessage().contains("explicit reference report"));
+                root.resolve("missing-trace"), ReplayConfig.defaults(), service, report));
+        assertTrue(error.getMessage().contains("Incomplete Trace"));
         assertFalse(Files.exists(index));
         assertFalse(Files.exists(report));
         assertEquals(0, temporary.getRoot().list().length);

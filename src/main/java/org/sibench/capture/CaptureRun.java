@@ -543,18 +543,18 @@ final class CaptureRun implements AutoCloseable {
         verifyInventory(directory, inventory);
         var files = new java.util.ArrayList<Path>();
         for (String name : inventory) files.add(checkedPath(directory, name));
-        FileDigests.prefetch(files);
+        var digests = FileDigests.hashFiles(files);
         for (var item : doc.getAsJsonArray("sessions")) {
             var session = item.getAsJsonObject();
             Path server = checkedPath(directory, session.get("pg_file").getAsString());
-            if (!FileDigests.sha256(server).equals(session.get("pg_sha256").getAsString()))
+            if (!digests.get(server).equals(session.get("pg_sha256").getAsString()))
                 throw new IOException("Capture changed after completion");
             if (!session.has("audit")
                     || !session.getAsJsonObject("audit").get("status").getAsString().equals("passed"))
                 throw new IOException("Capture session lacks a passed audit: " + server.getFileName());
             if (!session.has("jdbc_file")) continue;
             Path client = checkedPath(directory, session.get("jdbc_file").getAsString());
-            if (!FileDigests.sha256(client).equals(session.get("jdbc_sha256").getAsString()))
+            if (!digests.get(client).equals(session.get("jdbc_sha256").getAsString()))
                 throw new IOException("Capture changed after completion");
         }
         if (!input.equals(directory)

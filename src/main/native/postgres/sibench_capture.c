@@ -290,19 +290,6 @@ sib_append_uint(StringInfo out, uint64 value)
 	appendBinaryStringInfo(out, digits, pg_ulltoa_n(value, digits));
 }
 
-/* A 64-bit value as 16 lower-case hex digits, as %016llx prints it. */
-static inline void
-sib_append_hex16(StringInfo out, uint64 value)
-{
-	static const char hex[] = "0123456789abcdef";
-	char		digits[16];
-	int			i;
-
-	for (i = 15; i >= 0; i--, value >>= 4)
-		digits[i] = hex[value & 0xf];
-	appendBinaryStringInfo(out, digits, 16);
-}
-
 /*
  * application_name as JSON. It changes once per request (the capture driver names each one) while
  * every event of the request repeats it, so its escaped form is kept until the name changes.
@@ -1389,7 +1376,7 @@ sib_heap_visibility(IndexScanDesc scan, TupleTableSlot *slot, bool found)
 	}
 }
 
-/* An all-visible index-only row is returned without reading the heap: it has no identity. */
+/* Count all-visible entries without fetching their heap tuples. */
 void
 sib_vm_visible(IndexScanDesc scan, ItemPointer tid)
 {
@@ -1789,173 +1776,20 @@ sib_executor_end(uint64 processed)
 	sib_emit("executor_end", NULL, detail);
 }
 
-/*
- * Result rows are recorded as one 64-bit FNV-1a hash per row over canonical column text, which the
- * capture driver computes the same way from what the client read. Canonical text removes only the
- * representation differences of a binary JDBC transfer: float bits, numeric without trailing
- * fraction zeros, timestamps with six fraction digits, char without its padding.
- */
-#define SIB_FNV_OFFSET UINT64CONST(14695981039346656037)
-#define SIB_FNV_PRIME UINT64CONST(1099511628211)
-
-static uint64
-sib_fnv(uint64 hash, const char *data, size_t length)
-{
-	size_t		i;
-
-	for (i = 0; i < length; i++)
-	{
-		hash ^= (unsigned char) data[i];
-		hash *= SIB_FNV_PRIME;
-	}
-	return hash;
-}
-
-static uint64
-sib_canonical(uint64 hash, Oid type, FmgrInfo *output, Datum value)
-{
-	char		buffer[64];
-	char	   *text;
-	size_t		length;
-
-	switch (type)
-	{
-		case FLOAT4OID:
-			{
-				float4		f = DatumGetFloat4(value);
-				uint32		bits;
-
-				if (isnan(f))
-					bits = 0x7fc00000;
-				else
-					memcpy(&bits, &f, sizeof(bits));
-				snprintf(buffer, sizeof(buffer), "%08x", bits);
-				return sib_fnv(hash, buffer, strlen(buffer));
-			}
-		case FLOAT8OID:
-			{
-				float8		f = DatumGetFloat8(value);
-				uint64		bits;
-
-				if (isnan(f))
-					bits = UINT64CONST(0x7ff8000000000000);
-				else
-					memcpy(&bits, &f, sizeof(bits));
-				snprintf(buffer, sizeof(buffer), "%016llx", (unsigned long long) bits);
-				return sib_fnv(hash, buffer, strlen(buffer));
-			}
-		case TIMESTAMPOID:
-			{
-				Timestamp	ts = DatumGetTimestamp(value);
-				struct pg_tm tm;
-				fsec_t		fsec;
-
-				if (!TIMESTAMP_NOT_FINITE(ts) && timestamp2tm(ts, NULL, &tm, &fsec, NULL, NULL) == 0
-					&& tm.tm_year > 0 && tm.tm_year <= 9999)
-				{
-					snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02d.%06d",
-							 tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
-							 (int) fsec);
-					return sib_fnv(hash, buffer, strlen(buffer));
-				}
-				break;
-			}
-		default:
-			break;
-	}
-	text = OutputFunctionCall(output, value);
-	length = strlen(text);
-	if (type == BPCHAROID)
-		while (length > 0 && text[length - 1] == ' ')
-			length--;
-	else if (type == NUMERICOID && strchr(text, '.'))
-	{
-		while (length > 0 && text[length - 1] == '0')
-			length--;
-		if (length > 0 && text[length - 1] == '.')
-			length--;
-	}
-	if (type == NUMERICOID && length == 2 && strncmp(text, "-0", 2) == 0)
-		hash = sib_fnv(hash, "0", 1);
-	else
-		hash = sib_fnv(hash, text, length);
-	pfree(text);
-	return hash;
-}
-
+/* Count delivered rows without inspecting or retaining their values. */
 typedef struct SibReceiver
 {
 	DestReceiver pub;
 	DestReceiver *original;
-	int			natts;
-	Oid		   *types;
-	FmgrInfo   *outputs;
 	uint64		returned;
-	StringInfoData hashes;
 } SibReceiver;
-
-static void
-sib_prepare_columns(SibReceiver *self, TupleDesc typeinfo)
-{
-	int			i;
-	Oid			output;
-	bool		variable;
-
-	self->natts = typeinfo->natts;
-	self->types = palloc(sizeof(Oid) * Max(1, typeinfo->natts));
-	self->outputs = palloc(sizeof(FmgrInfo) * Max(1, typeinfo->natts));
-	for (i = 0; i < typeinfo->natts; i++)
-	{
-		self->types[i] = TupleDescAttr(typeinfo, i)->atttypid;
-		getTypeOutputInfo(self->types[i], &output, &variable);
-		fmgr_info(output, &self->outputs[i]);
-	}
-}
 
 static bool
 sib_receive(TupleTableSlot *slot, DestReceiver *receiver)
 {
 	SibReceiver *self = (SibReceiver *) receiver;
-	uint64		hash = SIB_FNV_OFFSET;
-	int			i;
 
-	slot_getallattrs(slot);
-	if (sib_detail())
-	{
-		StringInfoData out;
-
-		initStringInfo(&out);
-		appendStringInfoString(&out, "\"values\":[");
-		for (i = 0; i < slot->tts_tupleDescriptor->natts; i++)
-		{
-			if (i)
-				appendStringInfoChar(&out, ',');
-			sib_datum(&out, TupleDescAttr(slot->tts_tupleDescriptor, i)->atttypid,
-					  slot->tts_values[i], slot->tts_isnull[i]);
-		}
-		appendStringInfoChar(&out, ']');
-		sib_emit("result_row", NULL, out.data);
-		pfree(out.data);
-	}
-	if (self->natts != slot->tts_tupleDescriptor->natts)
-		sib_prepare_columns(self, slot->tts_tupleDescriptor);
-	for (i = 0; i < self->natts; i++)
-	{
-		if (slot->tts_isnull[i])
-			hash = sib_fnv(hash, "N", 1);
-		else
-		{
-			hash = sib_fnv(hash, "V", 1);
-			hash = sib_canonical(hash, self->types[i], &self->outputs[i], slot->tts_values[i]);
-		}
-		hash = sib_fnv(hash, "\x1f", 1);
-	}
 	self->returned++;
-	if (self->returned > 1)
-		appendStringInfoChar(&self->hashes, ',');
-	appendStringInfoChar(&self->hashes, '"');
-	sib_append_hex16(&self->hashes, hash);
-	appendStringInfoChar(&self->hashes, '"');
 	return self->original->receiveSlot(slot, self->original);
 }
 
@@ -1964,7 +1798,6 @@ sib_start(DestReceiver *receiver, int operation, TupleDesc typeinfo)
 {
 	SibReceiver *self = (SibReceiver *) receiver;
 
-	sib_prepare_columns(self, typeinfo);
 	self->original->rStartup(self->original, operation, typeinfo);
 }
 
@@ -1999,11 +1832,10 @@ sib_wrap_receiver(DestReceiver *original)
 	receiver->pub.rShutdown = sib_shutdown;
 	receiver->pub.rDestroy = sib_destroy;
 	receiver->pub.mydest = original->mydest;
-	initStringInfo(&receiver->hashes);
 	return (DestReceiver *) receiver;
 }
 
-/* The rows this execution returned, as a count and their hashes in order. */
+/* The number of rows this execution returned. */
 void
 sib_executor_run_end(DestReceiver *dest, uint64 processed)
 {
@@ -2017,12 +1849,9 @@ sib_executor_run_end(DestReceiver *dest, uint64 processed)
 	{
 		SibReceiver *self = (SibReceiver *) dest;
 
-		appendStringInfo(&detail, ",\"returned\":%llu,\"row_hashes\":[",
+		appendStringInfo(&detail, ",\"returned\":%llu",
 						 (unsigned long long) self->returned);
-		appendBinaryStringInfo(&detail, self->hashes.data, self->hashes.len);
-		appendStringInfoChar(&detail, ']');
 		self->returned = 0;
-		resetStringInfo(&self->hashes);
 	}
 	sib_emit("executor_run_end", NULL, detail.data);
 	pfree(detail.data);

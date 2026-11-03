@@ -14,7 +14,10 @@ The protocol namespace is `sibench.index`, defined in `src/main/proto/index_serv
 
 Writes with unknown outcomes are not retried automatically. `INVALID` means the request violates the contract; `UNAVAILABLE` means execution failed and a write may already have taken effect. The first error, subsequent drain, and process cleanup are recorded separately.
 
-For actual gRPC requests, `ClientStreamTracer.outboundMessageSent` confirms local send completion after serialization and handoff to the transport. A return from `StreamObserver.onNext` alone does not establish send completion. Send completion and service responses are awaited separately. Logical members awaiting batching or grouping are not counted as separate RPCs. Driver capacity diagnostics reuse a transaction-complete prefix of the original Trace and actual complete responses, applying the same per-query digest checks. A finite prefix does not establish sustained load or the index throughput limit.
+A local send acknowledgment confirms serialization and handoff to the transport;
+it does not establish remote receipt or execution. Merely enqueueing a message
+does not satisfy this boundary. Checked responses complete separately. Buffered
+batch/group members are counted separately from actual RPCs.
 
 ## Data, transactions, and reads
 
@@ -32,37 +35,39 @@ An index entry is `(table, index, indexed_value, PK)`; the primary index, `index
 
 Publishing version V requires its commit marker, completion of all its operations, matching write counts, and publication of V−1. The maximum observed version cannot replace the contiguous complete watermark. Snapshot reads wait for publication of read_version; transaction-local reads also wait for earlier positions in the same transaction.
 
-Late writes to published versions, version reuse across transactions, and duplicate pending / executing positions are rejected before reaching the backend. Requests must not change state after returning such a failure. Completed transaction lanes are released, retaining the identities needed to reject late requests in a bitmap. The bitmap still grows with the maximum transaction_id; prefix reclamation is not implemented.
+Late writes to published versions, version reuse across transactions, and duplicate
+pending/executing positions are rejected before reaching the backend. A rejected
+request must not change state. Transaction-identity bookkeeping grows with the
+maximum transaction_id; prefix reclamation is not implemented.
 
 ## Results and validation
 
-Ordinary queries return chunks of 16,384 results. `more=true` indicates another chunk with the same ID; only the last chunk carries the final status. The service respects gRPC flow control, and the driver accumulates digests chunk by chunk without retaining the entire ordinary query result. Query groups are fully materialized, so their memory requirements grow with member results and require capacity validation for the intended workload.
+Ordinary queries return chunks of 16,384 results. `more=true` indicates another chunk with the same ID; only the last chunk carries the final status. The service respects gRPC flow control, and the driver counts results chunk by chunk without retaining the entire ordinary query result. Query groups are fully materialized, so their memory requirements grow with member results and require capacity validation for the intended workload.
 
-Each query checks the native expected count and an ordered SHA-256 digest. The digest includes source query identity, range / pinned key, read point, transaction position, and complete `(PK, version, value)` results, including both int64 fields of a Locator. Wrong keys, versions, or values, changed order, results swapped between queries, missing chunks, and unchecked responses must all fail.
+Each query checks the native expected count, response status and chunk completion. Missing or extra result items, invalid partial responses and incomplete request consumption fail the replay. Equal counts do not establish matching keys, versions, values or order; replay does not claim that guarantee.
 
-Service replay requires an explicit reference report from `replay` or `validate-snapshots`, including its per-query digest sidecar. The sidecar header binds the Baseline / workload Trace, value mode, and secondary-index filtering configuration; its file SHA-256 must match the report. Missing reports or per-query digests are rejected before replay. Configuration matrices compare `query_digest_sha256` while retaining independent checks of final state, selected versions, and operation order.
+Replay consumes canonical requests and native counts, without per-query answer artifacts or a reference index. Input integrity, source bindings, capability checks, transaction ordering and exact Flush publication remain required.
 
 `request_bytes` sums `Request.getSerializedSize()`, including batch requests. `result_bytes` sums `Result.getSerializedSize()`, accounted after the final response arrives and its count is verified. These counters exclude response envelopes, repeated-field tags / lengths, empty responses, gRPC / HTTP2 / TCP overhead, and retransmissions; they do not measure network bytes.
 
-## Publication, execution, and recovery
+## Publication and reopening
 
-`IndexServer` and the in-process adapter both use `PublishedIndex`. Requests that are not ready wait on transaction lanes or version-indexed wait tables without occupying workers. Ready writes / commits use a fixed worker pool; queries use a separate pool. Backend calls and response callbacks do not hold the ordering lock. Baseline needs no transaction ordering and may load in parallel.
-
-`Flush` waits for requests accepted before the call began, then writes the publication watermark and Trace binding into the index and persists them with the data. An index rejects a binding for another Trace, value mode, or secondary-index configuration. A minimal index manifest beside the report records input identity, version coverage, key / value encoding, backend location, build identity, and digest provenance. Source snapshot is N/A until integrated.
+`Flush` waits for requests accepted before the call began, then writes the publication watermark and Trace binding into the index and persists them with the data. An index rejects a binding for another Trace, value mode, or secondary-index configuration. A minimal index manifest beside the report records input identity, version coverage, key / value encoding, backend location, build identity, and replay configuration. Source snapshot is N/A until integrated.
 
 `reopen: true` opens an existing index and restores the last Flush watermark; versions above it remain invisible. `verify-service` checks all replayable snapshot queries at their original read points. Transaction-local queries are reported separately and excluded from this check because they depend on live transaction prefixes that cannot be reconstructed by replay after the transaction has ended.
 
-## RocksDB implementation
+## Local RocksDB
 
-`RocksDbBackend` uses the key layout `table(u32) ++ index(u32) ++ [indexed_value] ++ PK ++ ~version(u64)`, placing an entry's versions next to each other from newest to oldest. Reads locate the latest version at or below the read point. Transaction-local reads first select the exact local_version, falling back to the snapshot only when it does not exist. Baseline bypasses WAL; other writes use the local WAL without fsync.
+Local RocksDB uses the [Trace key encoding](trace.md#identity-and-versions).
+Baseline bypasses WAL; other writes use local WAL without fsync. Acknowledgment
+therefore does not promise power-loss durability.
 
-Service and replay templates are [rocksdb.yaml](../config/index/rocksdb.yaml) and [sibench.yaml](../config/sibench.yaml), defaulting to row_id. In-process replay uses `target.service.adapter: rocksdb` and a fresh `target.service.path`. Locator is another value mode; both sides must agree on the configuration.
+See [README](../README.md#replay-and-service) for service configuration and replay
+entry points. Both sides must agree on value mode and secondary-index filtering.
 
 ## rocksdb-cloud backend
 
 The thin JNI layer forwards bytes and reuses the same Java key layout, version selection, and publication logic. See [README](../README.md#rocksdb-cloud-jni) for build and loading instructions.
-
-Select `service.backend: rocksdb_cloud` and set `service.storage: config/index/storage.yaml`, `service.profile`, and an independent `service.object_path` under the profile prefix. Credentials come only from the environment. The cloud backend is accessed through the index service; the in-process adapter currently supports only local RocksDB. The COS bucket is a placeholder; replace the bucket, endpoint, and region before running. The service does not create buckets automatically. Validate local_s3 and COS separately.
 
 | Item | Semantics |
 | --- | --- |
@@ -74,10 +79,15 @@ Select `service.backend: rocksdb_cloud` and set `service.storage: config/index/s
 
 Object requests record counts, failures, bytes, cumulative microseconds, and a fixed 32-bucket histogram by request type. Upper bounds are 1, 2, 4…2^30 μs, with the final bucket handling overflow: `overflow_after=2^30`, with overflow upper bound `Long.MAX_VALUE`. p50 / p95 / p99 are the upper bounds of the buckets containing their nearest ranks. Both successes and failures contribute; percentiles are not interpreted when samples=0. Concurrent snapshots are not transactional, and percentiles use each histogram's own sample count. Callbacks do not separately report SDK-internal HTTP retries. Cumulative parallel time cannot be added to wall time.
 
-Java and JNI statistics formats must match. JNI builds without the required histograms are rejected at open. `summarize_index_run.py` separately summarizes verified service reports and flush / compaction observations from supplied `EVENT_LOG_v1` logs, recording file and script SHA digests. It cannot establish that a log belongs to the report's run: combined analysis with logs is marked `unverified_engine_provenance` and cannot establish performance acceptance without independent same-run records. Job time is not process CPU time, sequence numbers are not user-key ranges, and missing logs are N/A.
+Java and JNI statistics formats must match; builds missing required histograms
+are rejected at open. Engine-log analysis requires independently established
+same-run provenance before supporting performance claims. Missing engine data is
+reported as N/A.
 
 ## Validation boundaries
 
-See [README](../README.md#tests) for basic check entry points. Service acceptance requires loading, complete replay, per-query checking, and Flush on the same Trace, followed by checks of the original snapshot queries after a clean close and reopen. Cloud acceptance checks the same correctness requirements against actual cloud storage. Forced termination, failure injection around Flush, local-directory loss, cloud cold recovery, and power-loss tests are outside required acceptance. Resource and correctness reports must come from the same run. Normal replay and clean reopening do not establish fault-recovery behavior or capacity limits.
+Required acceptance is one complete local replay and one real-cloud replay of the same Trace, including loading, response/native-count checks and Flush. See [README](../README.md#tests) for entry points. Normal reopening and fault recovery (forced termination, Flush fault injection, local-directory loss, cold recovery and power loss) are separate diagnostics outside this scope.
 
-Data-file Rewrite, physical version GC, recovery retries for writes with unknown outcomes, and the complete source-snapshot lifecycle are not implemented. Any fault-recovery claim requires separate evidence with matching input, configuration and build identities; it is not a required acceptance outcome. Query-group capacity and backend performance comparisons also require matching validation. Unit tests, short inputs, and storage-interface checks do not establish those guarantees.
+Correctness and resource reports must bind the same run, inputs, configuration and build. Unit tests, short inputs, clean reopening and storage-interface checks do not establish full-input capacity, fault recovery or backend performance rankings. Query-group capacity needs workload-specific validation.
+
+Data-file Rewrite, physical version GC, retries for writes with unknown outcomes and the complete source-snapshot lifecycle are not implemented.

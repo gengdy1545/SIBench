@@ -81,8 +81,6 @@ public final class PgBaselineExport {
     public static void export(String jdbc, Path output, GenerationConfig config) throws Exception {
         Map<String, Object> document = config.document();
         var source = SourceSchema.read(config.root(), document);
-        TraceOutput strategy = TraceOutput.from(document);
-        IndexCatalog catalog = IndexCatalog.fromSchema(source);
         var preflight = PgSchemaCheck.check(config.root(), document, jdbc, "postgres");
         // The schema check requires default column/index collations; these databases order text as C.
         boolean primaryOrder = config.benchmark().equals("ycsb")
@@ -106,9 +104,11 @@ public final class PgBaselineExport {
             coordinator.setReadOnly(true);
             String snapshot;
             try (Statement statement = coordinator.createStatement();
-                    ResultSet rows = statement.executeQuery("SELECT pg_export_snapshot()")) {
+                    ResultSet rows = statement.executeQuery("SELECT pg_export_snapshot(), "
+                            + "(SELECT count(*) FROM txid_snapshot_xip(txid_current_snapshot()))")) {
                 rows.next();
                 snapshot = rows.getString(1);
+                if (rows.getLong(2) != 0) throw new IOException("Baseline export requires quiescent writers");
             }
             var session = new Session(connections, snapshot, opened);
             var planned = new ArrayList<Future<Table>>();
@@ -125,7 +125,7 @@ public final class PgBaselineExport {
             var tables = new ArrayList<Table>();
             for (var future : planned) {
                 Table table = get(future);
-                tables.add(strategy == TraceOutput.PROTO ? indexColumns(table, catalog) : table);
+                tables.add(table);
             }
             var actualRows = new LinkedHashMap<String, Long>();
             for (Table table : tables) actualRows.put(table.source().name(), table.rows());
@@ -138,12 +138,12 @@ public final class PgBaselineExport {
                 long firstRowId = nextRowId;
                 nextRowId = Math.addExact(nextRowId, table.rows());
                 written.add(pool.submit(() -> session.run(pg -> stream(
-                        pg, table, tableIndex, tables.size(), firstRowId, output, config, primaryOrder, session, strategy, catalog))));
+                        pg, table, tableIndex, tables.size(), firstRowId, output, config, primaryOrder, session))));
             }
             var results = new ArrayList<Written>();
             for (var future : written) results.addAll(get(future));
             coordinator.commit();
-            finish(source, output, tables, results, strategy);
+            finish(source, output, tables, results);
         } finally {
             pool.shutdownNow();
             for (Connection pg : opened)
@@ -158,11 +158,10 @@ public final class PgBaselineExport {
 
     /** Check the native load against the same snapshot used to plan and export its rows. */
     static void requireRows(GenerationConfig config, Map<String, Long> rows) throws IOException {
-        if (!config.benchmark().equals("ycsb")) return;
-        var nativeConfig = ConfigValues.object(config.document(), "native");
-        if (!rows.equals(Map.of(ConfigValues.string(nativeConfig, "table"),
-                        ConfigValues.positive(nativeConfig, "recordcount"))))
-            throw new IOException("YCSB export found a different row count in PG: " + rows);
+        var expected = org.sibench.workloads.ScaleInspector.nativeRows(config.root(), config.document());
+        if (!rows.equals(expected))
+            throw new IOException(config.benchmark() + " export found a different row count in PG: "
+                    + rows + "; expected " + expected);
     }
 
     /** Worker connections, one per thread, each inside the exported snapshot. */
@@ -283,8 +282,7 @@ public final class PgBaselineExport {
 
     private static List<Written> stream(
             Connection pg, Table table, int tableIndex, int tableCount, long firstRowId,
-            Path output, GenerationConfig config, boolean primaryOrder, Session session,
-            TraceOutput strategy, IndexCatalog catalog) throws Exception {
+            Path output, GenerationConfig config, boolean primaryOrder, Session session) throws Exception {
         if (config.benchmark().equals("ycsb")) {
             String query = "SELECT " + columns(table) + " FROM " + quoted(table.source().name()) + " ORDER BY "
                     + (primaryOrder ? quoted(table.key()) : order(table));
@@ -300,7 +298,7 @@ public final class PgBaselineExport {
                 }
                 try (var input = new PrefetchRows(session, table, readers)) {
                     RunTiming.current().note("baseline_" + table.source().name() + "_prefetch_readers", readers);
-                    return write(table, tableIndex, tableCount, firstRowId, input, output, config, strategy, catalog);
+                    return writeTable(table, tableIndex, tableCount, firstRowId, input, output, config);
                 }
             } else sortSettings(pg);
             // A JDBC cursor's nonzero fetch count disables PG parallel workers at execution.
@@ -309,85 +307,21 @@ public final class PgBaselineExport {
                     pg.unwrap(org.postgresql.PGConnection.class),
                     "COPY (" + query + ") TO STDOUT (FORMAT binary, ENCODING 'UTF8')")) {
                 var input = new PgTextCopyRows(copy, table.schema().getFieldCount() - 2);
-                return write(table, tableIndex, tableCount, firstRowId, input, output, config, strategy, catalog);
+                return writeTable(table, tableIndex, tableCount, firstRowId, input, output, config);
             }
         }
         if (!table.ordered()) sortSettings(pg);
         try (Statement statement = pg.createStatement()) {
             statement.setFetchSize(8192);
             try (var input = new RangeRows(statement, table)) {
-                return write(table, tableIndex, tableCount, firstRowId, input::next, output, config, strategy, catalog);
+                return writeTable(table, tableIndex, tableCount, firstRowId, input::next, output, config);
             }
         }
-    }
-
-    static Table indexColumns(Table table, IndexCatalog catalog) {
-        var indexed = catalog.definitions().stream().filter(d -> d.table().equals(table.source().name()))
-                .map(IndexCatalog.Definition::column).collect(java.util.stream.Collectors.toSet());
-        var fields = table.schema().getFields().stream()
-                .filter(f -> indexed.contains(f.getName()) || f.getName().startsWith("_sib_")).toList();
-        return new Table(table.source(), table.key(), table.integerKey(),
-                new MessageType(table.schema().getName(), fields), table.rows(), table.ordered(), table.boundaries());
     }
 
     private static String columns(Table table) {
         return table.schema().getFields().stream().filter(f -> !f.getName().startsWith("_sib_"))
                 .map(f -> quoted(f.getName())).collect(java.util.stream.Collectors.joining(", "));
-    }
-
-    private static List<Written> write(Table table, int tableIndex, int tableCount, long firstRowId,
-            Rows input, Path output, GenerationConfig config, TraceOutput strategy, IndexCatalog catalog) throws Exception {
-        return strategy == TraceOutput.PROTO
-                ? writeIndexTable(table, tableIndex, firstRowId, input, output, config, catalog)
-                : writeTable(table, tableIndex, tableCount, firstRowId, input, output, config);
-    }
-
-    static List<Written> writeIndexTable(Table table, int tableIndex, long firstRowId, Rows input,
-            Path output, GenerationConfig config, IndexCatalog catalog) throws Exception {
-        Path file = output.resolve(table.source().name() + ".pb.zst");
-        long rows = 0;
-        String first = null, last = null;
-        var writer = new ProtoTrace.Writer(file);
-        int tableId = catalog.tableId(table.source().name());
-        var primary = catalog.primary(tableId);
-        org.sibench.trace.IndexKey previous = null;
-        try (writer) {
-            String[] row;
-            while ((row = input.next()) != null) {
-                if (rows >= table.rows() || row.length != table.schema().getFieldCount() - 2)
-                    throw new IOException("Index baseline row coverage or shape mismatch");
-                var value = new com.google.gson.JsonObject();
-                for (int i = 0; i < row.length; i++) value.addProperty(table.schema().getFieldName(i), row[i]);
-                var key = catalog.primaryKey(table.source().name(), value);
-                if (previous != null && previous.compareTo(key) >= 0)
-                    throw new IOException("Index baseline primary keys are not strictly ordered");
-                previous = key;
-                var operation = IndexOperationTrace.write(0, IndexOperationTrace.INSERT, tableId, 0,
-                        key, 0, 0, 0, Math.addExact(firstRowId, rows))
-                        .withWorkUnitId(1 + (firstRowId + rows - 1) / IndexOperationTrace.BLOCK_RECORDS);
-                IndexMutation.emit(operation, Map.of(), catalog.keys(table.source().name(), value), writer);
-                String text = value.get(primary.column()).getAsString();
-                if (first == null) first = text;
-                last = text;
-                rows++;
-                if (rows % 4096 == 0 && Files.getFileStore(output).getUsableSpace() < config.minFreeBytes())
-                    throw new IOException("Disk reserve reached");
-            }
-            if (rows != table.rows()) throw new IOException("Index baseline row coverage mismatch");
-        }
-        FileDigests.written(file, writer.sha256());
-        var result = new LinkedHashMap<String, Object>();
-        result.put("file_id", tableIndex + 1L);
-        result.put("path", file.getFileName().toString());
-        result.put("table", table.source().name());
-        result.put("key", table.key());
-        result.put("rows", rows);
-        result.put("operations", writer.count());
-        result.put("logical_sha256", writer.logicalSha256());
-        result.put("size_bytes", Files.size(file));
-        result.put("first_key", first);
-        result.put("last_key", last);
-        return List.of(new Written(result));
     }
 
     private static void sortSettings(Connection pg) throws SQLException {
@@ -411,12 +345,7 @@ public final class PgBaselineExport {
     }
 
     static void requirePrimaryPlan(com.google.gson.JsonObject plan, String index) throws IOException {
-        requirePrimaryPlan(plan, index, false);
-    }
-
-    static void requirePrimaryPlan(com.google.gson.JsonObject plan, String index, boolean indexOnly) throws IOException {
-        if (!plan.has("Node Type") || !(plan.get("Node Type").getAsString().equals("Index Scan")
-                        || indexOnly && plan.get("Node Type").getAsString().equals("Index Only Scan"))
+        if (!plan.has("Node Type") || !plan.get("Node Type").getAsString().equals("Index Scan")
                 || !plan.has("Index Name") || !plan.get("Index Name").getAsString().equals(index))
             throw new IOException("YCSB baseline export requires an ordered primary index scan: " + plan);
     }
@@ -546,7 +475,7 @@ public final class PgBaselineExport {
                             result.next();
                             var plan = com.google.gson.JsonParser.parseString(result.getString(1))
                                     .getAsJsonArray().get(0).getAsJsonObject().getAsJsonObject("Plan");
-                            requirePrimaryPlan(plan, index, table.schema().getFieldCount() == 3);
+                            requirePrimaryPlan(plan, index);
                         }
                         try (var copy = new org.postgresql.copy.PGCopyInputStream(
                                 pg.unwrap(org.postgresql.PGConnection.class),
@@ -696,7 +625,7 @@ public final class PgBaselineExport {
             path = output.resolve(String.format(Locale.ROOT, "%020d-%s.parquet", fileId, table.source().name()));
             writer = new ParquetDataFile(
                     path,
-                    new TableData(table.source().name(), 0, firstRowId, table.key(), schema, null),
+                    schema,
                     config,
                     Map.of("sibench.file_id", Long.toString(fileId), "sibench.source", "postgresql"));
         }
@@ -765,7 +694,7 @@ public final class PgBaselineExport {
     }
 
     /** Manifests in file order. */
-    private static void finish(SourceSchema source, Path output, List<Table> tables, List<Written> results, TraceOutput strategy)
+    private static void finish(SourceSchema source, Path output, List<Table> tables, List<Written> results)
             throws Exception {
         Gson json = new Gson();
         try (BufferedWriter files = Files.newBufferedWriter(output.resolve("files.jsonl"))) {
@@ -792,14 +721,13 @@ public final class PgBaselineExport {
         result.put("rows", total);
         result.put("tables", manifest);
         result.put("files", results.size());
-        result.put("file_size_policy", strategy == TraceOutput.PROTO
-                ? "compressed_protobuf_blocks" : GenerationConfig.FILE_SIZE_POLICY);
-        result.put("target_file_size_bytes", strategy == TraceOutput.PROTO || results.isEmpty()
+        result.put("file_size_policy", GenerationConfig.FILE_SIZE_POLICY);
+        result.put("target_file_size_bytes", results.isEmpty()
                 ? null : ((Map<?, ?>) results.get(0).file().get("file_size")).get("target_bytes"));
         Files.writeString(output.resolve("manifest.json"), json.toJson(result));
         var expected = new LinkedHashMap<String, Long>();
         for (Table table : tables) expected.put(table.source().name(), table.rows());
-        BaselineManifest.publish(source, output, expected, strategy);
+        BaselineManifest.publish(source, output, expected);
     }
 
 }

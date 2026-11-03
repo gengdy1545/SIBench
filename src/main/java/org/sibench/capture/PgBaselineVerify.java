@@ -7,7 +7,7 @@ import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.hadoop.ParquetReader;
 import org.apache.parquet.hadoop.example.GroupReadSupport;
 import org.apache.parquet.hadoop.util.HadoopInputFile;
-import org.sibench.generation.BaselineGenerator;
+import org.sibench.config.Digests;
 import org.sibench.schema.SourceSchema;
 
 import java.io.IOException;
@@ -206,7 +206,6 @@ public final class PgBaselineVerify {
             }
             return pg;
         };
-        var recorded = BaselineDigests.of(directory);
         var fileDigests = new java.util.concurrent.ConcurrentHashMap<Path, String>();
         try {
             // Preserve task order while comparisons execute concurrently.
@@ -237,7 +236,7 @@ public final class PgBaselineVerify {
                         Boolean.getBoolean(ORDERED_STREAM)
                                 ? stream(open, entry.getKey(), entry.getValue(), tasks, futures, pool, readers)
                                 : unordered(connections, coordinator, entry.getKey(), entry.getValue(), tasks, futures, pool, readers,
-                                        recorded, fileDigests));
+                                        fileDigests));
             var results = new ArrayList<Long>();
             try {
                 for (var future : futures) results.add(future.get());
@@ -253,7 +252,7 @@ public final class PgBaselineVerify {
             for (JsonObject file : files) {
                 Path path = directory.resolve(file.get("path").getAsString());
                 String known = fileDigests.get(path);
-                digests.add(known == null ? pool.submit(() -> recorded.read(path))
+                digests.add(known == null ? pool.submit(() -> FileDigests.sha256(path))
                         : java.util.concurrent.CompletableFuture.completedFuture(known));
             }
             for (int i = 0; i < files.size(); i++) {
@@ -261,7 +260,6 @@ public final class PgBaselineVerify {
                 file.addProperty("size_bytes", Files.size(directory.resolve(file.get("path").getAsString())));
                 file.addProperty("sha256", digests.get(i).get());
             }
-            recorded.save();
             return results;
         } finally {
             pool.shutdownNow();
@@ -443,7 +441,6 @@ public final class PgBaselineVerify {
             List<java.util.concurrent.Future<Long>> futures,
             java.util.concurrent.ExecutorService pool,
             java.util.concurrent.ExecutorService readers,
-            BaselineDigests recorded,
             Map<Path, String> fileDigests) {
         var digests = new FinalState.Digest[positions.size()];
         var groups = new ArrayList<java.util.concurrent.Future<Long>>();
@@ -462,7 +459,7 @@ public final class PgBaselineVerify {
                 digests[own] = digest;
                 // Hash YCSB's wide files while their just-checked pages are still cached.
                 if (textKey && remaining.get(task.path()).decrementAndGet() == 0)
-                    fileDigests.put(task.path(), recorded.read(task.path()));
+                    fileDigests.put(task.path(), FileDigests.sha256(task.path()));
                 return result;
             });
             groups.add(future);
@@ -639,7 +636,7 @@ public final class PgBaselineVerify {
                 "all Parquet values and row identities compared with the unchanged source PG");
         result.put(
                 "files_manifest_sha256",
-                BaselineGenerator.sha256(directory.resolve("files.jsonl")));
+                Digests.sha256(directory.resolve("files.jsonl")));
         Path partial = directory.resolve("verified-manifest.json.partial");
         Files.writeString(
                 partial,

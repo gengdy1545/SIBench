@@ -25,10 +25,6 @@ public final class ProtoTrace {
 
     private ProtoTrace() {}
 
-    public static boolean indexOnly(com.google.gson.JsonObject manifest) {
-        return manifest.get("output").getAsString().equals("proto");
-    }
-
     public static IndexOperationTrace.Source source(Path directory, com.google.gson.JsonObject manifest,
             String name) throws IOException {
         if (!manifest.has("proto_files")) throw new IOException("Missing proto Trace file inventory");
@@ -37,7 +33,7 @@ public final class ProtoTrace {
         if (!inventory.has(name) || !inventory.get(name).isJsonArray())
             throw new IOException("Invalid proto Trace file inventory: " + name);
         var files = inventory.getAsJsonArray(name);
-        if (files == null || files.isEmpty()) throw new IOException("Missing proto Trace files: " + name);
+        if (files.size() != 1) throw new IOException("Expected one canonical proto Trace file: " + name);
         for (var item : files) {
             if (!item.isJsonObject()) throw new IOException("Invalid proto Trace inventory entry");
             var file = item.getAsJsonObject();
@@ -55,9 +51,7 @@ public final class ProtoTrace {
             var file = item.getAsJsonObject();
             Path relative = Path.of(file.get("path").getAsString());
             if (relative.isAbsolute() || !relative.normalize().equals(relative) || relative.startsWith("..")
-                    || !(relative.toString().equals(name + ".pb.zst")
-                            || name.equals("baseline") && relative.getNameCount() == 2
-                                    && relative.startsWith("baseline") && relative.toString().endsWith(".pb.zst"))
+                    || !relative.toString().equals(name + ".pb.zst")
                     || !paths.add(relative))
                 throw new IOException("Invalid proto Trace file path: " + relative);
         }
@@ -77,7 +71,7 @@ public final class ProtoTrace {
 
     /** Binds shard order and semantic counts without decoding and re-encoding requests. */
     public static String identity(com.google.gson.JsonArray files) {
-        var digest = org.sibench.replay.QueryDigest.digest();
+        var digest = org.sibench.config.Digests.digest();
         for (var item : files) {
             var file = item.getAsJsonObject();
             digest.update(HexFormat.of().parseHex(file.get("logical_sha256").getAsString()));
@@ -96,10 +90,10 @@ public final class ProtoTrace {
     }
 
     public static final class Writer implements Closeable, IndexOperationTrace.Consumer {
-        private final java.security.MessageDigest physical = org.sibench.replay.QueryDigest.digest();
+        private final java.security.MessageDigest physical = org.sibench.config.Digests.digest();
         private final DataOutputStream output;
         private final ByteArrayOutputStream block = new ByteArrayOutputStream();
-        private final java.security.MessageDigest logical = org.sibench.replay.QueryDigest.digest();
+        private final java.security.MessageDigest logical = org.sibench.config.Digests.digest();
         private final OutputStream messages = new DigestOutputStream(block, logical);
         private long count;
         private String logicalSha256;
@@ -153,7 +147,7 @@ public final class ProtoTrace {
             } else {
                 var request = requests.request(0, operation);
                 if (request.hasWrite() && operation.kind() != IndexOperationTrace.LOGICAL_DELETE) {
-                    // Full output also retains real Locators; proto-only writes have no data-file location.
+                    // Persist both value representations for replay from the same physical data layout.
                     request = request.toBuilder().setWrite(request.getWrite().toBuilder().setValue(
                             request.getWrite().getValue().toBuilder()
                                     .setFile(operation.file()).setPosition(operation.position()))).build();
@@ -225,9 +219,9 @@ public final class ProtoTrace {
 
     public static long read(Path file, String expectedPhysical, String expectedLogical,
             IndexOperationTrace.Consumer consumer) throws IOException {
-        var physical = org.sibench.replay.QueryDigest.digest();
+        var physical = org.sibench.config.Digests.digest();
         var decoder = new Decoder();
-        var logical = org.sibench.replay.QueryDigest.digest();
+        var logical = org.sibench.config.Digests.digest();
         long count = 0;
         try (var input = new DataInputStream(new BufferedInputStream(new DigestInputStream(
                     Files.newInputStream(file), physical)))) {

@@ -274,7 +274,6 @@ public final class AccessLedger {
             case "executor_start", "executor_run_end", "executor_end" ->
                     claim("executor_lifecycle");
             case "transaction_commit", "transaction_abort" -> claim("transaction_boundary");
-            case "result_row" -> claim("result_rows");
             case "row_change" -> claim("row_changes");
             case "index_build_start", "index_build_end" -> claim("index_build");
             case "index_insert_attempt" -> claim("index_writes");

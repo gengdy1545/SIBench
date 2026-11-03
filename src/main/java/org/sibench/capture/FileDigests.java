@@ -1,65 +1,29 @@
 package org.sibench.capture;
 
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.attribute.BasicFileAttributes;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
-/**
- * SHA256 of capture and baseline files, computed once per process. One stage checks the same
- * immutable inputs several times (the run manifest, the row audit binding, the per-session
- * report); a file whose identity, size and modification time are unchanged since its digest was
- * taken is not read again. A check that must observe a change during its own run (a source
- * that changed while it was being read) uses {@link #read} directly.
- *
- * <p>Capture code digests files here rather than through the baseline generator, so the generator
- * and its Parquet writer share immutable file identities across pipeline stages.
- */
+/** Reads actual bytes at integrity boundaries; file metadata cannot certify unchanged contents. */
 public final class FileDigests {
-    private record Identity(Path path, Object key, long size, long modified) {}
-
-    private static final ConcurrentHashMap<Identity, String> DIGESTS = new ConcurrentHashMap<>();
-
     private FileDigests() {}
 
-    private static Identity identity(Path file) throws IOException {
-        Path path = file.toAbsolutePath().normalize();
-        var attributes = Files.readAttributes(path, BasicFileAttributes.class);
-        var modified = attributes.lastModifiedTime().toInstant();
-        return new Identity(
-                path,
-                attributes.fileKey(),
-                attributes.size(),
-                modified.getEpochSecond() * 1_000_000_000L + modified.getNano());
-    }
-
-    /** Reuse the byte-stream digest only after its generated file closed successfully. */
-    static void written(Path file, String digest) throws IOException {
-        DIGESTS.put(identity(file), digest);
-    }
-
     public static String sha256(Path file) throws IOException {
-        var identity = identity(file);
-        String known = DIGESTS.get(identity);
-        if (known != null) return known;
-        String digest = read(identity.path());
-        DIGESTS.put(identity, digest);
-        return digest;
+        return org.sibench.config.Digests.sha256(file);
     }
 
-    /**
-     * Digests files concurrently into the cache: digesting is read-bound, and one reader at a time
-     * leaves a disk far below its throughput.
-     */
-    static void prefetch(java.util.List<Path> files) throws IOException {
+    /** Hash each input once in this verification pass, retaining only the resulting digests. */
+    static Map<Path, String> hashFiles(List<Path> files) throws IOException {
         var pool = java.util.concurrent.Executors.newFixedThreadPool(Math.min(8, Math.max(1, files.size())));
         try {
-            var futures = new java.util.ArrayList<java.util.concurrent.Future<String>>();
-            for (Path file : files) futures.add(pool.submit(() -> sha256(file)));
-            for (var future : futures)
+            var futures = new LinkedHashMap<Path, java.util.concurrent.Future<String>>();
+            for (Path file : files) futures.computeIfAbsent(file, path -> pool.submit(() -> sha256(path)));
+            var result = new LinkedHashMap<Path, String>();
+            for (var entry : futures.entrySet())
                 try {
-                    future.get();
+                    result.put(entry.getKey(), entry.getValue().get());
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                     throw new IOException(interrupted);
@@ -67,13 +31,9 @@ public final class FileDigests {
                     if (failed.getCause() instanceof IOException io) throw io;
                     throw new IOException(failed.getCause());
                 }
+            return result;
         } finally {
             pool.shutdownNow();
         }
-    }
-
-    /** The file's SHA256, read now. */
-    public static String read(Path path) throws IOException {
-        return org.sibench.config.Digests.sha256(path);
     }
 }

@@ -9,7 +9,7 @@ import org.sibench.capture.*;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexOperationTrace.Range;
 import org.sibench.capture.IndexReferenceReplay.LookupResult;
-import org.sibench.generation.BaselineGenerator;
+import org.sibench.config.Digests;
 import org.sibench.trace.IndexKey;
 
 import java.io.IOException;
@@ -329,10 +329,7 @@ public final class SnapshotLookupValidation {
         if (rowIdModes.isEmpty()) throw new IOException("No value mode to check");
         if (Files.exists(report))
             throw new IOException("Snapshot report already exists: " + report);
-        var trace = org.sibench.trace.TraceManifest.read(directory);
-        if (trace.has("output") && trace.get("output").getAsString().equals("proto"))
-            throw new IOException("Parquet snapshot oracle requires full output; use replay for proto reference checks");
-        var input = ReferenceReplay.prepare(directory, config);
+        var input = ReplayInput.prepare(directory, config);
         var baseline = input.baseline();
         var preflight = input.preflight();
         JsonObject manifest =
@@ -341,7 +338,7 @@ public final class SnapshotLookupValidation {
         IndexCatalog catalog = IndexCatalog.fromManifest(manifest);
         var workload = org.sibench.capture.ProtoTrace.source(directory, manifest, "workload");
         Path sourceBaseline = Path.of(manifest.get("baseline_directory").getAsString());
-        if (!BaselineGenerator.sha256(sourceBaseline.resolve("baseline-manifest.json"))
+        if (!Digests.sha256(sourceBaseline.resolve("baseline-manifest.json"))
                 .equals(manifest.get("baseline_manifest_sha256").getAsString()))
             throw new IOException("Baseline identity mismatch");
         JsonObject verification =
@@ -349,7 +346,7 @@ public final class SnapshotLookupValidation {
                                 Files.readString(sourceBaseline.resolve("baseline-manifest.json")))
                         .getAsJsonObject();
         if (!verification.get("status").getAsString().equals("complete")
-                || !BaselineGenerator.sha256(sourceBaseline.resolve("files.jsonl"))
+                || !Digests.sha256(sourceBaseline.resolve("files.jsonl"))
                         .equals(verification.get("files_manifest_sha256").getAsString()))
             throw new IOException("Baseline manifests changed or are incomplete");
         for (var item : verification.getAsJsonArray("files"))
@@ -591,11 +588,7 @@ public final class SnapshotLookupValidation {
         List<Map<String, Object>> modes = new ArrayList<>();
         for (boolean rowIds : rowIdModes) {
             String mode = rowIds ? "rowid" : "locator";
-            Path digests = report.toAbsolutePath().resolveSibling(report.getFileName() + "." + mode + ".queries");
-            try (var digest = new QueryDigest.File(digests, rowIds,
-                            ReferenceReplay.binding(directory, config) + " mode=" + mode);
-                    var model = new IndexReferenceReplay(rowIds, config.secondaryIndexes(),
-                            IndexReferenceReplay.Settings.defaults(), digest);
+            try (var model = new IndexReferenceReplay(rowIds, config.secondaryIndexes());
                     var load = new ReplayProjection(config, false, model::accept);
                     var runtime = new ReplayProjection(config, true, model::accept)) {
                 baseline.read(load);
@@ -709,7 +702,6 @@ public final class SnapshotLookupValidation {
                         rangeProbes++;
                         items += actual.size();
                     }
-                digest.close();
                 var result = new LinkedHashMap<String, Object>();
                 result.put("mode", mode);
                 result.put("native_queries", model.queries());
@@ -719,9 +711,6 @@ public final class SnapshotLookupValidation {
                 result.put("derived_checked_result_items", items);
                 result.put("retained_index_versions", model.retainedVersions());
                 result.put("workload_dispatch", runtime.describe());
-                result.put("query_digests", digest.count());
-                result.put("query_digest_file", digests.toString());
-                result.put("query_digest_sha256", digest.sha256());
                 modes.add(result);
             }
         }
@@ -785,7 +774,7 @@ public final class SnapshotLookupValidation {
 
     private static void verifyFile(Path directory, JsonObject file) throws IOException {
         Path path = directory.resolve(file.get("path").getAsString());
-        if (!BaselineGenerator.sha256(path).equals(file.get("sha256").getAsString()))
+        if (!Digests.sha256(path).equals(file.get("sha256").getAsString()))
             throw new IOException("Parquet checksum mismatch: " + path);
     }
 

@@ -4,7 +4,6 @@ import static org.junit.Assert.*;
 
 import org.junit.Test;
 import org.sibench.config.ConfigValues;
-import org.sibench.replay.ReferenceReplay;
 import org.sibench.replay.ReplayConfig;
 
 import java.nio.file.*;
@@ -19,13 +18,15 @@ public class NativeCaptureIntegrationIT {
         String admin = Objects.requireNonNull(System.getenv("SIBENCH_DIRECT_PG_JDBC"));
         int port = Integer.parseInt(admin.substring(admin.lastIndexOf(':') + 1, admin.lastIndexOf('/')));
         for (String benchmark : List.of("sysbench", "ycsb")) {
-            Path profile = profile(root, run.resolve(benchmark), benchmark, port, 64);
+            // Two 512-row tables keep native point reads on indexes without changing planner settings.
+            int rows = benchmark.equals("sysbench") ? 512 : 64;
+            Path profile = profile(root, run.resolve(benchmark), benchmark, port, rows);
             var capture = CaptureProfile.read(root, profile);
             String jdbc = NativeCaptureConfig.read(root, profile).jdbc();
             stage(root, profile, "load");
-            if (benchmark.equals("ycsb")) {
-                // A successful client process does not establish that its final batch reached PG.
-                Path shortProfile = profile(root, run.resolve("ycsb-incomplete-load"), benchmark, port, 65);
+            {
+                // A successful client process does not establish complete table contents.
+                Path shortProfile = profile(root, run.resolve(benchmark + "-incomplete-load"), benchmark, port, rows + 1);
                 var shortCapture = CaptureProfile.read(root, shortProfile);
                 assertTrue(assertThrows(java.io.IOException.class, () ->
                         PgBaselineExport.export(jdbc, shortCapture.baseline(), shortCapture.layout()))
@@ -39,20 +40,26 @@ public class NativeCaptureIntegrationIT {
             Path trace = capture.artifacts().resolve("trace");
             var manifest = org.sibench.trace.TraceManifest.read(trace);
             assertEquals("proto", manifest.get("output").getAsString());
+            assertFalse(manifest.getAsJsonArray("incremental_files").isEmpty());
+            try (var files = Files.list(capture.baseline())) {
+                assertTrue(files.anyMatch(path -> path.toString().endsWith(".parquet")));
+            }
             assertEquals("direct_source_events", manifest.get("generation").getAsString());
             assertEquals("consistent", manifest.get("capture_completeness").getAsString());
-            assertEquals(64, manifest.get("baseline_rows").getAsLong());
+            assertEquals(benchmark.equals("sysbench") ? 1024 : 64, manifest.get("baseline_rows").getAsLong());
             assertTrue(manifest.get("source_work_units").getAsLong() > 0);
+            assertFalse(manifest.has("native_answers"));
             assertFalse(Files.exists(capture.artifacts().resolve("transactions")));
             try (var files = Files.list(capture.raw())) {
                 assertFalse(files.anyMatch(path -> path.toString().endsWith(".jsonl.zst")));
             }
-            Path reference = capture.artifacts().resolve("reference.json");
-            assertEquals("passed", ReferenceReplay.run(trace, ReplayConfig.defaults(), List.of(true), reference).get("status"));
             var service = new org.sibench.adapters.ServiceConfig("rocksdb", null, capture.artifacts().resolve("index"), 0,
-                    org.sibench.adapters.proto.ValueKind.ROW_ID, null, false);
-            assertEquals("passed", org.sibench.adapters.ServiceReplay.run(trace, ReplayConfig.defaults(), service,
-                    reference, capture.artifacts().resolve("service.json")).get("status"));
+                    org.sibench.adapters.proto.ValueKind.LOCATOR, null, false);
+            var replay = org.sibench.adapters.ServiceReplay.run(trace, ReplayConfig.defaults(), service,
+                    capture.artifacts().resolve("service.json"));
+            assertEquals("passed", replay.get("status"));
+            assertTrue("Native clients must exercise indexed reads",
+                    ((Number) ((Map<?, ?>) replay.get("result")).get("queries")).longValue() > 0);
         }
     }
 
@@ -84,7 +91,7 @@ public class NativeCaptureIntegrationIT {
         settings.put("threads", 1);
         settings.put("timeout_minutes", 1);
         if (benchmark.equals("sysbench")) {
-            settings.put("tables", 1);
+            settings.put("tables", 2);
             settings.put("table-size", rows);
             settings.put("prepare_threads", 1);
         } else {

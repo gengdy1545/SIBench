@@ -36,7 +36,6 @@ public final class ServerCaptureAudit {
         long[] zeroRowModifications = {0};
         long lastRequest = 0, returned = 0, processed = -1, failed = 0;
         boolean running = false, ranToEnd = false, executorEnded = true, transaction = false;
-        boolean perRowResults;
         boolean header;
         String sql = "";
         int pid = 0;
@@ -44,7 +43,7 @@ public final class ServerCaptureAudit {
 
         synchronized void accept(JsonObject e) throws IOException {
             if (!header) {
-                perRowResults = ServerTrace.detail(e).equals("rows");
+                ServerTrace.detail(e);
                 pid = e.get("pid").getAsInt();
                 header = true;
                 return;
@@ -77,7 +76,7 @@ public final class ServerCaptureAudit {
                     ranToEnd = false;
                     executorEnded = false;
                     returned = 0;
-                    processed = -1;
+                    processed = 0;
                     sql = e.has("sql") ? e.get("sql").getAsString() : "";
                     statements.merge(firstWord(sql), 1L, Long::sum);
                 }
@@ -85,27 +84,17 @@ public final class ServerCaptureAudit {
                     if (!running) throw new IOException("Execution return without a request");
                     if (depth <= 1) {
                         ranToEnd = true;
-                        processed = e.get("processed").getAsLong();
-                        // A summary capture counts the rows at the return, not one by one.
-                        if (!e.has("returned") || !e.has("row_hashes")
-                                || e.get("returned").getAsLong() != e.getAsJsonArray("row_hashes").size())
-                            throw new IOException("Executor return lacks its complete result hashes");
-                        if (!perRowResults) {
-                            returned += e.get("returned").getAsLong();
-                            resultRows += e.get("returned").getAsLong();
-                        }
+                        if (!e.has("returned") || !e.has("processed")
+                                || e.get("returned").getAsLong() < 0 || e.get("processed").getAsLong() < 0)
+                            throw new IOException("Executor return lacks nonnegative result counts");
+                        processed = Math.addExact(processed, e.get("processed").getAsLong());
+                        returned = Math.addExact(returned, e.get("returned").getAsLong());
+                        resultRows = Math.addExact(resultRows, e.get("returned").getAsLong());
                     }
                 }
                 case "executor_end" -> {
                     if (!running) throw new IOException("Executor end without a request");
                     if (depth <= 1) executorEnded = true;
-                }
-                case "result_row" -> {
-                    if (!running) throw new IOException("Result row without a request");
-                    if (depth <= 1) {
-                        returned++;
-                        resultRows++;
-                    }
                 }
                 case "transaction_commit" -> {
                     if (running && !ranToEnd)

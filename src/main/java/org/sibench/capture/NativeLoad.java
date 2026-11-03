@@ -68,11 +68,7 @@ final class NativeLoad {
         }
     }
 
-    /**
-     * Installs the row-capture triggers on every source table and sets what a loaded benchmark
-     * database has by the time it is measured: hint bits, a visibility map and planner statistics.
-     * Autovacuum is off in capture clusters; VACUUM moves no live tuple and changes no value.
-     */
+    /** Installs row-capture triggers and gathers planner statistics for the loaded source. */
     static void captureReady(String jdbc, String user, Path library, SourceSchema schema) throws Exception {
         long started = System.nanoTime();
         try (Connection connection = DriverManager.getConnection(jdbc, user, password());
@@ -97,9 +93,9 @@ final class NativeLoad {
                                 + table.name()
                                 + "\" FOR EACH ROW EXECUTE FUNCTION public.sibench_row_capture()");
             RunTiming.current().note("load_triggers_millis", (System.nanoTime() - started) / 1_000_000L);
-            long vacuumStarted = System.nanoTime();
-            statement.execute("VACUUM (ANALYZE)");
-            RunTiming.current().note("load_vacuum_analyze_millis", (System.nanoTime() - vacuumStarted) / 1_000_000L);
+            long analyzeStarted = System.nanoTime();
+            statement.execute("ANALYZE");
+            RunTiming.current().note("load_analyze_millis", (System.nanoTime() - analyzeStarted) / 1_000_000L);
         }
     }
 

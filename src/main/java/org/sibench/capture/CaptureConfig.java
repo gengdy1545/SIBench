@@ -70,9 +70,6 @@ public record CaptureConfig(
                 string(capture, "application_prefix").equals("sibench:"),
                 "Prefix must match compiled capture patch");
         require(!bool(capture, "allow_event_loss"), "Lossy capture is unsupported");
-        require(
-                string(capture, "statement_results").equals("server_rows_and_consumed_rows"),
-                "Capture includes actual server result rows");
         Path artifacts = child(root, string(object(doc, "artifacts"), "directory"));
         Path raw = child(root, string(capture, "raw_directory"));
         require(raw.startsWith(artifacts), "Raw directory must be under artifacts");
@@ -92,7 +89,6 @@ public record CaptureConfig(
                         root,
                         doc,
                         "hybench",
-                        0,
                         target,
                         GenerationConfig.maxOvershootPercent(data),
                         maxRows,
@@ -102,8 +98,6 @@ public record CaptureConfig(
                         true,
                         org.apache.parquet.hadoop.metadata.CompressionCodecName.ZSTD,
                         level,
-                        1,
-                        0,
                         artifacts.resolve("baseline"),
                         21474836480L);
         return new CaptureConfig(

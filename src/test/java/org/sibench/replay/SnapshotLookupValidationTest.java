@@ -259,7 +259,7 @@ public class SnapshotLookupValidationTest {
                 List.of(key(18), key(21), key(22)),
                 probe.expected(3, true).stream().map(r -> r.key()).toList());
         var reinserted = probe.expected(6, true);
-        assertEquals(new IndexReferenceReplay.LookupResult(key(20), 6, 202), reinserted.get(1));
+        assertEquals(new org.sibench.capture.IndexReferenceReplay.LookupResult(key(20), 6, 202), reinserted.get(1));
         assertEquals(probe.expected(6, true), fixture.model(-1).search(TABLE, 0, probe.range, 6));
     }
 }

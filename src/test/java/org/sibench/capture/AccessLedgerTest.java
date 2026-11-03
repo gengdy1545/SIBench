@@ -147,7 +147,7 @@ public class AccessLedgerTest {
 
         Trace row() {
             resultRows++;
-            return event("result_row", null, "\"values\":[\"x\"]");
+            return this;
         }
 
         Trace commit() {
@@ -161,7 +161,7 @@ public class AccessLedgerTest {
 
         /** An execution's return with the rows it sent, as summaries record it. */
         Trace returned(long processed, long returned) {
-            event("executor_run_end", null, "\"processed\":" + processed + ",\"returned\":" + returned + ",\"row_hashes\":[]");
+            event("executor_run_end", null, "\"processed\":" + processed + ",\"returned\":" + returned + "");
             event("executor_end", null, "\"processed\":" + processed);
             depth--;
             return this;
@@ -591,8 +591,8 @@ public class AccessLedgerTest {
         assertTrue(failure(contradicted, "pg-24.jsonl").contains("Scan summary differs from per-row events"));
 
         var miscounted = new Trace().header("rows");
-        miscounted.start("SELECT c FROM t").row().row().returned(2, 1);
-        assertTrue(failure(miscounted, "pg-25.jsonl").contains("Result row count differs"));
+        miscounted.start("SELECT c FROM t").returned(2, -1);
+        assertTrue(failure(miscounted, "pg-25.jsonl").contains("nonnegative result count"));
 
         var verdicts = new Trace().header("rows");
         verdicts.start("SELECT 1").plan("u", K, 2, "bitmap").bitmapHeap("h", "u").rescan("u", K, EQUALITY);
@@ -601,7 +601,7 @@ public class AccessLedgerTest {
         assertTrue(failure(verdicts, "pg-26.jsonl").contains("Bitmap verdict summary differs"));
 
         var rowInSummary = new Trace().header("summary");
-        rowInSummary.start("SELECT c FROM t").row();
+        rowInSummary.start("SELECT c FROM t").next("s", PK, true, false);
         assertTrue(failure(rowInSummary, "pg-27.jsonl").contains("Per-row event in a summary capture"));
 
         var late = new Trace().header("summary").start("SELECT 1").header("rows");

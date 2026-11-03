@@ -17,8 +17,10 @@ public class ReplayConfigTest {
         String template = Files.readString(root.resolve("config/sibench.yaml"));
         var simple = ReplayConfig.read(root, Path.of("config/sibench.yaml"));
         assertTrue(simple.secondaryIndexes());
-        assertEquals(java.util.List.of(true), ReplayConfig.rowIdModes(parse(template)));
-        assertEquals(java.util.List.of(false), ReplayConfig.rowIdModes(parse(template.replace("value: row_id", "value: locator"))));
+        assertEquals(org.sibench.adapters.proto.ValueKind.ROW_ID,
+                org.sibench.adapters.ServiceConfig.ofReplay(root, parse(template)).value());
+        assertEquals(org.sibench.adapters.proto.ValueKind.LOCATOR,
+                org.sibench.adapters.ServiceConfig.ofReplay(root, parse(template.replace("value: row_id", "value: locator"))).value());
         assertEquals(64, simple.clientCount());
         assertEquals(4096, simple.maxInFlight());
         assertEquals(600, simple.requestTimeoutSeconds());
@@ -58,23 +60,24 @@ public class ReplayConfigTest {
         var longRun = ReplayConfig.from(longDocument);
         assertEquals(666000000, longRun.requiredOperations());
         assertEquals(128, longRun.clientCount());
-        assertEquals(2, new ReplayConfig(false, "none", 1, 1, 0, 1).requiredOperations());
-        assertEquals(120, new ReplayConfig(false, "none", 1, 100, 0, 20).requiredOperations());
+        assertEquals(2, new ReplayConfig(false, 1, 1, 0, 1).requiredOperations());
+        assertEquals(120, new ReplayConfig(false, 1, 100, 0, 20).requiredOperations());
         assertThrows(
                 ArithmeticException.class,
-                () -> new ReplayConfig(true, "none", Long.MAX_VALUE, 2, 0, 0));
+                () -> new ReplayConfig(true, Long.MAX_VALUE, 2, 0, 0));
         assertThrows(
                 ArithmeticException.class,
-                () -> new ReplayConfig(true, "none", 1, Long.MAX_VALUE, 0, 100));
+                () -> new ReplayConfig(true, 1, Long.MAX_VALUE, 0, 100));
     }
 
     @Test
-    public void rejectsRepetitionUnknownOptionsAndUnsupportedReferenceGc() throws Exception {
+    public void rejectsRepetitionUnknownOptionsAndUnsupportedGc() throws Exception {
         String text = Files.readString(Path.of("config/sibench.yaml"));
         for (String invalid :
                 new String[] {
-                    text.replace("single_pass", "cycle"),
-                    text.replace("single_pass", "single_pass\n  repeat: 2"),
+                    text.replace("target:", "target:\n  value: locator"),
+                    text.replace("replay:", "replay:\n  strategy: cycle"),
+                    text.replace("replay:", "replay:\n  repeat: 2"),
                     text.replace("enabled: true", "enabled: 'false'"),
                     text.replace("dispatch_mode: operation", "dispatch_mode: parallel"),
                     text.replace("client_count: 64", "client_count: 0"),
@@ -86,19 +89,44 @@ public class ReplayConfigTest {
                             "transaction_writes:\n"
                                     + "    coalesce_same_key: true\n"
                                     + "  secondary_indexes:"),
-                    text.replace("owner: none", "owner: immediate"),
-                    text.replace("gc:\n", "gc:\n    send_delete: false\n")
+                    text + "\nversions:\n  gc:\n    owner: immediate\n",
+                    text + "\nversions:\n  gc:\n    send_delete: false\n"
                 }) {
             assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(parse(invalid)));
         }
-        for (String owner : new String[] {"backend", "benchmark"})
-            assertThrows(
-                    IllegalArgumentException.class,
-                    () -> new ReplayConfig(true, owner, 0, 0, 0, 0).requireReferenceCapabilities());
+        var retired = parse(text);
+        var target = object(retired, "target");
+        target.remove("service");
+        target.put("value", "locator");
+        retired.put("target", target);
+        assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(retired));
         assertThrows(
                 IllegalArgumentException.class,
-                () -> new ReplayConfig(true, "none", 0, 300000, 0, 0));
+                () -> new ReplayConfig(true, 0, 300000, 0, 0));
         assertThrows(
-                IllegalArgumentException.class, () -> new ReplayConfig(true, "none", 1, 1, -1, 0));
+                IllegalArgumentException.class, () -> new ReplayConfig(true, 1, 1, -1, 0));
+    }
+
+    @Test
+    public void rejectsRetiredFixedOptions() throws Exception {
+        String source = Files.readString(Path.of("config/sibench.yaml"));
+        for (String strategy : new String[] {"single_pass", "cycle"}) {
+            var document = parse(source);
+            var replay = object(document, "replay");
+            replay.put("strategy", strategy);
+            document.put("replay", replay);
+            assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(document));
+        }
+        for (String owner : new String[] {"none", "backend", "benchmark"}) {
+            var document = parse(source);
+            document.put("versions", Map.of("gc", Map.of("owner", owner)));
+            assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(document));
+        }
+        var previous = parse(source);
+        var replay = object(previous, "replay");
+        replay.put("strategy", "single_pass");
+        previous.put("replay", replay);
+        previous.put("versions", Map.of("gc", Map.of("owner", "none")));
+        assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(previous));
     }
 }

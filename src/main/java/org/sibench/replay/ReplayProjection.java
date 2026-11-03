@@ -41,7 +41,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     }
 
     public ReplayProjection(boolean secondaryIndexes, IndexOperationTrace.Consumer target) {
-        this(new ReplayConfig(secondaryIndexes, "none", 0, 0, 0, 0), false, target);
+        this(new ReplayConfig(secondaryIndexes, 0, 0, 0, 0), false, target);
     }
 
     public ReplayProjection(

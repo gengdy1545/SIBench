@@ -92,7 +92,6 @@ public record NativeCaptureConfig(
                         root,
                         doc,
                         benchmark,
-                        0,
                         target,
                         GenerationConfig.maxOvershootPercent(data),
                         maxRows,
@@ -102,8 +101,6 @@ public record NativeCaptureConfig(
                         true,
                         org.apache.parquet.hadoop.metadata.CompressionCodecName.ZSTD,
                         level,
-                        1,
-                        0,
                         artifacts.resolve("baseline"),
                         21474836480L);
         return new NativeCaptureConfig(

@@ -46,7 +46,7 @@ public class ReplayProjectionTest {
         for (String mode : new String[] {"operation", "transaction"}) {
             for (boolean secondary : new boolean[] {true, false}) {
                 List<Operation> received = new ArrayList<>();
-                var config = new ReplayConfig(secondary, "none", 0, 0, 0, 0, mode);
+                var config = new ReplayConfig(secondary, 0, 0, 0, 0, mode);
                 var projection = new ReplayProjection(config, true, received::add);
                 assertEquals(0L, projection.describe().get("last_commit_version"));
                 projection.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
@@ -103,7 +103,7 @@ public class ReplayProjectionTest {
                     }
                 };
                 try (var replay = ReplayProjection.withClients(
-                        new ReplayConfig(secondary, "none", 0, 0, 0, 0, mode), true, target, true)) {
+                        new ReplayConfig(secondary, 0, 0, 0, 0, mode), true, target, true)) {
                     replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
                     org.sibench.capture.TransferIndexFixtures.expandRow(mutation(5, 1, 1, 10, 1, 3), replay);
                     for (int index : new int[] {0, 1}) {
@@ -166,7 +166,7 @@ public class ReplayProjectionTest {
         };
         try (var replay =
                 ReplayProjection.snapshotSearches(
-                        new ReplayConfig(true, "none", 0, 0, 0, 0),
+                        new ReplayConfig(true, 0, 0, 0, 0),
                         target,
                         members -> events.add("skip " + members.get(0).sourceEvent()))) {
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
@@ -189,7 +189,7 @@ public class ReplayProjectionTest {
 
     @Test
     public void rejectsMalformedBoundariesEvenWhenSecondaryWritesAreFiltered() throws Exception {
-        var config = new ReplayConfig(false, "none", 0, 0, 0, 0);
+        var config = new ReplayConfig(false, 0, 0, 0, 0);
         var projection = new ReplayProjection(config, true, operation -> {});
         assertThrows(IOException.class, () -> projection.accept(mutation(3, 1, 1, 10, 1, 3)));
         var opened = new ReplayProjection(config, true, operation -> {});
@@ -216,7 +216,7 @@ public class ReplayProjectionTest {
                             };
             var replay =
                     ReplayProjection.withClients(
-                            new ReplayConfig(false, "none", 0, 0, 0, 0, mode), true, target);
+                            new ReplayConfig(false, 0, 0, 0, 0, mode), true, target);
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
             Operation write = mutation(3, 1, 1, 10, 1, 3);
             Operation search = local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 0, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH).withVersion(1), 10, 1);
@@ -286,7 +286,7 @@ public class ReplayProjectionTest {
         }
         var replay =
                 new ReplayProjection(
-                        new ReplayConfig(false, "none", 0, 0, 0, 0), true, operation -> fail());
+                        new ReplayConfig(false, 0, 0, 0, 0), true, operation -> fail());
         replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
         // The unit declares three index writes; filtering secondaries must not hide the gap.
         replay.accept(mutation(5, 1, 1, 10, 1, 3).withExpansion(0, 3));
@@ -304,7 +304,7 @@ public class ReplayProjectionTest {
             List<Operation> received = new ArrayList<>();
             var replay =
                     new ReplayProjection(
-                            new ReplayConfig(true, "none", 0, 0, 0, 0, mode),
+                            new ReplayConfig(true, 0, 0, 0, 0, mode),
                             true,
                             operation -> {
                                 received.add(operation);
@@ -328,7 +328,7 @@ public class ReplayProjectionTest {
     public void emptyFilteredGroupAdvancesReadPointWithoutCallingTarget() throws Exception {
         var replay =
                 new ReplayProjection(
-                        new ReplayConfig(false, "none", 0, 0, 0, 0, "transaction"),
+                        new ReplayConfig(false, 0, 0, 0, 0, "transaction"),
                         true,
                         operation -> fail());
         replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
@@ -369,7 +369,7 @@ public class ReplayProjectionTest {
     public void bufferLimitIncludesFilteredQueries() throws Exception {
         var replay =
                 new ReplayProjection(
-                        new ReplayConfig(false, "none", 0, 0, 0, 0), true, operation -> fail());
+                        new ReplayConfig(false, 0, 0, 0, 0), true, operation -> fail());
         replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
         Operation query = local(IndexOperationTrace.search(1, 5, 1, Range.equal(IndexKey.ofInt(10)), 0, 0, 0), 10, 0);
         for (int i = 0; i < ReplayProjection.MAX_TRANSACTION_OPERATIONS; i++) replay.accept(query);

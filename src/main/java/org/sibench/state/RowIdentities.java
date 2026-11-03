@@ -37,9 +37,9 @@ public final class RowIdentities implements AutoCloseable {
         }
 
         public void add(IndexKey key, long rowId) throws IOException {
-            if (rowId < 1) throw new IOException("Invalid RowID");
+            if (rowId < 1) throw new IOException("Invalid baseline row identity");
             try {
-                bulk.append(key(table, key), rowId);
+                bulk.append(key(table, key), ByteBuffer.allocate(Long.BYTES).putLong(rowId).array());
             } catch (IllegalStateException error) {
                 throw new IOException("Baseline primary keys are not strictly ordered", error);
             }

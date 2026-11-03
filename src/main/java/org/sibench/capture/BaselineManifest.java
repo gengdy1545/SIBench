@@ -13,7 +13,7 @@ public final class BaselineManifest {
 
     private BaselineManifest() {}
 
-    static void publish(SourceSchema schema, Path directory, Map<String, Long> expected, TraceOutput output) throws Exception {
+    static void publish(SourceSchema schema, Path directory, Map<String, Long> expected) throws Exception {
         var files = new JsonArray();
         var entries = Files.readAllLines(directory.resolve("files.jsonl")).stream()
                 .map(line -> JsonParser.parseString(line).getAsJsonObject()).toList();
@@ -21,19 +21,17 @@ public final class BaselineManifest {
         if (!counts.equals(expected)) throw new IOException("Baseline row coverage mismatch");
         var paths = new ArrayList<Path>();
         for (var entry : entries) paths.add(dataPath(directory, entry));
-        FileDigests.prefetch(paths);
-        var digests = BaselineDigests.of(directory);
+        var digests = FileDigests.hashFiles(paths);
         for (var entry : entries) {
             var file = entry.deepCopy();
             Path path = dataPath(directory, file);
-            String hash = FileDigests.sha256(path);
+            String hash = digests.get(path);
             file.addProperty("sha256", hash);
-            digests.put(path, hash);
             files.add(file);
         }
         var result = new LinkedHashMap<String, Object>();
         result.put("status", "complete");
-        result.put("output", output.setting());
+        result.put("data_format", "parquet");
         result.put("rows", total(counts));
         result.put("tables", counts);
         result.put("files", files);
@@ -43,7 +41,6 @@ public final class BaselineManifest {
         Path partial = directory.resolve(FILE + ".partial");
         Files.writeString(partial, new GsonBuilder().setPrettyPrinting().create().toJson(result), StandardOpenOption.CREATE_NEW);
         Files.move(partial, directory.resolve(FILE), StandardCopyOption.ATOMIC_MOVE);
-        digests.save();
     }
 
     private static Map<String, Long> coverage(Path directory, List<String> tables, List<JsonObject> files)
@@ -82,10 +79,8 @@ public final class BaselineManifest {
         if (Files.exists(baseline.resolve("INCOMPLETE"))) throw new IOException("Baseline is incomplete");
         JsonObject manifest = JsonParser.parseString(Files.readString(baseline.resolve(FILE))).getAsJsonObject();
         if (!manifest.get("status").getAsString().equals("complete")) throw new IOException("Baseline is incomplete");
-        var output = manifest.get("output");
-        if (output == null || !output.isJsonPrimitive() || !output.getAsJsonPrimitive().isString()
-                || !List.of("proto", "full").contains(output.getAsString()))
-            throw new IOException("Missing or unsupported Baseline output strategy");
+        if (!new JsonPrimitive("parquet").equals(manifest.get("data_format")))
+            throw new IOException("Missing or unsupported Baseline data format; regenerate it");
         if (!FileDigests.sha256(baseline.resolve("files.jsonl"))
                 .equals(manifest.get("files_manifest_sha256").getAsString()))
             throw new IOException("Baseline file manifest changed");
@@ -105,22 +100,14 @@ public final class BaselineManifest {
         if (!new Gson().toJsonTree(counts).equals(manifest.get("tables"))
                 || total(counts) != manifest.get("rows").getAsLong())
             throw new IOException("Baseline row coverage changed");
-        var recorded = BaselineDigests.of(baseline);
-        var unread = new ArrayList<Path>();
-        for (var entry : manifest.getAsJsonArray("files")) {
-            Path path = dataPath(baseline, entry.getAsJsonObject());
-            if (recorded.get(path) == null) unread.add(path);
-        }
-        FileDigests.prefetch(unread);
-        for (var entry : manifest.getAsJsonArray("files")) {
+        var paths = new ArrayList<Path>();
+        for (var entry : files) paths.add(dataPath(baseline, entry.getAsJsonObject()));
+        var digests = FileDigests.hashFiles(paths);
+        for (var entry : files) {
             var file = entry.getAsJsonObject();
-            Path path = dataPath(baseline, file);
-            String digest = recorded.get(path);
-            if (digest == null) digest = FileDigests.sha256(path);
-            if (!digest.equals(file.get("sha256").getAsString())) throw new IOException("Baseline data changed");
-            recorded.put(path, digest);
+            if (!digests.get(dataPath(baseline, file)).equals(file.get("sha256").getAsString()))
+                throw new IOException("Baseline data changed");
         }
-        recorded.save();
         return manifest;
     }
 

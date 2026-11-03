@@ -1,5 +1,6 @@
 package org.sibench.adapters;
 
+import org.sibench.replay.ReplayInput;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -8,7 +9,7 @@ import org.sibench.adapters.proto.DescribeResponse;
 import org.sibench.adapters.proto.ValueKind;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.RunTiming;
-import org.sibench.replay.ReferenceReplay;
+
 import org.sibench.replay.ReplayConfig;
 import org.sibench.replay.ReplayProjection;
 import org.sibench.replay.ReplayTarget;
@@ -23,23 +24,20 @@ import java.util.Map;
 /**
  * Replays a canonical trace against an index service: the baseline load, a flush, the workload
  * and a flush, each through the multi-client dispatcher with routing, in-flight bounds and
- * timeouts. Every search checks its native count and complete ordered per-query digest.
+ * timeouts. Every search checks its native result count.
  */
 public final class ServiceReplay {
     private ServiceReplay() {}
 
     public static Map<String, Object> run(
-            Path directory, ReplayConfig config, ServiceConfig service, Path reference, Path report)
+            Path directory, ReplayConfig config, ServiceConfig service, Path report)
             throws IOException {
-        if (reference == null)
-            throw new IOException("Service replay requires an explicit reference report; run replay first");
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
-        var input = ReferenceReplay.prepare(directory, config);
+        var input = ReplayInput.prepare(directory, config);
         var preflight = input.preflight();
         String mode = service.value() == ValueKind.ROW_ID ? "rowid" : "locator";
-        String binding = ReferenceReplay.binding(directory, config) + " mode=" + mode;
-        Path expectedResults = ReferenceReplay.queryDigestFile(reference, mode);
-        var requests = new TraceRequests(service.value(), expectedResults, binding);
+        String binding = ReplayInput.binding(directory, config) + " mode=" + mode;
+        var requests = new TraceRequests(service.value());
         DescribeResponse description;
         ReplayTarget.Factory factory;
         GrpcService remote = null;
@@ -117,7 +115,6 @@ public final class ServiceReplay {
                     result.put(phase, phaseReport);
                 }
             }
-            requests.finish();
             result.put("queries", requests.queries());
             result.put("search_requests", requests.queries());
             var workload = (Map<?, ?>) result.get("workload");
@@ -132,22 +129,13 @@ public final class ServiceReplay {
             result.put("request_bytes", requests.requestBytes());
             result.put("result_bytes", requests.resultBytes());
             result.put("max_results_per_query", requests.maxResults());
-            result.put("max_expected_in_flight", requests.maxExpected());
             result.put("max_group_members", requests.maxGroupMembers());
-            result.put("per_query_digest_checks", requests.digestChecks());
-            result.put("per_query_digest_mismatches", requests.digestMismatches());
-            result.put("expected_results_source", "reference_report");
-            result.put(
-                    "expected_results_sha256",
-                    org.sibench.generation.BaselineGenerator.sha256(expectedResults));
-            result.put("reference", Map.of("report", reference.toString(), "mode", mode,
-                    "status", "per_query_digests_matched"));
             var output = new LinkedHashMap<String, Object>();
             output.put("status", "passed");
             output.put("preflight", preflight);
             output.put("result", result);
-            output.put("scope", "every search returned its native expected count and its per-query"
-                    + " (PK, version, value) digest matched the reference; single sending thread,"
+            output.put("scope", "every search returned its native expected count; result identities, versions"
+                    + " and order were not compared; single sending thread,"
                     + " per-client ordered streams; not a sustained-rate, recovery or cross-client"
                     + " visibility test");
             Files.writeString(report, new GsonBuilder().setPrettyPrinting().create().toJson(output),
@@ -163,23 +151,19 @@ public final class ServiceReplay {
 
     /**
      * Checks an index that already holds the whole trace, e.g. after a restart or a cold start:
-     * every snapshot search of the workload, at its read version, must return its reference
-     * digest. Writes are not sent. Transaction-local searches are not checked: their answer is
+     * every snapshot search of the workload, at its read version, must return its native
+     * result count. Writes are not sent. Transaction-local searches are not checked: their answer is
      * their transaction's state at that point, which later writes of the transaction overwrite.
      */
     public static Map<String, Object> verify(
-            Path directory, ReplayConfig config, ServiceConfig service, Path reference, Path report)
+            Path directory, ReplayConfig config, ServiceConfig service, Path report)
             throws IOException {
         if (Files.exists(report)) throw new IOException("Verification report already exists: " + report);
-        if (reference == null)
-            throw new IOException("Snapshot verification needs a reference report's digests");
-        var input = ReferenceReplay.prepare(directory, config);
+        var input = ReplayInput.prepare(directory, config);
         var preflight = input.preflight();
         String mode = service.value() == ValueKind.ROW_ID ? "rowid" : "locator";
-        String binding = ReferenceReplay.binding(directory, config) + " mode=" + mode;
-        var requests =
-                new TraceRequests(
-                        service.value(), ReferenceReplay.queryDigestFile(reference, mode), binding);
+        String binding = ReplayInput.binding(directory, config) + " mode=" + mode;
+        var requests = new TraceRequests(service.value());
         requests.snapshotReads();
         long lastCommit = lastCommit(preflight);
         DescribeResponse description;
@@ -218,20 +202,17 @@ public final class ServiceReplay {
             RunTiming.current().phase("verify");
             long start = System.nanoTime();
             Map<String, Object> dispatch;
-            try (var projection = ReplayProjection.snapshotSearches(config, factory, requests::skipExpected)) {
+            try (var projection = ReplayProjection.snapshotSearches(config, factory, requests::skipSearch)) {
                 input.workload().read(projection);
                 projection.finish();
                 dispatch = projection.describe();
             }
             double seconds = (System.nanoTime() - start) / 1e9;
-            requests.finish();
             var result = new LinkedHashMap<String, Object>();
             result.put("service", description.getName());
             result.put("published_version", publishedVersion);
             result.put("seconds", seconds);
             result.put("queries", requests.queries());
-            result.put("per_query_digest_checks", requests.digestChecks());
-            result.put("per_query_digest_mismatches", requests.digestMismatches());
             result.put("unchecked_transaction_local_queries", requests.skippedQueries());
             result.put("checked_result_items", requests.checkedResults());
             result.put("result_bytes", requests.resultBytes());
@@ -241,7 +222,7 @@ public final class ServiceReplay {
             output.put("preflight", preflight);
             output.put("result", result);
             output.put("scope", "every snapshot search of the trace at its read version matched its"
-                    + " reference digest on an index that already held the whole trace; writes were"
+                    + " native result count on an index that already held the whole trace; writes were"
                     + " not sent and transaction-local searches were not checked");
             Files.writeString(report, new GsonBuilder().setPrettyPrinting().create().toJson(output),
                     StandardOpenOption.CREATE_NEW);
@@ -297,17 +278,11 @@ public final class ServiceReplay {
                         "versions", "0.." + ((Map<?, ?>) result.get("workload")).get("published_version"),
                         "commits", "complete commits only",
                         "secondary_indexes", config.secondaryIndexes()));
-        manifest.put(
-                "checksum",
-                Map.of(
-                        "per_query_digest_checks", result.get("per_query_digest_checks"),
-                        "per_query_digest_mismatches", result.get("per_query_digest_mismatches"),
-                        "expected_results_sha256", result.get("expected_results_sha256")));
         Path jar = Path.of(java.net.URI.create(
                 ServiceReplay.class.getProtectionDomain().getCodeSource().getLocation().toString()));
         manifest.put(
                 "build_sha256",
-                Files.isRegularFile(jar) ? org.sibench.generation.BaselineGenerator.sha256(jar) : "N/A (not a jar)");
+                Files.isRegularFile(jar) ? org.sibench.config.Digests.sha256(jar) : "N/A (not a jar)");
         manifest.put("replay_configuration", config.describe());
         manifest.put("source_snapshot_id", "N/A");
         Files.writeString(

@@ -52,14 +52,14 @@ public class SibenchTest {
                 "missing-trace",
                 "missing-report.json"
             },
-            {"check-schema", "src/test/resources/config/ycsb_1b.yaml"},
+            {"check-schema", "src/test/resources/config/ycsb_1k.yaml"},
             {"check-schema", "--jdbc"},
             {"check-schema", "--user"},
-            {"audit-rows", "src/test/resources/config/ycsb_1b.yaml"},
+            {"audit-rows", "src/test/resources/config/ycsb_1k.yaml"},
             {"audit-rows", "--jdbc"},
             {
                 "audit-rows",
-                "src/test/resources/config/ycsb_1b.yaml",
+                "src/test/resources/config/ycsb_1k.yaml",
                 "missing-baseline",
                 "missing-raw",
                 "--jdbc",
@@ -69,17 +69,17 @@ public class SibenchTest {
             },
             {
                 "check-schema",
-                "src/test/resources/config/ycsb_1b.yaml",
+                "src/test/resources/config/ycsb_1k.yaml",
                 "--jdbc",
                 "jdbc:mysql:localhost",
                 "--user",
                 "postgres"
             },
-            {"inspect-scale", "src/test/resources/config/ycsb_1b.yaml", "missing.yaml"},
+            {"inspect-scale", "src/test/resources/config/ycsb_1k.yaml", "missing.yaml"},
             {"compare-ledgers"},
-            {"compare-ledgers", "src/test/resources/config/ycsb_1b.yaml"},
-            {"snapshot-index-counters", "src/test/resources/config/ycsb_1b.yaml"},
-            {"check-capture-completeness", "src/test/resources/config/ycsb_1b.yaml"}
+            {"compare-ledgers", "src/test/resources/config/ycsb_1k.yaml"},
+            {"snapshot-index-counters", "src/test/resources/config/ycsb_1k.yaml"},
+            {"check-capture-completeness", "src/test/resources/config/ycsb_1k.yaml"}
         };
         for (String[] args : invalid) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
@@ -94,16 +94,27 @@ public class SibenchTest {
     }
 
     @Test
-    public void serviceReplayRequiresReferenceBeforeReadingInputs() {
+    public void serviceReplayRejectsExternalReferenceOption() {
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         ByteArrayOutputStream errors = new ByteArrayOutputStream();
         try (PrintStream out = new PrintStream(output, true, StandardCharsets.UTF_8);
                 PrintStream err = new PrintStream(errors, true, StandardCharsets.UTF_8)) {
             assertEquals(1, Sibench.run(new String[] {
-                    "replay-service", "missing-config.yaml", "missing-trace", "missing-report.json"
+                    "replay-service", "missing-config.yaml", "missing-trace", "missing-report.json", "--reference", "old.json"
             }, out, err));
             assertEquals(0, output.size());
-            assertTrue(errors.toString(StandardCharsets.UTF_8).contains("--reference REPORT"));
+            assertTrue(errors.toString(StandardCharsets.UTF_8).contains("Unknown option: --reference"));
+        }
+    }
+
+    @Test
+    public void rejectsRetiredPrepareCommand() {
+        var output = new ByteArrayOutputStream();
+        var errors = new ByteArrayOutputStream();
+        try (var out = new PrintStream(output); var err = new PrintStream(errors)) {
+            assertEquals(1, Sibench.run(new String[] {"prepare", "--help"}, out, err));
+            assertEquals(0, output.size());
+            assertTrue(errors.toString(StandardCharsets.UTF_8).contains("Unknown command: prepare"));
         }
     }
 

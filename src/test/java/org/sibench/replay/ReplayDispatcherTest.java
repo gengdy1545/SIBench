@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 public class ReplayDispatcherTest {
     private static ReplayConfig config(int clients, int inFlight) {
-        return new ReplayConfig(true, "none", 0, 0, 0, 0, "operation", clients, inFlight, 2);
+        return new ReplayConfig(true, 0, 0, 0, 0, "operation", clients, inFlight, 2);
     }
 
     private static Operation search(long unit) {
@@ -319,7 +319,7 @@ public class ReplayDispatcherTest {
             var response = new CompletableFuture<Void>();
             var dispatcher =
                     new ReplayDispatcher(
-                            new ReplayConfig(true, "none", 0, 0, 0, 0, "operation", 1, 1, 1),
+                            new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 1, 1),
                             client -> (seq, op) -> new ReplayTarget.SendHandle(sent, response));
             try {
                 if (localTimeout) assertThrows(IOException.class, () -> dispatcher.send(search(1)));
@@ -347,7 +347,7 @@ public class ReplayDispatcherTest {
                         search(3));
         for (boolean secondary : new boolean[] {false, true}) {
             List<Integer> routes = new ArrayList<>();
-            var config = new ReplayConfig(secondary, "none", 0, 0, 0, 0, "operation", 2, 10, 2);
+            var config = new ReplayConfig(secondary, 0, 0, 0, 0, "operation", 2, 10, 2);
             try (var projection =
                     ReplayProjection.withClients(
                             config,
@@ -418,7 +418,7 @@ public class ReplayDispatcherTest {
         var response = new CompletableFuture<Void>();
         try (var dispatcher =
                 new ReplayDispatcher(
-                        new ReplayConfig(true, "none", 0, 0, 0, 0, "operation", 1, 10, 1),
+                        new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 10, 1),
                         client ->
                                 (seq, op) ->
                                         new ReplayTarget.SendHandle(
@@ -433,7 +433,7 @@ public class ReplayDispatcherTest {
         var localSend = new CompletableFuture<Void>();
         var dispatcher =
                 new ReplayDispatcher(
-                        new ReplayConfig(true, "none", 0, 0, 0, 0, "operation", 1, 10, 1),
+                        new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 10, 1),
                         client ->
                                 (seq, op) ->
                                         new ReplayTarget.SendHandle(

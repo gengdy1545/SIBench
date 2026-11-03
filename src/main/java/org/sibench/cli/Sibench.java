@@ -1,5 +1,6 @@
 package org.sibench.cli;
 
+import org.sibench.replay.ReplayInput;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -8,18 +9,13 @@ import org.sibench.capture.AccessLedger;
 import org.sibench.capture.CaptureCompleteness;
 import org.sibench.capture.CaptureProfile;
 import org.sibench.capture.LedgerComparison;
-import org.sibench.capture.RelocationCheck;
 import org.sibench.capture.RowStateAudit;
 import org.sibench.capture.RunTiming;
 import org.sibench.config.ConfigValues;
-import org.sibench.generation.BaselineGenerator;
-import org.sibench.replay.ReferenceReplay;
 import org.sibench.adapters.IndexServer;
 import org.sibench.adapters.ServiceConfig;
 import org.sibench.adapters.ServiceReplay;
 import org.sibench.replay.ReplayConfig;
-import org.sibench.replay.ReplayMatrixValidation;
-import org.sibench.replay.SnapshotLookupValidation;
 import org.sibench.schema.PgSchemaCheck;
 import org.sibench.schema.SourceSchema;
 import org.sibench.workloads.ScaleInspector;
@@ -50,11 +46,11 @@ public final class Sibench {
                         + "   (serves a new or reopened RocksDB / rocksdb-cloud index over the SIBench index protocol)");
         out.println(
                 "       java -jar build/sibench/sibench.jar replay-service REPLAY_CONFIG"
-                        + " TRACE_DIRECTORY REPORT --reference REFERENCE_REPORT"
+                        + " TRACE_DIRECTORY REPORT"
                         + "   (target.service: grpc endpoint or in-process rocksdb path)");
         out.println(
                 "       java -jar build/sibench/sibench.jar verify-service REPLAY_CONFIG"
-                        + " TRACE_DIRECTORY REPORT --reference REFERENCE_REPORT"
+                        + " TRACE_DIRECTORY REPORT"
                         + "   (snapshot searches against an index already holding the trace)");
         out.println(
                 "       java -jar build/sibench/sibench.jar analyze-locality TRACE CONFIG OUTPUT"
@@ -77,10 +73,7 @@ public final class Sibench {
             if (!List.of(
                             "inspect-scale",
                             "postgres-config",
-                            "prepare",
-                            "replay",
                             "check-replay",
-                            "validate-snapshots",
                             "check-schema",
                             "audit-rows",
                             "audit-baseline",
@@ -88,8 +81,6 @@ public final class Sibench {
                             "compare-ledgers",
                             "snapshot-index-counters",
                             "check-capture-completeness",
-                            "validate-replay-matrix",
-                            "check-relocation",
                             "index-server",
                             "replay-service",
                             "verify-service",
@@ -101,14 +92,11 @@ public final class Sibench {
             }
             Path root = Path.of("").toAbsolutePath();
             List<String> profiles = new ArrayList<>();
-            boolean dryRun = false;
-            String jdbc = null, user = null, reference = null;
+            String jdbc = null, user = null;
             for (int i = 1; i < args.length; i++) {
                 if (args[i].equals("--help") || args[i].equals("-h")) {
                     printHelp(out);
                     return 0;
-                } else if (args[i].equals("--dry-run") && args[0].equals("prepare")) {
-                    dryRun = true;
                 } else if (List.of("check-schema", "audit-rows", "audit-baseline", "snapshot-index-counters")
                                 .contains(args[0])
                         && args[i].equals("--jdbc")) {
@@ -121,11 +109,6 @@ public final class Sibench {
                     if (++i == args.length)
                         throw new IllegalArgumentException("--user requires a role");
                     user = args[i];
-                } else if ((args[0].equals("replay-service") || args[0].equals("verify-service"))
-                        && args[i].equals("--reference")) {
-                    if (++i == args.length)
-                        throw new IllegalArgumentException("--reference requires a report");
-                    reference = args[i];
                 } else if (args[i].equals("--root")) {
                     if (++i == args.length) {
                         throw new IllegalArgumentException("--root requires a path");
@@ -250,27 +233,6 @@ public final class Sibench {
                 }
                 return 0;
             }
-            if (args[0].equals("validate-replay-matrix")) {
-                if (profiles.size() != 2)
-                    throw new IllegalArgumentException(
-                            "validate-replay-matrix requires TRACE_DIRECTORY OUTPUT_DIRECTORY");
-                ReplayMatrixValidation.validate(
-                        root.resolve(profiles.get(0)), root.resolve(profiles.get(1)));
-                out.println(Files.readString(root.resolve(profiles.get(1)).resolve("matrix.json")));
-                return 0;
-            }
-            if (args[0].equals("check-relocation")) {
-                if (profiles.size() != 3)
-                    throw new IllegalArgumentException(
-                            "check-relocation requires PROFILE TRACE_DIRECTORY OUTPUT_DIRECTORY");
-                Path output = root.resolve(profiles.get(2));
-                RelocationCheck.validate(
-                        CaptureProfile.read(root, Path.of(profiles.get(0))).layout(),
-                        root.resolve(profiles.get(1)),
-                        output);
-                out.println(Files.readString(output.resolve("report.json")));
-                return 0;
-            }
             if (args[0].equals("check-schema")) {
                 if (profiles.size() != 1 || jdbc == null || user == null)
                     throw new IllegalArgumentException(
@@ -334,38 +296,32 @@ public final class Sibench {
                 return 0;
             }
             if (args[0].equals("replay-service")) {
-                if (profiles.size() != 3 || reference == null)
+                if (profiles.size() != 3)
                     throw new IllegalArgumentException(
-                            "replay-service requires REPLAY_CONFIG TRACE_DIRECTORY REPORT --reference REPORT");
+                            "replay-service requires REPLAY_CONFIG TRACE_DIRECTORY REPORT");
                 var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
                 ReplayConfig config = ReplayConfig.from(document);
                 ServiceConfig service = ServiceConfig.ofReplay(root, document);
-                if (service == null)
-                    throw new IllegalArgumentException("replay-service needs target.service in its config");
                 var result =
                         ServiceReplay.run(
                                 root.resolve(profiles.get(1)),
                                 config,
                                 service,
-                                root.resolve(reference),
                                 root.resolve(profiles.get(2)));
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result.get("result")));
                 return 0;
             }
             if (args[0].equals("verify-service")) {
-                if (profiles.size() != 3 || reference == null)
+                if (profiles.size() != 3)
                     throw new IllegalArgumentException(
-                            "verify-service requires REPLAY_CONFIG TRACE_DIRECTORY REPORT --reference REPORT");
+                            "verify-service requires REPLAY_CONFIG TRACE_DIRECTORY REPORT");
                 var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
                 ServiceConfig service = ServiceConfig.ofReplay(root, document);
-                if (service == null)
-                    throw new IllegalArgumentException("verify-service needs target.service in its config");
                 var result =
                         ServiceReplay.verify(
                                 root.resolve(profiles.get(1)),
                                 ReplayConfig.from(document),
                                 service,
-                                root.resolve(reference),
                                 root.resolve(profiles.get(2)));
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result.get("result")));
                 return 0;
@@ -381,43 +337,12 @@ public final class Sibench {
                 out.println(Files.readString(root.resolve(profiles.get(2)).resolve("summary.json")));
                 return 0;
             }
-            if (List.of("replay", "check-replay", "validate-snapshots").contains(args[0])) {
-                boolean check = args[0].equals("check-replay");
-                if (profiles.size() != (check ? 2 : 3))
-                    throw new IllegalArgumentException(
-                            args[0]
-                                    + " requires REPLAY_CONFIG TRACE_DIRECTORY"
-                                    + (check ? "" : " REPORT"));
+            if (args[0].equals("check-replay")) {
+                if (profiles.size() != 2)
+                    throw new IllegalArgumentException("check-replay requires REPLAY_CONFIG TRACE_DIRECTORY");
                 var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
-                ReplayConfig config = ReplayConfig.from(document);
-                var modes = ReplayConfig.rowIdModes(document);
-                Path directory = root.resolve(profiles.get(1));
-                var result =
-                        check
-                                ? ReferenceReplay.check(directory, config)
-                                : args[0].equals("validate-snapshots")
-                                        ? SnapshotLookupValidation.run(
-                                                directory, config, modes, root.resolve(profiles.get(2)))
-                                        : ReferenceReplay.run(
-                                                directory, config, modes, root.resolve(profiles.get(2)));
+                var result = ReplayInput.check(root.resolve(profiles.get(1)), ReplayConfig.from(document));
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result));
-                return 0;
-            }
-            if (args[0].equals("prepare")) {
-                if (profiles.size() != 1)
-                    throw new IllegalArgumentException(
-                            "prepare requires exactly one configuration");
-                var prepared = BaselineGenerator.prepare(root, Path.of(profiles.get(0)));
-                var result =
-                        dryRun
-                                ? BaselineGenerator.describe(prepared)
-                                : BaselineGenerator.generate(prepared);
-                out.println(
-                        new GsonBuilder()
-                                .serializeNulls()
-                                .setPrettyPrinting()
-                                .create()
-                                .toJson(result));
                 return 0;
             }
             if (profiles.isEmpty()) {
@@ -498,40 +423,13 @@ public final class Sibench {
         out.println("       java -jar build/sibench/sibench.jar audit-baseline [--root PATH]"
                 + " PROFILE BASELINE --jdbc URL --user ROLE");
         out.println("audit-baseline independently compares Parquet values with the unchanged initial PostgreSQL database.");
-        out.println(
-                "       java -jar build/sibench/sibench.jar validate-replay-matrix [--root PATH]"
-                        + " TRACE_DIRECTORY OUTPUT_DIRECTORY");
-        out.println(
-                "validate-replay-matrix replays 1/64/128 clients x both dispatch modes x secondary"
-                    + " indexes on/off and requires identical operation order, state and results.");
-        out.println(
-                "       java -jar build/sibench/sibench.jar check-relocation [--root PATH]"
-                        + " PROFILE TRACE_DIRECTORY OUTPUT_DIRECTORY");
-        out.println(
-                "check-relocation rewrites the latest live rows of modified tables and checks exact"
-                    + " Locator relocation with RowIDs unchanged.");
+
         out.println(
                 "check-schema reads the live PG catalog; it never creates or repairs"
                         + " tables/indexes.");
         out.println(
-                "       java -jar build/sibench/sibench.jar prepare [--root PATH] [--dry-run]"
-                        + " PROFILE");
-        out.println(
-                "prepare writes baseline Parquet files; --dry-run only validates and describes"
-                        + " schemas.");
-        out.println(
                 "       java -jar build/sibench/sibench.jar check-replay [--root PATH]"
                         + " REPLAY_CONFIG TRACE_DIRECTORY");
-        out.println(
-                "       java -jar build/sibench/sibench.jar replay [--root PATH]"
-                        + " REPLAY_CONFIG TRACE_DIRECTORY REPORT");
-        out.println(
-                "replay runs the in-process reference once; no real backend or trace repetition.");
-        out.println(
-                "       java -jar build/sibench/sibench.jar validate-snapshots [--root PATH]"
-                        + " REPLAY_CONFIG TRACE_DIRECTORY REPORT");
-        out.println(
-                "validate-snapshots runs derived history correctness probes, not native workload or"
-                        + " performance.");
+
     }
 }

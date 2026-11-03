@@ -45,7 +45,6 @@ Datum sibench_row_capture(PG_FUNCTION_ARGS)
         appendStringInfoString(&output,",\"new\":");
         append_tuple(&output, trigger->tg_relation, next);
         if (old) appendStringInfo(&output,",\"old_tid\":\"(%u,%u)\"",ItemPointerGetBlockNumber(&old->t_self),ItemPointerGetOffsetNumber(&old->t_self));
-        if (next) appendStringInfo(&output,",\"new_tid\":\"(%u,%u)\"",ItemPointerGetBlockNumber(&next->t_self),ItemPointerGetOffsetNumber(&next->t_self));
         sib_emit("row_change",trigger->tg_relation,output.data);
         pfree(output.data);
     }

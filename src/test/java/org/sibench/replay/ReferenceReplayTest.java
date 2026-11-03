@@ -16,40 +16,6 @@ import java.util.List;
 import java.util.Map;
 
 public class ReferenceReplayTest {
-    @Test
-    public void referenceReportsRequireQueryDigestsForTheSelectedMode() throws Exception {
-        Path report = Files.createTempFile("sibench-reference-", ".json");
-        try {
-            Files.writeString(report, "{\"results\":[{\"mode\":\"rowid\"}]}");
-            var error = assertThrows(IOException.class, () -> ReferenceReplay.queryDigestFile(report, "rowid"));
-            assertTrue(error.getMessage().contains("no query digests"));
-            Files.writeString(report, "{\"results\":[]}");
-            assertThrows(IOException.class, () -> ReferenceReplay.queryDigestFile(report, "rowid"));
-        } finally {
-            Files.delete(report);
-        }
-    }
-
-    @Test
-    public void referenceQueryFileMustStillMatchItsRecordedIdentity() throws Exception {
-        Path report = Files.createTempFile("sibench-reference-", ".json");
-        Path sidecar = Files.createTempFile("sibench-queries-", ".tsv");
-        try {
-            Files.writeString(sidecar, "# workload=a baseline=b\n");
-            Files.writeString(report, new com.google.gson.Gson().toJson(Map.of("results", List.of(Map.of(
-                    "mode", "rowid", "query_digest_file", sidecar.toString(),
-                    "query_digest_sha256", org.sibench.config.Digests.sha256(sidecar))))));
-            assertEquals(sidecar, ReferenceReplay.queryDigestFile(report, "rowid"));
-            Files.writeString(sidecar, "# workload=c baseline=b\n");
-            assertThrows(IOException.class, () -> ReferenceReplay.queryDigestFile(report, "rowid"));
-            Files.delete(sidecar);
-            assertThrows(IOException.class, () -> ReferenceReplay.queryDigestFile(report, "rowid"));
-        } finally {
-            Files.deleteIfExists(sidecar);
-            Files.delete(report);
-        }
-    }
-
     private static Operation row(int kind, long version, long file, long rowId) {
         return TestOps.op(1, kind, 5, 0, 0, 1, version, file, 0, rowId, 10, 20, 0);
     }
@@ -85,30 +51,20 @@ public class ReferenceReplayTest {
                             ReferenceReplayFixture.run(
                                     baseline,
                                     workload,
-                                    new ReplayConfig(false, "none", 1, 3, 0, 0),
+                                    new ReplayConfig(false, 1, 3, 0, 0),
                                     report));
             assertFalse(Files.exists(report));
-            var config = new ReplayConfig(false, "none", 1, 2, 0, 0);
+            var config = new ReplayConfig(false, 1, 2, 0, 0);
             var checked = ReferenceReplayFixture.check(baseline, workload, config);
             assertEquals("trace_integrity_and_supply_valid", checked.get("status"));
             assertEquals(7L, ((Map<?, ?>) checked.get("workload")).get("last_commit_version"));
             var result = ReferenceReplayFixture.run(baseline, workload, config, report);
             assertEquals("passed", result.get("status"));
-            for (var item : (List<?>) result.get("results")) {
-                var mode = (Map<?, ?>) item;
-                Path sidecar = Path.of((String) mode.get("query_digest_file"));
-                assertEquals(org.sibench.config.Digests.sha256(sidecar), mode.get("query_digest_sha256"));
-                assertEquals(sidecar, ReferenceReplay.queryDigestFile(report, (String) mode.get("mode")));
-            }
             assertThrows(
                     IOException.class,
                     () -> ReferenceReplayFixture.run(baseline, workload, config, report));
         } finally {
             Files.deleteIfExists(report);
-            for (String mode : List.of("locator", "rowid"))
-                Files.deleteIfExists(
-                        report.toAbsolutePath()
-                                .resolveSibling(report.getFileName() + "." + mode + ".queries"));
             Files.deleteIfExists(baseline);
             Files.deleteIfExists(workload);
             Files.delete(directory);
@@ -152,8 +108,8 @@ public class ReferenceReplayTest {
                 writer.append(TestOps.op(12, 2, 5, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0));
             }
             for (boolean secondary : new boolean[] {true, false}) {
-                var groupedConfig = new ReplayConfig(secondary, "none", 0, 0, 0, 0, "transaction");
-                var rawConfig = new ReplayConfig(secondary, "none", 0, 0, 0, 0, "operation");
+                var groupedConfig = new ReplayConfig(secondary, 0, 0, 0, 0, "transaction");
+                var rawConfig = new ReplayConfig(secondary, 0, 0, 0, 0, "operation");
                 var grouped =
                         ReferenceReplayFixture.run(
                                 baseline,
@@ -171,7 +127,6 @@ public class ReferenceReplayTest {
                 for (int mode = 0; mode < 2; mode++) {
                     var x = (Map<?, ?>) a.get(mode);
                     var y = (Map<?, ?>) b.get(mode);
-                    assertEquals(x.get("query_digest_sha256"), y.get("query_digest_sha256"));
                     assertNotNull(x.get("primary_state_checksum"));
                     assertEquals(x.get("primary_state_checksum"), y.get("primary_state_checksum"));
                     assertEquals(secondary ? 14L : 6L, x.get("workload_operations"));
@@ -184,9 +139,7 @@ public class ReferenceReplayTest {
                                         baseline,
                                         workload,
                                         new ReplayConfig(
-                                                secondary,
-                                                "none",
-                                                1,
+                                                secondary, 1,
                                                 secondary ? 15 : 7,
                                                 0,
                                                 0,

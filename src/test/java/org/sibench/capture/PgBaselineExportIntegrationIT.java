@@ -63,8 +63,8 @@ public class PgBaselineExportIntegrationIT {
         document.put("postgres", pgConfig);
         var original = NativeCaptureConfig.read(root, Path.of("src/test/resources/config/ycsb_1k.yaml")).layout();
         long target = 8L << 20;
-        var config = new GenerationConfig(root, document, "ycsb", 71, target, 5,
-                128, 65536, 1024, 1024, true, original.codec(), 3, 1, 0, evidence.resolve("baseline"), 1);
+        var config = new GenerationConfig(root, document, "ycsb", target, 5,
+                128, 65536, 1024, 1024, true, original.codec(), 3, evidence.resolve("baseline"), 1);
         String rangeProperty = "sibench.baseline.sort_range_bytes";
         String previousRange = System.getProperty(rangeProperty);
         try (var pg = DriverManager.getConnection(admin, "postgres", ""); var sql = pg.createStatement()) {

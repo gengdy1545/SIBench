@@ -1,5 +1,6 @@
 package org.sibench.adapters;
 
+import org.sibench.replay.ReplayInput;
 import com.google.gson.*;
 import io.grpc.*;
 import io.grpc.stub.*;
@@ -10,7 +11,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import org.sibench.adapters.proto.*;
 import org.sibench.capture.*;
-import org.sibench.generation.BaselineGenerator;
+import org.sibench.config.Digests;
 import org.sibench.replay.*;
 
 /** Bounded diagnostic: record a committed prefix once, then replay its full responses over RPC. */
@@ -22,13 +23,13 @@ public final class DriverCapacityCheck {
 
     public static void main(String[] args) throws Exception {
         switch (args[0]) {
-            case "record" -> record(Path.of(args[1]), Path.of(args[2]), Path.of(args[3]), Long.parseLong(args[4]));
+            case "record" -> record(Path.of(args[1]), Path.of(args[2]), Long.parseLong(args[3]));
             case "serve", "serve-corrupt" -> serve(Path.of(args[1]), Integer.parseInt(args[2]), args[0].equals("serve-corrupt"));
             case "run" -> run(Path.of(args[1]), args[2], Integer.parseInt(args[3]), Path.of(args[4]));
             case "check-baseline" -> checkBaseline(Path.of(args[1]), Path.of(args[2]));
             case "check-work-units" -> checkWorkUnits(Path.of(args[1]), Path.of(args[2]));
             case "plan" -> plan(Path.of(args[1]), Long.parseLong(args[2]), Path.of(args[3]));
-            default -> throw new IllegalArgumentException("record TRACE REFERENCE OUTPUT RECORD_LIMIT | serve FIXTURE PORT | run FIXTURE ENDPOINT CLIENTS REPORT");
+            default -> throw new IllegalArgumentException("record TRACE OUTPUT RECORD_LIMIT | serve FIXTURE PORT | run FIXTURE ENDPOINT CLIENTS REPORT");
         }
     }
 
@@ -63,7 +64,7 @@ public final class DriverCapacityCheck {
     }
 
     private static ReplayConfig config(int clients) {
-        return new ReplayConfig(true, "none", 0, 0, 0, 0, "operation", clients, 4096, 60);
+        return new ReplayConfig(true, 0, 0, 0, 0, "operation", clients, 4096, 60);
     }
 
     private static void plan(Path trace, long wanted, Path report) throws Exception {
@@ -109,12 +110,12 @@ public final class DriverCapacityCheck {
         if (count[0] != limit) throw new IOException("Trace prefix was truncated");
     }
 
-    private static void record(Path trace, Path reference, Path output, long wanted) throws Exception {
+    private static void record(Path trace, Path output, long wanted) throws Exception {
         Files.createDirectory(output);
         Files.writeString(output.resolve("INCOMPLETE"), "Response recording not committed\n");
         // The full directory check is outside measured dispatch, and remains part of setup cost.
         System.out.println("phase=preflight");
-        var inputTrace = ReferenceReplay.prepare(trace, config(128));
+        var inputTrace = ReplayInput.prepare(trace, config(128));
         long[] records = {0}, queries = {0};
         try {
             ProtoTrace.source(trace, org.sibench.trace.TraceManifest.read(trace), "workload").read( operation -> {
@@ -124,20 +125,11 @@ public final class DriverCapacityCheck {
                 if (records[0] >= wanted && operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) throw new EndPrefix();
             });
         } catch (EndPrefix expected) {}
-        String binding = ReferenceReplay.binding(trace, config(128)) + " mode=rowid";
-        Path original = ReferenceReplay.queryDigestFile(reference, "rowid");
-        Path digests = output.resolve("queries.tsv");
-        try (var input = Files.newBufferedReader(original); var out = Files.newBufferedWriter(digests)) {
-            for (long line = 0; line <= queries[0]; line++) {
-                String value = input.readLine();
-                if (value == null) throw new IOException("Reference digest prefix is incomplete");
-                out.write(value); out.newLine();
-            }
-        }
+        String binding = ReplayInput.binding(trace, config(128)) + " mode=rowid";
         // The serialized-byte cap is not an object-heap bound; setup also needs its external heap/deadline limits.
         var recorded = new ConcurrentHashMap<Request, List<Response>>();
         var bytes = new AtomicLong();
-        var requests = new TraceRequests(ValueKind.ROW_ID, digests, binding);
+        var requests = new TraceRequests(ValueKind.ROW_ID);
         DescribeResponse description;
         try (var backend = RocksDbBackend.create(output.resolve("index"), ValueKind.ROW_ID);
                 var published = new PublishedIndex(backend)) {
@@ -171,9 +163,8 @@ public final class DriverCapacityCheck {
                 replay.finish();
                 replay.requireClientCoverage();
             }
-            requests.finish();
         }
-        if (requests.queries() != queries[0] || requests.digestMismatches() != 0) throw new IOException("Incomplete response fixture validation");
+        if (requests.queries() != queries[0]) throw new IOException("Incomplete response fixture validation");
         Path binary = output.resolve("responses.bin");
         try (var data = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(binary)))) {
             data.writeInt(MAGIC);
@@ -190,16 +181,14 @@ public final class DriverCapacityCheck {
         var manifest = new LinkedHashMap<String, Object>();
         manifest.put("status", "passed");
         manifest.put("trace", trace.toAbsolutePath().toString());
-        manifest.put("trace_manifest_sha256", BaselineGenerator.sha256(trace.resolve("manifest.json")));
+        manifest.put("trace_manifest_sha256", Digests.sha256(trace.resolve("manifest.json")));
         manifest.put("records", records[0]);
         manifest.put("queries", queries[0]);
         manifest.put("binding", binding);
         manifest.put("rpc_requests", recorded.size());
         manifest.put("serialized_request_response_bytes", bytes.get());
-        manifest.put("fixture_sha256", BaselineGenerator.sha256(binary));
-        manifest.put("queries_sha256", BaselineGenerator.sha256(digests));
-        manifest.put("original_query_digests_sha256", BaselineGenerator.sha256(original));
-        manifest.put("scope", "committed prefix of the original trace; full recorded results matched independent reference digests; no trace looping");
+        manifest.put("fixture_sha256", Digests.sha256(binary));
+        manifest.put("scope", "committed prefix of the original trace; recorded response counts matched Trace source counts; no trace looping");
         Files.writeString(output.resolve("manifest.json"), JSON.toJson(manifest));
         Files.delete(output.resolve("INCOMPLETE"));
         System.out.println("fixture=complete requests=" + recorded.size());
@@ -208,8 +197,7 @@ public final class DriverCapacityCheck {
     private static JsonObject manifest(Path fixture) throws IOException {
         if (Files.exists(fixture.resolve("INCOMPLETE"))) throw new IOException("Incomplete response fixture");
         var manifest = JsonParser.parseString(Files.readString(fixture.resolve("manifest.json"))).getAsJsonObject();
-        if (!BaselineGenerator.sha256(fixture.resolve("responses.bin")).equals(manifest.get("fixture_sha256").getAsString())
-                || !BaselineGenerator.sha256(fixture.resolve("queries.tsv")).equals(manifest.get("queries_sha256").getAsString()))
+        if (!Digests.sha256(fixture.resolve("responses.bin")).equals(manifest.get("fixture_sha256").getAsString()))
             throw new IOException("Response fixture changed");
         return manifest;
     }
@@ -278,9 +266,9 @@ public final class DriverCapacityCheck {
     private static void run(Path fixture, String endpoint, int clients, Path report) throws Exception {
         var manifest = manifest(fixture);
         Path trace = Path.of(manifest.get("trace").getAsString());
-        if (!BaselineGenerator.sha256(trace.resolve("manifest.json")).equals(manifest.get("trace_manifest_sha256").getAsString()))
+        if (!Digests.sha256(trace.resolve("manifest.json")).equals(manifest.get("trace_manifest_sha256").getAsString()))
             throw new IOException("Source trace manifest changed");
-        var requests = new TraceRequests(ValueKind.ROW_ID, fixture.resolve("queries.tsv"), manifest.get("binding").getAsString());
+        var requests = new TraceRequests(ValueKind.ROW_ID);
         long started = System.nanoTime();
         Map<String, Object> dispatch;
         try (var remote = new GrpcService(endpoint, requests, manifest.get("binding").getAsString(), 60);
@@ -290,7 +278,6 @@ public final class DriverCapacityCheck {
             replay.requireClientCoverage();
             dispatch = replay.describe();
         }
-        requests.finish();
         if (requests.queries() != manifest.get("queries").getAsLong()) throw new IOException("Query coverage mismatch");
         var result = new LinkedHashMap<String, Object>();
         result.put("status", "passed");
@@ -302,8 +289,6 @@ public final class DriverCapacityCheck {
         result.put("request_bytes", requests.requestBytes());
         result.put("result_bytes", requests.resultBytes());
         result.put("rpc_requests", manifest.get("rpc_requests").getAsLong());
-        result.put("digest_checks", requests.digestChecks());
-        result.put("digest_mismatches", requests.digestMismatches());
         result.put("fixture_sha256", manifest.get("fixture_sha256").getAsString());
         result.put("scope", "finite same-prefix full-response RPC calibration; fixture emitter/transport/checker can bottleneck; no sustained-rate or index-upper-bound claim");
         Files.writeString(report, JSON.toJson(result), StandardOpenOption.CREATE_NEW);

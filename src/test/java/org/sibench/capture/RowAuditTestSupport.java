@@ -9,7 +9,6 @@ import org.apache.parquet.hadoop.example.GroupReadSupport;
 import org.apache.parquet.schema.MessageTypeParser;
 import org.sibench.generation.GenerationConfig;
 import org.sibench.generation.ParquetDataFile;
-import org.sibench.generation.TableData;
 import org.sibench.schema.SourceSchema;
 
 import java.lang.reflect.*;
@@ -44,7 +43,6 @@ final class RowAuditTestSupport {
                         original.root(),
                         original.document(),
                         original.benchmark(),
-                        original.seed(),
                         original.targetBytes(),
                         original.maxOvershootPercent(),
                         groupRows > 0 ? groupRows : original.maxRows(),
@@ -54,8 +52,6 @@ final class RowAuditTestSupport {
                         original.dictionary(),
                         original.codec(),
                         original.codecLevel(),
-                        1,
-                        0,
                         directory,
                         1);
         var files = new ArrayList<String>();
@@ -80,13 +76,7 @@ final class RowAuditTestSupport {
             try (var output =
                     new ParquetDataFile(
                             file,
-                            new TableData(
-                                    table.name(),
-                                    contents.size(),
-                                    rowId,
-                                    SourceRow.primary(table).name(),
-                                    parquetSchema,
-                                    null),
+                            parquetSchema,
                             config,
                             Map.of())) {
                 for (var value : contents) {
@@ -122,7 +112,7 @@ final class RowAuditTestSupport {
         Files.write(directory.resolve("files.jsonl"), files);
         var expected = new LinkedHashMap<String, Long>();
         for (var table : schema.tables()) expected.put(table.name(), (long) rows.getOrDefault(table.name(), List.of()).size());
-        BaselineManifest.publish(schema, directory, expected, TraceOutput.FULL);
+        BaselineManifest.publish(schema, directory, expected);
         return directory;
     }
 
@@ -389,6 +379,8 @@ final class RowAuditTestSupport {
                                     "sql",
                                     "SELECT 1")));
             client.add(JSON.toJson(Map.of("event", "request_return", "application", app)));
+            client.add(JSON.toJson(Map.of("event", "request_end", "application", app,
+                    "consumed_rows", 0, "exhausted", false)));
             server.add(
                     JSON.toJson(
                             Map.of(
@@ -410,7 +402,7 @@ final class RowAuditTestSupport {
             }
             server.add(
                     JSON.toJson(Map.of("event", "executor_run_end", "application", app, "pid", 1,
-                            "depth", 1, "returned", 0, "row_hashes", List.of())));
+                            "depth", 1, "returned", 0)));
             server.add(JSON.toJson(Map.of("event", "executor_end", "application", app, "pid", 1)));
             client.add(
                     JSON.toJson(
@@ -477,11 +469,11 @@ final class RowAuditTestSupport {
                                         Map.of(
                                                 "pg_file", server.getFileName().toString(),
                                                 "pg_sha256",
-                                                        org.sibench.generation.BaselineGenerator
+                                                        org.sibench.config.Digests
                                                                 .sha256(server),
                                                 "jdbc_file", client.getFileName().toString(),
                                                 "jdbc_sha256",
-                                                        org.sibench.generation.BaselineGenerator
+                                                        org.sibench.config.Digests
                                                                 .sha256(client),
                                                 "bindings", true,
                                                 "audit", audit)))));
@@ -499,7 +491,7 @@ final class RowAuditTestSupport {
                             "pg_file",
                             server.getFileName().toString(),
                             "pg_sha256",
-                            org.sibench.generation.BaselineGenerator.sha256(server),
+                            org.sibench.config.Digests.sha256(server),
                             "audit",
                             ServerCaptureAudit.audit(server)));
         Files.writeString(

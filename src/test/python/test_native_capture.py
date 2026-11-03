@@ -271,11 +271,11 @@ class NativeCaptureLifecycleTest(unittest.TestCase):
         self.assertTrue(self.cluster.is_dir())
         self.assertFalse((self.cluster / "running").exists())
 
-    def test_proto_releases_only_consumed_inputs_after_success(self):
+    def test_proto_retains_data_files_and_releases_source_control_after_success(self):
         self.env["SIBENCH_TEST_TRACE_OUTPUT"] = "proto"
         result = self.execute()
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertFalse((self.artifacts / "baseline").exists())
+        self.assertTrue((self.artifacts / "baseline").is_dir())
         self.assertFalse((self.artifacts / "raw").exists())
         self.assertTrue((self.artifacts / "trace/access-ledger.json").is_file())
         self.assertTrue((self.artifacts / "native/sibench-run.jar").is_file())
@@ -287,13 +287,13 @@ class NativeCaptureLifecycleTest(unittest.TestCase):
         self.assertTrue((self.artifacts / "baseline").is_dir())
         self.assertTrue((self.artifacts / "raw").is_dir())
 
-    def test_proto_rejects_full_row_acceptance_before_creating_a_database(self):
+    def test_proto_supports_explicit_baseline_row_acceptance(self):
         self.env["SIBENCH_TEST_TRACE_OUTPUT"] = "proto"
         self.command.insert(-1, "--audit-baseline")
         result = self.execute()
-        self.assertEqual(2, result.returncode, result.stderr)
-        self.assertIn("requires capture.output: full", result.stderr)
-        self.assertFalse(self.cluster.exists())
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertTrue((self.artifacts / "baseline").is_dir())
+        self.assertIn("audit-baseline", [event["stage"] for event in self.events()])
 
     def test_failed_export_stops_but_retains_database_and_does_not_run_workload(self):
         self.env["SIBENCH_TEST_FAIL_STAGE"] = "export"

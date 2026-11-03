@@ -8,7 +8,7 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.sibench.config.ConfigValues;
-import org.sibench.generation.BaselineGenerator;
+import org.sibench.config.Digests;
 import org.sibench.schema.SourceSchema;
 
 import java.io.IOException;
@@ -24,7 +24,7 @@ public class RowStateAuditTest {
                         "src/test/resources/config/"
                                 + (benchmark.equals("hybench")
                                         ? "hybench_sf1"
-                                        : benchmark + "_1b")
+                                        : benchmark + (benchmark.equals("ycsb") ? "_1k" : "_2k"))
                                 + ".yaml");
         var document = ConfigValues.parse(Files.readString(profile));
         var nativeConfig = ConfigValues.object(document, "native");
@@ -101,6 +101,35 @@ public class RowStateAuditTest {
     }
 
     @Test
+    public void receiptReuseRejectsCaptureWithoutSessionInventory() throws Exception {
+        var schema = schema("ycsb", 1);
+        var table = schema.tables().get(0);
+        Path fixture = temporary.newFolder().toPath();
+        Path baseline = baseline(fixture, schema, Map.of(table.name(), List.of()));
+        var inserted = row(table, "user1");
+        Path raw = RowAuditTestSupport.capture(fixture, List.of(List.of(
+                RowAuditTestSupport.change(table.name(), "insert", null, inserted))), Set.of());
+        Path report = RowStateAudit.defaultReport(raw);
+        RowStateAudit.audit(RowAuditTestSupport.connection(schema, Map.of(table.name(), List.of(inserted)), new int[1]),
+                schema, baseline, raw, report);
+        Path manifest = raw.getParent().resolve("capture-run.json");
+        var original = JsonParser.parseString(Files.readString(manifest)).getAsJsonObject();
+        var receipt = JsonParser.parseString(Files.readString(report)).getAsJsonObject();
+        for (String missing : List.of("sessions", "session_order")) {
+            var unsupported = original.deepCopy();
+            unsupported.remove(missing);
+            unsupported.addProperty("pg_file", raw.getFileName().toString());
+            Files.writeString(manifest, unsupported.toString());
+            receipt.getAsJsonObject("source_inputs_sha256").addProperty("capture-run.json", Digests.sha256(manifest));
+            Files.writeString(report, receipt.toString());
+            assertTrue(assertThrows(IOException.class, () -> RowStateAudit.reuse(schema, baseline, raw, report))
+                    .getMessage().contains("Capture manifest lacks its sessions"));
+        }
+        Files.delete(manifest);
+        assertThrows(IOException.class, () -> RowStateAudit.reuse(schema, baseline, raw, report));
+    }
+
+    @Test
     public void mergesChangesAcrossMultipleOrderedBaselineFiles() throws Exception {
         var schema = schema("ycsb", 1);
         var table = schema.tables().get(0);
@@ -128,7 +157,7 @@ public class RowStateAuditTest {
         assertTrue(written.size() > 1);
         Files.write(baseline.resolve("files.jsonl"), written.stream()
                 .map(w -> new com.google.gson.Gson().toJson(w.file())).toList());
-        BaselineManifest.publish(schema, baseline, Map.of(table.name(), (long) initial.size()), TraceOutput.FULL);
+        BaselineManifest.publish(schema, baseline, Map.of(table.name(), (long) initial.size()));
         PgBaselineVerify.verify(RowAuditTestSupport.connections(schema, Map.of(table.name(), initial), new int[1]),
                 schema, baseline);
         String boundary = (String) written.get(1).file().get("first_key");
@@ -405,11 +434,11 @@ public class RowStateAuditTest {
                             "pg_file",
                             pg.getFileName().toString(),
                             "pg_sha256",
-                            BaselineGenerator.sha256(pg),
+                            Digests.sha256(pg),
                             "jdbc_file",
                             jdbc.getFileName().toString(),
                             "jdbc_sha256",
-                            BaselineGenerator.sha256(jdbc),
+                            Digests.sha256(jdbc),
                             "bindings",
                             false,
                             "audit",

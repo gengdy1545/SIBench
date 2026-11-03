@@ -237,9 +237,9 @@ final class CaptureTransactions implements AutoCloseable {
 
         Chunk(int pid, long sequence) { this.pid = pid; this.sequence = sequence; }
 
-        void append(String line, Event event) throws IOException {
+        /** Reuses the receiver's UTF-8 byte count, including the newline. */
+        void append(String line, com.google.gson.JsonObject event, int cost) throws IOException {
             if (sealed) throw new IOException("Source transaction is already complete");
-            int cost = Math.addExact(line.getBytes(StandardCharsets.UTF_8).length, 1);
             reserve(cost);
             bytes += cost;
             lines++;
@@ -254,7 +254,7 @@ final class CaptureTransactions implements AutoCloseable {
                 events = null;
                 releaseMemory(this);
             }
-            if (output == null) events.add(event);
+            if (output == null) events.add(Event.of(event));
             else { output.write(line); output.newLine(); }
         }
 

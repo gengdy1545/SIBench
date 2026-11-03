@@ -56,9 +56,9 @@ public class CapturePlanTest {
         manifest.put("baseline_trace_sha256", "0".repeat(64));
         Files.writeString(root.resolve("replay.yaml"),
                 "schema_version: 1\npurpose: sibench\ntarget:\n  secondary_indexes:\n    enabled: true\n"
-                        + "replay:\n  strategy: single_pass\n  trace_budget:\n"
+                        + "replay:\n  trace_budget:\n"
                         + "    duration_seconds: 10\n    planned_operations_per_second: 300\n    warmup_operations: 0\n    reserve_percent: 0\n"
-                        + "versions:\n  gc:\n    owner: none\n");
+                       );
         Files.writeString(root.resolve("sysbench.yaml"),
                 "benchmark: sysbench\nnative:\n  workloads:\n    oltp_point_select: {events: 100}\n");
         for (String strategy : java.util.List.of("full", "proto")) {

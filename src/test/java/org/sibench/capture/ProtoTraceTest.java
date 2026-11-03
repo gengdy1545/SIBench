@@ -135,35 +135,30 @@ public class ProtoTraceTest {
     }
 
     @Test
-    public void inventoryBindsShardOrderCountsAndSafeUniquePaths() throws Exception {
+    public void inventoryRequiresCanonicalFileAndBindsItsCountAndIdentity() throws Exception {
         Path root = temporary.getRoot().toPath();
-        Files.createDirectory(root.resolve("baseline"));
+        var writer = new ProtoTrace.Writer(root.resolve("baseline.pb.zst"));
+        try (writer) { writer.append(write(IndexOperationTrace.INSERT, 1, 0, 0)); }
         var files = new com.google.gson.JsonArray();
-        for (int i = 1; i <= 2; i++) {
-            String name = "baseline/table" + i + ".pb.zst";
-            var writer = new ProtoTrace.Writer(root.resolve(name));
-            try (writer) { writer.append(write(IndexOperationTrace.INSERT, i, 0, 0)); }
-            files.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file(name, writer)));
-        }
+        files.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("baseline.pb.zst", writer)));
         var manifest = new com.google.gson.JsonObject();
-        manifest.addProperty("output", "proto");
         var inventory = new com.google.gson.JsonObject();
         inventory.add("baseline", files);
         manifest.add("proto_files", inventory);
         manifest.addProperty("baseline_trace_sha256", ProtoTrace.identity(files));
-        assertEquals(2, ProtoTrace.source(root, manifest, "baseline").read(operation -> {}));
-        var first = files.get(0).deepCopy();
-        files.set(0, files.get(1));
-        files.set(1, first);
+        assertEquals(1, ProtoTrace.source(root, manifest, "baseline").read(operation -> {}));
+        var file = files.get(0).getAsJsonObject();
+        file.addProperty("operations", 2);
         assertThrows(IOException.class, () -> ProtoTrace.source(root, manifest, "baseline"));
-        manifest.addProperty("baseline_trace_sha256", ProtoTrace.identity(files));
-        assertEquals(2, ProtoTrace.source(root, manifest, "baseline").read(operation -> {}));
-        files.get(0).getAsJsonObject().addProperty("operations", 2);
         manifest.addProperty("baseline_trace_sha256", ProtoTrace.identity(files));
         assertThrows(IOException.class, () -> ProtoTrace.source(root, manifest, "baseline").read(operation -> {}));
-        files.get(0).getAsJsonObject().addProperty("path", "../outside.pb.zst");
-        assertThrows(IOException.class, () -> ProtoTrace.source(root, manifest, "baseline"));
-        files.get(0).getAsJsonObject().addProperty("path", files.get(1).getAsJsonObject().get("path").getAsString());
+        for (String name : List.of("../outside.pb.zst", "baseline/table1.pb.zst")) {
+            file.addProperty("path", name);
+            assertThrows(IOException.class, () -> ProtoTrace.source(root, manifest, "baseline"));
+        }
+        file.addProperty("path", "baseline.pb.zst");
+        files.add(file.deepCopy());
+        manifest.addProperty("baseline_trace_sha256", ProtoTrace.identity(files));
         assertThrows(IOException.class, () -> ProtoTrace.source(root, manifest, "baseline"));
     }
 

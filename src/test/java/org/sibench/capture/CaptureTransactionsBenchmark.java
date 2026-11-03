@@ -17,7 +17,8 @@ public final class CaptureTransactionsBenchmark {
                     var object = new JsonObject();
                     object.addProperty("id", id);
                     var chunk = source.begin(id);
-                    chunk.append(object.toString(), Event.of(object));
+                    String line = object.toString();
+                    chunk.append(line, object, (line + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
                     source.complete(chunk, id, true, true);
                 }
                 source.finish();

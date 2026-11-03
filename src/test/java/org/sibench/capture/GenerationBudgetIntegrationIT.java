@@ -4,7 +4,6 @@ import static org.junit.Assert.*;
 
 import org.junit.Test;
 import org.sibench.config.ConfigValues;
-import org.sibench.replay.ReferenceReplay;
 import org.sibench.replay.ReplayConfig;
 import org.sibench.trace.TraceManifest;
 
@@ -50,12 +49,6 @@ public class GenerationBudgetIntegrationIT {
                 String jdbc = NativeCaptureConfig.read(root, profile).jdbc();
                 NativeCaptureIntegrationIT.stage(root, profile, "load");
                 NativeCaptureIntegrationIT.stage(root, profile, "export");
-                long baselineBytes;
-                try (var files = Files.walk(capture.baseline())) {
-                    baselineBytes = files.filter(f -> f.toString().endsWith(".pb.zst"))
-                            .mapToLong(f -> { try { return Files.size(f); } catch (java.io.IOException e) {
-                                throw new java.io.UncheckedIOException(e); } }).sum();
-                }
                 Path runtime = capture.artifacts().resolve("native/sibench.yaml");
                 var settings = ConfigValues.parse(Files.readString(runtime));
                 var generation = ConfigValues.object(settings, "generation");
@@ -63,7 +56,7 @@ public class GenerationBudgetIntegrationIT {
                 generation.put("output_byte_target", 0);
                 generation.put(
                         target.equals("output") ? "output_byte_target" : "operation_target",
-                        target.equals("output") ? baselineBytes + 64 : target.equals("startup") ? 1L : 40L);
+                        target.equals("output") ? 4096L : target.equals("startup") ? 1L : 40L);
                 settings.put("generation", generation);
                 Files.writeString(runtime, new org.yaml.snakeyaml.Yaml().dump(settings));
                 CaptureCompleteness.snapshot(jdbc, "postgres",
@@ -81,6 +74,10 @@ public class GenerationBudgetIntegrationIT {
                     for (var file : manifest.getAsJsonObject("proto_files").getAsJsonArray(phase))
                         protoBytes += Files.size(trace.resolve(file.getAsJsonObject().get("path").getAsString()));
                 assertEquals(protoBytes, budget.get("actual_proto_bytes").getAsLong());
+                if (target.equals("output")) {
+                    assertTrue(Files.size(trace.resolve("baseline.pb.zst")) < 4096);
+                    assertTrue(protoBytes >= 4096);
+                }
                 assertEquals("consistent", manifest.get("capture_completeness").getAsString());
                 assertFalse(Files.exists(trace.resolve("INCOMPLETE")));
                 assertFalse(Files.exists(capture.artifacts().resolve("transactions")));
@@ -91,15 +88,12 @@ public class GenerationBudgetIntegrationIT {
                 var workload = completed.get(0).getAsJsonObject();
                 long actual = workload.get(benchmark.equals("ycsb") ? "operationcount" : "events").getAsLong();
                 assertTrue("Native work must stop before its requested 50000 operations", actual > 0 && actual < 50000);
-                Path reference = capture.artifacts().resolve("reference.json");
-                assertEquals("passed", ReferenceReplay.run(trace, ReplayConfig.defaults(), List.of(true), reference).get("status"));
                 if (target.equals("startup"))
                     assertEquals("passed", org.sibench.replay.SnapshotLookupValidation.run(trace,
                             ReplayConfig.defaults(), capture.artifacts().resolve("oracle.json")).get("status"));
                 var service = new org.sibench.adapters.ServiceConfig("rocksdb", null,
                         capture.artifacts().resolve("index"), 0, org.sibench.adapters.proto.ValueKind.ROW_ID, null, false);
-                assertEquals("passed", org.sibench.adapters.ServiceReplay.run(trace, ReplayConfig.defaults(), service,
-                        reference, capture.artifacts().resolve("service.json")).get("status"));
+                assertEquals("passed", org.sibench.adapters.ServiceReplay.run(trace, ReplayConfig.defaults(), service, capture.artifacts().resolve("service.json")).get("status"));
             }
     }
 }

@@ -18,8 +18,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Canonical baseline requests read from persisted protobuf shards. Full generation also derives
- * those requests from verified Parquet rows while retaining their Locator metadata.
+ * Canonical baseline requests derived from verified Parquet rows, retaining their Locator
+ * metadata, and read from persisted protobuf shards during replay.
  */
 public final class BaselineOperations {
     private BaselineOperations() {}
@@ -135,29 +135,29 @@ public final class BaselineOperations {
         var stopped = new java.util.concurrent.atomic.AtomicBoolean();
         // Reads go in group order behind a window; the submitter turns each read group into runs.
         for (int i = 0; i < groups.size(); i++) reads.add(new java.util.concurrent.CompletableFuture<>());
+        var readStarter = new Thread(() -> {
+            try {
+                for (int i = 0; i < groups.size() && !stopped.get(); i++) {
+                    readWindow.acquire();
+                    int index = i;
+                    var target = (java.util.concurrent.CompletableFuture<Columns>) reads.get(index);
+                    readers.execute(() -> {
+                        try {
+                            target.complete(read(baseline, catalog, files.get(groups.get(index).file()),
+                                    types.get(groups.get(index).file()), groups.get(index)));
+                        } catch (Throwable failure) {
+                            target.completeExceptionally(failure);
+                        }
+                    });
+                }
+            } catch (InterruptedException closed) {
+                Thread.currentThread().interrupt();
+            }
+        }, "baseline-read-start");
+        readStarter.setDaemon(true);
+        readStarter.start();
         var submitter = new Thread(() -> {
             try {
-                var readStarter = new Thread(() -> {
-                    try {
-                        for (int i = 0; i < groups.size() && !stopped.get(); i++) {
-                            readWindow.acquire();
-                            int index = i;
-                            var target = (java.util.concurrent.CompletableFuture<Columns>) reads.get(index);
-                            readers.execute(() -> {
-                                try {
-                                    target.complete(read(baseline, catalog, files.get(groups.get(index).file()),
-                                            types.get(groups.get(index).file()), groups.get(index)));
-                                } catch (Throwable failure) {
-                                    target.completeExceptionally(failure);
-                                }
-                            });
-                        }
-                    } catch (InterruptedException closed) {
-                        Thread.currentThread().interrupt();
-                    }
-                }, "baseline-read-start");
-                readStarter.setDaemon(true);
-                readStarter.start();
                 for (int i = 0; i < groups.size() && !stopped.get(); i++) {
                     Group group = groups.get(i);
                     JsonObject file = files.get(group.file());
@@ -234,6 +234,7 @@ public final class BaselineOperations {
         } finally {
             stopped.set(true);
             submitter.interrupt();
+            readStarter.interrupt();
             readers.shutdownNow();
             encoders.shutdownNow();
         }

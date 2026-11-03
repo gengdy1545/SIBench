@@ -20,15 +20,15 @@ public class HybenchNativeLoadTest {
     public void runtimeInputsMustBePresentAndMatchTheLoadManifest() throws Exception {
         Path work = temporary.newFolder().toPath(), data = Files.createDirectory(work.resolve("Data_1x"));
         Path manifest = work.resolve("load.json");
+        assertThrows(java.nio.file.NoSuchFileException.class, () -> HybenchNativeLoad.requireRuntimeInputs(data, manifest));
+        Files.writeString(manifest, "{\"data_sha256\":{}}");
         var failure = assertThrows(IllegalStateException.class, () -> HybenchNativeLoad.requireRuntimeInputs(data, manifest));
         assertTrue(failure.getMessage(), failure.getMessage().contains("Related_transfer_bids"));
         var digests = new com.google.gson.JsonObject();
         for (String name : HybenchNativeLoad.RUNTIME_INPUTS) {
             Files.writeString(data.resolve(name), name);
-            digests.addProperty(name, org.sibench.generation.BaselineGenerator.sha256(data.resolve(name)));
+            digests.addProperty(name, org.sibench.config.Digests.sha256(data.resolve(name)));
         }
-        // Without a manifest presence is all that can be checked.
-        HybenchNativeLoad.requireRuntimeInputs(data, manifest);
         var report = new com.google.gson.JsonObject();
         report.add("data_sha256", digests);
         Files.writeString(manifest, report.toString());
@@ -36,11 +36,14 @@ public class HybenchNativeLoadTest {
         Files.writeString(data.resolve("Related_checking_bids"), "regenerated");
         failure = assertThrows(IllegalStateException.class, () -> HybenchNativeLoad.requireRuntimeInputs(data, manifest));
         assertTrue(failure.getMessage(), failure.getMessage().contains("differs from the load manifest"));
-        // Once loaded, only the runtime inputs stay.
+        // Cleanup deletes only upstream COPY inputs, preserving unrelated diagnostic files.
         Files.writeString(data.resolve("transfer.csv"), "1,2,3");
-        HybenchNativeLoad.dropLoadInputs(data);
+        Files.writeString(data.resolve("diagnostic.txt"), "unique evidence");
+        HybenchNativeLoad.dropLoadInputs(data, SOURCE.resolve("conf/load_data_pg.sql"));
         try (var left = Files.list(data)) {
-            assertEquals(new java.util.TreeSet<>(HybenchNativeLoad.RUNTIME_INPUTS),
+            var expected = new java.util.TreeSet<>(HybenchNativeLoad.RUNTIME_INPUTS);
+            expected.add("diagnostic.txt");
+            assertEquals(expected,
                     left.map(f -> f.getFileName().toString()).collect(java.util.stream.Collectors.toCollection(java.util.TreeSet::new)));
         }
     }

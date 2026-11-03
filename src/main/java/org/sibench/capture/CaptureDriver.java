@@ -12,7 +12,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.sql.*;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -98,8 +97,6 @@ public final class CaptureDriver implements Driver {
         }
     }
 
-    /** Same switch as the PG instrumentation: keep every consumed row's text, not only its hash. */
-    static final boolean DETAIL_ROWS = "rows".equals(System.getenv("SIBENCH_CAPTURE_DETAIL"));
     /** The zstd level of the client traces. */
     static final int ZSTD_LEVEL = 3;
 
@@ -136,6 +133,7 @@ public final class CaptureDriver implements Driver {
         private String application;
         private final String phase = CaptureRun.phase();
         private final Path path;
+        private final java.util.Set<ResultCapture> openResults = new java.util.LinkedHashSet<>();
         Session(Connection connection, Path directory) throws IOException, SQLException {
             this.connection = connection;
             path =
@@ -252,6 +250,7 @@ public final class CaptureDriver implements Driver {
                                     }
                                     try {
                                         if (failure == null) {
+                                            for (var capture : java.util.List.copyOf(openResults)) capture.end();
                                             emit("close", Map.of());
                                             if (direct) emit("capture_end", Map.of());
                                         }
@@ -308,16 +307,22 @@ public final class CaptureDriver implements Driver {
 
         private final class ResultCapture {
             final Map<String, Object> identity;
-            boolean ended;
+            boolean ended, exhausted;
+            long consumed;
 
             ResultCapture() {
                 identity = Map.of("application", application, "request", request, "transaction", transaction);
+                openResults.add(this);
             }
 
             void end() throws SQLException {
                 if (ended) return;
-                emit("request_end", identity);
+                var counts = new LinkedHashMap<String, Object>(identity);
+                counts.put("consumed_rows", consumed);
+                counts.put("exhausted", exhausted);
+                emit("request_end", counts);
                 ended = true;
+                openResults.remove(this);
             }
         }
 
@@ -389,34 +394,14 @@ public final class CaptureDriver implements Driver {
                             (proxy, method, args) -> {
                                 try {
                                     Object result = invoke(method, rows, args);
-                                    if (method.getName().equals("next")
-                                            && Boolean.TRUE.equals(result)) {
-                                        Map<String, Object> values = new LinkedHashMap<>(capture.identity);
-                                        Map<String, Integer> types = new LinkedHashMap<>();
-                                        var texts = new ArrayList<String>();
-                                        var jdbcTypes = new ArrayList<Integer>();
-                                        ResultSetMetaData metadata = rows.getMetaData();
-                                        for (int i = 1;
-                                                i <= metadata.getColumnCount();
-                                                i++) {
-                                            texts.add(rows.getString(i));
-                                            jdbcTypes.add(metadata.getColumnType(i));
+                                    if (method.getName().equals("next")) {
+                                        if (Boolean.TRUE.equals(result)) capture.consumed++;
+                                        else {
+                                            capture.exhausted = true;
+                                            capture.end();
                                         }
-                                        // The hash is what the server records; the text only
-                                        // when the capture keeps per-row detail.
-                                        values.put("row_hash", ResultRowHash.of(texts, jdbcTypes));
-                                        if (DETAIL_ROWS) {
-                                            for (int i = 0; i < texts.size(); i++) {
-                                                values.put(Integer.toString(i + 1), texts.get(i));
-                                                types.put(Integer.toString(i + 1), jdbcTypes.get(i));
-                                            }
-                                            values.put("column_types", types);
-                                        }
-                                        emit("consumed_row", values);
                                     }
-                                    if (method.getName().equals("close")
-                                            || method.getName().equals("next") && Boolean.FALSE.equals(result))
-                                        capture.end();
+                                    if (method.getName().equals("close")) capture.end();
                                     return result;
                                 } catch (SQLException error) {
                                     error(error, "result_error", method.getName(), sql);

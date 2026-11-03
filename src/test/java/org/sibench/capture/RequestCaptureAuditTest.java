@@ -2,7 +2,6 @@ package org.sibench.capture;
 
 import static org.junit.Assert.*;
 
-import com.google.gson.JsonPrimitive;
 import com.google.gson.JsonParser;
 
 import org.junit.Rule;
@@ -13,7 +12,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
-import java.sql.Types;
 
 public class RequestCaptureAuditTest {
     private static final String HEADER = "{\"event\":\"capture_start\",\"pid\":42,\"detail\":\"summary\"}\n";
@@ -21,23 +19,7 @@ public class RequestCaptureAuditTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     @Test
-    public void normalizesJdbcTypesWithoutApproximateNumericTolerance() {
-        assertTrue(equal("40000", "40000.0", Types.REAL));
-        assertTrue(equal("0.1", "0.10000000149011612", Types.REAL));
-        assertFalse(equal("1", "1.0001", Types.REAL));
-        assertFalse(equal("0.1", "0.10000000149011612", Types.DOUBLE));
-        assertTrue(equal("1.0", "1.00", Types.NUMERIC));
-        assertTrue(equal("2024-01-01 00:00:00", "2024-01-01 00:00:00.0", Types.TIMESTAMP));
-        assertTrue(equal("accept ", "accept", Types.CHAR));
-        assertFalse(equal("accept ", "accept", Types.VARCHAR));
-    }
-
-    private static boolean equal(String a, String b, int type) {
-        return RequestCaptureAudit.equalResult(new JsonPrimitive(a), new JsonPrimitive(b), type);
-    }
-
-    @Test
-    public void directEventsMatchResultsThatArriveBeforeClientConsumption() throws Exception {
+    public void directEventsCheckCountsThatArriveBeforeClientConsumption() throws Exception {
         for (boolean wrong : java.util.List.of(false, true)) {
             var audit = new RequestCaptureAudit.State(false);
             audit.server(com.google.gson.JsonParser.parseString(HEADER).getAsJsonObject());
@@ -48,13 +30,13 @@ public class RequestCaptureAuditTest {
                     "{\"event\":\"request_start\",\"application\":\"a\",\"sql\":\"SELECT 1\",\"parameters\":{}}"))
                 audit.client(com.google.gson.JsonParser.parseString(line).getAsJsonObject());
             for (String line : java.util.List.of(
-                    "{\"event\":\"executor_run_end\",\"pid\":42,\"application\":\"a\",\"depth\":1,\"returned\":1,\"row_hashes\":[\"0000000000000001\"]}",
+                    "{\"event\":\"executor_run_end\",\"pid\":42,\"application\":\"a\",\"depth\":1,\"returned\":1}",
                     "{\"event\":\"executor_end\",\"pid\":42,\"application\":\"a\"}",
                     "{\"event\":\"transaction_commit\",\"pid\":42,\"application\":\"a\"}"))
                 audit.server(com.google.gson.JsonParser.parseString(line).getAsJsonObject());
             for (String line : java.util.List.of(
                     "{\"event\":\"request_return\",\"application\":\"a\"}",
-                    "{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"000000000000000" + (wrong ? "2" : "1") + "\"}",
+                    "{\"event\":\"request_end\",\"application\":\"a\",\"consumed_rows\":" + (wrong ? 2 : 1) + ",\"exhausted\":true}",
                     "{\"event\":\"commit\",\"application\":\"a\"}",
                     "{\"event\":\"close\",\"application\":\"a\"}"))
                 audit.client(com.google.gson.JsonParser.parseString(line).getAsJsonObject());
@@ -74,19 +56,21 @@ public class RequestCaptureAuditTest {
                 {"event":"connection","pid":42}
                 {"event":"request_start","application":"a","sql":"SELECT 1","parameters":{}}
                 {"event":"request_return","application":"a"}
+                {"event":"request_end","application":"a","consumed_rows":0,"exhausted":false}
                 {"event":"rollback","application":"a"}
                 {"event":"request_start","application":"b","sql":"SELECT 2","parameters":{}}
                 {"event":"request_return","application":"b"}
+                {"event":"request_end","application":"b","consumed_rows":0,"exhausted":false}
                 {"event":"close","application":"b"}
                 """);
         String pg = HEADER +
                 """
                 {"event":"executor_start","pid":42,"application":"a","sql":"SELECT 1"}
-                {"event":"executor_run_end","pid":42,"application":"a","depth":1,"returned":0,"row_hashes":[]}
+                {"event":"executor_run_end","pid":42,"application":"a","depth":1,"returned":0}
                 {"event":"executor_end","pid":42,"application":"a"}
                 {"event":"transaction_abort","pid":42,"application":"a"}
                 {"event":"executor_start","pid":42,"application":"b","sql":"SELECT 2"}
-                {"event":"executor_run_end","pid":42,"application":"b","depth":1,"returned":0,"row_hashes":[]}
+                {"event":"executor_run_end","pid":42,"application":"b","depth":1,"returned":0}
                 {"event":"executor_end","pid":42,"application":"b"}
                 """;
         write(
@@ -107,48 +91,26 @@ public class RequestCaptureAuditTest {
         assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
     }
 
-    /**
-     * A summary capture compares the client's row hashes with the server's; a row that kept its
-     * text is also hashed from it, so a stale hash cannot pass.
-     */
     @Test
-    public void comparesConsumedRowsWithServerRowHashes() throws Exception {
+    public void rejectsMissingCompletionAndIncorrectCountsWithoutReadingValues() throws Exception {
         var directory = temporary.newFolder().toPath();
         var client = directory.resolve("client.jsonl.zst");
         var server = directory.resolve("server.jsonl.zst");
-        String hash = ResultRowHash.of(java.util.List.of("2000.0"), java.util.List.of(Types.REAL));
-        String requests =
-                """
-                {"event":"connection","pid":42}
-                {"event":"request_start","application":"a","sql":"SELECT balance FROM t","parameters":{}}
-                {"event":"request_return","application":"a"}
-                %s
-                {"event":"commit","application":"a"}
-                {"event":"close","application":"a"}
-                """;
-        String pg = HEADER +
-                """
-                {"event":"executor_start","pid":42,"application":"a","sql":"SELECT balance FROM t","depth":1}
-                {"event":"executor_run_end","pid":42,"application":"a","depth":1,"returned":1,"row_hashes":["%s"]}
-                {"event":"executor_end","pid":42,"application":"a","depth":1}
-                {"event":"transaction_commit","pid":42,"application":"a"}
-                """;
-        write(server, pg.formatted(ResultRowHash.of(java.util.List.of("2000"), java.util.List.of(Types.REAL))));
-        write(client, requests.formatted("{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"" + hash + "\"}"));
-        assertEquals(1L, RequestCaptureAudit.audit(client, server, false).get("client_consumed_rows_checked"));
-        // A row with its text: the hash must be the text's, and both must match the server.
-        String text = "{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"%s\",\"1\":\"2000.0\",\"column_types\":{\"1\":7}}";
-        write(client, requests.formatted(text.formatted(hash)));
-        assertEquals(1L, RequestCaptureAudit.audit(client, server, false).get("client_consumed_rows_checked"));
-        write(client, requests.formatted("{\"event\":\"consumed_row\",\"application\":\"a\",\"1\":\"2000.0\",\"column_types\":{\"1\":7}}"));
-        assertThrows(IOException.class, () -> RequestCaptureAudit.audit(client, server, false));
-        write(client, requests.formatted(text.formatted("0000000000000000")));
-        assertTrue(assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, false))
-                .getMessage().contains("hash differs from its values"));
-        write(server, pg.formatted("0000000000000000"));
-        write(client, requests.formatted("{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"" + hash + "\"}"));
-        assertTrue(assertThrows(java.io.IOException.class, () -> RequestCaptureAudit.audit(client, server, false))
-                .getMessage().contains("differs from same-execution server result"));
+        String base = AUTOCOMMIT_CLIENT.replace("\"consumed_rows\":0", "\"consumed_rows\":2");
+        write(server, server(2, "").replace("\"returned\":0", "\"returned\":3"));
+        write(client, base);
+        assertEquals(2L, RequestCaptureAudit.audit(client, server, false).get("client_consumed_rows_checked"));
+        for (String invalid : java.util.List.of(
+                base.replace("\"consumed_rows\":2", "\"consumed_rows\":4"),
+                base.replace("\"exhausted\":false", "\"exhausted\":true"),
+                base.replace("\"consumed_rows\":2", "\"consumed_rows\":-1"),
+                base.lines().filter(line -> !line.contains("request_end")).collect(java.util.stream.Collectors.joining("\n")))) {
+            write(client, invalid);
+            assertThrows(IOException.class, () -> RequestCaptureAudit.audit(client, server, false));
+        }
+        write(client, base.replace("\"consumed_rows\":2", "\"consumed_rows\":3")
+                .replace("\"exhausted\":false", "\"exhausted\":true"));
+        assertEquals(3L, RequestCaptureAudit.audit(client, server, false).get("client_consumed_rows_checked"));
     }
 
     @Test
@@ -163,6 +125,7 @@ public class RequestCaptureAuditTest {
                 {"event":"request_start","application":"a","sql":"SELECT 1","parameters":{}}
                 {"event":"rollback","application":"a"}
                 {"event":"request_return","application":"a"}
+                {"event":"request_end","application":"a","consumed_rows":0,"exhausted":false}
                 {"event":"close","application":"a"}
                 """);
         write(server, "");
@@ -174,38 +137,29 @@ public class RequestCaptureAuditTest {
             {"event":"connection","pid":42}
             {"event":"request_start","application":"a","sql":"SELECT c FROM t WHERE id = ?","parameters":{"1":"5"},"autocommit":true}
             {"event":"request_return","application":"a"}
+            {"event":"request_end","application":"a","consumed_rows":0,"exhausted":false}
             {"event":"autocommit","application":"a","implicit_commits":2}
             {"event":"close","application":"a"}
             """;
 
     @Test
-    public void consumedPrefixesKeepExactOrderAcrossExecutorReturns() throws Exception {
+    public void consumedPrefixesSumCountsAcrossExecutorReturns() throws Exception {
         var directory = temporary.newFolder().toPath();
         var client = directory.resolve("client.jsonl.zst");
         var server = directory.resolve("server.jsonl.zst");
-        String rows = "";
-        for (int i = 0; i < 9; i++)
-            rows += "{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\""
-                    + "%016x".formatted(i) + "\"}\n";
-        write(client, AUTOCOMMIT_CLIENT.replace(
-                "{\"event\":\"close\",\"application\":\"a\"}", rows + "{\"event\":\"close\",\"application\":\"a\"}"));
-        String pg = server(2, "").replace(
-                "\"returned\":0,\"row_hashes\":[]",
-                "\"returned\":4,\"row_hashes\":[\"0000000000000000\",\"0000000000000001\",\"0000000000000002\",\"0000000000000003\"]");
-        pg += "{\"event\":\"executor_run_end\",\"pid\":42,\"application\":\"a\",\"depth\":1,\"returned\":6,\"row_hashes\":[\"0000000000000004\",\"0000000000000005\",\"0000000000000006\",\"0000000000000007\",\"0000000000000008\",\"0000000000000009\"]}\n";
+        write(client, AUTOCOMMIT_CLIENT.replace("\"consumed_rows\":0", "\"consumed_rows\":9"));
+        String pg = server(2, "").replace("\"returned\":0", "\"returned\":4")
+                + "{\"event\":\"executor_run_end\",\"pid\":42,\"application\":\"a\",\"depth\":1,\"returned\":6}\n";
         write(server, pg);
         assertEquals(9L, RequestCaptureAudit.audit(client, server, false).get("client_consumed_rows_checked"));
-        write(server, pg.replace("0000000000000007", "0000000000000008"));
-        assertThrows(IOException.class, () -> RequestCaptureAudit.audit(client, server, false));
-        write(server, pg.replace("\"returned\":6", "\"returned\":4")
-                .replace(",\"0000000000000008\",\"0000000000000009\"", ""));
+        write(server, pg.replace("\"returned\":6", "\"returned\":4"));
         assertThrows(IOException.class, () -> RequestCaptureAudit.audit(client, server, false));
     }
 
     private static String server(int commits, String scan) {
         return HEADER + "{\"event\":\"executor_start\",\"pid\":42,\"application\":\"a\",\"sql\":\"SELECT c FROM t WHERE id = $1\"}\n"
                 + scan
-                + "{\"event\":\"executor_run_end\",\"pid\":42,\"application\":\"a\",\"depth\":1,\"returned\":0,\"row_hashes\":[]}\n"
+                + "{\"event\":\"executor_run_end\",\"pid\":42,\"application\":\"a\",\"depth\":1,\"returned\":0}\n"
                 + "{\"event\":\"transaction_commit\",\"pid\":42,\"application\":\"a\"}\n".repeat(commits);
     }
 
@@ -277,6 +231,7 @@ public class RequestCaptureAuditTest {
             {"event":"connection","pid":42}
             {"event":"request_start","application":"a","sql":"SELECT c FROM t WHERE id = ?","parameters":{"1":"5"}}
             {"event":"request_return","application":"a"}
+            {"event":"request_end","application":"a","consumed_rows":0,"exhausted":false}
             {"event":"rollback","application":"a"}
             {"event":"commit","application":"a"}
             {"event":"close","application":"a"}
@@ -313,26 +268,24 @@ public class RequestCaptureAuditTest {
                 {"event":"request_return","application":"sibench:j1:1:1"}
                 {"event":"request_start","application":"sibench:j1:1:2","request":2,"sql":"SELECT 2","parameters":{}}
                 {"event":"request_return","application":"sibench:j1:1:2"}
-                {"event":"consumed_row","application":"sibench:j1:1:1","row_hash":"0000000000000001"}
-                {"event":"consumed_row","application":"sibench:j1:1:2","row_hash":"0000000000000002"}
-                {"event":"request_end","application":"sibench:j1:1:1"}
-                {"event":"request_end","application":"sibench:j1:1:2"}
+                {"event":"request_end","application":"sibench:j1:1:1","consumed_rows":1,"exhausted":true}
+                {"event":"request_end","application":"sibench:j1:1:2","consumed_rows":1,"exhausted":true}
                 {"event":"commit","application":"sibench:j1:1:2"}
                 {"event":"close","application":"sibench:j1:1:2"}
                 """;
         write(client, rows);
         write(server, HEADER + """
                 {"event":"executor_start","pid":42,"application":"sibench:j1:1:1","sql":"SELECT 1"}
-                {"event":"executor_run_end","pid":42,"application":"sibench:j1:1:1","depth":1,"returned":1,"row_hashes":["0000000000000001"]}
+                {"event":"executor_run_end","pid":42,"application":"sibench:j1:1:1","depth":1,"returned":1}
                 {"event":"executor_end","pid":42,"application":"sibench:j1:1:1"}
                 {"event":"scan_end","pid":42,"application":"sibench:j1:1:1"}
                 {"event":"executor_start","pid":42,"application":"sibench:j1:1:2","sql":"SELECT 2"}
-                {"event":"executor_run_end","pid":42,"application":"sibench:j1:1:2","depth":1,"returned":1,"row_hashes":["0000000000000002"]}
+                {"event":"executor_run_end","pid":42,"application":"sibench:j1:1:2","depth":1,"returned":1}
                 {"event":"executor_end","pid":42,"application":"sibench:j1:1:2"}
                 {"event":"transaction_commit","pid":42,"application":"sibench:j1:1:2"}
                 """);
         assertEquals(2L, RequestCaptureAudit.audit(client, server, false).get("client_consumed_rows_checked"));
-        write(client, rows.replace("0000000000000001", "0000000000000003"));
+        write(client, rows.replace("\"consumed_rows\":1", "\"consumed_rows\":3"));
         assertThrows(IOException.class, () -> RequestCaptureAudit.audit(client, server, false));
     }
 
@@ -360,13 +313,12 @@ public class RequestCaptureAuditTest {
                 String client = """
                         {"event":"request_start","application":"%s","request":%d,"sql":"SELECT 1","parameters":{}}
                         {"event":"request_return","application":"%s"}
-                        {"event":"consumed_row","application":"%s","row_hash":"0000000000000001"}
-                        {"event":"request_end","application":"%s"}
+                        {"event":"request_end","application":"%s","consumed_rows":1,"exhausted":true}
                         {"event":"commit","application":"%s"}
-                        """.formatted(app, i, app, app, app, app);
+                        """.formatted(app, i, app, app, app);
                 String server = """
                         {"event":"executor_start","pid":42,"application":"%s","sql":"SELECT 1"}
-                        {"event":"executor_run_end","pid":42,"application":"%s","depth":1,"returned":1,"row_hashes":["0000000000000001"]}
+                        {"event":"executor_run_end","pid":42,"application":"%s","depth":1,"returned":1}
                         {"event":"executor_end","pid":42,"application":"%s"}
                         {"event":"transaction_commit","pid":42,"application":"%s"}
                         """.formatted(app, app, app, app);

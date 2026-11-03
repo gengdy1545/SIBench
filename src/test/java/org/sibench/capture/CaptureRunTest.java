@@ -72,7 +72,7 @@ public class CaptureRunTest {
         RowAuditTestSupport.writeTrace(path, List.of(
                 event("capture_start", "fixture", ",\"req\":0,\"depth\":0,\"detail\":\"summary\""),
                 event("executor_start", "fixture", ",\"req\":1,\"depth\":1,\"sql\":\"SELECT 1\""),
-                event("executor_run_end", "fixture", ",\"req\":1,\"depth\":1,\"processed\":0,\"returned\":0,\"row_hashes\":[]"),
+                event("executor_run_end", "fixture", ",\"req\":1,\"depth\":1,\"processed\":0,\"returned\":0"),
                 event("executor_end", "fixture", ",\"req\":1,\"depth\":1"),
                 event("transaction_commit", "fixture", ",\"req\":1,\"depth\":0")));
     }
@@ -169,7 +169,7 @@ public class CaptureRunTest {
                     List.of(
                             event("capture_start", application, ",\"detail\":\"rows\""),
                             event("executor_start", application, ",\"sql\":\"SELECT 1\""),
-                            event("executor_run_end", application, ",\"depth\":1,\"returned\":0,\"row_hashes\":[]"),
+                            event("executor_run_end", application, ",\"depth\":1,\"returned\":0"),
                             event("executor_end", application, ""),
                             event("transaction_commit", application, "")));
             run.complete();
@@ -206,7 +206,7 @@ public class CaptureRunTest {
                     List.of(
                             event("capture_start", application, ",\"detail\":\"rows\""),
                             event("executor_start", application, ",\"sql\":\"SELECT 1\""),
-                            event("executor_run_end", application, ",\"depth\":1,\"returned\":0,\"row_hashes\":[]"),
+                            event("executor_run_end", application, ",\"depth\":1,\"returned\":0"),
                             event("executor_end", application, ""),
                             event("transaction_commit", application, "")));
             run.complete();
@@ -300,6 +300,7 @@ public class CaptureRunTest {
                                 "{\"event\":\"connection\",\"pid\":" + pid + ",\"phase\":\"xp\"}",
                                 "{\"event\":\"request_start\",\"application\":\"p" + pid + "\",\"sql\":\"SELECT 1\",\"parameters\":{}}",
                                 "{\"event\":\"request_return\",\"application\":\"p" + pid + "\"}",
+                                "{\"event\":\"request_end\",\"application\":\"p" + pid + "\",\"consumed_rows\":0,\"exhausted\":false}",
                                 "{\"event\":\"rollback\",\"application\":\"p" + pid + "\"}",
                                 "{\"event\":\"close\",\"application\":\"p" + pid + "\"}"));
                 RowAuditTestSupport.writeTrace(
@@ -308,7 +309,7 @@ public class CaptureRunTest {
                                 "{\"event\":\"capture_start\",\"pid\":" + pid + ",\"detail\":\"rows\"}",
                                 "{\"event\":\"executor_start\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\",\"sql\":\"SELECT 1\"}",
                                 "{\"event\":\"executor_end\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\"}",
-                                "{\"event\":\"executor_run_end\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\",\"depth\":1,\"returned\":0,\"row_hashes\":[]}",
+                                "{\"event\":\"executor_run_end\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\",\"depth\":1,\"returned\":0}",
                                 "{\"event\":\"transaction_abort\",\"pid\":" + pid + ",\"application\":\"p" + pid + "\"}"));
                 CaptureRun.sessionClosed(jdbc);
             }
@@ -344,9 +345,7 @@ public class CaptureRunTest {
         Path directory = temporary.newFolder().toPath();
         ResultSet result = proxy(ResultSet.class, (p, m, a) -> switch (m.getName()) {
             case "next" -> true;
-            case "getMetaData" -> proxy(java.sql.ResultSetMetaData.class,
-                    (q, n, b) -> n.getName().equals("getColumnCount") ? 1 : java.sql.Types.INTEGER);
-            case "getString" -> "42";
+            case "getMetaData", "getString" -> throw new AssertionError("Capture must not read result values");
             default -> null;
         });
         Connection actual = actual("", null, new boolean[1]);
@@ -374,22 +373,14 @@ public class CaptureRunTest {
         String application = events.stream()
                 .filter(e -> e.get("event").getAsString().equals("request_start"))
                 .findFirst().orElseThrow().get("application").getAsString();
-        var consumed = events.stream()
-                .filter(e -> e.get("event").getAsString().equals("consumed_row")).toList();
-        assertEquals(2, consumed.size());
+        assertFalse(events.stream().anyMatch(e -> e.get("event").getAsString().equals("consumed_row")
+                || e.has("row_hash") || e.has("column_types")));
         var ended = events.stream().filter(e -> e.get("event").getAsString().equals("request_end")
                 && e.get("request").getAsInt() == 1).toList();
         assertEquals(1, ended.size());
         assertEquals(application, ended.get(0).get("application").getAsString());
-        for (var row : consumed) {
-            assertEquals(application, row.get("application").getAsString());
-            assertEquals(1, row.get("request").getAsInt());
-            // The text stays only with SIBENCH_CAPTURE_DETAIL=rows; the hash always identifies it.
-            assertEquals(
-                    ResultRowHash.of(java.util.List.of("42"), java.util.List.of(java.sql.Types.INTEGER)),
-                    row.get("row_hash").getAsString());
-            if (CaptureDriver.DETAIL_ROWS) assertEquals("42", row.get("1").getAsString());
-        }
+        assertEquals(2, ended.get(0).get("consumed_rows").getAsLong());
+        assertFalse(ended.get(0).get("exhausted").getAsBoolean());
     }
 
     @Test

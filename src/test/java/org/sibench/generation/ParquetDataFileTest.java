@@ -23,8 +23,19 @@ public class ParquetDataFileTest {
 
     private static GenerationConfig layout(Path output, long target, int percent,
             CompressionCodecName codec, boolean dictionary) {
-        return new GenerationConfig(Path.of(""), Map.of(), "ycsb", 7, target, percent,
-                128, 65536, 1024, 1024, dictionary, codec, codec == CompressionCodecName.ZSTD ? 3 : 0, 1, 0, output, 1);
+        return new GenerationConfig(Path.of(""), Map.of(), "ycsb", target, percent,
+                128, 65536, 1024, 1024, dictionary, codec, codec == CompressionCodecName.ZSTD ? 3 : 0, output, 1);
+    }
+
+    @Test
+    public void rejectsInvalidFileBudgetsAndKeepsEitherRowGroupLimit() {
+        for (int percent : new int[] {0, 101})
+            assertThrows(IllegalArgumentException.class, () -> layout(Path.of(""), 65536, percent));
+        assertThrows(IllegalArgumentException.class, () -> layout(Path.of(""), Long.MAX_VALUE, 5));
+        assertFalse(ParquetDataFile.shouldFlush(9, 99, 10, 100));
+        assertTrue(ParquetDataFile.shouldFlush(10, 99, 10, 100));
+        assertTrue(ParquetDataFile.shouldFlush(1, 100, 10, 100));
+        assertTrue(ParquetDataFile.shouldFlush(11, 101, 10, 100));
     }
 
     @Test
@@ -34,13 +45,12 @@ public class ParquetDataFileTest {
                 Path directory = temporary.newFolder().toPath();
                 var config = layout(directory, 65536, 5, codec, dictionary);
                 var schema = MessageTypeParser.parseMessageType("message t { required int64 id; required binary payload; }");
-                var table = new TableData("t", 2000, 1, "id", schema, null);
                 var factory = new SimpleGroupFactory(schema);
                 int next = 0;
                 while (next < 2000) {
                     Path file = directory.resolve(next + ".parquet");
                     int first = next;
-                    try (var writer = new ParquetDataFile(file, table, config, Map.of())) {
+                    try (var writer = new ParquetDataFile(file, schema, config, Map.of())) {
                         while (next < 2000) {
                             byte[] bytes = new byte[256]; new Random(next).nextBytes(bytes);
                             boolean full = writer.write(factory.newGroup().append("id", (long) next)
@@ -78,14 +88,13 @@ public class ParquetDataFileTest {
             var directory = temporary.newFolder().toPath();
             var config = layout(directory, target, 5);
             var schema = MessageTypeParser.parseMessageType("message t { required int64 id; required binary payload; }");
-            var table = new TableData("t", 12000, 1, "id", schema, null);
             var factory = new SimpleGroupFactory(schema);
             var random = new Random(73);
             int next = 0, files = 0, tails = 0;
             while (next < 12000) {
                 Path file = directory.resolve((files++) + ".parquet");
                 int first = next;
-                try (var writer = new ParquetDataFile(file, table, config, Map.of())) {
+                try (var writer = new ParquetDataFile(file, schema, config, Map.of())) {
                     while (next < 12000) {
                         // Both compressibility and width change within a file.
                         byte[] bytes = new byte[next % 7 == 0 ? 256 : 512];
@@ -122,7 +131,7 @@ public class ParquetDataFileTest {
         var schema = MessageTypeParser.parseMessageType("message t { required binary payload; }");
         var bytes = new byte[90000];
         new Random(7).nextBytes(bytes);
-        try (var writer = new ParquetDataFile(file, new TableData("t", 1, 1, "payload", schema, null), config, Map.of())) {
+        try (var writer = new ParquetDataFile(file, schema, config, Map.of())) {
             writer.write(new SimpleGroupFactory(schema).newGroup().append("payload",
                     org.apache.parquet.io.api.Binary.fromConstantByteArray(bytes)));
             var error = assertThrows(java.io.IOException.class, writer::finish);

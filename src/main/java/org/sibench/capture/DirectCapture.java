@@ -36,7 +36,7 @@ final class DirectCapture implements AutoCloseable {
 
     private final class Stream {
         final Path path;
-        final MessageDigest digest = org.sibench.replay.QueryDigest.digest();
+        final MessageDigest digest = org.sibench.config.Digests.digest();
         final CompletableFuture<Void> ended = new CompletableFuture<>();
         final SocketChannel socket;
         final boolean server;
@@ -162,7 +162,7 @@ final class DirectCapture implements AutoCloseable {
                 stream.digest.update(bytes);
                 stream.bytes = Math.addExact(stream.bytes, bytes.length);
                 stream.events++;
-                if (stream.server) server(stream, line, event);
+                if (stream.server) server(stream, line, event, bytes.length);
                 else client(stream, event);
             }
             throw new EOFException("Source stream lost its completion marker: " + name);
@@ -179,7 +179,7 @@ final class DirectCapture implements AutoCloseable {
         return audits.computeIfAbsent(pid, ignored -> new RequestCaptureAudit.State(bindings));
     }
 
-    private void server(Stream stream, String line, JsonObject event) throws IOException {
+    private void server(Stream stream, String line, JsonObject event, int encodedBytes) throws IOException {
         if (stream.header == null) {
             ServerTrace.detail(event);
             stream.header = event;
@@ -190,7 +190,7 @@ final class DirectCapture implements AutoCloseable {
         if (jdbc) audit(stream.pid).server(event);
         else stream.audit.accept(event);
         if (stream.chunk == null) stream.chunk = transactions.begin(stream.pid);
-        stream.chunk.append(line, Event.of(event));
+        stream.chunk.append(line, event, encodedBytes);
         String type = event.get("event").getAsString();
         if (type.equals("transaction_commit") || type.equals("transaction_abort")) {
             long sequence = event.get("capture_sequence").getAsLong();

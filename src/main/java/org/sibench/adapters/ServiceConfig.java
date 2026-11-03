@@ -39,10 +39,10 @@ public record ServiceConfig(
         require(!adapter.equals("rocksdb") || path != null, "A RocksDB index needs a path");
     }
 
-    /** The service target of a replay config, or null when it replays into the reference. */
+    /** The required service target of a replay config. */
     public static ServiceConfig ofReplay(Path root, Map<String, Object> document) {
         var target = object(document, "target");
-        if (!target.containsKey("service")) return null;
+
         var service = object(target, "service");
         keys(service, Set.of("adapter", "endpoint", "path", "value"));
         String adapter = string(service, "adapter");

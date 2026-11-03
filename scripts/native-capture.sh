@@ -32,10 +32,6 @@ CORE=$ROOT/build/sibench/sibench.jar
 cd "$ROOT"
 ASSIGNMENTS=$("$JAVA" -cp "$CORE" org.sibench.capture.NativeCapture paths "$ROOT" "$PROFILE")
 eval "$ASSIGNMENTS"
-if [ "$AUDIT_BASELINE" = 1 ] && [ "$SIBENCH_TRACE_OUTPUT" != full ]; then
-  echo "--audit-baseline requires capture.output: full (complete-row Parquet)" >&2
-  exit 2
-fi
 # PG and the native clients read the detail level and trace encoding from the environment.
 export SIBENCH_CAPTURE_DETAIL SIBENCH_CAPTURE_COMPRESS
 export SIBENCH_BUDGET_STOP
@@ -186,8 +182,8 @@ stage run > "$SIBENCH_ARTIFACTS/native-run.log"
 cp "$SIBENCH_ARTIFACTS/trace/access-ledger.json" "$SIBENCH_ARTIFACTS/access-ledger-summary.json"
 cp "$SIBENCH_ARTIFACTS/trace/capture-completeness.json" "$SIBENCH_ARTIFACTS/capture-completeness.json"
 if [ "$SIBENCH_TRACE_OUTPUT" = proto ]; then
-  # The published proto Trace contains its complete initial index and source identities.
-  rm -rf "$SIBENCH_ARTIFACTS/baseline" "$SIBENCH_RAW"
+  # Row data remains available for physical lookup and future rewrites.
+  rm -rf "$SIBENCH_RAW"
 fi
 
 # The next capture loads fresh data. Explicit acceptance can retain the final database for audit.

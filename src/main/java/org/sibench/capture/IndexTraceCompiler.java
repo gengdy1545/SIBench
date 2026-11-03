@@ -1,11 +1,11 @@
 package org.sibench.capture;
 
+import org.sibench.config.Digests;
+
 import com.google.gson.*;
 
 import org.apache.parquet.example.data.Group;
 import org.apache.parquet.example.data.simple.SimpleGroupFactory;
-import org.apache.parquet.hadoop.ParquetReader;
-import org.apache.parquet.hadoop.example.GroupReadSupport;
 import org.apache.parquet.schema.MessageType;
 import org.sibench.capture.AccessProjection.Decision;
 import org.sibench.capture.AccessUnits.Request;
@@ -64,8 +64,6 @@ final class IndexTraceCompiler {
                 Path path,
                 MessageType schema,
                 GenerationConfig config,
-                String table,
-                String primaryKey,
                 long fileId)
                 throws IOException {
             this.path = path;
@@ -79,7 +77,7 @@ final class IndexTraceCompiler {
             writer =
                     new ParquetDataFile(
                             path,
-                            new TableData(table, 0, 0, primaryKey, this.schema, null),
+                            this.schema,
                             config,
                             Map.of("sibench.source", "committed-pg-row-changes"));
         }
@@ -125,9 +123,6 @@ final class IndexTraceCompiler {
         boolean concurrent = sessionOrder.equals("concurrent");
         Path baseline = layout.output();
         JsonObject verification = BaselineManifest.verify(sourceSchema, baseline);
-        boolean indexBaseline = verification.get("output").getAsString().equals("proto");
-        if (indexBaseline && strategy != TraceOutput.PROTO)
-            throw new IOException("Full output requires a complete-row baseline export");
         Path verified = baseline.resolve(BaselineManifest.FILE);
         Path preflightFile = baseline.resolve("schema-preflight.json");
         boolean cCollation =
@@ -147,17 +142,13 @@ final class IndexTraceCompiler {
         String baselineDigest, workloadDigest;
         RunTiming.current().phase("baseline");
         var baselineFiles = new com.google.gson.JsonArray();
-        // Index-only exports already contain final requests; reading establishes row identities.
-        var baselineProto = indexBaseline ? null : new ProtoTrace.Writer(output.resolve("baseline.pb.zst"));
-        var baselineOperations = indexBaseline ? null : new WriterThread(
+        var baselineProto = new ProtoTrace.Writer(output.resolve("baseline.pb.zst"));
+        var baselineOperations = new WriterThread(
                 strategy == TraceOutput.FULL ? new IndexOperationTrace.Writer(null) : null,
                 baselineProto, "baseline-writer");
-        long[] exportedCount = {0};
-        IndexOperationTrace.Consumer baselineSink = indexBaseline ? operation -> exportedCount[0]++ : baselineOperations;
         try (var operations = baselineOperations) {
             var extent =
-                    indexBaseline ? ProtoBaseline.derive(baseline, verification, catalog, identities, baselineSink)
-                    : BaselineOperations.derive(
+                    BaselineOperations.derive(
                             baseline,
                             catalog,
                             operations,
@@ -186,17 +177,15 @@ final class IndexTraceCompiler {
             maximumRowId = extent.maximumRowId();
             maximumFileId = extent.maximumFileId();
             baselineRows = extent.rows();
-            baselineCount = indexBaseline ? exportedCount[0] : operations.count();
+            baselineCount = operations.count();
         }
-        if (indexBaseline) baselineFiles = ProtoBaseline.retain(baseline, verification, output);
-        else baselineFiles.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("baseline.pb.zst", baselineProto)));
+        baselineFiles.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("baseline.pb.zst", baselineProto)));
         baselineDigest = ProtoTrace.identity(baselineFiles);
         var state = new Compilation(catalog, cCollation, identities, schemas, layout, output);
         state.concurrent = concurrent;
         state.commitWindow = new CommitWindow(commitWindow);
         state.maximumRowId = maximumRowId;
         state.firstIncrementalFile = maximumFileId;
-        state.keepRows = strategy == TraceOutput.FULL;
         var sessionReports = new ArrayList<Map<String, Object>>();
         RunTiming.current().phase("workload");
         state.budget = source.budget();
@@ -268,13 +257,12 @@ final class IndexTraceCompiler {
         report.put("proto_files", Map.of(
                 "baseline", baselineFiles,
                 "workload", workloadFiles));
-        if (strategy == TraceOutput.PROTO) report.put("value_kind", "row_id");
         report.put("secondary_operations_explicit", true);
         report.putAll(catalog.provenance());
         report.put("secondary_index_coverage", "all_source_definitions");
         report.put("key_encoding", "order_preserving");
         report.put("text_intervals_ordered", cCollation);
-        if (strategy == TraceOutput.FULL) report.put("baseline_directory", baseline.toAbsolutePath().toString());
+        report.put("baseline_directory", baseline.toAbsolutePath().toString());
         report.put("baseline_operations", baselineCount);
         report.put("baseline_rows", verification.get("rows").getAsLong());
         report.put(
@@ -333,15 +321,15 @@ final class IndexTraceCompiler {
         report.put("secondary_index_scope", "all secondary indexes in pinned source DDL");
         report.put("raw_index_insert_attempts", state.rawInserts);
         report.put("incremental_files", state.files);
-        report.put("baseline_manifest_sha256", BaselineGenerator.sha256(verified));
-        report.put("baseline_schema_preflight_sha256", BaselineGenerator.sha256(preflightFile));
+        report.put("baseline_manifest_sha256", Digests.sha256(verified));
+        report.put("baseline_schema_preflight_sha256", Digests.sha256(preflightFile));
         Files.copy(verified, output.resolve("source-baseline-manifest.json"));
         Files.copy(preflightFile, output.resolve("schema-preflight.json"));
         Path captureRun = (Files.isDirectory(raw) ? raw : raw.toAbsolutePath().getParent()).resolve("capture-run.json");
         Files.copy(captureRun, output.resolve("source-capture-run.json"));
-        report.put("source_capture_run_sha256", BaselineGenerator.sha256(captureRun));
+        report.put("source_capture_run_sha256", Digests.sha256(captureRun));
         report.put("verification", Map.of("mode", "runtime"));
-        report.put("access_ledger_sha256", BaselineGenerator.sha256(ledgerFile));
+        report.put("access_ledger_sha256", Digests.sha256(ledgerFile));
         report.put("capture_completeness", completeness);
         report.put("baseline_trace_sha256", baselineDigest);
         report.put("workload_trace_sha256", workloadDigest);
@@ -425,12 +413,6 @@ final class IndexTraceCompiler {
         }
     }
 
-    private static ParquetReader<Group> reader(Path path) throws IOException {
-        return ParquetReader.builder(
-                        new GroupReadSupport(), new org.apache.hadoop.fs.Path(path.toUri()))
-                .build();
-    }
-
     /** Compilation state carried across sessions: versions, work units, RowIDs and files. */
     static final class Compilation implements AccessUnits.Listener {
         final IndexCatalog catalog;
@@ -480,7 +462,6 @@ final class IndexTraceCompiler {
         long snapshotSearches, crossChecked, crossCheckUnverifiable, partSearches;
         boolean transactionRequest, transactionOpen;
         boolean concurrent;
-        boolean keepRows = true;
         /** The latest committed writers by completion counter; see {@link CommitWindow}. */
         CommitWindow commitWindow;
         int pid;
@@ -609,12 +590,6 @@ final class IndexTraceCompiler {
             pending.add(search);
         }
 
-        /**
-         * The version a search reads. Sessions that never overlap read the commit before their
-         * own; concurrent sessions read the last writer their snapshot's completion counter saw,
-         * which is the commit set PostgreSQL actually made visible to that statement. A reader's
-         * commit changes no data, so it is never a read point.
-         */
         private long readTimestampFor(Unit unit) throws IOException {
             // Sessions that never overlap read the commit before their own, exactly as before.
             if (!concurrent) return version;
@@ -716,7 +691,9 @@ final class IndexTraceCompiler {
                 Search search = live.remove(unit);
                 if (search == null) throw new IOException("Bitmap input without a search position");
                 if (first == null) first = search;
-                else pending.remove(search);
+                else {
+                    pending.remove(search);
+                }
             }
             liveGroups.put(group, first);
         }
@@ -932,21 +909,13 @@ final class IndexTraceCompiler {
                     };
             int position = 0;
             for (AccessProjection.Part part : decision.parts()) {
-                append(
-                        IndexOperationTrace.search(
-                                        search.event,
-                                        part.table(),
-                                        part.index(),
-                                        part.range(),
-                                        part.pinned(),
-                                        readTimestamp,
-                                        size == 0 ? part.count() : decision.count(),
-                                        flags | group,
-                                        size == 0 ? 0 : position++,
-                                        size)
-                                .withTransaction(transactionId, preceding)
-                                .withVersion(localVersion)
-                                .withWorkUnitId(search.workUnitId));
+                Operation operation = IndexOperationTrace.search(search.event, part.table(), part.index(),
+                        part.range(), part.pinned(), readTimestamp,
+                        size == 0 ? part.count() : decision.count(), flags | group,
+                        size == 0 ? 0 : position++, size)
+                        .withTransaction(transactionId, preceding).withVersion(localVersion)
+                        .withWorkUnitId(search.workUnitId);
+                append(operation);
                 partSearches++;
             }
         }
@@ -1021,28 +990,25 @@ final class IndexTraceCompiler {
                             ? previous
                             : (maximumRowId = Math.incrementExact(maximumRowId));
             Output destination = writers.get(table);
-            if (keepRows && destination == null) {
+            if (destination == null) {
                 destination = open(table, tableId);
                 writers.put(table, destination);
             }
-            Group row = null;
-            if (keepRows) {
-                row = new SimpleGroupFactory(destination.schema).newGroup();
-                for (var field : destination.schema.getFields()) {
-                    String name = field.getName();
-                    if (name.startsWith("_sib_")) continue;
-                    JsonElement v = value.get(name);
-                    if (v == null || v.isJsonNull()) continue;
-                    switch (field.asPrimitiveType().getPrimitiveTypeName()) {
-                        case INT64 -> row.add(name, v.getAsLong());
-                        case DOUBLE -> row.add(name, (double) v.getAsFloat());
-                        default -> row.add(name, v.getAsString());
-                    }
+            Group row = new SimpleGroupFactory(destination.schema).newGroup();
+            for (var field : destination.schema.getFields()) {
+                String name = field.getName();
+                if (name.startsWith("_sib_")) continue;
+                JsonElement v = value.get(name);
+                if (v == null || v.isJsonNull()) continue;
+                switch (field.asPrimitiveType().getPrimitiveTypeName()) {
+                    case INT64 -> row.add(name, v.getAsLong());
+                    case DOUBLE -> row.add(name, (double) v.getAsFloat());
+                    default -> row.add(name, v.getAsString());
                 }
-                row.add("_sib_row_id", rowId);
-                row.add("_sib_timestamp", commitVersion);
-                row.add("_sib_mutation_ordinal", ordinal);
             }
+            row.add("_sib_row_id", rowId);
+            row.add("_sib_timestamp", commitVersion);
+            row.add("_sib_mutation_ordinal", ordinal);
             Operation primary =
                     IndexOperationTrace.write(
                                     item.event(),
@@ -1053,15 +1019,15 @@ final class IndexTraceCompiler {
                                             : IndexOperationTrace.BUSINESS_UPDATE,
                                     key,
                                     commitVersion,
-                                    keepRows ? destination.fileId : 0,
-                                    keepRows ? destination.rows++ : 0,
+                                    destination.fileId,
+                                    destination.rows++,
                                     rowId)
                             .withTransaction(transactionId, ordinal)
                             .withWorkUnitId(item.workUnitId());
             identities.put(tableId, key, rowId);
             IndexMutation.emit(primary, before, catalog.keys(table, value), this::append);
             // A file that reached its target size is closed; the table's next row opens another.
-            if (keepRows && destination.writer.write(row)) {
+            if (destination.writer.write(row)) {
                 writers.remove(table);
                 finish(table, destination);
             }
@@ -1101,8 +1067,6 @@ final class IndexTraceCompiler {
                     output.resolve(name),
                     schemas.get(table),
                     layout,
-                    table,
-                    catalog.primary(tableId).column(),
                     fileId);
         }
 
@@ -1122,7 +1086,7 @@ final class IndexTraceCompiler {
             file.put("rows", writer.rows);
             file.put("size_bytes", Files.size(writer.path));
             file.put("file_size", writer.writer.sizing());
-            file.put("sha256", BaselineGenerator.sha256(writer.path));
+            file.put("sha256", Digests.sha256(writer.path));
             file.put(
                     "row_groups", footer.getBlocks().stream().map(b -> b.getRowCount()).toList());
             files.add(file);

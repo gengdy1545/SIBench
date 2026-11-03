@@ -1,5 +1,6 @@
 package org.sibench.capture;
 
+
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexOperationTrace.Range;
 import org.sibench.state.ExternalSort;
@@ -26,14 +27,8 @@ import java.util.function.Supplier;
  * depend on where an entry happens to live.
  */
 public final class IndexReferenceReplay implements AutoCloseable {
-    /**
-     * The entry a lookup selected. {@code value} is the RowID, or the FileID of a Locator whose row
-     * position is {@code position}; both words are int64 and compared as a pair.
-     */
     public record LookupResult(IndexKey key, long commitVersion, long value, long position) {
-        public LookupResult(IndexKey key, long commitVersion, long value) {
-            this(key, commitVersion, value, 0);
-        }
+        public LookupResult(IndexKey key, long commitVersion, long value) { this(key, commitVersion, value, 0); }
     }
 
     /**
@@ -573,7 +568,6 @@ public final class IndexReferenceReplay implements AutoCloseable {
     private final Settings settings;
     private final Workspace workspace;
     private final Budget budget;
-    private final org.sibench.replay.QueryDigest.Sink queryResults;
     private final Map<Namespace, Store> stores = new LinkedHashMap<>();
     /** Where entries were last written, kept for the transaction being applied only. */
     private final Map<EntryId, WritePosition> writePositions = new HashMap<>();
@@ -591,18 +585,9 @@ public final class IndexReferenceReplay implements AutoCloseable {
     }
 
     public IndexReferenceReplay(boolean rowIds, boolean secondaryIndexes, Settings settings) {
-        this(rowIds, secondaryIndexes, settings, null);
-    }
-
-    public IndexReferenceReplay(
-            boolean rowIds,
-            boolean secondaryIndexes,
-            Settings settings,
-            org.sibench.replay.QueryDigest.Sink queryResults) {
         this.rowIds = rowIds;
         this.secondaryIndexes = secondaryIndexes;
         this.settings = settings;
-        this.queryResults = queryResults;
         this.workspace = new Workspace(settings);
         this.budget = new Budget(settings.baselineEntries());
         if (settings.directory() != null) org.sibench.capture.RunTiming.current().measure(settings.directory());
@@ -649,8 +634,6 @@ public final class IndexReferenceReplay implements AutoCloseable {
             for (LookupResult result : results) checked(operation, result);
             checkedResults += results.size();
             queries++;
-            if (queryResults != null)
-                queryResults.accept(List.of(operation), List.copyOf(results));
             if ((operation.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0) snapshotQueries++;
             return;
         }
@@ -1098,15 +1081,12 @@ public final class IndexReferenceReplay implements AutoCloseable {
             }
             if (intersect) combined.keySet().retainAll(keys);
         }
-        List<Operation> members = List.copyOf(groupMembers);
         groupMembers.clear();
         groupResults.clear();
         expect(operation, combined.size());
         for (LookupResult result : combined.values()) checked(operation, result);
         checkedResults += combined.size();
         queries++;
-        if (queryResults != null)
-            queryResults.accept(members, List.copyOf(combined.values()));
         if ((operation.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0) snapshotQueries++;
     }
 

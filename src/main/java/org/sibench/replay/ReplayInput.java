@@ -5,9 +5,8 @@ import com.google.gson.JsonParser;
 
 import org.sibench.capture.IndexCatalog;
 import org.sibench.capture.IndexOperationTrace;
-import org.sibench.capture.IndexReferenceReplay;
+
 import org.sibench.capture.RunTiming;
-import org.sibench.generation.BaselineGenerator;
 import org.sibench.trace.TraceManifest;
 
 import java.io.IOException;
@@ -19,9 +18,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** A single-pass correctness reference, not a timed network/backend benchmark. */
-public final class ReferenceReplay {
-    private ReferenceReplay() {}
+/** Verified Trace inputs shared by service execution and independent acceptance. */
+public final class ReplayInput {
+    private ReplayInput() {}
 
     /** Workload preflight plus a baseline source that verifies coverage while its caller loads it. */
     public record Input(IndexOperationTrace.Source baseline, IndexOperationTrace.Source workload,
@@ -256,7 +255,6 @@ public final class ReferenceReplay {
 
     static Map<String, Object> checkStream(
             IndexOperationTrace.Source source, ReplayConfig config, boolean runtime) throws IOException {
-        config.requireReferenceCapabilities();
         try (var projection = new ReplayProjection(config, runtime, operation -> {})) {
             RunTiming.current().phase(runtime ? "preflight-workload" : "preflight-baseline");
             long records = source.read(projection);
@@ -287,45 +285,7 @@ public final class ReferenceReplay {
         return report;
     }
 
-    public static Map<String, Object> run(Path directory, ReplayConfig config, Path report)
-            throws IOException {
-        return run(directory, config, List.of(false, true), report);
-    }
-
-    /** {@code rowIdModes}: the value modes to replay, as row-id flags, in report order. */
-    public static Map<String, Object> run(
-            Path directory, ReplayConfig config, List<Boolean> rowIdModes, Path report)
-            throws IOException {
-        return runDirectory(directory, config, rowIdModes, report, false);
-    }
-
-    /** Explicit matrix diagnostics also scan the complete final primary state. */
-    static Map<String, Object> audit(Path directory, ReplayConfig config, Path report)
-            throws IOException {
-        return runDirectory(directory, config, List.of(false, true), report, true);
-    }
-
-    private static Map<String, Object> runDirectory(
-            Path directory, ReplayConfig config, List<Boolean> rowIdModes, Path report,
-            boolean auditState) throws IOException {
-        if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
-        var manifest = TraceManifest.read(directory);
-        if (manifest.has("value_kind") && manifest.get("value_kind").getAsString().equals("row_id")
-                && rowIdModes.contains(false))
-            throw new IOException("Proto-only Trace stores RowIDs; Locator replay requires full output");
-        var input = prepare(directory, config);
-        return runChecked(
-                binding(directory, config),
-                input.baseline(),
-                input.workload(),
-                config,
-                rowIdModes,
-                input.preflight(),
-                report,
-                auditState);
-    }
-
-    /** Binds a digest stream to the trace and replay settings that produced it. */
+    /** Binds an index to its Trace and replay settings. */
     public static String binding(Path directory, ReplayConfig config) throws IOException {
         var manifest =
                 JsonParser.parseString(
@@ -339,108 +299,4 @@ public final class ReferenceReplay {
                 + config.secondaryIndexes();
     }
 
-    /** The per-query digest file recorded in a reference report, requiring the current digest metadata. */
-    public static Path queryDigestFile(Path report, String mode) throws IOException {
-        var document = JsonParser.parseString(Files.readString(report)).getAsJsonObject();
-        if (!document.has("results")) throw new IOException("Reference report has no query digests");
-        for (var item : document.getAsJsonArray("results")) {
-            var result = item.getAsJsonObject();
-            if (!result.get("mode").getAsString().equals(mode)) continue;
-            if (!result.has("query_digest_file") || !result.has("query_digest_sha256"))
-                throw new IOException("Reference report has no query digests for " + mode);
-            Path file = Path.of(result.get("query_digest_file").getAsString());
-            if (!Files.isRegularFile(file)
-                    || !BaselineGenerator.sha256(file)
-                            .equals(result.get("query_digest_sha256").getAsString()))
-                throw new IOException("Reference query digest file changed or is missing: " + file);
-            return file;
-        }
-        throw new IOException("Reference report has no " + mode + " result");
-    }
-
-    static Map<String, Object> runChecked(
-            String binding,
-            IndexOperationTrace.Source baseline,
-            IndexOperationTrace.Source workload,
-            ReplayConfig config,
-            List<Boolean> rowIdModes,
-            Map<String, Object> preflight,
-            Path report,
-            boolean auditState)
-            throws IOException {
-        if (rowIdModes.isEmpty()) throw new IOException("No value mode to replay");
-        RunTiming.current().measure(report.toAbsolutePath().getParent());
-        List<Map<String, Object>> results = new ArrayList<>();
-        for (boolean rowId : rowIdModes) {
-            String mode = rowId ? "rowid" : "locator";
-            Path digests =
-                    report.toAbsolutePath()
-                            .resolveSibling(report.getFileName() + "." + mode + ".queries");
-            try (var digest =
-                            new QueryDigest.File(
-                                    digests,
-                                    rowId,
-                                    binding == null ? null : binding + " mode=" + mode);
-                    var index =
-                            new IndexReferenceReplay(
-                                    rowId,
-                                    config.secondaryIndexes(),
-                                    IndexReferenceReplay.Settings.defaults(),
-                                    digest);
-                    var load = new ReplayProjection(config, false, index::accept);
-                    var runtime = new ReplayProjection(config, true, index::accept)) {
-                RunTiming.current().phase("load");
-                long start = System.nanoTime();
-                baseline.read(load);
-                load.finish();
-                double loadSeconds = (System.nanoTime() - start) / 1e9;
-                RunTiming.current().phase("runtime");
-                start = System.nanoTime();
-                workload.read(runtime);
-                runtime.finish();
-                digest.close();
-                double seconds = (System.nanoTime() - start) / 1e9;
-                Map<String, Object> result = new LinkedHashMap<>();
-                result.put("mode", mode);
-                result.put("baseline_operations", load.dispatched());
-                result.put("workload_operations", runtime.dispatched());
-                result.put("baseline_seconds", loadSeconds);
-                result.put("workload_seconds", seconds);
-                result.put("operations_per_second", runtime.dispatched() / seconds);
-                result.put("baseline_dispatch", load.describe());
-                result.put("workload_dispatch", runtime.describe());
-                result.put("queries", index.queries());
-                result.put("checked_result_items", index.checkedResults());
-                result.put("relocation_writes", index.relocationWrites());
-                if (auditState) result.put("primary_state_checksum", index.stateChecksum());
-                result.put("selected_version_checksum", index.selectedVersionChecksum());
-                result.put("snapshot_queries", index.snapshotQueries());
-                result.put("retained_index_versions", index.retainedVersions());
-                result.put("skipped_entry_histories", index.skippedHistories());
-                result.put("read_model", "statement_snapshot_plus_transaction_local_prefix");
-                result.put("query_digests", digest.count());
-                result.put("query_digest_file", digests.toString());
-                result.put("query_digest_sha256", digest.sha256());
-                results.add(result);
-            }
-        }
-        Map<String, Object> output = new LinkedHashMap<>();
-        output.put("status", "passed");
-        output.put("preflight", preflight);
-        output.put("results", results);
-        output.put(
-                "scope",
-                "single-sender multi-client in-process correctness reference; clients share"
-                    + " reference service state; not a network or cross-client visibility"
-                    + " implementation; committed-source version history and timestamp lookup,"
-                    + " ordered point/range/limited scans, pinned entries and intersection/union"
-                    + " search groups over order-preserving keys of the complete declared source"
-                    + " indexes; no RPC, persistence, concurrent PG"
-                    + " MVCC, physical GC, rate scheduling or sustained-duration proof");
-        Files.writeString(
-                report,
-                new GsonBuilder().setPrettyPrinting().create().toJson(output),
-                StandardOpenOption.CREATE_NEW);
-        return output;
-    }
 }

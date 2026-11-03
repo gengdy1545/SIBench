@@ -16,7 +16,8 @@ public class CaptureTransactionsTest {
 
     private static void append(CaptureTransactions.Chunk chunk, int pid, String value) throws IOException {
         String line = "{\"event\":\"sample\",\"pid\":" + pid + ",\"value\":\"" + value + "\"}";
-        chunk.append(line, Event.parse(line));
+        chunk.append(line, com.google.gson.JsonParser.parseString(line).getAsJsonObject(),
+                (line + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
     }
 
     @Test public void waitsForMissingEarlierCompletionAndEmitsWriterBeforeReader() throws Exception {
@@ -99,6 +100,32 @@ public class CaptureTransactionsTest {
             Files.write(file, bytes);
             first.read(event -> assertEquals("earlier".repeat(50_000), event.get("value").getAsString()));
             assertThrows(IOException.class, () -> chunk.read(event -> {}));
+        }
+    }
+
+    @Test public void spillTransitionPreservesNestedFactsAndUtf8Accounting() throws Exception {
+        String first = "{\"event\":\"row_change\",\"pid\":1,\"new\":{\"key\":\"α🙂\",\"n\":9223372036854775807,\"value\":null}}";
+        String large = "{\"event\":\"row_change\",\"pid\":1,\"new\":{\"value\":\"" + "x".repeat(300_000) + "\"}}";
+        String last = "{\"event\":\"scan_rescan\",\"pid\":1,\"keys\":[{\"value\":\"\\\"\\nα🙂\"}],\"found\":false}";
+        var lines = java.util.List.of(first, large, last);
+        long expectedBytes = 0;
+        try (var source = new CaptureTransactions(temporary.getRoot().toPath().resolve("transition"), 1 << 20, 1)) {
+            var chunk = source.begin(1);
+            for (String line : lines) {
+                int bytes = (line + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+                chunk.append(line, com.google.gson.JsonParser.parseString(line).getAsJsonObject(), bytes);
+                expectedBytes += bytes;
+                assertEquals(expectedBytes, source.metrics().get("pending_encoded_bytes"));
+            }
+            assertEquals(0L, source.metrics().get("pending_memory_encoded_bytes"));
+            source.complete(chunk, 1, true, true);
+            source.finish();
+            int[] seen = {0};
+            try (var next = source.next(() -> { throw new AssertionError("Source already ended"); })) {
+                next.read(event -> assertEquals(com.google.gson.JsonParser.parseString(lines.get(seen[0]++)), event.json()));
+            }
+            assertEquals(3, seen[0]);
+            assertEquals(0L, source.metrics().get("pending_encoded_bytes"));
         }
     }
 

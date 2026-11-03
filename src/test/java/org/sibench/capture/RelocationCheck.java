@@ -1,5 +1,8 @@
 package org.sibench.capture;
 
+import org.sibench.config.Digests;
+
+import org.sibench.replay.ReplayInput;
 import com.google.gson.*;
 
 import org.apache.parquet.example.data.Group;
@@ -24,11 +27,10 @@ public final class RelocationCheck {
 
     /** {@code layout} sets the Parquet layout of the retained-row files. */
     public static void validate(GenerationConfig layout, Path input, Path output) throws Exception {
-        ReferenceReplay.check(input, ReplayConfig.defaults());
+        ReplayInput.check(input, ReplayConfig.defaults());
         JsonObject manifest =
                 JsonParser.parseString(Files.readString(input.resolve("manifest.json")))
                         .getAsJsonObject();
-        if (ProtoTrace.indexOnly(manifest)) throw new java.io.IOException("Data-file relocation requires full output");
         IndexCatalog catalog = IndexCatalog.fromManifest(manifest);
         Map<Key, Operation> latest = new LinkedHashMap<>();
         long[] maximumFile = {0};
@@ -43,7 +45,7 @@ public final class RelocationCheck {
         for (var item : manifest.getAsJsonArray("incremental_files")) {
             JsonObject file = item.getAsJsonObject();
             Path path = input.resolve(file.get("path").getAsString());
-            if (!BaselineGenerator.sha256(path).equals(file.get("sha256").getAsString()))
+            if (!Digests.sha256(path).equals(file.get("sha256").getAsString()))
                 throw new java.io.IOException("Incremental checksum mismatch");
             int table = catalog.tableId(file.get("table").getAsString());
             long fileId = file.get("file_id").getAsLong(), position = 0;
@@ -92,13 +94,7 @@ public final class RelocationCheck {
                 try (var writer =
                         new ParquetDataFile(
                                 path,
-                                new TableData(
-                                        table,
-                                        tableRows.getValue().size(),
-                                        0,
-                                        catalog.primary(tableRows.getKey()).column(),
-                                        schema,
-                                        null),
+                                schema,
                                 layout,
                                 Map.of("sibench.control", "forced-layout-only"))) {
                     for (var rowEntry : tableRows.getValue().entrySet()) {
@@ -145,7 +141,7 @@ public final class RelocationCheck {
                                 "path",
                                 path.getFileName().toString(),
                                 "sha256",
-                                BaselineGenerator.sha256(path)));
+                                Digests.sha256(path)));
             }
         }
         var results = new ArrayList<Map<String, Object>>();

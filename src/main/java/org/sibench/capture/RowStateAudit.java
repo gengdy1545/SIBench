@@ -5,7 +5,7 @@ import com.google.gson.*;
 import org.apache.parquet.example.data.Group;
 import org.apache.parquet.hadoop.ParquetReader;
 import org.apache.parquet.hadoop.example.GroupReadSupport;
-import org.sibench.generation.BaselineGenerator;
+import org.sibench.config.Digests;
 import org.sibench.schema.SourceSchema;
 import org.sibench.state.ExternalSort;
 import org.sibench.trace.IndexKey;
@@ -105,11 +105,11 @@ public final class RowStateAudit {
             throws Exception {
         if (Files.exists(report)) return reuse(schema, baseline, raw, report);
         long inputStarted = System.nanoTime();
-        CaptureRun.verifyInput(resolveRaw(raw));
+        CaptureRun.verifyInput(raw);
         BaselineManifest.verifyFiles(baseline);
         if (!connection.getAutoCommit())
             throw new IOException("Row audit requires a fresh autocommit connection");
-        Map<String, String> inputs = inputHashes(raw, false);
+        Map<String, String> inputs = inputHashes(raw);
         RunTiming.current().note("audit_input_millis", (System.nanoTime() - inputStarted) / 1_000_000L);
         var tables = new LinkedHashMap<String, SourceSchema.Table>();
         var tableOrder = new HashMap<String, Integer>();
@@ -212,7 +212,7 @@ public final class RowStateAudit {
                     throw error;
                 }
             }
-            if (!inputs.equals(inputHashes(raw, true)))
+            if (!inputs.equals(inputHashes(raw)))
                 throw new IOException("Source changed during row audit");
             var result = new LinkedHashMap<String, Object>();
             result.put("schema_version", 1);
@@ -223,7 +223,7 @@ public final class RowStateAudit {
             result.put("source_inputs_sha256", inputs);
             result.put(
                     "baseline_manifest_sha256",
-                    BaselineGenerator.sha256(baseline.resolve("baseline-manifest.json")));
+                    Digests.sha256(baseline.resolve("baseline-manifest.json")));
             result.put("changes_sha256", HexFormat.of().formatHex(changesDigest.digest()));
             result.put("commits", commits);
             result.put("aborts", aborts);
@@ -679,15 +679,15 @@ public final class RowStateAudit {
             SourceSchema schema, Path baseline, Path raw, Path report) throws Exception {
         if (!Files.exists(report))
             throw new IOException(
-                    "Source row audit required before compilation/maintenance: " + report);
+                    "Source row audit report missing: " + report);
         JsonObject value = JsonParser.parseString(Files.readString(report)).getAsJsonObject();
         if (!value.get("status").getAsString().equals("passed_source_row_state")
                 || value.get("schema_version").getAsInt() != 1
                 || !schema.benchmark().equals(value.get("benchmark").getAsString())
                 || !JSON.toJsonTree(schema.tables()).equals(value.get("source_schema"))
                 || !JSON.toJsonTree(schema.fingerprints()).equals(value.get("source_schema_sha256"))
-                || !JSON.toJsonTree(inputHashes(raw, false)).equals(value.get("source_inputs_sha256"))
-                || !BaselineGenerator.sha256(baseline.resolve("baseline-manifest.json"))
+                || !JSON.toJsonTree(inputHashes(raw)).equals(value.get("source_inputs_sha256"))
+                || !Digests.sha256(baseline.resolve("baseline-manifest.json"))
                         .equals(value.get("baseline_manifest_sha256").getAsString()))
             throw new IOException("Row audit does not match source/baseline/schema");
         BaselineManifest.verifyFiles(baseline);
@@ -699,51 +699,32 @@ public final class RowStateAudit {
         return result;
     }
 
-    static Path resolveRaw(Path raw) throws IOException {
-        if (!Files.isDirectory(raw)) return raw;
-        JsonObject run =
-                JsonParser.parseString(Files.readString(raw.resolve("capture-run.json")))
-                        .getAsJsonObject();
-        return run.has("sessions") ? raw : raw.resolve(run.get("pg_file").getAsString());
-    }
-
     private static List<Path> sourceFiles(Path raw) throws IOException {
         Path directory = Files.isDirectory(raw) ? raw : raw.toAbsolutePath().getParent();
         Path manifest = directory.resolve("capture-run.json");
-        if (Files.exists(manifest)) {
-            JsonObject run = JsonParser.parseString(Files.readString(manifest)).getAsJsonObject();
-            if (run.has("sessions")) {
-                var files = new ArrayList<Path>();
-                for (var session : run.getAsJsonArray("sessions"))
-                    files.add(
-                            directory.resolve(
-                                    session.getAsJsonObject().get("pg_file").getAsString()));
-                return files;
-            }
-            return List.of(directory.resolve(run.get("pg_file").getAsString()));
-        }
-        return List.of(raw);
+        JsonObject run = JsonParser.parseString(Files.readString(manifest)).getAsJsonObject();
+        if (!run.has("sessions") || !run.has("session_order"))
+            throw new IOException("Capture manifest lacks its sessions; recapture");
+        var files = new ArrayList<Path>();
+        for (var session : run.getAsJsonArray("sessions"))
+            files.add(directory.resolve(session.getAsJsonObject().get("pg_file").getAsString()));
+        return files;
     }
 
-    /** {@code fresh} reads every file again instead of trusting this process's earlier digests. */
-    private static Map<String, String> inputHashes(Path raw, boolean fresh) throws IOException {
+    private static Map<String, String> inputHashes(Path raw) throws IOException {
         Path directory = Files.isDirectory(raw) ? raw : raw.toAbsolutePath().getParent();
         var hashes = new TreeMap<String, String>();
         Path manifest = directory.resolve("capture-run.json");
         if (Files.exists(manifest))
-            hashes.put("capture-run.json", digest(manifest, fresh));
+            hashes.put("capture-run.json", Digests.sha256(manifest));
         for (Path source : sourceFiles(raw))
-            hashes.put(source.getFileName().toString(), digest(source, fresh));
+            hashes.put(source.getFileName().toString(), Digests.sha256(source));
         try (var paths = Files.list(directory)) {
             for (Path path :
                     paths.filter(p -> p.getFileName().toString().startsWith("jdbc-")).toList())
-                hashes.put(path.getFileName().toString(), digest(path, fresh));
+                hashes.put(path.getFileName().toString(), Digests.sha256(path));
         }
         return hashes;
-    }
-
-    private static String digest(Path file, boolean fresh) throws IOException {
-        return fresh ? BaselineGenerator.sha256(file) : FileDigests.sha256(file);
     }
 
     private static ParquetReader<Group> reader(Path path) throws IOException {

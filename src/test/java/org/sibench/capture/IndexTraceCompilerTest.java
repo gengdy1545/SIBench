@@ -1,5 +1,8 @@
 package org.sibench.capture;
 
+import org.sibench.config.Digests;
+
+import org.sibench.replay.ReplayInput;
 import static org.junit.Assert.*;
 
 import com.google.gson.*;
@@ -20,95 +23,45 @@ import java.util.*;
 public class IndexTraceCompilerTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
-    /** Reuse the hand-built rows, then remove their Parquet so the proto compiler cannot depend on it. */
-    private void indexOnlyBaseline(CaptureConfig config) throws Exception {
-        Path directory = config.layout().output();
-        var source = SourceSchema.hybench(config.source());
-        var catalog = IndexCatalog.fromSchema(source);
-        var files = new ArrayList<Map<String, Object>>();
-        long rowId = 1;
-        int tableIndex = 0;
-        for (var table : source.tables()) {
-            Path parquet = directory.resolve(table.name() + ".parquet");
-            try (var reader = org.apache.parquet.hadoop.ParquetReader.<org.apache.parquet.example.data.Group>builder(
-                    new org.apache.parquet.hadoop.example.GroupReadSupport(),
-                    new org.apache.hadoop.fs.Path(parquet.toUri())).build()) {
-                var row = reader.read();
-                var full = new PgBaselineExport.Table(table, catalog.primary(tableIndex + 1).column(), true,
-                        new org.apache.parquet.schema.MessageType(table.name(), row.getType().getFields()), 1, true, List.of());
-                var projected = PgBaselineExport.indexColumns(full, catalog);
-                var text = new String[projected.schema().getFieldCount() - 2];
-                for (int i = 0; i < text.length; i++) {
-                    String column = projected.schema().getFieldName(i);
-                    text[i] = row.getFieldRepetitionCount(column) == 0 ? null
-                            : row.getValueToString(row.getType().getFieldIndex(column), 0);
-                }
-                boolean[] read = {false};
-                for (var written : PgBaselineExport.writeIndexTable(projected, tableIndex, rowId,
-                        () -> { if (read[0]) return null; read[0] = true; return text; },
-                        directory, config.layout(), catalog)) files.add(written.file());
-            }
-            Files.delete(parquet);
-            rowId++;
-            tableIndex++;
-        }
-        Files.write(directory.resolve("files.jsonl"), files.stream().map(new Gson()::toJson).toList());
-        Files.delete(directory.resolve(BaselineManifest.FILE));
-        var counts = new LinkedHashMap<String, Long>();
-        source.tables().forEach(t -> counts.put(t.name(), 1L));
-        BaselineManifest.publish(source, directory, counts, TraceOutput.PROTO);
-    }
-
     @Test
-    public void protoCompilesAndReplaysGroupsWithoutParquetOrDetailedOperations() throws Exception {
+    public void protoRetainsPhysicalRowsAndReplaysBothValueModesWithoutDetailedOperations() throws Exception {
         Path fixture = temporary.newFolder().toPath();
         var config = baseline(fixture);
         Path raw = nonPrefixCapture(fixture, config, "1");
-        indexOnlyBaseline(config);
         Path output = fixture.resolve("proto");
         var manifest = CaptureFixtureCompiler.compile(SourceSchema.hybench(config.source()), config.layout(), raw,
                 output, new IndexTraceCompiler.Checks(null, null), TraceOutput.PROTO);
         assertEquals("proto", manifest.get("output"));
-        assertFalse(Files.exists(output.resolve("baseline.pb.zst")));
+        assertTrue(Files.exists(output.resolve("baseline.pb.zst")));
         var inventory = new Gson().toJsonTree(manifest).getAsJsonObject().getAsJsonObject("proto_files")
                 .getAsJsonArray("baseline");
-        assertEquals(8, inventory.size());
-        for (var item : inventory) {
-            Path retained = output.resolve(item.getAsJsonObject().get("path").getAsString());
-            assertTrue(Files.isSameFile(config.layout().output().resolve(retained.getFileName()), retained));
-        }
+        assertEquals(1, inventory.size());
         assertStoredPayloadsReachDispatch(output);
-        assertEquals(List.of(), manifest.get("incremental_files"));
+        assertFalse(((List<?>) manifest.get("incremental_files")).isEmpty());
         assertFalse(Files.exists(output.resolve("workload.ops")));
-        assertFalse(manifest.containsKey("baseline_directory"));
+        assertEquals(config.layout().output().toAbsolutePath().toString(), manifest.get("baseline_directory"));
         try (var files = Files.list(output)) {
-            assertFalse(files.anyMatch(p -> p.toString().endsWith(".parquet")));
+            assertTrue(files.anyMatch(p -> p.toString().endsWith(".parquet")));
         }
-        Files.move(config.layout().output(), fixture.resolve("export-not-needed"));
-        assertEquals("trace_integrity_and_supply_valid", ReferenceReplay.check(output, ReplayConfig.defaults()).get("status"));
+        assertEquals("trace_integrity_and_supply_valid", ReplayInput.check(output, ReplayConfig.defaults()).get("status"));
         Path reference = fixture.resolve("reference.json");
-        var replay = ReferenceReplay.run(output, ReplayConfig.defaults(), List.of(true), reference);
+        var replay = ReferenceReplay.run(output, ReplayConfig.defaults(), List.of(true, false), reference);
         assertEquals("passed", replay.get("status"));
         for (var result : (List<?>) replay.get("results"))
             assertFalse(((Map<?, ?>) result).containsKey("primary_state_checksum"));
         Path index = fixture.resolve("index");
         var service = new org.sibench.adapters.ServiceConfig("rocksdb", null, index, 0,
                 org.sibench.adapters.proto.ValueKind.ROW_ID, null, false);
-        assertEquals("passed", org.sibench.adapters.ServiceReplay.run(output, ReplayConfig.defaults(), service,
-                reference, fixture.resolve("service.json")).get("status"));
-        assertEquals("passed", org.sibench.adapters.ServiceReplay.verify(output, ReplayConfig.defaults(), service,
-                reference, fixture.resolve("reopen.json")).get("status"));
-        var failure = assertThrows(java.io.IOException.class, () -> SnapshotLookupValidation.run(output,
-                ReplayConfig.defaults(), List.of(true), fixture.resolve("oracle.json")));
-        assertTrue(failure.getMessage().contains("requires full"));
-        assertThrows(java.io.IOException.class, () -> ReferenceReplay.run(output, ReplayConfig.defaults(),
-                List.of(false), fixture.resolve("locator.json")));
+        assertEquals("passed", org.sibench.adapters.ServiceReplay.run(output, ReplayConfig.defaults(), service, fixture.resolve("service.json")).get("status"));
+        assertEquals("passed", org.sibench.adapters.ServiceReplay.verify(output, ReplayConfig.defaults(), service, fixture.resolve("reopen.json")).get("status"));
+        assertEquals("passed", SnapshotLookupValidation.run(output, ReplayConfig.defaults(),
+                List.of(true, false), fixture.resolve("oracle.json")).get("status"));
         Path analysis = fixture.resolve("locality-proto");
         org.sibench.analysis.UpdateLocality.run(output, Path.of("config/sibench.yaml"), analysis);
         assertTrue(Files.exists(analysis.resolve("summary.json")));
         byte[] bytes = Files.readAllBytes(output.resolve("workload.pb.zst"));
         Files.write(output.resolve("workload.pb.zst"), Arrays.copyOf(bytes, bytes.length - 1));
-        assertThrows(java.io.IOException.class, () -> ReferenceReplay.check(output, ReplayConfig.defaults()));
+        assertThrows(java.io.IOException.class, () -> ReplayInput.check(output, ReplayConfig.defaults()));
     }
 
     @Test
@@ -119,7 +72,6 @@ public class IndexTraceCompilerTest {
         Path raw = capture(fixture, List.of(change("update", first, second) + search("self", 1)
                 + change("delete", second, "null") + change("insert", "null", second) + search("reinsert", 1)
                 + "{\"event\":\"transaction_commit\",\"xid\":9}\n"));
-        indexOnlyBaseline(config);
         Path output = fixture.resolve("proto");
         var manifest = CaptureFixtureCompiler.compile(SourceSchema.hybench(config.source()), config.layout(), raw,
                 output, new IndexTraceCompiler.Checks(null, null), TraceOutput.PROTO);
@@ -133,22 +85,28 @@ public class IndexTraceCompilerTest {
     }
 
     @Test
-    public void protoReferenceRejectsWrongNativePinnedResult() throws Exception {
+    public void bothOutputsKeepSourceCountsAndReplayRejectsMissingPinnedRows() throws Exception {
         Path fixture = temporary.newFolder().toPath();
         var config = baseline(fixture);
         Path raw = nonPrefixCapture(fixture, config, "2");
-        indexOnlyBaseline(config);
-        Path output = fixture.resolve("proto");
-        CaptureFixtureCompiler.compile(SourceSchema.hybench(config.source()), config.layout(), raw,
-                output, new IndexTraceCompiler.Checks(null, null), TraceOutput.PROTO);
-        var failure = assertThrows(java.io.IOException.class, () -> ReferenceReplay.run(output,
-                ReplayConfig.defaults(), List.of(true), fixture.resolve("reference.json")));
-        assertTrue(failure.getMessage(), failure.getMessage().contains("Search count mismatch"));
+        for (var strategy : TraceOutput.values()) {
+            Path output = fixture.resolve(strategy.setting());
+            CaptureFixtureCompiler.compile(SourceSchema.hybench(config.source()), config.layout(), raw,
+                    output, new IndexTraceCompiler.Checks(null, null), strategy);
+            var service = new org.sibench.adapters.ServiceConfig("rocksdb", null,
+                    fixture.resolve(strategy.setting() + "-index"), 0,
+                    org.sibench.adapters.proto.ValueKind.ROW_ID, null, false);
+            var failure = assertThrows(java.io.IOException.class, () -> org.sibench.adapters.ServiceReplay.run(
+                    output, ReplayConfig.defaults(), service, fixture.resolve(strategy.setting() + "-service.json")));
+            Throwable cause = failure;
+            while (cause.getCause() != null) cause = cause.getCause();
+            assertTrue(cause.getMessage(), cause.getMessage().contains("Search count mismatch"));
+        }
     }
 
     /** Covers the inventory reader, coverage tee, transaction buffer and dispatcher together. */
     private static void assertStoredPayloadsReachDispatch(Path output) throws Exception {
-        var input = ReferenceReplay.prepare(output, ReplayConfig.defaults());
+        var input = ReplayInput.prepare(output, ReplayConfig.defaults());
         var packets = Collections.newSetFromMap(new IdentityHashMap<org.sibench.adapters.proto.Request, Boolean>());
         long[] sent = {0};
         ReplayTarget.Factory factory = client -> new ReplayTarget() {
@@ -197,7 +155,6 @@ public class IndexTraceCompilerTest {
     private void generatesDirect(boolean full) throws Exception {
         Path fixture = temporary.newFolder().toPath();
         var config = baseline(fixture);
-        if (!full) indexOnlyBaseline(config);
         var captureOptions = org.sibench.config.ConfigValues.object(config.layout().document(), "capture");
         captureOptions.put("output", full ? "full" : "proto");
         config.layout().document().put("capture", captureOptions);
@@ -240,7 +197,6 @@ public class IndexTraceCompilerTest {
     public void missingSourceEndMarkerPreventsTracePublication() throws Exception {
         Path fixture = temporary.newFolder().toPath();
         var config = baseline(fixture);
-        indexOnlyBaseline(config);
         var options = org.sibench.config.ConfigValues.object(config.layout().document(), "capture");
         options.put("output", "proto");
         config.layout().document().put("capture", options);
@@ -342,7 +298,6 @@ public class IndexTraceCompilerTest {
                         c.root(),
                         c.document(),
                         c.benchmark(),
-                        c.seed(),
                         targetBytes < 0 ? c.targetBytes() : targetBytes,
                         c.maxOvershootPercent(),
                         maxRows < 0 ? c.maxRows() : maxRows,
@@ -352,8 +307,6 @@ public class IndexTraceCompilerTest {
                         c.dictionary(),
                         c.codec(),
                         c.codecLevel(),
-                        c.buckets(),
-                        c.baselineTimestamp(),
                         baseline,
                         1);
         var files = new ArrayList<Map<String, Object>>();
@@ -398,7 +351,7 @@ public class IndexTraceCompilerTest {
             try (var writer =
                     new ParquetDataFile(
                             file,
-                            new TableData(table.getKey(), 1, id, table.getValue(), schema, null),
+                            schema,
                             layout,
                             Map.of())) {
                 writer.write(row);
@@ -419,7 +372,7 @@ public class IndexTraceCompilerTest {
                             "path",
                             file.getFileName().toString(),
                             "sha256",
-                            BaselineGenerator.sha256(file)));
+                            Digests.sha256(file)));
         }
         Files.write(
                 baseline.resolve("files.jsonl"), files.stream().map(new Gson()::toJson).toList());
@@ -429,7 +382,7 @@ public class IndexTraceCompilerTest {
         var source = SourceSchema.hybench(original.source());
         var expected = new LinkedHashMap<String, Long>();
         for (var table : source.tables()) expected.put(table.name(), 1L);
-        BaselineManifest.publish(source, baseline, expected, TraceOutput.FULL);
+        BaselineManifest.publish(source, baseline, expected);
         return new CaptureConfig(
                 root,
                 original.source(),
@@ -464,6 +417,8 @@ public class IndexTraceCompilerTest {
             client.add(
                     new Gson()
                             .toJson(Map.of("event", "request_return", "application", application)));
+            client.add(new Gson().toJson(Map.of("event", "request_end", "application", application,
+                    "consumed_rows", 0, "exhausted", false)));
             server.add(
                     new Gson()
                             .toJson(
@@ -521,9 +476,7 @@ public class IndexTraceCompilerTest {
                                             "processed",
                                             0,
                                             "returned",
-                                            0,
-                                            "row_hashes",
-                                            List.of())));
+                                            0)));
             server.add(
                     new Gson()
                             .toJson(
@@ -691,7 +644,7 @@ public class IndexTraceCompilerTest {
                                         "req", ordinal,
                                         "depth", 1,
                                         "processed", 0,
-                                        "returned", 0, "row_hashes", List.of())));
+                                        "returned", 0)));
         result.add(
                 new Gson()
                         .toJson(
@@ -846,20 +799,20 @@ public class IndexTraceCompilerTest {
                 "passed",
                 ReferenceReplay.run(
                                 output,
-                                new ReplayConfig(true, "none", 0, 0, 0, 0, "operation"),
+                                new ReplayConfig(true, 0, 0, 0, 0, "operation"),
                                 fixture.resolve("replay.json"))
                         .get("status"));
         assertEquals(
                 "passed",
                 SnapshotLookupValidation.run(
                                 output,
-                                new ReplayConfig(true, "none", 0, 0, 0, 0, "operation"),
+                                new ReplayConfig(true, 0, 0, 0, 0, "operation"),
                                 fixture.resolve("snapshots.json"))
                         .get("status"));
     }
 
     @Test
-    public void replayMatrixRetainsStateAuditAndOrdinaryReplayKeepsQueryDigests() throws Exception {
+    public void replayMatrixRetainsExplicitStateAudit() throws Exception {
         Path fixture = temporary.newFolder().toPath();
         CaptureConfig config = baseline(fixture);
         String first = row("2024-01-01 00:00:00"), second = row("2024-01-02 00:00:00");
@@ -883,8 +836,6 @@ public class IndexTraceCompilerTest {
         for (int i = 0; i < ordinary.size(); i++) {
             assertFalse(ordinary.get(i).getAsJsonObject().has("primary_state_checksum"));
             assertTrue(audited.get(i).getAsJsonObject().has("primary_state_checksum"));
-            assertEquals(ordinary.get(i).getAsJsonObject().get("query_digest_sha256"),
-                    audited.get(i).getAsJsonObject().get("query_digest_sha256"));
         }
     }
 
@@ -945,7 +896,6 @@ public class IndexTraceCompilerTest {
                 case "scan_rescan" -> counts.put(event.get("scan").getAsString(), new long[5]);
                 case "executor_run_end" -> {
                     event.addProperty("returned", 0);
-                    event.add("row_hashes", new com.google.gson.JsonArray());
                     result.add(event.toString());
                     continue;
                 }
@@ -978,7 +928,7 @@ public class IndexTraceCompilerTest {
             Path output = fixture.resolve("compiled");
             compile(config, raw, output);
             manifests.add(JsonParser.parseString(Files.readString(output.resolve("manifest.json"))).getAsJsonObject());
-            assertEquals("passed", ReferenceReplay.run(output, new ReplayConfig(true, "none", 0, 0, 0, 0, "operation"),
+            assertEquals("passed", ReferenceReplay.run(output, new ReplayConfig(true, 0, 0, 0, 0, "operation"),
                     fixture.resolve("replay.json")).get("status"));
         }
         for (String key : List.of("committed_transactions", "search_operations", "snapshot_searches", "workload_operations"))
@@ -1125,18 +1075,16 @@ public class IndexTraceCompilerTest {
                         output,
                         ReplayConfig.defaults(),
                         service,
-                        fixture.resolve("snapshots.json"),
                         fixture.resolve("service.json"));
         assertEquals("passed", served.get("status"));
         var servedResult = (Map<?, ?>) served.get("result");
-        assertEquals(1L, ((Number) servedResult.get("per_query_digest_checks")).longValue());
-        assertEquals("reference_report", servedResult.get("expected_results_source"));
-        var referenceRowId = com.google.gson.JsonParser.parseString(
-                        Files.readString(fixture.resolve("replay.json")))
-                .getAsJsonObject().getAsJsonArray("results").get(1).getAsJsonObject();
-        assertEquals("rowid", referenceRowId.get("mode").getAsString());
-        assertEquals(referenceRowId.get("query_digest_sha256").getAsString(),
-                servedResult.get("expected_results_sha256"));
+        assertEquals(1L, ((Number) servedResult.get("queries")).longValue());
+        assertFalse(servedResult.containsKey("expected_results_source"));
+        var traceManifest = JsonParser.parseString(Files.readString(output.resolve("manifest.json"))).getAsJsonObject();
+        assertFalse(traceManifest.has("native_answers"));
+        try (var paths = Files.list(output)) {
+            assertFalse(paths.anyMatch(p -> p.getFileName().toString().endsWith(".queries")));
+        }
         // Reopened, the index has nothing to check here: the trace's one search is
         // transaction-local and its answer is gone once the transaction's later writes landed.
         var reopened =
@@ -1154,10 +1102,9 @@ public class IndexTraceCompilerTest {
                                         output,
                                         ReplayConfig.defaults(),
                                         reopened,
-                                        fixture.resolve("replay.json"),
                                         fixture.resolve("verify.json"))
                                 .get("result");
-        assertEquals(0L, ((Number) verified.get("per_query_digest_checks")).longValue());
+        assertEquals(0L, ((Number) verified.get("queries")).longValue());
         assertEquals(1L, ((Number) verified.get("unchecked_transaction_local_queries")).longValue());
         // A locator-only reference replay reports that mode alone.
         var locatorOnly =
@@ -1225,7 +1172,7 @@ public class IndexTraceCompilerTest {
         assertEquals(
                 "passed",
                 org.sibench.adapters.ServiceReplay.run(
-                                output, ReplayConfig.defaults(), service, reference, fixture.resolve("verify-load.json"))
+                                output, ReplayConfig.defaults(), service, fixture.resolve("verify-load.json"))
                         .get("status"));
         Path baseline = Path.of(JsonParser.parseString(Files.readString(output.resolve("manifest.json")))
                 .getAsJsonObject().get("baseline_directory").getAsString());
@@ -1234,7 +1181,7 @@ public class IndexTraceCompilerTest {
         Map<?, ?> verified;
         try {
             verified = (Map<?, ?>) org.sibench.adapters.ServiceReplay.verify(
-                    output, ReplayConfig.defaults(), service, reference, fixture.resolve("verify.json")).get("result");
+                    output, ReplayConfig.defaults(), service, fixture.resolve("verify.json")).get("result");
         } finally {
             Files.move(held, baseline);
         }
@@ -1265,12 +1212,10 @@ public class IndexTraceCompilerTest {
                                         output,
                                         ReplayConfig.defaults(),
                                         publishedInProcess(fixture.resolve("verify-foreign-index")),
-                                        reference,
                                         fixture.resolve("verify-foreign.json")));
         assertTrue(mismatch.getMessage(), mismatch.getMessage().contains("Index holds another-trace"));
-        long checked = ((Number) verified.get("per_query_digest_checks")).longValue();
+        long checked = ((Number) verified.get("queries")).longValue();
         assertTrue(checked > 0);
-        assertEquals(0L, ((Number) verified.get("per_query_digest_mismatches")).longValue());
         assertTrue(((Number) verified.get("checked_result_items")).longValue() > 0);
         long watermark = ((Number) verified.get("published_version")).longValue();
         assertTrue(watermark > 0);
@@ -1288,7 +1233,6 @@ public class IndexTraceCompilerTest {
                                         output,
                                         ReplayConfig.defaults(),
                                         publishedInProcess(fixture.resolve("verify-empty-index")),
-                                        reference,
                                         fixture.resolve("verify-empty.json")));
         var message = new StringBuilder();
         for (Throwable cause = wrong; cause != null; cause = cause.getCause())
@@ -1344,7 +1288,7 @@ public class IndexTraceCompilerTest {
             names.add((String) file.get("path"));
             assertTrue(Files.exists(output.resolve((String) file.get("path"))));
             assertEquals(
-                    BaselineGenerator.sha256(output.resolve((String) file.get("path"))),
+                    Digests.sha256(output.resolve((String) file.get("path"))),
                     file.get("sha256"));
         }
         assertEquals(6000L, rows.stream().mapToLong(Long::longValue).sum());
@@ -1358,11 +1302,7 @@ public class IndexTraceCompilerTest {
             if (i + 1 < files.size()) assertTrue(bytes >= 65536);
         }
         for (boolean secondary : new boolean[] {true, false}) {
-            var replay = new ReplayConfig(secondary, "none", 0, 0, 0, 0, "operation");
-            assertEquals(
-                    "passed",
-                    ReferenceReplay.run(output, replay, fixture.resolve("replay-" + secondary + ".json"))
-                            .get("status"));
+            var replay = new ReplayConfig(secondary, 0, 0, 0, 0, "operation");
             assertEquals(
                     "passed",
                     SnapshotLookupValidation.run(
@@ -1461,10 +1401,10 @@ public class IndexTraceCompilerTest {
         Path output = fixture.resolve("compiled"), repeat = fixture.resolve("repeat");
         audit(config, raw, second);
         Path sourceAudit = RowStateAudit.defaultReport(raw);
-        String auditHash = BaselineGenerator.sha256(sourceAudit);
+        String auditHash = Digests.sha256(sourceAudit);
         compile(config, raw, output);
         // Compilation reuses the audit report and never rewrites it.
-        assertEquals(auditHash, BaselineGenerator.sha256(sourceAudit));
+        assertEquals(auditHash, Digests.sha256(sourceAudit));
         compile(config, raw, repeat);
         var manifest =
                 JsonParser.parseString(Files.readString(output.resolve("manifest.json")))
@@ -1481,9 +1421,16 @@ public class IndexTraceCompilerTest {
                         -1,
                         Files.mismatch(file, repeat.resolve(file.getFileName())));
         }
-        for (boolean secondary : new boolean[] {true, false})
+        for (boolean secondary : new boolean[] {true, false}) {
+            assertEquals(
+                    "passed",
+                    SnapshotLookupValidation.run(
+                                    output,
+                                    new ReplayConfig(secondary, 0, 0, 0, 0),
+                                    fixture.resolve("snapshots-" + secondary + ".json"))
+                            .get("status"));
             for (String mode : List.of("operation", "transaction")) {
-                var replay = new ReplayConfig(secondary, "none", 0, 0, 0, 0, mode);
+                var replay = new ReplayConfig(secondary, 0, 0, 0, 0, mode);
                 assertEquals(
                         "passed",
                         ReferenceReplay.run(
@@ -1491,14 +1438,6 @@ public class IndexTraceCompilerTest {
                                         replay,
                                         fixture.resolve(
                                                 "replay-" + secondary + "-" + mode + ".json"))
-                                .get("status"));
-                assertEquals(
-                        "passed",
-                        SnapshotLookupValidation.run(
-                                        output,
-                                        replay,
-                                        fixture.resolve(
-                                                "snapshots-" + secondary + "-" + mode + ".json"))
                                 .get("status"));
                 for (boolean rowIds : new boolean[] {true, false}) {
                     var model = new IndexReferenceReplay(rowIds, secondary);
@@ -1528,6 +1467,7 @@ public class IndexTraceCompilerTest {
                     }
                 }
             }
+        }
         RelocationCheck.validate(config.layout(), output, fixture.resolve("relocated"));
         var relocated =
                 JsonParser.parseString(Files.readString(fixture.resolve("relocated/report.json")))
@@ -1550,7 +1490,7 @@ public class IndexTraceCompilerTest {
         var outside =
                 assertThrows(
                         java.io.IOException.class,
-                        () -> ReferenceReplay.check(output, ReplayConfig.defaults()));
+                        () -> ReplayInput.check(output, ReplayConfig.defaults()));
         assertEquals("Declared index catalog differs from pinned source schema", outside.getMessage());
         Files.writeString(output.resolve("manifest.json"), new Gson().toJson(manifest));
         // A maintenance unit missing one secondary entry, with matching digest and count, must be
@@ -1582,7 +1522,7 @@ public class IndexTraceCompilerTest {
         var partial =
                 assertThrows(
                         java.io.IOException.class,
-                        () -> ReferenceReplay.check(output, ReplayConfig.defaults()));
+                        () -> ReplayInput.check(output, ReplayConfig.defaults()));
         assertTrue(
                 partial.getMessage(),
                 partial.getMessage().matches(
@@ -1757,14 +1697,14 @@ public class IndexTraceCompilerTest {
         compile(config, nonPrefixCapture(fixture, config, "1"), output);
         Path baseline = output.resolve("baseline.pb.zst"), hidden = fixture.resolve("baseline-held");
         Files.move(baseline, hidden);
-        ReferenceReplay.Input input;
+        ReplayInput.Input input;
         try {
-            input = ReferenceReplay.prepare(output, ReplayConfig.defaults());
+            input = ReplayInput.prepare(output, ReplayConfig.defaults());
             assertEquals("workload_integrity_and_supply_valid", input.preflight().get("status"));
             assertFalse(input.preflight().containsKey("baseline"));
             assertThrows(java.io.IOException.class, () -> input.baseline().read(ignored -> {}));
             var shortInput = assertThrows(java.io.IOException.class,
-                    () -> ReferenceReplay.prepare(output, new ReplayConfig(true, "none", 1, 1_000_000, 0, 0)));
+                    () -> ReplayInput.prepare(output, new ReplayConfig(true, 1, 1_000_000, 0, 0)));
             assertTrue(shortInput.getMessage(), shortInput.getMessage().contains("Insufficient single-pass"));
         } finally {
             Files.move(hidden, baseline);
@@ -1800,7 +1740,7 @@ public class IndexTraceCompilerTest {
                 else manifest.add(name, com.google.gson.JsonParser.parseString(invalid));
                 Files.writeString(path, manifest.toString());
                 var failure = assertThrows(java.io.IOException.class,
-                        () -> ReferenceReplay.prepare(output, ReplayConfig.defaults()));
+                        () -> ReplayInput.prepare(output, ReplayConfig.defaults()));
                 assertTrue(failure.getMessage(), failure.getMessage().contains(name));
                 Path analysis = fixture.resolve("locality-invalid-" + analysisCase++);
                 var analysisFailure = assertThrows(java.io.IOException.class,
@@ -1811,7 +1751,7 @@ public class IndexTraceCompilerTest {
         }
         Files.writeString(path, original);
         assertEquals("trace_integrity_and_supply_valid",
-                ReferenceReplay.check(output, ReplayConfig.defaults()).get("status"));
+                ReplayInput.check(output, ReplayConfig.defaults()).get("status"));
         Path analysis = fixture.resolve("locality-valid");
         org.sibench.analysis.UpdateLocality.run(output, Path.of("config/sibench.yaml"), analysis);
         assertEquals("complete_for_declared_layout",
@@ -1862,26 +1802,9 @@ public class IndexTraceCompilerTest {
                         "passed",
                         ReferenceReplay.run(
                                         output,
-                                        new ReplayConfig(secondary, "none", 0, 0, 0, 0, mode),
+                                        new ReplayConfig(secondary, 0, 0, 0, 0, mode),
                                         fixture.resolve("replay-" + secondary + "-" + mode + ".json"))
                                 .get("status"));
-    }
-
-    /** A pinned search names one entry; a row the scan never returned is a replay failure. */
-    @Test
-    public void aPinnedSearchForARowThatDoesNotExistFailsReplay() throws Exception {
-        Path fixture = temporary.newFolder().toPath();
-        var config = baseline(fixture);
-        Path raw = nonPrefixCapture(fixture, config, "2");
-        Path output = fixture.resolve("compiled");
-        compile(config, raw, output);
-        var failure =
-                assertThrows(
-                        java.io.IOException.class,
-                        () ->
-                                ReferenceReplay.run(
-                                        output, ReplayConfig.defaults(), fixture.resolve("replay.json")));
-        assertTrue(failure.getMessage(), failure.getMessage().contains("Search count mismatch"));
     }
 
     @Test
@@ -1967,7 +1890,7 @@ public class IndexTraceCompilerTest {
                                 java.io.IOException.class,
                                 () -> compile(config, raw, output))
                         .getMessage()
-                        .contains("row audit required"));
+                        .contains("row audit report missing"));
         assertFalse(Files.exists(output));
 
         for (String boundary : List.of("transaction_commit", "transaction_abort")) {
@@ -2065,7 +1988,7 @@ public class IndexTraceCompilerTest {
                     JsonParser.parseString(new GsonBuilder().serializeNulls().create().toJson(standalone)),
                     json(output.resolve("access-ledger.json")));
             assertEquals(
-                    BaselineGenerator.sha256(output.resolve("access-ledger.json")),
+                    Digests.sha256(output.resolve("access-ledger.json")),
                     manifest.get("access_ledger_sha256").getAsString());
             // The identity binds ordered protobuf shards and logical operation counts.
             assertEquals(
@@ -2085,7 +2008,7 @@ public class IndexTraceCompilerTest {
             undeclared.remove("output");
             Files.writeString(output.resolve("manifest.json"), undeclared.toString());
             var strategy = assertThrows(java.io.IOException.class,
-                    () -> ReferenceReplay.check(output, ReplayConfig.defaults()));
+                    () -> ReplayInput.check(output, ReplayConfig.defaults()));
             assertTrue(strategy.getMessage().contains("output strategy"));
             Files.writeString(output.resolve("manifest.json"), manifest.toString());
             assertEquals("runtime", manifest.getAsJsonObject("verification").get("mode").getAsString());

@@ -54,7 +54,7 @@ class IndexRunSummaryTest(unittest.TestCase):
             phase = {**dict.fromkeys(("operations", "seconds", "operations_per_second", "request_bytes",
                 "result_bytes", "flush_seconds", "published_version"), 0), "dispatch": dispatch}
             path.write_text(json.dumps({"status": "passed", "result": {
-                "per_query_digest_checks": 0, "per_query_digest_mismatches": 0, "search_requests": 0,
+                "search_requests": 0,
                 "service": "test", "baseline": phase, "workload": phase, "queries": 0,
                 "checked_result_items": 0}}))
             log.write_text('prefix EVENT_LOG_v1 {"event":"compaction_finished","job":1,'
@@ -64,20 +64,19 @@ class IndexRunSummaryTest(unittest.TestCase):
             self.assertEqual("unverified", result["engine"]["same_run_provenance"])
             self.assertEqual("passed", result["correctness_status"])
 
-    def test_deliberately_wrong_result_and_partial_run_are_rejected(self):
+    def test_incomplete_responses_and_failed_run_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "service.json"
             path.write_text(json.dumps({"status": "failed"}))
             with self.assertRaisesRegex(ValueError, "failed or incomplete"):
                 summary.summarize(path, [])
-            path.write_text(json.dumps({"status": "passed", "result": {
-                "per_query_digest_mismatches": 1, "per_query_digest_checks": 2, "search_requests": 2}}))
-            with self.assertRaisesRegex(ValueError, "mismatched"):
-                summary.summarize(path, [])
-            path.write_text(json.dumps({"status": "passed", "result": {
-                "per_query_digest_mismatches": 0, "per_query_digest_checks": 1, "search_requests": 2}}))
-            with self.assertRaisesRegex(ValueError, "incomplete"):
-                summary.summarize(path, [])
+            for pending, completed in ((1, 1), (0, 1)):
+                path.write_text(json.dumps({"status": "passed", "result": {
+                    "baseline": {"dispatch": {"pending_responses": pending,
+                        "completed_responses": completed, "target_calls": 2}}}}))
+                with self.assertRaisesRegex(ValueError, "responses are incomplete"):
+                    summary.summarize(path, [])
+
 
 
 if __name__ == "__main__":

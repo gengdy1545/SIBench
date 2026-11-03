@@ -10,7 +10,7 @@ import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.TestOps;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexReferenceReplay;
-import org.sibench.generation.BaselineGenerator;
+import org.sibench.config.Digests;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -66,7 +66,7 @@ public class VersionedLookupTest {
                 var model = new IndexReferenceReplay(rowIds, false);
                 var replay =
                         new ReplayProjection(
-                                new ReplayConfig(false, "none", 0, 0, 0, 0, dispatchMode),
+                                new ReplayConfig(false, 0, 0, 0, 0, dispatchMode),
                                 true,
                                 model::accept);
                 model.accept(TestOps.op(0, 1, 3, 0, 0, 2, 0, 3, 0, 52, 0, 0, 0));
@@ -158,7 +158,7 @@ public class VersionedLookupTest {
             assertEquals(
                     List.of(TestOps.key(2)),
                     model.lookupSecondary(5, 1, TestOps.key(10), 130).stream()
-                            .map(IndexReferenceReplay.LookupResult::key)
+                            .map(org.sibench.capture.IndexReferenceReplay.LookupResult::key)
                             .toList());
             replay.accept(snapshot(5, 1, 10, 105, 2));
             replay.accept(snapshot(5, 2, 20, 0, 1));
@@ -204,12 +204,12 @@ public class VersionedLookupTest {
                         snapshot(5, 1, 10, -1, 0))) {
             var rejected =
                     new ReplayProjection(
-                            new ReplayConfig(false, "none", 0, 0, 0, 0), true, o -> {});
+                            new ReplayConfig(false, 0, 0, 0, 0), true, o -> {});
             commit(rejected, 100);
             assertThrows(IOException.class, () -> rejected.accept(invalid));
         }
         var replay =
-                new ReplayProjection(new ReplayConfig(false, "none", 0, 0, 0, 0), true, o -> {});
+                new ReplayProjection(new ReplayConfig(false, 0, 0, 0, 0), true, o -> {});
         commit(replay, 100);
         replay.accept(snapshot(5, 1, 10, 99, 0));
         replay.accept(IndexOperationTrace.search(0, 3, 0, Range.equal(IndexKey.ofInt(1)), 100, 0, 0));
@@ -252,7 +252,7 @@ public class VersionedLookupTest {
                             ReferenceReplayFixture.run(
                                     baseline,
                                     workload,
-                                    new ReplayConfig(secondary, "none", 0, 0, 0, 0, dispatchMode),
+                                    new ReplayConfig(secondary, 0, 0, 0, 0, dispatchMode),
                                     directory.resolve(
                                             "report-" + secondary + "-" + dispatchMode + ".json"));
                     var modes = (List<?>) result.get("results");
@@ -262,8 +262,6 @@ public class VersionedLookupTest {
                         assertEquals(secondary ? 9L : 3L, report.get("retained_index_versions"));
                         if (previous != null) {
                             var before = (Map<?, ?>) previous.get(mode);
-                            assertEquals(
-                                    before.get("query_digest_sha256"), report.get("query_digest_sha256"));
                             assertEquals(
                                     before.get("selected_version_checksum"),
                                     report.get("selected_version_checksum"));

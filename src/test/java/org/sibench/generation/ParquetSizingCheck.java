@@ -1,5 +1,7 @@
 package org.sibench.generation;
 
+import org.sibench.config.Digests;
+
 import com.google.gson.GsonBuilder;
 import java.nio.file.*;
 import java.util.*;
@@ -17,11 +19,10 @@ public final class ParquetSizingCheck {
         Path output = Files.createDirectory(Path.of(args[0]));
         long target = Long.parseLong(args[1]);
         int rows = 100000, width = 8192;
-        var config = new GenerationConfig(Path.of(""), Map.of(), "ycsb", 71, target, 5,
+        var config = new GenerationConfig(Path.of(""), Map.of(), "ycsb", target, 5,
                 1048576, 67108864, 1048576, 1048576, true,
-                CompressionCodecName.ZSTD, 3, 1, 0, output, 21474836480L);
+                CompressionCodecName.ZSTD, 3, output, 21474836480L);
         var schema = MessageTypeParser.parseMessageType("message t { required int64 id; required binary payload; }");
-        var table = new TableData("t", rows, 1, "id", schema, null);
         var factory = new SimpleGroupFactory(schema);
         var random = new Random(71);
         var files = new ArrayList<Map<String, Object>>();
@@ -31,7 +32,7 @@ public final class ParquetSizingCheck {
             if (Files.getFileStore(output).getUsableSpace() < config.minFreeBytes()) throw new IllegalStateException("Disk reserve");
             Path file = output.resolve(files.size() + ".parquet");
             int first = next;
-            try (var writer = new ParquetDataFile(file, table, config, Map.of("seed", "71"))) {
+            try (var writer = new ParquetDataFile(file, schema, config, Map.of("seed", "71"))) {
                 while (next < rows) {
                     byte[] payload = new byte[width];
                     random.nextBytes(payload);
@@ -44,7 +45,7 @@ public final class ParquetSizingCheck {
                 if (Files.size(file) > target * 105 / 100) throw new AssertionError("overshoot");
                 if (next < rows && Files.size(file) < target) throw new AssertionError("premature tail");
                 files.add(Map.of("path", file.getFileName().toString(), "first_row", first,
-                        "rows", next - first, "size", writer.sizing(), "sha256", BaselineGenerator.sha256(file)));
+                        "rows", next - first, "size", writer.sizing(), "sha256", Digests.sha256(file)));
             }
         }
         double generateSeconds = (System.nanoTime() - started) / 1e9;

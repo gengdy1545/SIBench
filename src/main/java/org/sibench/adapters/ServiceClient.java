@@ -68,7 +68,7 @@ abstract class ServiceClient implements ReplayTarget {
                             Throwable failure = error;
                             if (failure == null) {
                                 try {
-                                    requests.checkBatch(result);
+                                    requests.checkBatch(result, request.getId());
                                 } catch (IOException mismatch) {
                                     failure = mismatch;
                                 }
@@ -88,7 +88,7 @@ abstract class ServiceClient implements ReplayTarget {
                 answer.thenApply(
                         result -> {
                             try {
-                                requests.checkCommit(result);
+                                requests.checkCommit(result, dispatchSequence);
                                 return null;
                             } catch (IOException mismatch) {
                                 throw new java.util.concurrent.CompletionException(mismatch);

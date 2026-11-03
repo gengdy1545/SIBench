@@ -13,9 +13,9 @@ final class ReferenceReplayFixture {
     private ReferenceReplayFixture() {}
 
     static Map<String, Object> check(Path baseline, Path workload, ReplayConfig config) throws IOException {
-        var report = ReferenceReplay.report(config,
-                ReferenceReplay.checkStream(reader(baseline), config, false),
-                ReferenceReplay.checkStream(reader(workload), config, true));
+        var report = ReplayInput.report(config,
+                ReplayInput.checkStream(reader(baseline), config, false),
+                ReplayInput.checkStream(reader(workload), config, true));
         report.put("validation_scope", "hand-built operation streams; no Trace-directory certification");
         return report;
     }
@@ -23,7 +23,7 @@ final class ReferenceReplayFixture {
     static Map<String, Object> run(Path baseline, Path workload, ReplayConfig config, Path report)
             throws IOException {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
-        return ReferenceReplay.runChecked(null, reader(baseline), reader(workload), config,
+        return ReferenceReplay.runChecked(reader(baseline), reader(workload), config,
                 List.of(false, true), check(baseline, workload, config), report, true);
     }
 

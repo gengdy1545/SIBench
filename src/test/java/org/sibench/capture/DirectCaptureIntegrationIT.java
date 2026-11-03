@@ -18,8 +18,8 @@ public class DirectCaptureIntegrationIT {
         Path root = Path.of("").toAbsolutePath();
         Path runRoot = Path.of(Objects.requireNonNull(System.getenv("SIBENCH_DIRECT_RUN")));
         String admin = Objects.requireNonNull(System.getenv("SIBENCH_DIRECT_PG_JDBC"));
-        for (String benchmark : List.of("sysbench", "ycsb")) {
-            Path artifacts = Files.createDirectory(runRoot.resolve(benchmark));
+        for (var output : TraceOutput.values()) for (String benchmark : List.of("sysbench", "ycsb")) {
+            Path artifacts = Files.createDirectory(runRoot.resolve(benchmark + "-" + output.setting()));
             Files.createDirectory(artifacts.resolve("native"));
             var runtime = org.sibench.config.SibenchConfig.read(root.resolve("config/sibench.yaml"));
             var generation = ConfigValues.object(runtime, "generation");
@@ -35,13 +35,13 @@ public class DirectCaptureIntegrationIT {
             else { nativeSettings.put("recordcount", 3); nativeSettings.put("insertcount", 3); }
             document.put("native", nativeSettings);
             var pg = ConfigValues.object(document, "postgres");
-            String database = "direct_probe_" + benchmark;
+            String database = "direct_probe_" + benchmark + "_" + output.setting();
             pg.put("database", database);
             pg.put("port", Integer.parseInt(admin.substring(admin.lastIndexOf(':') + 1, admin.lastIndexOf('/'))));
             document.put("postgres", pg);
             document.put("artifacts", Map.of("directory", root.relativize(artifacts).toString()));
             var capture = ConfigValues.object(document, "capture");
-            capture.put("output", "proto");
+            capture.put("output", output.setting());
             capture.put("raw_directory", root.relativize(artifacts.resolve("source")).toString());
             document.put("capture", capture);
             Path config = artifacts.resolve("native/benchmark.yaml");
@@ -67,6 +67,14 @@ public class DirectCaptureIntegrationIT {
                 }
             }
             NativeLoad.captureReady(jdbc, "postgres", NativeLoad.library(root), profile.schema());
+            try (var connection = DriverManager.getConnection(jdbc, "postgres", "");
+                    var sql = connection.createStatement();
+                    var rows = sql.executeQuery("SELECT reltuples, relallvisible FROM pg_class WHERE oid='"
+                            + table + "'::regclass")) {
+                assertTrue(rows.next());
+                assertEquals("Preparation must collect statistics for the three inserted rows", 3, rows.getLong(1));
+                assertEquals("Preparation must not vacuum the fresh table's visibility map", 0, rows.getLong(2));
+            }
             PgBaselineExport.export(jdbc, profile.baseline(), profile.layout());
             CaptureCompleteness.snapshot(jdbc, "postgres", artifacts.resolve("index-counters-before.json"), config.toString());
             try (var direct = DirectCapture.begin(profile, jdbc, "postgres");
@@ -98,24 +106,36 @@ public class DirectCaptureIntegrationIT {
                 assertEquals("consistent", direct.finish().get("capture_completeness"));
             }
             assertFalse(Files.exists(artifacts.resolve("transactions")));
-            try (var files = Files.list(profile.raw())) { assertFalse(files.anyMatch(p -> p.toString().endsWith(".jsonl.zst"))); }
+            try (var files = Files.list(profile.raw())) {
+                assertEquals(output == TraceOutput.FULL, files.anyMatch(p -> p.toString().endsWith(".jsonl.zst")));
+            }
+            if (output == TraceOutput.FULL) {
+                try (var files = Files.list(profile.raw())) {
+                    for (Path file : files.filter(p -> p.toString().endsWith(".jsonl.zst")).toList()) {
+                        for (String line : RowAuditTestSupport.readTrace(file)) {
+                            var fact = com.google.gson.JsonParser.parseString(line).getAsJsonObject();
+                            assertFalse(fact.has("row_hashes") || fact.has("row_hash"));
+                            assertFalse(Set.of("result_row", "consumed_row").contains(fact.get("event").getAsString()));
+                        }
+                    }
+                }
+            }
             var manifest = org.sibench.trace.TraceManifest.read(artifacts.resolve("trace"));
+            assertFalse(manifest.has("native_answers"));
             var operations = new ArrayList<IndexOperationTrace.Operation>();
             ProtoTrace.source(artifacts.resolve("trace"), manifest, "workload").read(operations::add);
             assertTrue(operations.stream().anyMatch(op -> op.kind() == IndexOperationTrace.SEARCH && op.readTimestamp() == 0));
             assertTrue(operations.stream().anyMatch(op -> op.kind() == IndexOperationTrace.UPSERT && op.rowId() == 4));
-            Path reference = artifacts.resolve("reference.json");
-            assertEquals("passed", ReferenceReplay.run(artifacts.resolve("trace"), ReplayConfig.defaults(), List.of(true), reference).get("status"));
             var service = new org.sibench.adapters.ServiceConfig("rocksdb", null, artifacts.resolve("index"), 0,
                     org.sibench.adapters.proto.ValueKind.ROW_ID, null, false);
-            assertEquals("passed", org.sibench.adapters.ServiceReplay.run(artifacts.resolve("trace"), ReplayConfig.defaults(), service,
-                    reference, artifacts.resolve("service.json")).get("status"));
+            assertEquals("passed", org.sibench.adapters.ServiceReplay.run(artifacts.resolve("trace"), ReplayConfig.defaults(), service, artifacts.resolve("service.json")).get("status"));
             Files.writeString(artifacts.resolve("probe.json"), new GsonBuilder().setPrettyPrinting().create().toJson(
                     Map.of("status", "passed", "scope", "controlled native-PG source facts, not a benchmark performance run", "baseline_rows", 3)));
         }
-        verifyNativeWatermark(admin.substring(0, admin.lastIndexOf('/') + 1) + "direct_probe_sysbench", runRoot);
-        verifyImplicitRollbackAtClose(admin.substring(0, admin.lastIndexOf('/') + 1) + "direct_probe_sysbench", runRoot);
-        verifyDisconnectedReceiver(admin.substring(0, admin.lastIndexOf('/') + 1) + "direct_probe_sysbench", runRoot);
+        String sysbench = admin.substring(0, admin.lastIndexOf('/') + 1) + "direct_probe_sysbench_proto";
+        verifyNativeWatermark(sysbench, runRoot);
+        verifyImplicitRollbackAtClose(sysbench, runRoot);
+        verifyDisconnectedReceiver(sysbench, runRoot);
     }
 
     /** A delayed receiver must hold back the source position without gating each commit. */

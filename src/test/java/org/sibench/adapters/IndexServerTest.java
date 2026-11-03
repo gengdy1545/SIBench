@@ -287,22 +287,6 @@ public class IndexServerTest {
             var received = new TraceRequests(ValueKind.ROW_ID).receive(operation, searchId);
             for (Response chunk : partial) received.add(chunk);
             received.finish(response);
-            // The incremental digest of the chunks equals the reference replay's digest of the rows.
-            var lookups = new java.util.ArrayList<org.sibench.capture.IndexReferenceReplay.LookupResult>();
-            for (int id = 1; id <= rows; id++)
-                lookups.add(new org.sibench.capture.IndexReferenceReplay.LookupResult(IndexKey.ofInt(id), 0, id));
-            var digest = new org.sibench.replay.QueryDigest.Incremental(java.util.List.of(operation), rows, true);
-            for (Response chunk : partial) chunk.getResultsList().forEach(digest::add);
-            response.getResultsList().forEach(digest::add);
-            assertEquals(org.sibench.replay.QueryDigest.of(java.util.List.of(operation), lookups, true), digest.hex());
-
-            // A changed result, a lost chunk and a chunk of another request are all refused.
-            var tampered = partial.get(0).toBuilder();
-            tampered.setResults(7, tampered.getResults(7).toBuilder().setValue(Value.newBuilder().setRowId(-1)));
-            var changed = new org.sibench.replay.QueryDigest.Incremental(java.util.List.of(operation), rows, true);
-            tampered.build().getResultsList().forEach(changed::add);
-            response.getResultsList().forEach(changed::add);
-            assertNotEquals(digest.hex(), changed.hex());
             var lost = new TraceRequests(ValueKind.ROW_ID).receive(operation, searchId);
             assertThrows(java.io.IOException.class, () -> lost.finish(response));
             var foreign = new TraceRequests(ValueKind.ROW_ID).receive(operation, searchId + 1);

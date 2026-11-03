@@ -30,8 +30,8 @@ public final class NativeBuildCheck {
                     if (SOURCE_SUFFIXES.stream().noneMatch(name::endsWith)) continue;
                     Path copy = build.resolve(pinned.relativize(file));
                     if (!Files.isRegularFile(copy)
-                            || !FileDigests.read(copy).equals(patched.getOrDefault(
-                                    pinned.relativize(file).toString(), FileDigests.read(file))))
+                            || !FileDigests.sha256(copy).equals(patched.getOrDefault(
+                                    pinned.relativize(file).toString(), FileDigests.sha256(file))))
                         throw new IOException(
                                 "Build copy differs from the pinned source: " + pinned.relativize(file));
                     checked++;
@@ -83,7 +83,7 @@ public final class NativeBuildCheck {
                 throw new IOException("Native stop patch check interrupted", interrupted);
             } finally { if (process.isAlive()) process.destroyForcibly(); }
             var hashes = new java.util.HashMap<String, String>();
-            for (String name : names) hashes.put(name, FileDigests.read(expected.resolve(name)));
+            for (String name : names) hashes.put(name, FileDigests.sha256(expected.resolve(name)));
             return hashes;
         } finally {
             try (var files = Files.walk(expected)) {

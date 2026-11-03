@@ -4,7 +4,7 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParser;
 
 import org.postgresql.PGConnection;
-import org.sibench.generation.BaselineGenerator;
+import org.sibench.config.Digests;
 
 import java.io.IOException;
 import java.io.Reader;
@@ -73,7 +73,7 @@ final class HybenchNativeLoad {
         } else report.put("generated", false);
         var files = new LinkedHashMap<String, Object>();
         try (var list = Files.list(data)) {
-            for (Path file : list.sorted().toList()) files.put(file.getFileName().toString(), BaselineGenerator.sha256(file));
+            for (Path file : list.sorted().toList()) files.put(file.getFileName().toString(), Digests.sha256(file));
         }
         report.put("data_sha256", files);
         try (Connection admin = DriverManager.getConnection(config.adminJdbc(), config.user(), password);
@@ -113,39 +113,38 @@ final class HybenchNativeLoad {
         report.put("total_rows", counts.values().stream().mapToLong(Long::longValue).sum());
         Files.writeString(manifest, new GsonBuilder().setPrettyPrinting().create().toJson(report), StandardOpenOption.CREATE_NEW);
         requireRuntimeInputs(data, manifest);
-        dropLoadInputs(data);
+        dropLoadInputs(data, config.source().resolve("conf/load_data_pg.sql"));
         System.out.println("HyBench " + sf + " loaded database " + config.database() + ": " + report.get("total_rows") + " rows");
     }
 
     /**
-     * The client's runtime inputs exist in the work directory's {@code Data_<sf>} and, when the
-     * load has a manifest, are the very files generated with that load.
+     * The client's runtime inputs are the files bound by this load's manifest.
      */
     static void requireRuntimeInputs(Path data, Path manifest) throws Exception {
-        var recorded = Files.exists(manifest)
-                ? JsonParser.parseString(Files.readString(manifest)).getAsJsonObject().getAsJsonObject("data_sha256")
-                : null;
+        var recorded = JsonParser.parseString(Files.readString(manifest))
+                .getAsJsonObject().getAsJsonObject("data_sha256");
         for (String name : RUNTIME_INPUTS) {
             Path file = data.resolve(name);
             if (!Files.isRegularFile(file))
                 throw new IllegalStateException(
                         "HyBench runtime input missing: " + file + "; the work directory must hold the Data_ directory"
                                 + " its database was generated with");
-            if (recorded == null) continue;
-            if (!recorded.has(name) || !BaselineGenerator.sha256(file).equals(recorded.get(name).getAsString()))
+            if (!recorded.has(name) || !Digests.sha256(file).equals(recorded.get(name).getAsString()))
                 throw new IllegalStateException("HyBench runtime input differs from the load manifest: " + file);
         }
     }
 
     /** Deletes the loaded CSV files of {@code Data_<sf>}, keeping the client's runtime inputs. */
-    static void dropLoadInputs(Path data) throws IOException {
+    static void dropLoadInputs(Path data, Path loadScript) throws IOException {
         long freed = 0;
-        try (var list = Files.list(data)) {
-            for (Path file : list.sorted().toList()) {
-                if (RUNTIME_INPUTS.contains(file.getFileName().toString()) || !Files.isRegularFile(file)) continue;
-                freed += Files.size(file);
-                Files.delete(file);
-            }
+        for (String line : Files.readAllLines(loadScript)) {
+            if (line.isBlank()) continue;
+            String[] loaded = copyStatement(line);
+            if (loaded == null) throw new IOException("Unexpected upstream load statement: " + line);
+            Path file = data.resolve(loaded[1]);
+            if (!Files.isRegularFile(file)) continue;
+            freed += Files.size(file);
+            Files.delete(file);
         }
         if (freed > 0) System.out.println("Deleted loaded CSV files of " + data + ": " + freed / (1 << 20) + " MiB");
     }

@@ -89,7 +89,7 @@ public class PgSchemaIntegrationIT {
             configuredEnvironment(hybench, hyConfig);
             captureAndCliBoundaries(hybench, hyConfig);
 
-            var ycConfig = SourceSchemaTest.config("src/test/resources/config/ycsb_1b.yaml");
+            var ycConfig = SourceSchemaTest.config("src/test/resources/config/ycsb_1k.yaml");
             ycsbFixture(ycsb, ycConfig);
             verified("ycsb-ten-text-fields", ycsb, SourceSchema.read(root, ycConfig));
             rejected(
@@ -105,7 +105,7 @@ public class PgSchemaIntegrationIT {
             ycsbFixture(ycsb, ycConfig);
             verified("ycsb-configured-three-fields", ycsb, SourceSchema.read(root, ycConfig));
 
-            var sbConfig = SourceSchemaTest.config("src/test/resources/config/sysbench_1b.yaml");
+            var sbConfig = SourceSchemaTest.config("src/test/resources/config/sysbench_2k.yaml");
             sysbenchFixture(sysbench, sbConfig);
             verified("sysbench-hundred-tables-serial", sysbench, SourceSchema.read(root, sbConfig));
             rejected(

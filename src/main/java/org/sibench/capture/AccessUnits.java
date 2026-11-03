@@ -330,8 +330,6 @@ final class AccessUnits {
         long pendingProbes;
         Detail detail;
         boolean seenEvent;
-        /** Result rows per executor depth since that depth's last return, checked in ROWS. */
-        final Map<Integer, Long> resultRows = new HashMap<>();
     }
 
     /** Events a summary capture records only in aggregate. */
@@ -343,8 +341,7 @@ final class AccessUnits {
                     "bitmap_candidate",
                     "bitmap_end",
                     "bitmap_heap_candidate",
-                    "bitmap_heap_lossy",
-                    "result_row");
+                    "bitmap_heap_lossy");
 
     private final Listener listener;
     private Session session;
@@ -426,14 +423,6 @@ final class AccessUnits {
             }
             case "transaction_abort" -> {
                 abandonFailedScans();
-                // A failed statement's rows never reach a return.
-                state.resultRows.clear();
-            }
-            case "result_row" -> {
-                if (state.current == null) throw new IOException("Result row without a started request");
-                if (state.detail == Detail.ROWS) state.resultRows.merge(depth, 1L, Long::sum);
-                else if (depth <= 1) state.current.returned++;
-                else nestedRows++;
             }
             case "row_change" -> {
                 if (state.current != null) state.current.rowChanges++;
@@ -696,7 +685,6 @@ final class AccessUnits {
                 }
             }
             case "vm_visible" -> {
-                // An all-visible index-only row is returned without reading the heap: no identity.
                 unit.vmVisible++;
                 unit.identityMissing = true;
             }
@@ -950,19 +938,11 @@ final class AccessUnits {
             differences.add(field + " " + e.get(field) + " != " + value);
     }
 
-    /**
-     * The rows one execution returned, from its return. A ROWS capture also has them one by one,
-     * and their number must match.
-     */
+    /** Count returned rows; access detail never contains query-result values. */
     private void returned(Event e, int depth) throws IOException {
-        if (!e.has("returned")) throw new IOException("Executor return without its result rows");
+        if (!e.has("returned") || e.get("returned").getAsLong() < 0)
+            throw new IOException("Executor return without a nonnegative result count");
         long returned = e.get("returned").getAsLong();
-        if (session.detail == Detail.ROWS) {
-            Long rows = session.resultRows.remove(depth);
-            if ((rows == null ? 0 : rows) != returned)
-                throw new IOException(
-                        "Result row count differs from executor return: " + rows + " != " + returned);
-        }
         if (depth <= 1) session.current.returned += returned;
         else nestedRows += returned;
     }

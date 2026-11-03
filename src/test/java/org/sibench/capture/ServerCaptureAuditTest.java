@@ -24,9 +24,7 @@ public class ServerCaptureAuditTest {
     private static List<String> statement(long req, String sql, long rows, long processed) {
         var lines = new ArrayList<String>();
         lines.add(event("executor_start", req, 1, "\"sql\":\"" + sql + "\""));
-        for (long i = 0; i < rows; i++) lines.add(event("result_row", req, 1, "\"values\":[\"x\"]"));
-        lines.add(event("executor_run_end", req, 1, "\"processed\":" + processed + ",\"returned\":" + rows + ",\"row_hashes\":["
-                + String.join(",", java.util.Collections.nCopies((int) rows, "\"0000000000000000\"")) + "]"));
+        lines.add(event("executor_run_end", req, 1, "\"processed\":" + processed + ",\"returned\":" + rows));
         lines.add(event("executor_end", req, 1, "\"processed\":" + processed));
         return lines;
     }
@@ -44,6 +42,20 @@ public class ServerCaptureAuditTest {
             }
         }
         return file;
+    }
+
+    @Test
+    public void multipleExecutorReturnsSumPerCallProcessedCounts() throws Exception {
+        var lines = new ArrayList<String>();
+        lines.add(event("executor_start", 1, 1, "\"sql\":\"SELECT c FROM t\""));
+        // PostgreSQL resets es_processed on each ExecutorRun; a cursor can run twice.
+        lines.add(event("executor_run_end", 1, 1, "\"processed\":2,\"returned\":2"));
+        lines.add(event("executor_run_end", 1, 1, "\"processed\":1,\"returned\":1"));
+        lines.add(event("executor_end", 1, 1, "\"processed\":1"));
+        lines.add(event("transaction_commit", 1, 0, null));
+        assertEquals(3L, ServerCaptureAudit.audit(writeBody(lines)).get("result_rows"));
+        lines.set(2, event("executor_run_end", 1, 1, "\"processed\":2,\"returned\":1"));
+        assertTrue(message(lines).contains("differ from executor return"));
     }
 
     @Test
@@ -70,10 +82,9 @@ public class ServerCaptureAuditTest {
         var lines = new ArrayList<String>();
         lines.add(event("executor_start", 1, 1, "\"sql\":\"UPDATE t SET c=$1\""));
         lines.add(event("executor_start", 1, 2, "\"sql\":\"SELECT 1 FROM ONLY p\""));
-        lines.add(event("result_row", 1, 2, "\"values\":[\"1\"]"));
-        lines.add(event("executor_run_end", 1, 2, "\"processed\":1,\"returned\":1,\"row_hashes\":[\"0000000000000000\"]"));
+        lines.add(event("executor_run_end", 1, 2, "\"processed\":1,\"returned\":1"));
         lines.add(event("executor_end", 1, 1, "\"processed\":1"));
-        lines.add(event("executor_run_end", 1, 1, "\"processed\":1,\"returned\":0,\"row_hashes\":[]"));
+        lines.add(event("executor_run_end", 1, 1, "\"processed\":1,\"returned\":0"));
         lines.add(event("executor_end", 1, 1, "\"processed\":1"));
         lines.add(event("transaction_commit", 1, 0, null));
         var report = ServerCaptureAudit.audit(writeBody(lines));
@@ -133,13 +144,13 @@ public class ServerCaptureAuditTest {
     }
 
     @Test
-    public void rejectsMissingHeaderAndMissingReturnHashes() throws Exception {
+    public void rejectsMissingHeaderAndMissingReturnCounts() throws Exception {
         Path missing = folder.newFile("missing-header.jsonl.zst").toPath();
         RowAuditTestSupport.writeTrace(missing, statement(1, "SELECT 1", 1, 1));
         assertThrows(IOException.class, () -> ServerCaptureAudit.audit(missing));
         var lines = new ArrayList<>(statement(1, "SELECT 1", 1, 1));
-        lines.set(2, event("executor_run_end", 1, 1, "\"processed\":1"));
-        assertTrue(message(lines).contains("complete result hashes"));
+        lines.set(1, event("executor_run_end", 1, 1, "\"processed\":1"));
+        assertTrue(message(lines).contains("nonnegative result counts"));
         RowAuditTestSupport.writeTrace(missing, java.util.stream.Stream.concat(
                 java.util.stream.Stream.of(event("capture_start", 0, 0, "\"detail\":\"rows\"")
                         .replace("\"pid\":9", "\"pid\":10")),

@@ -24,7 +24,7 @@ public final class SibenchConfig {
         require(string(document, "purpose").equals("sibench"), "Expected sibench purpose");
         for (String key : document.keySet())
             require(Set.of("schema_version", "purpose", "postgres", "target", "replay",
-                    "versions", "analysis", "generation").contains(key), "Unknown SIBench option: " + key);
+                    "analysis", "generation").contains(key), "Unknown SIBench option: " + key);
         if (document.containsKey("generation")) {
             var generation = object(document, "generation");
             require(generation.keySet().containsAll(Set.of("pending_transaction_bytes", "pending_transactions")),

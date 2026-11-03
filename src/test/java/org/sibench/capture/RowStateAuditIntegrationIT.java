@@ -40,7 +40,7 @@ public class RowStateAuditIntegrationIT {
                                             "src/test/resources/config/"
                                                     + (benchmark.equals("hybench")
                                                             ? "hybench_sf1"
-                                                            : benchmark + "_1b")
+                                                            : benchmark + (benchmark.equals("ycsb") ? "_1k" : "_2k"))
                                                     + ".yaml")));
             var nativeConfig = ConfigValues.object(document, "native");
             if (benchmark.equals("sysbench")) nativeConfig.put("tables", 2);

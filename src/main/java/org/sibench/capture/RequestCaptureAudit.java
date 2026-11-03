@@ -35,10 +35,10 @@ public final class RequestCaptureAudit {
         private final Map<String, Request> requests = new LinkedHashMap<>();
         private final ArrayDeque<JsonObject> waiting = new ArrayDeque<>();
         private static final int MAX_PENDING_REQUESTS = 65_536;
-        private static final int MAX_PENDING_ROWS = 1_048_576;
+        private static final int MAX_PENDING_EVENTS = 1_048_576;
         private String closeApplication, latestApplication, serverApplication, applicationPrefix;
         private long lastRequest, requestCount, checkedRows, noop;
-        private int executorReturns, executorCleanup, pendingRows, peakRequests;
+        private int executorReturns, executorCleanup, peakRequests;
         private final List<String> withoutExecutorEnd = new ArrayList<>();
         private final Map<String, Long> abortedCommits = new LinkedHashMap<>();
         private boolean clientTransactionOpen, serverTransactionOpen, serverHeader, clientComplete;
@@ -99,20 +99,16 @@ public final class RequestCaptureAudit {
                     if (request.returned) throw new IOException("Duplicate request return");
                     request.returned = true;
                 }
-                case "consumed_row" -> {
-                    if (!requests.containsKey(app) || !requests.get(app).returned)
-                        throw new IOException("Consumed row before request return");
-                    Request request = requests.get(app);
-                    if (request.rowsComplete) throw new IOException("Consumed row after result completion");
-                    reserveRow();
-                    if (request.consumed == null) request.consumed = new Consumed();
-                    request.consumed.add(e);
-                }
                 case "request_end" -> {
                     Request request = requests.get(app);
                     if (request == null || !request.returned || request.rowsComplete)
                         throw new IOException("Invalid request result completion");
-                    completeRows(app, request);
+                    if (!e.has("consumed_rows") || !e.has("exhausted")
+                            || e.get("consumed_rows").getAsLong() < 0)
+                        throw new IOException("Missing or invalid consumed row count");
+                    request.consumed = e.get("consumed_rows").getAsLong();
+                    request.exhausted = e.get("exhausted").getAsBoolean();
+                    request.rowsComplete = true;
                 }
                 case "commit" -> {
                     if (!requests.containsKey(app) || !requests.get(app).returned)
@@ -159,7 +155,7 @@ public final class RequestCaptureAudit {
             }
             if (e.get("event").getAsString().equals("capture_start"))
                 throw new IOException("Repeated capture_start");
-            if (waiting.size() >= MAX_PENDING_ROWS)
+            if (waiting.size() >= MAX_PENDING_EVENTS)
                 throw new IOException("Pending server association audit budget reached");
             waiting.add(e);
             drain();
@@ -213,28 +209,10 @@ public final class RequestCaptureAudit {
                 if (!request.started)
                     throw new IOException("Execution return without start");
                 request.executed = true;
-                if (!e.has("row_hashes") || !e.has("returned")
-                        || e.get("returned").getAsLong() != e.getAsJsonArray("row_hashes").size())
-                    throw new IOException("Executor return lacks its complete result hashes");
-                if (e.get("depth").getAsInt() <= 1) {
-                    for (JsonElement hash : e.getAsJsonArray("row_hashes")) {
-                        if (request.rowsComplete) {
-                            if (request.consumed != null) request.consumed.checkHash(app, hash.getAsString());
-                        } else {
-                            reserveRow();
-                            if (request.serverHashes == null) request.serverHashes = new ArrayList<>();
-                            request.serverHashes.add(hash.getAsString());
-                        }
-                    }
-                }
-            } else if (event.equals("result_row")) {
-                if (request.rowsComplete) {
-                    if (request.consumed != null) request.consumed.checkValues(app, e.getAsJsonArray("values"));
-                } else {
-                    reserveRow();
-                    if (request.serverValues == null) request.serverValues = new ArrayList<>();
-                    request.serverValues.add(e.getAsJsonArray("values"));
-                }
+                if (!e.has("returned") || e.get("returned").getAsLong() < 0)
+                    throw new IOException("Executor return lacks its result count");
+                if (e.get("depth").getAsInt() <= 1)
+                    request.serverRows = Math.addExact(request.serverRows, e.get("returned").getAsLong());
             } else if (event.equals("transaction_commit")) {
                 commits++;
                 request.serverCommits++;
@@ -262,27 +240,6 @@ public final class RequestCaptureAudit {
             retire(app);
         }
 
-        private void reserveRow() throws IOException {
-            if (++pendingRows > MAX_PENDING_ROWS) throw new IOException("Pending result audit budget reached");
-        }
-
-        private void completeRows(String app, Request request) throws IOException {
-            if (request.rowsComplete) return;
-            request.rowsComplete = true;
-            if (request.serverHashes != null) {
-                if (request.consumed != null)
-                    for (String hash : request.serverHashes) request.consumed.checkHash(app, hash);
-                pendingRows -= request.serverHashes.size();
-                request.serverHashes = null;
-            }
-            if (request.serverValues != null) {
-                if (request.consumed != null)
-                    for (JsonArray values : request.serverValues) request.consumed.checkValues(app, values);
-                pendingRows -= request.serverValues.size();
-                request.serverValues = null;
-            }
-        }
-
         private void retire(String app) throws IOException {
             Request request = requests.get(app);
             // ExecutorEnd precedes scan cleanup; both streams must move past a sealed request.
@@ -293,13 +250,13 @@ public final class RequestCaptureAudit {
                 return;
             summarize(app, request, 0);
             requests.remove(app);
-            if (request.consumed != null) pendingRows -= request.consumed.size;
         }
 
         synchronized void endClient() throws IOException {
             if (clientComplete) return;
             clientComplete = true;
-            for (var entry : requests.entrySet()) completeRows(entry.getKey(), entry.getValue());
+            if (requests.values().stream().anyMatch(request -> !request.rowsComplete))
+                throw new IOException("Missing client result completion");
         }
 
         private void summarize(String app, Request request, long closeAbort) throws IOException {
@@ -318,11 +275,11 @@ public final class RequestCaptureAudit {
             } else if (missingCommits < 0) throw new IOException("Commit request identities differ");
             if (request.aborts - request.clientRollbacks != closeAbort)
                 throw new IOException("Server abort is not associated with rollback or an open transaction at close");
-            if (request.consumed != null) {
-                if (request.consumed.hashesChecked < request.consumed.size)
-                    throw new IOException("Client consumed uncaptured row: " + app);
-                checkedRows += request.consumed.size;
-            }
+            if (request.consumed > request.serverRows
+                    || request.exhausted && request.consumed != request.serverRows)
+                throw new IOException("Client/server result count mismatch: " + app
+                        + "; consumed=" + request.consumed + ", returned=" + request.serverRows);
+            checkedRows += request.consumed;
         }
 
         synchronized Map<String, Object> finish() throws IOException {
@@ -364,7 +321,7 @@ public final class RequestCaptureAudit {
                         "unmatched_server_events",
                         unmatched,
                         "scope",
-                        "one JDBC session; same-execution SQL, results, commits and rollback/close"
+                        "one JDBC session; same-execution SQL, result counts, commits and rollback/close"
                                 + (bindings ? "; runtime scan keys are client-bound values" : "")));
         report.put("peak_pending_requests", peakRequests);
         report.put("explicit_rollbacks", clientRollbacks);
@@ -384,93 +341,14 @@ public final class RequestCaptureAudit {
         final long ordinal;
         boolean returned, started, finished, executed, wrote, rowsComplete, serverPassed;
         long clientCommits, clientRollbacks, serverCommits, aborts;
-        Consumed consumed;
-        List<String> serverHashes;
-        List<JsonArray> serverValues;
+        long consumed, serverRows;
+        boolean exhausted;
 
         Request(String sql, List<String> bound, long ordinal) {
             this.ordinal = ordinal;
             this.sql = sql;
             this.bound = bound;
         }
-    }
-
-    /** Exact 64-bit row hashes; summary captures retain no per-row JSON or server-side copies. */
-    private static final class Consumed {
-        private long[] hashes = new long[4];
-        private int size;
-        private long hashesChecked, valuesChecked;
-        private Map<Integer, JsonObject> detailed;
-
-        void add(JsonObject client) throws IOException {
-            long hash = hashBits(clientHash(client));
-            if (size == hashes.length) hashes = Arrays.copyOf(hashes, Math.multiplyExact(size, 2));
-            hashes[size] = hash;
-            if (client.has("column_types")) {
-                if (detailed == null) detailed = new HashMap<>();
-                detailed.put(size, client);
-            }
-            size++;
-        }
-
-        void checkHash(String request, String hash) throws IOException {
-            if (hashesChecked < size && hashes[(int) hashesChecked] != hashBits(hash))
-                throw new IOException("Client result differs from same-execution server result: "
-                        + request + " row=" + (hashesChecked + 1) + " server_hash=" + hash);
-            hashesChecked++;
-        }
-
-        void checkValues(String request, JsonArray server) throws IOException {
-            JsonObject client = detailed == null || valuesChecked >= size
-                    ? null : detailed.remove((int) valuesChecked);
-            valuesChecked++;
-            if (client == null) return;
-            for (int j = 0; j < server.size(); j++) {
-                JsonElement expected = server.get(j), actual = client.get(Integer.toString(j + 1));
-                if (!Objects.equals(expected, actual)
-                        && !equalResult(expected, actual,
-                                client.getAsJsonObject("column_types")
-                                        .get(Integer.toString(j + 1)).getAsInt()))
-                    throw new IOException("Client result differs from same-execution server result: "
-                            + request + " column=" + (j + 1)
-                            + " server=" + expected + " client=" + actual);
-            }
-        }
-
-        private static long hashBits(String hash) throws IOException {
-            if (hash.length() != 16) throw new IOException("Invalid recorded row hash: " + hash);
-            for (int i = 0; i < hash.length(); i++) {
-                char c = hash.charAt(i);
-                if (!(c >= '0' && c <= '9' || c >= 'a' && c <= 'f'))
-                    throw new IOException("Invalid recorded row hash: " + hash);
-            }
-            return Long.parseUnsignedLong(hash, 16);
-        }
-    }
-
-    /**
-     * The client's hash of a consumed row. A row that also kept its text must hash to what it
-     * recorded.
-     */
-    static String clientHash(JsonObject client) throws IOException {
-        if (!client.has("row_hash")) throw new IOException("Consumed row without recorded hash");
-        String recorded = client.get("row_hash").getAsString();
-        if (!client.has("column_types")) {
-            if (recorded == null) throw new IOException("Consumed row without values or hash");
-            return recorded;
-        }
-        JsonObject types = client.getAsJsonObject("column_types");
-        var values = new ArrayList<String>();
-        var jdbcTypes = new ArrayList<Integer>();
-        for (int j = 1; j <= types.size(); j++) {
-            JsonElement value = client.get(Integer.toString(j));
-            values.add(value == null || value.isJsonNull() ? null : value.getAsString());
-            jdbcTypes.add(types.get(Integer.toString(j)).getAsInt());
-        }
-        String computed = ResultRowHash.of(values, jdbcTypes);
-        if (recorded != null && !recorded.equals(computed))
-            throw new IOException("Consumed row hash differs from its values");
-        return computed;
     }
 
     /** Planner endpoint probes carry no bound value; they are not search predicates. */
@@ -488,24 +366,4 @@ public final class RequestCaptureAudit {
         return sql.strip().replaceAll(";+$", "").replaceAll("\\s+", " ").toLowerCase(Locale.ROOT);
     }
 
-    static boolean equalResult(JsonElement expected, JsonElement actual, int jdbcType) {
-        if (expected == null || actual == null || expected.isJsonNull() || actual.isJsonNull())
-            return Objects.equals(expected, actual);
-        String a = expected.getAsString(), b = actual.getAsString();
-        return switch (jdbcType) {
-            case java.sql.Types.REAL ->
-                    Float.floatToIntBits(Float.parseFloat(a))
-                            == Float.floatToIntBits(Float.parseFloat(b));
-            case java.sql.Types.FLOAT, java.sql.Types.DOUBLE ->
-                    Double.doubleToLongBits(Double.parseDouble(a))
-                            == Double.doubleToLongBits(Double.parseDouble(b));
-            case java.sql.Types.NUMERIC, java.sql.Types.DECIMAL ->
-                    new java.math.BigDecimal(a).compareTo(new java.math.BigDecimal(b)) == 0;
-            case java.sql.Types.TIMESTAMP ->
-                    java.time.LocalDateTime.parse(a.replace(' ', 'T'))
-                            .equals(java.time.LocalDateTime.parse(b.replace(' ', 'T')));
-            case java.sql.Types.CHAR -> a.stripTrailing().equals(b.stripTrailing());
-            default -> a.equals(b);
-        };
-    }
 }

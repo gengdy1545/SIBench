@@ -1,5 +1,6 @@
 package org.sibench.adapters;
 
+import org.sibench.replay.ReplayInput;
 import com.google.gson.GsonBuilder;
 import com.google.protobuf.ByteString;
 import java.io.IOException;
@@ -64,10 +65,10 @@ public final class BaselineCapacityCheck {
         var json=com.google.gson.JsonParser.parseString(Files.readString(path)).getAsJsonObject();var out=new HashMap<String,Long>();
         for(var key:List.of("members","sum64","xor64"))out.put(key,json.get(key).getAsLong());return out;
     }
-    static Map<String,Object> run(Path trace,String endpoint,int clients,Path receiver,Path report,long windowSeconds,ReferenceReplay.Input prepared) throws Exception {
+    static Map<String,Object> run(Path trace,String endpoint,int clients,Path receiver,Path report,long windowSeconds,ReplayInput.Input prepared) throws Exception {
         long preparing=System.nanoTime();
-        var config=new ReplayConfig(true,"none",0,0,0,0,"operation",clients,4096,60);
-        var input=prepared==null?ReferenceReplay.prepare(trace,config):prepared;var expected=new Fingerprint();var requests=new TraceRequests(ValueKind.ROW_ID);var before=received(receiver);
+        var config=new ReplayConfig(true, 0,0,0,0,"operation",clients,4096,60);
+        var input=prepared==null?ReplayInput.prepare(trace,config):prepared;var expected=new Fingerprint();var requests=new TraceRequests(ValueKind.ROW_ID);var before=received(receiver);
         requests.baselineBatch(Math.max(1,config.maxInFlight()/clients));boolean complete=true;Map<String,Object> dispatch;
         double setupSeconds=(System.nanoTime()-preparing)/1e9;
         long memberLimit=Long.getLong("sibench.capacity.members",Long.MAX_VALUE);
@@ -89,7 +90,7 @@ public final class BaselineCapacityCheck {
             Files.writeString(report.resolveSibling(report.getFileName()+".submission-stopped"),Long.toString(System.currentTimeMillis()));
             projection.finish();dispatch=projection.describe();remote.flush("baseline-capacity "+trace.toAbsolutePath());
         }
-        double seconds=(System.nanoTime()-started)/1e9;requests.finish();
+        double seconds=(System.nanoTime()-started)/1e9;
         verify(expected,difference(received(receiver),before));
         var out=new LinkedHashMap<String,Object>();out.put("status","passed");out.put("clients",clients);out.put("complete_baseline",complete);out.put("setup_seconds",setupSeconds);out.put("seconds_including_flush",seconds);out.put("field_fingerprint",expected.summary());out.put("request_bytes",requests.requestBytes());out.put("dispatch",dispatch);out.put("preflight",input.preflight());out.put("scope","same verified input; actual batch conversion/RPC/ACK path plus independent commutative field fingerprint; receiver has no index storage; full canonical SHA checked only if complete_baseline=true, otherwise prior full reference/oracle proof reused for immutable input; finite window, not backend throughput");
         Files.writeString(report,JSON.toJson(out)+"\n",StandardOpenOption.CREATE_NEW);return out;
@@ -100,8 +101,8 @@ public final class BaselineCapacityCheck {
             Runtime.getRuntime().addShutdownHook(new Thread(() -> { try {server.close();}catch(IOException ignored){} }));System.out.println("READY "+server.port());server.awaitTermination();
         } else if(args[0].equals("series")) {
             Path trace=Path.of(args[1]),receiver=Path.of(args[3]),output=Path.of(args[4]);
-            var config=new ReplayConfig(true,"none",0,0,0,0,"operation",128,4096,60);long start=System.nanoTime();
-            var input=ReferenceReplay.prepare(trace,config);double setup=(System.nanoTime()-start)/1e9;var paths=new ArrayList<String>();
+            var config=new ReplayConfig(true, 0,0,0,0,"operation",128,4096,60);long start=System.nanoTime();
+            var input=ReplayInput.prepare(trace,config);double setup=(System.nanoTime()-start)/1e9;var paths=new ArrayList<String>();
             int[] clients={64,1,128,128,1,64};
             for(int i=0;i<clients.length;i++){Path report=output.resolve("clients-"+clients[i]+"-"+i+".json");run(trace,args[2],clients[i],receiver,report,Long.parseLong(args[5]),input);paths.add(report.getFileName().toString());System.out.println("completed "+report.getFileName());}
             Files.writeString(output.resolve("series.json"),JSON.toJson(Map.of("status","passed","setup_seconds",setup,"reports",paths,"cache","one driver and receiver JVM across balanced trials; same immutable input; each trial starts from baseline beginning, no cycling within a trial"))+"\n",StandardOpenOption.CREATE_NEW);

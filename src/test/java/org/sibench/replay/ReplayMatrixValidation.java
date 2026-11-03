@@ -2,7 +2,7 @@ package org.sibench.replay;
 
 import com.google.gson.*;
 
-import org.sibench.generation.BaselineGenerator;
+import org.sibench.config.Digests;
 
 import java.io.IOException;
 import java.nio.file.*;
@@ -23,7 +23,7 @@ public final class ReplayMatrixValidation {
                     String name = "secondary-" + secondary + "-" + dispatch + "-" + clients;
                     var config =
                             new ReplayConfig(
-                                    secondary, "none", 0, 0, 0, 0, dispatch, clients, 4096, 60);
+                                    secondary, 0, 0, 0, 0, dispatch, clients, 4096, 60);
                     var report =
                             ReferenceReplay.audit(trace, config, output.resolve(name + ".json"));
                     for (var item : (List<?>) report.get("results")) {
@@ -34,7 +34,6 @@ public final class ReplayMatrixValidation {
                                 List.of(
                                                 result.get("workload_operations"),
                                                 result.get("queries"),
-                                                result.get("query_digest_sha256"),
                                                 result.get("primary_state_checksum"),
                                                 result.get("selected_version_checksum"),
                                                 workload.get("operation_order_checksum"))
@@ -49,7 +48,7 @@ public final class ReplayMatrixValidation {
                                     "report",
                                     name + ".json",
                                     "sha256",
-                                    BaselineGenerator.sha256(output.resolve(name + ".json")),
+                                    Digests.sha256(output.resolve(name + ".json")),
                                     "configuration",
                                     config.describe()));
                     System.out.println("Verified " + name);
@@ -57,7 +56,7 @@ public final class ReplayMatrixValidation {
         for (boolean secondary : new boolean[] {false, true})
             SnapshotLookupValidation.run(
                     trace,
-                    new ReplayConfig(secondary, "none", 0, 0, 0, 0),
+                    new ReplayConfig(secondary, 0, 0, 0, 0),
                     output.resolve("parquet-oracle-secondary-" + secondary + ".json"));
         Files.writeString(
                 output.resolve("matrix.json"),
@@ -72,8 +71,8 @@ public final class ReplayMatrixValidation {
                                         reports,
                                         "scope",
                                         "1/64/128 clients x both dispatch modes x secondary on/off;"
-                                            + " both value modes, exact"
-                                            + " operation-order/state/result equivalence."
+                                            + " both value modes,"
+                                            + " operation-order/state/count equivalence."
                                             + " Independent Parquet oracle at 1 client for both"
                                             + " secondary settings; no real network or performance"
                                             + " claim.")),
