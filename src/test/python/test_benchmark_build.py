@@ -25,6 +25,8 @@ class BenchmarkBuildTest(unittest.TestCase):
             path.write_text("#!/bin/sh\nexit 0\n")
             path.chmod(0o755)
         (self.source / "source.c").write_text("pinned input\n")
+        (self.root / "scripts/patches/native-stop-fixture.patch").write_text(
+            "--- a/source.c\n+++ b/source.c\n@@ -1 +1 @@\n-pinned input\n+patched input\n")
         shutil.copyfile(SCRIPT.parent.parent / "benchmark/HyBench-2024/pom.xml", self.source / "pom.xml")
         self.git("init", "-q")
         self.git("add", ".")
@@ -37,7 +39,8 @@ class BenchmarkBuildTest(unittest.TestCase):
 case "$*" in
   *" paths "*)
     printf "BENCHMARK='%s'\\nSOURCE='%s/benchmark/source'\\nBUILD='%s/build/benchmarks/client'\\n" \
-      "$SIBENCH_FIXTURE_BENCHMARK" "$SIBENCH_FIXTURE_ROOT" "$SIBENCH_FIXTURE_ROOT" ;;
+      "$SIBENCH_FIXTURE_BENCHMARK" "$SIBENCH_FIXTURE_ROOT" "$SIBENCH_FIXTURE_ROOT"
+    printf "NATIVE_STOP_PATCH='%s/scripts/patches/native-stop-fixture.patch'\\n" "$SIBENCH_FIXTURE_ROOT" ;;
   *" record "*) echo recorded > "$SIBENCH_FIXTURE_ROOT/build/benchmarks/client/native-build.json" ;;
   *) exit 74 ;;
 esac
@@ -75,7 +78,7 @@ esac
             with self.subTest(benchmark=benchmark):
                 result = self.run_build(benchmark)
                 self.assertEqual(0, result.returncode, result.stderr)
-                self.assertEqual("pinned input\n", (build / "source.c").read_text())
+                self.assertEqual("patched input\n", (build / "source.c").read_text())
                 self.assertTrue((build / "native-build.json").is_file())
                 self.assertEqual("", self.git("status", "--porcelain"))
                 shutil.rmtree(build)

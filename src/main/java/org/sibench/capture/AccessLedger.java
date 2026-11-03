@@ -254,8 +254,6 @@ public final class AccessLedger {
         events++;
         String type = e.type();
         increment(eventTypes, type);
-        if (!e.has("req") || !e.has("depth"))
-            throw new IOException("Trace lacks request ordinals and executor depth");
         if (type.equals("executor_start")
                 && e.get("depth").getAsInt() <= 1
                 && (!e.has("query_id") || e.get("query_id").getAsLong() == 0))
@@ -292,9 +290,20 @@ public final class AccessLedger {
     /** One session trace this ledger read: its digest, backend, format and counts. */
     void input(Path file, int pid, AccessUnits.Detail detail, long sessionEvents, long sessionUnits)
             throws IOException {
+        input(file.getFileName().toString(), FileDigests.sha256(file), pid, detail, sessionEvents, sessionUnits, false);
+    }
+
+    void input(String name, String sha256, int pid, AccessUnits.Detail detail,
+            long sessionEvents, long sessionUnits) {
+        input(name, sha256, pid, detail, sessionEvents, sessionUnits, true);
+    }
+
+    private void input(String name, String sha256, int pid, AccessUnits.Detail detail,
+            long sessionEvents, long sessionUnits, boolean stream) {
         var input = new LinkedHashMap<String, Object>();
-        input.put("file", file.getFileName().toString());
-        input.put("sha256", FileDigests.sha256(file));
+        input.put("file", name);
+        input.put("sha256", sha256);
+        if (stream) input.put("transport", "direct_events_utf8");
         input.put("pid", pid);
         input.put("detail", detail.name().toLowerCase(Locale.ROOT));
         input.put("events", sessionEvents);

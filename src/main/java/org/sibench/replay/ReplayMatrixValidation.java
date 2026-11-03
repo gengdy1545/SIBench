@@ -25,7 +25,7 @@ public final class ReplayMatrixValidation {
                             new ReplayConfig(
                                     secondary, "none", 0, 0, 0, 0, dispatch, clients, 4096, 60);
                     var report =
-                            ReferenceReplay.run(trace, config, output.resolve(name + ".json"));
+                            ReferenceReplay.audit(trace, config, output.resolve(name + ".json"));
                     for (var item : (List<?>) report.get("results")) {
                         Map<?, ?> result = (Map<?, ?>) item;
                         Map<?, ?> workload = (Map<?, ?>) result.get("workload_dispatch");

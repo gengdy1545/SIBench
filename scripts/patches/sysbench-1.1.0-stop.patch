@@ -1,0 +1,30 @@
+--- a/src/sysbench.c
++++ b/src/sysbench.c
+@@ -135,6 +135,7 @@
+ 
+ /* Wait at most this number of seconds for worker threads to initialize */
+ static int thread_init_timeout;
++static const char *sibench_budget_stop;
+ 
+ /* Barrier to signal reporting threads */
+ static sb_barrier_t report_barrier;
+@@ -690,6 +691,11 @@
+   (void) thread_id; /* unused */
+ 
+   if (sb_globals.error)
++    return false;
++
++  /* Stop only between complete native events. */
++  if (sibench_budget_stop != NULL && sibench_budget_stop[0] != 0 &&
++      access(sibench_budget_stop, F_OK) == 0)
+     return false;
+ 
+   /* Check if we have a time limit */
+@@ -1440,6 +1446,7 @@
+   sb_test_t *test = NULL;
+   int rc;
+ 
++  sibench_budget_stop = getenv("SIBENCH_BUDGET_STOP");
+   sb_globals.argc = argc;
+   sb_globals.argv = malloc(argc * sizeof(char *));
+   memcpy(sb_globals.argv, argv, argc * sizeof(char *));

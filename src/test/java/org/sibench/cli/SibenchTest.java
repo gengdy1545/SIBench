@@ -27,12 +27,9 @@ public class SibenchTest {
                             },
                             out,
                             err));
-            assertEquals(
-                    3,
-                    JsonParser.parseString(output.toString(StandardCharsets.UTF_8))
-                            .getAsJsonObject()
-                            .getAsJsonArray("profiles")
-                            .size());
+            var report = JsonParser.parseString(output.toString(StandardCharsets.UTF_8)).getAsJsonObject();
+            assertEquals("profiles_valid", report.get("status").getAsString());
+            assertEquals(3, report.getAsJsonArray("profiles").size());
             assertEquals(0, errors.size());
         }
     }

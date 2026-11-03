@@ -1,7 +1,8 @@
 /*
  * PostgreSQL 14.24 capture instrumentation, linked into the backend (see sibench_capture.h).
  *
- * Every event is one JSON line in SIBENCH_CAPTURE_DIR/pg-<pid>.jsonl.zst. The first line of a file is
+ * Events stream to the Java generator over SIBENCH_CAPTURE_SOCKET. Standalone full-fact probes
+ * without a socket write SIBENCH_CAPTURE_DIR/pg-<pid>.jsonl.zst. Each stream starts with
  * capture_start, naming whether per-row detail is kept.
  *
  * An index access unit starts with a scan_rescan and ends before the next rescan, the scan's end,
@@ -17,6 +18,9 @@
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include "storage/lwlock.h"
 #include <zstd.h>
 
 #include "access/htup_details.h"
@@ -51,6 +55,11 @@ int			sibench_depth = 0;
 uint64		sibench_request = 0;
 
 static FILE *sib_stream = NULL;
+static bool sib_direct = false;
+static bool sib_direct_ended = false;
+static bool sib_failed = false;
+static bool sib_committing = false;
+static const char *sib_failure_message = NULL;
 static int	sib_detail_mode = -1;
 
 /* Buffered zstd output ends its frame at backend exit; an incomplete frame fails the audit. */
@@ -66,7 +75,7 @@ static bool sib_zstd_open_frame = false;
 bool
 sib_enabled(void)
 {
-	return application_name && strncmp(application_name, "sibench:", 8) == 0;
+	return !sib_failed && application_name && strncmp(application_name, "sibench:", 8) == 0;
 }
 
 bool
@@ -89,6 +98,26 @@ sib_detail(void)
 }
 
 static void sib_flush_all(void);
+
+/* Commit callbacks cannot raise errors: finish the native commit before closing the backend. */
+void
+sib_capture_check_failure(void)
+{
+    if (sib_failed)
+        ereport(FATAL, (errmsg_internal("%s", sib_failure_message)));
+}
+
+static void
+sib_output_error(const char *message)
+{
+    FILE *stream = sib_stream;
+
+    sib_failed = true;
+    sib_failure_message = message;
+    sib_stream = NULL;
+    if (stream) fclose(stream);
+    if (!sib_committing) sib_capture_check_failure();
+}
 
 /* Feeds input to the zstd stream with the given directive and writes what it produced. */
 static bool
@@ -113,9 +142,15 @@ sib_zstd_feed(const char *data, size_t length, ZSTD_EndDirective directive)
 static void
 sib_write(const char *data, size_t length)
 {
+	if (sib_direct)
+	{
+		if (fwrite(data, 1, length, sib_stream) != length)
+			sib_output_error("SIBench direct capture write failed");
+		return;
+	}
 	sib_zstd_open_frame = true;
 	if (!sib_zstd_feed(data, length, ZSTD_e_continue))
-		elog(ERROR, "SIBench trace write failed");
+		sib_output_error("SIBench trace write failed");
 }
 
 /* Ends the zstd frame; anything written later starts a new frame of the same stream. */
@@ -127,18 +162,37 @@ sib_finish(void)
 	if (sib_zstd && sib_zstd_open_frame)
 	{
 		if (!sib_zstd_feed(NULL, 0, ZSTD_e_end))
-			elog(ERROR, "SIBench trace finalization failed");
+        {
+            sib_output_error("SIBench trace finalization failed");
+            return;
+        }
 		sib_zstd_open_frame = false;
 	}
 	if (fflush(sib_stream) != 0)
-		elog(ERROR, "SIBench trace flush failed");
+		sib_output_error("SIBench trace flush failed");
 }
 
 /* Open units and pending verdicts are still facts when the connection closes mid-request. */
-static void
-sib_before_exit(int code, Datum arg)
+void
+sib_backend_exit(void)
 {
+	if (!sib_stream || sib_failed) return;
 	sib_flush_all();
+	if (sib_direct && !sib_direct_ended)
+	{
+		sib_write("{\"event\":\"capture_end\"}\n", sizeof("{\"event\":\"capture_end\"}\n") - 1);
+		sib_direct_ended = true;
+		sib_finish();
+		{
+			char acknowledgement;
+			if (read(fileno(sib_stream), &acknowledgement, 1) != 1 || acknowledgement != 'E')
+				sib_output_error("SIBench direct capture did not finish the source stream");
+		}
+		/* The receiver has every fact; free PGPROC slots can retain their old PID. */
+		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+		MyProc->sibenchCaptureDirect = false;
+		LWLockRelease(ProcArrayLock);
+	}
 	sib_finish();
 }
 
@@ -159,6 +213,43 @@ sib_open(void)
 		return true;
 	if (!directory || !directory[0])
 		return false;
+	if (getenv("SIBENCH_CAPTURE_SOCKET"))
+	{
+		struct sockaddr_un address;
+		int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+		const char *endpoint = getenv("SIBENCH_CAPTURE_SOCKET");
+		memset(&address, 0, sizeof(address));
+		address.sun_family = AF_UNIX;
+		if (fd < 0 || strlen(endpoint) >= sizeof(address.sun_path))
+        {
+            if (fd >= 0) close(fd);
+            sib_output_error("SIBench direct capture socket is unavailable");
+            return false;
+        }
+		strlcpy(address.sun_path, endpoint, sizeof(address.sun_path));
+		if (connect(fd, (struct sockaddr *) &address, sizeof(address)) != 0)
+        {
+            close(fd);
+            sib_output_error("SIBench cannot connect to capture socket");
+            return false;
+        }
+		sib_stream = fdopen(fd, "w");
+		if (!sib_stream) {
+            close(fd);
+            sib_output_error("SIBench cannot open capture socket stream");
+            return false;
+        }
+		sib_direct = true;
+		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+		MyProc->sibenchCaptureProduced = 0;
+		MyProc->sibenchCaptureAcked = 0;
+		MyProc->sibenchCaptureCsn = ShmemVariableCache->xactCompletionCount;
+		MyProc->sibenchCaptureAckCsn = MyProc->sibenchCaptureCsn;
+		MyProc->sibenchCaptureDirect = true;
+		LWLockRelease(ProcArrayLock);
+		fprintf(sib_stream, "pg-%d.jsonl.zst\n", MyProcPid);
+	}
+	else
 	{
 		const char *compress = getenv("SIBENCH_CAPTURE_COMPRESS");
 		if (compress && strcmp(compress, "zstd") != 0)
@@ -174,14 +265,8 @@ sib_open(void)
 		sib_zstd_out_size = ZSTD_CStreamOutSize();
 		sib_zstd_out = MemoryContextAlloc(TopMemoryContext, sib_zstd_out_size);
 	}
-	/*
-	 * Written out only when buffers fill and at exit, where the zstd frame ends: the audit waits
-	 * for every backend to exit before it reads a trace, and a lost backend fails the capture
-	 * anyway. A flush per transaction cost a zstd block and a write per commit on the CPUs the
-	 * native run is bound by.
-	 */
+	/* File output keeps buffered zstd frames; direct output flushes each transaction's facts. */
 	setvbuf(sib_stream, NULL, _IOFBF, 1 << 20);
-	before_shmem_exit(sib_before_exit, (Datum) 0);
 	on_proc_exit(sib_proc_exit, (Datum) 0);
 	initStringInfo(&header);
 	appendStringInfo(&header,
@@ -193,7 +278,7 @@ sib_open(void)
 					 sib_detail() ? "rows" : "summary");
 	sib_write(header.data, header.len);
 	pfree(header.data);
-	return true;
+	return !sib_failed;
 }
 
 /* A non-negative integer in decimal, as %u / %llu / %d print it, without printf. */
@@ -1955,25 +2040,73 @@ sib_completion(void)
 {
 	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
 		return MyProc->sibenchCompletion;
+	if (sib_direct)
+	{
+		uint64 csn;
+		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+		csn = ShmemVariableCache->xactCompletionCount;
+		MyProc->sibenchCaptureProduced++;
+		MyProc->sibenchCaptureCsn = csn;
+		LWLockRelease(ProcArrayLock);
+		return csn;
+	}
 	return ShmemVariableCache->xactCompletionCount;
+}
+
+/* Acknowledgements advance only after completed transaction facts are queued in Java. */
+uint64
+sib_capture_watermark(int pid, uint64 sequence, uint64 csn)
+{
+	uint64 safe;
+	uint32 i;
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	safe = ShmemVariableCache->xactCompletionCount;
+	for (i = 0; i < ProcGlobal->allProcCount; i++)
+	{
+		PGPROC *proc = &ProcGlobal->allProcs[i];
+		if (proc->pid == 0 || !proc->sibenchCaptureDirect) continue;
+		if (proc->pid == pid && sequence > proc->sibenchCaptureAcked)
+		{
+			if (sequence > proc->sibenchCaptureProduced || csn > proc->sibenchCaptureCsn
+				|| csn < proc->sibenchCaptureAckCsn)
+			{
+				LWLockRelease(ProcArrayLock);
+				elog(ERROR, "SIBench source acknowledgement exceeds its producer");
+			}
+			proc->sibenchCaptureAcked = sequence;
+			proc->sibenchCaptureAckCsn = csn;
+		}
+		if (proc->sibenchCaptureProduced > proc->sibenchCaptureAcked)
+			safe = Min(safe, proc->sibenchCaptureAckCsn);
+	}
+	LWLockRelease(ProcArrayLock);
+	return safe;
 }
 
 void
 sib_transaction_commit(void)
 {
-	char		detail[64];
+    char detail[160];
 
-	if (!sib_enabled())
-		return;
-	snprintf(detail, sizeof(detail), "\"csn\":%llu", (unsigned long long) sib_completion());
-	sib_emit("transaction_commit", NULL, detail);
+    if (!sib_enabled()) return;
+    sib_committing = true;
+    if (sib_open())
+    {
+        uint64 csn = sib_completion();
+        snprintf(detail, sizeof(detail), "\"csn\":%llu,\"capture_sequence\":%llu",
+                 (unsigned long long) csn,
+                 (unsigned long long) (sib_direct ? MyProc->sibenchCaptureProduced : 0));
+        sib_emit("transaction_commit", NULL, detail);
+        if (sib_direct) sib_finish();
+    }
+    sib_committing = false;
 }
 
 /* A failed statement never ends its scans: their units end with the abort, after their summaries. */
 void
 sib_transaction_abort(void)
 {
-	char		detail[64];
+	char		detail[160];
 	HASH_SEQ_STATUS status;
 	SibUnit    *unit;
 	SibHeap    *heap;
@@ -1992,6 +2125,12 @@ sib_transaction_abort(void)
 			if (heap->cycle_open)
 				heap->cycle_sealed = true;
 	}
-	snprintf(detail, sizeof(detail), "\"csn\":%llu", (unsigned long long) sib_completion());
+	{
+		uint64 csn = sib_completion();
+		snprintf(detail, sizeof(detail), "\"csn\":%llu,\"capture_sequence\":%llu",
+				 (unsigned long long) csn,
+				 (unsigned long long) (sib_direct ? MyProc->sibenchCaptureProduced : 0));
+	}
 	sib_emit("transaction_abort", NULL, detail);
+	if (sib_direct) sib_finish();
 }

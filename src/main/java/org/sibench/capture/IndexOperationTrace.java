@@ -414,21 +414,18 @@ public final class IndexOperationTrace {
 
     public interface Consumer {
         void accept(Operation operation) throws IOException;
+
+        /** Keeps the stored service payload beside the views used by semantic validators. */
+        default void accept(org.sibench.adapters.proto.TraceRecord record, java.util.List<Operation> views)
+                throws IOException {
+            for (Operation operation : views) accept(operation);
+        }
     }
 
     /** A stream of operations: a trace file, or one derived when it is read. Returns the count. */
     @FunctionalInterface
     public interface Source {
         long read(Consumer consumer) throws IOException;
-
-        static Source file(Path file) {
-            return consumer -> IndexOperationTrace.read(file, consumer);
-        }
-
-        static Source file(Path file, String expectedSha256) {
-            java.util.Objects.requireNonNull(expectedSha256);
-            return consumer -> IndexOperationTrace.read(file, consumer, expectedSha256);
-        }
     }
 
     /**
@@ -636,7 +633,7 @@ public final class IndexOperationTrace {
     }
 
     /** Checks the logical identity in the same block traversal as decoding and CRC verification. */
-    private static long read(Path file, Consumer consumer, String expectedSha256) throws IOException {
+    static long read(Path file, Consumer consumer, String expectedSha256) throws IOException {
         long[] count = {0};
         var digest = expectedSha256 == null ? null : logicalDigest();
         var header = expectedSha256 == null ? null : ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);

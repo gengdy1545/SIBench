@@ -18,11 +18,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The baseline index load of a trace: one primary-key INSERT per baseline row and its secondary
- * index entries, in baseline file order. It is a function of the baseline Parquet and the index
- * definitions alone, so the trace does not store it: compilation records only its count and the
- * SHA256 of the file it would form ({@code baseline_trace_sha256}), and every reader derives it
- * again from the verified baseline and checks that digest when it ends.
+ * Canonical baseline requests read from persisted protobuf shards. Full generation also derives
+ * those requests from verified Parquet rows while retaining their Locator metadata.
  */
 public final class BaselineOperations {
     private BaselineOperations() {}
@@ -351,51 +348,15 @@ public final class BaselineOperations {
         return result;
     }
 
-    private static final Rows NONE =
-            new Rows() {
-                @Override
-                public void file(String table, int tableId) {}
-
-                @Override
-                public void row(String table, org.apache.parquet.schema.GroupType type, Operation primary) {}
-
-                @Override
-                public void fileFinished() {}
-            };
-
-    /**
-     * The baseline load of a compiled trace, derived from the baseline directory its manifest
-     * names. It requires the baseline files to be the verified ones and, once read, to be the
-     * stream the trace was compiled with.
-     */
+    /** The canonical baseline requests, including Locator metadata in full output. */
     public static IndexOperationTrace.Source of(Path trace) {
         return consumer -> {
-            JsonObject manifest = JsonParser.parseString(Files.readString(trace.resolve("manifest.json"))).getAsJsonObject();
-            for (String field : java.util.List.of("baseline_directory", "baseline_trace_sha256", "baseline_operations", "baseline_manifest_sha256"))
-                if (!manifest.has(field)) throw new IOException("Trace manifest cannot derive its baseline load: " + field);
-            Path baseline = Path.of(manifest.get("baseline_directory").getAsString());
-            if (!FileDigests.sha256(baseline.resolve("baseline-manifest.json"))
-                    .equals(manifest.get("baseline_manifest_sha256").getAsString()))
-                throw new IOException("The baseline is not the one the trace was compiled with: " + baseline);
-            try {
-                BaselineManifest.verifyFiles(baseline);
-            } catch (IOException error) {
-                throw error;
-            } catch (Exception error) {
-                throw new IOException(error);
-            }
-            IndexCatalog catalog = IndexCatalog.fromManifest(manifest);
-            var digest = new WriterThread(new IndexOperationTrace.Writer(null), "baseline-digest");
-            try (digest) {
-                derive(baseline, catalog, operation -> {
-                    digest.append(operation);
-                    consumer.accept(operation);
-                }, NONE);
-            }
-            if (digest.count() != manifest.get("baseline_operations").getAsLong()
-                    || !digest.sha256().equals(manifest.get("baseline_trace_sha256").getAsString()))
-                throw new IOException("Derived baseline load differs from the compiled trace");
-            return digest.count();
+            JsonObject manifest = org.sibench.trace.TraceManifest.read(trace);
+            IndexCatalog.fromManifest(manifest);
+            long records = ProtoTrace.source(trace, manifest, "baseline").read(consumer);
+            if (records != manifest.get("baseline_operations").getAsLong())
+                throw new IOException("Proto baseline record count mismatch");
+            return records;
         };
     }
 }

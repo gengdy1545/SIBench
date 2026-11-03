@@ -122,7 +122,7 @@ final class RowAuditTestSupport {
         Files.write(directory.resolve("files.jsonl"), files);
         var expected = new LinkedHashMap<String, Long>();
         for (var table : schema.tables()) expected.put(table.name(), (long) rows.getOrDefault(table.name(), List.of()).size());
-        BaselineManifest.publish(schema, directory, expected);
+        BaselineManifest.publish(schema, directory, expected, TraceOutput.FULL);
         return directory;
     }
 

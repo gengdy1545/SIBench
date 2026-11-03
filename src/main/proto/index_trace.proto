@@ -1,0 +1,35 @@
+// Compressed Trace files carry service requests and the source facts needed to validate replay.
+syntax = "proto3";
+
+package sibench.index;
+
+import "index_service.proto";
+
+option java_multiple_files = true;
+option java_package = "org.sibench.adapters.proto";
+
+message TracePosition {
+  uint64 source_event = 1;
+  uint64 work_unit_id = 2;
+  uint64 mutation_ordinal = 3;
+  uint32 flags = 4;
+  uint64 expected_count = 5;
+  uint32 expansion_position = 6;
+  uint32 expansion_size = 7;
+  // Deletes have no service value, but their source maintenance unit still names its RowID.
+  int64 deleted_row_id = 8;
+}
+
+message TraceBegin {
+  uint64 transaction_id = 1;
+  uint64 version = 2;
+}
+
+message TraceRecord {
+  oneof operation {
+    Request request = 1;
+    TraceBegin begin = 2;
+  }
+  // One position per logical member; a SearchGroup is a single service request.
+  repeated TracePosition positions = 3;
+}

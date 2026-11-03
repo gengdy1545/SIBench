@@ -37,7 +37,7 @@ final class NativeProcess {
             Path directory,
             Path logs,
             Duration timeout)
-            throws IOException, InterruptedException {
+            throws Exception {
         Files.createDirectories(logs);
         Path out = logs.resolve(name + ".out"), err = logs.resolve(name + ".err");
         Files.writeString(
@@ -48,18 +48,32 @@ final class NativeProcess {
         var builder = new ProcessBuilder(command).directory(directory.toFile());
         builder.environment().putAll(environment);
         builder.redirectOutput(out.toFile()).redirectError(err.toFile());
+        CaptureRun.checkFailure();
         Process process = builder.start();
-        if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
-            process.destroyForcibly();
-            throw new IOException("Native client timed out: " + name);
+        long deadline = System.nanoTime() + timeout.toNanos();
+        try {
+            while (true) {
+                CaptureRun.checkFailure();
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) throw new IOException("Native client timed out: " + name);
+                if (process.waitFor(Math.min(remaining, TimeUnit.SECONDS.toNanos(1)), TimeUnit.NANOSECONDS)) {
+                    CaptureRun.checkFailure();
+                    return new Result(process.exitValue(), out, err);
+                }
+            }
+        } finally {
+            if (process.isAlive()) {
+                process.descendants().forEach(ProcessHandle::destroyForcibly);
+                process.destroyForcibly();
+            }
         }
-        return new Result(process.exitValue(), out, err);
     }
 
     /** Waits until no backend still carries a capture label, so its trace is complete. */
-    static void drain(String adminJdbc, String user) throws SQLException, InterruptedException {
+    static void drain(String adminJdbc, String user) throws Exception {
         long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
         while (true) {
+            CaptureRun.checkFailure();
             try (Connection connection =
                             DriverManager.getConnection(
                                     adminJdbc, user, System.getenv().getOrDefault("PGPASSWORD", ""));

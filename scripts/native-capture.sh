@@ -32,8 +32,14 @@ CORE=$ROOT/build/sibench/sibench.jar
 cd "$ROOT"
 ASSIGNMENTS=$("$JAVA" -cp "$CORE" org.sibench.capture.NativeCapture paths "$ROOT" "$PROFILE")
 eval "$ASSIGNMENTS"
+if [ "$AUDIT_BASELINE" = 1 ] && [ "$SIBENCH_TRACE_OUTPUT" != full ]; then
+  echo "--audit-baseline requires capture.output: full (complete-row Parquet)" >&2
+  exit 2
+fi
 # PG and the native clients read the detail level and trace encoding from the environment.
 export SIBENCH_CAPTURE_DETAIL SIBENCH_CAPTURE_COMPRESS
+export SIBENCH_BUDGET_STOP
+SOCKET_DIRECTORY=
 # Only HyBench needs upstream classes in the orchestrator JVM.
 NATIVE_CP=
 if [ -n "${SIBENCH_HYBENCH:-}" ]; then
@@ -103,6 +109,16 @@ cleanup() {
       if [ "$status" -eq 0 ]; then status=1; fi
     fi
   fi
+  if [ -n "$SOCKET_DIRECTORY" ]; then
+    if [ -S "$SIBENCH_CAPTURE_SOCKET" ] && ! rm -f "$SIBENCH_CAPTURE_SOCKET"; then
+      echo "failed to remove capture socket: $SIBENCH_CAPTURE_SOCKET" >&2
+      if [ "$status" -eq 0 ]; then status=1; fi
+    fi
+    if ! rmdir "$SOCKET_DIRECTORY"; then
+      echo "retained capture socket directory: $SOCKET_DIRECTORY" >&2
+      if [ "$status" -eq 0 ]; then status=1; fi
+    fi
+  fi
   exit "$status"
 }
 
@@ -120,6 +136,9 @@ URL=jdbc:postgresql://127.0.0.1:$SIBENCH_PORT/$SIBENCH_DATABASE
 # Load once into this run's database. No PG state is reused by another capture.
 "$PG/runtime/bin/initdb" -D "$CLUSTER" -U postgres --locale=C -E UTF8 --auth=trust > "$SIBENCH_ARTIFACTS/native/initdb.log"
 trap cleanup EXIT
+# Unix socket paths must stay short even when artifact paths are long.
+SOCKET_DIRECTORY=$(mktemp -d /tmp/sibench-capture.XXXXXXXX)
+export SIBENCH_CAPTURE_SOCKET="$SOCKET_DIRECTORY/capture.sock"
 start_cluster "$CLUSTER" "$SIBENCH_ARTIFACTS/postgres.log"
 stage load
 # The capture directory is inherited by PG at startup. Restart this same cluster before export,
@@ -132,7 +151,6 @@ if [ "${SIBENCH_PREWARM:-0}" = 1 ]; then
   find "$CLUSTER/base" -type f -print0 | xargs -0 -P 8 -n 32 cat > /dev/null
   printf 'stage %-8s %d ms\n' prewarm "$(( ($(date +%s%N) - started) / 1000000 ))" >&2
 fi
-stage check > "$SIBENCH_ARTIFACTS/schema-preflight.json"
 stage export > "$SIBENCH_ARTIFACTS/baseline.log"
 # Independent initial-state acceptance must run before the native workload changes this database.
 if [ "$AUDIT_BASELINE" = 1 ]; then
@@ -162,17 +180,15 @@ counters() {
 }
 counters "$SIBENCH_ARTIFACTS/index-counters-before.json"
 stage run > "$SIBENCH_ARTIFACTS/native-run.log"
-counters "$SIBENCH_ARTIFACTS/index-counters-after.json"
-# Compilation needs the recorded facts; retain the stopped database until success for diagnostics.
+# The run stage checks source completion/counters and publishes the final Trace directly.
+# Retain the database until that publication succeeds; replay is a separate command.
 "$PG/runtime/bin/pg_ctl" -D "$CLUSTER" -m fast -t 3600 stop >/dev/null
-trap - EXIT
-# One pass compiles the trace and builds the access ledger; the trace is committed only when the
-# ledger matches PG's index counters.
-"$JAVA" $HEAP -cp "$CAPTURE_CP" org.sibench.cli.Sibench compile-trace "$PROFILE" "$SIBENCH_ARTIFACTS/trace" \
-  --counters "$SIBENCH_ARTIFACTS/index-counters-before.json" "$SIBENCH_ARTIFACTS/index-counters-after.json" \
-  --timing "$TIMING" > "$SIBENCH_ARTIFACTS/trace-summary.json"
 cp "$SIBENCH_ARTIFACTS/trace/access-ledger.json" "$SIBENCH_ARTIFACTS/access-ledger-summary.json"
 cp "$SIBENCH_ARTIFACTS/trace/capture-completeness.json" "$SIBENCH_ARTIFACTS/capture-completeness.json"
+if [ "$SIBENCH_TRACE_OUTPUT" = proto ]; then
+  # The published proto Trace contains its complete initial index and source identities.
+  rm -rf "$SIBENCH_ARTIFACTS/baseline" "$SIBENCH_RAW"
+fi
 
 # The next capture loads fresh data. Explicit acceptance can retain the final database for audit.
 if [ "${SIBENCH_KEEP_DATABASE:-0}" != 1 ]; then

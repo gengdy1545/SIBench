@@ -251,8 +251,7 @@ public final class UpdateLocality {
                         layouts,
                         baselineRows,
                         config,
-                        IndexOperationTrace.Source.file(trace.resolve("workload.ops"),
-                                manifest.get("workload_trace_sha256").getAsString()),
+                        org.sibench.capture.ProtoTrace.source(trace, manifest, "workload"),
                         output);
         long encoded = ((Number) report.get("encoded_records")).longValue();
         long expected = manifest.get("workload_operations").getAsLong();

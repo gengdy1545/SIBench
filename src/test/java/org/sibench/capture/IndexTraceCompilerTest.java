@@ -20,6 +20,313 @@ import java.util.*;
 public class IndexTraceCompilerTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    /** Reuse the hand-built rows, then remove their Parquet so the proto compiler cannot depend on it. */
+    private void indexOnlyBaseline(CaptureConfig config) throws Exception {
+        Path directory = config.layout().output();
+        var source = SourceSchema.hybench(config.source());
+        var catalog = IndexCatalog.fromSchema(source);
+        var files = new ArrayList<Map<String, Object>>();
+        long rowId = 1;
+        int tableIndex = 0;
+        for (var table : source.tables()) {
+            Path parquet = directory.resolve(table.name() + ".parquet");
+            try (var reader = org.apache.parquet.hadoop.ParquetReader.<org.apache.parquet.example.data.Group>builder(
+                    new org.apache.parquet.hadoop.example.GroupReadSupport(),
+                    new org.apache.hadoop.fs.Path(parquet.toUri())).build()) {
+                var row = reader.read();
+                var full = new PgBaselineExport.Table(table, catalog.primary(tableIndex + 1).column(), true,
+                        new org.apache.parquet.schema.MessageType(table.name(), row.getType().getFields()), 1, true, List.of());
+                var projected = PgBaselineExport.indexColumns(full, catalog);
+                var text = new String[projected.schema().getFieldCount() - 2];
+                for (int i = 0; i < text.length; i++) {
+                    String column = projected.schema().getFieldName(i);
+                    text[i] = row.getFieldRepetitionCount(column) == 0 ? null
+                            : row.getValueToString(row.getType().getFieldIndex(column), 0);
+                }
+                boolean[] read = {false};
+                for (var written : PgBaselineExport.writeIndexTable(projected, tableIndex, rowId,
+                        () -> { if (read[0]) return null; read[0] = true; return text; },
+                        directory, config.layout(), catalog)) files.add(written.file());
+            }
+            Files.delete(parquet);
+            rowId++;
+            tableIndex++;
+        }
+        Files.write(directory.resolve("files.jsonl"), files.stream().map(new Gson()::toJson).toList());
+        Files.delete(directory.resolve(BaselineManifest.FILE));
+        var counts = new LinkedHashMap<String, Long>();
+        source.tables().forEach(t -> counts.put(t.name(), 1L));
+        BaselineManifest.publish(source, directory, counts, TraceOutput.PROTO);
+    }
+
+    @Test
+    public void protoCompilesAndReplaysGroupsWithoutParquetOrDetailedOperations() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        var config = baseline(fixture);
+        Path raw = nonPrefixCapture(fixture, config, "1");
+        indexOnlyBaseline(config);
+        Path output = fixture.resolve("proto");
+        var manifest = CaptureFixtureCompiler.compile(SourceSchema.hybench(config.source()), config.layout(), raw,
+                output, new IndexTraceCompiler.Checks(null, null), TraceOutput.PROTO);
+        assertEquals("proto", manifest.get("output"));
+        assertFalse(Files.exists(output.resolve("baseline.pb.zst")));
+        var inventory = new Gson().toJsonTree(manifest).getAsJsonObject().getAsJsonObject("proto_files")
+                .getAsJsonArray("baseline");
+        assertEquals(8, inventory.size());
+        for (var item : inventory) {
+            Path retained = output.resolve(item.getAsJsonObject().get("path").getAsString());
+            assertTrue(Files.isSameFile(config.layout().output().resolve(retained.getFileName()), retained));
+        }
+        assertStoredPayloadsReachDispatch(output);
+        assertEquals(List.of(), manifest.get("incremental_files"));
+        assertFalse(Files.exists(output.resolve("workload.ops")));
+        assertFalse(manifest.containsKey("baseline_directory"));
+        try (var files = Files.list(output)) {
+            assertFalse(files.anyMatch(p -> p.toString().endsWith(".parquet")));
+        }
+        Files.move(config.layout().output(), fixture.resolve("export-not-needed"));
+        assertEquals("trace_integrity_and_supply_valid", ReferenceReplay.check(output, ReplayConfig.defaults()).get("status"));
+        Path reference = fixture.resolve("reference.json");
+        var replay = ReferenceReplay.run(output, ReplayConfig.defaults(), List.of(true), reference);
+        assertEquals("passed", replay.get("status"));
+        for (var result : (List<?>) replay.get("results"))
+            assertFalse(((Map<?, ?>) result).containsKey("primary_state_checksum"));
+        Path index = fixture.resolve("index");
+        var service = new org.sibench.adapters.ServiceConfig("rocksdb", null, index, 0,
+                org.sibench.adapters.proto.ValueKind.ROW_ID, null, false);
+        assertEquals("passed", org.sibench.adapters.ServiceReplay.run(output, ReplayConfig.defaults(), service,
+                reference, fixture.resolve("service.json")).get("status"));
+        assertEquals("passed", org.sibench.adapters.ServiceReplay.verify(output, ReplayConfig.defaults(), service,
+                reference, fixture.resolve("reopen.json")).get("status"));
+        var failure = assertThrows(java.io.IOException.class, () -> SnapshotLookupValidation.run(output,
+                ReplayConfig.defaults(), List.of(true), fixture.resolve("oracle.json")));
+        assertTrue(failure.getMessage().contains("requires full"));
+        assertThrows(java.io.IOException.class, () -> ReferenceReplay.run(output, ReplayConfig.defaults(),
+                List.of(false), fixture.resolve("locator.json")));
+        Path analysis = fixture.resolve("locality-proto");
+        org.sibench.analysis.UpdateLocality.run(output, Path.of("config/sibench.yaml"), analysis);
+        assertTrue(Files.exists(analysis.resolve("summary.json")));
+        byte[] bytes = Files.readAllBytes(output.resolve("workload.pb.zst"));
+        Files.write(output.resolve("workload.pb.zst"), Arrays.copyOf(bytes, bytes.length - 1));
+        assertThrows(java.io.IOException.class, () -> ReferenceReplay.check(output, ReplayConfig.defaults()));
+    }
+
+    @Test
+    public void protoPreservesReadYourWritesAndFreshIdentityAfterDeleteReinsert() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        var config = baseline(fixture);
+        String first = row("2024-01-01 00:00:00"), second = row("2024-01-02 00:00:00");
+        Path raw = capture(fixture, List.of(change("update", first, second) + search("self", 1)
+                + change("delete", second, "null") + change("insert", "null", second) + search("reinsert", 1)
+                + "{\"event\":\"transaction_commit\",\"xid\":9}\n"));
+        indexOnlyBaseline(config);
+        Path output = fixture.resolve("proto");
+        var manifest = CaptureFixtureCompiler.compile(SourceSchema.hybench(config.source()), config.layout(), raw,
+                output, new IndexTraceCompiler.Checks(null, null), TraceOutput.PROTO);
+        assertEquals(2L, manifest.get("transaction_local_searches"));
+        var operations = new ArrayList<IndexOperationTrace.Operation>();
+        ProtoTrace.source(output, new Gson().toJsonTree(manifest).getAsJsonObject(), "workload").read(operations::add);
+        var primaries = operations.stream().filter(o -> o.kind() == IndexOperationTrace.UPSERT && o.index() == 0).toList();
+        assertEquals(List.of(8L, 9L), primaries.stream().map(IndexOperationTrace.Operation::rowId).toList());
+        assertEquals("passed", ReferenceReplay.run(output, ReplayConfig.defaults(), List.of(true),
+                fixture.resolve("reference.json")).get("status"));
+    }
+
+    @Test
+    public void protoReferenceRejectsWrongNativePinnedResult() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        var config = baseline(fixture);
+        Path raw = nonPrefixCapture(fixture, config, "2");
+        indexOnlyBaseline(config);
+        Path output = fixture.resolve("proto");
+        CaptureFixtureCompiler.compile(SourceSchema.hybench(config.source()), config.layout(), raw,
+                output, new IndexTraceCompiler.Checks(null, null), TraceOutput.PROTO);
+        var failure = assertThrows(java.io.IOException.class, () -> ReferenceReplay.run(output,
+                ReplayConfig.defaults(), List.of(true), fixture.resolve("reference.json")));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("Search count mismatch"));
+    }
+
+    /** Covers the inventory reader, coverage tee, transaction buffer and dispatcher together. */
+    private static void assertStoredPayloadsReachDispatch(Path output) throws Exception {
+        var input = ReferenceReplay.prepare(output, ReplayConfig.defaults());
+        var packets = Collections.newSetFromMap(new IdentityHashMap<org.sibench.adapters.proto.Request, Boolean>());
+        long[] sent = {0};
+        ReplayTarget.Factory factory = client -> new ReplayTarget() {
+            @Override public SendHandle send(long sequence, IndexOperationTrace.Operation operation) {
+                throw new AssertionError("Stored payload was discarded");
+            }
+            @Override public SendHandle send(long sequence, IndexOperationTrace.Operation operation,
+                    org.sibench.adapters.proto.Request stored) {
+                assertNotNull(stored);
+                assertTrue(packets.contains(stored));
+                sent[0]++;
+                return SendHandle.completed();
+            }
+            @Override public SendHandle sendCommit(long sequence, long transaction, long version) {
+                return SendHandle.completed();
+            }
+        };
+        for (boolean runtime : List.of(false, true)) {
+            try (var projection = ReplayProjection.withClients(ReplayConfig.defaults(), runtime, factory, true)) {
+                (runtime ? input.workload() : input.baseline()).read(new IndexOperationTrace.Consumer() {
+                    @Override public void accept(IndexOperationTrace.Operation operation) {
+                        throw new AssertionError("Proto reader discarded the request");
+                    }
+                    @Override public void accept(org.sibench.adapters.proto.TraceRecord record,
+                            List<IndexOperationTrace.Operation> views) throws java.io.IOException {
+                        if (record.hasRequest()) packets.add(record.getRequest());
+                        projection.accept(record, views);
+                    }
+                });
+                projection.finish();
+            }
+        }
+        assertTrue(sent[0] > 8);
+    }
+
+    @Test(timeout = 20000)
+    public void generatesFromSourceStreamsWithoutWholeRunRawOrOfflineCompilation() throws Exception {
+        generatesDirect(false);
+    }
+
+    @Test(timeout = 20000)
+    public void fullAddsRawTapToTheSameDirectProjection() throws Exception {
+        generatesDirect(true);
+    }
+
+    private void generatesDirect(boolean full) throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        var config = baseline(fixture);
+        if (!full) indexOnlyBaseline(config);
+        var captureOptions = org.sibench.config.ConfigValues.object(config.layout().document(), "capture");
+        captureOptions.put("output", full ? "full" : "proto");
+        config.layout().document().put("capture", captureOptions);
+        Path inputs = temporary.newFolder().toPath();
+        Path raw = capture(inputs, List.of(change("update", row("2024-01-01 00:00:00"), row("2024-01-02 00:00:00"))
+                + String.join("\n", snapshotSearch("self", "2024-01-02 00:00:00", 100, "[]", 50, false))
+                + "\n{\"event\":\"transaction_commit\",\"xid\":9,\"csn\":101}\n"));
+        Path source = Files.createDirectory(fixture.resolve("source"));
+        Files.createDirectories(fixture.resolve("native"));
+        Files.copy(Path.of("config/sibench.yaml"), fixture.resolve("native/sibench.yaml"));
+        var profile = new CaptureProfile(SourceSchema.hybench(config.source()), config.layout(), source, fixture);
+        Path endpoint = fixture.resolve("capture.sock");
+        var closed = new java.util.concurrent.atomic.AtomicBoolean();
+        try (var direct = new DirectCapture(profile, endpoint, watermarkConnection(closed),
+                new IndexTraceCompiler.Checks(null, null))) {
+            direct.awaitReady();
+            sendSource(endpoint, "jdbc-1-1.jsonl.zst", inputs.resolve("jdbc-fixture.jsonl.zst"), false);
+            sendSource(endpoint, "pg-1.jsonl.zst", raw, true);
+            assertTrue(Files.exists(fixture.resolve("trace/workload.pb.zst")));
+            var audit = direct.sessionAudit(source.resolve("jdbc-1-1.jsonl.zst"), source.resolve("pg-1.jsonl.zst"));
+            assertEquals("passed", ((Map<?, ?>) audit.get("audit")).get("status"));
+            Files.writeString(source.resolve("capture-run.json"), new Gson().toJson(Map.of(
+                    "status", "complete", "session_order", "concurrent", "sessions", List.of(audit))));
+            direct.endSources();
+            assertTrue(closed.get());
+            assertEquals("direct_source_events", direct.finish().get("generation"));
+        }
+        assertFalse(Files.exists(fixture.resolve("transactions")));
+        try (var paths = Files.list(source)) {
+            assertEquals(full, paths.anyMatch(path -> path.toString().endsWith(".jsonl.zst")));
+        }
+        assertEquals(full, Files.exists(fixture.resolve("trace/workload.ops")));
+        if (full) assertEquals("passed", RequestCaptureAudit.audit(source.resolve("jdbc-1-1.jsonl.zst"),
+                source.resolve("pg-1.jsonl.zst"), false).get("status"));
+        assertEquals("passed", ReferenceReplay.run(fixture.resolve("trace"), ReplayConfig.defaults(),
+                List.of(true), fixture.resolve("reference.json")).get("status"));
+    }
+
+    @Test(timeout = 20000)
+    public void missingSourceEndMarkerPreventsTracePublication() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        var config = baseline(fixture);
+        indexOnlyBaseline(config);
+        var options = org.sibench.config.ConfigValues.object(config.layout().document(), "capture");
+        options.put("output", "proto");
+        config.layout().document().put("capture", options);
+        Path source = Files.createDirectory(fixture.resolve("source"));
+        Files.createDirectories(fixture.resolve("native"));
+        Files.copy(Path.of("config/sibench.yaml"), fixture.resolve("native/sibench.yaml"));
+        Path endpoint = fixture.resolve("capture.sock");
+        var profile = new CaptureProfile(SourceSchema.hybench(config.source()), config.layout(), source, fixture);
+        try (var run = CaptureRun.beginExternal(source, "incomplete_source");
+                var direct = new DirectCapture(profile, endpoint,
+                watermarkConnection(new java.util.concurrent.atomic.AtomicBoolean()),
+                new IndexTraceCompiler.Checks(null, null))) {
+            direct.awaitReady();
+            try (var socket = java.nio.channels.SocketChannel.open(java.net.StandardProtocolFamily.UNIX)) {
+                socket.connect(java.net.UnixDomainSocketAddress.of(endpoint));
+                var bytes = java.nio.ByteBuffer.wrap(("pg-1.jsonl.zst\n" + header(1, "summary") + "\n")
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                while (bytes.hasRemaining()) socket.write(bytes);
+            }
+            long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
+            while (direct.paths(true).isEmpty() && System.nanoTime() < deadline) Thread.sleep(1);
+            var error = assertThrows(java.io.IOException.class,
+                    () -> direct.sessionAudit(null, source.resolve("pg-1.jsonl.zst")));
+            assertTrue(error.toString(), error.getMessage().contains("complete") || error.getMessage().contains("failed"));
+            JsonObject recorded;
+            synchronized (run) { recorded = json(source.resolve("capture-run.json")); }
+            while (recorded.get("status").getAsString().equals("running") && System.nanoTime() < deadline) {
+                Thread.sleep(1);
+                synchronized (run) { recorded = json(source.resolve("capture-run.json")); }
+            }
+            assertEquals("failed", recorded.get("status").getAsString());
+            assertEquals("direct_generation", recorded.getAsJsonObject("failure").get("stage").getAsString());
+            assertTrue(recorded.getAsJsonObject("failure").get("stacktrace").getAsString()
+                    .contains("Source stream lost its completion marker"));
+        }
+        assertTrue(Files.exists(fixture.resolve("trace/INCOMPLETE")));
+        assertFalse(Files.exists(fixture.resolve("trace/manifest.json")));
+        assertTrue(Files.exists(fixture.resolve("transactions/failure.json")));
+    }
+
+    private static java.sql.Connection watermarkConnection(java.util.concurrent.atomic.AtomicBoolean closed) {
+        return (java.sql.Connection) java.lang.reflect.Proxy.newProxyInstance(
+                IndexTraceCompilerTest.class.getClassLoader(), new Class<?>[] {java.sql.Connection.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("close")) { closed.set(true); return null; }
+                    if (!method.getName().equals("createStatement")) throw new AssertionError(method);
+                    return java.lang.reflect.Proxy.newProxyInstance(IndexTraceCompilerTest.class.getClassLoader(),
+                            new Class<?>[] {java.sql.Statement.class}, (statement, call, values) -> {
+                                if (call.getName().equals("close")) return null;
+                                if (!call.getName().equals("executeQuery")) throw new AssertionError(call);
+                                assertTrue(values[0].toString().startsWith("SELECT public.sibench_capture_watermark("));
+                                return java.lang.reflect.Proxy.newProxyInstance(IndexTraceCompilerTest.class.getClassLoader(),
+                                        new Class<?>[] {java.sql.ResultSet.class}, (result, get, columns) -> switch (get.getName()) {
+                                            case "next" -> true;
+                                            case "getLong" -> 1000L;
+                                            case "close" -> null;
+                                            default -> throw new AssertionError(get);
+                                        });
+                            });
+                });
+    }
+
+    private static void sendSource(Path endpoint, String name, Path input, boolean server) throws Exception {
+        try (var socket = java.nio.channels.SocketChannel.open(java.net.StandardProtocolFamily.UNIX);
+                var source = ServerTrace.open(input)) {
+            socket.connect(java.net.UnixDomainSocketAddress.of(endpoint));
+            var output = new java.io.BufferedWriter(new java.io.OutputStreamWriter(
+                    java.nio.channels.Channels.newOutputStream(socket), java.nio.charset.StandardCharsets.UTF_8));
+            output.write(name); output.newLine();
+            long sequence = 0;
+            for (String line; (line = source.readLine()) != null; ) {
+                var record = JsonParser.parseString(line).getAsJsonObject();
+                String event = record.get("event").getAsString();
+                if (server && (event.equals("transaction_commit") || event.equals("transaction_abort")))
+                    record.addProperty("capture_sequence", ++sequence);
+                output.write(record.toString()); output.newLine(); output.flush();
+            }
+            output.write("{\"event\":\"capture_end\"}\n"); output.flush();
+            if (server) {
+                var ack = java.nio.ByteBuffer.allocate(1);
+                assertEquals(1, socket.read(ack));
+                assertEquals('E', ack.array()[0]);
+            }
+        }
+    }
+
     private CaptureConfig baseline(Path fixture) throws Exception {
         return baseline(fixture, -1, -1);
     }
@@ -122,7 +429,7 @@ public class IndexTraceCompilerTest {
         var source = SourceSchema.hybench(original.source());
         var expected = new LinkedHashMap<String, Long>();
         for (var table : source.tables()) expected.put(table.name(), 1L);
-        BaselineManifest.publish(source, baseline, expected);
+        BaselineManifest.publish(source, baseline, expected, TraceOutput.FULL);
         return new CaptureConfig(
                 root,
                 original.source(),
@@ -549,6 +856,36 @@ public class IndexTraceCompilerTest {
                                 new ReplayConfig(true, "none", 0, 0, 0, 0, "operation"),
                                 fixture.resolve("snapshots.json"))
                         .get("status"));
+    }
+
+    @Test
+    public void replayMatrixRetainsStateAuditAndOrdinaryReplayKeepsQueryDigests() throws Exception {
+        Path fixture = temporary.newFolder().toPath();
+        CaptureConfig config = baseline(fixture);
+        String first = row("2024-01-01 00:00:00"), second = row("2024-01-02 00:00:00");
+        var transactions = new ArrayList<String>();
+        for (int i = 0; i < 128; i++) {
+            transactions.add(change("update", i % 2 == 0 ? first : second, i % 2 == 0 ? second : first)
+                    + search("read" + i, i % 2 == 0 ? 1 : 0)
+                    + "{\"event\":\"transaction_commit\",\"xid\":9}\n");
+        }
+        Path raw = capture(fixture, transactions), output = fixture.resolve("compiled");
+        audit(config, raw, first);
+        compile(config, raw, output);
+        ReferenceReplay.run(output, ReplayConfig.defaults(), fixture.resolve("replay.json"));
+        Path matrix = fixture.resolve("matrix");
+        ReplayMatrixValidation.validate(output, matrix);
+        var ordinary = JsonParser.parseString(Files.readString(fixture.resolve("replay.json")))
+                .getAsJsonObject().getAsJsonArray("results");
+        var audited = JsonParser.parseString(Files.readString(
+                matrix.resolve("secondary-true-operation-1.json")))
+                .getAsJsonObject().getAsJsonArray("results");
+        for (int i = 0; i < ordinary.size(); i++) {
+            assertFalse(ordinary.get(i).getAsJsonObject().has("primary_state_checksum"));
+            assertTrue(audited.get(i).getAsJsonObject().has("primary_state_checksum"));
+            assertEquals(ordinary.get(i).getAsJsonObject().get("query_digest_sha256"),
+                    audited.get(i).getAsJsonObject().get("query_digest_sha256"));
+        }
     }
 
 
@@ -1056,7 +1393,7 @@ public class IndexTraceCompilerTest {
         audit(config, raw, second);
         Path reference = fixture.resolve("reference"), spilled = fixture.resolve("spilled");
         compile(config, raw, reference);
-        IndexTraceCompiler.compile(
+        CaptureFixtureCompiler.compile(
                 SourceSchema.hybench(config.source()),
                 config.layout(),
                 raw,
@@ -1087,7 +1424,7 @@ public class IndexTraceCompilerTest {
 
     private static Map<String, Object> compile(CaptureConfig config, Path raw, Path output)
             throws Exception {
-        return IndexTraceCompiler.compile(
+        return CaptureFixtureCompiler.compile(
                 SourceSchema.hybench(config.source()),
                 config.layout(),
                 raw,
@@ -1218,10 +1555,10 @@ public class IndexTraceCompilerTest {
         Files.writeString(output.resolve("manifest.json"), new Gson().toJson(manifest));
         // A maintenance unit missing one secondary entry, with matching digest and count, must be
         // refused by the coverage check that runs in the supply pass.
-        Path workload = output.resolve("workload.ops"), saved = fixture.resolve("workload.saved");
+        Path workload = output.resolve("workload.pb.zst"), saved = fixture.resolve("workload.saved");
         Files.copy(workload, saved);
         var operations = new java.util.ArrayList<IndexOperationTrace.Operation>();
-        IndexOperationTrace.read(saved, operations::add);
+        ProtoTrace.read(saved, null, null, operations::add);
         int dropped = -1;
         for (int i = 0; i < operations.size() && dropped < 0; i++)
             if (operations.get(i).index() > 0
@@ -1231,11 +1568,15 @@ public class IndexTraceCompilerTest {
         assertTrue(dropped > 0);
         operations.remove(dropped);
         Files.delete(workload);
-        try (var writer = new IndexOperationTrace.Writer(workload)) {
-            for (var operation : operations) writer.append(operation);
+        var replacement = new ProtoTrace.Writer(workload);
+        try (replacement) {
+            for (var operation : operations) replacement.append(operation);
         }
         var truncated = manifest.deepCopy();
-        truncated.addProperty("workload_trace_sha256", IndexOperationTrace.sha256(workload));
+        var replacementFiles = new com.google.gson.JsonArray();
+        replacementFiles.add(new Gson().toJsonTree(ProtoTrace.file("workload.pb.zst", replacement)));
+        truncated.getAsJsonObject("proto_files").add("workload", replacementFiles);
+        truncated.addProperty("workload_trace_sha256", ProtoTrace.identity(replacementFiles));
         truncated.addProperty("workload_operations", operations.size());
         Files.writeString(output.resolve("manifest.json"), new Gson().toJson(truncated));
         var partial =
@@ -1414,7 +1755,7 @@ public class IndexTraceCompilerTest {
         var config = baseline(fixture);
         Path output = fixture.resolve("compiled");
         compile(config, nonPrefixCapture(fixture, config, "1"), output);
-        Path baseline = config.layout().output(), hidden = fixture.resolve("baseline-held");
+        Path baseline = output.resolve("baseline.pb.zst"), hidden = fixture.resolve("baseline-held");
         Files.move(baseline, hidden);
         ReferenceReplay.Input input;
         try {
@@ -1726,11 +2067,11 @@ public class IndexTraceCompilerTest {
             assertEquals(
                     BaselineGenerator.sha256(output.resolve("access-ledger.json")),
                     manifest.get("access_ledger_sha256").getAsString());
-            // The traces are hashed as they are written; the digest is that of the file.
+            // The identity binds ordered protobuf shards and logical operation counts.
             assertEquals(
-                    IndexOperationTrace.sha256(output.resolve("workload.ops")),
+                    ProtoTrace.identity(manifest.getAsJsonObject("proto_files").getAsJsonArray("workload")),
                     manifest.get("workload_trace_sha256").getAsString());
-            // The baseline load is not stored; deriving it again yields the recorded stream.
+            // Both output modes replay the persisted protobuf baseline.
             assertFalse(Files.exists(output.resolve("baseline.ops")));
             assertEquals(
                     manifest.get("baseline_operations").getAsLong(),
@@ -1739,41 +2080,21 @@ public class IndexTraceCompilerTest {
             altered.addProperty("baseline_trace_sha256", "0".repeat(64));
             Files.writeString(output.resolve("manifest.json"), altered.toString());
             var failure = assertThrows(java.io.IOException.class, () -> BaselineOperations.of(output).read(operation -> {}));
-            assertTrue(failure.getMessage(), failure.getMessage().contains("differs from the compiled trace"));
+            assertTrue(failure.getMessage(), failure.getMessage().contains("inventory identity mismatch"));
+            var undeclared = manifest.deepCopy();
+            undeclared.remove("output");
+            Files.writeString(output.resolve("manifest.json"), undeclared.toString());
+            var strategy = assertThrows(java.io.IOException.class,
+                    () -> ReferenceReplay.check(output, ReplayConfig.defaults()));
+            assertTrue(strategy.getMessage().contains("output strategy"));
             Files.writeString(output.resolve("manifest.json"), manifest.toString());
-            assertEquals("row_audit", manifest.getAsJsonObject("verification").get("mode").getAsString());
+            assertEquals("runtime", manifest.getAsJsonObject("verification").get("mode").getAsString());
             assertEquals("not_checked", manifest.get("capture_completeness").getAsString());
         }
     }
 
     @Test
-    public void indexCountersThatDisagreeWithTheLedgerLeaveTheTraceUncommitted() throws Exception {
-        Path fixture = temporary.newFolder().toPath();
-        CaptureConfig config = baseline(fixture);
-        Path raw = auditedConcurrentCapture(fixture, config, true);
-        compile(config, raw, fixture.resolve("first"));
-        JsonObject ledger = json(fixture.resolve("first/access-ledger.json"));
-        var schema = SourceSchema.hybench(config.source());
-        Path[] agree = counters(fixture, ledger, 0), disagree = counters(fixture, ledger, 1);
-        Path output = fixture.resolve("checked");
-        IndexTraceCompiler.compile(
-                schema, config.layout(), raw, output,
-                new IndexTraceCompiler.Checks(RowStateAudit.defaultReport(raw), agree[0], agree[1]));
-        assertEquals("consistent", json(output.resolve("manifest.json")).get("capture_completeness").getAsString());
-        Path rejected = fixture.resolve("rejected");
-        var failure =
-                assertThrows(
-                        java.io.IOException.class,
-                        () -> IndexTraceCompiler.compile(
-                                schema, config.layout(), raw, rejected,
-                                new IndexTraceCompiler.Checks(RowStateAudit.defaultReport(raw), disagree[0], disagree[1])));
-        assertTrue(failure.getMessage(), failure.getMessage().contains("disagree"));
-        assertTrue(Files.exists(rejected.resolve("INCOMPLETE")));
-        assertEquals("inconsistent", json(rejected.resolve("capture-completeness.json")).get("status").getAsString());
-    }
-
-    @Test
-    public void runtimeCompilationNeedsNoIndependentAuditButStillRejectsCounterMismatch() throws Exception {
+    public void runtimeCountersGuardPublicationWithoutIndependentRowAudit() throws Exception {
         Path fixture = temporary.newFolder().toPath();
         CaptureConfig config = baseline(fixture);
         var schema = SourceSchema.hybench(config.source());
@@ -1782,16 +2103,20 @@ public class IndexTraceCompilerTest {
         Path[] agree = counters(fixture, json(fixture.resolve("audited/access-ledger.json")), 0);
         Files.delete(RowStateAudit.defaultReport(raw));
         Path runtime = fixture.resolve("runtime");
-        IndexTraceCompiler.compile(schema, config.layout(), raw, runtime,
-                new IndexTraceCompiler.Checks(null, agree[0], agree[1]));
+        CaptureFixtureCompiler.compile(schema, config.layout(), raw, runtime,
+                new IndexTraceCompiler.Checks(agree[0], agree[1]));
         var manifest = json(runtime.resolve("manifest.json"));
         assertEquals("runtime", manifest.getAsJsonObject("verification").get("mode").getAsString());
         assertFalse(manifest.has("row_state_audit_sha256"));
         assertEquals(json(fixture.resolve("audited/manifest.json")).get("workload_trace_sha256"),
                 manifest.get("workload_trace_sha256"));
         Path[] wrong = counters(Files.createDirectory(fixture.resolve("wrong")), json(runtime.resolve("access-ledger.json")), 1);
-        assertThrows(java.io.IOException.class, () -> IndexTraceCompiler.compile(schema, config.layout(), raw,
-                fixture.resolve("rejected-runtime"), new IndexTraceCompiler.Checks(null, wrong[0], wrong[1])));
+        Path rejected = fixture.resolve("rejected-runtime");
+        var failure = assertThrows(java.io.IOException.class, () -> CaptureFixtureCompiler.compile(
+                schema, config.layout(), raw, rejected, new IndexTraceCompiler.Checks(wrong[0], wrong[1])));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("disagree"));
+        assertTrue(Files.exists(rejected.resolve("INCOMPLETE")));
+        assertEquals("inconsistent", json(rejected.resolve("capture-completeness.json")).get("status").getAsString());
     }
     @Test
     public void runtimeCompilationRejectsMalformedImagesEvenWhenTheTransactionAborts() throws Exception {
@@ -1823,8 +2148,8 @@ public class IndexTraceCompilerTest {
                         Path output = directory.resolve("trace");
                         assertThrows(operation + " " + defect + " old=" + oldImage + " aborted=" + aborted,
                                 java.io.IOException.class,
-                                () -> IndexTraceCompiler.compile(schema, config.layout(), raw, output,
-                                        new IndexTraceCompiler.Checks(null, null, null)));
+                                () -> CaptureFixtureCompiler.compile(schema, config.layout(), raw, output,
+                                        new IndexTraceCompiler.Checks(null, null)));
                         assertFalse(Files.exists(output.resolve("manifest.json")));
                     }
                 }

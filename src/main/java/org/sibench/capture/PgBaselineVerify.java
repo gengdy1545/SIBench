@@ -56,6 +56,9 @@ public final class PgBaselineVerify {
                 Files.readAllLines(directory.resolve("files.jsonl")).stream()
                         .map(line -> JsonParser.parseString(line).getAsJsonObject())
                         .toList();
+        for (JsonObject file : files)
+            if (file.get("path").getAsString().endsWith(".pb.zst"))
+                throw new IOException("Complete-row baseline audit requires capture.output: full");
         Set<String> expectedTables =
                 schema.tables().stream()
                         .map(SourceSchema.Table::name)

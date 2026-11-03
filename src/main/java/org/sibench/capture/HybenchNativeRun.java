@@ -54,32 +54,12 @@ public final class HybenchNativeRun {
     private static void execute(Path resolved, Path statements, Path raw, CaptureRun run)
             throws Exception {
         System.setProperty("sibench.capture.directory", raw.toAbsolutePath().toString());
-        Properties properties = new Properties();
-        try (InputStream input = Files.newInputStream(resolved)) {
-            properties.load(input);
-        }
-        Class<?> loader = Class.forName("com.hybench.ConfigLoader");
-        loader.getField("prop").set(null, properties);
-        loader.getField("confFile").set(null, resolved.toAbsolutePath().toString());
-        Class.forName(CaptureDriver.class.getName());
-        Class<?> hybench = Class.forName("com.hybench.HyBench");
-        Object benchmark = hybench.getConstructor().newInstance();
-        Object reader =
-                Class.forName("com.hybench.workload.SqlReader")
-                        .getConstructor(String.class)
-                        .newInstance(statements.toString());
-        Object sql = reader.getClass().getMethod("loader").invoke(reader);
-        var setSqls =
-                hybench.getDeclaredMethod(
-                        "setSqls", Class.forName("com.hybench.workload.Sqlstmts"));
-        setSqls.setAccessible(true);
-        setSqls.invoke(benchmark, sql);
-        Field verbose = hybench.getDeclaredField("verbose");
-        verbose.setAccessible(true);
-        verbose.set(benchmark, false);
+        Object benchmark = benchmark(resolved, statements);
+        Class<?> hybench = benchmark.getClass();
         Object result = hybench.getMethod("getRes").invoke(benchmark);
         Object hist = result.getClass().getMethod("getHist").invoke(result);
         for (String phase : new String[] {"ap", "tp", "xp"}) {
+            if (DirectCapture.budgetStopped(raw)) break;
             run.phase(phase, null);
             long started = System.nanoTime();
             try {
@@ -120,4 +100,33 @@ public final class HybenchNativeRun {
             run.phase(phase, summary);
         }
     }
+
+    /** The native bootstrap is shared with explicit client-lifecycle checks. */
+    static Object benchmark(Path resolved, Path statements) throws Exception {
+        Properties properties = new Properties();
+        try (InputStream input = Files.newInputStream(resolved)) {
+            properties.load(input);
+        }
+        Class<?> loader = Class.forName("com.hybench.ConfigLoader");
+        loader.getField("prop").set(null, properties);
+        loader.getField("confFile").set(null, resolved.toAbsolutePath().toString());
+        Class.forName(CaptureDriver.class.getName());
+        Class<?> hybench = Class.forName("com.hybench.HyBench");
+        Object benchmark = hybench.getConstructor().newInstance();
+        Object reader =
+                Class.forName("com.hybench.workload.SqlReader")
+                        .getConstructor(String.class)
+                        .newInstance(statements.toString());
+        Object sql = reader.getClass().getMethod("loader").invoke(reader);
+        var setSqls =
+                hybench.getDeclaredMethod(
+                        "setSqls", Class.forName("com.hybench.workload.Sqlstmts"));
+        setSqls.setAccessible(true);
+        setSqls.invoke(benchmark, sql);
+        Field verbose = hybench.getDeclaredField("verbose");
+        verbose.setAccessible(true);
+        verbose.set(benchmark, false);
+        return benchmark;
+    }
+
 }

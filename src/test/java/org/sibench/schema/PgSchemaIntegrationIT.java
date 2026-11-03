@@ -311,7 +311,7 @@ public class PgSchemaIntegrationIT {
 
     private void captureAndCliBoundaries(Database db, Map<String, Object> config) throws Exception {
         String id = UUID.randomUUID().toString().replace("-", "");
-        Path artifacts = Path.of("results/poc/schema-preflight-integration-" + id);
+        Path artifacts = Path.of("results/capture/schema-preflight-integration-" + id);
         var capture = ConfigValues.object(config, "capture");
         capture.put("raw_directory", artifacts.resolve("raw").toString());
         config.put("capture", capture);

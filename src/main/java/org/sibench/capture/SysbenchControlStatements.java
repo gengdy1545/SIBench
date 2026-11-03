@@ -9,7 +9,7 @@ import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
- * The number of transaction-control statements (BEGIN / COMMIT) a pinned sysbench script issues.
+ * The counted transaction-control statements (BEGIN / COMMIT) a pinned sysbench script issues.
  *
  * <p>The pinned scripts guard every control call with {@code if not sysbench.opt.skip_trx then}
  * (for example {@code oltp_read_write.lua} around {@code prepare_begin()}, {@code begin()} and
@@ -18,6 +18,8 @@ import java.util.regex.Pattern;
  * call that only prepares the statement; the per-event calls are {@code begin()} and
  * {@code commit()}. Scripts such as {@code oltp_delete.lua} and {@code oltp_update_index.lua} call
  * neither and run in autocommit, so their control-statement count is zero regardless of the switch.
+ * A driver-ignored error retries the event, adding a counted BEGIN but no COMMIT; the driver's
+ * direct PQexec(ROLLBACK) bypasses its counters.
  */
 public final class SysbenchControlStatements {
     private static final String FLAG = "--skip-trx=";
@@ -30,6 +32,7 @@ public final class SysbenchControlStatements {
      * @param beginCallsPerEvent {@code begin()} calls in one event, ignoring prepare and definitions
      * @param commitCallsPerEvent {@code commit()} calls in one event, ignoring the same
      * @param controlStatements BEGIN plus COMMIT executions the whole run performs
+     * @param ignoredErrors failed attempts the pinned driver rolled back and retried
      * @param explicitTransactions whether the script runs its event inside an explicit transaction
      */
     public record Derivation(
@@ -37,6 +40,7 @@ public final class SysbenchControlStatements {
             int beginCallsPerEvent,
             int commitCallsPerEvent,
             long events,
+            long ignoredErrors,
             long controlStatements,
             boolean explicitTransactions) {
         public Map<String, Object> describe() {
@@ -44,25 +48,28 @@ public final class SysbenchControlStatements {
             result.put("skip_trx", skipTrx);
             result.put("begin_calls_per_event", beginCallsPerEvent);
             result.put("commit_calls_per_event", commitCallsPerEvent);
-            result.put("control_statements_per_event", controlStatements / Math.max(events, 1));
+            result.put("control_statements_per_event", skipTrx ? 0L : (long) beginCallsPerEvent + commitCallsPerEvent);
+            result.put("retry_begin_statements", skipTrx ? 0L : beginCallsPerEvent * ignoredErrors);
             result.put("control_statements", controlStatements);
             result.put("explicit_transactions", explicitTransactions);
             return result;
         }
     }
 
-    public static Derivation derive(Path script, boolean skipTrx, long events) throws IOException {
-        return derive(Files.readString(script), skipTrx, events);
+    public static Derivation derive(Path script, boolean skipTrx, long events, long ignoredErrors) throws IOException {
+        return derive(Files.readString(script), skipTrx, events, ignoredErrors);
     }
 
     /** Pure over the Lua source and the run's own switch. */
-    public static Derivation derive(String lua, boolean skipTrx, long events) {
-        if (events < 0) throw new IllegalArgumentException("events must not be negative");
+    public static Derivation derive(String lua, boolean skipTrx, long events, long ignoredErrors) {
+        if (events < 0 || ignoredErrors < 0) throw new IllegalArgumentException("Counts must not be negative");
         String body = stripComments(lua);
         int begins = calls(body, "begin"), commits = calls(body, "commit");
         long perEvent = skipTrx ? 0L : (long) begins + commits;
         return new Derivation(
-                skipTrx, begins, commits, events, perEvent * events, !skipTrx && perEvent > 0L);
+                skipTrx, begins, commits, events, ignoredErrors,
+                Math.addExact(Math.multiplyExact(perEvent, events), skipTrx ? 0L : Math.multiplyExact(begins, ignoredErrors)),
+                !skipTrx && perEvent > 0L);
     }
 
     /**
@@ -110,7 +117,7 @@ public final class SysbenchControlStatements {
                             + derivation.skipTrx()
                             + ", so "
                             + derivation.events()
-                            + " events derive "
+                            + " events and " + derivation.ignoredErrors() + " retries derive "
                             + derivation.controlStatements()
                             + " control statements, but the server trace has only "
                             + residual

@@ -51,3 +51,12 @@ Datum sibench_row_capture(PG_FUNCTION_ARGS)
     }
     PG_RETURN_POINTER(next ? next : old);
 }
+
+PG_FUNCTION_INFO_V1(sibench_capture_watermark);
+Datum sibench_capture_watermark(PG_FUNCTION_ARGS)
+{
+    int pid = PG_GETARG_INT32(0);
+    int64 sequence = PG_GETARG_INT64(1), csn = PG_GETARG_INT64(2);
+    if (pid < 0 || sequence < 0 || csn < 0) elog(ERROR, "Invalid source acknowledgement");
+    PG_RETURN_INT64((int64) sib_capture_watermark(pid, (uint64) sequence, (uint64) csn));
+}

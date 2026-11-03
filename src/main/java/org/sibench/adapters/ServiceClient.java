@@ -22,6 +22,8 @@ abstract class ServiceClient implements ReplayTarget {
     private final List<Operation> group = new ArrayList<>();
     private final List<CompletableFuture<Void>> groupResponses = new ArrayList<>();
     private final List<Operation> batch = new ArrayList<>();
+    private final List<org.sibench.adapters.proto.Write> batchWrites = new ArrayList<>();
+    private Request groupRequest;
     private CompletableFuture<Void> batchResponse;
     private long batchId;
 
@@ -56,9 +58,11 @@ abstract class ServiceClient implements ReplayTarget {
         if (batch.isEmpty()) return;
         var inserts = List.copyOf(batch);
         var response = batchResponse;
+        var request = requests.batch(batchId, inserts, batchWrites);
         batch.clear();
+        batchWrites.clear();
         batchResponse = null;
-        transmit(requests.batch(batchId, inserts), NO_CHUNKS)
+        transmit(request, NO_CHUNKS)
                 .whenComplete(
                         (result, error) -> {
                             Throwable failure = error;
@@ -95,12 +99,21 @@ abstract class ServiceClient implements ReplayTarget {
 
     @Override
     public final SendHandle send(long dispatchSequence, Operation operation) throws IOException {
+        return send(dispatchSequence, operation, null);
+    }
+
+    @Override
+    public final SendHandle send(long dispatchSequence, Operation operation, Request stored) throws IOException {
         int limit = requests.baselineBatch();
         if (limit > 1 && TraceRequests.baselineInsert(operation)) {
             if (!batch.isEmpty() && batch.get(0).workUnitId() != operation.workUnitId()) sendBatch();
             if (batch.isEmpty()) batchResponse = new CompletableFuture<>();
             var response = batchResponse;
             batch.add(operation);
+            if (stored != null) {
+                if (!stored.hasWrite()) throw new IOException("Missing stored Baseline write");
+                batchWrites.add(stored.getWrite());
+            }
             // The request takes the dispatch id of its last insert, unique on this stream.
             batchId = dispatchSequence;
             if (batch.size() == limit) sendBatch();
@@ -108,6 +121,8 @@ abstract class ServiceClient implements ReplayTarget {
         }
         sendBatch();
         if (operation.grouped()) {
+            if (group.isEmpty()) groupRequest = stored;
+            else if (groupRequest != stored) throw new IOException("Stored search group interrupted");
             group.add(operation);
             var response = new CompletableFuture<Void>();
             groupResponses.add(response);
@@ -118,7 +133,9 @@ abstract class ServiceClient implements ReplayTarget {
             var responses = List.copyOf(groupResponses);
             group.clear();
             groupResponses.clear();
-            var request = requests.group(dispatchSequence, members);
+            var request = groupRequest == null ? requests.group(dispatchSequence, members)
+                    : requests.forward(dispatchSequence, groupRequest, members);
+            groupRequest = null;
             var received = requests.receive(operation, request.getId());
             var answer = transmit(request, received.partial());
             answer.whenComplete((result, error) -> {
@@ -137,7 +154,8 @@ abstract class ServiceClient implements ReplayTarget {
             return new SendHandle(localSend(), response);
         }
         if (!group.isEmpty()) throw new IOException("Search group interrupted on its client");
-        var request = requests.request(dispatchSequence, operation);
+        var request = stored == null ? requests.request(dispatchSequence, operation)
+                : requests.forward(dispatchSequence, stored, List.of(operation));
         var received = requests.receive(operation, request.getId());
         var answer = transmit(request, received.partial());
         CompletableFuture<Void> response = answer.thenApply(result -> {

@@ -31,7 +31,7 @@ public class IndexOperationTraceTest {
                     .putInt(137).putInt(1).putInt((int) crc.getValue()).put(payload.array());
             String expected = HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(plain.array()));
             var decoded = new ArrayList<Operation>();
-            assertEquals(1, IndexOperationTrace.Source.file(file, expected).read(decoded::add));
+            assertEquals(1, IndexOperationTrace.read(file, decoded::add, expected));
             assertEquals(List.of(operation), decoded);
             assertEquals(expected, IndexOperationTrace.sha256(file));
             Files.delete(file);
@@ -39,7 +39,7 @@ public class IndexOperationTraceTest {
                 writer.append(operation.withWorkUnitId(1));
             }
             var mismatch = assertThrows(IOException.class,
-                    () -> IndexOperationTrace.Source.file(file, expected).read(ignored -> {}));
+                    () -> IndexOperationTrace.read(file, ignored -> {}, expected));
             assertTrue(mismatch.getMessage().contains("checksum mismatch"));
         } finally {
             Files.deleteIfExists(file); Files.delete(file.getParent());

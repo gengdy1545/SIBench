@@ -40,7 +40,7 @@ public final class DriverCapacityCheck {
             BaselineOperations.of(trace).read(operation -> operations[0]++);
             Files.writeString(report, JSON.toJson(Map.of("status", "passed", "operations", operations[0],
                     "seconds", (System.nanoTime() - started) / 1e9,
-                    "scope", "full derived baseline count and digest matched its retained manifest; no RPC/backend execution")), StandardOpenOption.CREATE_NEW);
+                    "scope", "full protobuf baseline count and digests matched its retained manifest; no RPC/backend execution")), StandardOpenOption.CREATE_NEW);
         }
     }
 
@@ -73,7 +73,7 @@ public final class DriverCapacityCheck {
         long[] records = {0}, queries = {0}, items = {0}, largest = {0};
         long[] next = {1000};
         try {
-            IndexOperationTrace.read(trace.resolve("workload.ops"), operation -> {
+            ProtoTrace.source(trace, org.sibench.trace.TraceManifest.read(trace), "workload").read( operation -> {
                 records[0]++;
                 if (operation.kind() != IndexOperationTrace.TRANSACTION_BEGIN
                         && operation.kind() != IndexOperationTrace.TRANSACTION_COMMIT)
@@ -99,7 +99,7 @@ public final class DriverCapacityCheck {
     private static void prefix(Path trace, long limit, IndexOperationTrace.Consumer consumer) throws IOException {
         long[] count = {0};
         try {
-            IndexOperationTrace.read(trace.resolve("workload.ops"), operation -> {
+            ProtoTrace.source(trace, org.sibench.trace.TraceManifest.read(trace), "workload").read( operation -> {
                 consumer.accept(operation);
                 if (++count[0] == limit) throw new EndPrefix();
             });
@@ -117,7 +117,7 @@ public final class DriverCapacityCheck {
         var inputTrace = ReferenceReplay.prepare(trace, config(128));
         long[] records = {0}, queries = {0};
         try {
-            IndexOperationTrace.read(trace.resolve("workload.ops"), operation -> {
+            ProtoTrace.source(trace, org.sibench.trace.TraceManifest.read(trace), "workload").read( operation -> {
                 records[0]++;
                 if (operation.kind() == IndexOperationTrace.SEARCH
                         && (!operation.grouped() || operation.expansionPosition() + 1 == operation.expansionSize())) queries[0]++;

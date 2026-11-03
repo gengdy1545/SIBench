@@ -10,12 +10,11 @@ import java.util.Map;
 
 /**
  * One backend trace event, with top-level fields in a hash map for repeated compiler lookups.
- * Parser threads build this form ({@link ParsedTrace}); nested row images and scan keys stay Gson
- * elements.
+ * Source readers build this form; nested row images and scan keys stay Gson elements.
  *
  * <p>Field names are the interned strings, as the compiler's literals are, so a lookup matches by
  * identity without reading the name; the event type and backend pid every event is asked for are
- * read once, on the parsing thread.
+ * read once when the event is constructed.
  */
 public final class Event {
     /** Interned field names; a trace has a few dozen, so the map stays small. */

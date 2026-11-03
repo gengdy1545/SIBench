@@ -11,11 +11,15 @@ JOBS ?= 8
 patch:
 	@test -f "$(PG_SRC)/configure" || (echo "Extract PostgreSQL 14.24 into PG_SRC first"; exit 1)
 	@grep -q 'PACKAGE_VERSION='\''14.24'\''' "$(PG_SRC)/configure"
-	@if ! test -f "$(PG_SRC)/.sibench-patched-4"; then \
-	  test ! -f "$(PG_SRC)/.sibench-patched" -a ! -f "$(PG_SRC)/.sibench-patched-2" -a ! -f "$(PG_SRC)/.sibench-patched-3" || \
-	    (echo "PG_SRC carries an older SIBench patch; extract a fresh PostgreSQL 14.24"; exit 1); \
+	@if test -f "$(PG_SRC)/.sibench-patched"; then \
+	  test "$$(cat "$(PG_SRC)/.sibench-patched")" = "$$(sha256sum "$(CURDIR)/postgresql-14.24.patch" | cut -d ' ' -f1)" || \
+	    (echo "PG_SRC carries a different SIBench patch; extract fresh PostgreSQL 14.24"; exit 1); \
+	else \
+	  if test -f "$(PG_SRC)/src/include/sibench_capture.h"; then \
+	    echo "PG_SRC is already instrumented; extract fresh PostgreSQL 14.24"; exit 1; \
+	  fi; \
 	  cd "$(PG_SRC)" && patch --batch --forward -p1 < "$(CURDIR)/postgresql-14.24.patch" && \
-	  touch "$(PG_SRC)/.sibench-patched-4"; \
+	  sha256sum "$(CURDIR)/postgresql-14.24.patch" | cut -d ' ' -f1 > .sibench-patched; \
 	fi
 	cp sibench_capture.h "$(PG_SRC)/src/include/"
 	cp sibench_capture.c "$(PG_SRC)/src/backend/access/index/"

@@ -50,6 +50,7 @@ final class HybenchNativeLoad {
         String password = System.getenv().getOrDefault("PGPASSWORD", "");
         if (Files.exists(manifest)) throw new IllegalStateException("Native load already recorded: " + manifest);
         Path library = NativeLoad.library(config.root());
+        NativeLoad.requireDirectCapture(config.adminJdbc(), config.user(), library);
         var report = new LinkedHashMap<String, Object>();
         report.put("sf", sf);
         report.put("database", config.database());

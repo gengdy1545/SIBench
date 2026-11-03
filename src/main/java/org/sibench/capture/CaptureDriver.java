@@ -103,10 +103,34 @@ public final class CaptureDriver implements Driver {
     /** The zstd level of the client traces. */
     static final int ZSTD_LEVEL = 3;
 
+    /** Native phase cancellation must not close the channel halfway through a source fact. */
+    static java.io.OutputStream directOutput(java.nio.channels.SocketChannel channel) throws IOException {
+        channel.configureBlocking(false);
+        return new java.io.OutputStream() {
+            @Override public void write(int value) throws IOException { write(new byte[] {(byte) value}); }
+            @Override public void write(byte[] bytes, int offset, int length) throws IOException {
+                boolean interrupted = Thread.interrupted();
+                try {
+                    var buffer = java.nio.ByteBuffer.wrap(bytes, offset, length);
+                    while (buffer.hasRemaining()) {
+                        if (channel.write(buffer) == 0) {
+                            interrupted |= Thread.interrupted();
+                            java.util.concurrent.locks.LockSupport.parkNanos(1_000_000);
+                        }
+                    }
+                } finally {
+                    if (interrupted) Thread.currentThread().interrupt();
+                }
+            }
+            @Override public void close() throws IOException { channel.close(); }
+        };
+    }
+
     private static final class Session {
         private final Connection connection;
         private final long id = CONNECTIONS.incrementAndGet();
         private final BufferedWriter output;
+        private final boolean direct = System.getenv("SIBENCH_CAPTURE_SOCKET") != null;
         private final Gson json = new GsonBuilder().serializeNulls().create();
         private long request, transaction = 1;
         private String application;
@@ -117,6 +141,14 @@ public final class CaptureDriver implements Driver {
             path =
                     directory.resolve(
                             "jdbc-" + ProcessHandle.current().pid() + "-" + id + ".jsonl.zst");
+            if (direct) {
+                var channel = java.nio.channels.SocketChannel.open(java.net.StandardProtocolFamily.UNIX);
+                channel.connect(java.net.UnixDomainSocketAddress.of(System.getenv("SIBENCH_CAPTURE_SOCKET")));
+                output = new BufferedWriter(new java.io.OutputStreamWriter(
+                        directOutput(channel), java.nio.charset.StandardCharsets.UTF_8), 1 << 16);
+                output.write(path.getFileName().toString());
+                output.newLine();
+            } else {
             output =
                     new BufferedWriter(
                             new java.io.OutputStreamWriter(
@@ -126,6 +158,7 @@ public final class CaptureDriver implements Driver {
                                             ZSTD_LEVEL),
                                     java.nio.charset.StandardCharsets.UTF_8),
                             1 << 16);
+            }
             try (Statement s = connection.createStatement();
                     ResultSet r = s.executeQuery("SELECT pg_backend_pid()")) {
                 if (!r.next()) throw new SQLException("Missing backend PID");
@@ -178,6 +211,7 @@ public final class CaptureDriver implements Driver {
             try {
                 output.write(json.toJson(entry));
                 output.newLine();
+                if (direct) output.flush();
             } catch (IOException e) {
                 SQLException error = new SQLException("Trace write failure", e);
                 CaptureRun.recordFailure(error, context("write_trace", null));
@@ -217,7 +251,10 @@ public final class CaptureDriver implements Driver {
                                         error(error, "connection_error", name, null);
                                     }
                                     try {
-                                        if (failure == null) emit("close", Map.of());
+                                        if (failure == null) {
+                                            emit("close", Map.of());
+                                            if (direct) emit("capture_end", Map.of());
+                                        }
                                     } catch (SQLException logging) {
                                         failure = logging;
                                     } finally {
@@ -269,9 +306,24 @@ public final class CaptureDriver implements Driver {
                             });
         }
 
+        private final class ResultCapture {
+            final Map<String, Object> identity;
+            boolean ended;
+
+            ResultCapture() {
+                identity = Map.of("application", application, "request", request, "transaction", transaction);
+            }
+
+            void end() throws SQLException {
+                if (ended) return;
+                emit("request_end", identity);
+                ended = true;
+            }
+        }
+
         Statement statement(Statement statement, String sql) {
             Map<Integer, Object> parameters = new LinkedHashMap<>();
-            Map<String, Object> resultIdentity = new LinkedHashMap<>();
+            ResultCapture[] resultCapture = {null};
             return (Statement)
                     Proxy.newProxyInstance(
                             CaptureDriver.class.getClassLoader(),
@@ -292,11 +344,9 @@ public final class CaptureDriver implements Driver {
                                     if (name.equals("executeQuery")
                                             || name.equals("executeUpdate")
                                             || name.equals("execute")) {
+                                        if (resultCapture[0] != null) resultCapture[0].end();
                                         mark(executedSql, parameters);
-                                        resultIdentity.clear();
-                                        resultIdentity.put("application", application);
-                                        resultIdentity.put("request", request);
-                                        resultIdentity.put("transaction", transaction);
+                                        resultCapture[0] = new ResultCapture();
                                         Object result = invoke(method, statement, args);
                                         emit(
                                                 "request_return",
@@ -309,15 +359,18 @@ public final class CaptureDriver implements Driver {
                                         if (connection.getAutoCommit())
                                             emit("autocommit", Map.of("implicit_commits", 2));
                                         if (result instanceof ResultSet rows)
-                                            return rows(rows, executedSql, resultIdentity);
+                                            return rows(rows, executedSql, resultCapture[0]);
+                                        if (!Boolean.TRUE.equals(result)) resultCapture[0].end();
                                         return result;
                                     }
                                     if (name.equals("getResultSet")) {
                                         Object result = invoke(method, statement, args);
                                         return result instanceof ResultSet rows
-                                                ? rows(rows, sql, resultIdentity) : result;
+                                                ? rows(rows, sql, resultCapture[0]) : result;
                                     }
-                                    return invoke(method, statement, args);
+                                    Object result = invoke(method, statement, args);
+                                    if (name.equals("close") && resultCapture[0] != null) resultCapture[0].end();
+                                    return result;
                                 } catch (SQLException error) {
                                     Map<String, Object> details = context(name, executedSql);
                                     details.put("parameters", new LinkedHashMap<>(parameters));
@@ -328,8 +381,7 @@ public final class CaptureDriver implements Driver {
                             });
         }
 
-        ResultSet rows(ResultSet rows, String sql, Map<String, Object> resultIdentity) {
-            Map<String, Object> identity = new LinkedHashMap<>(resultIdentity);
+        ResultSet rows(ResultSet rows, String sql, ResultCapture capture) {
             return (ResultSet)
                     Proxy.newProxyInstance(
                             CaptureDriver.class.getClassLoader(),
@@ -339,7 +391,7 @@ public final class CaptureDriver implements Driver {
                                     Object result = invoke(method, rows, args);
                                     if (method.getName().equals("next")
                                             && Boolean.TRUE.equals(result)) {
-                                        Map<String, Object> values = new LinkedHashMap<>(identity);
+                                        Map<String, Object> values = new LinkedHashMap<>(capture.identity);
                                         Map<String, Integer> types = new LinkedHashMap<>();
                                         var texts = new ArrayList<String>();
                                         var jdbcTypes = new ArrayList<Integer>();
@@ -362,6 +414,9 @@ public final class CaptureDriver implements Driver {
                                         }
                                         emit("consumed_row", values);
                                     }
+                                    if (method.getName().equals("close")
+                                            || method.getName().equals("next") && Boolean.FALSE.equals(result))
+                                        capture.end();
                                     return result;
                                 } catch (SQLException error) {
                                     error(error, "result_error", method.getName(), sql);

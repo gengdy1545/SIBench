@@ -64,7 +64,8 @@ public final class CapturePlan {
         if (target <= 0) throw new IllegalArgumentException("The replay configuration sets no operation budget: " + replay);
         long measured;
         try (var runtime = new ReplayProjection(config, true, operation -> {})) {
-            IndexOperationTrace.read(calibration.resolve("workload.ops"), runtime);
+            var manifest = org.sibench.trace.TraceManifest.read(calibration);
+            ProtoTrace.source(calibration, manifest, "workload").read(runtime);
             runtime.finish();
             measured = runtime.dispatched();
         }

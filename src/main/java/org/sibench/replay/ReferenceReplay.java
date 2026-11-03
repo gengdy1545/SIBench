@@ -46,8 +46,7 @@ public final class ReferenceReplay {
             throw new IOException("Source work-unit identity checksum mismatch");
         var catalog = catalog(manifest, units);
         var coverage = new Coverage("workload", catalog, units);
-        var workload = IndexOperationTrace.Source.file(directory.resolve("workload.ops"),
-                manifest.get("workload_trace_sha256").getAsString());
+        var workload = org.sibench.capture.ProtoTrace.source(directory, manifest, "workload");
         var counts = checkStream(tee(workload, coverage), config, true);
         coverage.finish(manifest);
         if (manifest.get("workload_operations").getAsLong() != (long) counts.get("encoded_records"))
@@ -58,7 +57,7 @@ public final class ReferenceReplay {
             report.remove("baseline");
             report.put("status", "workload_integrity_and_supply_valid");
             var baselineCoverage = new Coverage("baseline", catalog, null);
-            long records = tee(org.sibench.capture.BaselineOperations.of(directory), baselineCoverage).read(consumer);
+            long records = tee(org.sibench.capture.ProtoTrace.source(directory, manifest, "baseline"), baselineCoverage).read(consumer);
             baselineCoverage.finish(manifest);
             if (manifest.get("baseline_operations").getAsLong() != records)
                 throw new IOException("Trace record count mismatch: baseline");
@@ -239,26 +238,23 @@ public final class ReferenceReplay {
             IndexOperationTrace.Source source, IndexOperationTrace.Consumer also) {
         return consumer ->
                 source.read(
-                        operation -> {
-                            also.accept(operation);
-                            consumer.accept(operation);
+                        new IndexOperationTrace.Consumer() {
+                            @Override
+                            public void accept(IndexOperationTrace.Operation operation) throws IOException {
+                                also.accept(operation);
+                                consumer.accept(operation);
+                            }
+
+                            @Override
+                            public void accept(org.sibench.adapters.proto.TraceRecord record,
+                                    List<IndexOperationTrace.Operation> views) throws IOException {
+                                also.accept(record, views);
+                                consumer.accept(record, views);
+                            }
                         });
     }
 
-    static Map<String, Object> checkFiles(Path baseline, Path workload, ReplayConfig config)
-            throws IOException {
-        return checkFiles(IndexOperationTrace.Source.file(baseline), IndexOperationTrace.Source.file(workload), config);
-    }
-
-    static Map<String, Object> checkFiles(
-            IndexOperationTrace.Source baseline, IndexOperationTrace.Source workload, ReplayConfig config)
-            throws IOException {
-        var load = checkStream(baseline, config, false);
-        var runtime = checkStream(workload, config, true);
-        return report(config, load, runtime);
-    }
-
-    private static Map<String, Object> checkStream(
+    static Map<String, Object> checkStream(
             IndexOperationTrace.Source source, ReplayConfig config, boolean runtime) throws IOException {
         config.requireReferenceCapabilities();
         try (var projection = new ReplayProjection(config, runtime, operation -> {})) {
@@ -278,7 +274,7 @@ public final class ReferenceReplay {
         }
     }
 
-    private static Map<String, Object> report(ReplayConfig config, Map<String, Object> baseline,
+    static Map<String, Object> report(ReplayConfig config, Map<String, Object> baseline,
             Map<String, Object> workload) {
         var report = new LinkedHashMap<String, Object>();
         report.put("status", "trace_integrity_and_supply_valid");
@@ -286,7 +282,7 @@ public final class ReferenceReplay {
         if (baseline != null) report.put("baseline", baseline);
         report.put("workload", workload);
         report.put("budget_scope", "input supply only; no rate scheduling or duration guarantee");
-        report.put("validation_scope", "binary integrity and supply; directory inputs additionally verify source catalog,"
+        report.put("validation_scope", "canonical proto integrity and supply, source catalog,"
                 + " work-unit binding and complete maintenance units; baseline verification completes during its load");
         return report;
     }
@@ -300,7 +296,23 @@ public final class ReferenceReplay {
     public static Map<String, Object> run(
             Path directory, ReplayConfig config, List<Boolean> rowIdModes, Path report)
             throws IOException {
+        return runDirectory(directory, config, rowIdModes, report, false);
+    }
+
+    /** Explicit matrix diagnostics also scan the complete final primary state. */
+    static Map<String, Object> audit(Path directory, ReplayConfig config, Path report)
+            throws IOException {
+        return runDirectory(directory, config, List.of(false, true), report, true);
+    }
+
+    private static Map<String, Object> runDirectory(
+            Path directory, ReplayConfig config, List<Boolean> rowIdModes, Path report,
+            boolean auditState) throws IOException {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
+        var manifest = TraceManifest.read(directory);
+        if (manifest.has("value_kind") && manifest.get("value_kind").getAsString().equals("row_id")
+                && rowIdModes.contains(false))
+            throw new IOException("Proto-only Trace stores RowIDs; Locator replay requires full output");
         var input = prepare(directory, config);
         return runChecked(
                 binding(directory, config),
@@ -309,26 +321,8 @@ public final class ReferenceReplay {
                 config,
                 rowIdModes,
                 input.preflight(),
-                report);
-    }
-
-    static Map<String, Object> runFiles(Path baseline, Path workload, ReplayConfig config, Path report)
-            throws IOException {
-        return runFiles(IndexOperationTrace.Source.file(baseline), IndexOperationTrace.Source.file(workload), config, report);
-    }
-
-    static Map<String, Object> runFiles(
-            IndexOperationTrace.Source baseline, IndexOperationTrace.Source workload, ReplayConfig config, Path report)
-            throws IOException {
-        if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
-        return runChecked(
-                null,
-                baseline,
-                workload,
-                config,
-                List.of(false, true),
-                checkFiles(baseline, workload, config),
-                report);
+                report,
+                auditState);
     }
 
     /** Binds a digest stream to the trace and replay settings that produced it. */
@@ -364,14 +358,15 @@ public final class ReferenceReplay {
         throw new IOException("Reference report has no " + mode + " result");
     }
 
-    private static Map<String, Object> runChecked(
+    static Map<String, Object> runChecked(
             String binding,
             IndexOperationTrace.Source baseline,
             IndexOperationTrace.Source workload,
             ReplayConfig config,
             List<Boolean> rowIdModes,
             Map<String, Object> preflight,
-            Path report)
+            Path report,
+            boolean auditState)
             throws IOException {
         if (rowIdModes.isEmpty()) throw new IOException("No value mode to replay");
         RunTiming.current().measure(report.toAbsolutePath().getParent());
@@ -417,7 +412,7 @@ public final class ReferenceReplay {
                 result.put("queries", index.queries());
                 result.put("checked_result_items", index.checkedResults());
                 result.put("relocation_writes", index.relocationWrites());
-                result.put("primary_state_checksum", index.stateChecksum());
+                if (auditState) result.put("primary_state_checksum", index.stateChecksum());
                 result.put("selected_version_checksum", index.selectedVersionChecksum());
                 result.put("snapshot_queries", index.snapshotQueries());
                 result.put("retained_index_versions", index.retainedVersions());

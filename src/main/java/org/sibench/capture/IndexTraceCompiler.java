@@ -21,12 +21,12 @@ import java.nio.file.*;
 import java.util.*;
 
 /**
- * Compiles a completed native capture, sequential or concurrent sessions, into the canonical
- * trace: every audited access becomes the searches that reproduce its native result or fails the
- * compilation with its reason, and every committed row change becomes a complete index
- * maintenance unit; aborts stay in the raw trace.
+ * Projects live source transactions into canonical requests. Every
+ * audited access becomes searches reproducing its native result, or fails with its reason;
+ * committed row changes expand to complete index maintenance units. Full output retains abort
+ * facts in its raw side output.
  */
-public final class IndexTraceCompiler {
+final class IndexTraceCompiler {
     /** In-memory entries of the row-identity store before it spills a sorted run to disk. */
     static final int IDENTITY_MEMORY_ENTRIES = 1_000_000;
 
@@ -90,91 +90,44 @@ public final class IndexTraceCompiler {
         }
     }
 
-    /** Optional independent row audit and source-side counter snapshots for this capture. */
-    public record Checks(Path rowAudit, Path countersBefore, Path countersAfter) {
-        public Checks {
+    /** Source-side counter snapshots bracketing this capture. */
+    record Checks(Path countersBefore, Path countersAfter) {
+        Checks {
             if ((countersBefore == null) != (countersAfter == null))
                 throw new IllegalArgumentException("Index counters come as a before and after pair");
         }
-
-        public static Checks rowAudit(Path report) {
-            return new Checks(report, null, null);
-        }
     }
 
-    public static Map<String, Object> compileProfile(Path root, Path profile, Path output, Checks checks)
+    @FunctionalInterface
+    interface Source {
+        List<Map<String, Object>> generate(Compilation state) throws Exception;
+        default void check() throws Exception {}
+        default GenerationBudget budget() { return null; }
+    }
+
+    static Map<String, Object> compileDirect(CaptureProfile profile, DirectCapture direct, Checks checks)
             throws Exception {
-        var capture = CaptureProfile.read(root, profile);
-        return compile(capture.schema(), capture.layout(), capture.raw(), output, checks);
+        return generate(profile.schema(), profile.layout(), profile.raw(), profile.artifacts().resolve("trace"),
+                checks, IDENTITY_MEMORY_ENTRIES, COMMIT_WINDOW, TraceOutput.from(profile.layout().document()),
+                "concurrent", new Source() {
+                    public List<Map<String, Object>> generate(Compilation state) throws Exception {
+                        direct.ready();
+                        return state.generate(direct);
+                    }
+                    public void check() throws Exception { direct.check(); }
+                    public GenerationBudget budget() { return direct.budget; }
+                });
     }
 
-    /** The session traces of one capture and the order the capture recorded for them. */
-    record Sessions(String order, List<Path> files) {}
-
-    static Sessions sessions(Path raw) throws Exception {
-        CaptureRun.verifyInput(raw);
-        Path directory = Files.isDirectory(raw) ? raw : raw.toAbsolutePath().getParent();
-        JsonObject run =
-                JsonParser.parseString(Files.readString(directory.resolve("capture-run.json")))
-                        .getAsJsonObject();
-        String order = run.get("session_order").getAsString();
-        if (!Set.of("sequential", "concurrent").contains(order))
-            throw new IOException("Unsupported session order: " + order);
-        var files = new ArrayList<Path>();
-        for (var session : run.getAsJsonArray("sessions"))
-            files.add(directory.resolve(session.getAsJsonObject().get("pg_file").getAsString()));
-        if (!Files.isDirectory(raw) && !files.equals(List.of(raw.toAbsolutePath())))
-            throw new IOException("Compile the capture directory of a multi-session run");
-        return new Sessions(order, files);
-    }
-
-    public static Map<String, Object> compile(
-            SourceSchema sourceSchema,
-            GenerationConfig layout,
-            Path raw,
-            Path output,
-            Path auditReport)
-            throws Exception {
-        return compile(sourceSchema, layout, raw, output, Checks.rowAudit(auditReport));
-    }
-
-    public static Map<String, Object> compile(
-            SourceSchema sourceSchema, GenerationConfig layout, Path raw, Path output, Checks checks)
-            throws Exception {
-        return compile(sourceSchema, layout, raw, output, checks, IDENTITY_MEMORY_ENTRIES, COMMIT_WINDOW);
-    }
-
-    /**
-     * {@code identityMemory} bounds the in-memory entries of the row-identity store and {@code
-     * commitWindow} the committed writers kept to place snapshots.
-     */
-    static Map<String, Object> compile(
-            SourceSchema sourceSchema,
-            GenerationConfig layout,
-            Path raw,
-            Path output,
-            Path auditReport,
-            int identityMemory,
-            int commitWindow)
-            throws Exception {
-        return compile(sourceSchema, layout, raw, output, Checks.rowAudit(auditReport), identityMemory, commitWindow);
-    }
-
-    static Map<String, Object> compile(
-            SourceSchema sourceSchema,
-            GenerationConfig layout,
-            Path raw,
-            Path output,
-            Checks checks,
-            int identityMemory,
-            int commitWindow)
-            throws Exception {
-        Sessions sessions = sessions(raw);
-        boolean concurrent = sessions.order().equals("concurrent");
+    static Map<String, Object> generate(SourceSchema sourceSchema, GenerationConfig layout, Path raw,
+            Path output, Checks checks, int identityMemory, int commitWindow, TraceOutput strategy,
+            String sessionOrder, Source source) throws Exception {
+        boolean concurrent = sessionOrder.equals("concurrent");
         Path baseline = layout.output();
-        Path auditReport = checks.rowAudit();
-        if (auditReport != null) RowStateAudit.reuse(sourceSchema, baseline, raw, auditReport);
         JsonObject verification = BaselineManifest.verify(sourceSchema, baseline);
+        boolean indexBaseline = verification.get("output").getAsString().equals("proto");
+        if (indexBaseline && strategy != TraceOutput.PROTO)
+            throw new IOException("Full output requires a complete-row baseline export");
         Path verified = baseline.resolve(BaselineManifest.FILE);
         Path preflightFile = baseline.resolve("schema-preflight.json");
         boolean cCollation =
@@ -193,12 +146,18 @@ public final class IndexTraceCompiler {
         long maximumRowId = 0, maximumFileId = 0, baselineCount, baselineRows = 0;
         String baselineDigest, workloadDigest;
         RunTiming.current().phase("baseline");
-        // The baseline load is derived again by every reader (BaselineOperations), so only its
-        // count and the digest of the file it would form are recorded.
-        var baselineOperations = new WriterThread(new IndexOperationTrace.Writer(null), "baseline-writer");
+        var baselineFiles = new com.google.gson.JsonArray();
+        // Index-only exports already contain final requests; reading establishes row identities.
+        var baselineProto = indexBaseline ? null : new ProtoTrace.Writer(output.resolve("baseline.pb.zst"));
+        var baselineOperations = indexBaseline ? null : new WriterThread(
+                strategy == TraceOutput.FULL ? new IndexOperationTrace.Writer(null) : null,
+                baselineProto, "baseline-writer");
+        long[] exportedCount = {0};
+        IndexOperationTrace.Consumer baselineSink = indexBaseline ? operation -> exportedCount[0]++ : baselineOperations;
         try (var operations = baselineOperations) {
             var extent =
-                    BaselineOperations.derive(
+                    indexBaseline ? ProtoBaseline.derive(baseline, verification, catalog, identities, baselineSink)
+                    : BaselineOperations.derive(
                             baseline,
                             catalog,
                             operations,
@@ -227,30 +186,42 @@ public final class IndexTraceCompiler {
             maximumRowId = extent.maximumRowId();
             maximumFileId = extent.maximumFileId();
             baselineRows = extent.rows();
-            baselineCount = operations.count();
+            baselineCount = indexBaseline ? exportedCount[0] : operations.count();
         }
-        baselineDigest = baselineOperations.sha256();
+        if (indexBaseline) baselineFiles = ProtoBaseline.retain(baseline, verification, output);
+        else baselineFiles.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("baseline.pb.zst", baselineProto)));
+        baselineDigest = ProtoTrace.identity(baselineFiles);
         var state = new Compilation(catalog, cCollation, identities, schemas, layout, output);
         state.concurrent = concurrent;
         state.commitWindow = new CommitWindow(commitWindow);
         state.maximumRowId = maximumRowId;
         state.firstIncrementalFile = maximumFileId;
+        state.keepRows = strategy == TraceOutput.FULL;
         var sessionReports = new ArrayList<Map<String, Object>>();
         RunTiming.current().phase("workload");
-        var workloadOperations = new WriterThread(new IndexOperationTrace.Writer(output.resolve("workload.ops")), "workload-writer");
+        state.budget = source.budget();
+        for (var file : baselineFiles)
+            state.baselineProtoBytes = Math.addExact(state.baselineProtoBytes,
+                    Files.size(output.resolve(file.getAsJsonObject().get("path").getAsString())));
+        var workloadProto = new ProtoTrace.Writer(output.resolve("workload.pb.zst"));
+        state.workloadProto = workloadProto;
+        var workloadOperations = new WriterThread(strategy == TraceOutput.FULL
+                ? new IndexOperationTrace.Writer(output.resolve("workload.ops")) : null, workloadProto, "workload-writer");
         var workUnits = WorkUnits.create(output);
         try (var operations = workloadOperations;
                 var units = workUnits.lines()) {
+            if (state.budget != null) state.budget.baseline(state.baselineProtoBytes);
             state.operations = operations;
             state.units = units;
-            if (concurrent) sessionReports.addAll(state.merge(sessions.files()));
-            else for (Path session : sessions.files()) sessionReports.add(state.session(session));
+            sessionReports.addAll(source.generate(state));
             state.finishFiles();
         } finally {
             for (Output writer : state.writers.values()) writer.close();
             identities.close();
         }
-        workloadDigest = workloadOperations.sha256();
+        var workloadFiles = new com.google.gson.JsonArray();
+        workloadFiles.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("workload.pb.zst", workloadProto)));
+        workloadDigest = ProtoTrace.identity(workloadFiles);
         // The spill files are working state, not an artifact: a finished trace has none.
         deleteTree(output.resolve("state"));
         RunTiming.current().phase("ledger");
@@ -278,20 +249,32 @@ public final class IndexTraceCompiler {
         }
         RunTiming.current()
                 .phase("report")
-                .note("session_order", sessions.order())
-                .note("sessions", sessions.files().size())
+                .note("session_order", sessionOrder)
+                .note("sessions", sessionReports.size())
                 .note("source_events", state.event)
                 .note("workload_operations", state.operationsCount)
                 .note("searched_accesses", state.searches)
                 .note("search_operations", state.partSearches);
         Map<String, Object> report = new LinkedHashMap<>();
         report.put("status", "complete_for_declared_projection");
+        report.put("output", strategy.setting());
+        report.put("generation", "direct_source_events");
+        if (state.budget != null && state.budget.enabled()) {
+            var budgetReport = state.budget.report(state.operationsCount,
+                    state.baselineProtoBytes + Files.size(output.resolve("workload.pb.zst")));
+            report.put("generation_budget", budgetReport);
+            RunTiming.current().note("generation_budget", budgetReport);
+        }
+        report.put("proto_files", Map.of(
+                "baseline", baselineFiles,
+                "workload", workloadFiles));
+        if (strategy == TraceOutput.PROTO) report.put("value_kind", "row_id");
         report.put("secondary_operations_explicit", true);
         report.putAll(catalog.provenance());
         report.put("secondary_index_coverage", "all_source_definitions");
         report.put("key_encoding", "order_preserving");
         report.put("text_intervals_ordered", cCollation);
-        report.put("baseline_directory", baseline.toAbsolutePath().toString());
+        if (strategy == TraceOutput.FULL) report.put("baseline_directory", baseline.toAbsolutePath().toString());
         report.put("baseline_operations", baselineCount);
         report.put("baseline_rows", verification.get("rows").getAsLong());
         report.put(
@@ -301,7 +284,7 @@ public final class IndexTraceCompiler {
         report.put(
                 "baseline_work_unit_rule",
                 "consecutive batches of 4096 source rows; index expansion shares a unit");
-        report.put("session_order", sessions.order());
+        report.put("session_order", sessionOrder);
         report.put("sessions", sessionReports);
         report.put("source_work_units", state.requestUnits);
         report.put("workload_work_units", state.emittedUnits);
@@ -333,7 +316,7 @@ public final class IndexTraceCompiler {
         report.put(
                 "ordering",
                 concurrent
-                        ? "postgresql_transaction_completion_counter_then_operation_order"
+                        ? "postgresql_transaction_completion_counter_then_received_readers"
                         : "original_session_transaction_and_operation_order");
         var changes = new LinkedHashMap<String, Object>();
         changes.put("insert", state.inserts);
@@ -352,13 +335,12 @@ public final class IndexTraceCompiler {
         report.put("incremental_files", state.files);
         report.put("baseline_manifest_sha256", BaselineGenerator.sha256(verified));
         report.put("baseline_schema_preflight_sha256", BaselineGenerator.sha256(preflightFile));
-        var verificationReport = new LinkedHashMap<String, Object>();
-        verificationReport.put("mode", auditReport == null ? "runtime" : "row_audit");
-        if (auditReport != null) {
-            verificationReport.put("row_state_audit_sha256", BaselineGenerator.sha256(auditReport));
-            report.put("row_state_audit_sha256", verificationReport.get("row_state_audit_sha256"));
-        }
-        report.put("verification", verificationReport);
+        Files.copy(verified, output.resolve("source-baseline-manifest.json"));
+        Files.copy(preflightFile, output.resolve("schema-preflight.json"));
+        Path captureRun = (Files.isDirectory(raw) ? raw : raw.toAbsolutePath().getParent()).resolve("capture-run.json");
+        Files.copy(captureRun, output.resolve("source-capture-run.json"));
+        report.put("source_capture_run_sha256", BaselineGenerator.sha256(captureRun));
+        report.put("verification", Map.of("mode", "runtime"));
         report.put("access_ledger_sha256", BaselineGenerator.sha256(ledgerFile));
         report.put("capture_completeness", completeness);
         report.put("baseline_trace_sha256", baselineDigest);
@@ -425,7 +407,8 @@ public final class IndexTraceCompiler {
                         "Searches occupy native scan-start positions; counts finalized when the"
                                 + " access unit settles",
                         "No historical lookup or Rewrite events in this native trace",
-                        "Disk-backed compilation state not implemented"));
+                        "No end-to-end memory or disk hard cap"));
+        source.check();
         Files.writeString(
                 output.resolve("manifest.json"),
                 new GsonBuilder().setPrettyPrinting().create().toJson(report),
@@ -449,7 +432,7 @@ public final class IndexTraceCompiler {
     }
 
     /** Compilation state carried across sessions: versions, work units, RowIDs and files. */
-    private static final class Compilation implements AccessUnits.Listener {
+    static final class Compilation implements AccessUnits.Listener {
         final IndexCatalog catalog;
         final boolean cCollation;
         final RowIdentities identities;
@@ -485,6 +468,9 @@ public final class IndexTraceCompiler {
         /** Committed changes per table and operation: the change classes a capture exercised. */
         final Map<String, Map<String, Long>> changesByTable = new TreeMap<>();
         WriterThread operations;
+        GenerationBudget budget;
+        ProtoTrace.Writer workloadProto;
+        long baselineProtoBytes;
         BufferedWriter units;
         long maximumRowId, firstIncrementalFile, event, version, operationsCount;
         long requestUnits, currentUnit, mutations, searches, rawInserts, inserts, updates;
@@ -494,6 +480,7 @@ public final class IndexTraceCompiler {
         long snapshotSearches, crossChecked, crossCheckUnverifiable, partSearches;
         boolean transactionRequest, transactionOpen;
         boolean concurrent;
+        boolean keepRows = true;
         /** The latest committed writers by completion counter; see {@link CommitWindow}. */
         CommitWindow commitWindow;
         int pid;
@@ -516,100 +503,54 @@ public final class IndexTraceCompiler {
             this.output = output;
         }
 
-        /** One backend trace of a sequential-session capture. */
-        Map<String, Object> session(Path file) throws IOException {
-            long firstEvent = event + 1, sessionRequests = requestUnits, unitsBefore = ledger.settled();
-            pid = 0;
-            sessionFile = file.getFileName().toString();
-            var tracker = new AccessUnits(this);
-            tracker.beginSession();
-            try (var reader = ServerTrace.open(file)) {
-                String line;
-                while ((line = reader.readLine()) != null) line(line, tracker);
-            }
-            AccessUnits.Detail detail = tracker.detail();
-            tracker.endSession();
-            ledger.absorb(tracker);
-            finishSession();
-            ledger.input(file, pid, detail, event - firstEvent + 1, ledger.settled() - unitsBefore);
-            var report = report(file, pid, event - firstEvent + 1, requestUnits - sessionRequests);
-            report.put("first_source_event", firstEvent);
-            return report;
-        }
-
-        /**
-         * Backend traces of one concurrent capture, merged into completion-counter order. Each
-         * chunk is one transaction, so scans never cross a chunk boundary and the access tracker
-         * can start fresh on every one: scan identities are per-backend pointers and would
-         * otherwise collide between sessions.
-         */
-        List<Map<String, Object>> merge(List<Path> files) throws IOException {
-            var events = new long[files.size()];
-            var requests = new long[files.size()];
-            var backends = new int[files.size()];
-            var accessUnits = new long[files.size()];
-            // Each file's first part names its capture format; later parts inherit it.
-            var details = new AccessUnits.Detail[files.size()];
-            // Each session's events are tracked here, in the merge's own order: moving the
-            // per-session tracking onto threads of its own cost more in calls and queueing than
-            // it saved on the one ordered thread, so tracking stays in-line.
-            try (SessionMerge merge = SessionMerge.open(files)) {
-                while (merge.hasNext()) {
-                    var chunk = merge.next();
-                    long firstEvent = event + 1, sessionRequests = requestUnits, unitsBefore = ledger.settled();
+        List<Map<String, Object>> generate(DirectCapture source) throws Exception {
+            var details = new HashMap<Integer, AccessUnits.Detail>();
+            var counts = new HashMap<Integer, long[]>();
+            for (CaptureTransactions.Chunk next; (next = source.next()) != null; ) {
+                final var chunk = next;
+                try (chunk) {
+                    long settledBefore = ledger.settled(), requestsBefore = requestUnits;
                     pid = 0;
-                    sessionFile = files.get(chunk.session()).getFileName().toString();
+                    sessionFile = "pg-" + chunk.pid + ".jsonl.zst";
                     var tracker = new AccessUnits(this);
-                    if (details[chunk.session()] == null) tracker.beginSession();
-                    else tracker.continueSession(details[chunk.session()]);
-                    // The final record is line lineCount, so its ordinal is known now.
-                    knownCommit = chunk.committed();
-                    knownEvent = event + chunk.lineCount();
-                    for (Event event; (event = merge.event()) != null; ) event(event, tracker);
-                    details[chunk.session()] = tracker.detail();
+                    if (details.containsKey(chunk.pid)) tracker.continueSession(details.get(chunk.pid));
+                    else tracker.beginSession();
+                    knownCommit = chunk.committed;
+                    knownEvent = Math.addExact(event, chunk.lines);
+                    chunk.read(e -> event(e, tracker));
+                    details.put(chunk.pid, tracker.detail());
                     tracker.endSession();
                     ledger.absorb(tracker);
                     finishSession();
-                    accessUnits[chunk.session()] += ledger.settled() - unitsBefore;
-                    events[chunk.session()] += event - firstEvent + 1;
-                    requests[chunk.session()] += requestUnits - sessionRequests;
-                    backends[chunk.session()] = pid;
+                    long[] count = counts.computeIfAbsent(chunk.pid, ignored -> new long[3]);
+                    count[0] += chunk.lines;
+                    count[1] += ledger.settled() - settledBefore;
+                    count[2] += requestUnits - requestsBefore;
+                    if (budget != null && budget.enabled())
+                        budget.observe(operationsCount, baselineProtoBytes + workloadProto.bytesWritten());
                 }
             }
             var reports = new ArrayList<Map<String, Object>>();
-            for (int session = 0; session < files.size(); session++) {
-                if (details[session] == null)
-                    throw new IOException(
-                            "Session trace has no capture_start: " + files.get(session));
-                var detail = details[session];
-                ledger.input(files.get(session), backends[session], detail, events[session], accessUnits[session]);
-                reports.add(report(files.get(session), backends[session], events[session], requests[session]));
+            for (var sourceReport : source.sourceReports()) {
+                var report = new LinkedHashMap<>(sourceReport);
+                int backend = ((Number) report.get("pid")).intValue();
+                long[] count = counts.get(backend);
+                if (count == null) throw new IOException("Source stream has no completed transaction");
+                ledger.input((String) report.get("source_stream"), (String) report.get("sha256"), backend,
+                        details.get(backend), count[0], count[1]);
+                report.put("source_requests", count[2]);
+                reports.add(report);
             }
             return reports;
         }
 
-        private void finishSession() throws IOException {
+        void finishSession() throws IOException {
             if (transactionOpen || !pending.isEmpty() || !live.isEmpty() || !liveGroups.isEmpty())
                 throw new IOException("Truncated runtime capture: " + sessionFile);
         }
 
-        private Map<String, Object> report(Path file, int backend, long events, long requests)
-                throws IOException {
-            var report = new LinkedHashMap<String, Object>();
-            report.put("pg_file", file.getFileName().toString());
-            report.put("sha256", FileDigests.sha256(file));
-            report.put("pid", backend);
-            report.put("source_events", events);
-            report.put("source_requests", requests);
-            return report;
-        }
-
-        private void line(String line, AccessUnits tracker) throws IOException {
-            event(Event.parse(line), tracker);
-        }
-
         /** One event, routed by {@code tracker} and claimed once by the ledger. */
-        private void event(Event e, AccessUnits tracker) throws IOException {
+        void event(Event e, AccessUnits tracker) throws IOException {
             event++;
             RunTiming.current().advance(1);
             int eventPid = e.pid();
@@ -1080,25 +1021,28 @@ public final class IndexTraceCompiler {
                             ? previous
                             : (maximumRowId = Math.incrementExact(maximumRowId));
             Output destination = writers.get(table);
-            if (destination == null) {
+            if (keepRows && destination == null) {
                 destination = open(table, tableId);
                 writers.put(table, destination);
             }
-            Group row = new SimpleGroupFactory(destination.schema).newGroup();
-            for (var field : destination.schema.getFields()) {
-                String name = field.getName();
-                if (name.startsWith("_sib_")) continue;
-                JsonElement v = value.get(name);
-                if (v == null || v.isJsonNull()) continue;
-                switch (field.asPrimitiveType().getPrimitiveTypeName()) {
-                    case INT64 -> row.add(name, v.getAsLong());
-                    case DOUBLE -> row.add(name, (double) v.getAsFloat());
-                    default -> row.add(name, v.getAsString());
+            Group row = null;
+            if (keepRows) {
+                row = new SimpleGroupFactory(destination.schema).newGroup();
+                for (var field : destination.schema.getFields()) {
+                    String name = field.getName();
+                    if (name.startsWith("_sib_")) continue;
+                    JsonElement v = value.get(name);
+                    if (v == null || v.isJsonNull()) continue;
+                    switch (field.asPrimitiveType().getPrimitiveTypeName()) {
+                        case INT64 -> row.add(name, v.getAsLong());
+                        case DOUBLE -> row.add(name, (double) v.getAsFloat());
+                        default -> row.add(name, v.getAsString());
+                    }
                 }
+                row.add("_sib_row_id", rowId);
+                row.add("_sib_timestamp", commitVersion);
+                row.add("_sib_mutation_ordinal", ordinal);
             }
-            row.add("_sib_row_id", rowId);
-            row.add("_sib_timestamp", commitVersion);
-            row.add("_sib_mutation_ordinal", ordinal);
             Operation primary =
                     IndexOperationTrace.write(
                                     item.event(),
@@ -1109,15 +1053,15 @@ public final class IndexTraceCompiler {
                                             : IndexOperationTrace.BUSINESS_UPDATE,
                                     key,
                                     commitVersion,
-                                    destination.fileId,
-                                    destination.rows++,
+                                    keepRows ? destination.fileId : 0,
+                                    keepRows ? destination.rows++ : 0,
                                     rowId)
                             .withTransaction(transactionId, ordinal)
                             .withWorkUnitId(item.workUnitId());
             identities.put(tableId, key, rowId);
             IndexMutation.emit(primary, before, catalog.keys(table, value), this::append);
             // A file that reached its target size is closed; the table's next row opens another.
-            if (destination.writer.write(row)) {
+            if (keepRows && destination.writer.write(row)) {
                 writers.remove(table);
                 finish(table, destination);
             }

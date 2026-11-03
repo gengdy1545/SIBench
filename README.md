@@ -1,8 +1,8 @@
 # SIBench
 
-SIBench captures index accesses from native HyBench, YCSB JDBC, and sysbench PostgreSQL executions. It generates Parquet data and deterministic Trace artifacts for update-locality analysis and KV Index Service evaluation. It supports local RocksDB and rocksdb-cloud, with service replay checking each query's result count and complete ordered SHA-256 digest.
+SIBench captures index accesses from native HyBench, YCSB JDBC, and sysbench PostgreSQL executions. It generates compressed protobuf Trace requests by default; full output also retains Parquet data and detailed index operations for analysis and independent row validation. It supports local RocksDB and rocksdb-cloud, with service replay checking each query's result count and complete ordered SHA-256 digest.
 
-The pipeline is native generation and loading → Baseline export and identity checks → native execution capture → Trace compilation → analysis or replay. Trace represents index accesses under fixed PG execution plans; it does not represent end-to-end SQL performance or the original session arrival timing.
+The pipeline is native generation and loading → Baseline export and identity checks → native workload execution with direct Trace generation → publication → analysis or replay. Trace represents index accesses under fixed PG execution plans; it does not represent end-to-end SQL performance or the original session arrival timing.
 
 ## Build
 
@@ -34,6 +34,12 @@ scripts/build-benchmarks.sh config/benchmark/sysbench.yaml
 
 Builds use fresh copies under `build/benchmarks/` and reject existing build destinations. `native-build.json` pins the source commit and SHA digests of the actual executable, classes, and dependency JARs. Capture verifies this record; capture identities also include the actual client. sysbench's `native.binary` must select a file in that inventory; the standard build uses `src/sysbench`. A missing build-time inventory requires rebuilding the client from source. HyBench resolves dependencies through its POM. Its build copy applies `scripts/patches/hybench-1.0-snapshot.patch` to exclude the dsol XML simulator unused by `PowerDist`; the actual POM also contributes to the build digest. YCSB's distribution path is determined by the build output.
 
+Each build also applies its versioned `scripts/patches/*-stop.patch`. These add a
+cooperative stop check between native business operations, preserving their SQL,
+transaction bodies and configured concurrency. Capture derives the expected patched
+source from the pin, checks every source file, and binds the patch digest in the
+build record. The submodules remain unchanged.
+
 ### rocksdb-cloud JNI
 
 This component is required only for the cloud backend. Source revisions are pinned by the `index/rocksdb-cloud` and `third_party/aws-sdk-cpp` submodule gitlinks; Java dependencies are pinned in `pom.xml`. The build script requires both submodules to be clean and at their pinned commits.
@@ -52,6 +58,84 @@ The output is `build/index/librocksdb_cloud_jni.so`; select it at runtime with `
 scripts/native-capture.sh config/benchmark/ycsb.yaml
 ```
 
+`capture.output` selects `proto` (the default) or `full` in the benchmark profile.
+Proto export reads only primary and secondary index columns from one initial
+snapshot and produces final Index Service requests. Generation retains those
+encoded shards under `trace/baseline/` and writes `trace/workload.pb.zst`, with
+source positions, native expected counts, work units, checksums and input identities.
+Same-filesystem baseline retention uses hard links instead of rebuilding requests.
+Export checks the actual source schema and uses its snapshot planning count to
+enforce YCSB's declared row count before writing data. Row counts are recorded in
+the export manifest; loading does not scan the tables again just to count them.
+Proto file digests reuse the successfully closed writer's byte-stream digest;
+consumers check the stored bytes while reading them.
+
+During the native workload, PG and JDBC facts stream to the Java generator over
+a local Unix socket. The existing transaction/snapshot projection and validation
+produce final requests in that process; production does not save a whole-run raw
+capture or run a separate file conversion. Index Service replay is a separate phase.
+Proto output writes no complete-row Parquet, detailed `workload.ops` or retained
+raw event files. The published Trace has no Baseline data-file dependency.
+
+Unresolved transactions and completed transactions waiting for safe source order
+may use temporary segments under `artifacts/transactions/`.
+`generation.pending_transaction_bytes` and `pending_transactions`
+in `config/sibench.yaml` limit their combined encoded fact bytes and count
+(defaults: 128 GiB and 67,108,864). Pending facts share a 64 MiB encoded-memory
+budget; a transaction spills when its facts exceed 256 KiB or the shared budget
+is exhausted. Temporary transactions use independent zstd frames with checksums; the byte
+budget counts uncompressed encoded facts, so compression does not bypass it.
+Crossing either pending limit fails generation and prevents
+Trace publication. Size the pending limits for the finite native workload and
+available workspace. Frames from one source backend share segments with an
+8 MiB compressed target; a complete transaction frame may exceed that target.
+Processing releases each transaction's reference. Closed segments disappear when
+their last transaction is released; an active tail rotates at the target or closes
+when its source backend ends. This avoids a disk block and a compression buffer
+per small transaction. They admit facts without reserving disk space; file-system
+allocation and metadata add overhead. These are pending-fact limits, not whole-process memory or
+total disk caps: PG, source auditing and RowID state still need resources.
+JDBC auditing releases ended requests once server execution, consumed results
+and transaction association agree; late consumption of an older open ResultSet
+keeps that request live. Each session admits at most 65,536 pending requests and
+1,048,576 buffered row-hash/detail entries, failing generation on overflow. These
+are entry counts, not byte or RSS caps. PG and the generator run concurrently. Failure
+diagnostics stream at most 65,536 transaction details, declare truncation, and retain
+the exact aggregate pending metrics. Failures retain pending spool diagnostics and
+`INCOMPLETE`; they do not produce a successful partial Trace.
+
+Optional `generation.operation_target` and `generation.output_byte_target` in
+`config/sibench.yaml` request a normal stop; omitted or zero means no extra target.
+The operation target counts emitted workload Trace records, including transaction
+control and index expansion. The byte target counts the complete compressed
+canonical proto files, including Baseline; it excludes metadata, raw, Parquet,
+PG and temporary storage. It must exceed the complete Baseline proto size;
+initial-state-only captures are unsupported.
+
+After a complete source transaction reaches either target, clients stop admitting
+new business operations, finish their active operations, and close normally.
+Already produced facts are drained and audited, so projected-source lag, active
+transactions and buffered compressed blocks can cause overshoot. The
+`generation_budget` manifest/timing entry records targets, request-time progress,
+actual counts/bytes, overshoot and whether a target or the native workload ended
+the run. Later native workloads/phases are skipped after a target stop. All
+source-completeness and native-result checks apply to the actual executed prefix.
+These targets do not impose a memory or disk hard cap. With targets enabled,
+HyBench's native timer also lets active operations finish instead of interrupting them.
+
+Full output uses the same generation path and additionally saves compressed raw
+facts, complete-row Baseline, incremental Parquet and detailed operations as
+side outputs. Select it for Locator values, `--audit-baseline`, `audit-rows`,
+`validate-snapshots` or data-file relocation. Proto-only output supports RowIDs.
+The usual `check-replay`, `replay`, `replay-service`, `verify-service` and locality
+commands read published proto inputs. Replay forwards stored write/search/group
+payloads while assigning replay IDs and transaction positions. Both output modes
+use this protobuf path; full-mode writes select RowID or Locator values from
+the stored metadata. Detailed operations are diagnostic side output. Operation views
+support validation and the reference model. Run `replay` before service replay
+to check native counts and supply ordered result digests; this does not claim
+an independent Parquet row oracle.
+
 Run as a non-root user able to manage its own PG cluster. Java selection prefers `SIBENCH_JAVA_HOME`, then `JAVA_HOME`, then PATH. `SIBENCH_HEAP` defaults to `-Xmx12g`.
 
 All three sources default to **87,060,000 rows**, corresponding to HyBench SF10. Filenames remain stable; each file declares the scale, table count, and concurrency:
@@ -59,16 +143,16 @@ All three sources default to **87,060,000 rows**, corresponding to HyBench SF10.
 | Configuration | Responsibility |
 | --- | --- |
 | `config/benchmark/hybench.yaml`, `ycsb.yaml`, `sysbench.yaml` | Native workloads, capture database identities, and source execution constraints |
-| `config/sibench.yaml` | PG server settings, reference / service replay drivers, and locality analysis |
+| `config/sibench.yaml` | PG server settings, pending generation budgets, replay drivers, and locality analysis |
 | `config/index/rocksdb.yaml`, `storage.yaml` | Index service and object storage backends |
 
-All three sources use the same generation entry point: native baseline loading, initial-state export, native workload capture, and Trace compilation. Source adapters retain their own native clients and loading methods. Each run creates one fresh database, exports its initial state, and executes the native workloads in that same database. HyBench does not restore data between workload phases. Dedicated clusters use local trust authentication and empty client passwords; inherited `PGPASSWORD` is never written to command lines or logs.
+All three sources use the same generation entry point: native baseline loading, initial-state export, and native workload execution with direct Trace generation. Source adapters retain their own native clients and loading methods. Each run creates one fresh database, exports its initial state, and executes the native workloads in that same database. HyBench does not restore data between workload phases. Dedicated clusters use local trust authentication and empty client passwords; inherited `PGPASSWORD` is never written to command lines or logs.
 
 Generation PostgreSQL is disposable. Source tables and their indexes are unlogged, and the default settings disable `fsync` and `full_page_writes`. Native table creation is converted while tables are empty, before loading. Failed or crashed state must be rebuilt; existing database directories are never reused. This policy does not change Index Service durability. WAL and checkpoint settings remain targets, not hard disk limits.
 
-Production checks source provenance, client builds, schema, input files, request/session completion, transaction semantics, and the access ledger against PostgreSQL index counters. Baseline file identity is recorded in `baseline-manifest.json`; this is not an independent value-audit claim. Full baseline/row-state comparisons are explicit acceptance commands. Production writes Baseline, raw capture, Trace, timing and effective configurations, stops PG before compilation, and removes the database after success unless `SIBENCH_KEEP_DATABASE=1`. Failed artifacts remain for diagnosis and cannot be resumed. Use a fresh output path for each run.
+Production checks source provenance, client builds, schema, input files, request/session completion, transaction semantics, and the access ledger against PostgreSQL index counters. Baseline file identity is recorded in `baseline-manifest.json`; this is not an independent value-audit claim. Full baseline/row-state comparisons are explicit acceptance commands for full output. Production writes the selected Trace, timing and effective configurations, publishes only after source audits and PG counter checks, stops PG, and removes the database after success unless `SIBENCH_KEEP_DATABASE=1`. Full output retains the Baseline and raw capture; proto output releases the consumed initial export and source control directory after publication. Failed artifacts remain for diagnosis and cannot be resumed. Use a fresh output path for each run.
 
-Native execution stdout is saved as `native-run.log`. Structured capture status and build identities are recorded in `raw/capture-run.json`.
+Native execution stdout is saved as `native-run.log`. Structured capture status and build identities are recorded in `raw/capture-run.json` during generation and copied to `trace/source-capture-run.json` before publication. Proto mode uses the configured raw directory for control metadata only.
 
 Provision disk capacity for one working database, Parquet / Trace artifacts, and compiler workspaces. Generation does not retain a reusable initial database or copy it into a capture database. Explicit acceptance needs additional audit workspace.
 
@@ -85,14 +169,14 @@ Normal generation checks Baseline row coverage, file boundaries and file SHA-256
 
 Use `scripts/native-capture.sh --audit-baseline PROFILE` to run the initial comparison immediately after export. It records the audit command, timing and result separately and stops on failure. To retain the final database for `audit-rows`, set `SIBENCH_KEEP_DATABASE=1`; restart the cleanly stopped database on the same host boot before auditing. A final-state audit cannot replace the initial comparison.
 
-These audits read full inputs and require additional workspace. Measure normal generation in a separate run: subtracting audit time does not remove its cache effects. Trace conversion and service acceptance are described below and in the [Trace](docs/trace.md#validation-responsibilities) and [Index Service](docs/index-service.md#validation-boundaries) contracts.
+These audits read full inputs and require additional workspace. Measure normal generation in a separate run: subtracting audit time does not remove its cache effects. Trace publication and service acceptance are described below and in the [Trace](docs/trace.md#validation-responsibilities) and [Index Service](docs/index-service.md#validation-boundaries) contracts.
 
 ## Replay and service
 
 The following commands reuse an existing Trace without connecting to PG:
 
 ```bash
-T=results/poc/ycsb/trace
+T=results/capture/ycsb/trace
 java -jar build/sibench/sibench.jar replay config/sibench.yaml "$T" results/reference.json
 ```
 
@@ -100,9 +184,13 @@ java -jar build/sibench/sibench.jar replay config/sibench.yaml "$T" results/refe
 
 `replay-service` requires `--reference REPORT`. Prepare the reference explicitly; service replay rejects a missing reference before reading the configuration or Trace and does not generate answers implicitly.
 
-Replay entry points include input preflight, load verification, and result checks. `check-replay CONFIG TRACE` is a standalone input diagnostic that fully consumes Baseline; it need not run separately before every replay. For changes to compilation or reader semantics, backend integration, and formal acceptance, explicitly run `validate-snapshots CONFIG TRACE REPORT` at the affected boundary to check results against an independent Parquet row-history oracle.
+Replay entry points include input preflight, load verification, and result checks. `check-replay CONFIG TRACE` is a standalone input diagnostic that fully consumes Baseline; it need not run separately before every replay. Full-output acceptance uses `validate-snapshots CONFIG TRACE REPORT` at the affected boundary to check results against an independent Parquet row-history oracle. Proto inputs use `replay` for native-count checks and reference digests; source-semantic changes additionally need controlled source observations, and real-service acceptance remains separate.
 
 `validate-snapshots` also writes the per-query expectations during its reference-model pass. Its report can be passed directly to `replay-service --reference REPORT` and `verify-service`; a separate `replay` run is unnecessary when the oracle already prepares the required value mode.
+
+Ordinary `replay` checks native counts and writes complete ordered query digests.
+The additional whole-primary-state checksum scan belongs to the explicit
+`validate-replay-matrix` diagnostic, which compares final states across variants.
 
 Start the actual service, then replay from another terminal:
 
@@ -111,7 +199,7 @@ java -jar build/sibench/sibench.jar index-server config/index/rocksdb.yaml
 ```
 
 ```bash
-T=results/poc/ycsb/trace
+T=results/capture/ycsb/trace
 java -jar build/sibench/sibench.jar replay-service config/sibench.yaml \
   "$T" results/service.json --reference results/reference.json
 ```
@@ -122,14 +210,21 @@ Reference and service replay share `config/sibench.yaml`; the command selects th
 
 ```bash
 java -jar build/sibench/sibench.jar analyze-locality \
-  results/poc/ycsb/trace config/sibench.yaml results/locality
+  results/capture/ycsb/trace config/sibench.yaml results/locality
 python3 scripts/plot_update_locality.py results/locality --out results/locality/plots
 java -jar build/sibench/sibench.jar inspect-scale
 ```
 
-Plotting requires Python 3, pandas, and matplotlib. Static block / file overlap does not measure actual SST or compaction costs. `inspect-scale` checks default source configurations and displays row counts without generating data. `prepare --dry-run PROFILE` is a separate derived-generation entry point that does not accept native capture configurations. Derived examples are development / test inputs; their scale does not indicate compressed file size.
+Plotting requires Python 3, pandas, and matplotlib. Static block / file overlap does not measure actual SST or compaction costs. `inspect-scale` checks default source configurations and displays row counts with status `profiles_valid` without generating data. `prepare --dry-run PROFILE` is a separate derived-generation entry point that does not accept native capture configurations. Derived examples are development / test inputs; their scale does not indicate compressed file size.
 
 ## Tests
+
+Service acceptance covers actual local/cloud replay correctness, Flush, and
+snapshot checks after a clean close and reopen. Fault-recovery experiments,
+including forced termination and cloud cold recovery after local-directory loss,
+are outside required acceptance; see the [validation boundaries](docs/index-service.md#validation-boundaries).
+
+Python test entry points require Python 3.9 or later on a Unix host.
 
 ```bash
 mvn test
@@ -138,6 +233,44 @@ bash -n scripts/native-capture.sh
 bash -n scripts/build-benchmarks.sh
 bash -n scripts/build-rocksdb-cloud.sh
 ```
+
+### Native generation integration
+
+Build the current instrumented PG and packaged SIBench JAR, resolve Maven
+dependencies, and run as a non-root PG service user. Each check creates a fresh
+32 MiB-buffer PG cluster, uses a new output directory, records effective
+configuration/build identities, removes successful working data, and retains
+failed diagnostics. Native modes also require the pinned Sysbench and YCSB builds.
+
+```bash
+python3 src/test/python/direct_capture_it.py \
+  --postgres-bin build/services/postgresql-capture/runtime/bin \
+  --work-directory "results/capture/direct-source-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+| Mode flag | Input and execution deadline | Checks |
+| --- | --- | --- |
+| Omitted | Two three-row schemas, two sessions; 120 s | Snapshots, rollback, delete/reinsert identity, final handoff, disconnected receivers, PG counters, reference and local service. |
+| `--native-clients` | Sys/Y: 64 rows, one client, four native operations per workload; 120 s | Native load/export/run, complete publication without raw files, counters, reference/local service, and rejection of an incomplete YCSB load. |
+| `--generation-budgets` | Sys/Y: 64 rows, 50,000 requested native operations; 180 s | Two clients at 40 Trace records or baseline proto bytes + 64; 32 clients at one record. Checks early stop, exact final accounting and audits/replay, including complete YCSB read-modify-write operations. The 32-client cases use full output and independent retained-row snapshot validation. |
+
+The mode flags are mutually exclusive. These are bounded correctness checks,
+without full-scale captures, cloud experiments or performance claims.
+
+### Explicit diagnostics and source acceptance
+
+For a bounded protobuf decoder diagnostic, compile test classes with Maven and run:
+
+```bash
+CP=build/sibench/test-classes:build/sibench/sibench.jar
+java -Xmx1g -cp "$CP" org.sibench.capture.ProtoTraceBenchmark create /tmp/sibench-codec 1000000 250000
+java -Xmx1g -cp "$CP" org.sibench.capture.ProtoTraceBenchmark read /tmp/sibench-codec 5
+```
+
+Use a fresh fixture directory. This checks physical/logical digests and operation
+coverage, and reports warmed read time, thread CPU and allocation. Its fixed
+primary-write/read-your-writes input is a decoder diagnostic, not a native workload
+or Index Service throughput result.
 
 Run standalone native measurement tests for the cloud JNI with `make -C src/main/native/index/rocksdb_cloud test`. They require the cloud backend build above and the same build dependencies, and do not connect to cloud services.
 

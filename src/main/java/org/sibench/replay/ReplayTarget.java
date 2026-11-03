@@ -19,6 +19,12 @@ public interface ReplayTarget extends AutoCloseable {
      */
     SendHandle send(long dispatchSequence, Operation operation) throws IOException;
 
+    /** Logical reference targets consume views; service clients forward the stored payload. */
+    default SendHandle send(long dispatchSequence, Operation operation,
+            org.sibench.adapters.proto.Request stored) throws IOException {
+        return send(dispatchSequence, operation);
+    }
+
     /**
      * Sends a complete-commit marker after the transaction's operations. Services that only use
      * sequence ordering do not need it; the default fails rather than silently dropping it.

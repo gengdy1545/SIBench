@@ -82,17 +82,17 @@ public class ReferenceReplayTest {
             assertThrows(
                     IOException.class,
                     () ->
-                            ReferenceReplay.runFiles(
+                            ReferenceReplayFixture.run(
                                     baseline,
                                     workload,
                                     new ReplayConfig(false, "none", 1, 3, 0, 0),
                                     report));
             assertFalse(Files.exists(report));
             var config = new ReplayConfig(false, "none", 1, 2, 0, 0);
-            var checked = ReferenceReplay.checkFiles(baseline, workload, config);
+            var checked = ReferenceReplayFixture.check(baseline, workload, config);
             assertEquals("trace_integrity_and_supply_valid", checked.get("status"));
             assertEquals(7L, ((Map<?, ?>) checked.get("workload")).get("last_commit_version"));
-            var result = ReferenceReplay.runFiles(baseline, workload, config, report);
+            var result = ReferenceReplayFixture.run(baseline, workload, config, report);
             assertEquals("passed", result.get("status"));
             for (var item : (List<?>) result.get("results")) {
                 var mode = (Map<?, ?>) item;
@@ -102,7 +102,7 @@ public class ReferenceReplayTest {
             }
             assertThrows(
                     IOException.class,
-                    () -> ReferenceReplay.runFiles(baseline, workload, config, report));
+                    () -> ReferenceReplayFixture.run(baseline, workload, config, report));
         } finally {
             Files.deleteIfExists(report);
             for (String mode : List.of("locator", "rowid"))
@@ -155,13 +155,13 @@ public class ReferenceReplayTest {
                 var groupedConfig = new ReplayConfig(secondary, "none", 0, 0, 0, 0, "transaction");
                 var rawConfig = new ReplayConfig(secondary, "none", 0, 0, 0, 0, "operation");
                 var grouped =
-                        ReferenceReplay.runFiles(
+                        ReferenceReplayFixture.run(
                                 baseline,
                                 workload,
                                 groupedConfig,
                                 directory.resolve("grouped-" + secondary + ".json"));
                 var raw =
-                        ReferenceReplay.runFiles(
+                        ReferenceReplayFixture.run(
                                 baseline,
                                 workload,
                                 rawConfig,
@@ -172,6 +172,7 @@ public class ReferenceReplayTest {
                     var x = (Map<?, ?>) a.get(mode);
                     var y = (Map<?, ?>) b.get(mode);
                     assertEquals(x.get("query_digest_sha256"), y.get("query_digest_sha256"));
+                    assertNotNull(x.get("primary_state_checksum"));
                     assertEquals(x.get("primary_state_checksum"), y.get("primary_state_checksum"));
                     assertEquals(secondary ? 14L : 6L, x.get("workload_operations"));
                     assertEquals(secondary ? 14L : 6L, y.get("workload_operations"));
@@ -179,7 +180,7 @@ public class ReferenceReplayTest {
                 assertThrows(
                         IOException.class,
                         () ->
-                                ReferenceReplay.checkFiles(
+                                ReferenceReplayFixture.check(
                                         baseline,
                                         workload,
                                         new ReplayConfig(

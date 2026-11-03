@@ -24,7 +24,21 @@ public final class SibenchConfig {
         require(string(document, "purpose").equals("sibench"), "Expected sibench purpose");
         for (String key : document.keySet())
             require(Set.of("schema_version", "purpose", "postgres", "target", "replay",
-                    "versions", "analysis").contains(key), "Unknown SIBench option: " + key);
+                    "versions", "analysis", "generation").contains(key), "Unknown SIBench option: " + key);
+        if (document.containsKey("generation")) {
+            var generation = object(document, "generation");
+            require(generation.keySet().containsAll(Set.of("pending_transaction_bytes", "pending_transactions")),
+                    "Generation requires pending_transaction_bytes and pending_transactions");
+            for (String key : generation.keySet())
+                require(Set.of("pending_transaction_bytes", "pending_transactions", "operation_target",
+                        "output_byte_target").contains(key), "Unknown generation option: " + key);
+            positive(generation, "pending_transaction_bytes");
+            require(positive(generation, "pending_transactions") <= Integer.MAX_VALUE,
+                    "pending_transactions exceeds supported count");
+            for (String key : Set.of("operation_target", "output_byte_target"))
+                if (generation.containsKey(key))
+                    require(integer(generation, key) >= 0, "generation." + key + " must be nonnegative");
+        }
     }
 
     /** Materialize PG's native format only after validating every setting; never overwrite it. */

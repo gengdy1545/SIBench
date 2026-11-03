@@ -1,0 +1,373 @@
+package org.sibench.capture;
+
+import com.github.luben.zstd.Zstd;
+import com.google.protobuf.ByteString;
+
+import org.sibench.adapters.TraceRequests;
+import org.sibench.adapters.proto.*;
+import org.sibench.capture.IndexOperationTrace.Operation;
+import org.sibench.trace.IndexKey;
+
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.security.DigestInputStream;
+import java.security.DigestOutputStream;
+import java.util.*;
+import java.util.zip.CRC32C;
+
+/** Independently compressed blocks of delimited service requests, with source positions. */
+public final class ProtoTrace {
+    private static final int MAGIC = 0x53495042;
+    private static final int MAX_BYTES = 32 << 20;
+    private static final int BLOCK_BYTES = 1 << 20;
+
+    private ProtoTrace() {}
+
+    public static boolean indexOnly(com.google.gson.JsonObject manifest) {
+        return manifest.get("output").getAsString().equals("proto");
+    }
+
+    public static IndexOperationTrace.Source source(Path directory, com.google.gson.JsonObject manifest,
+            String name) throws IOException {
+        if (!manifest.has("proto_files")) throw new IOException("Missing proto Trace file inventory");
+        if (!manifest.get("proto_files").isJsonObject()) throw new IOException("Invalid proto Trace file inventory");
+        var inventory = manifest.getAsJsonObject("proto_files");
+        if (!inventory.has(name) || !inventory.get(name).isJsonArray())
+            throw new IOException("Invalid proto Trace file inventory: " + name);
+        var files = inventory.getAsJsonArray(name);
+        if (files == null || files.isEmpty()) throw new IOException("Missing proto Trace files: " + name);
+        for (var item : files) {
+            if (!item.isJsonObject()) throw new IOException("Invalid proto Trace inventory entry");
+            var file = item.getAsJsonObject();
+            for (String field : List.of("sha256", "logical_sha256"))
+                if (!file.has(field) || !file.get(field).getAsString().matches("[0-9a-f]{64}"))
+                    throw new IOException("Invalid proto Trace digest: " + field);
+            if (!file.has("operations") || file.get("operations").getAsLong() < 0 || !file.has("path"))
+                throw new IOException("Invalid proto Trace count or path");
+        }
+        String identity = identity(files);
+        if (!identity.equals(manifest.get(name + "_trace_sha256").getAsString()))
+            throw new IOException("Proto Trace inventory identity mismatch: " + name);
+        var paths = new HashSet<Path>();
+        for (var item : files) {
+            var file = item.getAsJsonObject();
+            Path relative = Path.of(file.get("path").getAsString());
+            if (relative.isAbsolute() || !relative.normalize().equals(relative) || relative.startsWith("..")
+                    || !(relative.toString().equals(name + ".pb.zst")
+                            || name.equals("baseline") && relative.getNameCount() == 2
+                                    && relative.startsWith("baseline") && relative.toString().endsWith(".pb.zst"))
+                    || !paths.add(relative))
+                throw new IOException("Invalid proto Trace file path: " + relative);
+        }
+        return consumer -> {
+            long count = 0;
+            for (var item : files) {
+                var file = item.getAsJsonObject();
+                long actual = read(directory.resolve(file.get("path").getAsString()),
+                        file.get("sha256").getAsString(), file.get("logical_sha256").getAsString(), consumer);
+                if (actual != file.get("operations").getAsLong())
+                    throw new IOException("Proto Trace file operation count mismatch");
+                count = Math.addExact(count, actual);
+            }
+            return count;
+        };
+    }
+
+    /** Binds shard order and semantic counts without decoding and re-encoding requests. */
+    public static String identity(com.google.gson.JsonArray files) {
+        var digest = org.sibench.replay.QueryDigest.digest();
+        for (var item : files) {
+            var file = item.getAsJsonObject();
+            digest.update(HexFormat.of().parseHex(file.get("logical_sha256").getAsString()));
+            digest.update(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(file.get("operations").getAsLong()).array());
+        }
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    public static Map<String, Object> file(String path, Writer writer) {
+        return Map.of("path", path, "sha256", writer.sha256(),
+                "logical_sha256", writer.logicalSha256(), "operations", writer.count());
+    }
+
+    public static IndexOperationTrace.Source source(Path file, String physical, String logical) {
+        return consumer -> read(file, physical, logical, consumer);
+    }
+
+    public static final class Writer implements Closeable, IndexOperationTrace.Consumer {
+        private final java.security.MessageDigest physical = org.sibench.replay.QueryDigest.digest();
+        private final DataOutputStream output;
+        private final ByteArrayOutputStream block = new ByteArrayOutputStream();
+        private final java.security.MessageDigest logical = org.sibench.replay.QueryDigest.digest();
+        private final OutputStream messages = new DigestOutputStream(block, logical);
+        private long count;
+        private String logicalSha256;
+        private final TraceRequests requests = new TraceRequests(ValueKind.ROW_ID);
+        private final List<Operation> group = new ArrayList<>();
+        private int records;
+        private long transaction;
+        private String sha256;
+        private boolean closed;
+        private volatile long bytesWritten = Integer.BYTES;
+
+        public Writer(Path file) throws IOException {
+            output = new DataOutputStream(new BufferedOutputStream(new DigestOutputStream(
+                    Files.newOutputStream(file, StandardOpenOption.CREATE_NEW), physical)));
+            output.writeInt(MAGIC);
+        }
+
+        @Override
+        public void accept(Operation operation) throws IOException {
+            append(operation);
+        }
+
+        public void append(Operation operation) throws IOException {
+            if (closed) throw new IOException("Proto Trace writer is closed");
+            IndexOperationTrace.validate(operation);
+            count++;
+            if (operation.grouped()) {
+                if (operation.expansionPosition() != group.size()
+                        || !group.isEmpty() && (operation.expansionSize() != group.get(0).expansionSize()
+                                || operation.sourceEvent() != group.get(0).sourceEvent()))
+                    throw new IOException("Invalid proto search group order");
+                group.add(operation);
+                if (group.size() == operation.expansionSize()) {
+                    var record = TraceRecord.newBuilder().setRequest(requests.group(0, group));
+                    for (Operation member : group) record.addPositions(position(member));
+                    write(record.build());
+                    group.clear();
+                }
+                return;
+            }
+            if (!group.isEmpty()) throw new IOException("Interrupted proto search group");
+            var record = TraceRecord.newBuilder().addPositions(position(operation));
+            if (operation.kind() == IndexOperationTrace.TRANSACTION_BEGIN) {
+                if (transaction != 0) throw new IOException("Nested proto transaction");
+                transaction = operation.transactionId();
+                record.setBegin(TraceBegin.newBuilder().setTransactionId(transaction).setVersion(operation.version()));
+            } else if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) {
+                if (transaction != operation.transactionId()) throw new IOException("Unmatched proto commit");
+                record.setRequest(requests.commit(0, transaction, operation.version()));
+                transaction = 0;
+            } else {
+                var request = requests.request(0, operation);
+                if (request.hasWrite() && operation.kind() != IndexOperationTrace.LOGICAL_DELETE) {
+                    // Full output also retains real Locators; proto-only writes have no data-file location.
+                    request = request.toBuilder().setWrite(request.getWrite().toBuilder().setValue(
+                            request.getWrite().getValue().toBuilder()
+                                    .setFile(operation.file()).setPosition(operation.position()))).build();
+                }
+                record.setRequest(request);
+            }
+            write(record.build());
+        }
+
+        private void write(TraceRecord record) throws IOException {
+            if (record.getSerializedSize() > MAX_BYTES - 5) throw new IOException("Proto Trace request exceeds block limit");
+            if (records != 0 && (records == IndexOperationTrace.BLOCK_RECORDS
+                    || block.size() + record.getSerializedSize() + 5 > BLOCK_BYTES)) flush();
+            record.writeDelimitedTo(messages);
+            records++;
+        }
+
+        private void flush() throws IOException {
+            if (records == 0) return;
+            byte[] plain = block.toByteArray(), compressed = Zstd.compress(plain, 3);
+            var crc = new CRC32C();
+            crc.update(plain);
+            output.writeInt(records);
+            output.writeInt(compressed.length);
+            output.writeInt(plain.length);
+            output.writeInt((int) crc.getValue());
+            output.write(compressed);
+            bytesWritten += 4L * Integer.BYTES + compressed.length;
+            block.reset();
+            records = 0;
+        }
+
+        public long count() { return count; }
+        long bytesWritten() { return bytesWritten; }
+        public String logicalSha256() {
+            if (logicalSha256 == null) throw new IllegalStateException("Proto Trace not closed successfully");
+            return logicalSha256;
+        }
+        public String sha256() {
+            if (sha256 == null) throw new IllegalStateException("Proto Trace not closed successfully");
+            return sha256;
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (closed) return;
+            closed = true;
+            try {
+                if (!group.isEmpty() || transaction != 0) throw new IOException("Incomplete proto transaction or search group");
+                flush();
+                for (int i = 0; i < 4; i++) output.writeInt(0);
+            } finally {
+                output.close();
+            }
+            sha256 = HexFormat.of().formatHex(physical.digest());
+            logicalSha256 = HexFormat.of().formatHex(logical.digest());
+        }
+    }
+
+    private static TracePosition position(Operation operation) {
+        var position = TracePosition.newBuilder()
+                .setSourceEvent(operation.sourceEvent()).setWorkUnitId(operation.workUnitId())
+                .setMutationOrdinal(operation.mutationOrdinal()).setFlags(operation.flags())
+                .setExpectedCount(operation.expectedCount()).setExpansionPosition(operation.expansionPosition())
+                .setExpansionSize(operation.expansionSize());
+        if (operation.kind() == IndexOperationTrace.LOGICAL_DELETE) position.setDeletedRowId(operation.rowId());
+        return position.build();
+    }
+
+    public static long read(Path file, String expectedPhysical, String expectedLogical,
+            IndexOperationTrace.Consumer consumer) throws IOException {
+        var physical = org.sibench.replay.QueryDigest.digest();
+        var decoder = new Decoder();
+        var logical = org.sibench.replay.QueryDigest.digest();
+        long count = 0;
+        try (var input = new DataInputStream(new BufferedInputStream(new DigestInputStream(
+                    Files.newInputStream(file), physical)))) {
+            if (input.readInt() != MAGIC) throw new IOException("Invalid proto Trace header");
+            while (true) {
+                int records = input.readInt(), compressed = input.readInt(), length = input.readInt(), checksum = input.readInt();
+                if (records == 0 && compressed == 0 && length == 0 && checksum == 0) {
+                    if (input.read() != -1) throw new IOException("Trailing proto Trace bytes");
+                    break;
+                }
+                if (records < 1 || records > IndexOperationTrace.BLOCK_RECORDS
+                        || length < 1 || length > MAX_BYTES || compressed < 1 || compressed > MAX_BYTES + (1 << 20))
+                    throw new IOException("Invalid proto Trace block lengths");
+                byte[] encoded = input.readNBytes(compressed);
+                if (encoded.length != compressed) throw new EOFException("Truncated proto Trace block");
+                byte[] plain;
+                try { plain = Zstd.decompress(encoded, length); }
+                catch (RuntimeException error) { throw new IOException("Invalid compressed proto Trace block", error); }
+                var crc = new CRC32C();
+                crc.update(plain);
+                if (plain.length != length || (int) crc.getValue() != checksum)
+                    throw new IOException("Proto Trace block checksum mismatch");
+                logical.update(plain);
+                var messages = com.google.protobuf.CodedInputStream.newInstance(plain);
+                for (int i = 0; i < records; i++) {
+                    if (messages.isAtEnd()) throw new EOFException("Missing proto Trace request");
+                    var record = messages.readMessage(TraceRecord.parser(),
+                            com.google.protobuf.ExtensionRegistryLite.getEmptyRegistry());
+                    var views = new ArrayList<Operation>(record.getPositionsCount());
+                    decoder.accept(record, views::add);
+                    for (Operation operation : views) IndexOperationTrace.validate(operation);
+                    consumer.accept(record, List.copyOf(views));
+                    count = Math.addExact(count, views.size());
+                }
+                if (!messages.isAtEnd()) throw new IOException("Extra proto Trace requests");
+            }
+            if (decoder.transaction != 0) throw new IOException("Unclosed proto Trace transaction");
+        }
+        if (expectedPhysical != null && !HexFormat.of().formatHex(physical.digest()).equals(expectedPhysical))
+            throw new IOException("Proto Trace file digest mismatch");
+        if (expectedLogical != null && !HexFormat.of().formatHex(logical.digest()).equals(expectedLogical))
+            throw new IOException("Proto Trace logical digest mismatch");
+        return count;
+    }
+
+    private static final class Decoder {
+        long transaction, version, operations, writes;
+
+        void accept(TraceRecord record, IndexOperationTrace.Consumer consumer) throws IOException {
+            if (!record.getUnknownFields().asMap().isEmpty() || record.getPositionsCount() == 0)
+                throw new IOException("Unsupported or missing proto Trace metadata");
+            var first = record.getPositions(0);
+            if (record.hasBegin()) {
+                var begin = record.getBegin();
+                if (transaction != 0 || begin.getTransactionId() <= 0 || begin.getVersion() <= 0
+                        || record.getPositionsCount() != 1) throw new IOException("Invalid proto transaction begin");
+                transaction = begin.getTransactionId();
+                version = begin.getVersion();
+                operations = writes = 0;
+                consumer.accept(IndexOperationTrace.transaction(first.getSourceEvent(),
+                        IndexOperationTrace.TRANSACTION_BEGIN, transaction, version, first.getExpectedCount()));
+                return;
+            }
+            if (!record.hasRequest()) throw new IOException("Missing proto service request");
+            var request = record.getRequest();
+            if (request.getId() != 0) throw new IOException("Proto request IDs are assigned at replay");
+            if (request.hasCommit()) {
+                var commit = request.getCommit();
+                if (transaction == 0 || request.getTransactionId() != transaction
+                        || request.getTransactionOperation() != 0 || commit.getVersion() != version
+                        || commit.getOperations() != operations || commit.getWrites() != writes
+                        || record.getPositionsCount() != 1) throw new IOException("Invalid proto commit counts or identity");
+                consumer.accept(IndexOperationTrace.transaction(first.getSourceEvent(),
+                        IndexOperationTrace.TRANSACTION_COMMIT, transaction, version, first.getExpectedCount()));
+                transaction = 0;
+                return;
+            }
+            if (request.getTransactionId() != transaction
+                    || request.getTransactionOperation() != (transaction == 0 ? 0 : ++operations))
+                throw new IOException("Invalid proto transaction position");
+            if (request.hasWrite()) writes++;
+            int members = request.hasGroup() ? request.getGroup().getMembersCount() : 1;
+            if (record.getPositionsCount() != members) throw new IOException("Proto source-member count mismatch");
+            if (request.hasGroup() && (members < 2 || request.getGroup().getMode() == SearchGroup.Mode.MODE_UNSPECIFIED
+                    || request.getGroup().getMode() == SearchGroup.Mode.UNRECOGNIZED))
+                throw new IOException("Invalid proto search group");
+            for (int i = 0; i < members; i++) {
+                var metadata = record.getPositions(i);
+                Operation operation;
+                if (request.hasWrite()) operation = write(request.getWrite(), request.getTransactionId(), metadata);
+                else if (request.hasSearch() || request.hasGroup()) {
+                    var search = request.hasSearch() ? request.getSearch() : request.getGroup().getMembers(i);
+                    if (request.hasGroup()) {
+                        int flag = request.getGroup().getMode() == SearchGroup.Mode.INTERSECTION
+                                ? IndexOperationTrace.INTERSECT_GROUP : IndexOperationTrace.UNION_GROUP;
+                        if ((metadata.getFlags() & flag) == 0 || metadata.getExpansionPosition() != i
+                                || metadata.getExpansionSize() != members)
+                            throw new IOException("Proto search group metadata mismatch");
+                    }
+                    operation = search(search, request.getTransactionId(), metadata);
+                } else throw new IOException("Unsupported proto service request");
+                consumer.accept(operation);
+            }
+        }
+    }
+
+    private static Operation write(Write write, long transaction, TracePosition p) throws IOException {
+        int kind = switch (write.getKind()) {
+            case INSERT -> IndexOperationTrace.INSERT;
+            case UPSERT -> IndexOperationTrace.UPSERT;
+            case LOGICAL_DELETE -> IndexOperationTrace.LOGICAL_DELETE;
+            case RELOCATE -> IndexOperationTrace.RELOCATE;
+            default -> throw new IOException("Unsupported proto write kind");
+        };
+        var key = write.getKey();
+        return new Operation(p.getSourceEvent(), kind, key.getTable(), key.getIndex(), p.getFlags(),
+                key(key.getPrimaryKey()), key.getIndexedValue().isEmpty() ? null : key(key.getIndexedValue()),
+                write.getVersion(), write.getValue().getFile(), write.getValue().getPosition(),
+                kind == IndexOperationTrace.LOGICAL_DELETE ? p.getDeletedRowId() : write.getValue().getRowId(),
+                p.getExpectedCount(), transaction, p.getMutationOrdinal(), -1, p.getWorkUnitId(),
+                p.getExpansionPosition(), p.getExpansionSize(), null, null, 0);
+    }
+
+    private static Operation search(Search search, long transaction, TracePosition p) throws IOException {
+        int bounds = (search.hasLower() && search.getLower().getInclusive() ? IndexOperationTrace.LOWER_INCLUSIVE : 0)
+                | (search.hasUpper() && search.getUpper().getInclusive() ? IndexOperationTrace.UPPER_INCLUSIVE : 0)
+                | (search.getDescending() ? IndexOperationTrace.DESCENDING : 0);
+        if ((p.getFlags() & (IndexOperationTrace.LOWER_INCLUSIVE | IndexOperationTrace.UPPER_INCLUSIVE
+                | IndexOperationTrace.DESCENDING)) != bounds
+                || ((p.getFlags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0) != (search.getLocalVersion() != 0))
+            throw new IOException("Proto search metadata mismatch");
+        return new Operation(p.getSourceEvent(), IndexOperationTrace.SEARCH, search.getTable(), search.getIndex(),
+                p.getFlags(), search.getPinnedPrimaryKey().isEmpty() ? null : key(search.getPinnedPrimaryKey()), null,
+                search.getLocalVersion(), 0, 0, 0, p.getExpectedCount(), transaction, p.getMutationOrdinal(),
+                search.getReadVersion(), p.getWorkUnitId(), p.getExpansionPosition(), p.getExpansionSize(),
+                search.hasLower() ? key(search.getLower().getKey()) : null,
+                search.hasUpper() ? key(search.getUpper().getKey()) : null, search.getLimit());
+    }
+
+    private static IndexKey key(ByteString bytes) throws IOException {
+        return IndexKey.decode(bytes.toByteArray());
+    }
+}

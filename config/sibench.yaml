@@ -14,6 +14,9 @@ replay:
   client_count: 64
   max_in_flight: 4096
   request_timeout_seconds: 600
+generation:
+  pending_transaction_bytes: 137438953472
+  pending_transactions: 67108864
 versions:
   gc:
     owner: none

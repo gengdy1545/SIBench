@@ -34,6 +34,18 @@ final class NativeLoad {
         return library;
     }
 
+    /** Reject a stale native build before spending time loading the benchmark. */
+    static void requireDirectCapture(String jdbc, String user, Path library) throws Exception {
+        try (Connection connection = DriverManager.getConnection(jdbc, user, password());
+                Statement statement = connection.createStatement()) {
+            statement.execute("CREATE FUNCTION pg_temp.sibench_capture_probe(integer,bigint,bigint) RETURNS bigint AS '"
+                    + library.toString().replace("'", "''") + "', 'sibench_capture_watermark' LANGUAGE C");
+            try (ResultSet result = statement.executeQuery("SELECT pg_temp.sibench_capture_probe(0,0,0)")) {
+                if (!result.next() || result.getLong(1) < 0) throw new IOException("Direct capture watermark is unavailable");
+            }
+        }
+    }
+
     /** Native loaders create their own tables; change persistence while those tables are empty. */
     static void unloggedTables(Connection connection) throws Exception {
         try (Statement statement = connection.createStatement()) {
@@ -76,6 +88,9 @@ final class NativeLoad {
                     "CREATE FUNCTION public.sibench_row_capture() RETURNS trigger AS '"
                             + library.toString().replace("'", "''")
                             + "', 'sibench_row_capture' LANGUAGE C");
+            statement.execute("CREATE FUNCTION public.sibench_capture_watermark(integer DEFAULT 0, bigint DEFAULT 0, bigint DEFAULT 0) RETURNS bigint AS '"
+                    + library.toString().replace("'", "''")
+                    + "', 'sibench_capture_watermark' LANGUAGE C");
             for (var table : schema.tables())
                 statement.execute(
                         "CREATE TRIGGER sibench_row_capture AFTER INSERT OR UPDATE OR DELETE ON \""
@@ -88,33 +103,13 @@ final class NativeLoad {
         }
     }
 
-    /** Rows of every source table, after native loading. */
-    static Map<String, Long> rows(String jdbc, String user, SourceSchema schema) throws Exception {
-        var result = new LinkedHashMap<String, Long>();
-        try (Connection connection = DriverManager.getConnection(jdbc, user, password());
-                Statement statement = connection.createStatement()) {
-            for (var table : schema.tables())
-                try (ResultSet rows = statement.executeQuery("SELECT count(*) FROM \"" + table.name() + "\"")) {
-                    rows.next();
-                    result.put(table.name(), rows.getLong(1));
-                }
-        }
-        return result;
-    }
-
-    static void requireRows(NativeCaptureConfig config, Map<String, Long> rows) throws IOException {
-        if (config.benchmark().equals("ycsb")
-                && !rows.equals(Map.of(ConfigValues.string(config.nativeConfig(), "table"),
-                        ConfigValues.positive(config.nativeConfig(), "recordcount"))))
-            throw new IOException("YCSB load left a different row count in PG: " + rows);
-    }
-
     /** Loads YCSB or sysbench into this run's database with the benchmark's own client. */
     static void build(NativeCaptureConfig config) throws Exception {
         String database = config.database();
         Path manifest = manifest(config.artifacts());
         if (Files.exists(manifest)) throw new IllegalStateException("Native load already recorded: " + manifest);
         Path library = library(config.root());
+        requireDirectCapture(config.adminJdbc(), config.user(), library);
         // Fail before any database exists when the native client is not the pinned build.
         if (config.benchmark().equals("ycsb")) YcsbNativeRun.libraries(config);
         else SysbenchNativeRun.binary(config);
@@ -139,14 +134,9 @@ final class NativeLoad {
         report.put("table_persistence", "unlogged");
         report.put("source_commit", string(config.document(), "source", "commit"));
         report.put("native", config.nativeConfig());
-        long countStarted = System.nanoTime();
-        var loadedRows = rows(config.jdbc(), config.user(), schema);
-        requireRows(config, loadedRows);
-        RunTiming.current().note("load_final_count_millis", (System.nanoTime() - countStarted) / 1_000_000L);
-        report.put("loaded_rows", loadedRows);
         report.put("load_seconds", (System.nanoTime() - started) / 1e9);
         Files.writeString(manifest, new GsonBuilder().setPrettyPrinting().create().toJson(report), StandardOpenOption.CREATE_NEW);
-        System.out.println(config.benchmark() + " loaded database " + database + ": " + report.get("loaded_rows"));
+        System.out.println(config.benchmark() + " loaded database " + database);
     }
 
     private static String string(Map<String, Object> document, String object, String field) {

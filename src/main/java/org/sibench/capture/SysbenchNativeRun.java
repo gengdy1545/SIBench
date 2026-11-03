@@ -2,7 +2,6 @@ package org.sibench.capture;
 
 import static org.sibench.config.ConfigValues.*;
 
-import org.sibench.schema.SourceSchema;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -14,7 +13,7 @@ import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
- * Runs the pinned sysbench binary and Lua scripts unchanged. The client is a libpq process with no
+ * Runs pinned sysbench Lua scripts with cooperative stopping between native events. The client is a libpq process with no
  * JDBC layer, so the server's request ordinals identify its statements; PGAPPNAME switches on
  * capture for its connections only.
  */
@@ -96,8 +95,8 @@ final class SysbenchNativeRun {
     static Map<String, Object> run(NativeCaptureConfig config, Path logs) throws Exception {
         var reports = new ArrayList<Map<String, Object>>();
         long requests = 0, transactions = 0;
-        var schema = SourceSchema.read(config.root(), config.document());
         for (var entry : object(config.nativeConfig(), "workloads").entrySet()) {
+            if (DirectCapture.budgetStopped(config.raw())) break;
             String script = entry.getKey();
             long events = positive(object(object(config.nativeConfig(), "workloads"), script), "events");
             var before = serverTraces(config);
@@ -124,11 +123,12 @@ final class SysbenchNativeRun {
                         script
                                 + ": sysbench reported a failure no pinned source behaviour explains"
                                 + failures.report().get("occurrences"));
-            if (counts.get("transactions") != events)
+            long completedEvents = counts.get("transactions");
+            if (completedEvents > events || completedEvents < events && !DirectCapture.budgetStopped(config.raw()))
                 throw new IOException(script + ": sysbench completed " + counts.get("transactions") + " of " + events + " events");
             var added = new ArrayList<>(serverTraces(config));
             added.removeAll(before);
-            long serverRequests = 0, serverCommits = 0, setupCommits = 0, zeroRows = 0;
+            long serverRequests = 0, serverCommits = 0, setupCommits = 0, zeroRows = 0, aborts = 0, abortedExecutions = 0;
             var sessions = new ArrayList<Map<String, Object>>();
             for (Path trace : added) {
                 var audit = CaptureRun.auditServer(trace);
@@ -136,6 +136,8 @@ final class SysbenchNativeRun {
                 serverCommits += (Long) audit.get("commits");
                 setupCommits += (Long) audit.get("setup_commits_before_first_execution");
                 zeroRows += (Long) audit.get("modifications_affecting_no_row");
+                aborts += (Long) audit.get("aborts");
+                abortedExecutions += (Long) audit.get("aborted_executions");
                 sessions.add(Map.of("pg_file", trace.getFileName().toString(), "requests", audit.get("requests"), "commits", audit.get("commits")));
             }
             // The pgsql driver counts a modification as "write" only when it changed a row and as
@@ -145,11 +147,12 @@ final class SysbenchNativeRun {
             // modifications from the server.
             Path lua = config.source().resolve("src/lua").resolve(script + ".lua");
             var control = SysbenchControlStatements.derive(
-                    lua, SysbenchControlStatements.skipTrx(command), events);
+                    lua, SysbenchControlStatements.skipTrx(command), completedEvents, counts.getOrDefault("ignored errors", 0L));
             long clientStatements = counts.get("read") + counts.get("write") + counts.get("other");
+            long successfulExecutions = certifiedExecutions(script, counts, serverRequests, aborts, abortedExecutions);
             long residual =
                     SysbenchControlStatements.requireAgreement(
-                            script, clientStatements, serverRequests, control);
+                            script, clientStatements, successfulExecutions, control);
             long expected = clientStatements - control.controlStatements();
             if (counts.get("other") - control.controlStatements() != zeroRows)
                 throw new IOException(
@@ -160,7 +163,7 @@ final class SysbenchNativeRun {
                                 + zeroRows
                                 + " modifications that changed no row");
             // One backend per client thread; their statements and commits add up to the client's.
-            if (added.size() != config.threads() || serverRequests != expected || serverCommits != counts.get("transactions"))
+            if (added.size() != config.threads() || successfulExecutions != expected || serverCommits != counts.get("transactions"))
                 throw new IOException(
                         script
                                 + ": sysbench issued "
@@ -168,15 +171,16 @@ final class SysbenchNativeRun {
                                 + " statements in "
                                 + counts.get("transactions")
                                 + " transactions; the server trace has "
-                                + serverRequests
-                                + " executions and "
+                                + successfulExecutions
+                                + " successful executions and "
                                 + serverCommits
                                 + " commits in "
                                 + added.size()
                                 + " sessions");
             var report = new LinkedHashMap<String, Object>();
             report.put("script", script);
-            report.put("events", events);
+            report.put("events", completedEvents);
+            report.put("requested_events", events);
             report.put("reads", counts.get("read"));
             report.put("writes", counts.get("write"));
             report.put("other", counts.get("other"));
@@ -187,10 +191,11 @@ final class SysbenchNativeRun {
             report.put("modifications_affecting_no_row", zeroRows);
             report.put("transactions", counts.get("transactions"));
             report.put("server_executions", serverRequests);
+            report.put("successful_server_executions", successfulExecutions);
+            report.put("aborted_server_executions", abortedExecutions);
             report.put("server_commits", serverCommits);
             report.put("sessions", sessions);
             report.put("source_failures", failures.report());
-            report.put("change_kinds", ChangeKinds.countTraces(schema, added).describe());
             reports.add(report);
             requests += serverRequests;
             transactions += serverCommits;
@@ -214,6 +219,15 @@ final class SysbenchNativeRun {
             if (matcher.matches()) result.putIfAbsent(matcher.group(1).strip(), Long.parseLong(matcher.group(2)));
         }
         return result;
+    }
+
+    /** The pinned driver counts a failed execution only as an error, then rolls it back. */
+    static long certifiedExecutions(String script, Map<String, Long> counts, long requests,
+            long aborts, long abortedExecutions) throws IOException {
+        long ignored = counts.getOrDefault("ignored errors", 0L);
+        if (aborts != ignored || abortedExecutions != ignored || abortedExecutions > requests)
+            throw new IOException(script + ": driver ignored errors and server aborted executions disagree");
+        return requests - abortedExecutions;
     }
 
     /**
@@ -259,6 +273,8 @@ final class SysbenchNativeRun {
     }
 
     private static List<Path> serverTraces(NativeCaptureConfig config) throws IOException {
+        var direct = DirectCapture.current(config.raw());
+        if (direct != null) return direct.paths(true);
         if (!Files.isDirectory(config.raw())) return List.of();
         try (var paths = Files.list(config.raw())) {
             return paths.filter(p -> p.getFileName().toString().startsWith("pg-")).sorted().toList();

@@ -25,19 +25,20 @@ public class WriterThreadTest {
             writer.close();
             expected = writer.sha256();
         }
-        var writer = new WriterThread(new IndexOperationTrace.Writer(threaded), "test-writer");
+        var encoded = new IndexOperationTrace.Writer(threaded);
+        var writer = new WriterThread(encoded, null, "test-writer");
         try (writer) {
             for (int i = 0; i < operations; i++) writer.append(operation(i));
         }
         assertEquals(operations, writer.count());
-        assertEquals(expected, writer.sha256());
+        assertEquals(expected, encoded.sha256());
         assertArrayEquals(Files.readAllBytes(direct), Files.readAllBytes(threaded));
     }
 
     /** An operation the writer refuses fails a later append or the close, not silently. */
     @Test
     public void aWriterFailureReachesTheAppender() throws Exception {
-        var writer = new WriterThread(new IndexOperationTrace.Writer(null), "test-writer");
+        var writer = new WriterThread(new IndexOperationTrace.Writer(null), null, "test-writer");
         var invalid = IndexOperationTrace.write(0, IndexOperationTrace.INSERT, 1, 0, null, 0, 1, 0, 1);
         assertThrows(Exception.class, () -> {
             try (writer) {

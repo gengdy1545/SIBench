@@ -28,12 +28,12 @@ public final class RelocationCheck {
         JsonObject manifest =
                 JsonParser.parseString(Files.readString(input.resolve("manifest.json")))
                         .getAsJsonObject();
+        if (ProtoTrace.indexOnly(manifest)) throw new java.io.IOException("Data-file relocation requires full output");
         IndexCatalog catalog = IndexCatalog.fromManifest(manifest);
         Map<Key, Operation> latest = new LinkedHashMap<>();
         long[] maximumFile = {0};
         BaselineOperations.of(input).read(o -> maximumFile[0] = Math.max(maximumFile[0], o.file()));
-        IndexOperationTrace.read(
-                input.resolve("workload.ops"),
+        ProtoTrace.source(input, manifest, "workload").read(
                 o -> {
                     maximumFile[0] = Math.max(maximumFile[0], o.file());
                     if (IndexOperationTrace.isMutation(o) && o.index() == 0)
@@ -156,7 +156,7 @@ public final class RelocationCheck {
                             new ReplayProjection(ReplayConfig.defaults(), true, model::accept)) {
                 BaselineOperations.of(input).read(load);
                 load.finish();
-                IndexOperationTrace.read(input.resolve("workload.ops"), runtime);
+                ProtoTrace.source(input, manifest, "workload").read(runtime);
                 runtime.finish();
                 IndexOperationTrace.read(output.resolve("relocation.ops"), model::accept);
                 for (var entry : retained.entrySet()) {

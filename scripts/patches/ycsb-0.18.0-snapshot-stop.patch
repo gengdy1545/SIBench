@@ -1,0 +1,21 @@
+--- a/core/src/main/java/site/ycsb/ClientThread.java
++++ b/core/src/main/java/site/ycsb/ClientThread.java
+@@ -87,6 +87,8 @@
+ 
+   @Override
+   public void run() {
++    String stopName = System.getenv("SIBENCH_BUDGET_STOP");
++    java.io.File stopFile = stopName == null || stopName.isEmpty() ? null : new java.io.File(stopName);
+     try {
+       db.init();
+     } catch (DBException e) {
+@@ -117,7 +119,8 @@
+       if (dotransactions) {
+         long startTimeNanos = System.nanoTime();
+ 
+-        while (((opcount == 0) || (opsdone < opcount)) && !workload.isStopRequested()) {
++        while (((opcount == 0) || (opsdone < opcount)) && !workload.isStopRequested()
++            && (stopFile == null || !stopFile.exists())) {
+ 
+           if (!workload.doTransaction(db, workloadstate)) {
+             break;

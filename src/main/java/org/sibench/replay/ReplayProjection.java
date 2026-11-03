@@ -15,7 +15,9 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     private final boolean secondaryIndexes, sourceTransactions, publication;
     private final String dispatchMode;
     private final ReplayDispatcher dispatcher;
-    private final List<Operation> pending = new ArrayList<>();
+    private record Pending(Operation operation, org.sibench.adapters.proto.Request request) {}
+    private final List<Pending> pending = new ArrayList<>();
+    private org.sibench.adapters.proto.Request storedRequest;
     private final Map<String, Long> kinds = new LinkedHashMap<>();
     private long source, dispatched, primary, secondary, filtered, transactions, controls, groups;
     private long peakPending, peakSearchGroup, peakExpansion;
@@ -114,6 +116,16 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         }
     }
 
+    @Override
+    public void accept(org.sibench.adapters.proto.TraceRecord record, List<Operation> views) throws IOException {
+        storedRequest = record.hasRequest() ? record.getRequest() : null;
+        try {
+            for (Operation operation : views) accept(operation);
+        } finally {
+            storedRequest = null;
+        }
+    }
+
     private void acceptOrdered(Operation operation) throws IOException {
         if (IndexOperationTrace.isControl(operation)) {
             control(operation);
@@ -172,7 +184,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
             return;
         }
         if (activeTransaction != 0) {
-            pending.add(operation);
+            pending.add(new Pending(operation, storedRequest));
             peakPending = Math.max(peakPending, pending.size());
         } else sendOperation(operation);
     }
@@ -255,7 +267,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     }
 
     private void sendOperation(Operation operation) throws IOException {
-        dispatcher.send(operation);
+        dispatcher.send(operation, storedRequest);
         countDispatch(operation);
     }
 
@@ -352,7 +364,10 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
             requireCompleteExpansion();
             if (!searchGroup.isEmpty()) throw new IOException("Search group crosses its commit");
             if (dispatchMode.equals("transaction") && !pending.isEmpty()) groups++;
-            for (Operation operation : pending) sendOperation(operation);
+            for (Pending item : pending) {
+                dispatcher.send(item.operation(), item.request());
+                countDispatch(item.operation());
+            }
             pending.clear();
             if (publication)
                 dispatcher.sendCommit(activeTransaction, activeVersion);

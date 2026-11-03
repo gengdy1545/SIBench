@@ -39,9 +39,14 @@ public final class NativeCapture {
     }
 
     /** The paths and capture settings the script reads, as shell assignments. */
-    private static void paths(java.util.Map<String, Object> document) {
+    private static void paths(java.util.Map<String, Object> document, Path root, Path artifacts) throws Exception {
         System.out.println("SIBENCH_CAPTURE_DETAIL=" + detail(document));
         System.out.println("SIBENCH_CAPTURE_COMPRESS=" + compression(document));
+        System.out.println("SIBENCH_TRACE_OUTPUT=" + TraceOutput.from(document).setting());
+        var runtime = org.sibench.config.SibenchConfig.read(root.resolve("config/sibench.yaml"));
+        var budget = new GenerationBudget(org.sibench.config.ConfigValues.object(runtime, "generation"),
+                DirectCapture.budgetPath(artifacts));
+        NativeProcess.assignment("SIBENCH_BUDGET_STOP", budget.enabled() ? DirectCapture.budgetPath(artifacts) : "");
         var capture = org.sibench.config.ConfigValues.object(document, "capture");
         org.sibench.config.ConfigValues.require(
                 !capture.containsKey("verification") && !capture.containsKey("certification"),
@@ -51,7 +56,7 @@ public final class NativeCapture {
     public static void main(String[] args) throws Exception {
         if (args.length != 3 && args.length != 4)
             throw new IllegalArgumentException(
-                    "NativeCapture paths|load|check|export|run ROOT CONFIG [TIMING]");
+                    "NativeCapture paths|load|export|run ROOT CONFIG [TIMING]");
         var timing = RunTiming.open(args.length == 4 ? Path.of(args[3]).toAbsolutePath() : null);
         try {
             timing.phase(args[0]);
@@ -88,19 +93,11 @@ public final class NativeCapture {
                 System.out.println("SIBENCH_PORT=" + config.port());
                 NativeProcess.assignment("SIBENCH_DATABASE", config.database());
                 NativeProcess.assignment("SIBENCH_ARTIFACTS", config.artifacts());
-                paths(config.document());
+                paths(config.document(), root, config.artifacts());
             }
             case "load" -> NativeLoad.build(config);
             case "export" -> PgBaselineExport.export(config.jdbc(), config.layout().output(), config.layout());
-            case "check" ->
-                    System.out.println(
-                            PgSchemaCheck.json(
-                                    PgSchemaCheck.check(
-                                            config.root(),
-                                            config.document(),
-                                            config.jdbc(),
-                                            config.user())));
-            case "run" -> run(config);
+            case "run" -> generate(root, Path.of(args[2]), config.jdbc(), config.user(), () -> run(config));
             default -> throw new IllegalArgumentException("Unknown stage: " + args[0]);
         }
     }
@@ -121,22 +118,36 @@ public final class NativeCapture {
                 NativeProcess.assignment("SIBENCH_ARTIFACTS", config.artifacts());
                 NativeProcess.assignment("SIBENCH_HYBENCH", root.resolve(NativeBuildCheck.HYBENCH_DIRECTORY));
                 NativeProcess.assignment("SIBENCH_WORKDIR", config.workDir());
-                paths(config.document());
+                paths(config.document(), root, config.artifacts());
             }
             case "load" -> HybenchNativeLoad.build(config);
             case "export" -> PgBaselineExport.export(config.jdbc(), config.layout().output(), config.layout());
-            case "check" ->
-                    System.out.println(
-                            org.sibench.schema.PgSchemaCheck.json(
-                                    org.sibench.schema.PgSchemaCheck.check(
-                                            root, config.document(), config.jdbc(), config.user())));
             case "run" -> {
                 HybenchNativeLoad.requireRuntimeInputs(config.workDir().resolve("Data_" + config.scaleFactor()),
                         HybenchNativeLoad.manifest(config));
                 java.nio.file.Files.createDirectories(config.artifacts().resolve("native"));
-                HybenchNativeRun.run(root, Path.of(profile));
+                generate(root, Path.of(profile), config.jdbc(), config.user(),
+                        () -> HybenchNativeRun.run(root, Path.of(profile)));
             }
             default -> throw new IllegalArgumentException("Unknown stage: " + stage);
+        }
+    }
+
+    @FunctionalInterface private interface Execution { void run() throws Exception; }
+
+    /** Source execution and request generation share one process; replay remains independent. */
+    private static void generate(Path root, Path profile, String jdbc, String user, Execution execution)
+            throws Exception {
+        var capture = CaptureProfile.read(root, profile);
+        try (var direct = DirectCapture.begin(capture, jdbc, user)) {
+            execution.run();
+            direct.endSources();
+            CaptureCompleteness.snapshot(jdbc, user,
+                    capture.artifacts().resolve("index-counters-after.json"), profile.toString());
+            var report = direct.finish();
+            Files.writeString(capture.artifacts().resolve("trace-summary.json"),
+                    new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(report),
+                    java.nio.file.StandardOpenOption.CREATE_NEW);
         }
     }
 

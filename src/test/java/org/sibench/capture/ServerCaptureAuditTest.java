@@ -120,11 +120,16 @@ public class ServerCaptureAuditTest {
     }
 
     @Test
-    public void abortedStatementThatNeverReturnedIsReported() throws Exception {
+    public void abortedStatementIsCountedForIndependentDriverCertification() throws Exception {
         var lines = new ArrayList<String>();
         lines.add(event("executor_start", 1, 1, "\"sql\":\"INSERT INTO t VALUES ($1)\""));
         lines.add(event("transaction_abort", 1, 0, null));
-        assertTrue(message(lines).contains("never returned"));
+        var report = ServerCaptureAudit.audit(writeBody(lines));
+        assertEquals(1L, report.get("aborted_executions"));
+        assertEquals(1L, report.get("aborts"));
+        assertEquals(1L, report.get("requests"));
+        lines.remove(lines.size() - 1);
+        assertTrue(message(lines).contains("unfinished transaction"));
     }
 
     @Test

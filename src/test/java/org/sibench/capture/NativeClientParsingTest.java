@@ -16,6 +16,31 @@ public class NativeClientParsingTest {
     @Rule public TemporaryFolder folder = new TemporaryFolder();
 
     @Test
+    public void sourceFailureStopsTheNativeClientWithoutReplacingItsCause() throws Exception {
+        Path root = folder.newFolder().toPath(), pid = root.resolve("client.pid");
+        var cause = new java.io.IOException("controlled source failure");
+        var worker = java.util.concurrent.Executors.newSingleThreadExecutor();
+        try (var run = CaptureRun.beginExternal(root.resolve("source"), "failure_probe")) {
+            var failure = worker.submit(() -> {
+                long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
+                while (!Files.exists(pid) && System.nanoTime() < deadline) Thread.yield();
+                if (!Files.exists(pid)) throw new AssertionError("Native client did not start");
+                run.fail(cause, Map.of("stage", "source_probe"));
+            });
+            long started = System.nanoTime();
+            var error = assertThrows(java.io.IOException.class, () -> NativeProcess.run("blocked",
+                    List.of("/bin/sh", "-c", "echo $$ > \"$1\"; exec sleep 30", "failure-probe", pid.toString()),
+                    Map.of(), root, root.resolve("logs"), java.time.Duration.ofSeconds(10)));
+            assertSame(cause, error);
+            failure.get(3, java.util.concurrent.TimeUnit.SECONDS);
+            assertTrue(System.nanoTime() - started < java.util.concurrent.TimeUnit.SECONDS.toNanos(3));
+            var child = ProcessHandle.of(Long.parseLong(Files.readString(pid).strip()));
+            if (child.isPresent()) child.get().onExit().get(3, java.util.concurrent.TimeUnit.SECONDS);
+            assertFalse(child.isPresent() && child.get().isAlive());
+        } finally { worker.shutdownNow(); }
+    }
+
+    @Test
     public void readsYcsbOperationCountsAndIgnoresLatencies() {
         var parsed =
                 YcsbNativeRun.parse(
@@ -209,15 +234,25 @@ public class NativeClientParsingTest {
         Files.createDirectories(build.resolve("src"));
         Files.writeString(pinned.resolve("src/a.c"), "int main() { return 0; }\n");
         Files.copy(pinned.resolve("src/a.c"), build.resolve("src/a.c"));
+        Path patch = folder.getRoot().toPath().resolve("scripts/patches/sysbench-1.1.0-stop.patch");
+        Files.createDirectories(patch.getParent());
+        Files.writeString(patch, "--- a/src/a.c\n+++ b/src/a.c\n@@ -1 +1 @@\n"
+                + "-int main() { return 0; }\n+int main() { return 1; }\n");
+        Files.writeString(build.resolve("src/a.c"), "int main() { return 1; }\n");
         Path executable = build.resolve("src/sysbench");
         Files.writeString(executable, "compiled client");
         assertTrue(executable.toFile().setExecutable(true));
         assertThrows(IOException.class, () -> NativeBuildCheck.verify(
                 folder.getRoot().toPath(), "sysbench", pinned, build, "source-identity"));
         var manifest = Map.of("benchmark", "sysbench", "source_commit", "source-identity",
+                "native_stop_patch_sha256", FileDigests.sha256(patch),
                 "artifacts", Map.of("src/sysbench", FileDigests.sha256(executable)));
         Files.writeString(build.resolve("native-build.json"), new com.google.gson.Gson().toJson(manifest));
         NativeBuildCheck.verify(folder.getRoot().toPath(), "sysbench", pinned, build, "source-identity");
+        Files.writeString(build.resolve("src/a.c"), "int main() { return 1; }\nint unrelated;\n");
+        assertThrows(IOException.class, () -> NativeBuildCheck.verify(
+                folder.getRoot().toPath(), "sysbench", pinned, build, "source-identity"));
+        Files.writeString(build.resolve("src/a.c"), "int main() { return 1; }\n");
         var nativeConfig = new java.util.LinkedHashMap<String, Object>();
         nativeConfig.put("build_directory", "build/benchmarks/sysbench");
         nativeConfig.put("binary", "src/sysbench");

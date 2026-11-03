@@ -367,14 +367,27 @@
  	Assert(tbm->iterating == TBM_NOT_ITERATING);
  	for (i = 0; i < ntids; i++)
  	{
+--- a/src/backend/storage/lmgr/proc.c
++++ b/src/backend/storage/lmgr/proc.c
+@@ -389,0 +390,5 @@
++	MyProc->sibenchCaptureDirect = false;
++	MyProc->sibenchCaptureProduced = 0;
++	MyProc->sibenchCaptureCsn = 0;
++	MyProc->sibenchCaptureAcked = 0;
++	MyProc->sibenchCaptureAckCsn = 0;
 --- a/src/backend/storage/ipc/procarray.c
 +++ b/src/backend/storage/ipc/procarray.c
-@@ -787,6 +787,8 @@
+@@ -787,6 +787,13 @@
  
  	/* Same with xactCompletionCount  */
  	ShmemVariableCache->xactCompletionCount++;
 +	/* The exact position at which this transaction stopped counting as running. */
 +	proc->sibenchCompletion = ShmemVariableCache->xactCompletionCount;
++	if (proc->sibenchCaptureDirect)
++	{
++		proc->sibenchCaptureProduced++;
++		proc->sibenchCaptureCsn = proc->sibenchCompletion;
++	}
  }
  
  /*
@@ -408,7 +421,7 @@
  	if (serialized_snapshot.xcnt > 0)
 --- a/src/include/storage/proc.h
 +++ b/src/include/storage/proc.h
-@@ -265,6 +265,13 @@
+@@ -265,6 +265,18 @@
  	PGPROC	   *lockGroupLeader;	/* lock group leader, if I'm a member */
  	dlist_head	lockGroupMembers;	/* list of members, if I'm a leader */
  	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
@@ -419,6 +432,11 @@
 +	 * in the group leader on a member's behalf, so it lives on the PGPROC, not in the backend.
 +	 */
 +	uint64		sibenchCompletion;
++	bool		sibenchCaptureDirect;
++	uint64		sibenchCaptureProduced;
++	uint64		sibenchCaptureCsn;
++	uint64		sibenchCaptureAcked;
++	uint64		sibenchCaptureAckCsn;
  };
  
  /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */
@@ -438,3 +456,41 @@
  } SnapshotData;
  
  #endif							/* SNAPSHOT_H */
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "postgres.h"
++#include "sibench_capture.h"
+ 
+ #include <fcntl.h>
+ #include <limits.h>
+@@ -2738,6 +2739,7 @@
+ #endif
+ 
+ 		xact_started = false;
++		sib_capture_check_failure();
+ 	}
+ }
+ 
+--- a/src/backend/utils/init/postinit.c
++++ b/src/backend/utils/init/postinit.c
+@@ -14,6 +14,7 @@
+  *-------------------------------------------------------------------------
+  */
+ #include "postgres.h"
++#include "sibench_capture.h"
+ 
+ #include <ctype.h>
+ #include <fcntl.h>
+@@ -1200,6 +1201,9 @@
+ 	/* Make sure we've killed any active transaction */
+ 	AbortOutOfAnyTransaction();
+ 
++	/* The source handoff must include the implicit rollback at connection close. */
++	sib_backend_exit();
++
+ 	/*
+ 	 * User locks are not released by transaction end, so be sure to release
+ 	 * them explicitly.

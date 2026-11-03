@@ -9,13 +9,7 @@ import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 
-/**
- * An {@link IndexOperationTrace.Writer} run on a thread of its own: the compiler's ordered thread
- * only collects operations, a block's worth at a time, and this thread validates, encodes,
- * digests, compresses and writes them in the order they were appended, so the stream is the one
- * the writer forms when it is called directly. That work was a quarter of the ordered thread.
- * A failure of the writer is thrown by the next append or by close.
- */
+/** Bounded, ordered encoding queue; full output adds a detailed stream beside proto. */
 final class WriterThread implements IndexOperationTrace.Consumer, Closeable {
     /** Batches waiting for the writer; bounds the operations held. */
     static final int AHEAD = 8;
@@ -23,6 +17,7 @@ final class WriterThread implements IndexOperationTrace.Consumer, Closeable {
     private static final List<Operation> END = List.of();
 
     private final IndexOperationTrace.Writer writer;
+    private final ProtoTrace.Writer protocol;
     private final BlockingQueue<List<Operation>> queue = new ArrayBlockingQueue<>(AHEAD);
     private final Thread thread;
     private volatile Throwable failure;
@@ -30,8 +25,9 @@ final class WriterThread implements IndexOperationTrace.Consumer, Closeable {
     private long count;
     private boolean closed;
 
-    WriterThread(IndexOperationTrace.Writer writer, String name) {
+    WriterThread(IndexOperationTrace.Writer writer, ProtoTrace.Writer protocol, String name) {
         this.writer = writer;
+        this.protocol = protocol;
         thread = new Thread(this::run, name);
         thread.setDaemon(true);
         thread.start();
@@ -42,19 +38,26 @@ final class WriterThread implements IndexOperationTrace.Consumer, Closeable {
             while (true) {
                 List<Operation> next = queue.take();
                 if (next == END) break;
-                for (Operation operation : next) writer.append(operation);
+                for (Operation operation : next) {
+                    if (writer != null) writer.append(operation);
+                    if (protocol != null) protocol.append(operation);
+                }
             }
-            writer.close();
+            closeWriters();
         } catch (Throwable error) {
             failure = error;
             // Unblock an appender waiting for room; nothing more is written.
             queue.clear();
             try {
-                writer.close();
+                closeWriters();
             } catch (IOException | RuntimeException ignored) {
                 // The first failure is the one reported.
             }
         }
+    }
+
+    private void closeWriters() throws IOException {
+        try { if (writer != null) writer.close(); } finally { if (protocol != null) protocol.close(); }
     }
 
     @Override
@@ -74,11 +77,6 @@ final class WriterThread implements IndexOperationTrace.Consumer, Closeable {
 
     long count() {
         return count;
-    }
-
-    /** The writer's SHA256, once closed. */
-    String sha256() {
-        return writer.sha256();
     }
 
     private void put(List<Operation> operations) throws IOException {

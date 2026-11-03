@@ -329,14 +329,17 @@ public final class SnapshotLookupValidation {
         if (rowIdModes.isEmpty()) throw new IOException("No value mode to check");
         if (Files.exists(report))
             throw new IOException("Snapshot report already exists: " + report);
+        var trace = org.sibench.trace.TraceManifest.read(directory);
+        if (trace.has("output") && trace.get("output").getAsString().equals("proto"))
+            throw new IOException("Parquet snapshot oracle requires full output; use replay for proto reference checks");
         var input = ReferenceReplay.prepare(directory, config);
         var baseline = input.baseline();
-        Path workload = directory.resolve("workload.ops");
         var preflight = input.preflight();
         JsonObject manifest =
                 JsonParser.parseString(Files.readString(directory.resolve("manifest.json")))
                         .getAsJsonObject();
         IndexCatalog catalog = IndexCatalog.fromManifest(manifest);
+        var workload = org.sibench.capture.ProtoTrace.source(directory, manifest, "workload");
         Path sourceBaseline = Path.of(manifest.get("baseline_directory").getAsString());
         if (!BaselineGenerator.sha256(sourceBaseline.resolve("baseline-manifest.json"))
                 .equals(manifest.get("baseline_manifest_sha256").getAsString()))
@@ -355,8 +358,7 @@ public final class SnapshotLookupValidation {
         Map<Key, Operation> pending = new LinkedHashMap<>();
         Map<String, Operation> payloadOperations = new HashMap<>();
         long[] lastCommit = {0};
-        IndexOperationTrace.read(
-                workload,
+        workload.read(
                 operation -> {
                     if (operation.kind() == IndexOperationTrace.RELOCATE)
                         throw new IOException(
@@ -407,8 +409,7 @@ public final class SnapshotLookupValidation {
         if (payloadRows.size() != payloadOperations.size())
             throw new IOException("Missing incremental Parquet payload");
         pending.clear();
-        IndexOperationTrace.read(
-                workload,
+        workload.read(
                 operation -> {
                     if (IndexOperationTrace.isMutation(operation) && operation.index() == 0)
                         pending.put(new Key(operation.table(), operation.key()), operation);
@@ -599,7 +600,7 @@ public final class SnapshotLookupValidation {
                     var runtime = new ReplayProjection(config, true, model::accept)) {
                 baseline.read(load);
                 load.finish();
-                IndexOperationTrace.read(workload, runtime);
+                workload.read(runtime);
                 runtime.finish();
                 long primaryProbes = 0, secondaryProbes = 0, items = 0;
                 for (var entry : histories.entrySet()) {
@@ -732,7 +733,7 @@ public final class SnapshotLookupValidation {
         output.put("preflight", preflight);
         // A derived load was checked against this digest when it was read.
         output.put("baseline_trace_sha256", manifest.get("baseline_trace_sha256").getAsString());
-        output.put("workload_trace_sha256", IndexOperationTrace.sha256(workload));
+        output.put("workload_trace_sha256", manifest.get("workload_trace_sha256").getAsString());
         output.put("changed_primary_keys", histories.size());
         output.put("secondary_predicate_sample_limit_per_index", SECONDARY_PREDICATES);
         output.put("sampled_secondary_predicates", buckets.size());

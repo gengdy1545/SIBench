@@ -228,12 +228,12 @@ public class CaptureRunTest {
             RowAuditTestSupport.writeTrace(raw, List.of("{}"));
             assertThrows(
                     IOException.class,
-                    () -> IndexTraceCompiler.compile(null, null, raw, directory.resolve("output"), (Path) null));
+                    () -> CaptureFixtureCompiler.compile(null, null, raw, directory.resolve("output"), (Path) null));
             assertFalse(Files.exists(directory.resolve("output")));
             run.fail(new SQLException("broken", "08006"), Map.of("operation", "commit"));
             assertThrows(
                     IOException.class,
-                    () -> IndexTraceCompiler.compile(null, null, raw, directory.resolve("output"), (Path) null));
+                    () -> CaptureFixtureCompiler.compile(null, null, raw, directory.resolve("output"), (Path) null));
         }
     }
 
@@ -328,8 +328,8 @@ public class CaptureRunTest {
         CaptureRun.verifyInput(directory);
         // Concurrent sessions are no longer rejected outright; they are ordered by PostgreSQL's
         // transaction completion counter, which these fixture traces do not carry.
-        assertEquals("concurrent", IndexTraceCompiler.sessions(directory).order());
-        assertEquals(2, IndexTraceCompiler.sessions(directory).files().size());
+        assertEquals("concurrent", CaptureFixtureCompiler.sessions(directory).order());
+        assertEquals(2, CaptureFixtureCompiler.sessions(directory).files().size());
         Path extra = directory.resolve("pg-unregistered.jsonl.zst");
         RowAuditTestSupport.writeTrace(extra, List.of("{}"));
         assertThrows(IOException.class, () -> CaptureRun.verifyInput(directory));
@@ -366,6 +366,8 @@ public class CaptureRunTest {
             connection.prepareStatement("UPDATE savingaccount SET balance = 1").executeUpdate();
             rows.next();
             first.getResultSet().next();
+            rows.close();
+            first.close();
         }
         var events = RowAuditTestSupport.readTrace(jdbc(directory)).stream()
                 .map(line -> JsonParser.parseString(line).getAsJsonObject()).toList();
@@ -375,6 +377,10 @@ public class CaptureRunTest {
         var consumed = events.stream()
                 .filter(e -> e.get("event").getAsString().equals("consumed_row")).toList();
         assertEquals(2, consumed.size());
+        var ended = events.stream().filter(e -> e.get("event").getAsString().equals("request_end")
+                && e.get("request").getAsInt() == 1).toList();
+        assertEquals(1, ended.size());
+        assertEquals(application, ended.get(0).get("application").getAsString());
         for (var row : consumed) {
             assertEquals(application, row.get("application").getAsString());
             assertEquals(1, row.get("request").getAsInt());

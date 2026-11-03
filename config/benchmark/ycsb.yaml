@@ -1,5 +1,5 @@
 schema_version: 1
-purpose: native_capture_poc
+purpose: native_capture
 benchmark: ycsb
 source:
   path: benchmark/YCSB
@@ -44,9 +44,10 @@ postgres:
   isolation: read_committed
   max_parallel_workers_per_gather: 0
 capture:
+  output: proto
   mode: instrumented_native_execution
   application_prefix: 'sibench:'
-  raw_directory: results/poc/ycsb/raw
+  raw_directory: results/capture/ycsb/raw
   allow_event_loss: false
   statement_results: server_rows_and_consumed_rows
 data_layout:
@@ -58,4 +59,4 @@ data_layout:
   compression: zstd
   compression_level: 3
 artifacts:
-  directory: results/poc/ycsb
+  directory: results/capture/ycsb

@@ -13,6 +13,7 @@ eval "$ASSIGNMENTS"
 mkdir -p "$(dirname "$BUILD")"
 # Keep source Git identity: upstream version generators must not read the enclosing SIBench repo.
 git clone --shared "$SOURCE" "$BUILD"
+patch --batch --forward -d "$BUILD" -p1 < "$NATIVE_STOP_PATCH"
 case "$BENCHMARK" in
   hybench)
     patch --batch --forward -d "$BUILD" -p1 < "$ROOT/scripts/patches/hybench-1.0-snapshot.patch"

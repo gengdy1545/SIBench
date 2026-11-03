@@ -18,6 +18,10 @@ public final class TraceManifest {
             throw new IOException("Incomplete Trace directory");
         var manifest = JsonParser.parseString(Files.readString(directory.resolve("manifest.json")))
                 .getAsJsonObject();
+        var output = manifest.get("output");
+        if (output == null || !output.isJsonPrimitive() || !output.getAsJsonPrimitive().isString()
+                || !List.of("proto", "full").contains(output.getAsString()))
+            throw new IOException("Missing or unsupported Trace output strategy");
         for (String name : List.of("baseline", "workload"))
             if (!manifest.has(name + "_trace_sha256"))
                 throw new IOException("Trace identity missing: " + name);

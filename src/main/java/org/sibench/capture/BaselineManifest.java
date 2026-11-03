@@ -13,7 +13,7 @@ public final class BaselineManifest {
 
     private BaselineManifest() {}
 
-    static void publish(SourceSchema schema, Path directory, Map<String, Long> expected) throws Exception {
+    static void publish(SourceSchema schema, Path directory, Map<String, Long> expected, TraceOutput output) throws Exception {
         var files = new JsonArray();
         var entries = Files.readAllLines(directory.resolve("files.jsonl")).stream()
                 .map(line -> JsonParser.parseString(line).getAsJsonObject()).toList();
@@ -33,6 +33,7 @@ public final class BaselineManifest {
         }
         var result = new LinkedHashMap<String, Object>();
         result.put("status", "complete");
+        result.put("output", output.setting());
         result.put("rows", total(counts));
         result.put("tables", counts);
         result.put("files", files);
@@ -81,6 +82,10 @@ public final class BaselineManifest {
         if (Files.exists(baseline.resolve("INCOMPLETE"))) throw new IOException("Baseline is incomplete");
         JsonObject manifest = JsonParser.parseString(Files.readString(baseline.resolve(FILE))).getAsJsonObject();
         if (!manifest.get("status").getAsString().equals("complete")) throw new IOException("Baseline is incomplete");
+        var output = manifest.get("output");
+        if (output == null || !output.isJsonPrimitive() || !output.getAsJsonPrimitive().isString()
+                || !List.of("proto", "full").contains(output.getAsString()))
+            throw new IOException("Missing or unsupported Baseline output strategy");
         if (!FileDigests.sha256(baseline.resolve("files.jsonl"))
                 .equals(manifest.get("files_manifest_sha256").getAsString()))
             throw new IOException("Baseline file manifest changed");

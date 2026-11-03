@@ -1,14 +1,144 @@
 # Trace contract
 
+## Output strategies
+
+Benchmark `capture.output` defaults to `proto`. Both `proto` and `full` use the
+same source checks, transaction/snapshot projection, complete index maintenance
+and native expected counts. This setting selects artifacts, not workload
+semantics or a resource/operation stop budget.
+
+Proto-only output contains baseline shards under `baseline/`, `workload.pb.zst`, work units,
+the access ledger, completeness results, the Trace manifest and source identity
+snapshots. Its initial export reads indexed columns only and directly produces
+final request shards. Compilation reads them to establish row identities and
+retains their encoded bytes, using hard links on the same filesystem; it does
+not reconstruct or re-encode baseline requests. During native execution, source
+facts stream into the Java semantic projection, which writes final workload
+requests without a whole-run raw file or a later conversion stage. Proto mode
+writes neither detailed operations nor incremental row Parquet. The published
+Trace does not reference the consumed export directory; the production script
+releases that export and source control metadata only after successful publication.
+Failed generation keeps diagnostics. Source manifests retain the recorded input identities, not the raw
+data required for a later independent full-row audit.
+
+PG and JDBC source streams end with an explicit completion marker; missing
+completion, mismatched identities or a skipped per-backend transaction sequence
+fail generation. PG exposes its completion counters and receiver acknowledgement
+positions under the same source lock. A completion is eligible only after all
+earlier writer facts are available. Readers tied at one counter follow receiver
+arrival order while preserving their session order; these readers share the same
+visible committed writes. A source backend completes its final handoff before
+exiting, after PostgreSQL has rolled back any transaction still open at connection
+close. Successful final handoff retires its watermark registration; an exited
+source cannot hold back a later capture. There is no per-transaction receiver-confirmation wait in the native
+client, and no Index Service participates in generation. Instrumentation, transport
+I/O and concurrent generator work still add execution overhead.
+
+Source-fact scratch stores only pending transactions. Encoded facts share a
+64 MiB memory budget, with at most 256 KiB per transaction; transactions that
+exceed either memory allowance use temporary zstd frames with checksums. Runtime settings
+`generation.pending_transaction_bytes` and
+`generation.pending_transactions` bound the aggregate pending encoded bytes and
+transaction count; they include completed transactions awaiting source order.
+The byte budget counts uncompressed encoded facts, independently of spool compression.
+
+Exceeding a limit fails rather than dropping events or publishing an incomplete
+transaction. Frames from one source backend share segments, rotated at an 8 MiB
+compressed target between transactions. A single frame may exceed the target.
+Processing releases its frame's reference; a retired segment is deleted when no
+pending transaction refers to it. A backend's active tail closes at source end,
+so consumed tails do not accumulate across sessions. Failure diagnostics may retain
+unprocessed scratch within the admitted budget. These limits do not cap Java
+object overhead, auditing state, RowID storage, PG memory or total disk use.
+Failure metadata streams at most 65,536 pending transaction details and explicitly
+marks truncation; aggregate pending counts and bytes remain complete.
+
+Optional `generation.operation_target` counts emitted workload Trace logical
+records, including transaction-control records and index expansion.
+`generation.output_byte_target` counts physical bytes of all canonical proto
+files, including Baseline, excluding metadata and full-output side files.
+Omitted or zero targets are disabled. An output target no greater than the
+complete Baseline proto size is rejected; initial-state-only captures are unsupported.
+These are soft targets: after a projected complete transaction reaches a target,
+native clients stop starting new business operations and finish active operations.
+Produced source facts are still drained, projected and audited. Projection lag,
+active transactions and block buffering can overshoot the target. Target stops
+skip later native workloads/phases and certify the actual executed prefix, with
+the requested native budgets retained alongside actual native counts. The
+`generation_budget` entry binds request-time progress, final counts/bytes,
+overshoot and stop reason. It is not a full-input or hard resource-limit claim.
+
+JDBC `request_end` seals result consumption on exhaustion, explicit ResultSet
+close, statement close or reuse. It retains the original request identity when
+another statement has already executed. Auditing releases an older sealed request
+only after result completion, executor cleanup and transaction association agree
+and the backend has moved to another request label; ExecutorEnd itself precedes
+scan cleanup. The latest label remains available for commit/rollback.
+Sessions admit at most 65,536 pending requests and 1,048,576 buffered row-hash/detail
+entries; overflow fails generation without publication. These entry limits are
+not byte or whole-process memory caps. Connection close seals remaining results.
+
+Full output additionally retains the complete-row Baseline, incremental Parquet,
+raw capture and detailed `workload.ops`. The Parquet, Locator, independent row
+oracle and relocation contracts below apply to full output. Proto-only output
+supports RowIDs; it rejects Locator reference replay and the Parquet oracle.
+Reference replay still checks every native expected count and generates ordered
+result digests for service replay. This is not an independent source-row oracle.
+
+Both strategies carry the Index Service protobuf request messages defined in
+`src/main/proto/index_service.proto`, wrapped by `index_trace.proto` source
+positions. A query group is one SearchGroup request with one position per member.
+Commit counts describe unfiltered requests; replay reassigns request IDs, client
+routing and transaction positions/counts when filtering or batching changes.
+TraceBegin records retain source transaction boundaries and are not RPCs.
+The source projection creates each payload once; full output adds detailed
+operations as a side output of that projection. Service replay forwards stored
+Write, Search and SearchGroup messages directly. Operation views support semantic
+validation, filtering and the reference model, without regenerating the payloads.
+Baseline batching wraps stored Writes; commit counts describe requests actually
+sent after filtering.
+
+Each protobuf file starts with big-endian int32 magic `0x53495042`. Each block has
+four big-endian int32 fields: message count, compressed byte count, uncompressed
+byte count and CRC32C of the uncompressed bytes, followed by an independent Zstd
+frame at level 3. The plain block contains length-delimited TraceRecord messages.
+Blocks target 1 MiB and contain at most 4096 messages; a single request is limited
+to 32 MiB including its delimiter. Four zero int32 fields terminate the file;
+missing termination and trailing bytes are errors. File SHA-256 identities bind
+the compressed bytes. Each inventory entry in `proto_files.baseline` or
+`proto_files.workload` records `path`, physical `sha256`, `logical_sha256` of the
+length-delimited uncompressed messages, and the semantic operation count (one per
+group member and transaction control). Both output modes' baseline/workload Trace
+identity hashes the ordered concatenation of each shard's 32-byte logical digest
+and big-endian int64 operation count. No detailed-operation encoding is needed to
+compute these identities. Detailed operations are diagnostic side output;
+replay, locality analysis and the full-row oracle read the protobuf requests. Readers enforce file,
+logical and inventory identities, transaction positions, commit counts and
+complete source-member coverage.
+
 ## Two artifact layers
 
-The raw layer preserves requests, parameters, results, index candidates, row changes, and commits / rollbacks from an actual execution. The canonical layer converts only declared supported index operations and retains their source-event associations. It does not rerun SQL to infer results. PG internals such as page splits, HOT, and VACUUM are not translated into downstream KV algorithms.
+The generator observes requests, parameters, results, index candidates, row changes, and commits / rollbacks from an actual execution. Full output additionally persists these source facts as the raw layer; proto output does not. The canonical layer converts only declared supported index operations and retains their source-event associations. It does not rerun SQL to infer results. PG internals such as page splits, HOT, and VACUUM are not translated into downstream KV algorithms.
 
 Before capture and Baseline export, the [source-scope](#source-scope) check verifies that actual PG tables, complete columns, and all primary / secondary indexes match the pinned source and configuration. Checks are read-only and do not create missing objects or repair the environment. Native runs save preflight results; this evidence is not fabricated for historical artifacts. Catalog support and canonical Trace support are accepted separately for each of the three sources.
 
-The default native execution is HyBench `runHTAP`, capturing multiple AP / TP / concurrent AT-IQ sessions with row-change triggers covering all eight tables. **Canonical projection** compiles sequential sessions (YCSB / sysbench workloads run one after another) or concurrent sessions (HTAP, merged by the transaction completion counter; see [Identity and versions](#identity-and-versions)). It is schema-driven for all three sources. Each access unit, or BitmapAnd group, becomes ordered queries that reproduce native results under the [Access projection](#access-projection) rules; otherwise, the entire compilation fails with a reason. Index maintenance covers every primary and secondary index in the fixed schema, supporting indexed-column value UPDATEs, DELETE / reinsertion, reads after writes in committed transactions, and routing across clients.
+The default native execution is HyBench `runHTAP`, capturing multiple AP / TP / concurrent AT-IQ sessions with row-change triggers covering all eight tables. **Canonical projection** processes source transactions by PostgreSQL's completion counters, including sequential workload phases and overlapping sessions (see [Identity and versions](#identity-and-versions)). It is schema-driven for all three sources. Each access unit, or BitmapAnd group, becomes ordered queries that reproduce native results under the [Access projection](#access-projection) rules; otherwise, the entire compilation fails with a reason. Index maintenance covers every primary and secondary index in the fixed schema, supporting indexed-column value UPDATEs, DELETE / reinsertion, reads after writes in committed transactions, and routing across clients.
 
-The raw layer uses one zstd stream per backend, `pg-<pid>.jsonl.zst` (`jdbc-*.jsonl.zst` for JDBC clients). Compilation requires one JSON object per line and rejects comments, unquoted field names, and non-JSON numeric literals. Uncompressed files and unfinished zstd frames are rejected; captures whose backends did not exit normally are unusable. On completion, `capture-run.json` records the file inventory and SHA256 digests. Output is buffered, flushed, and its frame finished when the backend exits. Instrumentation lives in `src/main/native/postgres/sibench_capture.c`; the patch adds call sites only in PG executor, index-access, heap, and transaction paths. Every file must begin with `capture_start`, whose `detail` is `summary` or `rows`, selected by `capture.detail` and defaulting to `summary`. Compilation rejects files without this header.
+Full output saves one zstd stream per backend, `pg-<pid>.jsonl.zst`, and
+`jdbc-*.jsonl.zst` for JDBC clients. The generator's raw side output compresses the
+same source facts used by the projection; it does not reread them to generate
+requests. Explicit file-based raw audits require one JSON object per
+line, reject invalid JSON, uncompressed files and unfinished zstd frames, and
+require a completed capture manifest. Every PG stream starts with `capture_start`,
+whose `detail` is `summary` or `rows` (default `summary`); JDBC streams start with
+`connection`. `capture-run.json` binds stream identities, logical event digests
+and audits. Full output also binds the retained compressed files' SHA-256 digests.
+Proto output retains the source identity/audit snapshot without those raw files.
+Instrumentation lives in `src/main/native/postgres/sibench_capture.c`; the patch
+adds observation hooks and completion metadata in PG executor, index-access,
+heap, process and transaction paths. Exact repeated comparisons use the published
+Trace, including its recorded order among concurrent read-only transactions
+tied at one completion counter. There is no production raw-to-Trace conversion command.
 
 PG accumulates facts for each access unit and writes one `scan_summary` before the event that ends it: the next `scan_rescan`, `scan_end`, transaction abort, or connection close. The summary includes fetch-call counts, candidates found, whether the last fetch found a candidate, scan direction, rechecks, heap-fetch counts and visible rows, visibility-map all-visible rows, bitmap candidate and unjudged-candidate counts, whether bitmap filling finished, and whether row identity is missing. When a consumer stops a scan early, it also records visible rows before the last value, completed value segments for array keys, the last value, and the PKs of rows returned at that value. When the first member of a BitmapAnd round ends, it records whether any candidate produced by all inputs was never judged. Bitmap heap verdicts are aggregated by the set of inputs that produced each TID into `bitmap_verdicts` (visible / invisible counts and lossy-page counts). They are written before any input changes unit and are equivalent to per-TID attribution. `executor_run_end` records returned-row counts and a 64-bit FNV-1a hash for each row after column-text normalization. Client `consumed_row` uses the same algorithm, defined in `ResultRowHash`, for client / server result checks. With `detail = rows`, all per-row events are also written: `scan_next`, `heap_visibility`, `vm_visible`, `bitmap_candidate`, `bitmap_end`, `bitmap_heap_candidate`, `bitmap_heap_lossy`, and `result_row`; client rows retain column text. The ledger derives facts from those events and requires every summary to match exactly, validating summaries against the same native execution. Per-row events in a `summary` capture cause failure.
 
@@ -16,7 +146,7 @@ Other events are identical in both detail modes. `plan_scan` binds an index-scan
 
 ## Access ledger
 
-The ledger (report v4) reads raw PG traces without connecting to PG. The compiler builds it in the same compilation pass and writes `access-ledger.json` in the Trace directory. The standalone `access-ledger` command produces the same report, sorting inputs by filename and choosing the lexicographically first template display text. It can list all rejections when compilation fails. Each index rescan is an access unit, including every inner-table rescan in a nested loop. Each raw event belongs exactly once to an access unit, write maintenance (`index_insert_attempt`), executor lifecycle, transaction boundary, result row, row change, index build, or plan binding. Category totals must equal the input event count. Candidate entries, visible rows, and SQL result rows describe three properties of the same access and are not added together. Bitmap candidates are TIDs before visibility checks. Visible rows are index rows visible through heap checks or the visibility map, or bitmap candidates judged visible by the heap. A candidate TID's verdict contributes to every index scan that produced it, so each side of BitmapOr gets its own visible-match count. BitmapAnd's heap checks only the intersection; inputs executed in the same round form one group with one visible count. PG skips later inputs once an intersection is empty, so a round includes only inputs actually executed. Per-TID or aggregated heap verdict events are reported separately as `bitmap_heap_verdicts` and are not counted again as access-unit events. `scan_summary` belongs to its access unit; `capture_start` is reported separately as `capture_header`. Each input file reports its `detail`.
+The generator builds the ledger from the same source events in its projection pass and writes `access-ledger.json` in the Trace directory. The standalone diagnostic can read retained raw PG facts without connecting to PG. The standalone `access-ledger` command produces the same report, sorting inputs by filename and choosing the lexicographically first template display text. It can list all rejections when compilation fails. Each index rescan is an access unit, including every inner-table rescan in a nested loop. Each raw event belongs exactly once to an access unit, write maintenance (`index_insert_attempt`), executor lifecycle, transaction boundary, result row, row change, index build, or plan binding. Category totals must equal the input event count. Candidate entries, visible rows, and SQL result rows describe three properties of the same access and are not added together. Bitmap candidates are TIDs before visibility checks. Visible rows are index rows visible through heap checks or the visibility map, or bitmap candidates judged visible by the heap. A candidate TID's verdict contributes to every index scan that produced it, so each side of BitmapOr gets its own visible-match count. BitmapAnd's heap checks only the intersection; inputs executed in the same round form one group with one visible count. PG skips later inputs once an intersection is empty, so a round includes only inputs actually executed. Per-TID or aggregated heap verdict events are reported separately as `bitmap_heap_verdicts` and are not counted again as access-unit events. `scan_summary` belongs to its access unit; `capture_start` is reported separately as `capture_header`. Each input file reports its `detail`.
 
 Each access unit carries the same projection decision used by the compiler, described below. `projection` summarizes projection shapes, rejection reasons, and exclusion reasons; any rejection sets status to `has_rejected_units`. Template identity is PG `query_id`, emitted as a string to avoid int64 precision loss in JSON tools. SQL with literals removed is display text only; multiple texts for one query_id are marked `text_variants`. Each template lists plan sequences (request-bound plan node, scan kind, and index) and request counts, with `plan_variants > 1` when several exist. It then reports access-path units, candidates, and visible rows by (source, plan node, index, scan kind, decision). Zero access units is an observation, for example a request using a sequential scan, rather than an inference from a plan.
 
@@ -52,9 +182,17 @@ The audit writes `row-state-audit.json` in the raw directory. Report digests bin
 
 Production generation checks source/schema identity, baseline file integrity, native session/request completion, transaction and snapshot semantics, and source access coverage. The baseline's `baseline-manifest.json` binds its schema, planned row counts, file inventory and SHA-256 identities; the Trace binds that manifest through `baseline_manifest_sha256`. An export manifest establishes file identity and coverage, not an independent comparison with database values. Compilation builds the access ledger and, when source counter snapshots are supplied, refuses mismatches before publishing a complete Trace. The normal generation entry point always supplies these snapshots.
 
-Independent acceptance is explicit. `audit-baseline` compares all source-column values with the unchanged initial database, checks generated RowID/timestamp invariants, and writes `verified-manifest.json`. In the single-database native workflow this audit must run before any workload changes; the explicit `--audit-baseline` capture option provides that boundary. `audit-rows` compares captured changes with the final database. The compiler can bind an explicitly supplied matching row-audit report; its `verification.mode` is then `row_audit`, otherwise `runtime`. Runtime mode does not claim independent row-state verification. Independent reports are not prerequisites for normal generation, and no cross-run certification substitutes for this run's runtime checks.
+The export entry point checks the actual source schema. Its snapshot planning
+count enforces YCSB's declared load size before exporting rows, then the emitted
+row count must match that plan. Native loading does not perform a separate full
+count for its report. Proto publication reuses a successfully closed writer's
+physical digest; projection and replay verify stored bytes during their necessary
+reads. Source access and transaction validation remain in the common projection;
+generation does not reread raw files to compute change-type statistics.
 
-Conversion acceptance checks source-event mapping, Parquet content and complete index expansion. The independent Parquet oracle checks current/historical keys, versions and values. Reference replay generates a per-query digest binding query identity, result order and complete `(PK, version, value)` results; service replay checks each query against it. Native counts remain independent source facts, and expected digests must not be derived from service responses. Changing client count, dispatch settings or backend does not require repeating an unchanged source audit, but input identity and actual service results remain checked.
+Independent acceptance is explicit. `audit-baseline` compares all source-column values with the unchanged initial database, checks generated RowID/timestamp invariants, and writes `verified-manifest.json`. In the single-database native workflow this audit must run before any workload changes; the explicit `--audit-baseline` capture option provides that boundary. `audit-rows` compares captured changes with the final database. Generation records `verification.mode=runtime`; independent row-audit reports belong to the separate acceptance workflow and are not inputs to the generator. Runtime verification does not claim independent row-state verification. Independent reports are not prerequisites for normal generation, and no cross-run certification substitutes for this run's runtime checks.
+
+Projection acceptance checks source-event mapping, Parquet content and complete index expansion. The independent Parquet oracle checks current/historical keys, versions and values. Reference replay generates a per-query digest binding query identity, result order and complete `(PK, version, value)` results; service replay checks each query against it. Native counts remain independent source facts, and expected digests must not be derived from service responses. Changing client count, dispatch settings or backend does not require repeating an unchanged source audit, but input identity and actual service results remain checked.
 
 PK value UPDATEs are outside the supported workloads for all three sources; both committed and rolled-back attempts are rejected. Ordinary-column / secondary-index-column UPDATEs with an unchanged PK and DELETE / reinsertion remain supported. CHAR ignores trailing ASCII spaces only; VARCHAR / TEXT preserve their text. REAL is compared at the source's single precision, and date / timestamp values are compared according to their types.
 
@@ -91,7 +229,7 @@ Replay uses the fixed rule `clientId = (workUnitId - 1) % client_count`. It does
 
 `client_count` defaults to 1; 64 and 128 are experiment settings, not hard limits. After secondary-index filtering, preflight checks that actual operations cover every configured client rather than merely counting distinct work units. Insufficient coverage is rejected before actual loading / sending. Extend native capture instead of repeating Trace or fabricating units to fill clients. Reports include configured / used clients and per-client operation, query, write, and work-unit counts. Coverage does not establish load balance or parallel connection throughput.
 
-## Current binary format
+## Detailed operation format
 
 The file header contains three little-endian int32 values: zstd file-type marker `0x53494f5a`, fixed record-prefix length `128`, and maximum records per block `4096`, totaling 12 bytes. Each following block stores compressed bytes, record count, CRC32C, and decompressed bytes, each as int32, followed by zstd data. The canonical stream SHA-256 uses the logical uncompressed form: file-type marker `0x53494f50`, then each block's decompressed bytes, record count, and CRC32C, followed by uncompressed records.
 
@@ -112,17 +250,17 @@ Canonical Trace preserves the original relative order of queries and changes wit
 
 Baseline emits INSERT per index; runtime INSERT emits UPSERT per index; DELETE invalidates the primary and all secondary entries. Reinserting the same PK allocates a new RowID; UPDATE retains the original RowID. Old entries, new entries, and the primary entry share source event, version, transaction, mutationOrdinal, workUnitId, and RowID. Value locations agree except that deleted entries have no physical location. `expansionPosition` is consecutive from 0, and `expansionSize` is the complete expansion width. Queries and control records cannot interrupt an expansion. Query groups reuse these fields for group position and width and likewise cannot be interrupted. Before secondary-index filtering, preflight checks the full inventory, complete expansions, and source work-unit bindings, rejecting truncation or missing members.
 
-During `compile-trace`, incremental files are created lazily for actual tables as `<table>-versions.parquet`, with initial FileID equal to the maximum Baseline FileID plus TableID. Each write retains `_sib_timestamp`, `_sib_mutation_ordinal`, and `_sib_row_id`. The same key and version overwrite in order. Intermediate effects serve original transaction-local queries without creating additional commit versions; later source transactions see only the final committed effect. Primary-key value UPDATE is explicitly rejected as out of scope. Incremental files roll after a closed row group reaches the source configuration's `data_layout` target size, independently of replay-backend SST settings; see [Data files](#data-files). The first FileID is the Baseline maximum plus TableID. Later FileIDs increase globally beyond the initial-file range reserved for all tables, using full int64 values. Actual row counts and SHA-256 are checked per file, and Locators point to actual files and positions.
+During full generation, incremental files are created lazily for actual tables as `<table>-versions.parquet`, with initial FileID equal to the maximum Baseline FileID plus TableID. Each write retains `_sib_timestamp`, `_sib_mutation_ordinal`, and `_sib_row_id`. The same key and version overwrite in order. Intermediate effects serve original transaction-local queries without creating additional commit versions; later source transactions see only the final committed effect. Primary-key value UPDATE is explicitly rejected as out of scope. Incremental files roll after a closed row group reaches the source configuration's `data_layout` target size, independently of replay-backend SST settings; see [Data files](#data-files). The first FileID is the Baseline maximum plus TableID. Later FileIDs increase globally beyond the initial-file range reserved for all tables, using full int64 values. Actual row counts and SHA-256 are checked per file, and Locators point to actual files and positions.
 
 Trace uses a compiler and reader built from the same commit.
 
 ## Delivery selection
 
-Only committed changes are sent downstream by default; this convention is not limited to a particular Index Service scenario. Raw Trace preserves change attempts, commits, and rollbacks. Canonical conversion identifies transaction outcomes and expands only committed business changes into downstream index updates. Rolled-back changes are not published, do not generate compensating reverse operations, and have no rollback switch. Normal business rollback does not imply capture failure. Unfinished transactions must not be silently consumed as rollbacks.
+Only committed changes are sent downstream by default; this convention is not limited to a particular Index Service scenario. Raw Trace preserves change attempts, commits, and rollbacks. The source projection identifies transaction outcomes and expands only committed business changes into downstream index updates. Rolled-back changes are not published, do not generate compensating reverse operations, and have no rollback switch. Normal business rollback does not imply capture failure. Unfinished transactions must not be silently consumed as rollbacks.
 
 Committed-only delivery constrains writes while retaining queries. In successfully committed transactions, reads after writes are converted using the timestamps and transaction positions above. In rolled-back transactions, supported queries before the first change remain; queries after it are excluded because their read environment depends on excluded changes. Filtering conservatively asks whether any change has already occurred, without inferring dependencies between query keys and changed keys. Exclusions are reported separately.
 
-The compiler emits a transaction's canonical operation group and incremental rows only after seeing its source commit. An abort that passed paired auditing excludes changes and subsequent queries. Canonical Trace emits neither ABORT nor reverse operations; rollback facts remain in raw Trace. Manifest fields `change_delivery=committed_only`, `raw_row_changes`, `discarded_aborted_row_changes`, `logical_row_version_writes`, and `index_version_writes` describe the delivery convention, raw row changes, rollback exclusions, committed row changes, and expanded index writes respectively. It also reports `transaction_local_searches` and `discarded_aborted_transaction_local_searches`. `aborted_transactions` includes explicit rollbacks and aborts on connection close. PG `index_insert_attempt` is not a downstream write.
+The compiler emits a transaction's canonical operation group and incremental rows only after seeing its source commit. An abort that passed paired auditing excludes changes and subsequent queries. Canonical Trace emits neither ABORT nor reverse operations; full output retains rollback facts in its raw side output. Manifest fields `change_delivery=committed_only`, `raw_row_changes`, `discarded_aborted_row_changes`, `logical_row_version_writes`, and `index_version_writes` describe the delivery convention, raw row changes, rollback exclusions, committed row changes, and expanded index writes respectively. It also reports `transaction_local_searches` and `discarded_aborted_transaction_local_searches`. `aborted_transactions` includes explicit rollbacks and aborts on connection close. PG `index_insert_attempt` is not a downstream write.
 
 The following driver settings live in `config/sibench.yaml`, sharing the file with `postgres` and `analysis`:
 
@@ -159,25 +297,56 @@ Reports distinguish persisted records (including controls), source index operati
 
 Derived Baseline includes `resolved-config.json`, `files.jsonl`, `manifest.json`, and Parquet, retaining `INCOMPLETE` until finished. Canonical compilation likewise publishes a completion manifest and checksums. Consumers reject incomplete or modified artifacts.
 
-Native execution writes `capture-run.json` in the raw directory:
+Native execution writes `capture-run.json` in the source-control directory selected by `capture.raw_directory`:
 
-- `running`: incomplete and cannot be compiled.
-- `failed`: retains the first error, SQLSTATE, request / transaction context, and stack trace. It cannot be compiled or resumed.
-- `complete`: connections closed normally, and correlated audits of this run's requests, results, and commits passed, with sessions audited in parallel. The manifest consistently records `sessions` (SHA256 of each PG trace and paired JDBC trace, whether scan keys must be client-bound values, and audit results), `session_order` (`single`, `sequential`, or `concurrent`, with HTAP phases stored separately), and `build`. Before consumption, every session file, digest, and inventory entry is rechecked, and every session must have a recorded passing audit. The audit itself is not rerun when its digest is unchanged. Runs lacking the session inventory are rejected and require recapture.
+- `running`: incomplete and cannot be published.
+- `failed`: retains the first error, SQLSTATE, request / transaction context, and stack trace. It cannot be published or resumed.
+- `complete`: connections closed normally, and correlated same-execution audits
+  of requests, results and transaction boundaries passed. `sessions` binds stream
+  identities, logical event digests, binding checks and audit certificates;
+  full output also binds the retained compressed files. `build` identifies the
+  generator, instrumented PG, trigger library and pinned native client. Normal
+  generation consumes live events once; explicit raw diagnostics verify their
+  retained file inventory and recorded certificates before reading them.
 
-With `--counters`, canonical compilation checks the ledger built in the same pass against PG14 counter semantics before committing the manifest, recording `capture-completeness.json`. A mismatch fails and retains `INCOMPLETE`. The manifest records `access_ledger_sha256`, `capture_completeness` (`consistent` or `not_checked`), and `business_changes_by_table`. Trace file SHA256 is computed while writing.
+Normal generation takes source index-counter snapshots around the native workload
+and checks its ledger against PG14 counter semantics before publishing
+`capture-completeness.json` and the final manifest. A mismatch fails and retains
+`INCOMPLETE`. The manifest records `access_ledger_sha256`, `capture_completeness`
+and `business_changes_by_table`. Proto file digests are computed while writing.
+
 
 JDBC exceptions fail the current run even if native methods catch them. Logging or cleanup exceptions do not replace the original cause. Auditing does not prove global freedom from lost events.
+
+The pinned sysbench PostgreSQL driver rolls back and retries its recognized
+deadlock, unique-violation and serialization errors. Generation requires its
+ignored-error count to equal both server aborts and aborted executions. Successful
+statement counts exclude those failed executions; explicit-transaction retries
+add counted BEGIN calls, while the driver's direct ROLLBACK bypasses its counters.
+Missing returns without an abort, inconsistent counts and other source failures
+still reject the capture. Retrying belongs to the native driver; SIBench does not
+retry source SQL.
 
 Diagnose unexpected errors, fix their causes, restore a known initial state, and rerun in a fresh directory. Do not guess PG internals or fabricate events. Raw auditing checks request identities for explicit business rollbacks and aborts on close. A transaction still open at close requires a corresponding server end boundary; closing a file cannot silently discard it. The eight-table state audit and compilation within the supported scope exclude rolled-back changes without rejecting an otherwise valid capture or automatically retrying. Compilation still rejects mismatched transaction XIDs, unfinished scans, missing completion positions, and snapshot conflicts. Sending still rejects unmatched boundaries, incorrect version / query positions, incomplete expansions, and thread switches. Correct final state cannot replace proof of global event completeness.
 
 ## Long-running inputs and validation
 
-The strategy is sufficient continuous native execution, segmentation at transaction boundaries, offline compilation, and single_pass, without looping, reordering, or remapping keys. Resumable segmented compilation and Checkpoint are not implemented.
+Generate a finite native workload into a persistent Trace, then use `single_pass`
+for repeatable independent service tests. Generation projects committed transactions
+as facts arrive and releases processed scratch. Pending-fact and audit-entry
+limits fail on overflow. Optional generation operation/output targets request
+cooperative native admission stop and drain completed transactions as described
+above. Resumable segments and checkpoints are not implemented. Native SQL,
+transaction boundaries and configured concurrency are preserved.
 
 Budgets count effective runtime operations after secondary-index filtering, identically for both dispatch modes, excluding Baseline, controls, and derived probes: warmup operations + ceil(rate × measurement seconds × (1 + margin)). Insufficient supply is rejected before loading / sending. Preflight establishes input quantity, not achievable throughput or sustained scheduling.
 
 `check-replay` validates the manifest, digests, pinned source-index inventory, complete expansions, source work-unit bindings, format, record counts, CRC, filtered client coverage, and budgets without invoking an actual adapter. Replay and locality analysis require a complete manifest with nonnegative int64 `baseline_rows`, `source_work_units`, `baseline_operations`, and `workload_operations`; missing or invalid coverage counts are rejected before loading. `replay` selects its value mode from `target.service.value`, or `target.value` in a standalone reference configuration; if unspecified, both value modes are checked. Production replay requires directory-level preflight.
+
+Ordinary reference replay checks every native expected count and publishes full
+ordered query digests. The whole final primary-state checksum is an additional
+scan used by explicit `validate-replay-matrix` state-equivalence diagnostics;
+ordinary reference reports do not compute it.
 
 `validate-snapshots` requires canonical Trace with source-code and Baseline provenance and no relocation. The oracle independently reads Baseline and incremental Parquet rather than deriving expectations from secondary Trace values. It checks every modified PK and complete secondary identity for key/version/Locator/RowID at Baseline, before and at every commit affecting that key, and at the final point. Each source secondary index gets up to 64 deterministic equality predicates: half from modified values, the rest uniformly distributed across the Baseline value domain including endpoints. Limited range probes for the primary and every source secondary index use 9 quantile boundaries, checking adjacent lower / upper bounds as inclusive and exclusive from each side in ascending and descending order, plus unbounded scans in both directions and ranges anchored on modified values. Predicates and intervals check result key/version/value and order at Baseline, before and at the first relevant change, and at the final point. Source-file digests, incremental positions, RowIDs, versions, and transaction-local mutation positions are also checked. Query groups are covered only through member lookups. This sampling does not prove all predicates. Probes are reported separately and neither written into Trace nor counted as native workload.
 

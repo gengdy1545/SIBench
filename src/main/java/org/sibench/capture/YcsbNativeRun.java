@@ -2,7 +2,6 @@ package org.sibench.capture;
 
 import static org.sibench.config.ConfigValues.*;
 
-import org.sibench.schema.SourceSchema;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -16,7 +15,7 @@ import java.util.Properties;
 import java.util.regex.Pattern;
 
 /**
- * Runs the pinned YCSB client unchanged, with its JDBC binding connected through the recording
+ * Runs the pinned YCSB client with cooperative admission stopping and its JDBC binding through the recording
  * driver. The client is a separate JVM: Client.main always ends in System.exit.
  */
 final class YcsbNativeRun {
@@ -131,7 +130,7 @@ final class YcsbNativeRun {
         require(
                 loaded == records && inserts.keySet().stream().allMatch(code -> code.equals("Return=OK") || code.equals("Return=BATCHED_OK") || !code.startsWith("Return=")),
                 "YCSB load did not insert every record");
-        // NativeLoad checks actual final rows before publishing; BATCHED_OK alone cannot prove cleanup flushed the last batch.
+        // Export checks the actual snapshot count; BATCHED_OK cannot prove cleanup flushed the last batch.
     }
 
     static Map<String, Object> run(NativeCaptureConfig config, Path logs) throws Exception {
@@ -139,10 +138,10 @@ final class YcsbNativeRun {
         Path libraries = libraries(config);
         var nativeConfig = config.nativeConfig();
         Path self = NativeProcess.self();
-        var schema = SourceSchema.read(config.root(), config.document());
         long records = positive(nativeConfig, "recordcount"), requests = 0;
         var reports = new ArrayList<Map<String, Object>>();
         for (var entry : object(nativeConfig, "workloads").entrySet()) {
+            if (DirectCapture.budgetStopped(config.raw())) break;
             String workload = entry.getKey();
             String timingPrefix = "ycsb_" + workload + "_";
             long workloadStarted = System.nanoTime();
@@ -151,7 +150,6 @@ final class YcsbNativeRun {
             Map<String, Object> overrides =
                     entryConfig.containsKey("properties") ? object(entryConfig, "properties") : Map.of();
             var before = jdbcTraces(config);
-            var serversBefore = serverTraces(config);
             var command =
                     NativeProcess.java(
                             libraries,
@@ -215,12 +213,11 @@ final class YcsbNativeRun {
                                 + " requests in "
                                 + added.size()
                                 + " sessions");
-            var addedServers = new ArrayList<>(serverTraces(config));
-            addedServers.removeAll(serversBefore);
             var declaration = declaration(config, workload);
             var observed = observed(measured);
             requireDeclared(workload, declaration, observed);
-            if (observed.get("total") != operations)
+            if (observed.get("total") > operations
+                    || observed.get("total") < operations && !DirectCapture.budgetStopped(config.raw()))
                 throw new IOException(
                         workload
                                 + ": the run asked for "
@@ -234,7 +231,8 @@ final class YcsbNativeRun {
                 sessions.add(Map.of("pg_file", ServerTrace.locate(config.raw(), CaptureRun.connectionPid(trace)).getFileName().toString()));
             report.put("sessions", sessions);
             report.put("recordcount_at_start", records);
-            report.put("operationcount", operations);
+            report.put("operationcount", observed.get("total"));
+            report.put("requested_operationcount", operations);
             report.put("statement_operations", executed);
             report.put("jdbc_requests", clientRequests);
             report.put("returns", returns);
@@ -248,9 +246,6 @@ final class YcsbNativeRun {
             report.put("read_modify_write", observed.get("read_modify_write"));
             if (!overrides.isEmpty()) report.put("native_property_overrides", overrides);
             report.put("source_failures", failures.report());
-            long changesStarted = System.nanoTime();
-            report.put("change_kinds", ChangeKinds.countTraces(schema, addedServers).describe());
-            RunTiming.current().note(timingPrefix + "change_kinds_millis", (System.nanoTime() - changesStarted) / 1_000_000L);
             reports.add(report);
             requests += clientRequests;
             // Later workloads continue on the grown table: inserted keys are existing records.
@@ -430,20 +425,17 @@ final class YcsbNativeRun {
     }
 
     private static List<Path> jdbcTraces(NativeCaptureConfig config) throws IOException {
+        var direct = DirectCapture.current(config.raw());
+        if (direct != null) return direct.paths(false);
         if (!Files.isDirectory(config.raw())) return List.of();
         try (var paths = Files.list(config.raw())) {
             return paths.filter(p -> p.getFileName().toString().startsWith("jdbc-")).sorted().toList();
         }
     }
 
-    private static List<Path> serverTraces(NativeCaptureConfig config) throws IOException {
-        if (!Files.isDirectory(config.raw())) return List.of();
-        try (var paths = Files.list(config.raw())) {
-            return paths.filter(p -> p.getFileName().toString().startsWith("pg-")).sorted().toList();
-        }
-    }
-
     private static long countRequests(Path trace) throws IOException {
+        var direct = DirectCapture.current(trace.toAbsolutePath().getParent());
+        if (direct != null) return direct.requestCount(trace);
         try (var lines = ServerTrace.open(trace).lines()) {
             return lines.filter(line -> line.contains("\"event\":\"request_start\"")).count();
         }

@@ -55,7 +55,7 @@ public final class ScaleInspector {
         byte[] bytes = Files.readAllBytes(path);
         Map<String, Object> config = parse(new String(bytes, StandardCharsets.UTF_8));
         require(integer(config, "schema_version") == 1, "Unsupported profile schema");
-        if (string(config, "purpose").equals("native_capture_poc")) {
+        if (string(config, "purpose").equals("native_capture")) {
             var schema = org.sibench.schema.SourceSchema.read(root, config);
             var nativeConfig = object(config, "native");
             long rows;

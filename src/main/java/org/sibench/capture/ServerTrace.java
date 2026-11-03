@@ -54,6 +54,8 @@ public final class ServerTrace {
     /** The trace file of one backend in a raw directory. */
     public static Path locate(Path directory, int pid) throws IOException {
         Path file = path(directory, pid);
+        var direct = DirectCapture.current(directory);
+        if (direct != null && direct.paths(true).contains(file.toAbsolutePath().normalize())) return file;
         if (!Files.isRegularFile(file)) throw new IOException("Backend trace not found: " + file);
         return file;
     }
@@ -83,7 +85,6 @@ public final class ServerTrace {
         private static final byte[] EVENT_BYTES = "{\"event\":\"".getBytes(StandardCharsets.UTF_8);
         private static final byte[] ROW_BYTES = "{\"event\":\"row_change\"".getBytes(StandardCharsets.UTF_8);
 
-        private final boolean rowChanges;
         private final InputStream input;
         private final byte[] buffer = new byte[1 << 20];
         private int position, limit;
@@ -99,16 +100,11 @@ public final class ServerTrace {
         private int record = -1;
         private final java.io.ByteArrayOutputStream kept = new java.io.ByteArrayOutputStream();
 
-        Records(Path file) throws IOException {
-            this(file, false);
-        }
-
         static Records rowChanges(Path file) throws IOException {
-            return new Records(file, true);
+            return new Records(file);
         }
 
-        private Records(Path file, boolean rowChanges) throws IOException {
-            this.rowChanges = rowChanges;
+        private Records(Path file) throws IOException {
             input = ServerTrace.input(file);
         }
 
@@ -157,10 +153,10 @@ public final class ServerTrace {
         /** Classifies the line once its head can tell. */
         private void decide() {
             boolean commit = startsWith(COMMIT_BYTES), abort = startsWith(ABORT_BYTES);
-            boolean row = rowChanges && startsWith(ROW_BYTES);
+            boolean row = startsWith(ROW_BYTES);
             if (!commit && !abort && !row) {
                 // Preserve noncanonical lines for the row audit parser, including malformed input.
-                if (rowChanges && !startsWith(EVENT_BYTES)) keep();
+                if (!startsWith(EVENT_BYTES)) keep();
                 else record = 0;
                 return;
             }
@@ -193,7 +189,7 @@ public final class ServerTrace {
         /** Ends the current line; its text when selected. */
         private String endLine() {
             lines++;
-            if (rowChanges && record == -1
+            if (record == -1
                     && !(headLength >= EVENT_BYTES.length && startsWith(EVENT_BYTES))) keep();
             String line = record == 1 ? kept.toString(StandardCharsets.UTF_8) : null;
             inLine = false;

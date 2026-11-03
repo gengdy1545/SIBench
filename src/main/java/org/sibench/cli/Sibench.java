@@ -7,7 +7,6 @@ import com.google.gson.JsonParser;
 import org.sibench.capture.AccessLedger;
 import org.sibench.capture.CaptureCompleteness;
 import org.sibench.capture.CaptureProfile;
-import org.sibench.capture.IndexTraceCompiler;
 import org.sibench.capture.LedgerComparison;
 import org.sibench.capture.RelocationCheck;
 import org.sibench.capture.RowStateAudit;
@@ -89,7 +88,6 @@ public final class Sibench {
                             "compare-ledgers",
                             "snapshot-index-counters",
                             "check-capture-completeness",
-                            "compile-trace",
                             "validate-replay-matrix",
                             "check-relocation",
                             "index-server",
@@ -105,7 +103,6 @@ public final class Sibench {
             List<String> profiles = new ArrayList<>();
             boolean dryRun = false;
             String jdbc = null, user = null, reference = null;
-            String countersBefore = null, countersAfter = null;
             for (int i = 1; i < args.length; i++) {
                 if (args[i].equals("--help") || args[i].equals("-h")) {
                     printHelp(out);
@@ -124,11 +121,6 @@ public final class Sibench {
                     if (++i == args.length)
                         throw new IllegalArgumentException("--user requires a role");
                     user = args[i];
-                } else if (args[0].equals("compile-trace") && args[i].equals("--counters")) {
-                    if (i + 2 >= args.length)
-                        throw new IllegalArgumentException("--counters requires BEFORE AFTER snapshots");
-                    countersBefore = args[++i];
-                    countersAfter = args[++i];
                 } else if ((args[0].equals("replay-service") || args[0].equals("verify-service"))
                         && args[i].equals("--reference")) {
                     if (++i == args.length)
@@ -277,40 +269,6 @@ public final class Sibench {
                         root.resolve(profiles.get(1)),
                         output);
                 out.println(Files.readString(output.resolve("report.json")));
-                return 0;
-            }
-            if (args[0].equals("compile-trace")) {
-                if (profiles.size() != 2 && profiles.size() != 3)
-                    throw new IllegalArgumentException(
-                            "compile-trace requires PROFILE OUTPUT [ROW_AUDIT] [--counters BEFORE AFTER]");
-                var checks =
-                        new IndexTraceCompiler.Checks(
-                                profiles.size() == 3 ? root.resolve(profiles.get(2)) : null,
-                                countersBefore == null ? null : root.resolve(countersBefore),
-                                countersAfter == null ? null : root.resolve(countersAfter));
-                var report =
-                        IndexTraceCompiler.compileProfile(
-                                root, Path.of(profiles.get(0)), root.resolve(profiles.get(1)), checks);
-                var summary = new LinkedHashMap<String, Object>();
-                for (String key :
-                        List.of(
-                                "status",
-                                "benchmark",
-                                "session_order",
-                                "baseline_operations",
-                                "workload_operations",
-                                "searched_accesses",
-                                "search_operations",
-                                "searched_accesses_by_shape",
-                                "excluded_access_units",
-                                "committed_transactions",
-                                "row_write_ratio",
-                                "utility_only_transactions",
-                                "business_changes",
-                                "verification",
-                                "capture_completeness"))
-                    summary.put(key, report.get(key));
-                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(summary));
                 return 0;
             }
             if (args[0].equals("check-schema")) {
@@ -470,7 +428,7 @@ public final class Sibench {
                 reports.add(ScaleInspector.inspect(root, Path.of(profile)));
             }
             Map<String, Object> report = new LinkedHashMap<>();
-            report.put("status", "profiles_valid_generation_pending");
+            report.put("status", "profiles_valid");
             report.put("workspace_free_bytes", Files.getFileStore(root).getUsableSpace());
             report.put("profiles", reports);
             out.println(
@@ -537,14 +495,6 @@ public final class Sibench {
         out.println(
                 "check-capture-completeness cross-checks a ledger against the PG index counter"
                     + " deltas of two snapshots; it never touches PG and exits 1 when they disagree.");
-        out.println(
-                "       java -jar build/sibench/sibench.jar compile-trace [--root PATH]"
-                        + " PROFILE OUTPUT [ROW_AUDIT]"
-                        + " [--counters BEFORE AFTER]");
-        out.println(
-                "compile-trace turns a completed capture into baseline/workload traces and its access"
-                        + " ledger in one pass; any access it cannot project fails the compilation."
-                        + " --counters requires the ledger to match PG's index counters.");
         out.println("       java -jar build/sibench/sibench.jar audit-baseline [--root PATH]"
                 + " PROFILE BASELINE --jdbc URL --user ROLE");
         out.println("audit-baseline independently compares Parquet values with the unchanged initial PostgreSQL database.");

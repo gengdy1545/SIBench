@@ -93,4 +93,22 @@ public class SibenchConfigTest {
                 "schema_version", 1, "purpose", "sibench", "postgres", settings)));
         return path;
     }
+
+    @Test
+    public void generationTargetsAreOptionalNonnegativeIntegers() {
+        var generation = new LinkedHashMap<String, Object>(Map.of(
+                "pending_transaction_bytes", 1000, "pending_transactions", 10));
+        var document = Map.<String, Object>of("schema_version", 1, "purpose", "sibench", "generation", generation);
+        SibenchConfig.validate(document);
+        generation.put("operation_target", 0);
+        generation.put("output_byte_target", Long.MAX_VALUE);
+        SibenchConfig.validate(document);
+        generation.put("operation_target", -1);
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(document));
+        generation.put("operation_target", 1.5);
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(document));
+        generation.put("operation_target", 1);
+        generation.put("unknown_budget", 1);
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(document));
+    }
 }

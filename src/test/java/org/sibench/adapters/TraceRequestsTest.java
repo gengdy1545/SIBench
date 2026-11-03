@@ -71,6 +71,23 @@ public class TraceRequestsTest {
     }
 
     @Test
+    public void storedFullWritesRespectTheSelectedValueMode() throws Exception {
+        var operation = IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0,
+                IndexKey.ofInt(7), 0, 3, 9, 17);
+        var stored = new TraceRequests(ValueKind.ROW_ID).request(0, operation);
+        stored = stored.toBuilder().setWrite(stored.getWrite().toBuilder().setValue(
+                stored.getWrite().getValue().toBuilder().setFile(3).setPosition(9))).build();
+        for (var kind : List.of(ValueKind.ROW_ID, ValueKind.LOCATOR)) {
+            var requests = new TraceRequests(kind);
+            var expected = kind == ValueKind.ROW_ID ? Value.newBuilder().setRowId(17).build()
+                    : Value.newBuilder().setFile(3).setPosition(9).build();
+            assertEquals(expected, requests.forward(1, stored, List.of(operation)).getWrite().getValue());
+            assertEquals(expected, requests.batch(2, List.of(operation), List.of(stored.getWrite()))
+                    .getBatch().getWrites(0).getValue());
+        }
+    }
+
+    @Test
     public void sameCountWrongKeyVersionRowIdDuplicateAndOrderFail() throws Exception {
         for (String fault :
                 List.of("version", "key", "duplicate", "reversed", "xor")) {
@@ -99,6 +116,21 @@ public class TraceRequestsTest {
                             () -> requests.check(operation, response(request.getId(), actual.toArray(Result[]::new))));
             assertTrue(fault + ": " + failure.getMessage(), failure.getMessage().contains("differ"));
         }
+    }
+
+    @Test
+    public void forwardedSearchStillChecksTheOrderedDigestOfStreamedResults() throws Exception {
+        Operation operation = query(3, 1, 2);
+        var stored = new TraceRequests(ValueKind.ROW_ID).request(0, operation);
+        Path stream = expected(List.of(operation), List.of(List.of(result(1, 1, 1), result(2, 3, 2))));
+        var requests = new TraceRequests(ValueKind.ROW_ID, stream);
+        var request = requests.forward(11, stored, List.of(operation));
+        assertSame(stored.getSearch(), request.getSearch());
+        var received = requests.receive(operation, request.getId());
+        received.partial().accept(response(11, responseResult(1, 1, 1)).toBuilder().setMore(true).build());
+        var failure = assertThrows(IOException.class,
+                () -> received.finish(response(11, responseResult(9, 3, 2))));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("differ"));
     }
 
     @Test

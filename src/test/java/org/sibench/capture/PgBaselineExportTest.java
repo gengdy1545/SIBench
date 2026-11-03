@@ -18,6 +18,17 @@ public class PgBaselineExportTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     @Test
+    public void exportedSnapshotMustIncludeEveryNativeLoadBatch() throws Exception {
+        var config = NativeCaptureConfig.read(Path.of(""), Path.of("src/test/resources/config/ycsb_1k.yaml"));
+        PgBaselineExport.requireRows(config.layout(), Map.of("usertable", 1000L));
+        // Client BATCHED_OK counters do not establish that PG contains the last batch.
+        for (var actual : List.of(Map.of("usertable", 999L), Map.of("usertable", 1001L),
+                Map.<String, Long>of(), Map.of("another_table", 1000L)))
+            assertTrue(assertThrows(java.io.IOException.class, () -> PgBaselineExport.requireRows(config.layout(), actual))
+                    .getMessage().contains("different row count"));
+    }
+
+    @Test
     public void prefetchByteBudgetRejectsRowsOverTheCreditLimit() throws Exception {
         assertEquals(28, PgBaselineExport.prefetchCost(28, 28));
         assertThrows(java.io.IOException.class, () -> PgBaselineExport.prefetchCost(28, 27));
@@ -87,6 +98,57 @@ public class PgBaselineExportTest {
                 "{\"Node Type\":\"Index Scan\",\"Index Name\":\"another_index\"}"))
             assertThrows(java.io.IOException.class, () -> PgBaselineExport.requirePrimaryPlan(
                     com.google.gson.JsonParser.parseString(plan).getAsJsonObject(), "usertable_pkey"));
+    }
+
+    @Test
+    public void protoExportProjectsIndexColumnsAndPreservesDuplicateSecondaryValues() throws Exception {
+        Path output = temporary.newFolder().toPath();
+        var config = ParquetDataFileTest.layout(output, 192 * 1024, 5);
+        var source = SourceSchema.of("sysbench", Path.of("benchmark/sysbench"), Map.of("tables", 1L));
+        var catalog = IndexCatalog.fromSchema(source);
+        var schema = MessageTypeParser.parseMessageType("message sbtest1 { optional int64 id; optional int64 k;"
+                + " optional binary c (UTF8); optional binary pad (UTF8);"
+                + " required int64 _sib_row_id; required int64 _sib_timestamp; }");
+        var full = new PgBaselineExport.Table(source.tables().get(0), "id", true, schema, 2, true, List.of());
+        var table = PgBaselineExport.indexColumns(full, catalog);
+        assertEquals(List.of("id", "k", "_sib_row_id", "_sib_timestamp"),
+                table.schema().getFields().stream().map(org.apache.parquet.schema.Type::getName).toList());
+        var rows = List.of(new String[] {"1", "10"}, new String[] {"2", "10"}).iterator();
+        var files = PgBaselineExport.writeIndexTable(table, 0, 1,
+                () -> rows.hasNext() ? rows.next() : null, output, config, catalog);
+        var operations = new ArrayList<IndexOperationTrace.Operation>();
+        assertEquals(4, ProtoTrace.read(output.resolve("sbtest1.pb.zst"), null,
+                (String) files.get(0).file().get("logical_sha256"), operations::add));
+        assertEquals(List.of(1L, 1L, 2L, 2L), operations.stream().map(IndexOperationTrace.Operation::rowId).toList());
+        assertEquals(List.of(0, 1, 0, 1), operations.stream().map(IndexOperationTrace.Operation::index).toList());
+        assertEquals(org.sibench.trace.IndexKey.ofInt(10), operations.get(1).indexedValue());
+        assertEquals(org.sibench.trace.IndexKey.ofInt(10), operations.get(3).indexedValue());
+        assertFalse(Files.exists(output.resolve("sbtest1.parquet")));
+        Path shard = output.resolve("sbtest1.pb.zst");
+        String expectedHash = java.util.HexFormat.of().formatHex(
+                java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(shard)));
+        Files.write(output.resolve("files.jsonl"), files.stream().map(f -> new com.google.gson.Gson().toJson(f.file())).toList());
+        BaselineManifest.publish(source, output, Map.of("sbtest1", 2L), TraceOutput.PROTO);
+        var manifest = BaselineManifest.verify(source, output);
+        assertEquals(expectedHash, manifest.getAsJsonArray("files").get(0).getAsJsonObject().get("sha256").getAsString());
+        try (var identities = new org.sibench.state.RowIdentities(output.resolve("state"), 4, 4)) {
+            assertEquals(2, ProtoBaseline.derive(output, manifest, catalog, identities, operation -> {}).rows());
+        }
+        // Even an unchanged file-cache identity must not let corrupt bytes enter the projection.
+        var modified = Files.getLastModifiedTime(shard);
+        byte[] corrupt = Files.readAllBytes(shard);
+        corrupt[corrupt.length - 1] = 1;
+        Files.write(shard, corrupt);
+        Files.setLastModifiedTime(shard, modified);
+        try (var identities = new org.sibench.state.RowIdentities(output.resolve("corrupt-state"), 4, 4)) {
+            assertThrows(java.io.IOException.class,
+                    () -> ProtoBaseline.derive(output, manifest, catalog, identities, operation -> {}));
+        }
+        PgBaselineExport.requirePrimaryPlan(com.google.gson.JsonParser.parseString(
+                "{\"Node Type\":\"Index Only Scan\",\"Index Name\":\"usertable_pkey\"}").getAsJsonObject(), "usertable_pkey", true);
+        assertThrows(java.io.IOException.class, () -> PgBaselineExport.requirePrimaryPlan(
+                com.google.gson.JsonParser.parseString("{\"Node Type\":\"Index Only Scan\",\"Index Name\":\"wrong\"}")
+                        .getAsJsonObject(), "usertable_pkey", true));
     }
 
     @Test

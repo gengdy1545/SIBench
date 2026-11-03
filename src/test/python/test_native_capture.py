@@ -88,7 +88,7 @@ class NativeCapturePostgresTest(unittest.TestCase):
                 (root / "config/sibench.yaml").touch()
                 profile = root / "profile.yaml"
                 profile.touch()
-                artifacts = root / "results/poc" / name
+                artifacts = root / "results/capture" / name
                 config = artifacts / "native/postgres.conf"
                 paths = root / "paths.sh"
                 paths.write_text("\n".join(key + "=" + shlex.quote(str(value)) for key, value in {
@@ -96,6 +96,7 @@ class NativeCapturePostgresTest(unittest.TestCase):
                     "SIBENCH_RAW": artifacts / "raw",
                     "SIBENCH_CAPTURE_DETAIL": "full",
                     "SIBENCH_CAPTURE_COMPRESS": "none",
+                    "SIBENCH_TRACE_OUTPUT": "full",
                     "SIBENCH_VERIFICATION": "full",
                     "SIBENCH_PORT": 5544,
                     "SIBENCH_DATABASE": "test",
@@ -151,7 +152,7 @@ class NativeCaptureLifecycleTest(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.artifacts = self.root / "results/poc/capture"
+        self.artifacts = self.root / "results/capture/capture"
         self.cluster = self.root / "build/services/postgresql-capture/data"
         script = self.root / "scripts/native-capture.sh"
         script.parent.mkdir()
@@ -162,10 +163,10 @@ class NativeCaptureLifecycleTest(unittest.TestCase):
             path.touch()
         stub = self.root / "stub.py"
         stub.write_text(textwrap.dedent(r'''            #!/usr/bin/env python3
-            import json, os, pathlib, shlex, sys
+            import json, os, pathlib, shlex, socket, stat, sys
             root = pathlib.Path(os.environ["SIBENCH_TEST_ROOT"])
             data = root / "build/services/postgresql-capture/data"
-            artifacts = root / "results/poc/capture"
+            artifacts = root / "results/capture" / os.environ.get("SIBENCH_TEST_ARTIFACT_NAME", "capture")
             name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
             def record(event):
                 with (root / "events.jsonl").open("a") as output:
@@ -176,28 +177,36 @@ class NativeCaptureLifecycleTest(unittest.TestCase):
                 if stage == "paths":
                     for k, v in {"SIBENCH_ARTIFACTS": artifacts, "SIBENCH_RAW": artifacts / "raw",
                                  "SIBENCH_CAPTURE_DETAIL": "summary", "SIBENCH_CAPTURE_COMPRESS": "zstd",
+                                 "SIBENCH_TRACE_OUTPUT": os.environ.get("SIBENCH_TEST_TRACE_OUTPUT", "full"),
                                  "SIBENCH_PORT": 5544, "SIBENCH_DATABASE": "capture"}.items():
                         print(k + "=" + shlex.quote(str(v)))
                 elif stage == "verify": pass
                 elif stage == "postgres-config": pathlib.Path(args[-1]).touch()
                 else:
-                    record({"stage": stage})
+                    record({"stage": stage, "socket": os.environ.get("SIBENCH_CAPTURE_SOCKET")})
                     if stage == os.environ.get("SIBENCH_TEST_FAIL_STAGE"):
                         (root / "failed").touch()
                         sys.exit(79)
-                    if stage in ("load", "check", "export", "run"):
+                    if stage in ("load", "export", "run"):
                         assert (data / "running").is_file()
                         capture = (data / "capture").read_text()
                         assert bool(capture) == (stage != "load")
                     if stage == "load": (data / "identity").write_text("original database")
                     elif stage in ("export", "run"):
                         assert (data / "identity").read_text() == "original database"
-                    elif stage == "compile-trace":
-                        assert not (data / "running").exists()
-                        trace = artifacts / "trace"
-                        trace.mkdir()
-                        for n in ("access-ledger.json", "capture-completeness.json"):
-                            (trace / n).write_text("{}")
+                        if stage == "export": (artifacts / "baseline").mkdir()
+                        if stage == "run":
+                            endpoint = pathlib.Path(os.environ["SIBENCH_CAPTURE_SOCKET"])
+                            with socket.socket(socket.AF_UNIX) as listener:
+                                listener.bind(str(endpoint))
+                            assert stat.S_IMODE(endpoint.parent.stat().st_mode) == 0o700
+                            if os.environ.get("SIBENCH_TEST_FAIL_STAGE") == "generation":
+                                (root / "failed").touch()
+                                sys.exit(79)
+                            trace = artifacts / "trace"
+                            trace.mkdir()
+                            for n in ("access-ledger.json", "capture-completeness.json"):
+                                (trace / n).write_text("{}")
             elif name == "pg_isready": sys.exit(1)
             elif name == "postgres": print("80")
             elif name == "initdb":
@@ -237,13 +246,23 @@ class NativeCaptureLifecycleTest(unittest.TestCase):
         result = self.execute()
         self.assertEqual(0, result.returncode, result.stderr)
         events = self.events()
-        self.assertEqual(["initdb", "start", "load", "stop", "start", "check", "export",
-                          "snapshot-index-counters", "run", "snapshot-index-counters", "stop", "compile-trace"],
+        self.assertEqual(["initdb", "start", "load", "stop", "start", "export",
+                          "snapshot-index-counters", "run", "stop"],
                          [event["stage"] for event in events])
         self.assertEqual({str(self.cluster)}, {event["data"] for event in events if "data" in event})
         self.assertFalse(self.cluster.exists())
         self.assertFalse((self.root / "build/services/postgresql-still").exists())
         self.assertTrue((self.artifacts / "trace/access-ledger.json").is_file())
+
+    def test_long_artifact_path_uses_a_private_socket_and_removes_it_after_success(self):
+        name = "long-run-" + "a" * 100
+        self.env["SIBENCH_TEST_ARTIFACT_NAME"] = name
+        self.artifacts = self.root / "results/capture" / name
+        self.assertGreater(len(os.fsencode(self.artifacts / "native/capture.sock")), 107)
+        result = self.execute()
+        self.assertEqual(0, result.returncode, result.stderr)
+        endpoint = Path(next(x["socket"] for x in self.events() if x["stage"] == "run"))
+        self.assertFalse(endpoint.parent.exists())
 
     def test_explicit_acceptance_can_retain_the_final_database(self):
         self.env["SIBENCH_KEEP_DATABASE"] = "1"
@@ -251,6 +270,30 @@ class NativeCaptureLifecycleTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertTrue(self.cluster.is_dir())
         self.assertFalse((self.cluster / "running").exists())
+
+    def test_proto_releases_only_consumed_inputs_after_success(self):
+        self.env["SIBENCH_TEST_TRACE_OUTPUT"] = "proto"
+        result = self.execute()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse((self.artifacts / "baseline").exists())
+        self.assertFalse((self.artifacts / "raw").exists())
+        self.assertTrue((self.artifacts / "trace/access-ledger.json").is_file())
+        self.assertTrue((self.artifacts / "native/sibench-run.jar").is_file())
+
+    def test_proto_generation_failure_preserves_diagnostics_and_export(self):
+        self.env.update(SIBENCH_TEST_TRACE_OUTPUT="proto", SIBENCH_TEST_FAIL_STAGE="generation")
+        result = self.execute()
+        self.assertEqual(79, result.returncode, result.stderr)
+        self.assertTrue((self.artifacts / "baseline").is_dir())
+        self.assertTrue((self.artifacts / "raw").is_dir())
+
+    def test_proto_rejects_full_row_acceptance_before_creating_a_database(self):
+        self.env["SIBENCH_TEST_TRACE_OUTPUT"] = "proto"
+        self.command.insert(-1, "--audit-baseline")
+        result = self.execute()
+        self.assertEqual(2, result.returncode, result.stderr)
+        self.assertIn("requires capture.output: full", result.stderr)
+        self.assertFalse(self.cluster.exists())
 
     def test_failed_export_stops_but_retains_database_and_does_not_run_workload(self):
         self.env["SIBENCH_TEST_FAIL_STAGE"] = "export"
@@ -260,12 +303,14 @@ class NativeCaptureLifecycleTest(unittest.TestCase):
         self.assertFalse((self.cluster / "running").exists())
         self.assertNotIn("run", [event["stage"] for event in self.events()])
 
-    def test_failed_compilation_retains_stopped_database(self):
-        self.env["SIBENCH_TEST_FAIL_STAGE"] = "compile-trace"
+    def test_failed_generation_retains_stopped_database(self):
+        self.env["SIBENCH_TEST_FAIL_STAGE"] = "generation"
         result = self.execute()
         self.assertEqual(79, result.returncode, result.stderr)
         self.assertTrue(self.cluster.is_dir())
         self.assertFalse((self.cluster / "running").exists())
+        endpoint = Path(next(x["socket"] for x in self.events() if x["stage"] == "run"))
+        self.assertFalse(endpoint.parent.exists())
 
     def test_cleanup_error_does_not_replace_first_failure(self):
         self.env.update(SIBENCH_TEST_FAIL_STAGE="run", SIBENCH_TEST_FAIL_STOP="1")

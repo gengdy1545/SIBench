@@ -192,6 +192,10 @@ public final class ReplayDispatcher implements AutoCloseable {
     }
 
     public void send(Operation operation) throws IOException {
+        send(operation, null);
+    }
+
+    public void send(Operation operation, org.sibench.adapters.proto.Request stored) throws IOException {
         checkSender();
         int clientId = route(operation);
         long started = System.nanoTime();
@@ -215,7 +219,7 @@ public final class ReplayDispatcher implements AutoCloseable {
                     System.nanoTime() + TimeUnit.SECONDS.toNanos(config.requestTimeoutSeconds());
             beginCall(System.nanoTime());
             ReplayTarget.SendHandle handle =
-                    Objects.requireNonNull(client.send(sequence, operation));
+                    Objects.requireNonNull(client.send(sequence, operation, stored));
             localSend = handle.sent().toCompletableFuture();
             CompletableFuture<Void> response = handle.response().toCompletableFuture();
             int latencyKind = operation.kind() == IndexOperationTrace.SEARCH ? 1 : 0;

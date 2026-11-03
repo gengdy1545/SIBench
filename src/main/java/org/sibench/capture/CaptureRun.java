@@ -166,10 +166,14 @@ final class CaptureRun implements AutoCloseable {
                 if (!names.isEmpty())
                     throw new IOException("Native client reported capture failures: " + names);
             }
+            var direct = DirectCapture.current(directory);
             var clients = new java.util.TreeMap<Integer, Path>();
             var servers = new java.util.TreeMap<Integer, Path>();
-            try (var paths = Files.list(directory)) {
-                for (Path path : paths.sorted().toList()) {
+            var sourcePaths = new java.util.ArrayList<Path>();
+            if (direct != null) { sourcePaths.addAll(direct.paths(true)); sourcePaths.addAll(direct.paths(false)); }
+            else try (var paths = Files.list(directory)) { sourcePaths.addAll(paths.sorted().toList()); }
+            {
+                for (Path path : sourcePaths) {
                     String name = path.getFileName().toString();
                     if (name.startsWith("jdbc-") && (name.endsWith(".jsonl") || name.endsWith(".jsonl.zst"))) {
                         int pid = connectionPid(path);
@@ -211,13 +215,15 @@ final class CaptureRun implements AutoCloseable {
             verifyInventory(directory, inventory);
             // Workloads never overlap; the threads of one workload do, and then every session is
             // merged by PostgreSQL's transaction completion counter.
-            boolean overlapping = false;
+            boolean overlapping = direct != null;
             for (Object item : (java.util.List<?>) client.get("workloads"))
                 overlapping |= ((java.util.List<?>) ((Map<?, ?>) item).get("sessions")).size() > 1;
             manifest.put("session_order", overlapping ? "concurrent" : "sequential");
+            if (direct != null) manifest.put("capture_transport", "direct_events");
             manifest.put(
                     "session_order_evidence",
-                    overlapping
+                    direct != null ? "direct generation uses PostgreSQL completion counters; writer first, then received readers"
+                    : overlapping
                             ? "several client threads per workload, one backend each, overlapping;"
                                     + " merged by the transaction completion counter"
                             : "one native client process per workload; each exited and no capture"
@@ -262,6 +268,8 @@ final class CaptureRun implements AutoCloseable {
     }
 
     static int connectionPid(Path jdbc) throws IOException {
+        var direct = DirectCapture.current(jdbc.toAbsolutePath().getParent());
+        if (direct != null) return direct.connectionPid(jdbc);
         try (var input = ServerTrace.open(jdbc)) {
             String line = input.readLine();
             if (line == null) throw new IOException("Empty JDBC trace: " + jdbc.getFileName());
@@ -359,6 +367,10 @@ final class CaptureRun implements AutoCloseable {
             verifyInventory(directory, inventory);
             var records = audit(pairs);
             manifest.put("session_order", "concurrent");
+            if (DirectCapture.current(directory) != null) {
+                manifest.put("capture_transport", "direct_events");
+                manifest.put("session_order_evidence", "PostgreSQL completion counters; writer first, then received readers");
+            }
             manifest.put("sessions", records);
             manifest.put("completed_at", Instant.now().toString());
             manifest.put("status", "complete");
@@ -377,6 +389,8 @@ final class CaptureRun implements AutoCloseable {
 
     /** Shares a drained sysbench session's audit between workload totals and run completion. */
     static Map<String, Object> auditServer(Path server) throws IOException {
+        var direct = DirectCapture.current(server.toAbsolutePath().getParent());
+        if (direct != null) return direct.serverAudit(server);
         CaptureRun run = active;
         Path path = server.toAbsolutePath().normalize();
         if (run == null || !path.getParent().equals(run.directory))
@@ -407,6 +421,19 @@ final class CaptureRun implements AutoCloseable {
      * trace, and one that needs more than the budget runs alone.
      */
     private static List<Map<String, Object>> audit(List<Pair> pairs) throws Exception {
+        if (!pairs.isEmpty()) {
+            var direct = DirectCapture.current(pairs.get(0).server().toAbsolutePath().getParent());
+            if (direct != null) {
+                var records = new java.util.ArrayList<Map<String, Object>>();
+                for (Pair pair : pairs) {
+                    var record = direct.sessionAudit(pair.client(), pair.server());
+                    record.put("bindings", pair.bindings());
+                    if (pair.external()) record.put("workload", pair.workload());
+                    records.add(record);
+                }
+                return records;
+            }
+        }
         long started = System.nanoTime();
         int threads = Math.max(1, Math.min(AUDIT_THREADS, Runtime.getRuntime().availableProcessors() / 2));
         int budget = (int) Math.max(1, Math.min(Integer.MAX_VALUE, Runtime.getRuntime().maxMemory() * 6 / 10 >> 20));
@@ -549,6 +576,14 @@ final class CaptureRun implements AutoCloseable {
 
     private static void verifyInventory(Path directory, java.util.Set<String> expected)
             throws IOException {
+        var direct = DirectCapture.current(directory);
+        if (direct != null) {
+            var actual = new java.util.HashSet<String>();
+            for (boolean server : List.of(true, false))
+                for (Path path : direct.paths(server)) actual.add(path.getFileName().toString());
+            if (!actual.equals(expected)) throw new IOException("Unregistered or missing source streams");
+            return;
+        }
         try (var paths = Files.list(directory)) {
             var actual = paths.map(p -> p.getFileName().toString())
                     .filter(n -> n.startsWith("pg-") || n.startsWith("jdbc-"))

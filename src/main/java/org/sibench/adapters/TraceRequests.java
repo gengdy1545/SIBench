@@ -127,14 +127,47 @@ public final class TraceRequests {
         return countRequest(request.setWrite(write(operation)).build());
     }
 
+    /** Reuses a validated Trace payload; only replay IDs and transaction positions change. */
+    public Request forward(long id, Request stored, List<Operation> members) throws IOException {
+        Operation first = members.get(0);
+        if (first.grouped()) {
+            if (!stored.hasGroup() || stored.getGroup().getMembersCount() != members.size()
+                    || members.size() != first.expansionSize()) throw new IOException("Incomplete stored search group");
+            maxGroupMembers.accumulateAndGet(members.size(), Math::max);
+        } else if (members.size() != 1 || (first.kind() == IndexOperationTrace.SEARCH
+                ? !stored.hasSearch() : !stored.hasWrite())) {
+            throw new IOException("Stored service payload disagrees with operation view");
+        }
+        if (first.kind() == IndexOperationTrace.SEARCH) expect(id, members);
+        var request = stored.toBuilder().setId(id).clearTransactionId().clearTransactionOperation();
+        if (stored.hasWrite() && stored.getWrite().getKind() != Write.Kind.LOGICAL_DELETE)
+            request.setWrite(forwardWrite(stored.getWrite(), first));
+        transaction(request, first);
+        return countRequest(request.build());
+    }
+
     /** Baseline INSERTs sent as one request; a batch takes one send position. */
     public Request batch(long id, List<Operation> inserts) throws IOException {
+        return batch(id, inserts, List.of());
+    }
+
+    Request batch(long id, List<Operation> inserts, List<Write> stored) throws IOException {
+        if (!stored.isEmpty() && stored.size() != inserts.size())
+            throw new IOException("Invalid stored Baseline batch");
         var batch = org.sibench.adapters.proto.WriteBatch.newBuilder();
-        for (Operation insert : inserts) {
+        for (int i = 0; i < inserts.size(); i++) {
+            Operation insert = inserts.get(i);
             if (!baselineInsert(insert)) throw new IOException("Only Baseline INSERTs travel in a batch");
-            batch.addWrites(write(insert));
+            if (stored.isEmpty()) batch.addWrites(write(insert));
+            else batch.addWrites(forwardWrite(stored.get(i), insert));
         }
         return countRequest(Request.newBuilder().setId(id).setBatch(batch).build());
+    }
+
+    private Write forwardWrite(Write stored, Operation operation) {
+        if (valueKind == ValueKind.ROW_ID && stored.getValue().getFile() == 0
+                && stored.getValue().getPosition() == 0) return stored;
+        return stored.toBuilder().setValue(value(operation)).build();
     }
 
     static boolean baselineInsert(Operation operation) {

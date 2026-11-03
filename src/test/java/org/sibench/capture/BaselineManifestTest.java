@@ -42,9 +42,9 @@ public class BaselineManifestTest {
         Path baseline = temporary.newFolder().toPath();
         Files.writeString(baseline.resolve("files.jsonl"), "");
         assertThrows(java.io.IOException.class, () -> BaselineManifest.publish(schema, baseline,
-                Map.of(schema.tables().get(0).name(), 1L)));
+                Map.of(schema.tables().get(0).name(), 1L), TraceOutput.FULL));
         assertFalse(Files.exists(baseline.resolve(BaselineManifest.FILE)));
-        BaselineManifest.publish(schema, baseline, Map.of(schema.tables().get(0).name(), 0L));
+        BaselineManifest.publish(schema, baseline, Map.of(schema.tables().get(0).name(), 0L), TraceOutput.FULL);
         assertEquals(0L, BaselineManifest.verify(schema, baseline).get("rows").getAsLong());
     }
     @Test
@@ -56,10 +56,13 @@ public class BaselineManifestTest {
         Path baseline = RowAuditTestSupport.baseline(temporary.newFolder().toPath(), schema, Map.of(table.name(), List.of(row)));
         Path receipt = baseline.resolve(BaselineManifest.FILE);
         String original = Files.readString(receipt);
-        for (String defect : List.of("total", "table_count", "missing_table", "extra_table")) {
+        for (String defect : List.of("total", "table_count", "missing_table", "extra_table", "missing_output", "unsupported_output", "non_string_output")) {
             var changed = com.google.gson.JsonParser.parseString(original).getAsJsonObject();
             switch (defect) {
                 case "total" -> changed.addProperty("rows", 2);
+                case "missing_output" -> changed.remove("output");
+                case "unsupported_output" -> changed.addProperty("output", "raw");
+                case "non_string_output" -> changed.addProperty("output", 1);
                 case "table_count" -> changed.getAsJsonObject("tables").addProperty(table.name(), 2);
                 case "missing_table" -> changed.getAsJsonObject("tables").remove(table.name());
                 case "extra_table" -> changed.getAsJsonObject("tables").addProperty("unknown", 0);
@@ -86,7 +89,7 @@ public class BaselineManifestTest {
         Files.write(baseline.resolve("first.parquet"), new byte[] {1});
         Files.write(baseline.resolve("second.parquet"), new byte[] {2});
         Files.write(baseline.resolve("files.jsonl"), List.of(first.toString(), second.toString()));
-        assertThrows(java.io.IOException.class, () -> BaselineManifest.publish(schema, baseline, Map.of(table, 2L)));
+        assertThrows(java.io.IOException.class, () -> BaselineManifest.publish(schema, baseline, Map.of(table, 2L), TraceOutput.FULL));
         assertFalse(Files.exists(baseline.resolve(BaselineManifest.FILE)));
     }
 

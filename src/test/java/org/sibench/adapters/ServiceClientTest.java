@@ -144,6 +144,55 @@ public class ServiceClientTest {
     }
 
     @Test
+    public void storedPayloadsReachTheTransportWithoutReconstruction() throws Exception {
+        var encoded = new TraceRequests(ValueKind.ROW_ID);
+        var requests = new TraceRequests(ValueKind.ROW_ID);
+        requests.baselineBatch(2);
+        var client = new Recorder(requests);
+        var first = insert(1, 1, 1);
+        var second = insert(2, 2, 1);
+        var a = encoded.request(0, first);
+        var b = encoded.request(0, second);
+        client.send(1, first, a);
+        client.send(2, second, b).response().toCompletableFuture().join();
+        assertSame(a.getWrite(), client.sent.get(0).getBatch().getWrites(0));
+        assertSame(b.getWrite(), client.sent.get(0).getBatch().getWrites(1));
+        var update = IndexOperationTrace.write(3, IndexOperationTrace.UPSERT, 3, 0, IndexKey.ofInt(1),
+                1, 0, 0, 3).withTransaction(9, 1).withWorkUnitId(2);
+        var storedWrite = encoded.request(0, update);
+        client.send(3, update, storedWrite).response().toCompletableFuture().join();
+        assertSame(storedWrite.getWrite(), client.sent.get(1).getWrite());
+        var members = List.of(member(0, 2, 0, IndexOperationTrace.UNION_GROUP).withTransaction(9, 1),
+                member(1, 2, 0, IndexOperationTrace.UNION_GROUP).withTransaction(9, 1));
+        var storedGroup = encoded.group(0, members);
+        // Source operation positions may include filtered requests; actual send counts differ.
+        storedGroup = storedGroup.toBuilder().setTransactionOperation(7).build();
+        client.send(4, members.get(0), storedGroup);
+        client.send(5, members.get(1), storedGroup).response().toCompletableFuture().join();
+        assertSame(storedGroup.getGroup(), client.sent.get(2).getGroup());
+        assertEquals(5, client.sent.get(2).getId());
+        assertEquals(2, client.sent.get(2).getTransactionOperation());
+        client.sendCommit(6, 9, 1).response().toCompletableFuture().join();
+        assertEquals(2, client.sent.get(3).getCommit().getOperations());
+        assertEquals(1, client.sent.get(3).getCommit().getWrites());
+
+        var snapshots = new TraceRequests(ValueKind.ROW_ID);
+        snapshots.snapshotReads();
+        var search = IndexOperationTrace.search(12, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 0, 0)
+                .withTransaction(9, 0);
+        var storedSearch = encoded.request(0, search);
+        var snapshotClient = new Recorder(snapshots);
+        snapshotClient.send(1, search, storedSearch).response().toCompletableFuture().join();
+        assertSame(storedSearch.getSearch(), snapshotClient.sent.get(0).getSearch());
+        assertEquals(0, snapshotClient.sent.get(0).getTransactionId());
+        assertEquals(0, snapshotClient.sent.get(0).getTransactionOperation());
+        snapshotClient.results = 1;
+        var wrong = snapshotClient.send(2, search, storedSearch).response().toCompletableFuture();
+        assertTrue(assertThrows(java.util.concurrent.CompletionException.class, wrong::join)
+                .getCause().getMessage().contains("Search count mismatch"));
+    }
+
+    @Test
     public void aFailedBatchFailsEveryInsertInIt() throws IOException {
         var requests = new TraceRequests(ValueKind.ROW_ID);
         requests.baselineBatch(2);

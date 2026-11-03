@@ -3,6 +3,7 @@ package org.sibench.capture;
 import static org.junit.Assert.*;
 
 import com.google.gson.JsonPrimitive;
+import com.google.gson.JsonParser;
 
 import org.junit.Rule;
 import org.junit.Test;
@@ -33,6 +34,33 @@ public class RequestCaptureAuditTest {
 
     private static boolean equal(String a, String b, int type) {
         return RequestCaptureAudit.equalResult(new JsonPrimitive(a), new JsonPrimitive(b), type);
+    }
+
+    @Test
+    public void directEventsMatchResultsThatArriveBeforeClientConsumption() throws Exception {
+        for (boolean wrong : java.util.List.of(false, true)) {
+            var audit = new RequestCaptureAudit.State(false);
+            audit.server(com.google.gson.JsonParser.parseString(HEADER).getAsJsonObject());
+            audit.server(com.google.gson.JsonParser.parseString(
+                    "{\"event\":\"executor_start\",\"pid\":42,\"application\":\"a\",\"sql\":\"SELECT 1\"}").getAsJsonObject());
+            for (String line : java.util.List.of(
+                    "{\"event\":\"connection\",\"pid\":42}",
+                    "{\"event\":\"request_start\",\"application\":\"a\",\"sql\":\"SELECT 1\",\"parameters\":{}}"))
+                audit.client(com.google.gson.JsonParser.parseString(line).getAsJsonObject());
+            for (String line : java.util.List.of(
+                    "{\"event\":\"executor_run_end\",\"pid\":42,\"application\":\"a\",\"depth\":1,\"returned\":1,\"row_hashes\":[\"0000000000000001\"]}",
+                    "{\"event\":\"executor_end\",\"pid\":42,\"application\":\"a\"}",
+                    "{\"event\":\"transaction_commit\",\"pid\":42,\"application\":\"a\"}"))
+                audit.server(com.google.gson.JsonParser.parseString(line).getAsJsonObject());
+            for (String line : java.util.List.of(
+                    "{\"event\":\"request_return\",\"application\":\"a\"}",
+                    "{\"event\":\"consumed_row\",\"application\":\"a\",\"row_hash\":\"000000000000000" + (wrong ? "2" : "1") + "\"}",
+                    "{\"event\":\"commit\",\"application\":\"a\"}",
+                    "{\"event\":\"close\",\"application\":\"a\"}"))
+                audit.client(com.google.gson.JsonParser.parseString(line).getAsJsonObject());
+            if (wrong) assertThrows(IOException.class, audit::finish);
+            else assertEquals(1L, audit.finish().get("client_consumed_rows_checked"));
+        }
     }
 
     @Test
@@ -281,24 +309,27 @@ public class RequestCaptureAuditTest {
         var server = directory.resolve("server.jsonl.zst");
         String rows = """
                 {"event":"connection","pid":42}
-                {"event":"request_start","application":"a","sql":"SELECT 1","parameters":{}}
-                {"event":"request_return","application":"a"}
-                {"event":"request_start","application":"b","sql":"SELECT 2","parameters":{}}
-                {"event":"request_return","application":"b"}
-                {"event":"consumed_row","application":"a","row_hash":"0000000000000001"}
-                {"event":"consumed_row","application":"b","row_hash":"0000000000000002"}
-                {"event":"commit","application":"b"}
-                {"event":"close","application":"b"}
+                {"event":"request_start","application":"sibench:j1:1:1","request":1,"sql":"SELECT 1","parameters":{}}
+                {"event":"request_return","application":"sibench:j1:1:1"}
+                {"event":"request_start","application":"sibench:j1:1:2","request":2,"sql":"SELECT 2","parameters":{}}
+                {"event":"request_return","application":"sibench:j1:1:2"}
+                {"event":"consumed_row","application":"sibench:j1:1:1","row_hash":"0000000000000001"}
+                {"event":"consumed_row","application":"sibench:j1:1:2","row_hash":"0000000000000002"}
+                {"event":"request_end","application":"sibench:j1:1:1"}
+                {"event":"request_end","application":"sibench:j1:1:2"}
+                {"event":"commit","application":"sibench:j1:1:2"}
+                {"event":"close","application":"sibench:j1:1:2"}
                 """;
         write(client, rows);
         write(server, HEADER + """
-                {"event":"executor_start","pid":42,"application":"a","sql":"SELECT 1"}
-                {"event":"executor_run_end","pid":42,"application":"a","depth":1,"returned":1,"row_hashes":["0000000000000001"]}
-                {"event":"executor_end","pid":42,"application":"a"}
-                {"event":"executor_start","pid":42,"application":"b","sql":"SELECT 2"}
-                {"event":"executor_run_end","pid":42,"application":"b","depth":1,"returned":1,"row_hashes":["0000000000000002"]}
-                {"event":"executor_end","pid":42,"application":"b"}
-                {"event":"transaction_commit","pid":42,"application":"b"}
+                {"event":"executor_start","pid":42,"application":"sibench:j1:1:1","sql":"SELECT 1"}
+                {"event":"executor_run_end","pid":42,"application":"sibench:j1:1:1","depth":1,"returned":1,"row_hashes":["0000000000000001"]}
+                {"event":"executor_end","pid":42,"application":"sibench:j1:1:1"}
+                {"event":"scan_end","pid":42,"application":"sibench:j1:1:1"}
+                {"event":"executor_start","pid":42,"application":"sibench:j1:1:2","sql":"SELECT 2"}
+                {"event":"executor_run_end","pid":42,"application":"sibench:j1:1:2","depth":1,"returned":1,"row_hashes":["0000000000000002"]}
+                {"event":"executor_end","pid":42,"application":"sibench:j1:1:2"}
+                {"event":"transaction_commit","pid":42,"application":"sibench:j1:1:2"}
                 """);
         assertEquals(2L, RequestCaptureAudit.audit(client, server, false).get("client_consumed_rows_checked"));
         write(client, rows.replace("0000000000000001", "0000000000000003"));
@@ -316,6 +347,44 @@ public class RequestCaptureAuditTest {
                         "{\"event\":\"close\",\"application\":\"unknown\"}"));
         write(server, server(0, ""));
         assertThrows(IOException.class, () -> RequestCaptureAudit.audit(client, server, true));
+    }
+
+    @Test
+    public void closedRequestsAreCheckedAndReleasedDuringLongSessions() throws Exception {
+        for (boolean clientFirst : new boolean[] {true, false}) {
+            var audit = new RequestCaptureAudit.State(false);
+            audit.client(JsonParser.parseString("{\"event\":\"connection\",\"pid\":42}").getAsJsonObject());
+            audit.server(JsonParser.parseString(HEADER).getAsJsonObject());
+            for (int i = 1; i <= 2000; i++) {
+                String app = "sibench:j1:1:" + i;
+                String client = """
+                        {"event":"request_start","application":"%s","request":%d,"sql":"SELECT 1","parameters":{}}
+                        {"event":"request_return","application":"%s"}
+                        {"event":"consumed_row","application":"%s","row_hash":"0000000000000001"}
+                        {"event":"request_end","application":"%s"}
+                        {"event":"commit","application":"%s"}
+                        """.formatted(app, i, app, app, app, app);
+                String server = """
+                        {"event":"executor_start","pid":42,"application":"%s","sql":"SELECT 1"}
+                        {"event":"executor_run_end","pid":42,"application":"%s","depth":1,"returned":1,"row_hashes":["0000000000000001"]}
+                        {"event":"executor_end","pid":42,"application":"%s"}
+                        {"event":"transaction_commit","pid":42,"application":"%s"}
+                        """.formatted(app, app, app, app);
+                if (clientFirst) {
+                    for (String line : client.lines().toList()) audit.client(JsonParser.parseString(line).getAsJsonObject());
+                    for (String line : server.lines().toList()) audit.server(JsonParser.parseString(line).getAsJsonObject());
+                } else {
+                    for (String line : server.lines().toList()) audit.server(JsonParser.parseString(line).getAsJsonObject());
+                    for (String line : client.lines().toList()) audit.client(JsonParser.parseString(line).getAsJsonObject());
+                }
+            }
+            audit.client(JsonParser.parseString("{\"event\":\"close\",\"application\":\"sibench:j1:1:2000\"}").getAsJsonObject());
+            var report = audit.finish();
+            assertEquals(2000L, report.get("requests"));
+            assertEquals(2000L, report.get("client_consumed_rows_checked"));
+            assertTrue(((Number) report.get("peak_pending_requests")).intValue() <= 2);
+            assertEquals(report, audit.finish());
+        }
     }
 
     private static Path write(Path file, String text) throws IOException {

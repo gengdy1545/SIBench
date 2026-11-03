@@ -27,7 +27,7 @@ public record CaptureConfig(
         var doc = parse(Files.readString(root.resolve(path)));
         require(
                 integer(doc, "schema_version") == 1
-                        && string(doc, "purpose").equals("native_capture_poc"),
+                        && string(doc, "purpose").equals("native_capture"),
                 "Expected capture config v1");
         require(string(doc, "benchmark").equals("hybench"), "Only HyBench capture is implemented");
         var source = object(doc, "source");
@@ -60,8 +60,9 @@ public record CaptureConfig(
         String database = string(pg, "database");
         require(database.matches("[a-z][a-z0-9_]*"), "Invalid database identifier");
         String user = string(pg, "user");
-        require(user.equals("postgres"), "PoC requires dedicated postgres role");
+        require(user.equals("postgres"), "Capture requires a dedicated postgres role");
         var capture = object(doc, "capture");
+        TraceOutput.from(doc);
         require(
                 string(capture, "mode").equals("instrumented_native_execution"),
                 "Invalid capture mode");
@@ -75,9 +76,10 @@ public record CaptureConfig(
         Path artifacts = child(root, string(object(doc, "artifacts"), "directory"));
         Path raw = child(root, string(capture, "raw_directory"));
         require(raw.startsWith(artifacts), "Raw directory must be under artifacts");
+        TraceOutput.checkPaths(doc, artifacts, raw);
         var data = object(doc, "data_layout");
         String compression = string(data, "compression");
-        require(compression.equals("zstd"), "PoC currently requires Zstd");
+        require(compression.equals("zstd"), "Capture requires Zstd");
         int level = Math.toIntExact(integer(data, "compression_level"));
         require(level >= 1 && level <= 22, "Invalid Zstd level");
         long target = positive(data, "target_file_size_bytes"),
@@ -122,8 +124,8 @@ public record CaptureConfig(
         require(!relative.isAbsolute(), "Output must be repository-relative");
         Path result = root.resolve(relative).normalize();
         require(
-                result.startsWith(root.resolve("results/poc")),
-                "PoC output must be under results/poc");
+                result.startsWith(root.resolve("results/capture")),
+                "Capture output must be under results/capture");
         Path parent = result;
         while (!Files.exists(parent)) parent = parent.getParent();
         require(parent.toRealPath().startsWith(root), "Symlink escape in output path");

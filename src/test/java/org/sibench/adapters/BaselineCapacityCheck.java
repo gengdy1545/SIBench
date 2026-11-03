@@ -73,9 +73,18 @@ public final class BaselineCapacityCheck {
         long memberLimit=Long.getLong("sibench.capacity.members",Long.MAX_VALUE);
         long started=System.nanoTime();Files.writeString(report.resolveSibling(report.getFileName()+".started"),Long.toString(System.currentTimeMillis()));
         try(var remote=new GrpcService(endpoint,requests, "baseline-capacity " + trace.toAbsolutePath(), 60);var projection=ReplayProjection.withClients(config,false,remote.factory(),true)) {
-            try { input.baseline().read(op -> {
-                if (expected.count.sum()>=memberLimit || windowSeconds>0 && (expected.count.sum()&4095)==0 && System.nanoTime()-started>=windowSeconds*1_000_000_000L) throw new EndWindow();
-                expected.operation(op);projection.accept(op);
+            try { input.baseline().read(new IndexOperationTrace.Consumer() {
+                private void count(IndexOperationTrace.Operation op) throws IOException {
+                    if (expected.count.sum()>=memberLimit || windowSeconds>0 && (expected.count.sum()&4095)==0 && System.nanoTime()-started>=windowSeconds*1_000_000_000L) throw new EndWindow();
+                    expected.operation(op);
+                }
+                public void accept(IndexOperationTrace.Operation op) throws IOException {
+                    count(op);projection.accept(op);
+                }
+                public void accept(TraceRecord record, List<IndexOperationTrace.Operation> views) throws IOException {
+                    for (var op : views) count(op);
+                    projection.accept(record, views);
+                }
             }); } catch(EndWindow stop) { complete=false; }
             Files.writeString(report.resolveSibling(report.getFileName()+".submission-stopped"),Long.toString(System.currentTimeMillis()));
             projection.finish();dispatch=projection.describe();remote.flush("baseline-capacity "+trace.toAbsolutePath());

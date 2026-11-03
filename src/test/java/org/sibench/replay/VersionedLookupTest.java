@@ -4,7 +4,6 @@ import org.sibench.capture.IndexOperationTrace.Range;
 import org.sibench.trace.IndexKey;
 import static org.junit.Assert.*;
 
-import com.google.gson.Gson;
 
 import org.junit.Test;
 import org.sibench.capture.IndexOperationTrace;
@@ -246,31 +245,11 @@ public class VersionedLookupTest {
                 writer.append(snapshot(5, 2, 20, 0, 1));
                 writer.append(snapshot(5, 0, 1, 110, 0));
             }
-            try (var out =
-                    new com.github.luben.zstd.ZstdOutputStream(
-                            Files.newOutputStream(directory.resolve("work-units.jsonl.zst")))) {
-                out.write(new byte[0]);
-            }
-            Files.writeString(
-                    directory.resolve("manifest.json"),
-                    new Gson()
-                            .toJson(
-                                    Map.of(
-                                            "baseline_operations",
-                                            3,
-                                            "workload_operations",
-                                            17,
-                                            "baseline_trace_sha256",
-                                            org.sibench.capture.IndexOperationTrace.sha256(baseline),
-                                            "workload_trace_sha256",
-                                            org.sibench.capture.IndexOperationTrace.sha256(workload),
-                                            "work_units_sha256",
-                                            org.sibench.capture.WorkUnits.read(directory).sha256())));
             for (boolean secondary : new boolean[] {false, true}) {
                 List<?> previous = null;
                 for (String dispatchMode : new String[] {"operation", "transaction"}) {
                     var result =
-                            ReferenceReplay.runFiles(
+                            ReferenceReplayFixture.run(
                                     baseline,
                                     workload,
                                     new ReplayConfig(secondary, "none", 0, 0, 0, 0, dispatchMode),

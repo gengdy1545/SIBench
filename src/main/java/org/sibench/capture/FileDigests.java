@@ -23,19 +23,27 @@ public final class FileDigests {
 
     private FileDigests() {}
 
-    public static String sha256(Path file) throws IOException {
+    private static Identity identity(Path file) throws IOException {
         Path path = file.toAbsolutePath().normalize();
         var attributes = Files.readAttributes(path, BasicFileAttributes.class);
         var modified = attributes.lastModifiedTime().toInstant();
-        var identity =
-                new Identity(
-                        path,
-                        attributes.fileKey(),
-                        attributes.size(),
-                        modified.getEpochSecond() * 1_000_000_000L + modified.getNano());
+        return new Identity(
+                path,
+                attributes.fileKey(),
+                attributes.size(),
+                modified.getEpochSecond() * 1_000_000_000L + modified.getNano());
+    }
+
+    /** Reuse the byte-stream digest only after its generated file closed successfully. */
+    static void written(Path file, String digest) throws IOException {
+        DIGESTS.put(identity(file), digest);
+    }
+
+    public static String sha256(Path file) throws IOException {
+        var identity = identity(file);
         String known = DIGESTS.get(identity);
         if (known != null) return known;
-        String digest = read(path);
+        String digest = read(identity.path());
         DIGESTS.put(identity, digest);
         return digest;
     }
