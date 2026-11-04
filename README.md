@@ -66,7 +66,15 @@ All three public profiles use **87,060,000 baseline rows** (HyBench SF10):
 | [sibench.yaml](config/sibench.yaml) | PG settings, generation limits, replay and locality analysis |
 | [rocksdb.yaml](config/index/rocksdb.yaml), [storage.yaml](config/index/storage.yaml) | Index service and object storage |
 
-Each run loads one fresh PG database, exports its initial snapshot, then executes native workloads in that database. HyBench keeps changes between phases. SIBench installs capture triggers and runs `ANALYZE` after loading. Source tables are unlogged; the default PG settings disable `fsync` and `full_page_writes`. This disposable working database uses local trust authentication and is not a reusable initial-state cache.
+Each run uses one fresh PG database for the following sequence:
+
+1. Load data and create indexes with the native benchmark loader.
+2. Install capture triggers and run one ordinary `VACUUM ANALYZE` before taking the initial snapshot. This prepares visibility maps and planner statistics; it is not `VACUUM FULL`.
+3. Export the initial snapshot, then execute native workloads in the same database. HyBench keeps changes between phases. SIBench does not issue `VACUUM` during workloads; the default PG configuration also disables autovacuum.
+
+Preparation is included in load time and total generation time, with its duration recorded separately as `load_vacuum_analyze_millis` in the timing report. This initial maintenance can enable index-only scans to avoid heap visibility checks, changing physical access paths and the captured index workload. Later writes naturally clear affected all-visible bits; PG falls back to checking tuple visibility under the transaction snapshot, so missing bits do not cause missing rows. Whether preparation reduces total generation time depends on the workload and must be measured including its cost.
+
+Source tables are unlogged; the default PG settings disable `fsync` and `full_page_writes`. This disposable working database uses local trust authentication and is not a reusable initial-state cache.
 
 PG/JDBC facts stream into the Java generator, which projects transactions directly into Trace. `capture.output` selects artifacts:
 
@@ -80,6 +88,8 @@ Both modes retain real row data and Locators. Baseline and incremental Parquet t
 Generation validates source/build/schema identity, baseline row counts, source completion, transactions and PG access counters before publication. Successful runs stop PG and remove its database unless `SIBENCH_KEEP_DATABASE=1`; proto output also removes source-control scratch. Failed runs retain diagnostics and `INCOMPLETE` and cannot be resumed. Always use a fresh output path. `native-run.log` records native stdout; `trace/source-capture-run.json` retains capture status and build identities.
 
 Provision space for PG, Parquet, Trace and compiler scratch. Pending-fact limits and optional cooperative operation/byte targets are configured under `generation`; they are not whole-process memory or disk caps. Target stops validate only the executed prefix. See [Output strategies](docs/trace.md#output-strategies) for counting, drain and failure semantics. Non-C/POSIX YCSB export additionally needs temporary sorting space proportional to the input.
+
+Spilled source facts use bounded parallel JSON decoding; transaction projection and event delivery remain in source order. Decoder buffers are limited by text size and record count, with oversized individual events handled alone; these limits are not a whole-process heap cap. Baseline counts use normal planner settings, independently of YCSB's ordered export-read constraints.
 
 ### Independent source acceptance
 

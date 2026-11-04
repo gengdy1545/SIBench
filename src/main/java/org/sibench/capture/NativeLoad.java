@@ -68,7 +68,7 @@ final class NativeLoad {
         }
     }
 
-    /** Installs row-capture triggers and gathers planner statistics for the loaded source. */
+    /** Installs capture triggers and prepares visibility maps and statistics before baseline export. */
     static void captureReady(String jdbc, String user, Path library, SourceSchema schema) throws Exception {
         long started = System.nanoTime();
         try (Connection connection = DriverManager.getConnection(jdbc, user, password());
@@ -93,9 +93,9 @@ final class NativeLoad {
                                 + table.name()
                                 + "\" FOR EACH ROW EXECUTE FUNCTION public.sibench_row_capture()");
             RunTiming.current().note("load_triggers_millis", (System.nanoTime() - started) / 1_000_000L);
-            long analyzeStarted = System.nanoTime();
-            statement.execute("ANALYZE");
-            RunTiming.current().note("load_analyze_millis", (System.nanoTime() - analyzeStarted) / 1_000_000L);
+            long vacuumAnalyzeStarted = System.nanoTime();
+            statement.execute("VACUUM ANALYZE");
+            RunTiming.current().note("load_vacuum_analyze_millis", (System.nanoTime() - vacuumAnalyzeStarted) / 1_000_000L);
         }
     }
 

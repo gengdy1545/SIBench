@@ -487,28 +487,30 @@ final class IndexTraceCompiler {
         List<Map<String, Object>> generate(DirectCapture source) throws Exception {
             var details = new HashMap<Integer, AccessUnits.Detail>();
             var counts = new HashMap<Integer, long[]>();
-            for (CaptureTransactions.Chunk next; (next = source.next()) != null; ) {
-                final var chunk = next;
-                try (chunk) {
-                    long settledBefore = ledger.settled(), requestsBefore = requestUnits;
-                    pid = 0;
-                    sessionFile = "pg-" + chunk.pid + ".jsonl.zst";
-                    var tracker = new AccessUnits(this);
-                    if (details.containsKey(chunk.pid)) tracker.continueSession(details.get(chunk.pid));
-                    else tracker.beginSession();
-                    knownCommit = chunk.committed;
-                    knownEvent = Math.addExact(event, chunk.lines);
-                    chunk.read(e -> event(e, tracker));
-                    details.put(chunk.pid, tracker.detail());
-                    tracker.endSession();
-                    ledger.absorb(tracker);
-                    finishSession();
-                    long[] count = counts.computeIfAbsent(chunk.pid, ignored -> new long[3]);
-                    count[0] += chunk.lines;
-                    count[1] += ledger.settled() - settledBefore;
-                    count[2] += requestUnits - requestsBefore;
-                    if (budget != null && budget.enabled())
-                        budget.observe(operationsCount, baselineProtoBytes + workloadProto.bytesWritten());
+            try (var decoder = new EventDecoder()) {
+                for (CaptureTransactions.Chunk next; (next = source.next()) != null; ) {
+                    final var chunk = next;
+                    try (chunk) {
+                        long settledBefore = ledger.settled(), requestsBefore = requestUnits;
+                        pid = 0;
+                        sessionFile = "pg-" + chunk.pid + ".jsonl.zst";
+                        var tracker = new AccessUnits(this);
+                        if (details.containsKey(chunk.pid)) tracker.continueSession(details.get(chunk.pid));
+                        else tracker.beginSession();
+                        knownCommit = chunk.committed;
+                        knownEvent = Math.addExact(event, chunk.lines);
+                        chunk.read(e -> event(e, tracker), decoder);
+                        details.put(chunk.pid, tracker.detail());
+                        tracker.endSession();
+                        ledger.absorb(tracker);
+                        finishSession();
+                        long[] count = counts.computeIfAbsent(chunk.pid, ignored -> new long[3]);
+                        count[0] += chunk.lines;
+                        count[1] += ledger.settled() - settledBefore;
+                        count[2] += requestUnits - requestsBefore;
+                        if (budget != null && budget.enabled())
+                            budget.observe(operationsCount, baselineProtoBytes + workloadProto.bytesWritten());
+                    }
                 }
             }
             var reports = new ArrayList<Map<String, Object>>();

@@ -11,7 +11,8 @@ public final class CaptureTransactionsBenchmark {
         var results = new ArrayList<Map<String, Object>>();
         for (int round = 0; round < rounds; round++) {
             Path root = Files.createTempDirectory("capture-queue-");
-            try (var source = new CaptureTransactions(root.resolve("pending"), 1L << 30, count)) {
+            try (var source = new CaptureTransactions(root.resolve("pending"), 1L << 30, count);
+                    var decoder = new EventDecoder()) {
                 long filling = System.nanoTime();
                 for (int id = 1; id <= count; id++) {
                     var object = new JsonObject();
@@ -30,7 +31,7 @@ public final class CaptureTransactionsBenchmark {
                 })) != null; ) {
                     try (var chunk = next) {
                         if (chunk.csn != ++expected || chunk.pid != expected) throw new AssertionError("Wrong source order");
-                        chunk.read(event -> { sum[0] += event.get("id").getAsLong(); events[0]++; });
+                        chunk.read(event -> { sum[0] += event.get("id").getAsLong(); events[0]++; }, decoder);
                     }
                 }
                 double seconds = (System.nanoTime() - started) / 1e9;

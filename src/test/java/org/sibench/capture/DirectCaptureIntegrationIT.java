@@ -69,11 +69,12 @@ public class DirectCaptureIntegrationIT {
             NativeLoad.captureReady(jdbc, "postgres", NativeLoad.library(root), profile.schema());
             try (var connection = DriverManager.getConnection(jdbc, "postgres", "");
                     var sql = connection.createStatement();
-                    var rows = sql.executeQuery("SELECT reltuples, relallvisible FROM pg_class WHERE oid='"
+                    var rows = sql.executeQuery("SELECT reltuples, relallvisible, relpages FROM pg_class WHERE oid='"
                             + table + "'::regclass")) {
                 assertTrue(rows.next());
                 assertEquals("Preparation must collect statistics for the three inserted rows", 3, rows.getLong(1));
-                assertEquals("Preparation must not vacuum the fresh table's visibility map", 0, rows.getLong(2));
+                assertTrue("The loaded table must have heap pages", rows.getLong(3) > 0);
+                assertEquals("Preparation must mark all fresh heap pages all-visible", rows.getLong(3), rows.getLong(2));
             }
             PgBaselineExport.export(jdbc, profile.baseline(), profile.layout());
             CaptureCompleteness.snapshot(jdbc, "postgres", artifacts.resolve("index-counters-before.json"), config.toString());
@@ -83,10 +84,14 @@ public class DirectCaptureIntegrationIT {
                 run.build(CaptureBuild.identity(root, Map.of("kind", "controlled_sql_probe")));
                 try (var writer = connection(jdbc, profile.raw(), !sysbench, false);
                         var reader = connection(jdbc, profile.raw(), !sysbench, true)) {
+                    assertEquals(sysbench ? "1" : "user1", select(reader, table, pk, pk, sysbench, 1));
+                    reader.commit();
                     modify(writer, "UPDATE " + table + " SET " + value + "=? WHERE " + pk + "=?", sysbench, "40", 1);
                     assertEquals("10", select(reader, table, pk, value, sysbench, 1));
                     writer.commit();
                     assertEquals("10", select(reader, table, pk, value, sysbench, 1));
+                    reader.commit();
+                    assertEquals("40", select(reader, table, pk, value, sysbench, 1));
                     reader.commit();
                     modify(writer, "DELETE FROM " + table + " WHERE " + pk + "=?", sysbench, null, 1);
                     writer.commit();
@@ -97,6 +102,12 @@ public class DirectCaptureIntegrationIT {
                     writer.rollback();
                     assertEquals("50", select(writer, table, pk, value, sysbench, 1));
                     writer.commit();
+                    if (sysbench && output == TraceOutput.PROTO) {
+                        // One reader transaction exceeds the in-memory facts and decoder batch sizes.
+                        for (int i = 0; i < 600; i++)
+                            assertEquals("50", select(reader, table, pk, value, true, 1));
+                        reader.commit();
+                    }
                 }
                 NativeProcess.drain(jdbc, "postgres");
                 var sessions = direct.paths(true).stream().map(path -> Map.of("pg_file", path.getFileName().toString())).toList();

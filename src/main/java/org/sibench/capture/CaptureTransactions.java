@@ -268,7 +268,7 @@ final class CaptureTransactions implements AutoCloseable {
             }
         }
 
-        void read(Events consumer) throws IOException {
+        void read(Events consumer, EventDecoder decoder) throws IOException {
             if (!sealed) throw new IOException("Source outcome is not known");
             if (segment == null) { for (Event event : events) consumer.accept(event); }
             else try (var channel = FileChannel.open(segment.file, StandardOpenOption.READ);
@@ -276,7 +276,7 @@ final class CaptureTransactions implements AutoCloseable {
                             new com.github.luben.zstd.ZstdInputStream(new FrameInput(
                                     Channels.newInputStream(channel.position(offset)), length),
                                     com.github.luben.zstd.RecyclingBufferPool.INSTANCE), StandardCharsets.UTF_8))) {
-                for (String line; (line = input.readLine()) != null; ) consumer.accept(Event.parse(line));
+                decoder.read(input, consumer);
             }
         }
 

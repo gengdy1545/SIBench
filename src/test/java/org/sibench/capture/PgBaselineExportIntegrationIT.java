@@ -100,7 +100,42 @@ public class PgBaselineExportIntegrationIT {
             try (var pg = DriverManager.getConnection(jdbc, "postgres", "")) {
                 assertFalse(PgBaselineExport.plan(pg, schema.tables().get(0), 8L << 20).boundaries().isEmpty());
             }
-            PgBaselineExport.export(jdbc, config.output(), config);
+            var counts = new java.util.concurrent.atomic.AtomicInteger();
+            var observer = new org.postgresql.Driver() {
+                private static final String PREFIX = "jdbc:count-observer:";
+                @Override public boolean acceptsURL(String url) { return url.startsWith(PREFIX); }
+                @Override public Connection connect(String url, Properties properties) throws SQLException {
+                    if (!acceptsURL(url)) return null;
+                    Connection connection = super.connect(url.substring(PREFIX.length()), properties);
+                    return (Connection) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),
+                            new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                                Object value = invoke(connection, method, args);
+                                if (!method.getName().equals("createStatement")) return value;
+                                Statement statement = (Statement) value;
+                                return java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),
+                                        new Class<?>[] {Statement.class}, (ignored, call, values) -> {
+                                            if (call.getName().equals("executeQuery") && values[0].equals(
+                                                    "SELECT count(*) FROM \"usertable\"")) {
+                                                try (var settings = statement.executeQuery("SHOW enable_seqscan")) {
+                                                    assertTrue(settings.next());
+                                                    assertEquals("Count must not inherit ordered-read settings", "on", settings.getString(1));
+                                                }
+                                                counts.incrementAndGet();
+                                            }
+                                            return invoke(statement, call, values);
+                                        });
+                            });
+                }
+                private Object invoke(Object target, java.lang.reflect.Method method, Object[] args) throws Throwable {
+                    try { return method.invoke(target, args); }
+                    catch (java.lang.reflect.InvocationTargetException failed) { throw failed.getCause(); }
+                }
+            };
+            DriverManager.registerDriver(observer);
+            try {
+                PgBaselineExport.export("jdbc:count-observer:" + jdbc, config.output(), config);
+                assertEquals(1, counts.get());
+            } finally { DriverManager.deregisterDriver(observer); }
             // Independent JDBC text decoding, same existing Parquet writer: distinguish COPY
             // parsing errors from layout changes, including NULL, empty and non-ASCII values.
             Path reference = Files.createDirectory(evidence.resolve("jdbc-reference"));

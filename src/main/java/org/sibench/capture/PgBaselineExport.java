@@ -113,15 +113,9 @@ public final class PgBaselineExport {
             var session = new Session(connections, snapshot, opened);
             var planned = new ArrayList<Future<Table>>();
             for (var table : source.tables())
-                planned.add(pool.submit(() -> session.run(pg -> {
-                    // YCSB's hashed keys otherwise make each range rescan the whole wide heap.
-                    if (config.benchmark().equals("ycsb")) {
-                        if (primaryOrder) primarySettings(pg);
-                        else sortSettings(pg);
-                    }
-                    return plan(pg, table, config.benchmark().equals("ycsb")
-                            ? Long.MAX_VALUE : sortRangeBytes());
-                })));
+                // Exact counts need no key order; ordered-read settings belong to stream/window reads.
+                planned.add(pool.submit(() -> session.run(pg -> plan(pg, table,
+                        config.benchmark().equals("ycsb") ? Long.MAX_VALUE : sortRangeBytes()))));
             var tables = new ArrayList<Table>();
             for (var future : planned) {
                 Table table = get(future);

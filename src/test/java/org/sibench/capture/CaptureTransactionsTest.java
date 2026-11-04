@@ -20,6 +20,10 @@ public class CaptureTransactionsTest {
                 (line + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
     }
 
+    private static void read(CaptureTransactions.Chunk chunk, CaptureTransactions.Events consumer) throws IOException {
+        try (var decoder = new EventDecoder()) { chunk.read(consumer, decoder); }
+    }
+
     @Test public void waitsForMissingEarlierCompletionAndEmitsWriterBeforeReader() throws Exception {
         Path scratch = temporary.getRoot().toPath().resolve("transactions");
         try (var source = new CaptureTransactions(scratch, 1 << 20, 8)) {
@@ -69,7 +73,7 @@ public class CaptureTransactionsTest {
                         java.nio.charset.StandardCharsets.UTF_8).strip()).get("value").getAsString());
             }
             long[] count = {0};
-            chunk.read(event -> {
+            read(chunk, event -> {
                 assertEquals(300_000, event.get("value").getAsString().length());
                 count[0]++;
             });
@@ -98,8 +102,8 @@ public class CaptureTransactionsTest {
             byte[] bytes = Files.readAllBytes(file);
             bytes[bytes.length - 1] ^= 1;
             Files.write(file, bytes);
-            first.read(event -> assertEquals("earlier".repeat(50_000), event.get("value").getAsString()));
-            assertThrows(IOException.class, () -> chunk.read(event -> {}));
+            read(first, event -> assertEquals("earlier".repeat(50_000), event.get("value").getAsString()));
+            assertThrows(IOException.class, () -> read(chunk, event -> {}));
         }
     }
 
@@ -122,7 +126,7 @@ public class CaptureTransactionsTest {
             source.finish();
             int[] seen = {0};
             try (var next = source.next(() -> { throw new AssertionError("Source already ended"); })) {
-                next.read(event -> assertEquals(com.google.gson.JsonParser.parseString(lines.get(seen[0]++)), event.json()));
+                read(next, event -> assertEquals(com.google.gson.JsonParser.parseString(lines.get(seen[0]++)), event.json()));
             }
             assertEquals(3, seen[0]);
             assertEquals(0L, source.metrics().get("pending_encoded_bytes"));
@@ -211,10 +215,10 @@ public class CaptureTransactionsTest {
             source.complete(second, 2, false, true);
             try (var files = Files.list(scratch)) { assertEquals(1, files.count()); }
             long[] counts = {0, 0};
-            first.read(e -> { assertEquals(firstValue, e.get("value").getAsString()); counts[0]++; });
+            read(first, e -> { assertEquals(firstValue, e.get("value").getAsString()); counts[0]++; });
             first.close();
             source.endStream(1);
-            second.read(e -> { assertEquals(secondValue, e.get("value").getAsString()); counts[1]++; });
+            read(second, e -> { assertEquals(secondValue, e.get("value").getAsString()); counts[1]++; });
             assertArrayEquals(new long[] {1, 1}, counts);
             try (var files = Files.list(scratch)) { assertEquals(1, files.count()); }
             second.close();
@@ -235,7 +239,7 @@ public class CaptureTransactionsTest {
             append(second, 1, "x".repeat(300_000));
             source.complete(second, 2, true, true);
             try (var files = Files.list(scratch)) { assertEquals(2, files.count()); }
-            first.read(e -> assertEquals(value, e.get("value").getAsString()));
+            read(first, e -> assertEquals(value, e.get("value").getAsString()));
             first.close();
             try (var files = Files.list(scratch)) { assertEquals(1, files.count()); }
             source.finish();
@@ -252,7 +256,7 @@ public class CaptureTransactionsTest {
                 var chunk = source.begin(1);
                 append(chunk, 1, value);
                 source.complete(chunk, i, false, true);
-                chunk.read(e -> assertEquals(value, e.get("value").getAsString()));
+                read(chunk, e -> assertEquals(value, e.get("value").getAsString()));
                 chunk.close();
                 assertEquals(0L, source.metrics().get("pending_encoded_bytes"));
                 try (var files = Files.list(scratch)) { assertEquals(1, files.count()); }
@@ -281,7 +285,7 @@ public class CaptureTransactionsTest {
             for (int pid = 1; pid <= 1024; pid++) {
                 try (var chunk = source.next(() -> { throw new AssertionError("Source already ended"); })) {
                     assertEquals(pid, chunk.pid);
-                    chunk.read(event -> assertEquals(value, event.get("value").getAsString()));
+                    read(chunk, event -> assertEquals(value, event.get("value").getAsString()));
                 }
             }
             assertEquals(0L, source.metrics().get("pending_memory_encoded_bytes"));
