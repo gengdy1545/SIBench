@@ -30,13 +30,13 @@ import java.util.List;
 import java.util.Random;
 
 /** The RocksDB backend answers every search exactly as the reference model does. */
-public class RocksDbBackendTest {
+public class VersionedIndexBackendTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     private static final int TABLE = IndexReferenceSpillTest.TABLE, ROWS = IndexReferenceSpillTest.ROWS;
 
-    private RocksDbBackend load(List<Operation> operations, ValueKind kind) throws Exception {
-        var backend = RocksDbBackend.create(temporary.getRoot().toPath().resolve("db-" + kind + "-" + System.nanoTime()), kind);
+    private VersionedIndexBackend load(List<Operation> operations, ValueKind kind) throws Exception {
+        var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("db-" + kind + "-" + System.nanoTime()), kind);
         var requests = new TraceRequests(kind);
         long id = 0;
         for (Operation operation : operations) {
@@ -110,123 +110,7 @@ public class RocksDbBackendTest {
         }
     }
 
-    @Test
-    public void transactionLocalReadSeesOwnWritesAndKeepsTheStatementSnapshot() throws Exception {
-        int table = 1;
-        var operations = new ArrayList<Operation>();
-        for (int id = 1; id <= 2; id++) {
-            Operation row =
-                    IndexOperationTrace.write(
-                            1,
-                            IndexOperationTrace.INSERT,
-                            table,
-                            0,
-                            IndexKey.ofInt(id),
-                            0,
-                            1,
-                            id - 1,
-                            id);
-            operations.add(row);
-            operations.add(row.withIndex(1, IndexKey.ofInt(1), IndexOperationTrace.INSERT));
-        }
-        // Another transaction moves row 2 from value 1 to value 2 at version 1.
-        Operation other =
-                IndexOperationTrace.write(
-                                2,
-                                IndexOperationTrace.UPSERT,
-                                table,
-                                0,
-                                IndexKey.ofInt(2),
-                                1,
-                                1,
-                                2,
-                                2)
-                        .withTransaction(1, 1);
-        operations.add(other);
-        operations.add(
-                other.withIndex(1, IndexKey.ofInt(1), IndexOperationTrace.LOGICAL_DELETE));
-        operations.add(other.withIndex(1, IndexKey.ofInt(2), IndexOperationTrace.UPSERT));
-        // Our transaction moves row 1 from value 1 to value 2 at version 2.
-        Operation own =
-                IndexOperationTrace.write(
-                                3,
-                                IndexOperationTrace.UPSERT,
-                                table,
-                                0,
-                                IndexKey.ofInt(1),
-                                2,
-                                1,
-                                2,
-                                1)
-                        .withTransaction(2, 1);
-        operations.add(own);
-        operations.add(
-                own.withIndex(1, IndexKey.ofInt(1), IndexOperationTrace.LOGICAL_DELETE));
-        operations.add(own.withIndex(1, IndexKey.ofInt(2), IndexOperationTrace.UPSERT));
-
-        Operation local =
-                IndexOperationTrace.search(
-                                4,
-                                table,
-                                1,
-                                Range.equal(IndexKey.ofInt(2)),
-                                0,
-                                1,
-                                IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
-                        .withTransaction(2, 1)
-                        .withVersion(2);
-        Operation localPrimary =
-                IndexOperationTrace.search(
-                                5,
-                                table,
-                                0,
-                                Range.equal(IndexKey.ofInt(1)),
-                                0,
-                                1,
-                                IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
-                        .withTransaction(2, 1)
-                        .withVersion(2);
-        try (var backend = load(operations, ValueKind.ROW_ID)) {
-            var requests = new TraceRequests(ValueKind.ROW_ID);
-            var request = requests.request(1, local);
-            assertEquals(2, request.getSearch().getLocalVersion());
-            assertEquals(0, request.getSearch().getReadVersion());
-            var response = IndexExecution.execute(backend, request);
-            assertEquals(response.getMessage(), Status.OK, response.getStatus());
-            // Hand-derived oracle: own row 1 moved to value 2; other row 2 is still at value 1.
-            var ownResult = List.of(new LookupResult(IndexKey.ofInt(1), 2, 1, 0));
-            same("own secondary", ownResult, response.getResultsList(), true);
-            same("own primary", ownResult,
-                    IndexExecution.execute(backend, requests.request(2, localPrimary)).getResultsList(), true);
-            Search oldSecondary = search(1, Range.equal(IndexKey.ofInt(1)), 0).toBuilder()
-                    .setTable(table).setLocalVersion(2).build();
-            same("other transaction remains at snapshot", List.of(new LookupResult(IndexKey.ofInt(2), 0, 2, 0)),
-                    backend.search(oldSecondary), true);
-
-            // Same transaction, later prefix: delete then reinsert the same PK with a new RowID.
-            Operation deleted = IndexOperationTrace.write(6, IndexOperationTrace.LOGICAL_DELETE,
-                    table, 0, IndexKey.ofInt(1), 2, 0, 0, 1).withTransaction(2, 2);
-            assertEquals(Status.OK, IndexExecution.execute(backend, requests.request(3, deleted)).getStatus());
-            assertEquals(Status.OK, IndexExecution.execute(backend, requests.request(4,
-                    deleted.withIndex(1, IndexKey.ofInt(2), IndexOperationTrace.LOGICAL_DELETE))).getStatus());
-            assertTrue(backend.search(request.getSearch()).isEmpty());
-            assertTrue(backend.search(requests.request(5, localPrimary).getSearch()).isEmpty());
-            same("deletion does not erase the snapshot", List.of(new LookupResult(IndexKey.ofInt(1), 0, 1, 0)),
-                    backend.search(search(0, Range.equal(IndexKey.ofInt(1)), 0).toBuilder().setTable(table).build()), true);
-
-            Operation reinserted = IndexOperationTrace.write(7, IndexOperationTrace.UPSERT,
-                    table, 0, IndexKey.ofInt(1), 2, 1, 3, 101).withTransaction(2, 3);
-            assertEquals(Status.OK, IndexExecution.execute(backend, requests.request(6, reinserted)).getStatus());
-            assertEquals(Status.OK, IndexExecution.execute(backend, requests.request(7,
-                    reinserted.withIndex(1, IndexKey.ofInt(2), IndexOperationTrace.UPSERT))).getStatus());
-            var reinsertedResult = List.of(new LookupResult(IndexKey.ofInt(1), 2, 101, 0));
-            same("new identity in secondary", reinsertedResult, backend.search(request.getSearch()), true);
-            same("new identity in primary", reinsertedResult,
-                    backend.search(requests.request(8, localPrimary).getSearch()), true);
-        }
-    }
-
-    private static void put(RocksDbBackend backend, int index, int value, int pk,
+    private static void put(VersionedIndexBackend backend, int index, int value, int pk,
             long version, long rowId, boolean deleted) throws Exception {
         var key = EntryKey.newBuilder().setTable(TABLE).setIndex(index)
                 .setPrimaryKey(ByteString.copyFrom(IndexKey.ofInt(pk).bytes()));
@@ -257,16 +141,13 @@ public class RocksDbBackendTest {
                 var initial = new ArrayList<>(List.of(row(1, 0, 11), row(3, 0, 30), row(4, 0, 40)));
                 var deleted = new ArrayList<>(List.of(row(3, 0, 30), row(4, 0, 40)));
                 var reinserted = new ArrayList<>(List.of(row(1, 7, 17), row(2, 5, 25), row(3, 6, 36), row(4, 5, 45)));
-                // Only our exact version 6 may override the version-zero snapshot.
-                var local = new ArrayList<>(List.of(row(1, 0, 11), row(3, 6, 36), row(4, 0, 40)));
                 if (descending) {
                     java.util.Collections.reverse(initial); java.util.Collections.reverse(deleted);
-                    java.util.Collections.reverse(reinserted); java.util.Collections.reverse(local);
+                    java.util.Collections.reverse(reinserted);
                 }
                 same("initial", initial, backend.search(search(0, bounds, 0)), true);
                 same("tombstone hides older rows", deleted, backend.search(search(0, bounds, 4)), true);
                 same("reinserted identity", reinserted, backend.search(search(0, bounds, 7)), true);
-                same("local overlay", local, backend.search(search(0, bounds, 0).toBuilder().setLocalVersion(6).build()), true);
                 same("limit counts visible rows", initial.subList(0, 2),
                         backend.search(search(0, bounds, 0).toBuilder().setLimit(2).build()), true);
                 Range exclusive = new Range(IndexKey.ofInt(1), false, IndexKey.ofInt(4), false, descending, 0);
@@ -295,32 +176,6 @@ public class RocksDbBackendTest {
                 same("secondary limit", latest.subList(0, 2),
                         backend.search(search(1, all, 7).toBuilder().setLimit(2).build()), true);
             }
-        }
-    }
-
-    @Test
-    public void abortedTombstonesAndSecondaryMovesAreSkippedInBothDirections() throws Exception {
-        var path = temporary.getRoot().toPath().resolve("aborted-ranges");
-        try (var backend = RocksDbBackend.create(path, ValueKind.ROW_ID)) {
-            put(backend, 1, 10, 1, 0, 11, false);
-            put(backend, 1, 10, 1, 1, 12, false);
-            put(backend, 1, 10, 1, 2, 12, true);
-            put(backend, 1, 20, 1, 2, 13, false);
-            put(backend, 1, 20, 2, 2, 22, false);
-            put(backend, 1, 10, 1, 3, 14, false);
-            backend.abort(2);
-            backend.abort(3);
-            backend.flush();
-        }
-        try (var backend = RocksDbBackend.open(path, ValueKind.ROW_ID)) {
-            for (boolean descending : new boolean[] {false, true}) {
-                Range all = new Range(null, false, null, false, descending, 0);
-                same("restored secondary", List.of(row(1, 1, 12)),
-                        backend.search(search(1, all, 3)), true);
-                same("aborted local cannot expose the intervening commit", List.of(row(1, 0, 11)),
-                        backend.search(search(1, all, 0).toBuilder().setLocalVersion(3).build()), true);
-            }
-            assertThrows(IllegalArgumentException.class, () -> put(backend, 1, 20, 2, 2, 99, false));
         }
     }
 
@@ -364,24 +219,39 @@ public class RocksDbBackendTest {
         }
         // An index directory is never reused.
         var path = temporary.getRoot().toPath().resolve("once");
-        RocksDbBackend.create(path, ValueKind.LOCATOR).close();
-        assertThrows(java.io.IOException.class, () -> RocksDbBackend.create(path, ValueKind.LOCATOR));
+        VersionedIndexBackend.create(path, ValueKind.LOCATOR).close();
+        assertThrows(java.io.IOException.class, () -> VersionedIndexBackend.create(path, ValueKind.LOCATOR));
     }
 
     @Test
-    public void reopenedIndexKeepsItsWatermarkAndRefusesAnotherValueKind() throws Exception {
+    public void reopenRejectsUnrecognizedMetadataInsteadOfIgnoringItsSemantics() throws Exception {
+        var path = temporary.getRoot().toPath().resolve("unknown-metadata");
+        VersionedIndexBackend.create(path, ValueKind.ROW_ID).close();
+        try (var store = LocalRocksStore.open(path)) {
+            byte[] name = "unsupported_state".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+            byte[] key = java.nio.ByteBuffer.allocate(8 + name.length).putLong(0).put(name).array();
+            store.put(key, new byte[] {1}, true);
+            store.flush();
+        }
+        var error = assertThrows(java.io.IOException.class, () -> VersionedIndexBackend.open(path, ValueKind.ROW_ID));
+        assertTrue(error.getMessage(), error.getMessage().contains("Unsupported index metadata"));
+    }
+
+    @Test
+    public void reopenedIndexKeepsHistoricalValuesAndRefusesAnotherValueKind() throws Exception {
         java.nio.file.Path path = temporary.getRoot().toPath().resolve("reopen");
-        try (var backend = RocksDbBackend.create(path, ValueKind.ROW_ID)) {
-            assertEquals(0, backend.publishedVersion());
+        try (var backend = VersionedIndexBackend.create(path, ValueKind.ROW_ID)) {
             backend.bind("trace-a");
             backend.bind("trace-a");
             assertThrows(java.io.IOException.class, () -> backend.bind("trace-b"));
             assertThrows(IllegalArgumentException.class, () -> backend.bind(""));
-            backend.recordPublishedVersion(42);
+            put(backend, 0, 0, 7, 0, 70, false);
+            put(backend, 0, 0, 7, 42, 71, false);
             backend.flush();
         }
-        try (var backend = RocksDbBackend.open(path, ValueKind.ROW_ID)) {
-            assertEquals(42, backend.publishedVersion());
+        try (var backend = VersionedIndexBackend.open(path, ValueKind.ROW_ID)) {
+            same("retained old value", List.of(row(7, 0, 70)), backend.search(search(0, Range.equal(IndexKey.ofInt(7)), 41)), true);
+            same("retained latest value", List.of(row(7, 42, 71)), backend.search(search(0, Range.equal(IndexKey.ofInt(7)), 42)), true);
             // The binding survives the reopen: the index still refuses another trace.
             backend.bind("trace-a");
             assertThrows(java.io.IOException.class, () -> backend.bind("trace-b"));
@@ -393,10 +263,10 @@ public class RocksDbBackendTest {
         assertEquals(1, line.get("flush").getAsLong());
         assertEquals("N/A", line.get("object_requests").getAsString());
         assertTrue(line.get("rocksdb.stats").getAsString().contains("Compaction Stats"));
-        assertThrows(java.io.IOException.class, () -> RocksDbBackend.open(path, ValueKind.LOCATOR));
+        assertThrows(java.io.IOException.class, () -> VersionedIndexBackend.open(path, ValueKind.LOCATOR));
         assertThrows(
                 java.io.IOException.class,
-                () -> RocksDbBackend.open(temporary.getRoot().toPath().resolve("missing"), ValueKind.ROW_ID));
-        assertThrows(java.io.IOException.class, () -> RocksDbBackend.create(path, ValueKind.ROW_ID));
+                () -> VersionedIndexBackend.open(temporary.getRoot().toPath().resolve("missing"), ValueKind.ROW_ID));
+        assertThrows(java.io.IOException.class, () -> VersionedIndexBackend.create(path, ValueKind.ROW_ID));
     }
 }

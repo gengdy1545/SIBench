@@ -37,7 +37,7 @@ public final class FullSnapshotValidation {
             try(var load=new ReplayProjection(config,false,operation->{
                     model.accept(operation);entry(actual,0,operation.table(),operation.index(),operation.key(),
                             operation.indexedValue(),0,operation.rowId());
-                });var replay=new ReplayProjection(config,true,model::accept)) {
+                });var replay=new ReplayProjection(config,true,model::acceptCommitted)) {
                 input.baseline().read(load);load.finish();input.workload().read(replay);replay.finish();
             }
             model.scanVisible(last,(table,index,key,value,result)->

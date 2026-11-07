@@ -25,21 +25,22 @@ public class CapturePlanTest {
         Files.writeString(replay, "schema_version: 1\npurpose: sibench\ntarget:\n  secondary_indexes: {enabled: false}\n"
                 + "replay:\n  trace_budget: {duration_seconds: 1, planned_operations_per_second: 25, warmup_operations: 0, reserve_percent: 0}\n");
         var plan = CapturePlan.operations(root, Path.of("sysbench.yaml"), trace, replay);
-        assertEquals(5.0, (Double) plan.get("factor"), 1e-9);
-        assertEquals(Map.of("native.workloads.oltp_insert.events", 500L, "native.workloads.oltp_point_select.events", 1500L),
+        assertEquals(12.5, (Double) plan.get("factor"), 1e-9);
+        assertEquals(Map.of("native.workloads.oltp_insert.events", 1250L, "native.workloads.oltp_point_select.events", 3750L),
                 plan.get("parameters"));
         Files.writeString(root.resolve("hybench.yaml"),
                 "benchmark: hybench\nnative:\n  duration_minutes: 1\n  phase_duration_minutes: {tp: 2}\n");
         var hybench = CapturePlan.operations(root, Path.of("hybench.yaml"), trace, replay);
-        // TP keeps its own duration, XP the default; both scale by the same factor of 5.
-        assertEquals(Map.of("native.phase_duration_minutes.tp", 10L, "native.phase_duration_minutes.xp", 5L),
+        // TP keeps its own duration, XP the default; both scale by the same factor of 12.5, rounding each duration up.
+        assertEquals(Map.of("native.phase_duration_minutes.tp", 25L, "native.phase_duration_minutes.xp", 13L),
                 hybench.get("parameters"));
         var aborted = Files.createDirectory(root.resolve("aborted"));
         calibration(aborted, true);
-        // Aborted operations consumed service work too; outcomes do not change the request budget.
-        assertEquals(5L, CapturePlan.operations(root, Path.of("sysbench.yaml"), aborted, replay)
-                .get("calibration_effective_operations"));
-        assertEquals(5L, plan.get("calibration_effective_operations"));
+        // Only the first transaction's two primary writes survive; all-aborted input has no supply.
+        assertTrue(assertThrows(java.io.IOException.class,
+                () -> CapturePlan.operations(root, Path.of("sysbench.yaml"), aborted, replay))
+                .getMessage().contains("no effective workload operations"));
+        assertEquals(2L, plan.get("calibration_effective_operations"));
         manifest.put("workload_operations", 999L);
         Files.writeString(trace.resolve("manifest.json"), new com.google.gson.Gson().toJson(manifest));
         assertThrows(java.io.IOException.class,
@@ -73,6 +74,7 @@ public class CapturePlanTest {
         manifest.put("baseline_operations", 200);
         manifest.put("baseline_trace_sha256", "0".repeat(64));
         manifest.put("source_work_units", 2);
+        manifest.put("last_resolved_version", 2);
         manifest.put("workload_operations", writer.count());
         var files = new com.google.gson.JsonArray();
         files.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("workload.pb.zst", writer)));
@@ -84,13 +86,17 @@ public class CapturePlanTest {
 
     /** The replay budget is reached by scaling with the effective operations replay itself counts. */
     @Test
-    public void operationsScaleToTheReplayBudget() throws Exception {
+    public void operationsScaleToTheReplayBudgetIncludingGroupedSearches() throws Exception {
         var root = temporary.getRoot().toPath();
         var trace = Files.createDirectory(root.resolve("ops-trace"));
         var protocol = new ProtoTrace.Writer(trace.resolve("workload.pb.zst"));
         try (protocol) {
             for (int i = 0; i < 1000; i++) {
-                var operation = TestOps.op(i, IndexOperationTrace.SEARCH, 1, 0, 0, i, 0, 0, 0, 0, 0, 0, 1);
+                var operation = i < 3
+                        ? IndexOperationTrace.search(0, 1, 0,
+                                IndexOperationTrace.Range.equal(org.sibench.trace.IndexKey.ofInt(i)),
+                                null, 0, 3, IndexOperationTrace.UNION_GROUP, i, 3).withWorkUnitId(1)
+                        : TestOps.op(i, IndexOperationTrace.SEARCH, 1, 0, 0, i, 0, 0, 0, 0, 0, 0, 1);
                 protocol.append(operation);
             }
         }
@@ -98,6 +104,7 @@ public class CapturePlanTest {
         manifest.put("value_kinds", java.util.List.of("row_id", "locator"));
         manifest.put("baseline_rows", 0);
         manifest.put("source_work_units", 1);
+        manifest.put("last_resolved_version", 0);
         manifest.put("baseline_operations", 0);
         manifest.put("workload_operations", 1000);
         manifest.put("baseline_trace_sha256", "0".repeat(64));

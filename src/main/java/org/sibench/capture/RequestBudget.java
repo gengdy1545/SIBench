@@ -8,7 +8,7 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** Counts exported workload requests and asks sources to stop admitting complete business events. */
+/** Counts exported primitive index operations and stops admission at complete business events. */
 final class RequestBudget {
     private final long target;
     private final long timeoutNanos;
@@ -37,10 +37,11 @@ final class RequestBudget {
         signalled = false;
     }
 
-    /** Called only by the common writer, after filtering, once per request rather than per group member. */
-    synchronized void record() throws IOException {
+    /** The common writer counts a complete request's primitive operations after export filtering. */
+    synchronized void record(long operations) throws IOException {
         if (stage == null) throw new IOException("Workload output outside a budget stage");
-        total = Math.addExact(total, 1);
+        if (operations < 1) throw new IllegalArgumentException("Expected positive primitive operation count");
+        total = Math.addExact(total, operations);
         if (!signalled && reached()) {
             if (stop != null) Files.writeString(stop, "Request budget reached; drain admitted events\n", StandardOpenOption.CREATE_NEW);
             signalled = true;

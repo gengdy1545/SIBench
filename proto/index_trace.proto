@@ -25,10 +25,20 @@ message TraceBegin {
   uint64 version = 2;
 }
 
+// Source resolution only: never sent to the Index Service. Counts describe exported members.
+message TraceEnd {
+  uint64 transaction_id = 1;
+  uint64 version = 2;
+  bool aborted = 3;
+  uint64 operations = 4;
+  uint64 writes = 5;
+}
+
 message TraceRecord {
   oneof operation {
     Request request = 1;
     TraceBegin begin = 2;
+    TraceEnd end = 4;
   }
   // One position per logical member; a SearchGroup is a single service request.
   repeated TracePosition positions = 3;

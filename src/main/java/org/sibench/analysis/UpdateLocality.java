@@ -37,8 +37,8 @@ import java.util.zip.GZIPOutputStream;
  *
  * <p>Business row modifications and index maintenance are counted separately. A business row
  * change counts once, at its primary maintenance record; secondary entries are index maintenance.
- * Windows contain a fixed number of business changes, so one source change's expansion is never
- * split. The analysis only reads existing Trace / Baseline products and never runs source capture.
+ * Windows contain a fixed number of final committed row changes, keeping each row's primary and
+ * secondary writes together. The analysis reads existing Trace / Baseline products, never capture.
  */
 public final class UpdateLocality {
     public record Config(
@@ -283,18 +283,32 @@ public final class UpdateLocality {
         return report;
     }
 
-    /** Resolve one transaction at a time; aborted attempts do not affect committed-write locality. */
+    private record RowKey(int table, IndexKey primaryKey) {}
+
+    /** Regroup final entries by row for offline windows; the stored Trace order is unchanged. */
     static IndexOperationTrace.Source committed(IndexOperationTrace.Source source) {
         return consumer -> {
-            var pending = new ArrayList<Operation>();
+            var pending = new LinkedHashMap<RowKey, List<Operation>>();
             try (var validation = new org.sibench.replay.ReplayProjection(
                     new org.sibench.replay.ReplayConfig(true, 0, 0, 0, 0, "operation"), true, ignored -> {})) {
                 long records = source.read(operation -> {
                     validation.accept(operation);
-                    if (IndexOperationTrace.isMutation(operation)) pending.add(operation);
+                    if (IndexOperationTrace.isMutation(operation))
+                        pending.computeIfAbsent(new RowKey(operation.table(), operation.key()),
+                                ignored -> new ArrayList<>()).add(operation);
                     else {
-                        if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT)
-                            for (var write : pending) consumer.accept(write);
+                        if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) {
+                            for (var row : pending.values()) {
+                                Operation primary = null;
+                                for (var write : row) if (write.index() == 0) {
+                                    if (primary != null) throw new IOException("Repeated final primary write");
+                                    primary = write;
+                                }
+                                if (primary == null) throw new IOException("Final row writes lack a primary entry");
+                                consumer.accept(primary);
+                                for (var write : row) if (write.index() != 0) consumer.accept(write);
+                            }
+                        }
                         if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT
                                 || operation.kind() == IndexOperationTrace.TRANSACTION_ABORT) pending.clear();
                         consumer.accept(operation);
@@ -336,8 +350,8 @@ public final class UpdateLocality {
         report.put("windows", windows.windows);
         report.put("last_window_business_changes", windows.lastWindowBusiness);
         report.put("l0_batch_rule",
-                "consecutive all-index maintenance operations; a batch closes before the next source"
-                        + " maintenance unit once the configured count is reached; no same-key dedup");
+                "consecutive final row groups; a batch closes before the next row once the configured"
+                        + " all-index operation count is reached; no additional deduplication");
         report.put("baseline_rows", baselineRows);
         report.put("progress_checkpoints", windows.checkpoints(baselineRows));
         return report;
@@ -769,7 +783,7 @@ public final class UpdateLocality {
                             + "span_file_fraction,overflow_left,overflow_right,empty_keys\n");
         }
 
-        /** A new source maintenance unit starts only after the previous one is complete. */
+        /** A final row group starts only after the previous row's entries are complete. */
         void before(Operation operation) throws IOException {
             if (entries >= config.l0IndexModifications()
                     && operation.index() == 0

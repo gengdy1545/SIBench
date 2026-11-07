@@ -10,7 +10,7 @@ import java.nio.file.Path;
  * The native library is loaded from {@code sibench.rocksdb_cloud.library}, by default
  * {@code build/index/librocksdb_cloud_jni.so}.
  */
-final class CloudRocksStore implements RocksStore {
+final class CloudRocksStore implements OrderedStore {
     private static boolean loaded;
 
     private final long handle;

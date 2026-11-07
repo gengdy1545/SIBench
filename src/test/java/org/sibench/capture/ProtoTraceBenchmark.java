@@ -81,8 +81,7 @@ public final class ProtoTraceBenchmark {
                 long start=System.nanoTime();long[] records={0},requests={0},digest={0};
                 ProtoTrace.source(trace,manifest,phase).read(operation->{
                     records[0]++;
-                    if(!IndexOperationTrace.isControl(operation)
-                            && (!operation.grouped() || operation.expansionPosition()==0)) requests[0]++;
+                    if(!IndexOperationTrace.isControl(operation)) requests[0]++;
                     digest[0]=Long.rotateLeft(digest[0],1)^operation.sourceEvent()^operation.kind()
                             ^operation.version()^operation.rowId();
                 });

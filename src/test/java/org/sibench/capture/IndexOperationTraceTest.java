@@ -41,12 +41,12 @@ public class IndexOperationTraceTest {
                             5,
                             0,
                             new Range(IndexKey.ofInt(-5), false, null, false, true, 2),
-                            4,
+                            0,
                             2,
                             0));
             written.add(
                     IndexOperationTrace.search(
-                            4, 5, 0, new Range(null, false, null, false, false, 0), 4, 9, 0));
+                            4, 5, 0, new Range(null, false, null, false, false, 0), 0, 9, 0));
             try (var writer = new ProtoTrace.Writer(file)) {
                 for (Operation operation : written) writer.append(operation);
             }
@@ -111,10 +111,15 @@ public class IndexOperationTraceTest {
                             3,
                             0,
                             Range.equal(IndexKey.ofInt(1)),
-                            105,
+                            1,
                             1,
                             IndexOperationTrace.SNAPSHOT_SEARCH);
+            var begin = IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0);
+            var end = IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 1, 1, 0);
             try (var writer = new ProtoTrace.Writer(file)) {
+                // Resolve a source slot before querying its committed snapshot.
+                writer.append(begin);
+                writer.append(end);
                 writer.append(search);
                 // A search that also carries a version is ambiguous and must not be written.
                 assertThrows(
@@ -122,15 +127,15 @@ public class IndexOperationTraceTest {
                         () ->
                                 writer.append(
                                         new Operation(
-                                                1, 2, 3, 0, 0, null, null, 105, 0, 0, 0, 1, 0, 0,
-                                                105, 0, 0, 0, IndexKey.ofInt(1), IndexKey.ofInt(1),
+                                                1, 2, 3, 0, 0, null, null, 1, 0, 0, 0, 1, 0, 0,
+                                                1, 0, 0, 0, IndexKey.ofInt(1), IndexKey.ofInt(1),
                                                 0)));
             }
             List<Operation> actual = new ArrayList<>();
             ProtoTrace.read(file, null, null, actual::add);
-            assertEquals(List.of(search), actual);
-            assertEquals(0, actual.get(0).version());
-            assertEquals(105, actual.get(0).readTimestamp());
+            assertEquals(List.of(begin, end, search), actual);
+            assertEquals(0, actual.get(2).version());
+            assertEquals(1, actual.get(2).readTimestamp());
         } finally {
             Files.deleteIfExists(file);
         }
@@ -147,11 +152,11 @@ public class IndexOperationTraceTest {
         try {
             var written =
                     List.of(
-                            IndexOperationTrace.search(1, 5, 1, point, IndexKey.ofInt(9), 3, 1, 0, 0, 0),
-                            IndexOperationTrace.search(2, 5, 1, interval, null, 3, 4, intersect, 0, 2),
-                            IndexOperationTrace.search(2, 5, 2, point, null, 3, 4, intersect, 1, 2),
-                            IndexOperationTrace.search(3, 5, 1, point, null, 3, 2, union, 0, 2),
-                            IndexOperationTrace.search(3, 5, 1, Range.equal(IndexKey.ofInt(8)), null, 3, 2, union, 1, 2));
+                            IndexOperationTrace.search(1, 5, 1, point, IndexKey.ofInt(9), 0, 1, 0, 0, 0),
+                            IndexOperationTrace.search(2, 5, 1, interval, null, 0, 4, intersect, 0, 2),
+                            IndexOperationTrace.search(2, 5, 2, point, null, 0, 4, intersect, 1, 2),
+                            IndexOperationTrace.search(3, 5, 1, point, null, 0, 2, union, 0, 2),
+                            IndexOperationTrace.search(3, 5, 1, Range.equal(IndexKey.ofInt(8)), null, 0, 2, union, 1, 2));
             try (var writer = new ProtoTrace.Writer(file)) {
                 for (Operation operation : written) writer.append(operation);
             }
@@ -166,18 +171,18 @@ public class IndexOperationTraceTest {
         for (Operation invalid :
                 List.of(
                         // A pinned search names one secondary entry: a point, count 1, no PK index.
-                        IndexOperationTrace.search(1, 5, 1, interval, IndexKey.ofInt(9), 3, 1, 0, 0, 0),
-                        IndexOperationTrace.search(1, 5, 1, point, IndexKey.ofInt(9), 3, 2, 0, 0, 0),
-                        IndexOperationTrace.search(1, 5, 0, point, IndexKey.ofInt(9), 3, 1, 0, 0, 0),
+                        IndexOperationTrace.search(1, 5, 1, interval, IndexKey.ofInt(9), 0, 1, 0, 0, 0),
+                        IndexOperationTrace.search(1, 5, 1, point, IndexKey.ofInt(9), 0, 2, 0, 0, 0),
+                        IndexOperationTrace.search(1, 5, 0, point, IndexKey.ofInt(9), 0, 1, 0, 0, 0),
                         // A group has at least two members, a valid position, no limit or pin.
-                        IndexOperationTrace.search(2, 5, 1, interval, null, 3, 4, intersect, 0, 1),
-                        IndexOperationTrace.search(2, 5, 1, interval, null, 3, 4, intersect, 2, 2),
-                        IndexOperationTrace.search(2, 5, 1, interval, null, 3, 4, intersect | union, 0, 2),
-                        IndexOperationTrace.search(2, 5, 1, point, IndexKey.ofInt(9), 3, 1, union, 0, 2),
+                        IndexOperationTrace.search(2, 5, 1, interval, null, 0, 4, intersect, 0, 1),
+                        IndexOperationTrace.search(2, 5, 1, interval, null, 0, 4, intersect, 2, 2),
+                        IndexOperationTrace.search(2, 5, 1, interval, null, 0, 4, intersect | union, 0, 2),
+                        IndexOperationTrace.search(2, 5, 1, point, IndexKey.ofInt(9), 0, 1, union, 0, 2),
                         IndexOperationTrace.search(
-                                2, 5, 1, new Range(null, false, null, false, false, 4), null, 3, 4, union, 0, 2),
+                                2, 5, 1, new Range(null, false, null, false, false, 4), null, 0, 4, union, 0, 2),
                         // Only group members carry positions.
-                        IndexOperationTrace.search(2, 5, 1, interval, null, 3, 4, 0, 0, 2))) {
+                        IndexOperationTrace.search(2, 5, 1, interval, null, 0, 4, 0, 0, 2))) {
             Path target = Files.createTempFile("sibench-invalid-", ".pb.zst");
             Files.delete(target);
             try (var writer = new ProtoTrace.Writer(target)) {

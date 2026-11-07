@@ -56,16 +56,9 @@ public class TraceRequestsTest {
         assertThrows(IOException.class, () -> requests.receive(search, 7)
                 .finish(response(7).toBuilder().setMore(true).build()));
         requests.receive(search, 7).finish(response(7));
-        for (boolean commit : new boolean[] {false, true}) {
-            for (Response invalid : List.of(response(8), response(7).toBuilder().setMore(true).build())) {
-                assertThrows(IOException.class, () -> {
-                    if (commit) requests.checkCommit(invalid, 7);
-                    else requests.checkBatch(invalid, 7);
-                });
-            }
-            if (commit) requests.checkCommit(response(7), 7);
-            else requests.checkBatch(response(7), 7);
-        }
+        for (Response invalid : List.of(response(8), response(7).toBuilder().setMore(true).build()))
+            assertThrows(IOException.class, () -> requests.checkBatch(invalid, 7));
+        requests.checkBatch(response(7), 7);
     }
 
     @Test
@@ -101,5 +94,18 @@ public class TraceRequestsTest {
                 responseResult(1, 1, 1), responseResult(2, 1, 2), responseResult(3, 1, 3))));
         assertThrows(IOException.class, () -> requests.check(operation,
                 response(15).toBuilder().setStatus(Status.INVALID).build()));
+    }
+
+    @Test
+    public void baselineBatchIsOneExecuteMessageForMultipleOperations() throws Exception {
+        var requests = new TraceRequests(ValueKind.ROW_ID);
+        var first = IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0,
+                IndexKey.ofInt(1), 0, 0, 0, 1);
+        var second = IndexOperationTrace.write(2, IndexOperationTrace.INSERT, 1, 0,
+                IndexKey.ofInt(2), 0, 0, 0, 2);
+        var message = requests.batch(1, List.of(first, second), List.of());
+        assertEquals(2, message.getBatch().getWritesCount());
+        assertEquals(1, requests.executeRequests());
+        assertEquals(message.getSerializedSize(), requests.requestBytes());
     }
 }

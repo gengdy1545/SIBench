@@ -135,18 +135,18 @@ public final class DriverCapacityCheck {
         var bytes = new AtomicLong();
         var requests = new TraceRequests(ValueKind.ROW_ID);
         DescribeResponse description;
-        try (var backend = RocksDbBackend.create(output.resolve("index"), ValueKind.ROW_ID);
-                var published = new PublishedIndex(backend)) {
-            description = backend.describe().toBuilder().setCompleteCommitPublication(true).build();
+        try (var backend = VersionedIndexBackend.create(output.resolve("index"), ValueKind.ROW_ID);
+                var executor = new IndexExecutor(backend)) {
+            description = backend.describe();
             var baselineRequests = new TraceRequests(ValueKind.ROW_ID);
             baselineRequests.baselineBatch(64);
             System.out.println("phase=baseline");
             try (var load = ReplayProjection.withClients(config(trace, 64), false,
-                    InProcessService.factory(published, baselineRequests), true)) {
+                    InProcessService.factory(executor, baselineRequests))) {
                 inputTrace.baseline().read(load);
                 load.finish();
             }
-            published.flush();
+            executor.flush();
             System.out.println("phase=record records=" + records[0] + " queries=" + queries[0]);
             ReplayTarget.Factory factory = client -> new ServiceClient(requests) {
                 @Override CompletableFuture<Response> transmit(Request request, java.util.function.Consumer<Response> partial) throws IOException {
@@ -158,11 +158,11 @@ public final class DriverCapacityCheck {
                     };
                     if (bytes.addAndGet(request.getSerializedSize()) > MAX_BYTES) throw new IOException("Fixture budget exceeded");
                     if (recorded.putIfAbsent(request, chunks) != null) throw new IOException("Duplicate fixture request");
-                    return published.submit(request, chunk -> { keep.accept(chunk); partial.accept(chunk); })
+                    return executor.submit(request, chunk -> { keep.accept(chunk); partial.accept(chunk); })
                             .thenApply(response -> { keep.accept(response); return response; });
                 }
             };
-            try (var replay = ReplayProjection.withClients(config(trace, 128), true, factory, true)) {
+            try (var replay = ReplayProjection.withClients(config(trace, 128), true, factory)) {
                 prefix(trace, records[0], replay);
                 replay.finish();
                 replay.requireClientCoverage();
@@ -277,7 +277,7 @@ public final class DriverCapacityCheck {
         long started = System.nanoTime();
         Map<String, Object> dispatch;
         try (var remote = new GrpcService(endpoint, requests, manifest.get("binding").getAsString(), 60);
-                var replay = ReplayProjection.withClients(config, true, remote.factory(), true)) {
+                var replay = ReplayProjection.withClients(config, true, remote.factory())) {
             prefix(trace, manifest.get("records").getAsLong(), replay);
             replay.finish();
             replay.requireClientCoverage();

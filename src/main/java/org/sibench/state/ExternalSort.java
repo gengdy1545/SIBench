@@ -5,7 +5,6 @@ import java.io.BufferedOutputStream;
 import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
-import java.io.EOFException;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -118,14 +117,15 @@ public final class ExternalSort implements AutoCloseable {
         }
 
         boolean advance() throws IOException {
-            int keyLength;
-            try {
-                keyLength = in.readInt();
-            } catch (EOFException end) {
+            int first = in.read();
+            if (first == -1) {
                 current = null;
                 return false;
             }
+            int keyLength = first << 24 | in.readUnsignedByte() << 16
+                    | in.readUnsignedByte() << 8 | in.readUnsignedByte();
             int valueLength = in.readInt();
+            if (keyLength < 0 || valueLength < 0) throw new IOException("Negative sort record length");
             long order = in.readLong();
             byte[] key = new byte[keyLength], value = new byte[valueLength];
             in.readFully(key);

@@ -86,7 +86,7 @@ public class ReferenceReplayTest {
     }
 
     @Test
-    public void dispatchModesKeepIdenticalSupplyStateAndInsertDeleteOrder() throws Exception {
+    public void dispatchModesKeepIdenticalFinalCommittedStateAndSupply() throws Exception {
         Path directory = Files.createTempDirectory("sibench-tx-replay-");
         Path baseline = directory.resolve("baseline.pb.zst"),
                 workload = directory.resolve("workload.pb.zst");
@@ -130,8 +130,10 @@ public class ReferenceReplayTest {
                     var y = (Map<?, ?>) b.get(mode);
                     assertNotNull(x.get("primary_state_checksum"));
                     assertEquals(x.get("primary_state_checksum"), y.get("primary_state_checksum"));
-                    assertEquals(secondary ? 14L : 6L, x.get("workload_operations"));
-                    assertEquals(secondary ? 14L : 6L, y.get("workload_operations"));
+                    // Key 1 retains its last update; key 2 retains its final tombstone.
+                    // Two final entries per included index, followed by two snapshot searches.
+                    assertEquals(secondary ? 8L : 4L, x.get("workload_operations"));
+                    assertEquals(secondary ? 8L : 4L, y.get("workload_operations"));
                 }
                 assertThrows(
                         IOException.class,
@@ -141,7 +143,7 @@ public class ReferenceReplayTest {
                                         workload,
                                         new ReplayConfig(
                                                 secondary, 1,
-                                                secondary ? 15 : 7,
+                                                secondary ? 9 : 5,
                                                 0,
                                                 0,
                                                 "transaction")));

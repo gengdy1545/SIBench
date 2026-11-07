@@ -47,6 +47,42 @@ public class ProtoTraceTest {
                 .withTransaction(version == 0 ? 0 : 91, ordinal).withWorkUnitId(1);
     }
 
+    @Test public void countsEachSearchMemberWithoutSplittingItsRequestOrBudgetBoundary() throws Exception {
+        Path file = temporary.getRoot().toPath().resolve("primitive-count.pb.zst");
+        Path stop = file.resolveSibling("primitive-count.stop");
+        var budget = new RequestBudget(4, java.time.Duration.ofSeconds(10));
+        budget.begin("mixed", 1, stop);
+        var writer = new ProtoTrace.Writer(file, false, budget);
+        try (writer) {
+            writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 91, 1, 0));
+            for (int ordinal = 1; ordinal <= 2; ordinal++) {
+                writer.accept(IndexOperationTrace.write(ordinal, IndexOperationTrace.UPSERT, 1, 0,
+                        IndexKey.ofInt(ordinal), 1, 7, ordinal, ordinal)
+                        .withTransaction(91, ordinal).withWorkUnitId(1).withExpansion(0, 1));
+            }
+            writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 91, 1, 2));
+            for (int member = 0; member < 3; member++) {
+                writer.accept(IndexOperationTrace.search(13, 1, 0,
+                        IndexOperationTrace.Range.equal(IndexKey.ofInt(member + 1)), null, 1, 2,
+                        IndexOperationTrace.UNION_GROUP, member, 3).withWorkUnitId(2));
+                if (member < 2) {
+                    assertEquals(2, budget.count());
+                    assertFalse(Files.exists(stop));
+                }
+            }
+        }
+        // Two writes and three searches are five operations, although the searches share one request.
+        assertEquals(5L, writer.statistics().get("effective_requests"));
+        assertEquals(Map.of("upsert", 2L, "union_search", 1L), writer.statistics().get("request_types"));
+        assertEquals(Map.of("begin", 1L, "commit", 1L), writer.statistics().get("transaction_markers"));
+        assertEquals(7, writer.count());
+        assertEquals(7, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), ignored -> {}));
+        assertEquals(5, budget.count());
+        assertTrue(Files.isRegularFile(stop));
+        budget.end();
+        assertEquals(1L, budget.finish().get("overshoot_requests"));
+    }
+
     @Test public void primaryExportKeepsTransactionsAndWholeGroupsWithSeparateCounts() throws Exception {
         for (boolean secondary : List.of(false, true)) {
             Path file = temporary.getRoot().toPath().resolve("scope-" + secondary + ".pb.zst");
@@ -56,13 +92,13 @@ public class ProtoTraceTest {
             var writer = new ProtoTrace.Writer(file, secondary, budget);
             try (writer) {
                 writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 91, 1, 0));
+                for (int i = 0; i < 2; i++) writer.accept(IndexOperationTrace.search(11, 1, i,
+                        IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), null, 0, 1,
+                        IndexOperationTrace.UNION_GROUP, i, 2).withTransaction(91, 0).withWorkUnitId(1));
                 IndexMutation.emit(write(IndexOperationTrace.UPSERT, 1, 1, 1),
                         Map.of(1, IndexKey.ofInt(2)), Map.of(1, IndexKey.ofInt(3)), writer);
                 writer.accept(IndexOperationTrace.search(13, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)),
                         0, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH).withTransaction(91, 1).withVersion(1).withWorkUnitId(1));
-                for (int i = 0; i < 2; i++) writer.accept(IndexOperationTrace.search(14, 1, i,
-                        IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), null, 0, 1,
-                        IndexOperationTrace.UNION_GROUP, i, 2).withTransaction(91, 0).withWorkUnitId(1));
                 writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 91, 1, 1));
                 writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 92, 2, 0));
                 writer.accept(IndexOperationTrace.search(15, 1, 1, IndexOperationTrace.Range.equal(IndexKey.ofInt(3)),
@@ -75,28 +111,27 @@ public class ProtoTraceTest {
                 writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 93, 3, 0));
             }
             assertTrue(Files.isRegularFile(stop));
-            assertEquals(secondary ? 7 : 3, budget.count());
+            assertEquals(secondary ? 8 : 3, budget.count());
             budget.end();
-            assertEquals(secondary ? 5L : 1L, budget.finish().get("overshoot_requests"));
+            assertEquals(secondary ? 6L : 1L, budget.finish().get("overshoot_requests"));
             var decoded = new ArrayList<Operation>();
-            assertEquals(secondary ? 15 : 10, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
-            assertEquals(secondary ? 15 : 10, writer.count());
+            assertEquals(secondary ? 14 : 9, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
+            assertEquals(secondary ? 14 : 9, writer.count());
             assertEquals(Files.size(file), writer.bytesWritten());
             var stats = writer.statistics();
-            assertEquals(secondary ? 9L : 4L, stats.get("index_entries"));
-            assertEquals(secondary ? 7L : 3L, stats.get("effective_requests"));
-            assertEquals(secondary ? 5L : 4L, stats.get("primary_entries"));
+            assertEquals(secondary ? 8L : 3L, stats.get("index_entries"));
+            assertEquals(secondary ? 8L : 3L, stats.get("effective_requests"));
+            assertEquals(secondary ? 4L : 3L, stats.get("primary_entries"));
             assertEquals(secondary ? 4L : 0L, stats.get("secondary_entries"));
             assertEquals(Map.of("begin", 3L, "commit", 2L, "abort", 1L), stats.get("transaction_markers"));
             assertEquals(secondary
-                    ? Map.of("upsert", 2L, "logical_delete", 1L, "point_search", 2L, "union_search", 2L)
-                    : Map.of("upsert", 1L, "point_search", 1L, "union_search", 1L), stats.get("request_types"));
+                    ? Map.of("upsert", 2L, "logical_delete", 1L, "point_search", 1L, "union_search", 2L)
+                    : Map.of("upsert", 1L, "union_search", 1L), stats.get("request_types"));
             if (!secondary) {
                 assertTrue(decoded.stream().allMatch(o -> o.index() == 0));
                 assertEquals(1, decoded.get(1).expansionSize());
-                assertEquals(1, decoded.get(2).version());
-                assertEquals(0, decoded.get(2).readTimestamp());
-                assertEquals(IndexOperationTrace.TRANSACTION_ABORT, decoded.get(5).kind());
+                assertTrue(decoded.stream().noneMatch(o -> (o.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0));
+                assertEquals(IndexOperationTrace.TRANSACTION_ABORT, decoded.get(4).kind());
             }
         }
     }
@@ -119,7 +154,7 @@ public class ProtoTraceTest {
     }
 
     @Test
-    public void abortedWritesAndTheirLocalReadsSurviveEncoding() throws Exception {
+    public void abortedWritesAndLocalReadsAreExcludedBeforeCounting() throws Exception {
         Path file = temporary.getRoot().toPath().resolve("abort.pb.zst");
         var original = List.of(
                 IndexOperationTrace.transaction(10, IndexOperationTrace.TRANSACTION_BEGIN, 91, 1, 0),
@@ -132,11 +167,15 @@ public class ProtoTraceTest {
         try (writer) { for (var operation : original) writer.append(operation); }
         var decoded = new ArrayList<Operation>();
         ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add);
-        assertEquals(original, decoded);
+        assertEquals(List.of(original.get(0), original.get(3)), decoded);
+        assertEquals(0L, writer.statistics().get("effective_requests"));
+        var filtered = (Map<?, ?>) writer.statistics().get("source_projection");
+        assertEquals(1L, filtered.get("excluded_aborted_writes"));
+        assertEquals(1L, filtered.get("excluded_local_search_members"));
     }
 
     @Test
-    public void serviceRequestsPreserveLocalReadsGroupsLocatorsAndDeleteReinsertIdentity() throws Exception {
+    public void committedRequestsPreserveGroupsLocatorsAndFinalDeleteReinsertIdentity() throws Exception {
         Path file = temporary.getRoot().toPath().resolve("trace.pb.zst");
         var original = new ArrayList<Operation>();
         original.add(write(IndexOperationTrace.INSERT, 1, 0, 0).withExpansion(0, 1));
@@ -153,13 +192,111 @@ public class ProtoTraceTest {
         var writer = new ProtoTrace.Writer(file);
         try (writer) { for (Operation operation : original) writer.append(operation); }
         var decoded = new ArrayList<Operation>();
-        assertEquals(original.size(), ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
-        assertEquals(original, decoded);
+        assertEquals(6, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
+        assertEquals(List.of(original.get(0), original.get(1), original.get(3), original.get(5),
+                original.get(6), original.get(7)), decoded);
         try (var model = new IndexReferenceReplay(true, true, new IndexReferenceReplay.Settings(null, 1, 1, 1024))) {
             for (Operation operation : decoded) if (!IndexOperationTrace.isControl(operation)) model.accept(operation);
             assertEquals(1, model.lookupPrimary(1, IndexKey.ofInt(1), 0).value());
             assertEquals(2, model.lookupPrimary(1, IndexKey.ofInt(1), 1).value());
         }
+    }
+
+    @Test
+    public void onlyFinalPhysicalWritesSurviveRepeatedPrimaryAndSecondaryUpdates() throws Exception {
+        var file = temporary.getRoot().toPath().resolve("net-state.pb.zst");
+        var writer = new ProtoTrace.Writer(file);
+        try (writer) {
+            writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 91, 1, 0));
+            IndexMutation.emit(write(IndexOperationTrace.UPSERT, 2, 1, 1),
+                    Map.of(1, IndexKey.ofInt(10)), Map.of(1, IndexKey.ofInt(20)), writer);
+            IndexMutation.emit(write(IndexOperationTrace.UPSERT, 3, 1, 2),
+                    Map.of(1, IndexKey.ofInt(20)), Map.of(1, IndexKey.ofInt(30)), writer);
+            writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 91, 1, 2));
+        }
+        var decoded = new ArrayList<Operation>();
+        assertEquals(6, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
+        var writes = decoded.stream().filter(IndexOperationTrace::isMutation).toList();
+        assertEquals(4, writes.size());
+        assertEquals(1, writes.stream().filter(o -> o.index() == 0).count());
+        assertEquals(3, writes.stream().filter(o -> o.index() == 0).findFirst().orElseThrow().rowId());
+        assertEquals(Set.of(IndexKey.ofInt(10), IndexKey.ofInt(20)), writes.stream()
+                .filter(o -> o.kind() == IndexOperationTrace.LOGICAL_DELETE).map(Operation::indexedValue)
+                .collect(java.util.stream.Collectors.toSet()));
+        assertEquals(List.of(IndexKey.ofInt(30)), writes.stream().filter(o -> o.index() == 1
+                && o.kind() == IndexOperationTrace.UPSERT).map(Operation::indexedValue).toList());
+        assertTrue(writes.stream().allMatch(o -> o.expansionPosition() == 0 && o.expansionSize() == 1));
+        assertEquals(4L, writer.statistics().get("effective_requests"));
+        assertEquals(2L, ((Map<?, ?>) writer.statistics().get("source_projection")).get("coalesced_writes"));
+        assertEquals(2, decoded.get(decoded.size() - 1).expectedCount());
+        try (var raw = new IndexReferenceReplay(true, true);
+                var committed = new IndexReferenceReplay(true, true)) {
+            var baseline = write(IndexOperationTrace.INSERT, 1, 0, 0);
+            IndexMutation.emit(baseline, Map.of(), Map.of(1, IndexKey.ofInt(10)), raw::accept);
+            IndexMutation.emit(baseline, Map.of(), Map.of(1, IndexKey.ofInt(10)), committed::acceptCommitted);
+            for (Operation operation : writes) committed.acceptCommitted(operation);
+            assertEquals(3, committed.lookupPrimary(1, IndexKey.ofInt(1), 1).value());
+            assertTrue(committed.search(1, 1, IndexOperationTrace.Range.equal(IndexKey.ofInt(20)), 1).isEmpty());
+            assertEquals(3, committed.search(1, 1, IndexOperationTrace.Range.equal(IndexKey.ofInt(30)), 1).get(0).value());
+            assertTrue(assertThrows(IOException.class, () -> {
+                for (Operation operation : writes) raw.accept(operation);
+            }).getMessage().contains("Deletion of absent index entry"));
+        }
+    }
+
+    @Test
+    public void sourceSnapshotValidationPrecedesScopeAndOutcomeFiltering() throws Exception {
+        var file = temporary.getRoot().toPath().resolve("future-snapshot.pb.zst");
+        try (var writer = new ProtoTrace.Writer(file, false)) {
+            assertThrows(IOException.class, () -> writer.append(IndexOperationTrace.search(1, 1, 1,
+                    IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 1, 0, IndexOperationTrace.SNAPSHOT_SEARCH)));
+        }
+        var aborted = new ProtoTrace.Writer(file.resolveSibling("invalid-aborted-snapshot.pb.zst"));
+        aborted.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
+        assertThrows(IOException.class, () -> aborted.append(IndexOperationTrace.search(1, 1, 0,
+                IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 1, 0, IndexOperationTrace.SNAPSHOT_SEARCH)
+                .withTransaction(1, 0)));
+        assertThrows(IOException.class, aborted::close);
+    }
+
+    @Test
+    public void abortedSourceRetainsItsSnapshotButDropsItsWholeLocalGroup() throws Exception {
+        var file = temporary.getRoot().toPath().resolve("aborted-snapshots.pb.zst");
+        var budget = new RequestBudget(1, java.time.Duration.ofSeconds(10));
+        budget.begin("snapshot", 1, file.resolveSibling("stop"));
+        var writer = new ProtoTrace.Writer(file, true, budget);
+        try (writer) {
+            writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 91, 1, 0));
+            writer.append(IndexOperationTrace.search(1, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)),
+                    0, 1, IndexOperationTrace.SNAPSHOT_SEARCH).withTransaction(91, 0).withWorkUnitId(1));
+            writer.append(write(IndexOperationTrace.UPSERT, 2, 1, 1).withExpansion(0, 1));
+            for (int member = 0; member < 2; member++)
+                writer.append(IndexOperationTrace.search(13, 1, 0,
+                        IndexOperationTrace.Range.equal(IndexKey.ofInt(member + 1)), null, 0, 1,
+                        IndexOperationTrace.UNION_GROUP | IndexOperationTrace.TRANSACTION_LOCAL_SEARCH, member, 2)
+                        .withTransaction(91, 1).withVersion(1).withWorkUnitId(1));
+            assertEquals(0, budget.count());
+            writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_ABORT, 91, 1, 1));
+        }
+        var decoded = new ArrayList<Operation>();
+        assertEquals(3, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
+        assertEquals(IndexOperationTrace.SEARCH, decoded.get(1).kind());
+        assertEquals(0, decoded.get(1).readTimestamp());
+        assertEquals(1, decoded.get(1).expectedCount());
+        assertEquals(1, budget.count());
+        budget.end();
+        assertEquals(2L, ((Map<?, ?>) writer.statistics().get("source_projection")).get("excluded_local_search_members"));
+    }
+
+    @Test
+    public void malformedAbortedSourceIsRejectedBeforeItsWritesCanBeFiltered() throws Exception {
+        var file = temporary.getRoot().toPath().resolve("malformed-source.pb.zst");
+        var writer = new ProtoTrace.Writer(file);
+        writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 91, 1, 0));
+        writer.append(write(IndexOperationTrace.UPSERT, 2, 1, 1).withExpansion(0, 2));
+        assertThrows(IOException.class, () -> writer.append(IndexOperationTrace.transaction(
+                0, IndexOperationTrace.TRANSACTION_ABORT, 91, 1, 1)));
+        assertThrows(IOException.class, writer::close);
     }
 
     @Test
@@ -207,15 +344,14 @@ public class ProtoTraceTest {
         var begin = TraceRecord.newBuilder().addPositions(control)
                 .setBegin(TraceBegin.newBuilder().setTransactionId(1).setVersion(1)).build();
         var end = TraceRecord.newBuilder().addPositions(control)
-                .setRequest(Request.newBuilder().setTransactionId(1).setCommit(Commit.newBuilder().setVersion(1))).build();
+                .setEnd(TraceEnd.newBuilder().setTransactionId(1).setVersion(1)).build();
         var cases = List.of(List.of(write), List.of(badSearch), List.of(group),
                 // A valid envelope and CRC cannot make an unterminated encoded text key valid.
                 List.of(write.toBuilder().setRequest(write.getRequest().toBuilder().setWrite(
                         write.getRequest().getWrite().toBuilder().setKey(key.setTable(1).setPrimaryKey(
                                 com.google.protobuf.ByteString.copyFrom(new byte[] {1, 'x'}))))).build()),
                 List.of(begin.toBuilder().setBegin(begin.getBegin().toBuilder().setTransactionId(0)).build()),
-                List.of(begin, end.toBuilder().setRequest(end.getRequest().toBuilder()
-                        .setCommit(end.getRequest().getCommit().toBuilder().setOperations(1))).build()));
+                List.of(begin, end.toBuilder().setEnd(end.getEnd().toBuilder().setOperations(1)).build()));
         for (var records : cases) {
             Path file = temporary.newFile().toPath();
             unchecked(file, records);

@@ -21,11 +21,11 @@ public final class RocksDbTimestamps {
         }
         var runtime = path.getParent().resolve("librocksdbjni-linux64.so");
         try (var embedded = RocksDB.class.getResourceAsStream("/librocksdbjni-linux64.so")) {
-            if (embedded == null) throw new java.io.IOException("Missing Maven RocksDB runtime");
+            if (embedded == null) throw new java.io.IOException("Missing source-built RocksDB runtime");
             var digest = org.sibench.config.Digests.digest(); byte[] bytes = new byte[1 << 20];
             for (int count; (count = embedded.read(bytes)) != -1;) digest.update(bytes, 0, count);
             if (!java.util.HexFormat.of().formatHex(digest.digest()).equals(org.sibench.config.Digests.sha256(runtime)))
-                throw new java.io.IOException("Timestamp bridge runtime differs from the Maven RocksDB dependency");
+                throw new java.io.IOException("Timestamp bridge runtime differs from the packaged source build");
         }
         RocksDB.loadLibrary();
         System.load(path.toString());

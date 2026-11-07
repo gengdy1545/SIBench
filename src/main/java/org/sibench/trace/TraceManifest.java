@@ -84,7 +84,7 @@ public final class TraceManifest {
             if (!manifest.has(name + "_trace_sha256"))
                 throw new IOException("Trace identity missing: " + name);
         for (String name : List.of("baseline_rows", "source_work_units",
-                "baseline_operations", "workload_operations")) {
+                "baseline_operations", "workload_operations", "last_resolved_version")) {
             var value = manifest.get(name);
             if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber())
                 throw new IOException("Missing or invalid Trace coverage count: " + name);

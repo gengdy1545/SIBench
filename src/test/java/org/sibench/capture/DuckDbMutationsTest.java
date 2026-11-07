@@ -34,7 +34,7 @@ public class DuckDbMutationsTest {
         sql(db,"CREATE TEMP TABLE sibench_insert_identities AS SELECT * FROM sibench_identities WHERE version>0");
         sql(db,"CREATE TEMP TABLE sibench_access_batches(access_id BIGINT,connection_id BIGINT,transaction_id BIGINT,query_id BIGINT,raw_record BIGINT,physical_rows BIGINT[],phase VARCHAR)");
         sql(db,"CREATE TEMP TABLE sibench_accesses(access_id BIGINT,connection_id BIGINT,transaction_id BIGINT,query_id BIGINT,table_id INTEGER,raw_record BIGINT)");
-        sql(db,"CREATE TEMP TABLE sibench_access_results(access_id BIGINT,key_sql VARCHAR)");
+        sql(db,"CREATE TEMP TABLE sibench_access_keys(access_id BIGINT,key_sql VARCHAR)");
         return db;
     }
     @Test public void keepsCompletedChangesAndExcludesFailedStatementInternals()throws Exception {

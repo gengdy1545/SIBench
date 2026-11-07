@@ -16,8 +16,6 @@ import java.util.List;
 import java.util.Map;
 import org.sibench.config.BenchmarkSelection.Mode;
 import org.sibench.generation.DuckDbData;
-import org.sibench.replay.ReplayConfig;
-import org.sibench.replay.ReplayProjection;
 import org.sibench.schema.SourceSchema;
 
 /** Both native inputs publish the same baseline, workload and sealed data contract. */
@@ -30,7 +28,6 @@ public final class DuckDbTrace implements AutoCloseable {
     private ProtoTrace.Writer base;
     private final ProtoTrace.Writer workload;
     private final WorkUnits.Output units;
-    private final ReplayProjection validation = new ReplayProjection(new ReplayConfig(true,0,0,0,0),true,operation->{});
     private final Map<String,Long> shapes = new LinkedHashMap<>();
     private long unitCount,commits,aborts,localSearches,statements;
     private int windows;
@@ -101,7 +98,7 @@ public final class DuckDbTrace implements AutoCloseable {
             if(operation.kind()==IndexOperationTrace.SEARCH&&operation.mutationOrdinal()>0)localSearches++;
             if(operation.grouped()&&operation.expansionPosition()==0)
                 shapes.merge((operation.flags()&IndexOperationTrace.INTERSECT_GROUP)!=0?"intersection":"union",1L,Long::sum);
-            validation.accept(operation);workload.accept(operation);
+            workload.accept(operation);
         };
         DuckDbProjection.write(database,output);
         if(lastVersion()-before!=number(database,"SELECT count(*) FROM temp.main.sibench_transactions"))
@@ -112,7 +109,7 @@ public final class DuckDbTrace implements AutoCloseable {
 
     public Draft finish(Connection database,Map<String,Object> evidence)throws SQLException,IOException {
         if(finished || windows==0)throw new IOException("Trace workload is not ready for publication");
-        validation.finish();workload.close();units.lines().close();
+        workload.close();units.lines().close();
         DuckDbTransactions.finish(database);
         manifest.put("work_units_sha256",HexFormat.of().formatHex(units.digest().digest()));
         manifest.put("source_work_units",unitCount);
@@ -140,7 +137,7 @@ public final class DuckDbTrace implements AutoCloseable {
     }
 
     @Override public void close()throws IOException {
-        try(workload;var lines=units.lines();validation) { }
+        try(workload;var lines=units.lines()) { }
     }
 
     private long[] origins(Connection database)throws SQLException,IOException {

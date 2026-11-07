@@ -82,8 +82,8 @@ public final class ReferenceReplay {
         for (boolean rowId : rowIdModes) {
             String mode = rowId ? "rowid" : "locator";
             try (var index = new IndexReferenceReplay(rowId, config.secondaryIndexes());
-                    var load = new ReplayProjection(config, false, index::accept);
-                    var runtime = new ReplayProjection(config, true, index::accept)) {
+                    var load = new ReplayProjection(config, false, index::acceptCommitted);
+                    var runtime = new ReplayProjection(config, true, index::acceptCommitted)) {
                 RunTiming.current().phase("load");
                 long start = System.nanoTime();
                 baseline.read(load);
@@ -111,7 +111,7 @@ public final class ReferenceReplay {
                 result.put("snapshot_queries", index.snapshotQueries());
                 result.put("retained_index_versions", index.retainedVersions());
                 result.put("skipped_entry_histories", index.skippedHistories());
-                result.put("read_model", "statement_snapshot_plus_transaction_local_prefix");
+                result.put("read_model", "committed_snapshot");
                 results.add(result);
             }
         }

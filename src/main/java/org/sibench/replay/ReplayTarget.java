@@ -8,11 +8,12 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
-/** A client separates complete local transmission from the eventual service response. */
+/** A client separates local transport completion from the eventual service response. */
 @FunctionalInterface
 public interface ReplayTarget extends AutoCloseable {
     /**
-     * sent completes only after local transmission, not enqueueing. response completes after
+     * sent completes at the adapter transport callback (gRPC outboundMessageSent), not at the
+     * send API return. This is not a peer acknowledgement. response completes after
      * matching and validating the response against this operation; mismatches complete
      * exceptionally. The adapter owns transport cancellation on close and must not reorder local
      * sends.
@@ -23,20 +24,6 @@ public interface ReplayTarget extends AutoCloseable {
     default SendHandle send(long dispatchSequence, Operation operation,
             org.sibench.adapters.proto.Request stored) throws IOException {
         return send(dispatchSequence, operation);
-    }
-
-    /**
-     * Sends a complete-commit marker after the transaction's operations. Service targets must
-     * implement it; logical reference targets consume operation views without publication markers.
-     */
-    default SendHandle sendCommit(long dispatchSequence, long transactionId, long version)
-            throws IOException {
-        throw new IOException("Replay target does not support complete-commit markers");
-    }
-
-    default SendHandle sendAbort(long dispatchSequence, long transactionId, long version)
-            throws IOException {
-        throw new IOException("Replay target does not support Abort");
     }
 
     /** Sends whatever the client still holds back, such as a partial batch, before a drain. */
@@ -69,12 +56,6 @@ public interface ReplayTarget extends AutoCloseable {
                     return SendHandle.completed();
                 }
 
-                @Override
-                public SendHandle sendAbort(long sequence, long transactionId, long version) throws IOException {
-                    consumer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_ABORT,
-                            transactionId, version, 0));
-                    return SendHandle.completed();
-                }
             };
     }
 

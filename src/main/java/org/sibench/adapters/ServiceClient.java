@@ -79,36 +79,6 @@ abstract class ServiceClient implements ReplayTarget {
     }
 
     @Override
-    public final SendHandle sendCommit(long dispatchSequence, long transactionId, long version)
-            throws IOException {
-        return finish(dispatchSequence, transactionId, version, false);
-    }
-
-    @Override
-    public final SendHandle sendAbort(long dispatchSequence, long transactionId, long version)
-            throws IOException {
-        return finish(dispatchSequence, transactionId, version, true);
-    }
-
-    private SendHandle finish(long dispatchSequence, long transactionId, long version, boolean aborted)
-            throws IOException {
-        sendBatch();
-        if (!group.isEmpty()) throw new IOException("Commit marker inside a search group");
-        var answer = transmit(requests.finish(dispatchSequence, transactionId, version, aborted), NO_CHUNKS);
-        CompletableFuture<Void> response =
-                answer.thenApply(
-                        result -> {
-                            try {
-                                requests.checkCommit(result, dispatchSequence);
-                                return null;
-                            } catch (IOException mismatch) {
-                                throw new java.util.concurrent.CompletionException(mismatch);
-                            }
-                        });
-        return new SendHandle(localSend(), response);
-    }
-
-    @Override
     public final SendHandle send(long dispatchSequence, Operation operation) throws IOException {
         return send(dispatchSequence, operation, null);
     }

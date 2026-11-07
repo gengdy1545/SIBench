@@ -12,6 +12,14 @@ import org.rocksdb.*;
 
 /** Real-engine counterexamples: native history survives close; concurrent partial updates do not vanish. */
 public class RocksDbHistoryCheck {
+    @org.junit.Test public void bridgeAndRocksJavaShareOneNativeRuntime() throws Exception {
+        RocksDbTimestamps.load(Path.of(System.getProperty("sibench.rocksdb.library")));
+        var libraries = new java.util.HashSet<String>();
+        for (String line : java.nio.file.Files.readAllLines(Path.of("/proc/self/maps")))
+            if (line.contains("librocksdbjni")) libraries.add(line.split("\\s+", 6)[5]);
+        assertEquals(libraries.toString(), 1, libraries.size());
+    }
+
     private static byte[] bytes(String value) { return value.getBytes(StandardCharsets.UTF_8); }
 
     @Test public void flushedMemtableCacheIsUnneededWithoutTransactionSnapshots() throws Exception {

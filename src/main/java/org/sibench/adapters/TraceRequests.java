@@ -3,7 +3,6 @@ package org.sibench.adapters;
 import com.google.protobuf.ByteString;
 
 import org.sibench.adapters.proto.Bound;
-import org.sibench.adapters.proto.Commit;
 import org.sibench.adapters.proto.EntryKey;
 import org.sibench.adapters.proto.Request;
 import org.sibench.adapters.proto.Response;
@@ -26,33 +25,12 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class TraceRequests {
     private final ValueKind valueKind;
     private final AtomicLong results = new AtomicLong(), queries = new AtomicLong();
-    private final AtomicLong skippedQueries = new AtomicLong();
-    private boolean snapshotReads;
     private final AtomicLong requestBytes = new AtomicLong(), resultBytes = new AtomicLong();
+    private final AtomicLong executeRequests = new AtomicLong();
     private final AtomicLong maxResults = new AtomicLong(), maxGroupMembers = new AtomicLong();
     private volatile int baselineBatch = 1;
-    /** The source transaction of the requests being built and its sent-operation counters. */
-    private long currentTransaction, currentOperation, currentWrites;
-
     public TraceRequests(ValueKind valueKind) {
         this.valueKind = valueKind;
-    }
-
-    /**
-     * Searches of an index that already holds the whole trace: they go out as plain snapshot reads
-     * at their read version, without the transaction position a live replay sends.
-     */
-    public void snapshotReads() {
-        snapshotReads = true;
-    }
-
-    /** Counts a transaction-local search omitted from snapshot-only verification. */
-    public void skipSearch(List<Operation> members) {
-        skippedQueries.incrementAndGet();
-    }
-
-    public long skippedQueries() {
-        return skippedQueries.get();
     }
 
     public ValueKind valueKind() {
@@ -64,14 +42,12 @@ public final class TraceRequests {
         var request = Request.newBuilder().setId(id);
         if (operation.kind() == IndexOperationTrace.SEARCH) {
             if (operation.grouped()) throw new IOException("Group members are sent as one group");
-            transaction(request, operation);
             return countRequest(request.setSearch(search(operation)).build());
         }
-        transaction(request, operation);
         return countRequest(request.setWrite(write(operation)).build());
     }
 
-    /** Reuses a validated Trace payload; only replay IDs and transaction positions change. */
+    /** Reuses a validated Trace payload; only replay IDs and value representation change. */
     public Request forward(long id, Request stored, List<Operation> members) throws IOException {
         Operation first = members.get(0);
         if (first.grouped()) {
@@ -82,10 +58,9 @@ public final class TraceRequests {
                 ? !stored.hasSearch() : !stored.hasWrite())) {
             throw new IOException("Stored service payload disagrees with operation view");
         }
-        var request = stored.toBuilder().setId(id).clearTransactionId().clearTransactionOperation();
+        var request = stored.toBuilder().setId(id);
         if (stored.hasWrite() && stored.getWrite().getKind() != Write.Kind.LOGICAL_DELETE)
             request.setWrite(forwardWrite(stored.getWrite(), first));
-        transaction(request, first);
         return countRequest(request.build());
     }
 
@@ -168,70 +143,19 @@ public final class TraceRequests {
                         : SearchGroup.Mode.UNION);
         for (Operation member : members) group.addMembers(search(member));
         var request = Request.newBuilder().setId(id);
-        transaction(request, first);
         maxGroupMembers.accumulateAndGet(members.size(), Math::max);
         return countRequest(request.setGroup(group).build());
     }
 
-    /** Marks the request with its source transaction and sent-operation position. */
-    private void transaction(Request.Builder request, Operation operation) throws IOException {
-        long transaction = operation.transactionId();
-        if (transaction <= 0 || snapshotReads) return;
-        if (currentTransaction != transaction) {
-            currentTransaction = transaction;
-            currentOperation = 0;
-            currentWrites = 0;
-        }
-        currentOperation++;
-        if (operation.kind() == IndexOperationTrace.UPSERT
-                || operation.kind() == IndexOperationTrace.LOGICAL_DELETE
-                || operation.kind() == IndexOperationTrace.RELOCATE) currentWrites++;
-        request.setTransactionId(transaction).setTransactionOperation(currentOperation);
-    }
-
-    /**
-     * The complete-commit marker of one source transaction. {@code writes} and {@code operations}
-     * count the requests actually sent, after secondary filtering; a group is one operation.
-     */
-    public Request commit(long id, long transactionId, long version) throws IOException {
-        return finish(id, transactionId, version, false);
-    }
-
-    public Request finish(long id, long transactionId, long version, boolean aborted) throws IOException {
-        if (transactionId <= 0 || version <= 0)
-            throw new IOException("Invalid transaction commit marker");
-        if (currentTransaction != 0 && currentTransaction != transactionId)
-            throw new IOException("Commit marker does not follow its transaction");
-        var request =
-                Request.newBuilder()
-                        .setId(id)
-
-                        .setTransactionId(transactionId)
-                        .setTransactionOperation(0)
-                        .setCommit(
-                                Commit.newBuilder()
-                                        .setVersion(version)
-                                        .setWrites(currentWrites)
-                                        .setOperations(currentOperation));
-        if (aborted) request.setAbort(org.sibench.adapters.proto.Abort.newBuilder()
-                .setVersion(version).setWrites(currentWrites).setOperations(currentOperation));
-        currentTransaction = 0;
-        currentOperation = 0;
-        currentWrites = 0;
-        return countRequest(request.build());
-    }
-
-    private Search search(Operation operation) {
+    private Search search(Operation operation) throws IOException {
+        if ((operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0)
+            throw new IOException("Only committed-snapshot searches may reach the service");
         var search = Search.newBuilder()
                 .setTable(operation.table())
                 .setIndex(operation.index())
                 .setDescending((operation.flags() & IndexOperationTrace.DESCENDING) != 0)
                 .setLimit(operation.limit())
-                .setReadVersion(operation.readTimestamp())
-                .setLocalVersion(
-                        (operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0
-                                ? operation.version()
-                                : 0);
+                .setReadVersion(operation.readTimestamp());
         if (operation.lower() != null)
             search.setLower(Bound.newBuilder().setKey(bytes(operation.lower()))
                     .setInclusive((operation.flags() & IndexOperationTrace.LOWER_INCLUSIVE) != 0));
@@ -329,18 +253,6 @@ public final class TraceRequests {
         }
     }
 
-    /** A commit marker response carries no results. */
-    public void checkCommit(Response response, long id) throws IOException {
-        if (response.getId() != id || response.getMore())
-            throw new IOException("Invalid final response for commit marker " + id);
-        if (response.getStatus() != Status.OK)
-            throw new IOException(
-                    "Service " + response.getStatus() + " for commit marker: "
-                            + response.getMessage());
-        if (response.getResultsCount() != 0)
-            throw new IOException("Commit marker returned results");
-    }
-
     public long checkedResults() {
         return results.get();
     }
@@ -366,7 +278,13 @@ public final class TraceRequests {
     }
 
     private Request countRequest(Request request) {
+        executeRequests.incrementAndGet();
         requestBytes.addAndGet(request.getSerializedSize());
         return request;
+    }
+
+    /** Execute request messages; a stream contains many messages. */
+    public long executeRequests() {
+        return executeRequests.get();
     }
 }

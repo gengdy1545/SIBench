@@ -86,7 +86,7 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
                     pending.add(new Change(e,unitEvent,currentUnit,++writes));statementWrites++;
                 }
                 drain();
-                if(pending.size()>org.sibench.replay.ReplayProjection.MAX_TRANSACTION_OPERATIONS)
+                if(pending.size()>ProtoTrace.MAX_TRANSACTION_OPERATIONS)
                     throw new IOException("Unsettled PG operation prefix exceeds the buffer limit");
             });
             details.put(source.pid,tracker.detail());tracker.endSession();drain();

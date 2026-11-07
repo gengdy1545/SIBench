@@ -110,11 +110,28 @@ public final class Sibench {
                     throw new IllegalArgumentException("index-server requires SERVICE_CONFIG");
                 var service = ServiceConfig.ofServer(root, Path.of(profiles.get(0)));
                 RunTiming.current().measure(service.path());
-                try (var backend = service.backend();
-                        var server = IndexServer.start(service.port(), backend)) {
+                var backend = service.backend();
+                IndexServer server;
+                try { server = IndexServer.start(service.port(), backend); }
+                catch (Exception failure) {
+                    try { backend.close(); } catch (Exception close) { failure.addSuppressed(close); }
+                    throw failure;
+                }
+                Throwable failed = null;
+                try {
                     out.println("index-server " + backend.describe().getName() + " on port " + server.port());
                     out.flush();
                     server.awaitTermination();
+                } catch (Exception | Error error) {
+                    failed = error;
+                    throw error;
+                } finally {
+                    // A failed shutdown leaves native calls alive; keep their handles valid.
+                    try { server.close(); backend.close(); }
+                    catch (Exception close) {
+                        if (failed == null) throw close;
+                        failed.addSuppressed(close);
+                    }
                 }
                 return 0;
             }

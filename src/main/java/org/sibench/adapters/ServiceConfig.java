@@ -20,7 +20,7 @@ import java.util.Set;
  * </ul>
  *
  * {@code value} is {@code locator} or {@code row_id}: what an index entry points to. An index
- * server's {@code backend} is {@code rocksdb}, or {@code rocksdb_cloud} with {@code storage} (the
+ * server's {@code backend} is {@code rocksdb} for fixtures, or {@code rocksdb_cloud}/{@code slatedb} with {@code storage} (the
  * storage config), {@code profile} and the index's {@code object_path} below the profile prefix.
  * {@code reopen: true} serves an index this server created before instead of a new one: after a
  * restart, or for rocksdb-cloud without its local directory, from the bucket alone.
@@ -34,9 +34,11 @@ public record ServiceConfig(
         ObjectStore objects,
         boolean reopen) {
     public ServiceConfig {
-        require(Set.of("grpc", "rocksdb").contains(adapter), "Unknown service adapter: " + adapter);
+        require(Set.of("grpc", "rocksdb", "rocksdb_cloud", "slatedb").contains(adapter), "Unknown service adapter: " + adapter);
         require(!adapter.equals("grpc") || endpoint != null, "A gRPC target needs an endpoint");
-        require(!adapter.equals("rocksdb") || path != null, "A RocksDB index needs a path");
+        require(adapter.equals("grpc") || path != null, "An index needs a path");
+        require(!(adapter.equals("rocksdb_cloud") || adapter.equals("slatedb")) || objects != null,
+                "An object-storage backend needs storage settings");
     }
 
     /** The required service target of a replay config. */
@@ -46,6 +48,7 @@ public record ServiceConfig(
         var service = object(target, "service");
         keys(service, Set.of("adapter", "endpoint", "path", "value"));
         String adapter = string(service, "adapter");
+        require(Set.of("grpc", "rocksdb").contains(adapter), "Replay adapter must be grpc or rocksdb");
         return new ServiceConfig(
                 adapter,
                 service.containsKey("endpoint") ? string(service, "endpoint") : null,
@@ -56,7 +59,7 @@ public record ServiceConfig(
                 false);
     }
 
-    /** A server with complete-commit publication and versioned reads. */
+    /** A server with visible mutation acknowledgements and versioned reads. */
     public static ServiceConfig ofServer(Path root, Path path) throws java.io.IOException {
         Map<String, Object> document = parse(Files.readString(root.resolve(path)));
         keys(document, Set.of("schema_version", "purpose", "service"));
@@ -70,13 +73,13 @@ public record ServiceConfig(
                         "profile", "object_path", "reopen"));
         String backend = string(service, "backend");
         require(
-                backend.equals("rocksdb") || backend.equals("rocksdb_cloud"),
-                "backend must be rocksdb or rocksdb_cloud");
-        boolean cloud = backend.equals("rocksdb_cloud");
+                Set.of("rocksdb", "rocksdb_cloud", "slatedb").contains(backend),
+                "backend must be rocksdb, rocksdb_cloud or slatedb");
+        boolean cloud = !backend.equals("rocksdb");
         for (String key : List.of("storage", "profile", "object_path"))
-            require(cloud == service.containsKey(key), key + " is for and required by rocksdb_cloud");
+            require(cloud == service.containsKey(key), key + " is required only for object-storage backends");
         return new ServiceConfig(
-                "rocksdb",
+                backend,
                 null,
                 root.resolve(string(service, "path")),
                 Math.toIntExact(positive(service, "port")),
@@ -90,13 +93,14 @@ public record ServiceConfig(
                 service.containsKey("reopen") && bool(service, "reopen"));
     }
 
-    /** This server's index, new or reopened: a local RocksDB, or rocksdb-cloud. */
-    public RocksDbBackend backend() throws java.io.IOException {
+    /** This server's index, new or reopened. */
+    public VersionedIndexBackend backend() throws java.io.IOException {
+        if (adapter.equals("slatedb")) return VersionedIndexBackend.slate(path, value, objects, reopen);
         if (objects == null)
-            return reopen ? RocksDbBackend.open(path, value) : RocksDbBackend.create(path, value);
+            return reopen ? VersionedIndexBackend.open(path, value) : VersionedIndexBackend.create(path, value);
         return reopen
-                ? RocksDbBackend.openCloud(path, value, objects)
-                : RocksDbBackend.cloud(path, value, objects);
+                ? VersionedIndexBackend.openCloud(path, value, objects)
+                : VersionedIndexBackend.cloud(path, value, objects);
     }
 
     private static ValueKind value(Map<String, Object> service) {

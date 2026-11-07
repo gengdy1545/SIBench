@@ -1,241 +1,72 @@
 # Trace contract
 
-The native producer uses the explicitly selected engine for stored rows, transactions and capture. Both
-`api` and `capture` modes publish the format below. Successful operations and
-transaction-local searches remain in aborted transactions; `Abort` has the same
-operation/write accounting as `Commit`, but never publishes those writes as
-committed state. No legacy format reader is provided.
-
-## Native row consumption component
-
-Sealed native data retain current rows, committed before-images, stable RowIDs,
-canonical transaction outcomes and native statement read points in one database.
-The DuckDB standalone file inventory binds byte size, SHA-256, engine version/source
-identity and the last resolution slot. A matching read-only reader can reopen the
-file after relocation, without the capture host or data re-import. A remaining
-WAL, spill dependency, checksum mismatch or different reader engine identity
-prevents opening it as a sealed artifact.
-
-PostgreSQL stores a normally stopped native cluster with a per-file size/hash inventory,
-matching server/instrumentation identities and a last resolution slot. Its row reader
-verifies this inventory and starts a private copy using the explicitly supplied runtime
-and fresh working directory. Read-only transactions prevent business writes; the
-original artifact remains unchanged. The private copy is removed after normal close.
-This reader cost is separate from generation and index-only replay.
-
-RocksDB retains timestamped rows, RowID mappings and statement read points in native files. Its inventory binds file sizes, SHA-256, runtime/bridge identities and the last resolution slot. The reader independently verifies the files and opens them read-only in place, without a mutable copy or recovery. Empty native-created WAL files are allowed; actual WAL records prevent publication.
-
-`NativeData.snapshotRow` takes table, RowID and canonical read version.
-`rowBeforeStatement` takes table, RowID and native connection/query identity; it
-resolves the actual transaction snapshot plus preceding local writes. This is a
-statement-start point, not a claim about arbitrary intra-statement index accesses.
-Deleted identities cannot resolve to a replacement inserted under the same key.
-Unknown statement points and versions beyond the published watermark are errors.
-PostgreSQL records each statement's actual native snapshot, including changing RC
-snapshots and fixed RR snapshots within a single transaction.
-
-Committed local row versions are retained. Full row contents of rolled-back writes
-are not: a statement following such local writes explicitly rejects row retrieval.
-This does not remove the corresponding index operations or Abort from index-only
-Trace replay. The native reader resolves RowIDs rather than physical Locators.
-Binary fields are detached byte arrays, including empty values; SQL NULL stays null.
+Both `api` and `capture` modes publish this single format from one explicitly selected native engine. The engine owns rows, transactions and snapshots. Exported Trace contains committed updates and committed-snapshot queries; aborted writes and transaction-local searches are excluded. Source support and user commands are listed in [README](../README.md).
 
 ## Native publication
 
-Both native input modes publish `baseline.pb.zst`, `workload.pb.zst`,
-`work-units.jsonl.zst`, native files under `data/` and `manifest.json`. Generation and
-native history sealing leave `INCOMPLETE` present. Once source connections and the
-host close, publication verifies the standalone file and matching data/Trace
-resolution watermark, embeds its inventory as `native_data`, and removes the
-marker only after the manifest exists. Consumers reject the marker. Failed
-compilation retains diagnostics; it cannot be consumed as a complete Trace.
+A complete artifact contains:
 
-Both engines emit the final baseline stream from native initial rows before workload
-execution. PostgreSQL also emits the final workload stream during execution. Only pending transactions may spill temporarily.
-Source sequences, native ordering watermarks and client/source completion counts
-are checked during necessary reads. It seals resolution metadata after drain, stops
-the server normally and publishes the cluster inventory without an independent
-historical-row audit or reference replay. Business tables are UNLOGGED; this contract
-requires normal server shutdown and does not provide recovery of interrupted generation.
-Readers use an isolated copy of the sealed cluster and leave published files untouched.
+| Path | Contents |
+| --- | --- |
+| `baseline.pb.zst` | Initial exported index entries at version 0. |
+| `workload.pb.zst` | Committed index operations with source transaction boundaries/outcomes. |
+| `work-units.jsonl.zst` | Operation origins and client-routing identities. |
+| `data/` | Sealed native rows, committed history and identity/read-point metadata. |
+| `manifest.json` | Catalog, source/configuration/build identities, file inventories, statistics and version coverage. |
 
-`TraceManifest.openData` verifies the embedded native inventory and opens the
-row resolver above. PostgreSQL requires the overload with explicit runtime and fresh
-working directory. The manifest's `value_kinds` explicitly declares
-supported index values. Native publication currently declares only `row_id`;
-service replay rejects `locator` before opening or creating a backend.
+Generation keeps `INCOMPLETE` until the engine closes normally, data and Trace resolution watermarks agree, and the manifest is atomically published. Consumers reject incomplete, altered or unsealed artifacts. Failure retains diagnostics, stops later benchmarks and cannot resume; crash recovery and reusable initial-state databases are unsupported.
 
-The native work-unit catalog records distinct operation origins in increasing raw
-`source_event` order, with actual `connection_id` and `query_id`. Capture origins
-are adopted ART accesses or successful row-change facts; API origins are source
-statement starts. Operations bind to their exact origin. Source statements with
-no projected index operation remain counted in `source_statements`, not as
-invented accesses. Canonical Trace still follows transaction resolution and
-within-transaction operation order; raw log order does not define commit order.
-For PostgreSQL capture, each statement is a work unit; its `source_event` is assigned
-during the ordered transaction merge. Actual backend/request identities remain in
-`connection_id`/`query_id`. A statement without a projected index operation remains
-an origin in that catalog and never creates a synthetic access.
+`native_data` binds required native files, sizes, SHA-256, engine/bridge identities and the last resolution slot. `source_evidence` binds effective configuration, client/engine identities, expected per-table baseline counts and source-completeness evidence. PostgreSQL exports online without retaining all raw facts; DuckDB retains facts and count-only receipts; YCSB exports API operations directly. These identities do not independently certify an untrusted producer's completeness.
 
-The complete index definitions, benchmark, source commit, schema digests and
-source schema configuration are bound by `catalog_sha256`. Consumption validates
-this embedded identity and its table/index structure without opening the source
-checkout. The source directory is informational. Source/schema validation belongs
-to generation; the digest is an integrity identity, not independent certification
-of an untrusted producer's completeness.
+`catalog_sha256` binds the complete table/index definitions, benchmark, source commit, schema digests and source schema configuration, even for primary-only export. Consumers validate the embedded catalog without opening the source checkout. The source directory is informational. `value_kinds` currently declares only `row_id`; native replay rejects `locator` before creating/opening a backend.
+
+## Native row consumption component
+
+`TraceManifest.openData` verifies the native inventory and opens the appropriate row resolver:
+
+| Engine | Opening requirements |
+| --- | --- |
+| DuckDB | Read-only `data/data.duckdb`, matching engine identity, no remaining WAL/spill dependency; no capture host or re-import. |
+| PostgreSQL | Normally stopped cluster, matching explicit runtime and fresh working directory. The reader starts a private reflink/full copy with read-only transactions, leaving the artifact unchanged; normal close removes the copy. |
+| RocksDB | Read-only native files with matching runtime/timestamp bridge; no mutable copy or recovery. Empty engine-created WAL files are allowed, actual WAL records prevent publication. |
+
+`openData(trace)` opens DuckDB; `openData(trace, rocksdbBuildDirectory)` opens RocksDB; PostgreSQL uses `openData(trace, runtime, freshWorkingDirectory)`. Historical row reading is separate from index-only replay; PostgreSQL copy/startup cost belongs to row consumption.
+
+- `NativeData.snapshotRow(table, rowId, readVersion)` resolves a committed snapshot.
+- `rowBeforeStatement(table, rowId, connectionId, queryId)` resolves the actual statement-start snapshot plus preceding local writes, not arbitrary intra-statement reads. PostgreSQL preserves changing RC snapshots and fixed RR snapshots.
+- Unknown statement points, versions beyond the watermark and mismatched native identities are errors.
+- Updates retain RowID; delete/reinsert allocates a new identity. Old RowIDs never resolve to replacement rows.
+- Committed local row versions are retained. Full rolled-back row images are not: retrieval after such local writes is rejected, and those local searches and aborted writes are excluded from exported Trace.
+- Binary fields are detached byte arrays, including empty values; SQL NULL remains null. Readers resolve RowIDs, not physical Locators.
+
+Native file layout belongs to the selected engine. History is retained without Rewrite, physical version GC or file-relocation maintenance. Business Delete does not reclaim history; backend SST/WAL/MANIFEST files are separate index state.
 
 ## Protobuf format
 
-Trace stores the Index Service request messages from
-`proto/index_service.proto`, wrapped by `index_trace.proto` source
-positions. A query group is one SearchGroup request with one position per member.
-TraceBegin records preserve source transaction boundaries and are not RPCs.
-Stored commit counts describe exported requests; replay adjusts IDs, routing,
-positions and counts after filtering or batching. Native generation has one protobuf output format.
+Requests use [index_service.proto](../proto/index_service.proto), wrapped with source positions by [index_trace.proto](../proto/index_trace.proto). SearchGroup is one request with one position per member; TraceBegin and TraceEnd are source metadata, not RPCs. The `request_types` counts describe serialized requests/groups; `effective_requests` counts their basic operations. Replay assigns request IDs and routing, and recomputes selected counts after filtering/batching.
 
-Each protobuf file starts with big-endian int32 magic `0x53495042`. Each block has
-four big-endian int32 fields: message count, compressed byte count, uncompressed
-byte count and CRC32C of the uncompressed bytes, followed by an independent Zstd
-frame at level 3. The plain block contains length-delimited TraceRecord messages.
-Blocks target 1 MiB and contain at most 4096 messages; a single request is limited
-to 32 MiB including its delimiter. Four zero int32 fields terminate the file;
-missing termination and trailing bytes are errors. File SHA-256 identities bind
-the compressed bytes. Each inventory entry in `proto_files.baseline` or
-`proto_files.workload` records `path`, physical `sha256`, `logical_sha256` of the
-length-delimited uncompressed messages, and the semantic operation count (one per
-group member and transaction control). The baseline/workload Trace
-identity hashes the canonical file's 32-byte logical digest
-and big-endian int64 operation count. No detailed-operation encoding is needed to
-compute these identities. Replay and locality analysis read the protobuf requests. Readers enforce file,
-logical and inventory identities, transaction positions, commit counts and
-complete source-member coverage.
-
-Each inventory entry also reports `bytes` for the complete compressed file and
-`statistics` computed during writing, separately for baseline and workload:
-
-| Statistic | Counting unit |
+| Element | Encoding |
 | --- | --- |
-| `index_entries` | Index writes and search members; excludes transaction markers. |
-| `effective_requests` | Each write, Search or complete SearchGroup once; excludes markers. |
+| File prefix | Big-endian int32 magic `0x53495042`. |
+| Block header | Four big-endian int32 fields: message count, compressed bytes, uncompressed bytes, CRC32C of uncompressed bytes. |
+| Block payload | Independent Zstd frame at level 3 containing length-delimited TraceRecord messages. |
+| Limits | Target 1 MiB/block, at most 4096 messages; one request including its delimiter is at most 32 MiB. |
+| Terminator | Four zero int32 fields; missing termination or trailing bytes are errors. |
+
+Each `proto_files.baseline` / `proto_files.workload` entry records `path`, physical `sha256`, `logical_sha256` of the length-delimited uncompressed messages, semantic operation count, compressed `bytes` and the statistics below. Semantic operations count group members and source boundary markers separately. Baseline/workload identity hashes the canonical file's 32-byte logical digest followed by its big-endian int64 operation count.
+
+| Statistic | Unit |
+| --- | --- |
+| `index_entries` | Writes and search members, excluding transaction markers. |
+| `effective_requests` | Each write and each SearchGroup member (or standalone Search) once, excluding markers. |
 | `primary_entries`, `secondary_entries` | Exported entries by index scope, including search members. |
-| `request_types` | Requests by `insert`, `upsert`, `logical_delete`, `relocate`, `point_search`, `range_search`, `union_search` or `intersection_search`; absent kinds have zero count. |
-| `transaction_markers` | Begin, Commit and Abort separately. |
-| `write_origins` | Exported write entries carrying business-insert/update flags, not distinct source rows. |
-| `uncompressed_message_bytes` | Length-delimited protobuf bytes, excluding file/block headers. |
+| `request_types` | `insert`, `upsert`, `logical_delete`, `relocate`, `point_search`, `range_search`, `union_search`, `intersection_search`; absent kinds count as zero. |
+| `transaction_markers` | Source Begin, Commit and Abort outcomes separately; none is sent to the service. |
+| `source_projection` | Excluded aborted writes/local search members, coalesced writes and peak buffered source operations. |
+| `write_origins` | Write entries with business-insert/update flags, not distinct rows. |
+| `uncompressed_message_bytes` | Length-delimited protobuf bytes, excluding headers. |
 
-Requests from aborted transactions count because replay executes them before
-Abort. Request counts are independent of returned rows and transport batching.
-These producer statistics are informational, not substitutes for digest and
-semantic validation; preflight independently counts the consumed stream.
-
-## Source facts
-
-Capture generation binds source records to native connection, query and transaction
-identities, using query, transaction, mutation, index-attempt, visible-row and
-consumption logs. Query/session completion and transaction outcomes are required.
-The compiler does not rerun source SQL to synthesize index accesses.
-
-YCSB uses an embedded RocksDB API binding and emits its actual calls, status and result counts directly into the final Trace. Native timestamped rows retain history; row locks protect partial updates. A
-read-modify-write workload issues separate Read and Update calls; it is not made
-atomic by the generator. sysbench uses libpq or the native DuckDB driver; HyBench uses the
-shared-host JDBC adapter. Source retries remain source behavior and must have
-matching receipts/outcomes. Generation does not silently retry failed source SQL.
-HyBench rolls back native write-conflict transactions and continues subsequent
-transactions; it retains their reads, prior successful writes and Abort. Other
-SQL errors still fail the source. YCSB baseline loading alone buffers upstream
-inserts into bounded native transaction batches. Its immediate OK means buffered input;
-generation requires each worker's successful completion, with committed rows and emitted baseline counts matching the upstream insert count. A failed batch or
-cleanup cannot certify the baseline. Workload API calls are not batched.
-
-RocksDB generation skips WAL and per-operation durability synchronization. Successful publication flushes all column families and closes the engine; native files and build identities are retained. Failure leaves diagnostics and an incomplete artifact, never a resumable generation. SST/Blob SHA-256 identities are computed during native writes and collected from the same engine after successful close; publication does not reread SST/Blob contents. Missing or differently sized SST/Blob outputs prevent publication. Consumers verify the recorded file bytes independently. History retained for snapshot reads is distinct from a crash-recovery log.
-
-PostgreSQL consumes native capture facts online, retaining source completion/count reports and final Trace identities. It does not retain full raw facts or answer-key files. DuckDB currently retains raw facts and count-only receipts with hashes for offline binding. `source_evidence` binds the
-run's effective configuration, client and engine identities and corresponding source evidence.
-It records expected baseline table counts. HyBench also binds its load
-input manifest, including the CSVs removed after successful loading and the two
-runtime files checked before workload execution. The local engine build receipt
-binds the pinned source, instrumentation, prepared sources, build commands and
-executed binaries; it is not a signed or hermetic build attestation.
-
-After DuckDB receipt/statement binding, `source-diagnostics.json` retains per-window summaries of storage SQL
-outcomes, statements without adopted ART, adopted/abandoned attempts and mutation
-scopes by statement outcome. It is written before access projection, so it also
-survives unsupported-access failures; successful publication binds its hash in
-`source_evidence`. It scans already imported facts, not benchmark row data. In API
-mode these are storage SQL diagnostics, not API operation counts.
-
-Attempt costs include probe calls, summed candidate-vector maxima and measured
-probe nanoseconds, not distinct rows, physical I/O or full query time. Mutation
-counts distinguish requested rows, completed scope rows and scopes without a
-completion. They do not measure a failed scope's physical successful prefix.
-Completed internal scopes in a failed statement remain diagnostic. A statement
-without adopted ART may still maintain indexes; this classification alone does
-not prove that it executed a column scan.
-
-## Access projection
-
-A capture Search represents a **finally adopted ART access's snapshot-visible
-matches**, including earlier writes from its own transaction. It excludes later
-non-index predicates, sorting, aggregation and other SQL operators. SQL result
-counts therefore need not equal Search counts. Abandoned ART attempts, raw
-candidate counts, physical row order and extra reads remain diagnostic facts;
-the Index Service need not reproduce the physical process.
-
-The boundary is the index operator's actual output, not subsequent consumption.
-If the index has emitted its complete visible match set, a downstream JOIN that
-discards the batch or a LIMIT that uses only part of it does not shrink Search.
-Completeness requires all base candidates and transaction-local matches to have
-been exhausted; an empty local store can establish the latter without an extra
-fetch. Generic stop records do not measure consumption: their zero prefix is a
-placeholder. Partial source output is rejected unless its exact range, order and
-truncation can be represented; the current compiler accepts complete output only.
-
-| Native case | Projection |
-| --- | --- |
-| Single-column ART equality or ordered comparison | Encode actual typed probe bounds; intersect two bounds when present. |
-| Repeated point probes, such as supported IN accesses | Deduplicate points and emit a union group with the native visible result count. |
-| Base plus transaction-local ART probes | Require matching conditions and preserve the actual snapshot plus prior local writes. |
-| Fully drained adopted access | Search over the represented predicate, using the native visible-match count. |
-| Interrupted primary-key equality after its sole matching row was output | Preserve the exact point Search and transaction outcome. Require identical equality predicates across probes and exactly one emitted primary key matching that predicate; native uniqueness proves complete logical output even without the final empty fetch. |
-| Abandoned attempt or internal history-table access | No benchmark Search; retain source facts for diagnosis. |
-| Downstream stop after complete index output | Preserve the complete snapshot-visible Search, irrespective of downstream consumption. |
-| Incomplete index output | Reject: no exact partial-range/order projection is currently implemented. A SQL LIMIT cannot be copied into Search limit. |
-| Missing identity/batch/close facts, unsupported types/conditions, or ambiguous intra-statement read/write ordering | Fail generation rather than approximate or invent accesses. |
-
-The configured source may execute column scans with no index operation. The
-compiler does not manufacture an index access for such a statement. YCSB's
-explicit API Scan has its requested maximum result count and may exhaust its
-range before that maximum; this does not change capture-mode early-stop rules.
-
-A failed SQL statement may perform ART writes that are immediately undone without
-forming a result visible to later operations. Those internal writes stay in failed
-attempt diagnostics, not logical Trace writes. Unknown partial physical success
-must not be reported as all success or zero physical work. Earlier successfully
-completed writes and accurately projected Search operations remain, followed by
-the actual Commit/Abort. If a read observed such internal temporary writes, its
-semantics must be resolved explicitly before accepting that projection.
-
-## Validation responsibilities
-
-| Boundary | Required checks and cost |
-| --- | --- |
-| Configuration/source/build | Before any host starts: selected mode/profile, source gitlink and clean checkout, native client inventory, fresh and nonoverlapping outputs. Reads selected configuration and source/build files. |
-| Native load | Per-table native row counts before workload; history/RowID installation. HyBench reuses actual COPY counts from its atomic load; subsequent index/sequence setup cannot change rows. sysbench uses stored table counts; YCSB checks upstream successful inserts, completed binding calls and native baseline-row counts. HyBench hashes generated inputs once and checks runtime files before execution. |
-| Facts and projection | While binding actual receipts/logs: source completeness, statement outcomes, transaction/snapshot consistency, mutation attribution, exact supported accesses and RowID coverage. Reads captured facts; does not run a reference workload. |
-| Publication | Validate common baseline/workload structure while writing; seal history and bind data/Trace watermarks after normal shutdown. RocksDB reuses same-instance write-time SST/Blob SHA-256 and hashes remaining metadata; other native engines hash closed artifacts. |
-| Consumption | Manifest and catalog integrity, file/logical digests, record counts, complete expansions/source-origin bindings, requested value capability and sufficient replay supply. |
-| Service replay | Request/response completion, source expected counts and exact Flush publication; see [Index Service](index-service.md#results-and-validation). |
-
-Native baseline requests are derived from loaded initial rows and their native identities,
-with every source index expanded. Production replay does not create a per-query
-answer file. Matching result counts cannot establish equal keys, RowIDs, versions
-or order; controlled native observations and independent small tests provide those
-oracles. Full-input independent acceptance is an explicitly triggered workflow,
-not an extra scan attached to every generation.
-
-Changing client count, dispatch or backend can reuse an immutable Trace. A new
-run still checks its inputs. Evidence for different bytes, configurations or
-relevant implementation semantics cannot replace that check.
+Only exported operations count. A committed-snapshot search is retained even when its source transaction later aborts; its original read point remains valid. Native manifest transaction, local-search and logical-row-change totals describe source activity and may exceed exported totals. These units differ from returned rows and transport batches. Producer statistics do not replace consumer validation of file/logical identities, record counts, positions, transaction accounting and source-member coverage.
 
 ## Identity and versions
 
@@ -245,171 +76,80 @@ SecondaryKey = (Table, IndexID, IndexedValue, PK, VersionDescending)
 LogicalValue = RowID
 ```
 
-TableIDs start at 1 in source-schema order. IndexID 0 is the primary key;
-secondary IDs follow each table's source index order. The complete catalog and
-its identity are embedded in the manifest even for primary-only export.
-`secondary_index_coverage` is `primary_only` or `all_source_definitions`.
-Benchmark setting `trace.secondary_indexes` defaults to false; true selects all
-source definitions. Source database indexes are retained in either case.
-Nonunique secondary predicates search
-all matching primary keys rather than becoming one PK lookup.
+TableIDs start at 1 in source-schema order; secondary IndexIDs follow each table's source index order. Nonunique secondary predicates search all matching primary keys.
 
-`IndexKey` components are self-delimiting and order-preserving under unsigned
-byte comparison. NULL is `0x02`; non-NULL values start with `0x01`. Signed integers
-use sign-bit-flipped big-endian int64. Timestamps encode microseconds from 1970
-with supported infinities at the extremes. Text is UTF-8 terminated by `0x00`;
-embedded NUL is unsupported. Native DuckDB CHAR is VARCHAR: trailing spaces are
-preserved. Current index families are signed integers, timestamps and binary
-ordered text; arbitrary collations and composite/expression indexes are unsupported.
+`IndexKey` components are self-delimiting and preserve unsigned byte order. NULL is `0x02`; non-NULL values start with `0x01`. Signed integers use sign-bit-flipped big-endian int64; timestamps use microseconds from 1970 with supported infinities at the extremes. Text uses UTF-8 terminated by `0x00`; embedded NUL is unsupported. DuckDB CHAR preserves trailing spaces. Supported families are signed integers, timestamps and binary-ordered text; arbitrary collations and composite/expression indexes are unsupported.
 
-The backend key bytes are `Table(uint32 BE) ++ IndexID(uint32 BE) ++
-[IndexedValue] ++ PK ++ (~Version int64 BE)`. A component-prefix point is
-`[value, prefixSuccessor(value))`; inclusive/exclusive boundaries adjust that
-prefix endpoint. Values at a read point select the latest committed version at
-or below it; a selected tombstone means absent and must not reveal an older value.
+Backend keys are `Table(uint32 BE) ++ IndexID(uint32 BE) ++ [IndexedValue] ++ PK ++ (~Version int64 BE)`. Component-prefix equality is `[value, prefixSuccessor(value))`; inclusive/exclusive bounds adjust that endpoint.
 
-Baseline version is 0. Observed source transaction outcomes receive canonical
-resolution slots in native outcome order, including Commit, Abort and read-only
-transactions. Native start IDs need not increase in that order. Trace
-`transactionId` uses the resolution version; persistent
-`sibench_history.transactions` retains its mapping to native transaction IDs.
-The actual native snapshot determines the visible committed upper bound, rather
-than wall-clock time, transaction ID magnitude or replay completion order.
+Baseline version is 0. Native transaction outcomes receive canonical resolution slots in actual outcome order, including Commit, Abort and read-only transactions; `transactionId` is the resolution version. Native start IDs, wall time, log arrival and replay completion do not define visibility. The actual snapshot determines the committed read bound. At a read point, select the latest exported committed version at or below it; a selected tombstone means absent and cannot expose an older value.
 
-Within a transaction, operation order and `mutationOrdinal` identify preceding
-row changes. Transaction-local Search overlays only that transaction's earlier
-writes on its original snapshot. Other transactions cannot read those provisional
-writes. Commit makes final changes visible; Abort discards them from committed
-index state. Abort still occupies its resolution slot and retains its preceding
-operations in Trace. The service protocol and visibility rules are specified in
-[Data transactions and reads](index-service.md#data-transactions-and-reads).
+Source operation order and `mutationOrdinal` identify original changes. Generation validates complete source transactions before filtering, then retains only the last action for each `(table, index, indexed_value, PK)` at that commit version. Intermediate values do not become separate same-version writes. A secondary key introduced and removed within one transaction may retain an absent-key tombstone; this is harmless and prevents older versions from resurfacing. Original source positions may therefore have gaps.
 
-An Update keeps its RowID. Delete followed by reinsertion allocates a new identity,
-so an old RowID cannot resolve to the replacement row. Failed statement internals
-are not used to guess missing successful identities. Primary-key assignments,
-including permutations and attempts later rolled back, are unsupported.
+Snapshot searches keep the actual committed read bound. Transaction-local searches, including an entire group with any local member, are excluded. Source Abort slots remain as metadata with no exported writes. See [service visibility rules](index-service.md#data-and-snapshot-reads). Primary-key assignments, including permutations and later-aborted attempts, are unsupported.
 
 ## Work units and routing
 
-`work-units.jsonl.zst` stores `work_unit_id`, `connection_id`, `query_id` and
-`source_event`, numbered continuously from 1 in raw origin order. Its SHA-256 is
-in the manifest. Native origins are described under [Native publication](#native-publication).
-This catalog associates requests with recorded operations; it does not reconstruct
-a serverless DAG or make log arrival order into transaction order.
+`work-units.jsonl.zst` stores `work_unit_id`, `connection_id`, `query_id` and `source_event`, with work units numbered continuously from 1; its SHA-256 is in the manifest.
 
-Baseline work units group 4,096 source rows across table boundaries, before index
-expansion. A row's primary and secondary entries stay in the same work unit.
-Control records have workUnitId 0. Workload operation origins have positive IDs.
-Replay preserves the source order and uses these IDs for configured client routing.
+DuckDB capture origins are adopted ART accesses or successful row-change facts; API origins are statement starts. They follow increasing raw `source_event` order. PostgreSQL uses statements as work units and assigns `source_event` during its ordered transaction merge, preserving backend/request identities. Statements without index operations remain accounted for, never as synthetic accesses. Trace itself follows transaction resolution and within-transaction order.
+
+Baseline work units group 4096 source rows across tables before index expansion; all entries for a row stay together. Controls use workUnitId 0; workload origins use positive IDs. Routing preserves recorded order and bindings; work units do not reconstruct a serverless DAG.
 
 ## Operations and index expansion
 
 | Operation | Meaning |
 | --- | --- |
-| Baseline Insert | Load one declared index entry at version 0. |
-| Search / SearchGroup | Query native index bounds at the recorded read point; groups preserve one source access and its expected union/intersection count. |
-| Upsert | Successful source row insert/update projected onto one index entry. |
-| Logical delete | Versioned invalidation; no RowID/Locator sentinel is used. |
-| Begin | Trace transaction boundary, not an RPC. |
-| Commit / Abort | Resolve the source transaction with exact operation/write accounting. |
+| Baseline Insert | One exported index entry at version 0. |
+| Search / SearchGroup | Recorded bounds/read point, with native expected count; groups preserve one source access. |
+| Upsert | The final committed action for one physical index identity at a source version. |
+| Logical delete | Versioned invalidation without a sentinel RowID/Locator. |
+| Begin | Source transaction boundary, not an RPC. |
+| TraceEnd | Source Commit/Abort outcome with exact exported operation/write counts; not an RPC. |
 
-A row change expands to the primary index and every exported secondary index in increasing
-IndexID order. Changing an indexed value deletes the old secondary identity and
-upserts the new one. Unchanged secondary keys also receive the new row version.
-The service must not implicitly perform this expansion again.
+Source changes expand to the primary and every exported secondary index in increasing IndexID order. Changed secondary values delete the old identity and upsert the new; unchanged secondary keys also receive the new row version. Generation checks complete source expansions before coalescing. The service must not expand entries again.
 
-All members share source event, transaction/version, mutation ordinal, work unit
-and RowID. `expansionPosition` is consecutive from 0 and `expansionSize` is the
-complete width. Delete positions carry `deleted_row_id` for maintenance validation.
-A query or control cannot interrupt an expansion. SearchGroup has one source
-position per member, shared group expectations and complete member coverage.
-Primary-only export rewrites mutation expansions to one primary entry. It omits
-secondary searches and whole SearchGroups containing any secondary member,
-without changing the expected result of a remaining query. Begin/Commit/Abort
-and source mutation ordinals remain; stored request/write counts are recomputed.
-Preflight validates complete expansions for the declared export scope before
-applying any additional consumption-side secondary-index filtering.
+Baseline expansion members share source identity, RowID and a complete consecutive `expansionPosition` / `expansionSize`. Exported workload writes are independent final entries with expansion `(0, 1)` and retain their original mutation ordinal, work unit and source event. Deletes carry `deleted_row_id`. SearchGroup has one source position per member and a shared group expectation. `TraceEnd.operations` counts exported writes and search members, and `TraceEnd.writes` counts exported writes. Its position's `expected_count` retains the source mutation count as a provenance bound.
 
-Search results use canonical key order, ascending unless the request specifies
-descending. A positive API limit is a maximum, with expected count no greater
-than it. Snapshot and transaction-local read points are distinct from the native
-engine's physical row ordering. The native producer currently supplies RowID
-values; the protocol's Locator/Relocate capabilities do not imply a native data
-relocation or GC workflow.
+`trace.secondary_indexes` defaults to false. The manifest declares `secondary_index_coverage` as `primary_only` or `all_source_definitions`; source database indexes remain intact. Primary-only export omits secondary writes/searches and whole groups containing secondary members. It preserves source outcomes, including empty transactions, read points and original provenance; exported request/write counts are recomputed.
 
-## Delivery selection
+The writer buffers one source transaction, bounded by 1,000,000 source operations. It validates source accounting, expansions, groups and read points before excluding operations. Preflight validates exported counts, provenance, unique physical keys per commit version and snapshot-only searches before consumption-side filtering. Secondary-enabled consumption rejects a primary-only Trace before backend access; full exports support either setting. Baseline loading drains before workload sending. Snapshot queries wait for required pending write ACKs in replay; no synthetic request or server-side transaction control is added. Failures stop/cancel outstanding work.
 
-Consumption requesting secondary indexes rejects a primary-only Trace before
-opening the backend. A full export can be consumed with either setting.
-Baseline loading drains before workload sending. Replay applies configured
-secondary-index filtering and client routing, then adjusts sent positions and
-transaction counts. The Index Service owns visibility; replay adds no synthetic
-read barriers or source SQL retries. A request failure stops sending, cancels
-outstanding work and closes clients.
+Search uses canonical key order, ascending unless requested otherwise; a positive API limit is a maximum. The protocol's Locator/Relocate capability does not imply native relocation/GC support.
 
-Reports distinguish baseline/workload records, effective operations, source
-transactions, commits/aborts, responses, in-flight work and backpressure.
-`last_resolved_version` includes both committed and aborted transactions. RowID
-replay does not rewrite native row files. The [service contract](index-service.md)
-defines acknowledgment, Flush and durability.
+## Access projection
 
-## Completion and failure
+Source capture represents a finally adopted index access's snapshot-visible output, including prior writes in its transaction. The committed Trace export subsequently excludes transaction-local accesses. It excludes subsequent non-index filtering, sorting, aggregation and other SQL operators, so SQL result counts may differ. For DuckDB, this is an adopted ART access; abandoned attempts and physical candidate order/cost remain diagnostics.
 
-Only normally closed, independently readable native data may be published.
-Compilation leaves `INCOMPLETE`; successful publication atomically writes the
-manifest before removing it. Consumers reject incomplete or altered artifacts.
-Generation retains the first failure and diagnostics and stops later benchmarks.
-There is no PG fallback, resume, recovery replay or automatic source retry.
+Complete index output remains a complete Search even if downstream JOIN/LIMIT discards it. All base and transaction-local matches must be exhausted. Incomplete output is rejected: no exact partial-range/order projection is implemented, and SQL LIMIT cannot become a Search limit.
 
-Source clients have a configured execution timeout. Host setup and shutdown are
-bounded separately. Cleanup errors must not replace the original error. A correct
-final database alone cannot certify complete capture: missing receipts, unresolved
-transactions, scan fragments or snapshot mismatches still reject publication.
+| DuckDB access | Projection |
+| --- | --- |
+| Single-column ART equality/comparison | Actual typed bounds; intersect two bounds where present. |
+| Supported repeated point probes | Deduplicate points; union group with the native visible result count. |
+| Base and transaction-local probes | Matching conditions and the actual snapshot plus earlier local writes. |
+| Interrupted primary-key equality | Accept only identical equality predicates and exactly one emitted matching PK; uniqueness proves complete logical output without a final empty fetch. |
+| Abandoned/internal-history access or a statement without index access | No synthetic benchmark Search. |
+| Missing identity/batch/close facts, unsupported conditions/types or ambiguous intra-statement ordering | Reject generation. |
+
+YCSB API Scan retains its explicit maximum result count and may exhaust the range earlier. It does not alter capture early-stop rules. Failed SQL internals immediately undone without later-visible results stay diagnostic, not logical writes; unknown physical success is neither all-success nor zero work. Source validation retains earlier successful writes and accurately projected searches with the actual outcome before committed export filtering. An observed read of those internal temporary writes requires explicit supported semantics before projection.
 
 ## Replay preflight
 
-`check-replay CONFIG TRACE` validates input without invoking an adapter. Replay
-already performs preflight, so this is a standalone diagnostic, not a required
-extra step. Preflight checks digests, record/expansion counts, source bindings,
-client coverage and operation supply. Runtime value capability is checked before
-creating/opening the target backend.
+`check-replay CONFIG TRACE` validates without invoking an adapter; replay already performs preflight. Checks cover manifest/catalog integrity, physical/logical digests, counts, contiguous resolution slots and the declared watermark, baseline expansions, final-write uniqueness/source bindings, client coverage, requested value capability and sufficient supply. Baseline validation is fused with loading and accepts only version-zero Inserts. Source failures, missing completion facts, unresolved transactions or snapshot mismatches prevent publication even if final rows appear correct.
 
-Supply budgets count effective operations after filtering, excluding baseline and
-controls; each SearchGroup counts once, including requests in aborted transactions.
-The budget is warmup operations + ceil(rate × measurement seconds × (1 + margin)).
-Replay dispatch timing currently uses target calls, including terminal markers
-and individual group members; its `warmup_calls` and call rates are not effective
-request rates. The supply budget alone does not normalize that timing window.
-Insufficient supply fails before loading/sending. Supply does not establish
-achievable throughput or sustained scheduling. Generation emits a finite Trace;
-segmented resume/checkpoints are unsupported.
+Supply counts effective requests after filtering, excluding baseline/source markers, aborted writes and transaction-local searches; each SearchGroup member counts once. Required supply is warmup operations + ceil(rate × measurement seconds × (1 + margin)). Insufficient supply fails before loading/sending. Dispatch warmup, measurement windows and operation rates use this same primitive-operation count. Source terminal markers have no service call or latency samples. Warmup responses remain excluded from measured latency and completion rates even when they arrive after the measured window starts. Supply does not establish achievable throughput; Trace is finite and has no segmented resume/checkpoints.
+
+Reports distinguish baseline/workload records, effective requests, transactions/outcomes, responses, in-flight work and backpressure. `last_resolved_version` includes Abort. RowID replay does not rewrite native rows. [Service checks](index-service.md#results-and-validation) validate counts/completion and Flush completion/binding, not every result identity; independent full-data auditing is a separate explicit workflow.
 
 ## Source scope
 
-Only pinned clean benchmark submodules and the supported native schema/configuration
-are accepted. Generation creates that schema in a new private host; dynamic DDL
-and arbitrary external databases are not supported.
+Only clean pinned benchmark sources with supported native schemas/configurations are accepted. Generation creates a private database; dynamic DDL and arbitrary external databases are unsupported. Baseline counts must match every configured table independently.
 
-| Source/mode | Data and indexes | Execution |
-| --- | --- | --- |
-| YCSB / api | UTF-8 key, configured binary fields in native timestamped RocksDB rows; one primary index. | Upstream A/B/C/F/D/E through the API binding. |
-| sysbench / capture | Configured sbtest tables, id primary index and k secondary index. | Six configured OLTP scripts, including delete/reinsert and conflict retry. |
-| HyBench / capture | Eight source tables, eight primary and thirteen secondary indexes. | AP → TP → concurrent XP; access projection follows the complete-output boundary above. |
+| Source | Data and behavior |
+| --- | --- |
+| YCSB / api | UTF-8 keys, configured binary fields, one primary index; real A/B/C/F/D/E calls. Baseline-only buffering requires successful worker completion and matching committed/emitted insert counts; workload calls are not batched. F remains separate Read and Update calls. |
+| sysbench / capture | Configured sbtest tables, id primary and k secondary indexes; six configured OLTP scripts including delete/reinsert and native conflict retry. |
+| HyBench / capture | Eight tables, eight primary and thirteen secondary indexes; AP → TP → concurrent XP. Native write conflicts roll back that transaction and continue, retaining source diagnostics/outcomes; other SQL errors fail. |
 
-The baseline count must match each configured source table independently. HyBench
-uses its upstream parameter table for the selected `sf`; the small integration
-checks have separately bound inputs. Supported mutation and access semantics are
-those stated above, not arbitrary SQL support implied by DuckDB itself.
-
-## Data files
-
-One sealed `data/data.duckdb` holds current rows, committed before-images, RowIDs
-and source transaction/read-point metadata. DuckDB controls its native file layout;
-the selected native database owns loading, history and capture throughout generation.
-Logical historical versions are deliberately retained. Rolled-back full row images
-are not preserved for Locator retrieval, as described under native row consumption.
-
-Rewrite, physical version GC and file relocation maintenance are not implemented.
-Business Delete is versioned invalidation; it does not reclaim history. Backend
-SST/WAL/MANIFEST files are separate index state controlled by that backend, not
-row-data file generation settings.
+Source retries require matching outcomes; the generator does not invent accesses by rerunning SQL or silently retry failed SQL. Setup, execution and shutdown have separate bounds; cleanup errors cannot replace the first failure. Successful publication requires normal shutdown, not crash recovery.

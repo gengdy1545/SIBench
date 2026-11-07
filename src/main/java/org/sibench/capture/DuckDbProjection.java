@@ -24,7 +24,7 @@ public final class DuckDbProjection {
                     +"CASE tag WHEN 'search' THEN 0 ELSE 1 END,source_event,identity) AS unit_id,* FROM ("
                     +"SELECT a.version,a.transaction_id,a.query_id,a.raw_record AS source_event,a.access_id AS identity,'search' AS tag,"
                     +"'' AS action,a.table_id,a.index_id,a.key_type,a.read_version,0::BIGINT AS row_id,"
-                    +"(SELECT count(*) FROM temp.main.sibench_access_results r WHERE r.access_id=a.access_id) AS expected_count,"
+                    +"(SELECT count(*) FROM temp.main.sibench_access_keys r WHERE r.access_id=a.access_id) AS expected_count,"
                     +"coalesce((SELECT max(c.mutation_ordinal) FROM temp.main.sibench_changes c "
                     +"WHERE c.transaction_id=a.transaction_id AND c.query_id<a.query_id),0) AS mutation_ordinal "
                     +"FROM temp.main.sibench_accesses a UNION ALL SELECT c.version,c.transaction_id,c.query_id,c.source_event,c.change_id,"

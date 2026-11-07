@@ -109,11 +109,27 @@ public class PostgresProjectionCheck {
                     &&o.key().equals(org.sibench.trace.IndexKey.ofInt(1))).toList();
             assertEquals(java.util.List.of(original,original,replacement,replacement,replacement,replacement),
                     changes.stream().map(IndexOperationTrace.Operation::rowId).toList());
+            try(var reference=new IndexReferenceReplay(true,true)) {
+                for(var operation:baseline)reference.accept(operation);
+                for(var operation:operations)
+                    if(!IndexOperationTrace.isControl(operation)||operation.kind()==IndexOperationTrace.TRANSACTION_ABORT)
+                        reference.accept(operation);
+                assertTrue(reference.queries()>=7);
+            }
+            Path exported=root.resolve("committed.pb.zst");
+            var writer=new ProtoTrace.Writer(exported);
+            try(writer){for(var operation:operations)writer.append(operation);}
+            var committed=new ArrayList<IndexOperationTrace.Operation>();
+            ProtoTrace.read(exported,writer.sha256(),writer.logicalSha256(),committed::add);
+            // The aborted UPDATE/INSERT disappear; DELETE/INSERT/UPDATE of id=1 collapse to one.
+            assertEquals(3,committed.stream().filter(o->IndexOperationTrace.isMutation(o)&&o.index()==0).count());
+            assertTrue(committed.stream().noneMatch(o->(o.flags()&IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)!=0));
             var config=new ReplayConfig(true,0,0,0,0,"operation");
-            try(var reference=new IndexReferenceReplay(true,true);var load=new ReplayProjection(config,false,reference::accept);
-                    var replay=new ReplayProjection(config,true,reference::accept)) {
-                for(var operation:baseline)load.accept(operation);load.finish();
-                for(var operation:operations)replay.accept(operation);replay.finish();assertTrue(reference.queries()>=7);
+            try(var reference=new IndexReferenceReplay(true,true);
+                    var replay=new ReplayProjection(config,true,reference::acceptCommitted)) {
+                for(var operation:baseline)reference.acceptCommitted(operation);
+                for(var operation:committed)replay.accept(operation);
+                replay.finish();
             }
             assertEquals(2,capture.reports().size());
             long last;

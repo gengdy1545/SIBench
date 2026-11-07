@@ -9,6 +9,21 @@ import java.util.Map;
 import org.junit.Test;
 
 public class DuckDbGenerationTest {
+    @org.junit.Rule public org.junit.rules.TemporaryFolder temporary = new org.junit.rules.TemporaryFolder();
+
+    @Test public void outputAliasesCannotHideOverlapOrEscapeCaptureDirectory() throws Exception {
+        Path root=temporary.getRoot().toPath().toRealPath();
+        Path capture=Files.createDirectories(root.resolve("results/capture"));
+        Path target=Files.createDirectory(capture.resolve("target"));
+        Files.createSymbolicLink(capture.resolve("alias"),target);
+        assertEquals(Generation.outputDirectory(root,"results/capture/target/run"),
+                Generation.outputDirectory(root,"results/capture/alias/run"));
+        Files.createSymbolicLink(capture.resolve("outside"),Files.createDirectory(root.resolve("source")));
+        assertThrows(IllegalArgumentException.class,()->Generation.outputDirectory(root,"results/capture/outside/run"));
+        Files.createSymbolicLink(capture.resolve("dangling"),root.resolve("missing"));
+        assertThrows(IllegalArgumentException.class,()->Generation.outputDirectory(root,"results/capture/dangling"));
+    }
+
     @Test public void exportDefaultsToPrimaryWithoutChangingSourceIndexes() throws Exception {
         assertFalse(Generation.secondaryIndexes(Map.of()));
         for (String benchmark : new String[]{"ycsb", "sysbench", "hybench"}) {
@@ -25,7 +40,7 @@ public class DuckDbGenerationTest {
     @Test public void requestTargetsAreExplicitPositiveAndSharedAcrossProfiles() throws Exception {
         assertEquals(0,Generation.requestTarget(Map.of()));
         for(String benchmark:java.util.List.of("ycsb","sysbench","hybench"))
-            assertEquals(60000000,Generation.requestTarget(parse(Files.readString(Path.of("config/benchmark/"+benchmark+".yaml")))));
+            assertEquals(10000000,Generation.requestTarget(parse(Files.readString(Path.of("config/benchmark/"+benchmark+".yaml")))));
         for(Object invalid:java.util.List.of(0,-1,"60000000",1.5,true))
             assertThrows(IllegalArgumentException.class,()->Generation.requestTarget(Map.of("trace",Map.of("workload_requests",invalid))));
     }

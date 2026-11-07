@@ -4,36 +4,38 @@ import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
 
 import java.io.IOException;
+import java.math.BigInteger;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.LongSupplier;
 
 /** One sender, deterministic work-unit routing, and bounded independently completed responses. */
 public final class ReplayDispatcher implements AutoCloseable {
     private static final class Pending {
         private final long deadline, started;
         private final CompletableFuture<Void> response;
-        private final String commitDescription;
-        private final int clientId, kind;
+        private final int clientId;
         private final Operation operation;
         private int members = 1;
+        private int warmupMembers;
         private long[] memberStarts;
+        private boolean failed;
 
-        Pending(long deadline, CompletableFuture<Void> response, String commitDescription,
-                int clientId, Operation operation, long started, int kind) {
+        Pending(long deadline, CompletableFuture<Void> response,
+                int clientId, Operation operation, long started, boolean measured) {
             this.deadline = deadline;
             this.response = response;
-            this.commitDescription = commitDescription;
             this.clientId = clientId;
             this.operation = operation;
             this.started = started;
-            this.kind = kind;
+            this.warmupMembers = measured ? 0 : 1;
         }
 
         long deadline() { return deadline; }
         CompletableFuture<Void> response() { return response; }
 
         // The sender and response callback hold inFlight while adding or completing members.
-        void addMember(long start) {
+        void addMember(long start, boolean measured) {
             if (memberStarts == null) {
                 memberStarts = new long[8];
                 memberStarts[0] = started;
@@ -41,82 +43,91 @@ public final class ReplayDispatcher implements AutoCloseable {
             if (members == memberStarts.length)
                 memberStarts = Arrays.copyOf(memberStarts, members * 2);
             memberStarts[members++] = start;
+            if (!measured) warmupMembers++;
         }
 
         void recordLatency(Latency latency, long completed) {
-            if (memberStarts == null) latency.add(completed - started);
-            else for (int i = 0; i < members; i++) latency.add(completed - memberStarts[i]);
+            if (memberStarts == null) {
+                if (warmupMembers == 0) latency.add(completed - started);
+            } else for (int i = warmupMembers; i < members; i++) latency.add(completed - memberStarts[i]);
         }
 
         String description() {
-            if (operation == null) return commitDescription;
             return "client " + clientId + ", source event " + operation.sourceEvent()
                     + ", " + IndexOperationTrace.kindName(operation.kind())
                     + ", transaction " + operation.transactionId() + ", version " + operation.version();
         }
     }
 
-    /** Millisecond response latency from send call (queue included) to response. */
-    private static final class Latency {
-        private static final int MAX_MILLIS = 60_000;
-        private final long[] buckets = new long[MAX_MILLIS + 1];
-        private long count, totalNanos, maximumNanos, overflow;
-
-        void reset() {
-            java.util.Arrays.fill(buckets, 0);
-            count = totalNanos = maximumNanos = overflow = 0;
-        }
+    /** Exact samples below 2048 ns; larger buckets have less than 1/1024 relative width. */
+    static final class Latency {
+        private final long[] buckets = new long[54 * 1024];
+        private long count, totalNanos, maximumNanos;
+        private BigInteger overflowTotal;
 
         void add(long nanos) {
+            if (nanos < 0) throw new IllegalArgumentException("Negative response latency");
             count++;
-            totalNanos += nanos;
+            if (overflowTotal != null) overflowTotal = overflowTotal.add(BigInteger.valueOf(nanos));
+            else if (Long.MAX_VALUE - totalNanos < nanos)
+                overflowTotal = BigInteger.valueOf(totalNanos).add(BigInteger.valueOf(nanos));
+            else totalNanos += nanos;
             maximumNanos = Math.max(maximumNanos, nanos);
-            long millis = nanos / 1_000_000L;
-            if (millis > MAX_MILLIS) {
-                overflow++;
-                buckets[MAX_MILLIS]++;
-            } else buckets[(int) millis]++;
+            int shift = Math.max(0, 63 - Long.numberOfLeadingZeros(nanos) - 10);
+            buckets[(shift << 10) + (int) (nanos >>> shift)]++;
         }
 
         Map<String, Object> describe() {
             var report = new LinkedHashMap<String, Object>();
             report.put("count", count);
-            report.put("mean_ms", count == 0 ? 0.0 : totalNanos / 1e6 / count);
+            double total = overflowTotal == null ? totalNanos : overflowTotal.doubleValue();
+            report.put("mean_ms", count == 0 ? 0.0 : total / 1e6 / count);
             report.put("p50_ms", percentile(50));
             report.put("p95_ms", percentile(95));
             report.put("p99_ms", percentile(99));
             report.put("max_ms", maximumNanos / 1e6);
-            report.put("resolution_ms", 1);
-            report.put("overflow_ms", overflow);
+            report.put("percentile_bound", "upper");
+            report.put("percentile_relative_error_bound", 1.0 / 1024);
+            report.put("exact_below_ns", 2048);
+            report.put("mean_and_max", "unquantized");
             return report;
         }
 
         /** The bucket at or above the requested share; bucket values are upper bounds. */
-        private long percentile(int percent) {
+        private double percentile(int percent) {
             if (count == 0) return 0;
             long target = Math.max(1, (count * percent + 99) / 100);
             long seen = 0;
-            for (int millis = 0; millis <= MAX_MILLIS; millis++) {
-                seen += buckets[millis];
-                if (seen >= target) return millis;
+            for (int bucket = 0; bucket < buckets.length; bucket++) {
+                seen += buckets[bucket];
+                if (seen >= target) {
+                    int shift = Math.max(0, (bucket >>> 10) - 1);
+                    long upper = bucket < 2048 ? bucket
+                            : ((long) (1024 + (bucket & 1023)) << shift) | ((1L << shift) - 1);
+                    return Math.min(upper, maximumNanos) / 1e6;
+                }
             }
-            return MAX_MILLIS;
+            throw new IllegalStateException("Latency histogram count mismatch");
         }
     }
 
     private final ReplayConfig config;
     private final ReplayTarget.Factory factory;
-    /** Calls sent before the measured window starts; their latencies are not reported. */
+    private final LongSupplier nanoTime;
+    /** Basic operations sent before the measured window starts. */
     private final long warmup;
-    private long firstSend, measuredStart, lastSend, lastCompletion, completedAtMeasuredStart, drainNanos;
+    private long firstSend, measuredStart, lastSend, lastCompletion, measuredLastCompletion, measuredCompleted, drainNanos;
     private final Map<Integer, ReplayTarget> clients = new LinkedHashMap<>();
     private final BitSet workUnits = new BitSet();
     private final Map<Integer, long[]> counts = new TreeMap<>();
     private final Map<Long, Pending> inFlight = new LinkedHashMap<>();
     private final Map<CompletableFuture<Void>, Pending> baselineResponses = new IdentityHashMap<>();
-    private final Latency writeLatency = new Latency(), searchLatency = new Latency(), commitLatency = new Latency(), abortLatency = new Latency();
-    private long sent, completed, workUnitCount, peakInFlight, orderChecksum, backpressureNanos, commitMarkers, abortMarkers;
+    private final Latency writeLatency = new Latency(), searchLatency = new Latency();
+    private long sent, operationsSent, completed, completedOperations, workUnitCount, peakInFlight,
+            orderChecksum, backpressureNanos, dependencyWaitNanos;
     private long inFlightMembers, peakCompletionGroups;
+    private int pendingWriteResponses;
+    private long failedOperations, timedOutOperations;
     private IOException failure;
     private CompletableFuture<Void> localSend;
     private volatile boolean closed;
@@ -126,11 +137,16 @@ public final class ReplayDispatcher implements AutoCloseable {
         this(config, factory, 0);
     }
 
-    /** {@code warmup}: target calls before the measured window, 0 to measure from the start. */
+    /** {@code warmup}: basic operations before the measured window, 0 to measure from the start. */
     public ReplayDispatcher(ReplayConfig config, ReplayTarget.Factory factory, long warmup) {
+        this(config, factory, warmup, System::nanoTime);
+    }
+
+    ReplayDispatcher(ReplayConfig config, ReplayTarget.Factory factory, long warmup, LongSupplier nanoTime) {
         this.config = config;
         this.factory = Objects.requireNonNull(factory);
         this.warmup = warmup;
+        this.nanoTime = Objects.requireNonNull(nanoTime);
     }
 
     /**
@@ -138,15 +154,10 @@ public final class ReplayDispatcher implements AutoCloseable {
      * before its first call, whose response may complete within the send itself.
      */
     private void beginCall(long now) {
-        if (sent == 0) firstSend = now;
-        if (sent == warmup)
+        if (operationsSent == 0) firstSend = now;
+        if (operationsSent == warmup)
             synchronized (inFlight) {
                 measuredStart = now;
-                completedAtMeasuredStart = completed;
-                writeLatency.reset();
-                searchLatency.reset();
-                commitLatency.reset();
-                abortLatency.reset();
             }
     }
 
@@ -175,8 +186,9 @@ public final class ReplayDispatcher implements AutoCloseable {
     private void checkFailure() throws IOException {
         if (failure != null) throw failure;
         if (!inFlight.isEmpty()
-                && inFlight.values().iterator().next().deadline() <= System.nanoTime()) {
+                && inFlight.values().iterator().next().deadline() <= nanoTime.getAsLong()) {
             var oldest = inFlight.entrySet().iterator().next();
+            recordResponseFailure(oldest.getValue(), true);
             throw fail(
                     new IOException(
                             "Service response timeout at dispatch "
@@ -192,6 +204,13 @@ public final class ReplayDispatcher implements AutoCloseable {
         return failure;
     }
 
+    private void recordResponseFailure(Pending pending, boolean timeout) {
+        if (pending.failed) return;
+        pending.failed = true;
+        if (timeout) timedOutOperations += pending.members;
+        else failedOperations += pending.members;
+    }
+
     public void send(Operation operation) throws IOException {
         send(operation, null);
     }
@@ -199,14 +218,23 @@ public final class ReplayDispatcher implements AutoCloseable {
     public void send(Operation operation, org.sibench.adapters.proto.Request stored) throws IOException {
         checkSender();
         int clientId = route(operation);
-        long started = System.nanoTime();
+        if (operation.kind() == IndexOperationTrace.SEARCH
+                && (!operation.grouped() || operation.expansionPosition() == 0))
+            awaitWrites(operation.readTimestamp());
         synchronized (inFlight) {
-            long wait = inFlightMembers >= config.maxInFlight() ? System.nanoTime() : 0;
-            while (inFlightMembers >= config.maxInFlight()) {
+            // A buffered search group cannot produce responses until its last member arrives.
+            // Projection delivers complete groups contiguously on this single sender.
+            int admissionSize = operation.grouped() && operation.expansionPosition() == 0
+                    ? operation.expansionSize() : 1;
+            if (admissionSize > config.maxInFlight())
+                throw fail(new IOException("Search group has " + admissionSize
+                        + " members, exceeding max_in_flight=" + config.maxInFlight()));
+            long wait = inFlightMembers > config.maxInFlight() - admissionSize ? nanoTime.getAsLong() : 0;
+            while (inFlightMembers > config.maxInFlight() - admissionSize) {
                 checkFailure();
                 waitForResponse();
             }
-            if (wait != 0) backpressureNanos += System.nanoTime() - wait;
+            if (wait != 0) backpressureNanos += nanoTime.getAsLong() - wait;
             checkFailure();
         }
         try {
@@ -217,8 +245,10 @@ public final class ReplayDispatcher implements AutoCloseable {
             }
             long sequence = sent + 1;
             long deadline =
-                    System.nanoTime() + TimeUnit.SECONDS.toNanos(config.requestTimeoutSeconds());
-            beginCall(System.nanoTime());
+                    nanoTime.getAsLong() + TimeUnit.SECONDS.toNanos(config.requestTimeoutSeconds());
+            long started = nanoTime.getAsLong();
+            beginCall(started);
+            boolean measured = operationsSent >= warmup;
             ReplayTarget.SendHandle handle =
                     Objects.requireNonNull(client.send(sequence, operation, stored));
             localSend = handle.sent().toCompletableFuture();
@@ -230,10 +260,11 @@ public final class ReplayDispatcher implements AutoCloseable {
             synchronized (inFlight) {
                 Pending shared = baseline ? baselineResponses.get(response) : null;
                 if (shared == null) {
-                    added = new Pending(deadline, response, null, clientId, operation, started, latencyKind);
+                    added = new Pending(deadline, response, clientId, operation, started, measured);
                     inFlight.put(sequence, added);
+                    if (operation.kind() != IndexOperationTrace.SEARCH) pendingWriteResponses++;
                     if (baseline) baselineResponses.put(response, added);
-                } else shared.addMember(started);
+                } else shared.addMember(started, measured);
                 inFlightMembers++;
                 peakInFlight = Math.max(peakInFlight, inFlightMembers);
                 peakCompletionGroups = Math.max(peakCompletionGroups, inFlight.size());
@@ -244,8 +275,10 @@ public final class ReplayDispatcher implements AutoCloseable {
                         synchronized (inFlight) {
                             Pending removed = inFlight.remove(sequence);
                             if (removed != null) inFlightMembers -= removed.members;
+                            if (removed != null && operation.kind() != IndexOperationTrace.SEARCH) pendingWriteResponses--;
                             baselineResponses.remove(response, pending);
-                            if (error != null && !closed)
+                            if (error != null && !closed) {
+                                recordResponseFailure(pending, false);
                                 fail(
                                         new IOException(
                                                 "Service response failed at dispatch "
@@ -253,17 +286,23 @@ public final class ReplayDispatcher implements AutoCloseable {
                                                         + ", client "
                                                         + clientId,
                                                 error));
+                            }
                             else if (error == null && !closed) {
-                                if (deadline <= System.nanoTime())
+                                if (deadline <= nanoTime.getAsLong()) {
+                                    recordResponseFailure(pending, true);
                                     fail(
                                             new IOException(
                                                     "Service response timeout at dispatch "
                                                             + sequence
                                                             + ", client "
                                                             + clientId));
+                                }
                                 else {
                                     completed += pending.members;
-                                    lastCompletion = System.nanoTime();
+                                    completedOperations += pending.members;
+                                    measuredCompleted += pending.members - pending.warmupMembers;
+                                    lastCompletion = nanoTime.getAsLong();
+                                    if (pending.members > pending.warmupMembers) measuredLastCompletion = lastCompletion;
                                     pending.recordLatency(latencyKind == 1 ? searchLatency : writeLatency,
                                             lastCompletion);
                                 }
@@ -271,12 +310,13 @@ public final class ReplayDispatcher implements AutoCloseable {
                             inFlight.notifyAll();
                         }
                     });
-            long remaining = deadline - System.nanoTime();
+            long remaining = deadline - nanoTime.getAsLong();
             if (remaining <= 0) throw new TimeoutException("Local send timeout");
             localSend.get(remaining, TimeUnit.NANOSECONDS);
             localSend = null;
             sent++;
-            lastSend = System.nanoTime();
+            operationsSent++;
+            lastSend = nanoTime.getAsLong();
             long[] clientCounts = counts.computeIfAbsent(clientId, key -> new long[4]);
             clientCounts[0]++;
             if (operation.kind() == IndexOperationTrace.SEARCH) clientCounts[1]++;
@@ -328,108 +368,44 @@ public final class ReplayDispatcher implements AutoCloseable {
         }
     }
 
-    /** Sends the terminal marker after its transaction's operations, on the control client. */
-    public void sendTerminal(long transactionId, long version, boolean aborted) throws IOException {
-        checkSender();
-        int clientId = 0;
-        long started = System.nanoTime();
+    /** Snapshot reads depend on acknowledged writes at or before their read timestamp. */
+    private void awaitWrites(long readTimestamp) throws IOException {
         synchronized (inFlight) {
-            while (inFlightMembers >= config.maxInFlight()) {
+            if (!hasPendingWrites(readTimestamp)) return;
+        }
+        long start = nanoTime.getAsLong();
+        flushClients();
+        synchronized (inFlight) {
+            while (hasPendingWrites(readTimestamp)) {
                 checkFailure();
                 waitForResponse();
             }
             checkFailure();
         }
+        dependencyWaitNanos += nanoTime.getAsLong() - start;
+    }
+
+    // Called only at query boundaries under inFlight; bounded by max_in_flight.
+    private boolean hasPendingWrites(long readTimestamp) {
+        if (pendingWriteResponses == 0) return false;
+        for (Pending pending : inFlight.values())
+            if (pending.operation.kind() != IndexOperationTrace.SEARCH
+                    && pending.operation.version() <= readTimestamp) return true;
+        return false;
+    }
+
+    private void flushClients() throws IOException {
         try {
-            ReplayTarget client = clients.get(clientId);
-            if (client == null) {
-                client = Objects.requireNonNull(factory.open(clientId));
-                clients.put(clientId, client);
-            }
-            long sequence = sent + 1;
-            long deadline =
-                    System.nanoTime() + TimeUnit.SECONDS.toNanos(config.requestTimeoutSeconds());
-            beginCall(System.nanoTime());
-            ReplayTarget.SendHandle handle =
-                    Objects.requireNonNull(aborted ? client.sendAbort(sequence, transactionId, version)
-                            : client.sendCommit(sequence, transactionId, version));
-            localSend = handle.sent().toCompletableFuture();
-            CompletableFuture<Void> response = handle.response().toCompletableFuture();
+            for (ReplayTarget client : clients.values()) client.flush();
+        } catch (IOException | RuntimeException error) {
             synchronized (inFlight) {
-                inFlight.put(
-                        sequence,
-                        new Pending(
-                                deadline,
-                                response,
-                                "client " + clientId + (aborted ? ", abort marker, transaction " : ", commit marker, transaction ")
-                                        + transactionId + ", version " + version,
-                                clientId,
-                                null,
-                                started,
-                                2));
-                inFlightMembers++;
-                peakInFlight = Math.max(peakInFlight, inFlightMembers);
-                peakCompletionGroups = Math.max(peakCompletionGroups, inFlight.size());
-            }
-            response.whenComplete(
-                    (unused, error) -> {
-                        synchronized (inFlight) {
-                            Pending removed = inFlight.remove(sequence);
-                            if (removed != null) inFlightMembers -= removed.members;
-                            if (error != null && !closed)
-                                fail(
-                                        new IOException(
-                                                "Commit response failed at dispatch "
-                                                        + sequence
-                                                        + ", client "
-                                                        + clientId,
-                                                error));
-                            else if (error == null && !closed) {
-                                if (deadline <= System.nanoTime())
-                                    fail(
-                                            new IOException(
-                                                    "Commit response timeout at dispatch "
-                                                            + sequence
-                                                            + ", client "
-                                                            + clientId));
-                                else {
-                                    completed++;
-                                    lastCompletion = System.nanoTime();
-                                    (aborted ? abortLatency : commitLatency).add(lastCompletion - started);
-                                }
-                            }
-                            inFlight.notifyAll();
-                        }
-                    });
-            long remaining = deadline - System.nanoTime();
-            if (remaining <= 0) throw new TimeoutException("Local send timeout");
-            localSend.get(remaining, TimeUnit.NANOSECONDS);
-            localSend = null;
-            sent++;
-            lastSend = System.nanoTime();
-            if (aborted) abortMarkers++;
-            else commitMarkers++;
-            synchronized (inFlight) {
-                checkFailure();
-            }
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
-            synchronized (inFlight) {
-                throw fail(new IOException("Replay interrupted", error));
-            }
-        } catch (ExecutionException | TimeoutException | RuntimeException error) {
-            synchronized (inFlight) {
-                throw fail(new IOException("Local send failed", error));
-            }
-        } catch (IOException error) {
-            synchronized (inFlight) {
-                throw fail(error);
+                throw fail(error instanceof IOException io ? io : new IOException("Client flush failed", error));
             }
         }
     }
 
     private void waitForResponse() throws IOException {
-        long nanos = inFlight.values().iterator().next().deadline() - System.nanoTime();
+        long nanos = inFlight.values().iterator().next().deadline() - nanoTime.getAsLong();
         if (nanos <= 0) {
             checkFailure();
             return;
@@ -444,14 +420,8 @@ public final class ReplayDispatcher implements AutoCloseable {
 
     public void drain() throws IOException {
         checkSender();
-        long start = System.nanoTime();
-        try {
-            for (ReplayTarget client : clients.values()) client.flush();
-        } catch (IOException | RuntimeException error) {
-            synchronized (inFlight) {
-                throw fail(error instanceof IOException io ? io : new IOException("Client flush failed", error));
-            }
-        }
+        long start = nanoTime.getAsLong();
+        flushClients();
         synchronized (inFlight) {
             while (!inFlight.isEmpty()) {
                 checkFailure();
@@ -459,7 +429,7 @@ public final class ReplayDispatcher implements AutoCloseable {
             }
             checkFailure();
         }
-        drainNanos += System.nanoTime() - start;
+        drainNanos += nanoTime.getAsLong() - start;
     }
 
     public void requireClientCoverage() throws IOException {
@@ -479,14 +449,19 @@ public final class ReplayDispatcher implements AutoCloseable {
         report.put("work_units", workUnitCount);
         report.put("client_routing", "source_work_unit_round_robin");
         report.put("target_calls", sent);
-        report.put("commit_markers", commitMarkers);
-        report.put("abort_markers", abortMarkers);
+        report.put("basic_operations", operationsSent);
         report.put("operation_order_checksum", orderChecksum);
-        report.put("local_send_boundary", "complete_local_transmission_not_service_execution");
+        report.put("local_send_boundary", "transport_acceptance_not_service_execution");
         report.put("service_visibility_owner", "index_service");
         report.put("backpressure_seconds", backpressureNanos / 1e9);
+        report.put("dependency_wait_seconds", dependencyWaitNanos / 1e9);
+        report.put("latency_boundary", "client_api_entry_to_final_response_excluding_replay_waits");
         synchronized (inFlight) {
             report.put("completed_responses", completed);
+            report.put("completed_operations", completedOperations);
+            report.put("failed_response_operations", failedOperations);
+            report.put("timed_out_operations", timedOutOperations);
+            if (failure != null) report.put("failure", failure.getMessage());
             report.put("pending_responses", inFlightMembers);
             report.put("pending_completion_groups", inFlight.size());
             report.put("peak_completion_groups", peakCompletionGroups);
@@ -494,8 +469,6 @@ public final class ReplayDispatcher implements AutoCloseable {
             report.put("measurement", measurement());
             report.put("search_latency", searchLatency.describe());
             report.put("write_latency", writeLatency.describe());
-            report.put("commit_latency", commitLatency.describe());
-            report.put("abort_latency", abortLatency.describe());
         }
         report.put(
                 "per_client",
@@ -531,6 +504,7 @@ public final class ReplayDispatcher implements AutoCloseable {
             inFlight.clear();
             baselineResponses.clear();
             inFlightMembers = 0;
+            pendingWriteResponses = 0;
             inFlight.notifyAll();
         }
         IOException error = null;
@@ -546,25 +520,27 @@ public final class ReplayDispatcher implements AutoCloseable {
     }
 
     /**
-     * The measured window: calls after the warmup, their local send rate and the rate responses
-     * completed at, and the final drain. Latency histograms cover the same calls. There is no
+     * The measured window: basic operations after warmup, their local send rate and response
+     * completion rate, and the final drain. There is no
      * rate schedule, so a target arrival rate does not exist (N/A).
      */
     private Map<String, Object> measurement() {
         var report = new LinkedHashMap<String, Object>();
-        report.put("warmup_calls", Math.min(warmup, sent));
-        long calls = Math.max(0, sent - warmup);
-        report.put("measured_calls", calls);
+        report.put("unit", "basic_index_operation");
+        report.put("warmup_operations", Math.min(warmup, operationsSent));
+        long calls = Math.max(0, operationsSent - warmup);
+        report.put("measured_operations", calls);
+        report.put("completed_operations", measuredCompleted);
         report.put("target_arrival_rate", "N/A");
         if (calls > 0) {
             double sending = (lastSend - measuredStart) / 1e9;
-            double completing = (lastCompletion - measuredStart) / 1e9;
+            double completing = measuredLastCompletion == 0 ? 0 : (measuredLastCompletion - measuredStart) / 1e9;
             report.put("send_seconds", sending);
             report.put("send_rate", sending > 0 ? calls / sending : 0.0);
             report.put("completion_seconds", completing);
             report.put(
                     "completion_rate",
-                    completing > 0 ? (completed - completedAtMeasuredStart) / completing : 0.0);
+                    completing > 0 ? measuredCompleted / completing : 0.0);
         }
         report.put("first_send_to_last_completion_seconds", Math.max(0, lastCompletion - firstSend) / 1e9);
         report.put("drain_seconds", drainNanos / 1e9);

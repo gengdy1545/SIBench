@@ -52,14 +52,14 @@ public class DuckDbAccessesCheck extends DuckDbHostFixture {
             }
             bind(observer,raw,session);DuckDbAccesses.bind(observer,CATALOG);
             assertEquals(3,number(observer,"SELECT count(*) FROM sibench_accesses WHERE index_id=1"));
-            try(var q=observer.createStatement();var r=q.executeQuery("SELECT a.version,count(r.row_id),sum(CAST(r.key_sql AS BIGINT)) "
-                    +"FROM sibench_accesses a LEFT JOIN sibench_access_results r USING(access_id) WHERE a.index_id=1 "
+            try(var q=observer.createStatement();var r=q.executeQuery("SELECT a.version,count(r.key_sql),sum(CAST(r.key_sql AS BIGINT)) "
+                    +"FROM sibench_accesses a LEFT JOIN sibench_access_keys r USING(access_id) WHERE a.index_id=1 "
                     +"GROUP BY a.access_id,a.version,a.query_id ORDER BY a.query_id")) {
                 assertTrue(r.next());assertEquals(1,r.getLong(1));assertEquals(2,r.getLong(2));assertEquals(30,r.getLong(3));
                 assertTrue(r.next());assertEquals(1,r.getLong(1));assertEquals(4,r.getLong(2));assertEquals(100,r.getLong(3));
                 assertTrue(r.next());assertEquals(2,r.getLong(1));assertEquals(2,r.getLong(2));assertEquals(30,r.getLong(3));assertFalse(r.next());
             }
-            assertEquals(local,number(observer,"SELECT row_id FROM sibench_access_results WHERE key_sql='40'"));
+            assertEquals(local,DuckDbIdentities.observedRow(observer,1,"40",0,1,Long.MAX_VALUE));
             assertEquals(1,number(observer,"SELECT count(*) FROM sibench_accesses WHERE index_id=0"));
             assertEquals(1,number(observer,"SELECT count(*) FROM sibench_transactions WHERE outcome='rollback'"));
         }
@@ -74,8 +74,8 @@ public class DuckDbAccessesCheck extends DuckDbHostFixture {
             var diagnostics=DuckDbDiagnostics.summarize(observer,org.sibench.config.BenchmarkSelection.Mode.CAPTURE);
             assertFalse(((List<?>)diagnostics.get("art_attempts")).isEmpty());
             DuckDbAccesses.bind(observer,CATALOG);
-            assertEquals(2,number(observer,"SELECT count(*) FROM sibench_access_results"));
-            assertEquals(30,number(observer,"SELECT sum(CAST(key_sql AS BIGINT)) FROM sibench_access_results"));
+            assertEquals(2,number(observer,"SELECT count(*) FROM sibench_access_keys"));
+            assertEquals(30,number(observer,"SELECT sum(CAST(key_sql AS BIGINT)) FROM sibench_access_keys"));
         }
     }
     @Test public void rejectsUnreadBaseBatches()throws Exception {
@@ -102,8 +102,8 @@ public class DuckDbAccessesCheck extends DuckDbHostFixture {
             bind(observer,raw,session);
             assertTrue(number(observer,"SELECT count(*) FROM sibench_consumption WHERE stage='limit' AND input_rows=1")>0);
             DuckDbAccesses.bind(observer,CATALOG);
-            assertEquals(2048,number(observer,"SELECT count(*) FROM sibench_access_results"));
-            assertEquals(2047L*2048/2,number(observer,"SELECT sum(CAST(key_sql AS BIGINT)) FROM sibench_access_results"));
+            assertEquals(2048,number(observer,"SELECT count(*) FROM sibench_access_keys"));
+            assertEquals(2047L*2048/2,number(observer,"SELECT sum(CAST(key_sql AS BIGINT)) FROM sibench_access_keys"));
         }
     }
     @Test public void rejectsUnreadOwnWritesAfterCompleteBaseBatch()throws Exception {
@@ -141,7 +141,7 @@ public class DuckDbAccessesCheck extends DuckDbHostFixture {
             DuckDbStatements.bind(observer,List.of(first,second));DuckDbTransactions.bind(observer,"data");DuckDbIdentities.bind(observer);
             assertTrue(number(observer,"SELECT count(*) FROM sibench_index_rows WHERE phase='closed' AND NOT source_drained")>0);
             DuckDbAccesses.bind(observer,List.of(CATALOG.get(0)));
-            assertEquals(2,number(observer,"SELECT count(*) FROM sibench_access_results WHERE key_sql='10'"));
+            assertEquals(2,number(observer,"SELECT count(*) FROM sibench_access_keys WHERE key_sql='10'"));
             assertEquals(2,number(observer,"SELECT count(*) FROM sibench_transactions WHERE outcome='rollback'"));
             assertEquals(1,number(observer,"SELECT k FROM items WHERE id=10"));
         }

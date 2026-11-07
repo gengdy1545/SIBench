@@ -27,13 +27,43 @@ import org.sibench.trace.IndexKey;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
-/** The service publishes complete commits and streams full query results. */
+/** Writes acknowledge applied versions; queries retain snapshots and stream complete results. */
 public class IndexServerTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     @Test(timeout = 10000)
+    public void streamClosurePreservesTheFirstProtocolFailure() throws Exception {
+        var server = ServerBuilder.forPort(0).addService(new IndexServiceGrpc.IndexServiceImplBase() {
+            @Override public StreamObserver<Request> execute(StreamObserver<Response> responses) {
+                return new StreamObserver<>() {
+                    public void onNext(Request request) {
+                        responses.onNext(Response.newBuilder().setId(999).setStatus(Status.OK).build());
+                        responses.onCompleted();
+                    }
+                    public void onError(Throwable error) {}
+                    public void onCompleted() {}
+                };
+            }
+        }).build().start();
+        try (var grpc = new GrpcService("127.0.0.1:" + server.getPort(),
+                new TraceRequests(ValueKind.ROW_ID), "first-error", 2)) {
+            var target = grpc.factory().open(0);
+            var row = IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0, IndexKey.ofInt(7), 0, 0, 0, 70);
+            var response = target.send(1, row).response().toCompletableFuture();
+            var first = assertThrows(java.util.concurrent.ExecutionException.class, () -> response.get(2, TimeUnit.SECONDS));
+            assertTrue(first.getCause().getMessage().contains("unknown request"));
+            // The later terminal callback must not replace the protocol error already delivered.
+            for (int attempt = 0; attempt < 100; attempt++) {
+                var next = assertThrows(java.io.IOException.class, () -> target.send(2, row));
+                assertSame(first.getCause(), next.getCause());
+                Thread.sleep(1);
+            }
+        } finally { server.shutdownNow(); }
+    }
+
+    @Test(timeout = 10000)
     public void foreignStreamCannotChangeAnAlreadyBoundIndex() throws Exception {
-        try (var backend = RocksDbBackend.create(temporary.getRoot().toPath().resolve("binding"), ValueKind.ROW_ID);
+        try (var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("binding"), ValueKind.ROW_ID);
                 var server = IndexServer.start(0, backend)) {
             backend.bind("original");
             var row = IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0,
@@ -52,7 +82,7 @@ public class IndexServerTest {
         var entered = new java.util.concurrent.CountDownLatch(1);
         var release = new java.util.concurrent.CountDownLatch(1);
         var pool = java.util.concurrent.Executors.newSingleThreadExecutor();
-        try (var backend = RocksDbBackend.create(temporary.getRoot().toPath().resolve("flush-boundary"), ValueKind.ROW_ID)) {
+        try (var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("flush-boundary"), ValueKind.ROW_ID)) {
             var blocked = (IndexBackend) java.lang.reflect.Proxy.newProxyInstance(
                     getClass().getClassLoader(), new Class<?>[] {IndexBackend.class}, (proxy, method, args) -> {
                         if (method.getName().equals("write")) {
@@ -74,7 +104,7 @@ public class IndexServerTest {
                         () -> flushed.get(100, TimeUnit.MILLISECONDS));
                 release.countDown();
                 written.get(2, TimeUnit.SECONDS);
-                assertEquals(0, flushed.get(2, TimeUnit.SECONDS).getPublishedVersion());
+                assertEquals("flush-test", flushed.get(2, TimeUnit.SECONDS).getIndexBinding());
                 assertEquals(1, backend.search(Search.newBuilder().setTable(1).build()).size());
             }
         } finally {
@@ -93,7 +123,7 @@ public class IndexServerTest {
                 var deadline = io.grpc.Context.current().getDeadline();
                 response.onNext(org.sibench.adapters.proto.FlushResponse.newBuilder().setIndexBinding(
                         deadline != null && deadline.timeRemaining(TimeUnit.SECONDS)
-                                <= PublishedIndex.FLUSH_TIMEOUT_SECONDS ? "bounded" : "unbounded").build());
+                                <= IndexExecutor.FLUSH_TIMEOUT_SECONDS ? "bounded" : "unbounded").build());
                 response.onCompleted();
             }
         }).build().start();
@@ -106,14 +136,13 @@ public class IndexServerTest {
     }
 
     @Test
-    public void flushEvidenceMustMatchTheExpectedBindingVersionAndLocation() throws Exception {
+    public void flushEvidenceMustMatchTheExpectedBindingAndLocation() throws Exception {
         var correct = org.sibench.adapters.proto.FlushResponse.newBuilder()
-                .setIndexBinding("trace-a").setPublishedVersion(4).setIndexLocation("index").build();
-        ServiceReplay.requireFlush(correct, "trace-a", 4);
-        for (var wrong : java.util.List.of(correct.toBuilder().setPublishedVersion(0).build(),
-                correct.toBuilder().setIndexBinding("trace-b").build(),
+                .setIndexBinding("trace-a").setIndexLocation("index").build();
+        ServiceReplay.requireFlush(correct, "trace-a");
+        for (var wrong : java.util.List.of(correct.toBuilder().setIndexBinding("trace-b").build(),
                 correct.toBuilder().clearIndexLocation().build()))
-            assertThrows(java.io.IOException.class, () -> ServiceReplay.requireFlush(wrong, "trace-a", 4));
+            assertThrows(java.io.IOException.class, () -> ServiceReplay.requireFlush(wrong, "trace-a"));
     }
 
     @Test(timeout = 10000)
@@ -136,16 +165,6 @@ public class IndexServerTest {
             assertFalse(handle.response().toCompletableFuture().isDone());
         } finally {
             server.shutdownNow();
-        }
-    }
-
-    @Test
-    public void replayRequiresCompleteCommitPublication() throws Exception {
-        try (var backend = RocksDbBackend.create(temporary.getRoot().toPath().resolve("capabilities"), ValueKind.ROW_ID)) {
-            var description = backend.describe().toBuilder().setCompleteCommitPublication(true).build();
-            var incomplete = assertThrows(java.io.IOException.class, () -> ServiceReplay.require(
-                    description.toBuilder().setCompleteCommitPublication(false).build(), ValueKind.ROW_ID, java.util.Map.of()));
-            assertTrue(incomplete.getMessage().contains("complete commits"));
         }
     }
 
@@ -185,103 +204,80 @@ public class IndexServerTest {
         }
     }
 
-    @Test
-    public void completePublicationWaitsForTheDriverCommitMarker() throws Exception {
-        try (var backend = RocksDbBackend.create(temporary.getRoot().toPath().resolve("published"), ValueKind.ROW_ID);
-                var server = IndexServer.start(0, backend);
-                var grpc = new GrpcService("127.0.0.1:" + server.port(), new TraceRequests(ValueKind.ROW_ID), "trace-a mode=rowid", 5)) {
-            assertTrue(grpc.describe().getCompleteCommitPublication());
-            assertEquals("sibench.index.IndexService", IndexServiceGrpc.getServiceDescriptor().getName());
-            var target = grpc.factory().open(0);
-            // The target's requests must use the same request builder state as its commit marker.
-            var insert =
-                    IndexOperationTrace.write(
-                            1, IndexOperationTrace.INSERT, 1, 0, IndexKey.ofInt(7), 0, 0, 0, 70);
-            target.send(1, insert).response().toCompletableFuture().get(10, TimeUnit.SECONDS);
-            var update =
-                    IndexOperationTrace.write(
-                                    2,
-                                    IndexOperationTrace.UPSERT,
-                                    1,
-                                    0,
-                                    IndexKey.ofInt(7),
-                                    1,
-                                    0,
-                                    0,
-                                    71)
-                            .withTransaction(100, 1);
-            target.send(2, update).response().toCompletableFuture().get(10, TimeUnit.SECONDS);
-            var search =
-                    IndexOperationTrace.search(
-                            3,
-                            1,
-                            0,
-                            new org.sibench.capture.IndexOperationTrace.Range(
-                                    null, false, null, false, false, 0),
-                            1,
-                            1,
-                            0);
-            var reader = grpc.factory().open(1);
-            var waited = reader.send(3, search).response().toCompletableFuture();
-            Thread.sleep(150);
-            assertFalse("search waits for the commit marker", waited.isDone());
-            target.sendCommit(4, 100, 1).response().toCompletableFuture().get(10, TimeUnit.SECONDS);
-            waited.get(10, TimeUnit.SECONDS);
-            var flushed = grpc.flush("trace-a mode=rowid");
-            assertEquals(1, flushed.getPublishedVersion());
-            assertEquals("trace-a mode=rowid", flushed.getIndexBinding());
-            assertTrue(flushed.getIndexLocation().endsWith("published"));
-            assertEquals(1, grpc.flush("trace-a mode=rowid").getPublishedVersion());
-            // The index holds trace-a: a Flush for another trace, or naming none, is refused.
-            var other = assertThrows(io.grpc.StatusRuntimeException.class, () -> grpc.flush("trace-b mode=rowid"));
-            assertTrue(other.getMessage(), other.getMessage().contains("Index holds trace-a"));
-            var none = assertThrows(io.grpc.StatusRuntimeException.class, () -> grpc.flush(""));
-            assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT, none.getStatus().getCode());
-        }
+    @Test(timeout = 15000)
+    public void acknowledgementWaitsForApplyAndAnotherStreamReadsItWithoutACommit() throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        try (var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("visible"), ValueKind.ROW_ID)) {
+            var blocked = (IndexBackend) java.lang.reflect.Proxy.newProxyInstance(
+                    getClass().getClassLoader(), new Class<?>[] {IndexBackend.class}, (proxy, method, args) -> {
+                        if (method.getName().equals("write") && ((Write) args[0]).getVersion() == 1) {
+                            entered.countDown();
+                            if (!release.await(5, TimeUnit.SECONDS)) throw new java.io.IOException("release timeout");
+                        }
+                        try { return method.invoke(backend, args); }
+                        catch (java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
+                    });
+            try (var server = IndexServer.start(0, blocked);
+                    var writer = new GrpcService("127.0.0.1:" + server.port(),
+                            new TraceRequests(ValueKind.ROW_ID), "visible", 3)) {
+                var target = writer.factory().open(0);
+                target.send(1, IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0,
+                        IndexKey.ofInt(7), 0, 0, 0, 70)).response().toCompletableFuture().get(3, TimeUnit.SECONDS);
+                var acknowledged = target.send(2, IndexOperationTrace.write(2, IndexOperationTrace.UPSERT,
+                        1, 0, IndexKey.ofInt(7), 1, 0, 0, 71)).response().toCompletableFuture();
+                assertTrue(entered.await(2, TimeUnit.SECONDS));
+                assertThrows(java.util.concurrent.TimeoutException.class,
+                        () -> acknowledged.get(100, TimeUnit.MILLISECONDS));
+                release.countDown();
+                acknowledged.get(3, TimeUnit.SECONDS);
+                // A separate RPC client reads the acknowledged version without any publication marker.
+                IndexVersionCheck.require(read(server.port(), 1).getResultsList(), 1, 71);
+                target.send(3, IndexOperationTrace.write(3, IndexOperationTrace.LOGICAL_DELETE,
+                        1, 0, IndexKey.ofInt(7), 2, 0, 0, 71)).response().toCompletableFuture().get(3, TimeUnit.SECONDS);
+                assertEquals(0, read(server.port(), 2).getResultsCount());
+                IndexVersionCheck.require(read(server.port(), 1).getResultsList(), 1, 71);
+                target.send(4, IndexOperationTrace.write(4, IndexOperationTrace.UPSERT,
+                        1, 0, IndexKey.ofInt(7), 3, 0, 0, 73)).response().toCompletableFuture().get(3, TimeUnit.SECONDS);
+                IndexVersionCheck.require(read(server.port(), 3).getResultsList(), 3, 73);
+                IndexVersionCheck.require(read(server.port(), 0).getResultsList(), 0, 70);
+                assertEquals(0, read(server.port(), 2).getResultsCount());
+                ServiceReplay.requireFlush(writer.flush("visible"), "visible");
+                var foreign = assertThrows(io.grpc.StatusRuntimeException.class, () -> writer.flush("foreign"));
+                assertTrue(foreign.getMessage(), foreign.getMessage().contains("Index holds visible"));
+                assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT,
+                        assertThrows(io.grpc.StatusRuntimeException.class, () -> writer.flush("")).getStatus().getCode());
+            }
+        } finally { release.countDown(); }
     }
 
-    @Test(timeout = 30000)
-    public void encodedAbortReplaysLocalSearchAndRestoresTheCommittedSnapshotOverGrpc() throws Exception {
-        var trace = temporary.getRoot().toPath().resolve("abort.pb.zst");
-        var writer = new org.sibench.capture.ProtoTrace.Writer(trace);
-        var key = IndexKey.ofInt(7);
-        try (writer) {
-            writer.append(IndexOperationTrace.transaction(1, IndexOperationTrace.TRANSACTION_BEGIN, 100, 1, 0));
-            writer.append(IndexOperationTrace.write(2, IndexOperationTrace.UPSERT, 1, 0, key, 1, 0, 0, 71)
-                    .withTransaction(100, 1).withExpansion(0, 1));
-            writer.append(IndexOperationTrace.search(3, 1, 0, IndexOperationTrace.Range.equal(key), 0, 1,
-                    IndexOperationTrace.TRANSACTION_LOCAL_SEARCH).withTransaction(100, 1).withVersion(1));
-            writer.append(IndexOperationTrace.transaction(4, IndexOperationTrace.TRANSACTION_ABORT, 100, 1, 1));
-        }
-        try (var backend = RocksDbBackend.create(temporary.getRoot().toPath().resolve("abort-grpc"), ValueKind.ROW_ID);
-                var server = IndexServer.start(0, backend);
-                var grpc = new GrpcService("127.0.0.1:" + server.port(), new TraceRequests(ValueKind.ROW_ID), "abort-trace", 5)) {
-            assertTrue(grpc.describe().getTransactionAbort());
-            try (var loader = grpc.factory().open(0)) {
-                loader.send(1, IndexOperationTrace.write(0, IndexOperationTrace.INSERT,
-                        1, 0, key, 0, 0, 0, 70)).response().toCompletableFuture().get(5, TimeUnit.SECONDS);
-            }
-            try (var replay = org.sibench.replay.ReplayProjection.withClients(
-                    new org.sibench.replay.ReplayConfig(true, 0, 0, 0, 0), true, grpc.factory(), true)) {
-                org.sibench.capture.ProtoTrace.read(trace, writer.sha256(), writer.logicalSha256(), replay);
-                replay.finish();
-                assertEquals(1L, replay.describe().get("aborted_transactions"));
-                assertEquals(0L, replay.describe().get("committed_transactions"));
-                assertEquals(2L, replay.dispatched());
-            }
-            assertEquals(1, grpc.flush("abort-trace").getPublishedVersion());
-            var rows = backend.search(org.sibench.adapters.proto.Search.newBuilder()
-                    .setTable(1).setReadVersion(1).build());
-            assertEquals(1, rows.size());
-            assertEquals(70, rows.get(0).getValue().getRowId());
-            assertEquals(0, rows.get(0).getVersion());
-        }
+    private static Response read(int port, long timestamp) throws Exception {
+        var channel = ManagedChannelBuilder.forAddress("127.0.0.1", port).usePlaintext().build();
+        try {
+            var headers = new io.grpc.Metadata();
+            headers.put(GrpcService.INDEX_BINDING, "visible");
+            var result = new CompletableFuture<Response>();
+            var stream = IndexServiceGrpc.newStub(channel).withDeadlineAfter(3, TimeUnit.SECONDS)
+                    .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers))
+                    .execute(new StreamObserver<Response>() {
+                        public void onNext(Response response) { result.complete(response); }
+                        public void onError(Throwable error) { result.completeExceptionally(error); }
+                        public void onCompleted() {}
+                    });
+            stream.onNext(Request.newBuilder().setId(1)
+                    .setSearch(Search.newBuilder().setTable(1).setReadVersion(timestamp)).build());
+            var response = result.get(3, TimeUnit.SECONDS);
+            assertEquals(response.getMessage(), Status.OK, response.getStatus());
+            assertFalse(response.getMore());
+            stream.onCompleted();
+            return response;
+        } finally { channel.shutdownNow(); }
     }
 
     @Test(timeout = 60000)
-    public void aLargeResultArrivesInChunksWhoseDigestMatchesTheReference() throws Exception {
+    public void aLargeResultArrivesInChunksWithMatchingIdentityAndTotalCount() throws Exception {
         int rows = IndexExecution.CHUNK_RESULTS + 4_464;
-        try (var backend = RocksDbBackend.create(temporary.getRoot().toPath().resolve("chunks"), ValueKind.ROW_ID);
+        try (var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("chunks"), ValueKind.ROW_ID);
                 var server = IndexServer.start(0, backend)) {
             var channel = ManagedChannelBuilder.forAddress("127.0.0.1", server.port()).usePlaintext().build();
             var chunks = new java.util.concurrent.ConcurrentHashMap<Long, java.util.List<Response>>();
@@ -336,7 +332,7 @@ public class IndexServerTest {
 
     @Test
     public void writeBatchesLoadBaselineInsertsAndRefuseAnyOtherWriteWhole() throws Exception {
-        try (var backend = RocksDbBackend.create(temporary.getRoot().toPath().resolve("batch"), ValueKind.ROW_ID)) {
+        try (var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("batch"), ValueKind.ROW_ID)) {
             assertTrue(backend.describe().getBaselineWriteBatches());
             var insert = org.sibench.adapters.proto.Write.newBuilder()
                     .setKind(org.sibench.adapters.proto.Write.Kind.INSERT)

@@ -43,9 +43,19 @@ public class VersionedLookupTest {
 
     private static void commit(ReplayProjection target, long version, Operation... rows)
             throws Exception {
-        target.accept(IndexOperationTrace.transaction(version, 6, version, version, 0));
-        for (Operation row : rows) org.sibench.capture.TransferIndexFixtures.expandRow(row, target);
-        target.accept(IndexOperationTrace.transaction(version, 7, version, version, rows.length));
+        Path directory = Files.createTempDirectory("sibench-committed-lookup-");
+        Path trace = directory.resolve("workload.pb.zst");
+        try {
+            try (var writer = new ProtoTrace.Writer(trace)) {
+                writer.append(IndexOperationTrace.transaction(version, 6, version, version, 0));
+                for (Operation row : rows) org.sibench.capture.TransferIndexFixtures.appendRow(writer, row);
+                writer.append(IndexOperationTrace.transaction(version, 7, version, version, rows.length));
+            }
+            ProtoTrace.read(trace, null, null, target);
+        } finally {
+            Files.deleteIfExists(trace);
+            Files.deleteIfExists(directory);
+        }
     }
 
     private static Operation snapshot(int table, int index, long key, long timestamp, long count) {
@@ -69,7 +79,7 @@ public class VersionedLookupTest {
                         new ReplayProjection(
                                 new ReplayConfig(false, 0, 0, 0, 0, dispatchMode),
                                 true,
-                                model::accept);
+                                model::acceptCommitted);
                 model.accept(TestOps.op(0, 1, 3, 0, 0, 2, 0, 3, 0, 52, 0, 0, 0));
                 commit(replay, 100, row(3, 1, 100, 0, 50, 3, 1));
                 commit(replay, 110, row(3, 1, 110, 1, 50, 3, 1));
@@ -148,7 +158,7 @@ public class VersionedLookupTest {
                     throws Exception {
         for (boolean rowIds : new boolean[] {false, true}) {
             var model = new IndexReferenceReplay(rowIds, true);
-            var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0), true, model::accept);
+            var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0), true, model::acceptCommitted);
             org.sibench.capture.TransferIndexFixtures.expandRow(
                     TestOps.op(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0), model::accept);
             commit(replay, 100, row(5, 1, 100, 1, 50, 3, 1), row(5, 2, 100, 2, 51, 3, 2));

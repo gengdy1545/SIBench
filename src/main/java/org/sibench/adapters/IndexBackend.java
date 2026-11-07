@@ -11,17 +11,14 @@ import java.util.List;
 /**
  * A KV index service implementation behind the SIBench index protocol (proto). It owns
  * its physical layout; the semantics are docs/index-service.md. Implementations may be
- * called concurrently and must be thread-safe; the order requests run in is the caller's
- * (IndexServer, or the driver's sending thread in process).
+ * called concurrently and must be thread-safe; replay establishes required write/read
+ * dependencies before dispatch.
  */
 public interface IndexBackend extends AutoCloseable {
     DescribeResponse describe();
 
-    /** Applies one write; it is visible to every later request once this returns. */
+    /** Applies one write; later normal reads at applicable versions see its effect once this returns. */
     void write(Write write) throws IOException;
-
-    /** Marks an unpublished transaction version as aborted at the declared write durability; its writes remain invisible thereafter. */
-    void abort(long version) throws IOException;
 
     /** Receives search results one at a time, in result order. */
     @FunctionalInterface
@@ -50,12 +47,6 @@ public interface IndexBackend extends AutoCloseable {
 
     /** Where the index lives: a local directory or an object-storage location. */
     String location();
-
-    /** The complete-commit watermark last recorded in this index, 0 for none. */
-    long publishedVersion() throws IOException;
-
-    /** Records the watermark in the index; it is durable after the next {@link #flush()}. */
-    void recordPublishedVersion(long version) throws IOException;
 
     @Override
     void close() throws IOException;

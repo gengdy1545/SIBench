@@ -533,37 +533,6 @@ public final class SpillingMap implements AutoCloseable {
             return descending ? new ReverseSource(this, from, to) : new ForwardSource(this, from, to);
         }
 
-        static Run open(Path path, int level, boolean pinned) throws IOException {
-            try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-                long size = channel.size();
-                if (size < 24) throw new IOException("Truncated spill run: " + path);
-                ByteBuffer trailer = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
-                readFully(channel, trailer, size - 16);
-                long footer = trailer.getLong();
-                if (trailer.getInt() != MAGIC) throw new IOException("Not a spill run: " + path);
-                if (footer < 8 || footer > size - 16) throw new IOException("Corrupt spill run: " + path);
-                ByteBuffer body =
-                        ByteBuffer.allocate((int) (size - 16 - footer)).order(ByteOrder.LITTLE_ENDIAN);
-                readFully(channel, body, footer);
-                long entries = body.getLong(), dataEnd = body.getLong();
-                byte[] min = bytes(body), max = bytes(body);
-                int count = body.getInt();
-                byte[][] keys = new byte[count][];
-                long[] offsets = new long[count];
-                for (int i = 0; i < count; i++) {
-                    keys[i] = bytes(body);
-                    offsets[i] = body.getLong();
-                }
-                int words = body.getInt();
-                long[] bloom = null;
-                if (words > 0) {
-                    bloom = new long[words];
-                    for (int i = 0; i < words; i++) bloom[i] = body.getLong();
-                }
-                return new Run(path, level, pinned, entries, dataEnd, min, max, keys, offsets, bloom);
-            }
-        }
-
         @Override
         public void close() throws IOException {
             if (channel != null) {
@@ -571,21 +540,6 @@ public final class SpillingMap implements AutoCloseable {
                 channel = null;
             }
         }
-    }
-
-    private static byte[] bytes(ByteBuffer from) {
-        byte[] result = new byte[from.getInt()];
-        from.get(result);
-        return result;
-    }
-
-    private static void readFully(FileChannel channel, ByteBuffer target, long position)
-            throws IOException {
-        while (target.hasRemaining()) {
-            int read = channel.read(target, position + target.position());
-            if (read < 0) throw new IOException("Truncated spill run");
-        }
-        target.flip();
     }
 
     /** Sequential entries of a run span; each {@link #next} replaces key and value. */

@@ -7,8 +7,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.junit.Test;
-import org.sibench.adapters.PublishedIndex;
-import org.sibench.adapters.RocksDbBackend;
+import org.sibench.adapters.IndexExecutor;
+import org.sibench.adapters.VersionedIndexBackend;
 import org.sibench.adapters.proto.Status;
 import org.sibench.adapters.proto.TraceRecord;
 import org.sibench.adapters.proto.ValueKind;
@@ -78,16 +78,16 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
             assertEquals(7,expected.size());
             var workload=root.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(workload);
             try(writer){assertEquals(30,DuckDbProjection.write(db,writer));}
-            try(var backend=RocksDbBackend.create(root.resolve("index"),ValueKind.ROW_ID);var index=new PublishedIndex(backend)) {
+            try(var backend=VersionedIndexBackend.create(root.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {
                 long[] requests={0},searches={0},aborts={0};
                 var consumer=new IndexOperationTrace.Consumer(){
                     @Override public void accept(IndexOperationTrace.Operation operation){fail("Missing stored service request");}
                     @Override public void accept(TraceRecord record,List<IndexOperationTrace.Operation> operations)throws java.io.IOException {
                         if(record.hasBegin())return;
+                        if(record.hasEnd()){if(record.getEnd().getAborted())aborts[0]++;return;}
                         try {
                             var request=record.getRequest().toBuilder().setId(++requests[0]).build();
                             var response=index.submit(request).get(5,TimeUnit.SECONDS);assertEquals(response.getMessage(),Status.OK,response.getStatus());
-                            if(request.hasAbort())aborts[0]++;
                             if(request.hasSearch()||request.hasGroup()) {
                                 var wanted=expected.get(operations.get(0).sourceEvent());assertNotNull(wanted);assertEquals(wanted.size(),response.getResultsCount());
                                 for(int i=0;i<wanted.size();i++) {
@@ -102,12 +102,12 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
                 };
                 ProtoTrace.read(baseline,baseWriter.sha256(),baseWriter.logicalSha256(),consumer);
                 ProtoTrace.read(workload,writer.sha256(),writer.logicalSha256(),consumer);
-                assertEquals(7,searches[0]);assertEquals(1,aborts[0]);assertEquals(30,requests[0]);
+                assertEquals(6,searches[0]);assertEquals(1,aborts[0]);assertEquals(19,requests[0]);
             }
         }
     }
 
-    @Test public void excludesCompletedWritesInsideFailedSqlButReplaysEarlierLocalReadAndAbort()throws Exception {
+    @Test public void retainsNativeFailedStatementFactsButExportsNoAbortedWritesOrLocalReads()throws Exception {
         try(var db=connect()) {
             sql(db,"CREATE TABLE items(id BIGINT PRIMARY KEY,k BIGINT)");sql(db,"CREATE INDEX items_k ON items(k)");
             sql(db,"INSERT INTO items VALUES(10,100),(20,200)");
@@ -134,21 +134,21 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
             assertEquals(2,number(db,"SELECT count(*) FROM items"));
             var trace=root.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(trace);
             try(writer){assertEquals(5,DuckDbProjection.write(db,writer));}
-            try(var backend=RocksDbBackend.create(root.resolve("index"),ValueKind.ROW_ID);var index=new PublishedIndex(backend)) {
+            try(var backend=VersionedIndexBackend.create(root.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {
                 long[] searches={0},aborts={0},ids={0};
                 ProtoTrace.read(trace,writer.sha256(),writer.logicalSha256(),new IndexOperationTrace.Consumer(){
                     @Override public void accept(IndexOperationTrace.Operation operation){fail("Missing stored request");}
                     @Override public void accept(TraceRecord record,List<IndexOperationTrace.Operation> operations)throws java.io.IOException {
                         if(record.hasBegin())return;
+                        if(record.hasEnd()){if(record.getEnd().getAborted())aborts[0]++;return;}
                         try {
                             var request=record.getRequest().toBuilder().setId(++ids[0]).build();
                             var response=index.submit(request).get(5,TimeUnit.SECONDS);assertEquals(response.getMessage(),Status.OK,response.getStatus());
                             if(request.hasSearch()) {assertEquals(1,response.getResultsCount());assertEquals(rowId,response.getResults(0).getValue().getRowId());assertEquals(1,response.getResults(0).getVersion());searches[0]++;}
-                            if(request.hasAbort())aborts[0]++;
                         }catch(Exception error){throw new java.io.IOException(error);}
                     }
                 });
-                assertEquals(1,searches[0]);assertEquals(1,aborts[0]);
+                assertEquals(0,searches[0]);assertEquals(1,aborts[0]);assertEquals(0,ids[0]);
             }
         }
     }

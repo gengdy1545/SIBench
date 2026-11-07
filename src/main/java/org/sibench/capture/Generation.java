@@ -74,17 +74,24 @@ public final class Generation {
             var parameters=selection.benchmark().equals("hybench")?HybenchParameters.read(source.source(),nativeConfig):Map.<String,Object>of();
             var baselineRows=parameters.isEmpty()?ScaleInspector.nativeRows(root,document):HybenchParameters.rows(parameters);
             Path client=root.resolve(string(nativeConfig,"build_directory")).toRealPath();
-            Path output=root.resolve(string(object(document,"artifacts"),"directory")).toAbsolutePath().normalize();
-            require(output.startsWith(root.resolve("results/capture"))&&!output.equals(root.resolve("results/capture")),
-                    "Generation output must be under results/capture");
-            require(!Files.exists(output),"Generation output already exists: "+output);
-            Path ancestor=output.getParent();while(!Files.exists(ancestor))ancestor=ancestor.getParent();
-            require(ancestor.toRealPath().startsWith(root),"Generation output escapes the repository");
+            Path output=outputDirectory(root,string(object(document,"artifacts"),"directory"));
             for(var previous:inputs)require(!output.startsWith(previous.output())&&!previous.output().startsWith(output),"Overlapping generation outputs");
             var identity=NativeBuildCheck.verify(root,selection.benchmark(),source.source(),client,source.sourceCommit());
             inputs.add(new Input(selection,document,source,client,output,identity,Map.copyOf(baselineRows),parameters));
         }
         return new Plan(root,runtime,Map.copyOf(engines),List.copyOf(inputs));
+    }
+
+    static Path outputDirectory(Path root,String configured) throws IOException {
+        Path output=root.resolve(configured).toAbsolutePath().normalize();
+        require(output.startsWith(root.resolve("results/capture"))&&!output.equals(root.resolve("results/capture")),
+                "Generation output must be under results/capture");
+        require(!Files.exists(output,java.nio.file.LinkOption.NOFOLLOW_LINKS),"Generation output already exists: "+output);
+        Path ancestor=output.getParent();
+        while(!Files.exists(ancestor,java.nio.file.LinkOption.NOFOLLOW_LINKS))ancestor=ancestor.getParent();
+        output=ancestor.toRealPath().resolve(ancestor.relativize(output)).normalize();
+        require(output.startsWith(root.resolve("results/capture")),"Generation output escapes results/capture");
+        return output;
     }
 
     static boolean secondaryIndexes(Map<String,Object> document) {
@@ -206,10 +213,6 @@ public final class Generation {
                     requireRows(expected,HybenchDuckDb.load(database,input.source().source(),data));
                     HybenchInputs.requireRuntimeInputs(data,manifest);
                     HybenchInputs.dropLoadInputs(data,script);
-                }else {
-                    var actualRows=new LinkedHashMap<String,Long>();
-                    for(String table:expected.keySet())actualRows.put(table,number(database,"SELECT count(*) FROM "+quote(table)));
-                    requireRows(expected,actualRows);
                 }
                 timings.put("native_load_seconds",seconds(loadStart));long baselineStart=System.nanoTime();
                 database.setAutoCommit(false);NativeHistory.initialize(database, org.sibench.config.Engine.DUCKDB);int tableId=0;

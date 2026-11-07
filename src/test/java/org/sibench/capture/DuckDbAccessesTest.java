@@ -32,12 +32,12 @@ public class DuckDbAccessesTest {
                 +"batch_id BIGINT,stage VARCHAR,consumed_prefix BIGINT,input_rows BIGINT,direct_from_scan BOOLEAN)");
         return db;
     }
-    @Test public void mapsNativePrimaryIdentityAndKeepsOwnRowsBeforeAbort()throws Exception {
+    @Test public void keepsNativePrimaryKeysAndOwnRowsBeforeAbort()throws Exception {
         try(var db=fixture()) {
             DuckDbAccesses.bind(db,CATALOG);
-            try(var q=db.createStatement();var r=q.executeQuery("SELECT key_sql,row_id FROM sibench_access_results ORDER BY key_sql")) {
-                assertTrue(r.next());assertEquals("10",r.getString(1));assertEquals(100,r.getLong(2));
-                assertTrue(r.next());assertEquals("20",r.getString(1));assertEquals(200,r.getLong(2));assertFalse(r.next());
+            try(var q=db.createStatement();var r=q.executeQuery("SELECT key_sql FROM sibench_access_keys ORDER BY key_sql")) {
+                assertTrue(r.next());assertEquals("10",r.getString(1));
+                assertTrue(r.next());assertEquals("20",r.getString(1));assertFalse(r.next());
             }
             try(var q=db.createStatement();var r=q.executeQuery("SELECT index_id,transaction_outcome FROM sibench_accesses")) {
                 assertTrue(r.next());assertEquals(0,r.getInt(1));assertEquals("rollback",r.getString(2));
@@ -58,8 +58,8 @@ public class DuckDbAccessesTest {
             sql(db,"INSERT INTO sibench_consumption VALUES(1,1,2,3,1,'"+stage+"',0,1,true)");
             if(stage.equals("limit"))sql(db,"INSERT INTO sibench_consumption VALUES(1,1,2,3,1,'limit',0,0,true)");
             DuckDbAccesses.bind(db,CATALOG);
-            try(var q=db.createStatement();var r=q.executeQuery("SELECT count(*),sum(row_id) FROM sibench_access_results")) {
-                assertTrue(r.next());assertEquals(2,r.getInt(1));assertEquals(300,r.getLong(2));
+            try(var q=db.createStatement();var r=q.executeQuery("SELECT count(*),sum(CAST(key_sql AS BIGINT)) FROM sibench_access_keys")) {
+                assertTrue(r.next());assertEquals(2,r.getInt(1));assertEquals(30,r.getLong(2));
             }
         }
     }
@@ -109,8 +109,8 @@ public class DuckDbAccessesTest {
                     assertTrue(failure.getMessage(),failure.getMessage().contains("Unsupported ART early stop"));
                 }else {
                     DuckDbAccesses.bind(db,catalog);
-                    try(var q=db.createStatement();var r=q.executeQuery("SELECT key_sql,row_id FROM sibench_access_results")) {
-                        assertTrue(r.next());assertEquals("10",r.getString(1));assertEquals(100,r.getLong(2));assertFalse(r.next());
+                    try(var q=db.createStatement();var r=q.executeQuery("SELECT key_sql FROM sibench_access_keys")) {
+                        assertTrue(r.next());assertEquals("10",r.getString(1));assertFalse(r.next());
                     }
                 }
             }

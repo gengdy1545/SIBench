@@ -19,6 +19,7 @@ import java.util.zip.CRC32C;
 
 /** Independently compressed blocks of delimited service requests, with source positions. */
 public final class ProtoTrace {
+    public static final int MAX_TRANSACTION_OPERATIONS = CommittedOperations.MAX_TRANSACTION_OPERATIONS;
     private static final int MAGIC = 0x53495042;
     private static final int MAX_BYTES = 32 << 20;
     private static final int BLOCK_BYTES = 1 << 20;
@@ -101,9 +102,11 @@ public final class ProtoTrace {
         private long count;
         private String logicalSha256;
         private final TraceRequests requests = new TraceRequests(ValueKind.ROW_ID);
+        private final CommittedOperations projection = new CommittedOperations(this::appendExported);
         private final List<Operation> group = new ArrayList<>();
         private int records;
         private long transaction;
+        private long transactionOperations, transactionWrites;
         private String sha256;
         private boolean closed;
         private volatile long bytesWritten = Integer.BYTES;
@@ -138,7 +141,10 @@ public final class ProtoTrace {
 
         public void append(Operation operation) throws IOException {
             if (closed) throw new IOException("Proto Trace writer is closed");
-            IndexOperationTrace.validate(operation);
+            projection.accept(operation);
+        }
+
+        private void appendExported(Operation operation) throws IOException {
             if (operation.grouped()) {
                 if (operation.expansionPosition() != group.size()
                         || !group.isEmpty() && (operation.expansionSize() != group.get(0).expansionSize()
@@ -164,12 +170,14 @@ public final class ProtoTrace {
             if (operation.kind() == IndexOperationTrace.TRANSACTION_BEGIN) {
                 if (transaction != 0) throw new IOException("Nested proto transaction");
                 transaction = operation.transactionId();
+                transactionOperations = transactionWrites = 0;
                 record.setBegin(TraceBegin.newBuilder().setTransactionId(transaction).setVersion(operation.version()));
             } else if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT
                     || operation.kind() == IndexOperationTrace.TRANSACTION_ABORT) {
                 if (transaction != operation.transactionId()) throw new IOException("Unmatched proto commit");
-                record.setRequest(requests.finish(0, transaction, operation.version(),
-                        operation.kind() == IndexOperationTrace.TRANSACTION_ABORT));
+                record.setEnd(TraceEnd.newBuilder().setTransactionId(transaction).setVersion(operation.version())
+                        .setAborted(operation.kind() == IndexOperationTrace.TRANSACTION_ABORT)
+                        .setOperations(transactionOperations).setWrites(transactionWrites));
                 transaction = 0;
             } else {
                 var request = requests.request(0, operation);
@@ -192,12 +200,17 @@ public final class ProtoTrace {
             records++;
             count += record.getPositionsCount();
             var request = record.getRequest();
-            if (record.hasBegin() || request.hasCommit() || request.hasAbort()) {
-                controls.merge(record.hasBegin() ? "begin" : request.hasCommit() ? "commit" : "abort", 1L, Long::sum);
+            if (record.hasBegin() || record.hasEnd()) {
+                controls.merge(record.hasBegin() ? "begin" : record.getEnd().getAborted() ? "abort" : "commit", 1L, Long::sum);
                 return;
             }
-            effectiveRequests++;
-            if (budget != null) budget.record();
+            int operations = record.getPositionsCount();
+            if (transaction != 0) {
+                transactionOperations += operations;
+                if (request.hasWrite()) transactionWrites++;
+            }
+            effectiveRequests = Math.addExact(effectiveRequests, operations);
+            if (budget != null) budget.record(operations);
             indexEntries += record.getPositionsCount();
             String type;
             if (request.hasWrite()) {
@@ -242,7 +255,8 @@ public final class ProtoTrace {
             return Map.of("index_entries", indexEntries, "effective_requests", effectiveRequests,
                     "primary_entries", primaryEntries, "secondary_entries", indexEntries - primaryEntries,
                     "request_types", Map.copyOf(requestTypes), "transaction_markers", Map.copyOf(controls),
-                    "write_origins", Map.copyOf(writeOrigins), "uncompressed_message_bytes", uncompressedBytes);
+                    "write_origins", Map.copyOf(writeOrigins), "uncompressed_message_bytes", uncompressedBytes,
+                    "source_projection", projection.statistics());
         }
         public String logicalSha256() {
             if (logicalSha256 == null) throw new IllegalStateException("Proto Trace not closed successfully");
@@ -258,6 +272,7 @@ public final class ProtoTrace {
             if (closed) return;
             closed = true;
             try {
+                projection.finish();
                 if (!group.isEmpty() || transaction != 0) throw new IOException("Incomplete proto transaction or search group");
                 flush();
                 for (int i = 0; i < 4; i++) output.writeInt(0);
@@ -348,28 +363,28 @@ public final class ProtoTrace {
                         IndexOperationTrace.TRANSACTION_BEGIN, transaction, version, first.getExpectedCount()));
                 return;
             }
-            if (!record.hasRequest()) throw new IOException("Missing proto service request");
-            var request = record.getRequest();
-            if (request.getId() != 0) throw new IOException("Proto request IDs are assigned at replay");
-            if (request.hasCommit() || request.hasAbort()) {
-                long terminalVersion = request.hasAbort() ? request.getAbort().getVersion() : request.getCommit().getVersion();
-                long terminalOperations = request.hasAbort() ? request.getAbort().getOperations() : request.getCommit().getOperations();
-                long terminalWrites = request.hasAbort() ? request.getAbort().getWrites() : request.getCommit().getWrites();
-                if (transaction == 0 || request.getTransactionId() != transaction
-                        || request.getTransactionOperation() != 0 || terminalVersion != version
-                        || terminalOperations != operations || terminalWrites != writes
+            if (record.hasEnd()) {
+                var end = record.getEnd();
+                if (transaction == 0 || end.getTransactionId() != transaction || end.getVersion() != version
+                        || end.getOperations() != operations || end.getWrites() != writes
+                        || end.getAborted() && writes != 0
                         || record.getPositionsCount() != 1) throw new IOException("Invalid proto terminal counts or identity");
                 consumer.accept(IndexOperationTrace.transaction(first.getSourceEvent(),
-                        request.hasAbort() ? IndexOperationTrace.TRANSACTION_ABORT : IndexOperationTrace.TRANSACTION_COMMIT,
+                        end.getAborted() ? IndexOperationTrace.TRANSACTION_ABORT : IndexOperationTrace.TRANSACTION_COMMIT,
                         transaction, version, first.getExpectedCount()));
                 transaction = 0;
                 return;
             }
-            if (request.getTransactionId() != transaction
-                    || request.getTransactionOperation() != (transaction == 0 ? 0 : ++operations))
-                throw new IOException("Invalid proto transaction position");
-            if (request.hasWrite()) writes++;
+            if (!record.hasRequest()) throw new IOException("Missing proto service request");
+            var request = record.getRequest();
+            if (request.getId() != 0) throw new IOException("Proto request IDs are assigned at replay");
+            if (!request.getUnknownFields().asMap().isEmpty()) throw new IOException("Unsupported proto service fields");
             int members = request.hasGroup() ? request.getGroup().getMembersCount() : 1;
+            if (transaction != 0) {
+                operations += members;
+                if (request.hasWrite()) writes++;
+                if (operations > MAX_TRANSACTION_OPERATIONS) throw new IOException("Proto source group exceeds operation buffer limit");
+            }
             if (record.getPositionsCount() != members) throw new IOException("Proto source-member count mismatch");
             if (request.hasGroup() && (members < 2 || request.getGroup().getMode() == SearchGroup.Mode.MODE_UNSPECIFIED
                     || request.getGroup().getMode() == SearchGroup.Mode.UNRECOGNIZED))
@@ -377,7 +392,7 @@ public final class ProtoTrace {
             for (int i = 0; i < members; i++) {
                 var metadata = record.getPositions(i);
                 Operation operation;
-                if (request.hasWrite()) operation = write(request.getWrite(), request.getTransactionId(), metadata);
+                if (request.hasWrite()) operation = write(request.getWrite(), transaction, metadata);
                 else if (request.hasSearch() || request.hasGroup()) {
                     var search = request.hasSearch() ? request.getSearch() : request.getGroup().getMembers(i);
                     if (request.hasGroup()) {
@@ -387,7 +402,7 @@ public final class ProtoTrace {
                                 || metadata.getExpansionSize() != members)
                             throw new IOException("Proto search group metadata mismatch");
                     }
-                    operation = search(search, request.getTransactionId(), metadata);
+                    operation = search(search, transaction, metadata);
                 } else throw new IOException("Unsupported proto service request");
                 consumer.accept(operation);
             }
@@ -417,11 +432,12 @@ public final class ProtoTrace {
                 | (search.getDescending() ? IndexOperationTrace.DESCENDING : 0);
         if ((p.getFlags() & (IndexOperationTrace.LOWER_INCLUSIVE | IndexOperationTrace.UPPER_INCLUSIVE
                 | IndexOperationTrace.DESCENDING)) != bounds
-                || ((p.getFlags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0) != (search.getLocalVersion() != 0))
+                || (p.getFlags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0
+                || !search.getUnknownFields().asMap().isEmpty())
             throw new IOException("Proto search metadata mismatch");
         return new Operation(p.getSourceEvent(), IndexOperationTrace.SEARCH, search.getTable(), search.getIndex(),
                 p.getFlags(), search.getPinnedPrimaryKey().isEmpty() ? null : key(search.getPinnedPrimaryKey()), null,
-                search.getLocalVersion(), 0, 0, 0, p.getExpectedCount(), transaction, p.getMutationOrdinal(),
+                0, 0, 0, 0, p.getExpectedCount(), transaction, p.getMutationOrdinal(),
                 search.getReadVersion(), p.getWorkUnitId(), p.getExpansionPosition(), p.getExpansionSize(),
                 search.hasLower() ? key(search.getLower().getKey()) : null,
                 search.hasUpper() ? key(search.getUpper().getKey()) : null, search.getLimit());

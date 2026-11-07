@@ -19,51 +19,48 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * A versioned index on one RocksDB instance (local, or rocksdb-cloud), in the trace contract's KV
+ * A versioned index on one ordered byte store, in the trace contract's KV
  * layout:
  * {@code table(u32) ++ index(u32) ++ [indexed value] ++ primary key ++ ~version(u64)}, all big
  * endian, so the versions of one entry sort newest first right after each other. The value is
  * {@code present(1) ++ indexed value length(u32) ++ file(i64) ++ position(i64) ++ row id(i64)}; a
  * logical delete is a version that is not present.
  *
- * <p>Baseline inserts skip the WAL and become durable at {@link #flush()}; every other write uses
- * the WAL without fsync. Table 0, which no entry uses, holds the index's value kind and its
- * recorded complete-commit watermark, so a reopened index is checked and resumes publication.
+ * <p>Baseline inserts become durable at {@link #flush()}; incremental write durability is
+ * declared by the store. Table 0, which no entry uses, holds the index's value kind and its
+ * Trace binding, so a reopened index is checked before reuse.
  */
-public final class RocksDbBackend implements IndexBackend {
+public final class VersionedIndexBackend implements IndexBackend {
     private static final int HEADER = 8, VERSION = 8, VALUE = 1 + 4 + 8 + 8 + 8;
     private static final byte[] VALUE_KIND = metadata("value_kind"),
-            PUBLISHED_VERSION = metadata("published_version"),
-            TRACE_BINDING = metadata("trace_binding"),
-            ABORTED_VERSION = metadata("aborted_version/");
-    private final RocksStore store;
+            TRACE_BINDING = metadata("trace_binding");
+    private final OrderedStore store;
     private final ValueKind valueKind;
     /** One JSON line per Flush: the engine's state and object-storage requests so far. */
     private final Path engineStats;
     private long flushes;
-    private final java.util.Set<Long> aborted = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-    private RocksDbBackend(RocksStore store, ValueKind valueKind, Path path) {
+    private VersionedIndexBackend(OrderedStore store, ValueKind valueKind, Path path) {
         this.store = store;
         this.valueKind = valueKind;
         this.engineStats = path.resolveSibling(path.getFileName() + ".engine-stats.jsonl");
     }
 
     /** A new, empty index in {@code path}; an existing directory is refused, never reused. */
-    public static RocksDbBackend create(Path path, ValueKind valueKind) throws IOException {
+    public static VersionedIndexBackend create(Path path, ValueKind valueKind) throws IOException {
         prepare(path, valueKind);
         return created(LocalRocksStore.create(path), valueKind, path);
     }
 
     /** A new, empty rocksdb-cloud index: local files in {@code path}, objects in the store. */
-    static RocksDbBackend cloud(Path path, ValueKind valueKind, ObjectStore objects)
+    static VersionedIndexBackend cloud(Path path, ValueKind valueKind, ObjectStore objects)
             throws IOException {
         prepare(path, valueKind);
         return created(CloudRocksStore.create(path, objects), valueKind, path);
     }
 
     /** An index this class created in {@code path}, reopened, e.g. after a restart. */
-    public static RocksDbBackend open(Path path, ValueKind valueKind) throws IOException {
+    public static VersionedIndexBackend open(Path path, ValueKind valueKind) throws IOException {
         if (!Files.isDirectory(path)) throw new IOException("No index directory: " + path);
         return reopened(LocalRocksStore.open(path), valueKind, path);
     }
@@ -72,10 +69,20 @@ public final class RocksDbBackend implements IndexBackend {
      * A rocksdb-cloud index reopened from its local files, or, when {@code path} does not exist,
      * from the bucket alone (a cold start).
      */
-    static RocksDbBackend openCloud(Path path, ValueKind valueKind, ObjectStore objects)
+    static VersionedIndexBackend openCloud(Path path, ValueKind valueKind, ObjectStore objects)
             throws IOException {
         Files.createDirectories(path.getParent());
         return reopened(CloudRocksStore.open(path, objects), valueKind, path);
+    }
+
+    static VersionedIndexBackend slate(Path path, ValueKind valueKind, ObjectStore objects,
+            boolean reopen) throws IOException {
+        if (reopen) {
+            Files.createDirectories(path.getParent());
+            return reopened(SlateDbStore.open(path, objects), valueKind, path);
+        }
+        prepare(path, valueKind);
+        return created(SlateDbStore.create(path, objects), valueKind, path);
     }
 
     private static void prepare(Path path, ValueKind valueKind) throws IOException {
@@ -85,7 +92,7 @@ public final class RocksDbBackend implements IndexBackend {
         Files.createDirectories(path.getParent());
     }
 
-    private static RocksDbBackend created(RocksStore store, ValueKind valueKind, Path path)
+    private static VersionedIndexBackend created(OrderedStore store, ValueKind valueKind, Path path)
             throws IOException {
         try {
             store.put(VALUE_KIND, new byte[] {(byte) valueKind.getNumber()}, true);
@@ -93,27 +100,23 @@ public final class RocksDbBackend implements IndexBackend {
             store.close();
             throw error;
         }
-        return new RocksDbBackend(store, valueKind, path);
+        return new VersionedIndexBackend(store, valueKind, path);
     }
 
-    private static RocksDbBackend reopened(RocksStore store, ValueKind valueKind, Path path)
+    private static VersionedIndexBackend reopened(OrderedStore store, ValueKind valueKind, Path path)
             throws IOException {
         byte[] stored = store.get(VALUE_KIND);
         if (stored == null || stored.length != 1 || stored[0] != valueKind.getNumber()) {
             store.close();
             throw new IOException("Reopened index does not hold " + valueKind + " values");
         }
-        var backend = new RocksDbBackend(store, valueKind, path);
-        try (var entries = store.cursor(ABORTED_VERSION, successor(ABORTED_VERSION))) {
-            entries.seek(ABORTED_VERSION);
+        var backend = new VersionedIndexBackend(store, valueKind, path);
+        byte[] prefix = new byte[HEADER];
+        try (var entries = store.cursor(prefix, successor(prefix))) {
+            entries.seek(prefix);
             while (entries.valid()) {
-                byte[] key = entries.key();
-                if (key.length != ABORTED_VERSION.length + Long.BYTES
-                        || !Arrays.equals(entries.value(), new byte[] {1}))
-                    throw new IOException("Invalid aborted-version metadata");
-                long version = ByteBuffer.wrap(key, ABORTED_VERSION.length, Long.BYTES).getLong();
-                if (version <= 0) throw new IOException("Invalid aborted version");
-                backend.aborted.add(version);
+                if (!Arrays.equals(entries.key(), VALUE_KIND) && !Arrays.equals(entries.key(), TRACE_BINDING))
+                    throw new IOException("Unsupported index metadata");
                 entries.next();
             }
         } catch (IOException | RuntimeException error) {
@@ -134,21 +137,17 @@ public final class RocksDbBackend implements IndexBackend {
                 .setName(store.name())
                 .setValueKind(valueKind)
                 .setVersionedReads(true)
-                .setOrderedSameVersionOverwrite(true)
-                .setTransactionLocalReads(true)
                 .setSearchGroups(true)
                 .setDurability(store.durability())
-                .setWriteAck(org.sibench.adapters.proto.Acknowledgement.ACK_WAL)
+                .setWriteAck(store.writeAck())
                 .setBaselineDurableOnlyAtFlush(true)
                 .setFlushMakesDurable(true)
                 .setBaselineWriteBatches(true)
-                .setTransactionAbort(true)
                 .build();
     }
 
     @Override
     public void write(Write write) throws IOException {
-        if (aborted.contains(write.getVersion())) throw new IllegalArgumentException("Write to an aborted version");
         var key = write.getKey();
         IndexExecution.validateKey(key);
         byte[] entry = entry(key.getTable(), key.getIndex(), key.getIndexedValue(), key.getPrimaryKey());
@@ -175,16 +174,9 @@ public final class RocksDbBackend implements IndexBackend {
     }
 
     @Override
-    public void abort(long version) throws IOException {
-        if (version <= 0) throw new IllegalArgumentException("Abort version must be positive");
-        byte[] key = ByteBuffer.allocate(ABORTED_VERSION.length + Long.BYTES)
-                .put(ABORTED_VERSION).putLong(version).array();
-        store.put(key, new byte[] {1}, true);
-        aborted.add(version);
-    }
-
-    @Override
     public void search(Search search, ResultSink sink) throws IOException {
+        if (!search.getUnknownFields().asMap().isEmpty())
+            throw new IllegalArgumentException("Unsupported search fields");
         if (search.getTable() < 1) throw new IllegalArgumentException("Invalid search table");
         long found = 0;
         byte[] prefix = entry(search.getTable(), search.getIndex(), ByteString.EMPTY, ByteString.EMPTY);
@@ -193,7 +185,7 @@ public final class RocksDbBackend implements IndexBackend {
                 throw new IllegalArgumentException("A pinned search names one secondary entry");
             byte[] entry = entry(search.getTable(), search.getIndex(), search.getLower().getKey(), search.getPinnedPrimaryKey());
             try (var iterator = store.cursor(null, null)) {
-                Result result = visible(iterator, entry, search.getReadVersion(), search.getLocalVersion());
+                Result result = visible(iterator, entry, search.getReadVersion());
                 if (result != null) sink.accept(result);
             }
             return;
@@ -212,9 +204,9 @@ public final class RocksDbBackend implements IndexBackend {
                     byte[] key = iterator.key();
                     byte[] entry = logical(key);
                     long version = ~ByteBuffer.wrap(key, entry.length, VERSION).getLong();
-                    long selected = Math.max(search.getReadVersion(), search.getLocalVersion());
+                    long selected = search.getReadVersion();
                     if (version > selected) iterator.seek(versioned(entry, selected));
-                    Result result = visibleAt(iterator, entry, search.getReadVersion(), search.getLocalVersion());
+                    Result result = visibleAt(iterator, entry, search.getReadVersion());
                     if (result != null) {
                         sink.accept(result);
                         found++;
@@ -235,7 +227,7 @@ public final class RocksDbBackend implements IndexBackend {
                     iterator.prev();
                 while (iterator.valid() && (limit == 0 || found < limit)) {
                     byte[] entry = logical(iterator.key());
-                    Result result = visible(versions, entry, search.getReadVersion(), search.getLocalVersion());
+                    Result result = visible(versions, entry, search.getReadVersion());
                     if (result != null) {
                         sink.accept(result);
                         found++;
@@ -248,15 +240,14 @@ public final class RocksDbBackend implements IndexBackend {
     }
 
     /**
-     * The newest version of {@code entry} at or below the read version, or the exact local version
-     * when a transaction-local search asks for one above it, if that state is present.
+     * The newest committed version of {@code entry} at or below the read version.
      */
     private Result visible(
-            RocksStore.Cursor versions, byte[] entry, long readVersion, long localVersion)
+            OrderedStore.Cursor versions, byte[] entry, long readVersion)
             throws IOException {
-        byte[] selected = versioned(entry, Math.max(readVersion, localVersion));
+        byte[] selected = versioned(entry, readVersion);
         versions.seek(selected);
-        return visibleAt(versions, entry, readVersion, localVersion);
+        return visibleAt(versions, entry, readVersion);
     }
 
     private static boolean sameEntry(byte[] key, byte[] entry) {
@@ -265,31 +256,11 @@ public final class RocksDbBackend implements IndexBackend {
     }
 
     private Result visibleAt(
-            RocksStore.Cursor versions, byte[] entry, long readVersion, long localVersion)
+            OrderedStore.Cursor versions, byte[] entry, long readVersion)
             throws IOException {
         if (!versions.valid()) return null;
         byte[] key = versions.key();
         if (!sameEntry(key, entry)) return null;
-        if (localVersion > readVersion
-                && ~ByteBuffer.wrap(key, entry.length, VERSION).getLong() != localVersion) {
-            // The transaction did not write this entry; read the statement snapshot instead.
-            versions.seek(versioned(entry, readVersion));
-            if (!versions.valid()) return null;
-            key = versions.key();
-            if (!sameEntry(key, entry)) return null;
-        }
-        while (aborted.contains(~ByteBuffer.wrap(key, entry.length, VERSION).getLong())) {
-            versions.next();
-            if (!versions.valid()) return null;
-            key = versions.key();
-            if (!sameEntry(key, entry)) return null;
-            if (~ByteBuffer.wrap(key, entry.length, VERSION).getLong() > readVersion) {
-                versions.seek(versioned(entry, readVersion));
-                if (!versions.valid()) return null;
-                key = versions.key();
-                if (!sameEntry(key, entry)) return null;
-            }
-        }
         ByteBuffer value = ByteBuffer.wrap(versions.value());
         if (value.get(0) == 0) return null;
         int indexedValue = value.getInt(1);
@@ -442,17 +413,6 @@ public final class RocksDbBackend implements IndexBackend {
     @Override
     public String location() {
         return store.location();
-    }
-
-    @Override
-    public long publishedVersion() throws IOException {
-        byte[] value = store.get(PUBLISHED_VERSION);
-        return value == null ? 0 : ByteBuffer.wrap(value).getLong();
-    }
-
-    @Override
-    public void recordPublishedVersion(long version) throws IOException {
-        store.put(PUBLISHED_VERSION, ByteBuffer.allocate(8).putLong(version).array(), true);
     }
 
     @Override

@@ -15,25 +15,23 @@ import org.sibench.adapters.proto.Response;
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
-/** Serves complete-commit publication, transaction-local order and versioned reads over gRPC. */
+/** Serves visible mutation completion and versioned reads over gRPC. */
 public final class IndexServer implements AutoCloseable {
     private final Server server;
-    private final PublishedIndex published;
+    private final IndexExecutor executor;
 
-    private IndexServer(Server server, PublishedIndex published) {
+    private IndexServer(Server server, IndexExecutor executor) {
         this.server = server;
-        this.published = published;
+        this.executor = executor;
     }
 
     public static IndexServer start(int port, IndexBackend backend) throws IOException {
-        var published = new PublishedIndex(backend);
+        var executor = new IndexExecutor(backend);
         var service = new IndexServiceGrpc.IndexServiceImplBase() {
             @Override
             public void describe(DescribeRequest request, StreamObserver<DescribeResponse> response) {
                 response.onNext(
-                        backend.describe().toBuilder()
-                                .setCompleteCommitPublication(true)
-                                .build());
+                        backend.describe());
                 response.onCompleted();
             }
 
@@ -41,10 +39,9 @@ public final class IndexServer implements AutoCloseable {
             public void flush(FlushRequest request, StreamObserver<FlushResponse> response) {
                 try {
                     backend.bind(request.getIndexBinding());
-                    long version = published.flush();
+                    executor.flush();
                     response.onNext(
                             FlushResponse.newBuilder()
-                                    .setPublishedVersion(version)
                                     .setIndexBinding(request.getIndexBinding())
                                     .setIndexLocation(backend.location())
                                     .build());
@@ -58,7 +55,7 @@ public final class IndexServer implements AutoCloseable {
 
             @Override
             public StreamObserver<Request> execute(StreamObserver<Response> responses) {
-                var publicationPending = new java.util.concurrent.atomic.AtomicInteger();
+                var pendingResponses = new java.util.concurrent.atomic.AtomicInteger();
                 // Responses respect gRPC flow control: a sender waits while the client has not
                 // read earlier messages, so chunks of large results are not buffered unboundedly.
                 var call = (io.grpc.stub.ServerCallStreamObserver<Response>) responses;
@@ -87,14 +84,14 @@ public final class IndexServer implements AutoCloseable {
                 return new StreamObserver<>() {
                     @Override
                     public void onNext(Request request) {
-                        publicationPending.incrementAndGet();
-                        published.submit(request, send).thenAccept(response -> {
+                        pendingResponses.incrementAndGet();
+                        executor.submit(request, send).thenAccept(response -> {
                             try {
                                 send.accept(response);
                             } finally {
-                                if (publicationPending.decrementAndGet() == 0)
-                                    synchronized (publicationPending) {
-                                        publicationPending.notifyAll();
+                                if (pendingResponses.decrementAndGet() == 0)
+                                    synchronized (pendingResponses) {
+                                        pendingResponses.notifyAll();
                                     }
                             }
                         });
@@ -105,10 +102,10 @@ public final class IndexServer implements AutoCloseable {
 
                     @Override
                     public void onCompleted() {
-                        synchronized (publicationPending) {
-                            while (publicationPending.get() != 0) {
+                        synchronized (pendingResponses) {
+                            while (pendingResponses.get() != 0) {
                                 try {
-                                    publicationPending.wait(1000);
+                                    pendingResponses.wait(1000);
                                 } catch (InterruptedException interrupted) {
                                     Thread.currentThread().interrupt();
                                     break;
@@ -140,9 +137,14 @@ public final class IndexServer implements AutoCloseable {
                 return next.startCall(call, headers);
             }
         });
-        return new IndexServer(
+        try {
+            return new IndexServer(
                 ServerBuilder.forPort(port).addService(bound).maxInboundMessageSize(Integer.MAX_VALUE).build().start(),
-                published);
+                executor);
+        } catch (IOException | RuntimeException failure) {
+            try { executor.close(); } catch (IOException close) { failure.addSuppressed(close); }
+            throw failure;
+        }
     }
 
     public int port() {
@@ -155,13 +157,14 @@ public final class IndexServer implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
-        published.close();
-        server.shutdown();
+        server.shutdownNow();
         try {
-            if (!server.awaitTermination(30, TimeUnit.SECONDS)) server.shutdownNow();
+            if (!server.awaitTermination(30, TimeUnit.SECONDS))
+                throw new IOException("Index server shutdown timed out; backend must remain open");
+            executor.close();
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
-            server.shutdownNow();
+            throw new IOException("Index server shutdown interrupted; backend must remain open", interrupted);
         }
     }
 }

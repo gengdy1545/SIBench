@@ -1,6 +1,6 @@
 // JNI binding of rocksdb-cloud as a plain ordered byte store for
 // org.sibench.adapters.CloudRocksStore. It forwards keys and values only: the index layout,
-// versions and visibility stay in Java (RocksDbBackend).
+// versions and visibility stay in Java (VersionedIndexBackend).
 #include <jni.h>
 
 #include <array>

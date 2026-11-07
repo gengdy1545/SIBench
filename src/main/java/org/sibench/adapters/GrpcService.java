@@ -56,13 +56,13 @@ public final class GrpcService implements AutoCloseable {
 
     /**
      * Waits until every request received is durable, binding the index to {@code binding}; returns
-     * the complete-publication watermark and where the index lives.
+     * the matching binding and where the index lives.
      */
     public org.sibench.adapters.proto.FlushResponse flush(String binding) {
         ManagedChannel channel = channel(endpoint);
         try {
             return IndexServiceGrpc.newBlockingStub(channel)
-                    .withDeadlineAfter(PublishedIndex.FLUSH_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
+                    .withDeadlineAfter(IndexExecutor.FLUSH_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
                     .flush(FlushRequest.newBuilder().setIndexBinding(binding).build());
         } finally {
             channel.shutdownNow();
@@ -144,7 +144,8 @@ public final class GrpcService implements AutoCloseable {
             });
         }
 
-        private void fail(Throwable error) {
+        private synchronized void fail(Throwable error) {
+            if (failure != null) return;
             failure = error;
             for (var waiting : pending.values()) waiting.done().completeExceptionally(error);
             pending.clear();
@@ -153,7 +154,7 @@ public final class GrpcService implements AutoCloseable {
         }
 
         @Override
-        CompletableFuture<Response> transmit(
+        synchronized CompletableFuture<Response> transmit(
                 Request request, java.util.function.Consumer<Response> partial) throws IOException {
             if (failure != null) throw new IOException("Service stream failed", failure);
             var response = new CompletableFuture<Response>();
@@ -175,7 +176,7 @@ public final class GrpcService implements AutoCloseable {
         }
 
         @Override
-        public void close() {
+        public synchronized void close() {
             if (closed) return;
             closed = true;
             if (failure == null) stream.onCompleted();

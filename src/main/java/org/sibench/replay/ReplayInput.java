@@ -50,6 +50,8 @@ public final class ReplayInput {
         coverage.finish(manifest);
         if (manifest.get("workload_operations").getAsLong() != (long) counts.get("encoded_records"))
             throw new IOException("Trace record count mismatch: workload");
+        if (manifest.get("last_resolved_version").getAsLong() != (long) counts.get("last_resolved_version"))
+            throw new IOException("Trace resolution watermark mismatch");
         var report = report(config, null, counts);
         report.put("secondary_index_coverage", manifest.get("secondary_index_coverage").getAsString());
         report.put("status", "workload_integrity_and_supply_valid");
@@ -69,8 +71,8 @@ public final class ReplayInput {
     }
 
     /**
-     * Validates source catalog coverage, maintenance units and source-request binding of one
-     * stream while it is read for the supply check, so the trace is decoded once.
+     * Validates source catalog membership and source-request binding, plus complete baseline
+     * maintenance units, during the supply check. Workload writes are final singleton entries.
      */
     private static final class Coverage implements IndexOperationTrace.Consumer {
         private final String name;
@@ -80,7 +82,7 @@ public final class ReplayInput {
         private final java.util.Set<Integer> loadedTables = new java.util.HashSet<>();
         private IndexOperationTrace.Operation primary, previous;
         private int position, group;
-        private long rows, groupEvent;
+        private long rows, groupEvent, resolution;
 
         Coverage(
                 String name,
@@ -93,6 +95,11 @@ public final class ReplayInput {
 
         @Override
         public void accept(IndexOperationTrace.Operation operation) throws IOException {
+                if (name.equals("baseline") && (operation.kind() != IndexOperationTrace.INSERT || operation.version() != 0))
+                    throw new IOException("Baseline requires version-zero Inserts");
+                if (operation.kind() == IndexOperationTrace.TRANSACTION_BEGIN
+                        && operation.version() != ++resolution)
+                    throw new IOException("Incomplete Trace resolution sequence");
                 if (!IndexOperationTrace.isControl(operation) && name.equals("workload")) {
                     long start = units.firstEvent(operation.workUnitId());
                     long next = units.firstEvent(operation.workUnitId() + 1);
@@ -131,6 +138,13 @@ public final class ReplayInput {
                 }
                 if (group > 0) throw new IOException("Interrupted search group");
                 if (IndexOperationTrace.isControl(operation)) return;
+                if (name.equals("workload")) {
+                    if (operation.expansionSize() != 1 || operation.expansionPosition() != 0)
+                        throw new IOException("Workload requires final singleton index writes");
+                    if (!catalog.getOrDefault(operation.table(), java.util.Set.of()).contains(operation.index()))
+                        throw new IOException("Write outside source catalog");
+                    return;
+                }
                 if (operation.expansionSize() < 1)
                     throw new IOException(
                             "Current index write missing complete maintenance unit");
@@ -164,8 +178,6 @@ public final class ReplayInput {
                         || operation.sourceEvent() != primary.sourceEvent()
                         || operation.flags() != primary.flags()
                         || (operation.index() == 0 && operation.indexedValue() != null)
-                        || (name.equals("baseline")
-                                && operation.kind() != IndexOperationTrace.INSERT)
                         || (operation.kind() != primary.kind()
                                 && operation.kind() != IndexOperationTrace.LOGICAL_DELETE))
                     throw new IOException("Invalid maintenance unit identity");

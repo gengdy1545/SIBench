@@ -11,6 +11,8 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <grpc.version>1.74.0</grpc.version>
     <protobuf.version>3.25.5</protobuf.version>
+    <duckdb.build.directory>${project.basedir}/build/services/duckdb</duckdb.build.directory>
+    <rocksdb.build.directory>${project.basedir}/build/services/rocksdb</rocksdb.build.directory>
   </properties>
   <dependencies>
     <dependency>
@@ -19,9 +21,11 @@
       <version>42.7.8</version>
     </dependency>
     <dependency>
-      <groupId>org.duckdb</groupId>
+      <groupId>org.sibench.native</groupId>
       <artifactId>duckdb_jdbc</artifactId>
-      <version>2.0.0.1</version>
+      <version>source</version>
+      <scope>system</scope>
+      <systemPath>${duckdb.build.directory}/duckdb_jdbc.jar</systemPath>
     </dependency>
     <dependency>
       <groupId>com.moandjiezana.toml</groupId>
@@ -65,9 +69,12 @@
       <version>1.5.6-6</version>
     </dependency>
     <dependency>
-      <groupId>org.rocksdb</groupId>
+      <!-- The gitlink owns the engine version; this is the locally built JNI artifact. -->
+      <groupId>org.sibench.native</groupId>
       <artifactId>rocksdbjni</artifactId>
-      <version>9.1.1</version>
+      <version>source</version>
+      <scope>system</scope>
+      <systemPath>${rocksdb.build.directory}/rocksdbjni.jar</systemPath>
     </dependency>
     <dependency>
       <groupId>junit</groupId>
@@ -137,6 +144,10 @@
             <goals><goal>shade</goal></goals>
             <configuration>
               <createDependencyReducedPom>false</createDependencyReducedPom>
+              <extraJars>
+                <extraJar>${duckdb.build.directory}/duckdb_jdbc.jar</extraJar>
+                <extraJar>${rocksdb.build.directory}/rocksdbjni.jar</extraJar>
+              </extraJars>
               <filters>
                 <filter>
                   <artifact>*:*</artifact>

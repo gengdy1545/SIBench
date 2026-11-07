@@ -3,10 +3,10 @@ package org.sibench.adapters;
 import java.io.IOException;
 
 /**
- * The ordered byte store under {@link RocksDbBackend}: a local RocksDB, or rocksdb-cloud. It only
- * stores bytes; the index layout, versions and visibility are {@link RocksDbBackend}'s.
+ * The ordered byte store under {@link VersionedIndexBackend}. It only
+ * stores bytes; the index layout, versions and visibility are {@link VersionedIndexBackend}'s.
  */
-interface RocksStore extends AutoCloseable {
+interface OrderedStore extends AutoCloseable {
     /** Engine and version, as Describe reports it. */
     String name();
 
@@ -16,6 +16,11 @@ interface RocksStore extends AutoCloseable {
     /** Where a write and a Flush are durable, as Describe reports it. */
     String durability();
 
+    /** Durability reached by a successful incremental write, separate from query visibility. */
+    default org.sibench.adapters.proto.Acknowledgement writeAck() {
+        return org.sibench.adapters.proto.Acknowledgement.ACK_WAL;
+    }
+
     void put(byte[] key, byte[] value, boolean wal) throws IOException;
 
     /** The value of the exact key, or null. */
@@ -24,7 +29,7 @@ interface RocksStore extends AutoCloseable {
     /** A cursor over the keys in {@code [lower, upper)}; a null bound is open. */
     Cursor cursor(byte[] lower, byte[] upper) throws IOException;
 
-    /** Every memtable written to SST files and the WAL synced. */
+    /** Makes prior writes durable to the level declared by the store. */
     void flush() throws IOException;
 
     /** A RocksDB property such as {@code rocksdb.stats}, or null when the engine has none. */

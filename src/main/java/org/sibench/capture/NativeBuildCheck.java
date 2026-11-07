@@ -12,33 +12,25 @@ public final class NativeBuildCheck {
     static java.util.Map<String,Object> verifyRocks(Path root, Path build) throws IOException {
         var recorded = org.sibench.config.ConfigValues.parse(Files.readString(build.resolve("engine-build.json")));
         var inputs = org.sibench.config.ConfigValues.object(recorded, "inputs");
-        var expected = new java.util.TreeMap<String,Object>();
-        expected.put("bridge_sha256", Digests.sha256(root.resolve("src/main/native/rocksdb/timestamps_jni.cc")));
-        expected.put("build_script_sha256", Digests.sha256(root.resolve("scripts/build-rocksdb.sh")));
-        Path headers = root.resolve("index/rocksdb-cloud/include");
-        var hashes = new java.util.TreeMap<String,String>();
-        try (var paths = Files.walk(headers)) {
-            for (Path file : paths.filter(p -> Files.isRegularFile(p) && p.toString().endsWith(".h")).sorted().toList())
-                hashes.put(headers.relativize(file).toString(), Digests.sha256(file));
-        }
-        expected.put("headers", hashes);
-        if (!inputs.equals(expected)) throw new IOException("RocksDB bridge inputs differ from verified build");
+        if (!inputs.equals(engineInputs(root, "rocksdb", "rocksdb")))
+            throw new IOException("RocksDB inputs differ from verified build");
         var artifacts = org.sibench.config.ConfigValues.object(recorded, "artifacts");
-        if (!artifacts.containsKey("libsibench_rocksdb.so") || !artifacts.containsKey("librocksdbjni-linux64.so"))
-            throw new IOException("Incomplete RocksDB bridge build");
+        if (!artifacts.keySet().equals(Set.of("rocksdbjni.jar", "libsibench_rocksdb.so",
+                "librocksdbjni-linux64.so", "source-files.json", "compiler-version.txt",
+                "cmake/CMakeCache.txt", "cmake/compile_commands.json")))
+            throw new IOException("Incomplete RocksDB source build");
         for (var artifact : artifacts.entrySet()) {
             Path name = Path.of(artifact.getKey());
-            if (name.getNameCount() != 1 || name.isAbsolute() || name.toString().equals("..")
-                    || !Digests.sha256(build.resolve(name)).equals(artifact.getValue()))
+            if (!Digests.sha256(build.resolve(name)).equals(artifact.getValue()))
                 throw new IOException("RocksDB runtime artifact differs: " + name);
         }
         try (var runtime = org.rocksdb.RocksDB.class.getResourceAsStream("/librocksdbjni-linux64.so")) {
-            if (runtime == null) throw new IOException("Missing Maven RocksDB runtime");
+            if (runtime == null) throw new IOException("Missing source-built RocksDB runtime");
             var digest = org.sibench.config.Digests.digest();
             byte[] block = new byte[1 << 20];
             for (int count; (count = runtime.read(block)) != -1;) digest.update(block, 0, count);
             if (!java.util.HexFormat.of().formatHex(digest.digest()).equals(artifacts.get("librocksdbjni-linux64.so")))
-                throw new IOException("Bridge RocksDB runtime differs from Maven dependency");
+                throw new IOException("Bridge RocksDB runtime differs from packaged source build");
         }
         return recorded;
     }
@@ -264,7 +256,7 @@ public final class NativeBuildCheck {
         var process = new ProcessBuilder(command).redirectError(ProcessBuilder.Redirect.DISCARD).start();
         try {
             if (!process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS) || process.exitValue() != 0)
-                throw new IOException("Cannot verify DuckDB source: " + command);
+                throw new IOException("Cannot verify native source: " + command);
             return new String(process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).strip();
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt(); throw new IOException(interrupted);
@@ -282,18 +274,24 @@ public final class NativeBuildCheck {
     }
 
     private static java.util.Map<String, Object> engineInputs(Path root) throws IOException {
-        return engineInputs(root,"duckdb","duckdb");
+        var inputs = new java.util.LinkedHashMap<>(engineInputs(root,"duckdb","duckdb"));
+        inputs.put("jdbc_source_commit", sourcePin(root, "duckdb-java"));
+        return inputs;
     }
 
     private static java.util.Map<String,Object> engineInputs(Path root,String engine,String sourceName)throws IOException {
-        Path source = root.resolve("third_party/"+sourceName);
-        String pin = git(root, "rev-parse", ":third_party/"+sourceName);
-        if (!pin.matches("[0-9a-f]{40}") || !pin.equals(git(source, "rev-parse", "HEAD"))
-                || !git(source, "status", "--porcelain=v1", "--untracked-files=all").isEmpty())
-            throw new IOException(engine+" source must be clean and at its gitlink");
-        return java.util.Map.of("source_commit", pin,
+        return java.util.Map.of("source_commit", sourcePin(root, sourceName),
                 "native_sources", tree(root.resolve("src/main/native/"+engine)),
                 "build_script_sha256", Digests.sha256(root.resolve("scripts/build-"+engine+".sh")));
+    }
+
+    private static String sourcePin(Path root, String name) throws IOException {
+        Path source = root.resolve("third_party/" + name);
+        String pin = git(root, "rev-parse", ":third_party/" + name);
+        if (!pin.matches("[0-9a-f]{40}") || !pin.equals(git(source, "rev-parse", "HEAD"))
+                || !git(source, "status", "--porcelain=v1", "--untracked-files=all").isEmpty())
+            throw new IOException(name + " source must be clean and at its gitlink");
+        return pin;
     }
 
     private static void record(Path file, Object value) throws IOException {
@@ -310,27 +308,27 @@ public final class NativeBuildCheck {
     private static java.util.Map<String, String> engineArtifacts(Path build) throws IOException {
         var hashes = new java.util.TreeMap<String, String>();
         for (String name : List.of("duckdb_host", "src/libduckdb.so", "duckdb", "CMakeCache.txt",
-                "compile_commands.json", "compiler-version.txt", "source-files.json"))
+                "compile_commands.json", "compiler-version.txt", "source-files.json", "duckdb_jdbc.jar",
+                "libduckdb_java.so_linux_amd64", "jdbc/build/CMakeCache.txt", "jdbc/build/compile_commands.json"))
             hashes.put(name, Digests.sha256(build.resolve(name)));
         if (!Files.isExecutable(build.resolve("duckdb_host"))) throw new IOException("DuckDB host is not executable");
         return hashes;
     }
 
-    /** The build receipt is written only after compilation succeeds and all inputs remain unchanged. */
-    static void recordEngine(Path root, Path build) throws IOException {
-        var inputs = engineInputs(root);
-        requireRecord(build.resolve("engine-inputs.json"), inputs, "DuckDB build inputs");
-        requireRecord(build.resolve("source-files.json"), tree(build.resolve("source")), "Prepared DuckDB source");
-        if (!Digests.sha256(build.resolve("duckdb_host.cpp")).equals(
-                Digests.sha256(root.resolve("src/main/native/duckdb/duckdb_host.cpp"))))
-            throw new IOException("Compiled host source differs from project input");
-        record(build.resolve("engine-build.json"), java.util.Map.of("inputs", inputs, "artifacts", engineArtifacts(build)));
-    }
-
     /** Generation verifies immutable build inputs and the artifacts it will actually execute. */
     static java.util.Map<String, Object> verifyEngine(Path root, Path build) throws IOException {
-        var identity = java.util.Map.<String, Object>of("inputs", engineInputs(root), "artifacts", engineArtifacts(build));
+        var artifacts = engineArtifacts(build);
+        var identity = java.util.Map.<String, Object>of("inputs", engineInputs(root), "artifacts", artifacts);
         requireRecord(build.resolve("engine-build.json"), identity, "DuckDB engine");
+        try (var runtime = org.duckdb.DuckDBDriver.class.getResourceAsStream("/libduckdb_java.so_linux_amd64")) {
+            if (runtime == null) throw new IOException("Missing source-built DuckDB runtime");
+            var digest = Digests.digest();
+            byte[] block = new byte[1 << 20];
+            for (int count; (count = runtime.read(block)) != -1;) digest.update(block, 0, count);
+            if (!java.util.HexFormat.of().formatHex(digest.digest()).equals(
+                    artifacts.get("libduckdb_java.so_linux_amd64")))
+                throw new IOException("Packaged DuckDB runtime differs from the capture source build");
+        }
         return identity;
     }
 
@@ -371,23 +369,11 @@ public final class NativeBuildCheck {
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 3) throw new IllegalArgumentException("NativeBuildCheck paths|record|verify|engine-path|engine-inputs|engine-prepared|engine-record|postgres-path|postgres-inputs|postgres-prepared|postgres-record|postgres-verify ROOT CONFIG");
+        if (args.length != 3) throw new IllegalArgumentException("NativeBuildCheck paths|record|verify|postgres-path|postgres-inputs|postgres-prepared|postgres-record|postgres-verify ROOT CONFIG");
         Path root = Path.of(args[1]).toRealPath();
         if(args[0].startsWith("postgres-")) {
             var runtime=org.sibench.config.SibenchConfig.read(root.resolve(args[2]));
             postgresBuild(args[0],root,engineDirectory(root,runtime,"postgres"));return;
-        }
-        if (args[0].startsWith("engine-")) {
-            var runtime = org.sibench.config.SibenchConfig.read(root.resolve(args[2]));
-            Path directory = engineDirectory(root, runtime);
-            switch (args[0]) {
-                case "engine-path" -> NativeProcess.assignment("BUILD", directory);
-                case "engine-inputs" -> record(directory.resolve("engine-inputs.json"), engineInputs(root));
-                case "engine-prepared" -> record(directory.resolve("source-files.json"), tree(directory.resolve("source")));
-                case "engine-record" -> recordEngine(root, directory);
-                default -> throw new IllegalArgumentException("Unknown engine build action: " + args[0]);
-            }
-            return;
         }
         Build build = build(root, Path.of(args[2]));
         switch (args[0]) {

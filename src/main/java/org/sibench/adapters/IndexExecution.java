@@ -45,6 +45,8 @@ public final class IndexExecution {
             IndexBackend backend, Request request, java.util.function.Consumer<Response> partial) {
         var response = Response.newBuilder().setId(request.getId());
         try {
+            if (!request.getUnknownFields().asMap().isEmpty())
+                throw new IllegalArgumentException("Unsupported request fields");
             switch (request.getOperationCase()) {
                 case WRITE -> backend.write(request.getWrite());
                 case BATCH -> batch(backend, request.getBatch());
@@ -113,8 +115,7 @@ public final class IndexExecution {
         for (int i = 1; i < group.getMembersCount(); i++) {
             Search member = group.getMembers(i);
             if (member.getTable() != first.getTable()
-                    || member.getReadVersion() != first.getReadVersion()
-                    || member.getLocalVersion() != first.getLocalVersion())
+                    || member.getReadVersion() != first.getReadVersion())
                 throw new IllegalArgumentException("Group members span tables or read versions");
             var keys = new HashSet<ByteString>();
             for (Result result : backend.search(member)) {

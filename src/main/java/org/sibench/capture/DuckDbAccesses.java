@@ -108,12 +108,11 @@ public final class DuckDbAccesses {
                     +"unnest(r.primary_keys_sql) WITH ORDINALITY AS k(key_sql,ordinality)");
             reject(database,"SELECT 1 FROM temp.main.sibench_access_keys GROUP BY access_id,key_sql HAVING count(*)<>1 LIMIT 1",
                     "Duplicate visible primary key in ART access");
-            execute(database,"CREATE TEMP TABLE sibench_access_results AS SELECT k.*,i.row_id FROM temp.main.sibench_access_keys k "
-                    +"JOIN temp.main.sibench_accesses a USING(access_id) LEFT JOIN temp.main.sibench_identities i "
-                    +"ON i.table_id=a.table_id AND i.primary_key_sql=k.key_sql AND ((i.outcome='commit' AND i.version<=a.read_version) "
-                    +"OR (i.version=a.version AND i.query_id<a.query_id)) QUALIFY row_number() OVER(PARTITION BY "
-                    +"k.access_id,k.batch_id,k.position ORDER BY (i.version=a.version) DESC,i.version DESC,i.query_id DESC)=1");
-            reject(database,"SELECT 1 FROM temp.main.sibench_access_results WHERE row_id IS NULL LIMIT 1",
+            // Verify source identity coverage without constructing per-query RowID answers.
+            reject(database,"SELECT 1 FROM temp.main.sibench_access_keys k JOIN temp.main.sibench_accesses a USING(access_id) "
+                    +"WHERE NOT EXISTS(SELECT 1 FROM temp.main.sibench_identities i WHERE i.table_id=a.table_id "
+                    +"AND i.primary_key_sql=k.key_sql AND ((i.outcome='commit' AND i.version<=a.read_version) "
+                    +"OR (i.version=a.version AND i.query_id<a.query_id))) LIMIT 1",
                     "Missing visible native identity for ART result");
             database.commit();
         } catch(SQLException|RuntimeException failure) {

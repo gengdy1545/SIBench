@@ -14,16 +14,15 @@ public final class IndexVersionCheck {
     public static void main(String[] args) throws Exception {
         var config=ServiceConfig.ofServer(Path.of(""),Path.of(args[0]));
         try(var backend=config.backend()) { check(backend); }
-        Files.writeString(Path.of(args[1]),"{\"status\":\"passed\",\"scope\":\"hand-derived version, deletion and abort checks plus Flush; not full Trace result identities\"}\n",StandardOpenOption.CREATE_NEW);
+        Files.writeString(Path.of(args[1]),"{\"status\":\"passed\",\"scope\":\"hand-derived version, deletion and reinsert checks plus Flush; not full Trace result identities\"}\n",StandardOpenOption.CREATE_NEW);
     }
 
     static void check(IndexBackend backend) throws Exception {
-        for(int version=0;version<=4;version++) {
+        for(int version=0;version<=3;version++) {
             backend.write(Write.newBuilder().setKey(EntryKey.newBuilder().setTable(1).setPrimaryKey(KEY))
                     .setKind(version==0?Write.Kind.INSERT:version==2?Write.Kind.LOGICAL_DELETE:Write.Kind.UPSERT)
                     .setVersion(version).setValue(Value.newBuilder().setRowId(70+version)).build());
         }
-        backend.abort(4);
         for(int pass=0;pass<2;pass++) {
             for(int timestamp=0;timestamp<=5;timestamp++) {
                 var actual=backend.search(Search.newBuilder().setTable(1).setReadVersion(timestamp).build());

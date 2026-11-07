@@ -1,0 +1,72 @@
+--- a/src/main/java/org/duckdb/DuckDBNative.java
++++ b/src/main/java/org/duckdb/DuckDBNative.java
+@@ -6,14 +6,10 @@
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.math.BigDecimal;
+-import java.net.URI;
+ import java.net.URL;
+ import java.nio.ByteBuffer;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+-import java.nio.file.Paths;
+-import java.security.CodeSource;
+-import java.security.ProtectionDomain;
+ import java.sql.SQLException;
+ import java.util.Properties;
+ 
+@@ -46,19 +42,7 @@
+             return;
+         }
+ 
+-        // There is no native library inside the JAR file, so we try to load it by name
+-        try {
+-            System.loadLibrary("duckdb_java");
+-        } catch (UnsatisfiedLinkError e) {
+-            // Native library cannot be loaded by name using ordinary JVM mechanisms, we try to load it directly
+-            // from FS - from the same directory where the current JAR resides
+-            try {
+-                loadFromCurrentJarDir(libName);
+-            } catch (Throwable t) {
+-                e.printStackTrace();
+-                throw new IllegalStateException(t);
+-            }
+-        }
++        throw new FileNotFoundException("Missing source-built DuckDB JNI resource: " + libName);
+     }
+ 
+     private static String cpuArch() {
+@@ -92,16 +76,6 @@
+         return "libduckdb_java.so_" + osName() + "_" + cpuArch();
+     }
+ 
+-    static Path currentJarDir() throws Exception {
+-        ProtectionDomain pd = DuckDBNative.class.getProtectionDomain();
+-        CodeSource cs = pd.getCodeSource();
+-        URL loc = cs.getLocation();
+-        URI uri = loc.toURI();
+-        Path jarPath = Paths.get(uri);
+-        Path dirPath = jarPath.getParent();
+-        return dirPath.toRealPath();
+-    }
+-
+     private static void unpackAndLoad(URL nativeLibRes) throws IOException {
+         Path tmpFile = Files.createTempFile("libduckdb_java", ".so");
+         try (InputStream is = nativeLibRes.openStream()) {
+@@ -113,16 +87,6 @@
+         System.load(tmpFile.toAbsolutePath().toString());
+     }
+ 
+-    private static void loadFromCurrentJarDir(String libName) throws Exception {
+-        Path dir = currentJarDir();
+-        Path libPath = dir.resolve(libName);
+-        if (Files.exists(libPath)) {
+-            System.load(libPath.toAbsolutePath().toString());
+-        } else {
+-            throw new FileNotFoundException("DuckDB JNI library not found, path: '" + libPath.toAbsolutePath() + "'");
+-        }
+-    }
+-
+     // We use zero-length ByteBuffer-s as a hacky but cheap way to pass C++ pointers
+     // back and forth
+ 

@@ -14,8 +14,8 @@ import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import org.junit.Test;
 import org.junit.After;
-import org.sibench.adapters.PublishedIndex;
-import org.sibench.adapters.RocksDbBackend;
+import org.sibench.adapters.IndexExecutor;
+import org.sibench.adapters.VersionedIndexBackend;
 import org.sibench.adapters.proto.Status;
 import org.sibench.adapters.proto.TraceRecord;
 import org.sibench.adapters.proto.ValueKind;
@@ -196,21 +196,30 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             assertTrue(number(observer,"SELECT count(*) FROM sibench_accesses")>0);
             assertTrue(number(observer,"SELECT count(*) FROM sibench_changes")>0);
             var expected=new HashMap<Long,HashSet<Long>>();
-            try(var q=observer.createStatement();var rows=q.executeQuery("SELECT a.raw_record,r.row_id FROM sibench_accesses a "
-                    +"LEFT JOIN sibench_access_results r USING(access_id) ORDER BY a.raw_record")) {
+            record Observed(long record,int table,long read,long local,long query,String key) {}
+            var observed=new ArrayList<Observed>();
+            try(var q=observer.createStatement();var rows=q.executeQuery("SELECT a.raw_record,a.table_id,a.read_version,a.version,a.query_id,r.key_sql FROM sibench_accesses a "
+                    +"LEFT JOIN sibench_access_keys r USING(access_id) WHERE NOT EXISTS (SELECT 1 FROM sibench_changes c "
+                    +"WHERE c.transaction_id=a.transaction_id AND c.query_id<a.query_id) ORDER BY a.raw_record")) {
                 while(rows.next()) {
-                    var ids=expected.computeIfAbsent(rows.getLong(1),ignored->new HashSet<>());
-                    long id=rows.getLong(2);if(!rows.wasNull())assertTrue(ids.add(id));
+                    observed.add(new Observed(rows.getLong(1),rows.getInt(2),rows.getLong(3),
+                            rows.getLong(4),rows.getLong(5),rows.getString(6)));
                 }
+            }
+            for(var row:observed) {
+                var ids=expected.computeIfAbsent(row.record(),ignored->new HashSet<>());
+                if(row.key()!=null)assertTrue(ids.add(DuckDbIdentities.observedRow(observer,row.table(),row.key(),
+                        row.read(),row.local(),row.query())));
             }
             var trace=output.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(trace);
             try(writer){DuckDbProjection.write(observer,writer);}
             long[] ids={0},searches={0},matched={0};
-            try(var backend=RocksDbBackend.create(output.resolve("index"),ValueKind.ROW_ID);var index=new PublishedIndex(backend)) {
+            try(var backend=VersionedIndexBackend.create(output.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {
                 var consumer=new IndexOperationTrace.Consumer(){
                     @Override public void accept(IndexOperationTrace.Operation operation){fail("Missing stored request");}
                     @Override public void accept(TraceRecord record,List<IndexOperationTrace.Operation> operations)throws java.io.IOException {
                         if(record.hasBegin())return;
+                        if(record.hasEnd())return;
                         try {
                             var request=record.getRequest().toBuilder().setId(++ids[0]).build();
                             var response=index.submit(request).get(5,TimeUnit.SECONDS);assertEquals(response.getMessage(),Status.OK,response.getStatus());

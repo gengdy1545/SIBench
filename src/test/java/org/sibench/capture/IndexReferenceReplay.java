@@ -635,6 +635,15 @@ public final class IndexReferenceReplay implements AutoCloseable {
     }
 
     public void accept(Operation operation) throws IOException {
+        accept(operation, false);
+    }
+
+    /** Committed net changes may retain a tombstone for a transient key never exported live. */
+    public void acceptCommitted(Operation operation) throws IOException {
+        accept(operation, true);
+    }
+
+    private void accept(Operation operation, boolean committed) throws IOException {
         if (!groupMembers.isEmpty() && !operation.grouped())
             throw new IOException("Search group interrupted before its last member");
         if (operation.kind() == IndexOperationTrace.TRANSACTION_ABORT) {
@@ -697,6 +706,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
             throw new IOException("Unsupported index write");
         StoredVersion previous = store.current(entry);
         if (operation.kind() == IndexOperationTrace.LOGICAL_DELETE
+                && !committed
                 && (previous == null || !previous.present()))
             throw new IOException("Deletion of absent index entry");
         if (operation.transactionId() != positionsTransaction) {

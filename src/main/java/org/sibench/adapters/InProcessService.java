@@ -6,11 +6,11 @@ import org.sibench.replay.ReplayTarget;
 
 import java.util.concurrent.CompletableFuture;
 
-/** Clients of an in-process executor, with the same asynchronous publication as gRPC. */
+/** Clients of an in-process executor, with the same asynchronous execution as gRPC. */
 public final class InProcessService {
     private InProcessService() {}
 
-    /** A published executor answers later: a read may wait for a commit marker not yet sent. */
+    /** An executor completes responses after backend execution. */
     public static ReplayTarget.Factory factory(
             IndexExecution.Executor executor, TraceRequests requests) {
         return clientId -> new ServiceClient(requests) {

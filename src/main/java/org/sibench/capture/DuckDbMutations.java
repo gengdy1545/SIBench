@@ -28,7 +28,7 @@ public final class DuckDbMutations {
             reject(database,"SELECT 1 FROM temp.main.sibench_accesses a JOIN temp.main.sibench_source_mutations m "
                     +"USING(connection_id,transaction_id,query_id,table_id),unnest(m.rows) AS captured(r) "
                     +"WHERE m.event='begin' AND m.kind IN ('delete','update') AND NOT EXISTS(SELECT 1 FROM "
-                    +"temp.main.sibench_access_results k WHERE k.access_id=a.access_id AND k.key_sql="
+                    +"temp.main.sibench_access_keys k WHERE k.access_id=a.access_id AND k.key_sql="
                     +"r.values_sql[list_position(list_transform(m.columns,lambda c: c.name),m.primary_key)]) "
                     +"AND EXISTS(SELECT 1 FROM temp.main.sibench_access_batches b JOIN temp.main.sibench_source_mutations w "
                     +"USING(connection_id,transaction_id,query_id) WHERE b.access_id=a.access_id AND b.phase<>'closed' "
