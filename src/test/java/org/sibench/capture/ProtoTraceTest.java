@@ -50,7 +50,10 @@ public class ProtoTraceTest {
     @Test public void primaryExportKeepsTransactionsAndWholeGroupsWithSeparateCounts() throws Exception {
         for (boolean secondary : List.of(false, true)) {
             Path file = temporary.getRoot().toPath().resolve("scope-" + secondary + ".pb.zst");
-            var writer = new ProtoTrace.Writer(file, secondary);
+            var budget = new RequestBudget(2, java.time.Duration.ofSeconds(10));
+            Path stop = file.resolveSibling("stop-" + secondary);
+            budget.begin("mixed", 1, stop);
+            var writer = new ProtoTrace.Writer(file, secondary, budget);
             try (writer) {
                 writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 91, 1, 0));
                 IndexMutation.emit(write(IndexOperationTrace.UPSERT, 1, 1, 1),
@@ -71,6 +74,10 @@ public class ProtoTraceTest {
                         IndexOperationTrace.UNION_GROUP, i, 2).withTransaction(93, 0).withWorkUnitId(3));
                 writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 93, 3, 0));
             }
+            assertTrue(Files.isRegularFile(stop));
+            assertEquals(secondary ? 7 : 3, budget.count());
+            budget.end();
+            assertEquals(secondary ? 5L : 1L, budget.finish().get("overshoot_requests"));
             var decoded = new ArrayList<Operation>();
             assertEquals(secondary ? 15 : 10, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
             assertEquals(secondary ? 15 : 10, writer.count());

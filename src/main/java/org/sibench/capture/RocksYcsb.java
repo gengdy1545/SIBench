@@ -17,6 +17,12 @@ public final class RocksYcsb {
     private final AtomicLong connections = new AtomicLong();
     private long opened, completed, calls;
     private boolean loading;
+    private RequestBudget budget;
+
+    void budget(RequestBudget value) { budget=value; }
+    public static synchronized boolean stopRequested() {
+        return active != null && !active.loading && active.budget != null && active.budget.reached();
+    }
 
     RocksYcsb(RocksDbRows rows, RocksDbRows.Baseline baseline, int fieldCount) {
         this.rows = rows; this.baseline = baseline; this.fieldCount = fieldCount;

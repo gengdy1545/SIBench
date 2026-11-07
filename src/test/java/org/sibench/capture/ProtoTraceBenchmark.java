@@ -10,6 +10,9 @@ import java.util.*;
 public final class ProtoTraceBenchmark {
     public static void main(String[] args) throws Exception {
         Path directory = Path.of(args[1]);
+        if (args[0].equals("read-trace")) {
+            readTrace(directory,Integer.parseInt(args[2]),Path.of(args[3]));return;
+        }
         if (args[0].equals("create")) {
             int rows = Integer.parseInt(args[2]), transactions = Integer.parseInt(args[3]);
             Files.createDirectory(directory);
@@ -68,4 +71,35 @@ public final class ProtoTraceBenchmark {
         }
         System.out.println(new GsonBuilder().setPrettyPrinting().create().toJson(results));
     }
+    static void readTrace(Path trace,int repeats,Path report) throws Exception {
+        if(repeats<1 || repeats>10)throw new IllegalArgumentException("Use 1 to 10 measured passes");
+        var manifest=org.sibench.trace.TraceManifest.read(trace);
+        var results=new ArrayList<Map<String,Object>>();
+        for(String phase:List.of("baseline","workload")) {
+            long fingerprint=0;
+            for(int repeat=-1;repeat<repeats;repeat++) {
+                long start=System.nanoTime();long[] records={0},requests={0},digest={0};
+                ProtoTrace.source(trace,manifest,phase).read(operation->{
+                    records[0]++;
+                    if(!IndexOperationTrace.isControl(operation)
+                            && (!operation.grouped() || operation.expansionPosition()==0)) requests[0]++;
+                    digest[0]=Long.rotateLeft(digest[0],1)^operation.sourceEvent()^operation.kind()
+                            ^operation.version()^operation.rowId();
+                });
+                double seconds=(System.nanoTime()-start)/1e9;
+                if(records[0]!=manifest.get(phase+"_operations").getAsLong())throw new AssertionError("Incomplete phase read");
+                if(repeat==-1)fingerprint=digest[0];
+                else {
+                    if(fingerprint!=digest[0])throw new AssertionError("Unstable parsed operations");
+                    results.add(Map.of("phase",phase,"pass",repeat,"records",records[0],"effective_requests",requests[0],
+                            "seconds",seconds,"effective_requests_per_second",requests[0]/seconds,"fingerprint",digest[0]));
+                }
+            }
+        }
+        Files.writeString(report,new GsonBuilder().setPrettyPrinting().create().toJson(Map.of(
+                "trace_manifest_sha256",org.sibench.config.Digests.sha256(trace.resolve("manifest.json")),
+                "scope","Single parser, full phase reads with digest checks; one unmeasured warm pass per phase; observed throughput, not a global maximum",
+                "passes",results)),StandardOpenOption.CREATE_NEW);
+    }
+
 }

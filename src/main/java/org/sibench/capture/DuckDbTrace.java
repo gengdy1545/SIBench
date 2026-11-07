@@ -21,15 +21,29 @@ import org.sibench.replay.ReplayProjection;
 import org.sibench.schema.SourceSchema;
 
 /** Both native inputs publish the same baseline, workload and sealed data contract. */
-public final class DuckDbTrace {
+public final class DuckDbTrace implements AutoCloseable {
     private final Mode mode;
     private final Path directory;
     private final boolean secondaryIndexes;
     private final List<IndexCatalog.Definition> catalog;
     private final LinkedHashMap<String,Object> manifest;
     private ProtoTrace.Writer base;
+    private final ProtoTrace.Writer workload;
+    private final WorkUnits.Output units;
+    private final ReplayProjection validation = new ReplayProjection(new ReplayConfig(true,0,0,0,0),true,operation->{});
+    private final Map<String,Long> shapes = new LinkedHashMap<>();
+    private long unitCount,commits,aborts,localSearches,statements;
+    private int windows;
+    private boolean finished;
+
+    long lastVersion() { return commits+aborts; }
+
 
     public DuckDbTrace(Mode mode,SourceSchema source,Path directory,boolean secondaryIndexes)throws IOException {
+        this(mode,source,directory,secondaryIndexes,null);
+    }
+
+    DuckDbTrace(Mode mode,SourceSchema source,Path directory,boolean secondaryIndexes,RequestBudget budget)throws IOException {
         if(mode!=Mode.CAPTURE || source.benchmark().equals("ycsb"))
             throw new IllegalArgumentException("Unsupported native benchmark mode");
         this.secondaryIndexes=secondaryIndexes;this.mode=mode;this.directory=directory;catalog=IndexCatalog.duckDbDefinitions(source);
@@ -37,6 +51,8 @@ public final class DuckDbTrace {
         IndexCatalog.fromManifest(new Gson().toJsonTree(manifest).getAsJsonObject());
         Files.createDirectory(directory);
         Files.writeString(directory.resolve("INCOMPLETE"),"Native trace generation/publication pending\n",StandardOpenOption.CREATE_NEW);
+        units=WorkUnits.create(directory);
+        workload=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,budget);
     }
 
     public void baseline(Connection database,Map<String,Long> expected)throws SQLException,IOException {
@@ -69,77 +85,81 @@ public final class DuckDbTrace {
         }
     }
 
-    /** Facts and mode-specific projection bindings must be complete; source sessions must have closed. */
-    public Draft workload(Connection database,Map<String,Object> evidence)throws SQLException,IOException {
-        if(!manifest.containsKey("baseline_rows"))throw new IOException("Baseline export is incomplete");
-        try {
-            var origins=origins(database,directory);
-            manifest.put("work_units_sha256",origins.sha256());manifest.put("source_work_units",origins.count());
-            manifest.put("work_unit_rule","one native operation origin; numbered by raw event identity, not transaction resolution order");
-            var policy=new ReplayConfig(true,0,0,0,0,"operation");
-            long[] commits={0},aborts={0},localSearches={0};
-            var shapes=new LinkedHashMap<String,Long>();
-            var workload=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes);
-            try(workload;var validation=new ReplayProjection(policy,true,operation->{})) {
-                IndexOperationTrace.Consumer output=operation->{
-                    if(!IndexOperationTrace.isControl(operation)) {
-                        int unit=Arrays.binarySearch(origins.firstEvents(),1,(int)origins.count()+1,operation.sourceEvent());
-                        if(unit<1)throw new IOException("Operation has no exact native source origin");
-                        operation=operation.withWorkUnitId(unit);
-                    }
-                    if(operation.kind()==IndexOperationTrace.TRANSACTION_COMMIT)commits[0]++;
-                    if(operation.kind()==IndexOperationTrace.TRANSACTION_ABORT)aborts[0]++;
-                    if(operation.kind()==IndexOperationTrace.SEARCH&&operation.mutationOrdinal()>0)localSearches[0]++;
-                    if(operation.grouped()&&operation.expansionPosition()==0)
-                        shapes.merge((operation.flags()&IndexOperationTrace.INTERSECT_GROUP)!=0?"intersection":"union",1L,Long::sum);
-                    validation.accept(operation);workload.accept(operation);
-                };
-                DuckDbProjection.write(database,output);
-                validation.finish();
+    /** A closed source window has its own temporary bindings; only its new facts are projected. */
+    public void append(Connection database)throws SQLException,IOException {
+        if(finished || !manifest.containsKey("baseline_rows"))throw new IOException("Trace is not accepting workload output");
+        long before=lastVersion(),baseUnit=unitCount;
+        long[] origins=origins(database);
+        IndexOperationTrace.Consumer output=operation->{
+            if(!IndexOperationTrace.isControl(operation)) {
+                int unit=Arrays.binarySearch(origins,1,origins.length,operation.sourceEvent());
+                if(unit<1)throw new IOException("Operation has no exact native source origin");
+                operation=operation.withWorkUnitId(baseUnit+unit);
             }
-            manifest.put("output","proto");manifest.put("value_kinds",List.of("row_id"));
-            manifest.put("mode",mode.name().toLowerCase(java.util.Locale.ROOT));
-            manifest.put("generation","native_duckdb");manifest.put("secondary_index_coverage",secondaryIndexes?"all_source_definitions":"primary_only");
-            manifest.put("workload_operations",workload.count());manifest.put("committed_transactions",commits[0]);
-            manifest.put("aborted_transactions",aborts[0]);manifest.put("transaction_local_searches",localSearches[0]);
-            if(!shapes.isEmpty())manifest.put("searched_accesses_by_shape",shapes);
-            var baselineFiles=List.of(ProtoTrace.file("baseline.pb.zst",base));
-            var workloadFiles=List.of(ProtoTrace.file("workload.pb.zst",workload));
-            manifest.put("proto_files",Map.of("baseline",baselineFiles,"workload",workloadFiles));
-            var gson=new Gson();
-            manifest.put("baseline_trace_sha256",ProtoTrace.identity(gson.toJsonTree(baselineFiles).getAsJsonArray()));
-            manifest.put("workload_trace_sha256",ProtoTrace.identity(gson.toJsonTree(workloadFiles).getAsJsonArray()));
-            manifest.put("source_statements",number(database,"SELECT count(*) FROM temp.main.sibench_statements"));
-            long resolved=number(database,"SELECT count(*) FROM temp.main.sibench_transactions");
-            if(commits[0]+aborts[0]!=resolved)throw new IOException("Incomplete native transaction projection");
-            manifest.put("last_resolved_version",resolved);
-            manifest.put("source_evidence",Map.copyOf(evidence));
-            DuckDbTransactions.seal(database);
-            return new Draft(directory,manifest);
-        }catch(SQLException|IOException|RuntimeException failure) {
-            try{Files.writeString(directory.resolve("failure.txt"),failure.toString()+"\n",StandardOpenOption.CREATE_NEW);}
-            catch(IOException diagnostic){failure.addSuppressed(diagnostic);}throw failure;
-        }
+            if(operation.kind()==IndexOperationTrace.TRANSACTION_COMMIT)commits++;
+            if(operation.kind()==IndexOperationTrace.TRANSACTION_ABORT)aborts++;
+            if(operation.kind()==IndexOperationTrace.SEARCH&&operation.mutationOrdinal()>0)localSearches++;
+            if(operation.grouped()&&operation.expansionPosition()==0)
+                shapes.merge((operation.flags()&IndexOperationTrace.INTERSECT_GROUP)!=0?"intersection":"union",1L,Long::sum);
+            validation.accept(operation);workload.accept(operation);
+        };
+        DuckDbProjection.write(database,output);
+        if(lastVersion()-before!=number(database,"SELECT count(*) FROM temp.main.sibench_transactions"))
+            throw new IOException("Incomplete native transaction projection");
+        statements+=number(database,"SELECT count(*) FROM temp.main.sibench_statements");
+        DuckDbTransactions.retain(database,windows++==0);
     }
 
-    private static WorkUnits.Catalog origins(Connection database,Path directory)throws SQLException,IOException {
-        String origins="SELECT raw_record AS source_event,connection_id,query_id FROM temp.main.sibench_accesses UNION "
+    public Draft finish(Connection database,Map<String,Object> evidence)throws SQLException,IOException {
+        if(finished || windows==0)throw new IOException("Trace workload is not ready for publication");
+        validation.finish();workload.close();units.lines().close();
+        DuckDbTransactions.finish(database);
+        manifest.put("work_units_sha256",HexFormat.of().formatHex(units.digest().digest()));
+        manifest.put("source_work_units",unitCount);
+        manifest.put("work_unit_rule","one native operation origin; numbered by capture-window and raw event order");
+        manifest.put("output","proto");manifest.put("value_kinds",List.of("row_id"));
+        manifest.put("mode",mode.name().toLowerCase(java.util.Locale.ROOT));
+        manifest.put("generation","native_duckdb");manifest.put("secondary_index_coverage",secondaryIndexes?"all_source_definitions":"primary_only");
+        manifest.put("workload_operations",workload.count());manifest.put("committed_transactions",commits);
+        manifest.put("aborted_transactions",aborts);manifest.put("transaction_local_searches",localSearches);
+        if(!shapes.isEmpty())manifest.put("searched_accesses_by_shape",shapes);
+        var baselineFiles=List.of(ProtoTrace.file("baseline.pb.zst",base));
+        var workloadFiles=List.of(ProtoTrace.file("workload.pb.zst",workload));
+        manifest.put("proto_files",Map.of("baseline",baselineFiles,"workload",workloadFiles));
+        var gson=new Gson();
+        manifest.put("baseline_trace_sha256",ProtoTrace.identity(gson.toJsonTree(baselineFiles).getAsJsonArray()));
+        manifest.put("workload_trace_sha256",ProtoTrace.identity(gson.toJsonTree(workloadFiles).getAsJsonArray()));
+        manifest.put("source_statements",statements);manifest.put("last_resolved_version",lastVersion());
+        manifest.put("source_evidence",Map.copyOf(evidence));
+        finished=true;
+        return new Draft(directory,manifest);
+    }
+
+    public Draft workload(Connection database,Map<String,Object> evidence)throws SQLException,IOException {
+        try(this) { append(database);return finish(database,evidence); }
+    }
+
+    @Override public void close()throws IOException {
+        try(workload;var lines=units.lines();validation) { }
+    }
+
+    private long[] origins(Connection database)throws SQLException,IOException {
+        String source="SELECT raw_record AS source_event,connection_id,query_id FROM temp.main.sibench_accesses UNION "
                 +"SELECT source_event,connection_id,query_id FROM temp.main.sibench_changes";
         long[] events=new long[1024];int count=0;long previous=0;
-        var output=WorkUnits.create(directory);
-        try(var lines=output.lines();var query=database.createStatement();var rows=query.executeQuery(
-                "SELECT DISTINCT source_event,connection_id,query_id FROM ("+origins+") ORDER BY source_event")) {
+        try(var query=database.createStatement();var rows=query.executeQuery(
+                "SELECT DISTINCT source_event,connection_id,query_id FROM ("+source+") ORDER BY source_event")) {
             while(rows.next()) {
                 long event=rows.getLong(1),connection=rows.getLong(2),sourceQuery=rows.getLong(3);
-                if(event<=previous||connection<0||sourceQuery<0||count>=Integer.MAX_VALUE-8)
+                if(event<=previous||connection<0||sourceQuery<0||unitCount>=Integer.MAX_VALUE-8)
                     throw new IOException("Invalid native operation origin");
-                previous=event;count++;
+                previous=event;count++;unitCount++;
                 if(count>=events.length)events=Arrays.copyOf(events,Math.toIntExact(Math.min(Integer.MAX_VALUE-8L,events.length*2L)));
                 events[count]=event;
-                lines.write("{\"work_unit_id\":"+count+",\"source_event\":"+event+",\"connection_id\":"+connection+",\"query_id\":"+sourceQuery+"}\n");
+                units.lines().write("{\"work_unit_id\":"+unitCount+",\"source_event\":"+event+",\"connection_id\":"+connection+",\"query_id\":"+sourceQuery+"}\n");
             }
         }
-        return new WorkUnits.Catalog(HexFormat.of().formatHex(output.digest().digest()),events,count);
+        return Arrays.copyOf(events,count+1);
     }
 
     private static long number(Connection database,String sql)throws SQLException {

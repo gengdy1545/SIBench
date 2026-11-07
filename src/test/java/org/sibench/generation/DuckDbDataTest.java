@@ -14,7 +14,7 @@ public class DuckDbDataTest {
     @Rule public TemporaryFolder temporary=new TemporaryFolder();
     private static void sql(Connection db,String text)throws SQLException {try(var q=db.createStatement()){q.execute(text);}}
     private static void inputs(Connection db)throws SQLException {
-        sql(db,"CREATE TEMP TABLE sibench_transactions(transaction_id UBIGINT,version BIGINT,read_version BIGINT,outcome VARCHAR)");
+        sql(db,"CREATE TEMP TABLE sibench_transactions(transaction_id UBIGINT,version BIGINT,read_version BIGINT,outcome VARCHAR,commit_stamp UBIGINT)");
         sql(db,"CREATE TEMP TABLE sibench_read_points(connection_id BIGINT,query_id BIGINT,transaction_id UBIGINT)");
         sql(db,"CREATE TEMP TABLE sibench_mutation_statements(transaction_id UBIGINT,query_id BIGINT,schema_name VARCHAR,"
                 +"table_name VARCHAR,statement_outcome VARCHAR,event VARCHAR,affected_rows BIGINT)");

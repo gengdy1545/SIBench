@@ -46,6 +46,7 @@ public class DuckDbGenerationCheck {
                 n.put("workloads",workloads);
             }
             document.put("native",n);
+            document.put("trace",Map.of("secondary_indexes",false,"workload_requests",1000));
             document.put("artifacts",Map.of("directory",root.relativize(output.resolve(benchmark)).toString()));
             Path profile=output.resolve(benchmark+".yaml");Files.writeString(profile,new Yaml().dump(document));
             selections.add(Map.of("config",profile.toString(),"engine","duckdb","mode","capture"));
@@ -75,6 +76,8 @@ public class DuckDbGenerationCheck {
             var manifest=TraceManifest.read(trace);assertEquals(benchmark.equals("sysbench")?1024:8706,manifest.get("baseline_rows").getAsInt());
             assertEquals("primary_only",manifest.get("secondary_index_coverage").getAsString());
             assertEquals(manifest.get("baseline_rows"),manifest.get("baseline_operations"));
+            assertTrue(manifest.getAsJsonObject("source_evidence").getAsJsonObject("request_budget")
+                    .get("effective_requests").getAsLong()>=1000);
             assertEquals(Digests.sha256(directory.resolve("source-diagnostics.json")),
                     manifest.getAsJsonObject("source_evidence").get("source_diagnostics_sha256").getAsString());
             try(var data=TraceManifest.openData(trace)){assertTrue(data.snapshotRow(1,1,0).isPresent());}

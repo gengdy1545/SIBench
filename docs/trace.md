@@ -157,7 +157,7 @@ runtime files checked before workload execution. The local engine build receipt
 binds the pinned source, instrumentation, prepared sources, build commands and
 executed binaries; it is not a signed or hermetic build attestation.
 
-After DuckDB receipt/statement binding, `source-diagnostics.json` summarizes storage SQL
+After DuckDB receipt/statement binding, `source-diagnostics.json` retains per-window summaries of storage SQL
 outcomes, statements without adopted ART, adopted/abandoned attempts and mutation
 scopes by statement outcome. It is written before access projection, so it also
 survives unsupported-access failures; successful publication binds its hash in

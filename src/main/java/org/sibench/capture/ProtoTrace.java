@@ -108,6 +108,7 @@ public final class ProtoTrace {
         private boolean closed;
         private volatile long bytesWritten = Integer.BYTES;
         private final boolean secondaryIndexes;
+        private final RequestBudget budget;
         private long indexEntries, primaryEntries, effectiveRequests, uncompressedBytes;
         private final Map<String, Long> requestTypes = new LinkedHashMap<>();
         private final Map<String, Long> controls = new LinkedHashMap<>();
@@ -119,6 +120,11 @@ public final class ProtoTrace {
 
         /** Export filtering leaves source execution unchanged and keeps query groups indivisible. */
         public Writer(Path file, boolean secondaryIndexes) throws IOException {
+            this(file, secondaryIndexes, null);
+        }
+
+        Writer(Path file, boolean secondaryIndexes, RequestBudget budget) throws IOException {
+            this.budget = budget;
             this.secondaryIndexes = secondaryIndexes;
             output = new DataOutputStream(new BufferedOutputStream(new DigestOutputStream(
                     Files.newOutputStream(file, StandardOpenOption.CREATE_NEW), physical)));
@@ -191,6 +197,7 @@ public final class ProtoTrace {
                 return;
             }
             effectiveRequests++;
+            if (budget != null) budget.record();
             indexEntries += record.getPositionsCount();
             String type;
             if (request.hasWrite()) {

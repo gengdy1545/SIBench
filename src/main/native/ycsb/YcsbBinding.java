@@ -18,6 +18,7 @@ public final class YcsbBinding extends DB {
     @Override public void init() throws DBException {
         try {
             table = required("table");
+            getProperties().put("sibench.stop", (java.util.function.BooleanSupplier) RocksYcsb::stopRequested);
             api = RocksYcsb.open(Boolean.parseBoolean(getProperties().getProperty("sibench.baseline", "false")),
                     Integer.parseInt(required("fieldcount")));
         } catch (Exception failure) { throw new DBException(failure); }

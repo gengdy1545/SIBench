@@ -17,6 +17,7 @@ final class PostgresSysbench {
     static Map<String,Object> run(Path root,Path build,Map<String,Object> config,PostgresDatabase database,
             Path logs,String workload,PostgresCapture capture)throws Exception {
         boolean load=capture==null;
+        Path stop=logs.getParent().resolve("budget.stop");
         var previous=load?List.<Map<String,Object>>of():capture.completedSessions();
         long events=load?0:positive(object(object(config,"workloads"),workload),"events");
         Path script=build.resolve("src/lua/"+workload+".lua");
@@ -29,15 +30,18 @@ final class PostgresSysbench {
         }
         command.add(load?"prepare":"run");
         var result=NativeProcess.run(load?"prepare":"run",command,
-                Map.of("LUA_PATH",build.resolve("src/lua")+"/?.lua;;","PGAPPNAME",load?"sibench-load":"sibench:sysbench"),
+                Map.of("LUA_PATH",build.resolve("src/lua")+"/?.lua;;","PGAPPNAME",load?"sibench-load":"sibench:sysbench",
+                        "SIBENCH_BUDGET_STOP",load?"":stop.toString()),
                 root,logs,Duration.ofMinutes(positive(config,"timeout_minutes")),()->{if(capture!=null)capture.check();});
         if(result.exit()!=0)throw new IOException("sysbench exited with "+result.exit()+"; see "+logs);
         if(load)return Map.of();
         try(var control=database.connect("source-counts")){capture.awaitSources(control);}
         var sessions=new ArrayList<>(capture.completedSessions());sessions.removeAll(previous);
         var measured=SysbenchSummary.parse(result.stdout());
-        if(measured.getOrDefault("transactions",-1L)!=events||measured.getOrDefault("reconnects",0L)!=0)
+        long actual=measured.getOrDefault("transactions",-1L);
+        if(actual<0 || actual>events || actual!=events&&!Files.isRegularFile(stop) || measured.getOrDefault("reconnects",0L)!=0)
             throw new IOException("sysbench did not complete its configured events without reconnection");
+        events=actual;
         for(String field:List.of("read","write","other","total","ignored errors"))
             if(!measured.containsKey(field))throw new IOException("Missing sysbench count: "+field);
         var source=new LinkedHashMap<String,Long>();

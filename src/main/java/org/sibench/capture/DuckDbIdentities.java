@@ -36,11 +36,15 @@ public final class DuckDbIdentities {
                     + "transaction_id UBIGINT NOT NULL, query_id UBIGINT NOT NULL, version BIGINT NOT NULL, "
                     + "outcome VARCHAR NOT NULL, UNIQUE(table_id,primary_key_sql,transaction_id,query_id))");
             var baseline = new ArrayList<String>();
+            boolean retained;
+            try(var q=database.createStatement();var r=q.executeQuery("SELECT count(*) FROM duckdb_tables() WHERE database_name=current_database() AND schema_name='sibench_history' AND table_name='transactions'")) { r.next();retained=r.getLong(1)==1; }
             for (Table table : tables) {
                 String key = keyExpression(quote(table.key()), table.type());
                 baseline.add("SELECT " + table.id() + " AS table_id," + key + " AS primary_key_sql, "
                         + "_sib_row_id AS row_id, _sib_tx AS transaction_id, _sib_query AS query_id, "
                         + "0::BIGINT AS version,'commit' AS outcome FROM " + table.identities() + " WHERE _sib_tx=0");
+                if(retained) baseline.add("SELECT "+table.id()+", "+key+",i._sib_row_id,i._sib_tx,i._sib_query,t.version,t.outcome FROM "
+                        +table.identities()+" i JOIN sibench_history.transactions t ON i._sib_tx=t.transaction_id WHERE t.outcome='commit'");
                 importTable(database, table, key);
             }
             for (Table table : tables) {
@@ -91,7 +95,7 @@ public final class DuckDbIdentities {
         // Reconcile committed identities against native state; aborted identities must remain absent there.
         reject(database, "SELECT 1 FROM (SELECT _sib_row_id AS row_id,_sib_tx AS transaction_id,"
                 + "_sib_query AS query_id," + key + " AS primary_key_sql FROM " + table.identities()
-                + " WHERE _sib_tx<>0) stored FULL OUTER JOIN (SELECT * FROM temp.main.sibench_insert_identities "
+                + " WHERE _sib_tx IN (SELECT transaction_id FROM temp.main.sibench_transactions)) stored FULL OUTER JOIN (SELECT * FROM temp.main.sibench_insert_identities "
                 + "WHERE table_id=" + table.id() + " AND outcome='commit') captured USING(row_id) "
                 + "WHERE stored.row_id IS NULL OR captured.row_id IS NULL "
                 + "OR stored.transaction_id<>captured.transaction_id OR stored.query_id<>captured.query_id "

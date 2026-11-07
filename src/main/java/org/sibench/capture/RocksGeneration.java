@@ -26,26 +26,39 @@ final class RocksGeneration {
         json(out.resolve("effective-config.json"), Map.of("runtime", plan.runtime(), "benchmark", input.document(), "engine", "rocksdb", "mode", "api"));
         json(out.resolve("engine-build.json"), build.identity()); json(out.resolve("client-build.json"), input.buildIdentity());
         var stages = new LinkedHashMap<String, Object>();
-        try (var trace = new RocksTrace(out.resolve("trace"), input.source(), Generation.secondaryIndexes(input.document()))) {
+        var budget = new RequestBudget(Generation.requestTarget(input.document()),input.timeout());
+        try (var trace = new RocksTrace(out.resolve("trace"), input.source(), Generation.secondaryIndexes(input.document()),budget)) {
             long closeStarted;
             var rows = new RocksDbRows(out.resolve("trace/data"), fields, settings, trace::event);
             try (rows) {
                 var binding = new RocksYcsb(rows, trace::baseline, fields);
+                binding.budget(budget);
                 RocksYcsb.install(binding);
                 try {
                     long load = System.nanoTime();
-                    stages.put("load", stage(plan, input, binding, "load", positive(n, "recordcount")));
+                    stages.put("load", stage(plan, input, binding, "load", positive(n, "recordcount"), out.resolve("load"), budget));
                     long expected = positive(n, "recordcount");
                     Generation.requireRows(input.baselineRows(), Map.of(string(n, "table"), rows.baselineRows()));
                     rows.finishLoad(); trace.finishBaseline(expected);
                     timings.put("baseline_generation_load_export_seconds", seconds(load));
                     long workload = System.nanoTime(), records = expected;
+                    int remaining = object(n,"workloads").size();
                     for (String name : object(n, "workloads").keySet()) {
-                        // Return freed load/previous-stage allocations before the next client starts.
-                        RocksDbTimestamps.releaseMemory();
-                        var result = stage(plan, input, binding, name, records); stages.put(name, result);
-                        records += ((Number) result.get("inserted")).longValue();
+                        Path stageRoot=Files.createDirectory(out.resolve(name));
+                        budget.begin(name,remaining--,null);
+                        var batches=new ArrayList<Map<String,Object>>();
+                        do {
+                            budget.checkTime();
+                            long before=budget.count();
+                            RocksDbTimestamps.releaseMemory();
+                            var result = stage(plan,input,binding,name,records,stageRoot.resolve("batch-"+batches.size()),budget);
+                            batches.add(result);
+                            records+=((Number)result.get("inserted")).longValue();
+                            if(budget.enabled())budget.requireProgress(before);
+                        } while(budget.enabled()&&!budget.reached());
+                        budget.end();stages.put(name,batches);
                     }
+                    json(out.resolve("request-budget.json"),budget.finish());
                     timings.put("workload_and_export_seconds", seconds(workload));
                     long seal = System.nanoTime(); rows.seal();
                     timings.put("native_flush_seconds", seconds(seal));
@@ -56,7 +69,7 @@ final class RocksGeneration {
             trace.close(); timings.put("native_close_seconds", seconds(closeStarted));
             long publication = System.nanoTime();
             var manifest = trace.publish(library, rows.writtenFiles(), Map.of("engine", build.identity(), "settings", config,
-                    "client", input.buildIdentity(), "stages", stages, "baseline_rows", input.baselineRows(),
+                    "client", input.buildIdentity(), "stages", stages, "request_budget", budget.finish(), "baseline_rows", input.baselineRows(),
                     "effective_config_sha256", Digests.sha256(out.resolve("effective-config.json"))));
             timings.put("publication_seconds", seconds(publication)); timings.put("total_seconds", seconds(start));
             json(out.resolve("result.json"), Map.of("status", "complete", "trace", out.resolve("trace").toString(), "timings", timings));
@@ -70,9 +83,9 @@ final class RocksGeneration {
     }
 
     private static Map<String, Object> stage(Generation.Plan plan, Generation.Input input, RocksYcsb binding,
-            String name, long records) throws Exception {
+            String name, long records, Path stage, RequestBudget budget) throws Exception {
         boolean load = name.equals("load"); var n = input.nativeConfig();
-        Path stage = Files.createDirectory(input.output().resolve(name));
+        Files.createDirectory(stage);
         var properties = new LinkedHashMap<String, Object>();
         for (String key : List.of("table", "fieldcount", "fieldlength", "fieldlengthdistribution", "insertorder", "zeropadding", "insertstart"))
             properties.put(key, n.get(key));
@@ -105,7 +118,9 @@ final class RocksGeneration {
             System.setOut(stdout); System.setErr(stderr); Thread.currentThread().setContextClassLoader(previous);
         }
         var measured = YcsbSummary.parse(Files.readString(stage.resolve("measurements.txt")));
-        if (YcsbSummary.observed(measured).get("total") != wanted) throw new IOException("YCSB did not complete configured operations: " + stage);
+        long observed=YcsbSummary.observed(measured).get("total");
+        if (observed>wanted || observed!=wanted && (load || !budget.reached()))
+            throw new IOException("YCSB stopped before its configured operations or request budget: " + stage);
         long calls = 0;
         for (String kind : List.of("READ", "SCAN", "INSERT", "UPDATE", "DELETE")) calls += YcsbSummary.operations(measured, kind);
         if (binding.completed(threads) != calls) throw new IOException("YCSB binding/upstream operation counts disagree");

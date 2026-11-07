@@ -34,7 +34,9 @@ public final class HybenchDuckDb {
         var setter=benchmark.getClass().getDeclaredMethod("setSqls",sql.getClass());setter.setAccessible(true);setter.invoke(benchmark,sql);
         var verbose=benchmark.getClass().getDeclaredField("verbose");verbose.setAccessible(true);verbose.set(benchmark,false);
         Object hist=invoke(invoke(benchmark,"getRes"),"getHist");var report=new LinkedHashMap<String,Object>();
-        for(String phase:List.of("ap","tp","xp")) {
+        String selected=properties.getProperty("sibench.phase");
+        if(selected!=null&&!List.of("ap","tp","xp").contains(selected))throw new IllegalArgumentException("Unknown HyBench phase");
+        for(String phase:selected==null?List.of("ap","tp","xp"):List.of(selected)) {
             if(phase.equals("xp")) {
                 try{benchmark.getClass().getMethod("runXP",int.class).invoke(benchmark,0);}
                 catch(java.lang.reflect.InvocationTargetException error){throw cause(error);}

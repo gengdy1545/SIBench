@@ -20,6 +20,7 @@ public class RocksGenerationCheck {
         var workloads = object(n, "workloads");
         for (String name : workloads.keySet()) { var workload = object(workloads, name); workload.put("operationcount", 320); workloads.put(name, workload); }
         n.put("workloads", workloads); document.put("native", n);
+        document.put("trace", Map.of("secondary_indexes", false, "workload_requests", 2400));
         document.put("artifacts", Map.of("directory", root.relativize(run.resolve("generated")).toString()));
         var json = new GsonBuilder().setPrettyPrinting().create();
         Path profile = run.resolve("profile.json"); Files.writeString(profile, json.toJson(document));
@@ -30,6 +31,10 @@ public class RocksGenerationCheck {
         assertEquals(1000L, result.get("baseline_rows")); assertEquals(1000L, result.get("baseline_operations"));
         assertEquals(0L, result.get("aborted_transactions"));
         assertEquals("primary_only", result.get("secondary_index_coverage"));
+        var budget=object(object(result,"source_evidence"),"request_budget");
+        assertTrue(((Number)budget.get("effective_requests")).longValue()>=2400);
+        assertEquals(6,object(budget,"stages").size());
+        assertTrue(Files.exists(run.resolve("generated/workloada/batch-1")));
         Path trace = run.resolve("generated/trace");
         assertFalse(Files.exists(trace.resolve("INCOMPLETE")));
         org.sibench.replay.ReferenceReplay.run(trace, new org.sibench.replay.ReplayConfig(false, 0, 0, 0, 0, "operation"), run.resolve("reference.json"));

@@ -20,10 +20,17 @@ import org.sibench.schema.SourceSchema;
 final class PostgresTrace {
     private final Path directory;
     private final boolean secondaryIndexes;
+    private final RequestBudget budget;
+    private volatile long projectedTransactions;
     private final IndexCatalog catalog;
     private final Map<String,Object> manifest;
 
     PostgresTrace(Path directory,SourceSchema source,boolean secondaryIndexes)throws IOException {
+        this(directory,source,secondaryIndexes,null);
+    }
+
+    PostgresTrace(Path directory,SourceSchema source,boolean secondaryIndexes,RequestBudget budget)throws IOException {
+        this.budget=budget;
         this.secondaryIndexes=secondaryIndexes;this.directory=directory;catalog=IndexCatalog.fromSchema(source);
         manifest=new LinkedHashMap<>(IndexCatalog.provenance(source,catalog.definitions()));
         IndexCatalog.fromManifest(new Gson().toJsonTree(manifest).getAsJsonObject());
@@ -44,12 +51,13 @@ final class PostgresTrace {
     /** One consumer runs concurrently with native clients; source counts are checked before seal. */
     void workload(Connection database,PostgresCapture capture)throws Exception {
         var units=WorkUnits.create(directory);
-        var writer=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes);
+        var writer=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,budget);
         try(var lines=units.lines();writer;var versions=new PostgresVersions(database);
                 var projection=new PostgresProjection(database,catalog,directory,versions,units,writer::accept)) {
             for(PostgresTransactions.Chunk next;(next=capture.transactions.next(()->capture.watermark(database)))!=null;)
                 try(var chunk=next){
                     projection.accept(chunk);
+                    if (chunk.hasRequests) projectedTransactions++;
                 }
             var counts=projection.counts();
             long requests=0,commits=0,aborts=0;
@@ -70,6 +78,21 @@ final class PostgresTrace {
         manifest.put("work_units_sha256",HexFormat.of().formatHex(units.digest().digest()));
         manifest.put("work_unit_rule","one native statement origin; numbered in native transaction completion order");
         stream("workload",writer);
+    }
+
+    void awaitProjection(PostgresCapture capture, java.time.Duration timeout) throws Exception {
+        long expected=0;
+        for(var session:capture.completedSessions()) {
+            var counts=org.sibench.config.ConfigValues.object(session,"counts");
+            expected+=((Number)counts.get("commits")).longValue()+((Number)counts.get("aborts")).longValue();
+        }
+        long deadline=System.nanoTime()+timeout.toNanos();
+        while(projectedTransactions<expected) {
+            capture.check();
+            if(System.nanoTime()>=deadline)throw new IOException("PG budget projection drain timed out");
+            Thread.sleep(10);
+        }
+        if(projectedTransactions!=expected)throw new IOException("PG projected outcome count differs from source");
     }
 
     private void stream(String name,ProtoTrace.Writer writer)throws IOException {

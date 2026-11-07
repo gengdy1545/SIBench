@@ -18,5 +18,6 @@ native:
     xp: 5
 trace:
   secondary_indexes: false
+  workload_requests: 60000000
 artifacts:
   directory: results/capture/hybench

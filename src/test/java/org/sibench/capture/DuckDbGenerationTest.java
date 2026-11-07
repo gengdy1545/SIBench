@@ -22,8 +22,16 @@ public class DuckDbGenerationTest {
                 Map.of("secondary_indexes",false,"unknown",true), Map.of()))
             assertThrows(IllegalArgumentException.class, () -> Generation.secondaryIndexes(Map.of("trace",trace)));
     }
+    @Test public void requestTargetsAreExplicitPositiveAndSharedAcrossProfiles() throws Exception {
+        assertEquals(0,Generation.requestTarget(Map.of()));
+        for(String benchmark:java.util.List.of("ycsb","sysbench","hybench"))
+            assertEquals(60000000,Generation.requestTarget(parse(Files.readString(Path.of("config/benchmark/"+benchmark+".yaml")))));
+        for(Object invalid:java.util.List.of(0,-1,"60000000",1.5,true))
+            assertThrows(IllegalArgumentException.class,()->Generation.requestTarget(Map.of("trace",Map.of("workload_requests",invalid))));
+    }
     static Map<String,Object> profile(String benchmark)throws Exception {
         var document=parse(Files.readString(Path.of("config/benchmark/"+benchmark+".yaml")));
+        if (document.containsKey("trace")) { var trace=object(document,"trace"); trace.remove("workload_requests"); document.put("trace",trace); }
         var nativeConfig=object(document,"native");
         nativeConfig.put("timeout_minutes",1);document.put("native",nativeConfig);return document;
     }

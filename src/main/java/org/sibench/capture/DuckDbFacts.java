@@ -19,6 +19,11 @@ public final class DuckDbFacts {
 
     /** Call after source drain and logging shutdown. No benchmark rows or persistent tables are copied. */
     public static Map<String, Long> load(Connection database, Path capture) throws IOException, SQLException {
+        return load(database,capture,0);
+    }
+
+    public static Map<String, Long> load(Connection database, Path capture, long prefix) throws IOException, SQLException {
+        if(prefix<0)throw new IllegalArgumentException("Negative source record prefix");
         if (!database.getAutoCommit()) throw new SQLException("Fact import requires an idle auto-commit connection");
         try (var statement = database.createStatement();
                 var rows = statement.executeQuery("SELECT current_setting('enable_logging')")) {
@@ -31,7 +36,7 @@ public final class DuckDbFacts {
         database.setAutoCommit(false);
         try {
             // The pinned serial CSV scanner silently drops an unterminated last field; the parallel scanner rejects it.
-            try (var query = database.prepareStatement("CREATE TEMP TABLE sibench_raw AS SELECT ordinality AS raw_record, "
+            try (var query = database.prepareStatement("CREATE TEMP TABLE sibench_raw AS SELECT "+prefix+"+ordinality AS raw_record, "
                     + "* EXCLUDE(ordinality) FROM read_csv(?, header=true, auto_detect=false, parallel=true, "
                     + "delim=',', quote='\"', escape='\"', strict_mode=true, null_padding=false, columns={"
                     + "'context_id':'UBIGINT','scope':'VARCHAR','connection_id':'UBIGINT',"

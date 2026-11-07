@@ -25,6 +25,33 @@ public class PostgresGenerationCheck {
     @Test public void primaryOnlyExportRetainsNativeSecondaryIndexesAndReplays() throws Exception {
         run(false);
     }
+    @Test public void sharedOutputBudgetControlsRealSourceAdmission() throws Exception {
+        Path root=Path.of("").toRealPath();
+        Path output=Files.createTempDirectory(root.resolve("results/capture"),"postgres-budget-");
+        String runtime=System.getProperty("sibench.postgres.runtime"),client=System.getProperty("sibench.sysbench.build");
+        assertNotNull(runtime);assertNotNull(client);
+        var document=DuckDbGenerationTest.profile("sysbench");var config=object(document,"native");
+        config.put("tables",2);config.put("table-size",512);config.put("threads",2);config.put("prepare_threads",2);
+        config.put("build_directory",client);
+        var workloads=new LinkedHashMap<String,Object>();
+        for(String workload:object(config,"workloads").keySet()) workloads.put(workload,Map.of("events",32));
+        config.put("workloads",workloads);document.put("native",config);
+        document.put("trace",Map.of("secondary_indexes",false,"workload_requests",600));
+        document.put("artifacts",Map.of("directory",root.relativize(output.resolve("generated")).toString()));
+        var yaml=new org.yaml.snakeyaml.Yaml();Path profile=output.resolve("profile.yaml"),settings=output.resolve("runtime.yaml");
+        Files.writeString(profile,yaml.dump(document));
+        Files.writeString(settings,yaml.dump(Map.of("schema_version",1,"purpose","sibench",
+                "benchmarks",java.util.List.of(Map.of("config",profile.toString(),"mode","capture","engine","postgres")),
+                "postgres",Map.of("build_directory",Path.of(runtime).getParent().toString()))));
+        var result=Generation.run(root,settings).get(0);
+        assertEquals(1024L,result.get("baseline_operations"));
+        var budget=object(object(result,"source_evidence"),"request_budget");
+        assertTrue(((Number)budget.get("effective_requests")).longValue()>=600);
+        assertEquals(6,object(budget,"stages").size());
+        assertTrue(Files.exists(output.resolve("generated/oltp_read_write/budget.stop")));
+        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
+                new org.sibench.replay.ReplayConfig(false,0,0,0,0,"operation"),output.resolve("reference.json")).get("status"));
+    }
     private void run(boolean secondaryIndexes) throws Exception {
         String runtime=System.getProperty("sibench.postgres.runtime"),client=System.getProperty("sibench.sysbench.build");
         assertNotNull(runtime);assertNotNull(client);

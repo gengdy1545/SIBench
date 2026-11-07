@@ -34,7 +34,8 @@ final class PostgresGeneration {
                 try(var setup=database.connect("load-schema")) { PostgresDatabase.unloggedTables(setup); }
                 PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,output.resolve("load"),"oltp_read_write",null);
                 timings.put("native_load_seconds",seconds(loadStart));long baselineStart=System.nanoTime();
-                var trace=new PostgresTrace(output.resolve("trace"),input.source(),Generation.secondaryIndexes(input.document()));
+                var budget=new RequestBudget(Generation.requestTarget(input.document()),input.timeout());
+                var trace=new PostgresTrace(output.resolve("trace"),input.source(),Generation.secondaryIndexes(input.document()),budget);
                 try(var setup=database.connect("baseline")) {
                     PostgresDatabase.finishLoad(setup);
                     // Mark loaded pages visible before copying keys, avoiding another wide-table scan.
@@ -55,10 +56,21 @@ final class PostgresGeneration {
                     return null;
                 });
                 long workloadStart=System.nanoTime();var stages=new LinkedHashMap<String,Object>();
+                int remaining=object(input.nativeConfig(),"workloads").size();
                 for(String workload:object(input.nativeConfig(),"workloads").keySet()) {
-                    stages.put(workload,PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,
-                            output.resolve(workload),workload,capture));
+                    Path stage=Files.createDirectory(output.resolve(workload));
+                    budget.begin(workload,remaining--,stage.resolve("budget.stop"));
+                    var batches=new java.util.ArrayList<Map<String,Object>>();
+                    do {
+                        budget.checkTime();long before=budget.count();
+                        batches.add(PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,
+                                stage.resolve("batch-"+batches.size()),workload,capture));
+                        trace.awaitProjection(capture,input.timeout());
+                        if(budget.enabled())budget.requireProgress(before);
+                    } while(budget.enabled()&&!budget.reached());
+                    budget.end();stages.put(workload,batches);
                 }
+                json(output.resolve("request-budget.json"),budget.finish());
 
                 try(var control=database.connect("source-drain")){capture.finishSources(control);}
                 projected.get(input.timeout().toMillis(),TimeUnit.MILLISECONDS);
@@ -67,7 +79,7 @@ final class PostgresGeneration {
                 Files.move(database.data(),output.resolve("trace/data"));
                 timings.put("native_close_seconds",seconds(closeStart));long publicationStart=System.nanoTime();
                 var evidence=Map.<String,Object>of("engine",build.identity(),"client",input.buildIdentity(),"stages",stages,
-                        "effective_config_sha256",Digests.sha256(output.resolve("effective-config.json")),"baseline_rows",input.baselineRows());
+                        "request_budget",budget.finish(),"effective_config_sha256",Digests.sha256(output.resolve("effective-config.json")),"baseline_rows",input.baselineRows());
                 var manifest=trace.publish(runtime,evidence);
                 timings.put("publication_seconds",seconds(publicationStart));timings.put("total_seconds",seconds(started));
                 json(output.resolve("result.json"),Map.of("status","complete","trace",output.resolve("trace").toString(),"timings",timings));

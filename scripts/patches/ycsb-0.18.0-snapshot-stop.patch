@@ -175,7 +175,16 @@
      return props;
 --- a/core/src/main/java/site/ycsb/ClientThread.java
 +++ b/core/src/main/java/site/ycsb/ClientThread.java
-@@ -144,7 +144,7 @@
+@@ -122,3 +122,8 @@
++          Object stop = props.get("sibench.stop");
++          if (stop instanceof java.util.function.BooleanSupplier &&
++              ((java.util.function.BooleanSupplier) stop).getAsBoolean()) {
++            break;
++          }
+           if (!workload.doTransaction(db, workloadstate)) {
+             break;
+           }
+@@ -144,7 +149,7 @@
      } catch (Exception e) {
        e.printStackTrace();
        e.printStackTrace(System.out);

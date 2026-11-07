@@ -204,4 +204,61 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
         }
     }
 
+    @Test public void incrementalWindowsPreserveVersionsAndDeletedRowIdentities() throws Exception {
+        output("incremental");
+        var source=SourceSchema.of("sysbench",Path.of("benchmark/sysbench"),Map.of("tables",1));
+        DuckDbTrace.Draft draft;
+        try(var db=connect()) {
+            sql(db,"CREATE TABLE sbtest1(id INTEGER PRIMARY KEY,k INTEGER NOT NULL,c VARCHAR NOT NULL,pad VARCHAR NOT NULL)");
+            sql(db,"CREATE INDEX k_1 ON sbtest1(k)");
+            sql(db,"INSERT INTO sbtest1 VALUES(10,1,'original','')");
+            history(db,"sbtest1","id");
+            try(var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"),true)) {
+                db.setAutoCommit(false);trace.baseline(db,Map.of("sbtest1",1L));db.commit();db.setAutoCommit(true);
+                long rawPrefix=0;
+                for(int window=0;window<2;window++) {
+                    Path directory=Files.createDirectory(output.resolve("window-"+window));
+                    Path receipts=Files.createDirectory(directory.resolve("clients")), raw=directory.resolve("native.csv");
+                    sql(db,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
+                            +"'SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path='"+raw+"')");
+                    try(var worker=DuckDbHostDriver.open(socket,receipts)) {
+                        worker.setAutoCommit(false);
+                        assertEquals(1,number(worker,"SELECT count(*) FROM sbtest1 WHERE id=10"));
+                        if(window==0) sql(worker,"UPDATE sbtest1 SET c='committed' WHERE id=10");
+                        else {
+                            sql(worker,"DELETE FROM sbtest1 WHERE id=10");
+                            sql(worker,"INSERT INTO sbtest1 VALUES(10,2,'replacement','')");
+                        }
+                        worker.commit();
+                        sql(worker,"UPDATE sbtest1 SET k=99 WHERE id=10");
+                        assertEquals(1,number(worker,"SELECT count(*) FROM sbtest1 WHERE k=99"));
+                        worker.rollback();
+                    }
+                    sql(db,"CALL disable_logging()");
+                    sql(db,"SET logging_storage='memory'");
+                    try(var capture=connect()) {
+                        var counts=DuckDbFacts.load(capture,raw,rawPrefix);
+                        rawPrefix+=counts.values().stream().mapToLong(Long::longValue).sum();
+                        var sessions=DuckDbReceipts.load(capture,files(receipts),directory.resolve("receipts"));
+                        DuckDbStatements.bind(capture,sessions);DuckDbReceipts.bind(capture);
+                        DuckDbTransactions.bind(capture,"data",trace.lastVersion());
+                        if(window==1) assertEquals(1,number(capture,"SELECT min(read_version) FROM sibench_transactions"));
+                        DuckDbIdentities.bind(capture);DuckDbAccesses.bind(capture,IndexCatalog.duckDbDefinitions(source));
+                        DuckDbMutations.bind(capture);trace.append(capture);
+                    }
+                }
+                assertEquals(4,trace.lastVersion());
+                draft=trace.finish(db,Map.of("input","two drained native windows"));
+            }
+        }
+        Path moved=publish(draft);
+        ProtoTraceBenchmark.readTrace(moved,1,output.resolve("parse.json"));
+        assertThrows(IllegalArgumentException.class,()->ProtoTraceBenchmark.readTrace(moved,0,output.resolve("invalid-parse.json")));
+        try(var data=TraceManifest.openData(moved)) {
+            assertEquals("original",data.snapshotRow(1,1,0).orElseThrow().get("c"));
+            assertEquals("committed",data.snapshotRow(1,1,2).orElseThrow().get("c"));
+            assertTrue(data.snapshotRow(1,1,3).isEmpty());
+        }
+    }
+
 }

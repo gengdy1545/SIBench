@@ -21,6 +21,10 @@ final class RocksTrace implements AutoCloseable {
     private boolean baselineClosed, closed;
 
     RocksTrace(Path directory, SourceSchema source, boolean secondaryIndexes) throws IOException {
+        this(directory, source, secondaryIndexes, null);
+    }
+
+    RocksTrace(Path directory, SourceSchema source, boolean secondaryIndexes, RequestBudget budget) throws IOException {
         this.directory = directory;
         var catalog = IndexCatalog.fromSchema(source);
         manifest = new LinkedHashMap<>(IndexCatalog.provenance(source, catalog.definitions()));
@@ -28,7 +32,7 @@ final class RocksTrace implements AutoCloseable {
         Files.createDirectory(directory);
         Files.writeString(directory.resolve("INCOMPLETE"), "Native generation/publication pending\n", StandardOpenOption.CREATE_NEW);
         baseline = new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"),secondaryIndexes);
-        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes);
+        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,budget);
         units = WorkUnits.create(directory);
         manifest.put("output", "proto"); manifest.put("value_kinds", List.of("row_id"));
         manifest.put("mode", "api"); manifest.put("generation", "native_rocksdb");

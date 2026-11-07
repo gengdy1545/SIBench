@@ -66,6 +66,7 @@ public final class Generation {
             var document=parse(Files.readString(selection.config()));
             keys(document,Set.of("schema_version","purpose","benchmark","source","native","trace","artifacts"));
             secondaryIndexes(document);
+            requestTarget(document);
             require(integer(document,"schema_version")==1&&string(document,"purpose").equals("native_capture"),"Expected native_capture profile");
             keys(object(document,"source"),Set.of("path","commit"));keys(object(document,"artifacts"),Set.of("directory"));
             var source=SourceSchema.read(root,document);var nativeConfig=object(document,"native");
@@ -89,8 +90,14 @@ public final class Generation {
     static boolean secondaryIndexes(Map<String,Object> document) {
         if (!document.containsKey("trace")) return false;
         var trace = object(document,"trace");
-        keys(trace,Set.of("secondary_indexes"));
+        keys(trace,Set.of("secondary_indexes", "workload_requests"));
         return bool(trace,"secondary_indexes");
+    }
+
+    static long requestTarget(Map<String,Object> document) {
+        if (!document.containsKey("trace")) return 0;
+        var trace = object(document,"trace");
+        return trace.containsKey("workload_requests") ? positive(trace,"workload_requests") : 0;
     }
 
     static void validateNative(String benchmark,Map<String,Object> n) {
@@ -190,7 +197,7 @@ public final class Generation {
                 long loadStart=System.nanoTime();
                 Path load=Files.createDirectory(out.resolve("load"));
                 if(input.selection().benchmark().equals("sysbench"))sysbench(plan,input,socket,load,"oltp_read_write",true);
-                else hybench(plan,input,socket,load,true);
+                else hybench(plan,input,socket,load,true,null);
                 if(input.selection().benchmark().equals("hybench")) {
                     Path data=out.resolve("native/Data_"+string(input.nativeConfig(),"sf"));
                     Path script=input.source().source().resolve("conf/load_data_pg.sql"),manifest=load.resolve("inputs.json");
@@ -209,46 +216,64 @@ public final class Generation {
                 for(var table:input.source().tables())NativeHistory.install(database, org.sibench.config.Engine.DUCKDB,++tableId,"main",table.name(),
                         table.indexes().stream().filter(SourceSchema.Index::primary).findFirst().orElseThrow().column());
                 database.commit();
-                var trace=new DuckDbTrace(input.selection().mode(),input.source(),out.resolve("trace"),secondaryIndexes(input.document()));
-                trace.baseline(database,expected);database.commit();database.setAutoCommit(true);
-                timings.put("baseline_indexes_seconds",seconds(baselineStart));long workloadStart=System.nanoTime();
-                sql(database,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation','SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path="+literal(out.resolve("native.csv").toString())+")");
-                var stages=new ArrayList<Stage>();
-                if(input.selection().benchmark().equals("hybench"))stages.add(hybench(plan,input,socket,Files.createDirectory(out.resolve("workload")),false));
-                else {
-                    for(String workload:object(input.nativeConfig(),"workloads").keySet()) {
-                        Path stage=Files.createDirectory(out.resolve(workload));
-                        stages.add(sysbench(plan,input,socket,stage,workload,false));
+                var budget=new RequestBudget(requestTarget(input.document()),input.timeout());
+                try(var trace=new DuckDbTrace(input.selection().mode(),input.source(),out.resolve("trace"),secondaryIndexes(input.document()),budget)) {
+                    trace.baseline(database,expected);database.commit();database.setAutoCommit(true);
+                    timings.put("baseline_indexes_seconds",seconds(baselineStart));long workloadStart=System.nanoTime();
+                    boolean hybench=input.selection().benchmark().equals("hybench");
+                    var names=hybench?List.of("ap","tp","xp"):List.copyOf(object(input.nativeConfig(),"workloads").keySet());
+                    int remaining=hybench?2:names.size();long rawPrefix=0;double projectionSeconds=0;
+                    var rawHashes=new LinkedHashMap<String,String>();var receiptsHashes=new LinkedHashMap<String,String>();
+                    var diagnostics=new ArrayList<Map<String,Object>>();
+                    Path workloads=Files.createDirectory(out.resolve("workload"));
+                    for(String name:names) {
+                        Path stageRoot=Files.createDirectory(workloads.resolve(name));
+                        boolean setup=hybench&&name.equals("ap");
+                        budget.begin(name,setup?0:remaining--,null);
+                        int batch=0;
+                        do {
+                            budget.checkTime();long before=budget.count();
+                            Path window=Files.createDirectory(stageRoot.resolve("batch-"+batch++)),raw=window.resolve("native.csv");
+                            sql(database,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation','SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path="+literal(raw.toString())+")");
+                            Stage stage=hybench?hybench(plan,input,socket,window,false,name):sysbench(plan,input,socket,window,name,false);
+                            sql(database,"CALL disable_logging()");
+                            sql(database,"SET logging_storage='memory'");
+                            long projectionStart=System.nanoTime();
+                            try(var capture=DuckDbHostDriver.open(socket)) {
+                                var counts=DuckDbFacts.load(capture,raw,rawPrefix);
+                                rawPrefix=Math.addExact(rawPrefix,counts.values().stream().mapToLong(Long::longValue).sum());
+                                var receipts=DuckDbReceipts.load(capture,stage.receipts(),window.resolve("receipts"));
+                                DuckDbStatements.bind(capture,receipts);DuckDbReceipts.bind(capture);
+                                if(stage.calls()>=0)require(number(capture,"SELECT count(*) FROM sibench_sql_calls WHERE kind='query' AND error_code=0")==stage.calls(),"sysbench source summary/receipt count mismatch");
+                                var diagnostic=DuckDbDiagnostics.summarize(capture,input.selection().mode());
+                                json(window.resolve("source-diagnostics.json"),diagnostic);
+                                diagnostics.add(Map.of("window",out.relativize(window).toString(),"diagnostics",diagnostic));
+                                DuckDbTransactions.bind(capture,"data",trace.lastVersion());DuckDbIdentities.bind(capture);
+                                DuckDbAccesses.bind(capture,IndexCatalog.duckDbDefinitions(input.source()));DuckDbMutations.bind(capture);
+                                trace.append(capture);
+                            }
+                            projectionSeconds+=seconds(projectionStart);
+                            rawHashes.put(out.relativize(raw).toString(),Digests.sha256(raw));
+                            for(Path receipt:stage.receipts())receiptsHashes.put(out.relativize(receipt).toString(),Digests.sha256(receipt));
+                            if(budget.enabled()&&!setup)budget.requireProgress(before);
+                        } while(budget.enabled()&&!setup&&!budget.reached());
+                        budget.end();
                     }
-                }
-                sql(database,"CALL disable_logging()");
-                timings.put("workload_seconds",seconds(workloadStart));long projectionStart=System.nanoTime();
-                DuckDbFacts.load(database,out.resolve("native.csv"));
-                var files=stages.stream().flatMap(stage->stage.receipts().stream()).toList();
-                {
-                    var receipts=DuckDbReceipts.load(database,files,out.resolve("receipts"));
-                    DuckDbStatements.bind(database,receipts);DuckDbReceipts.bind(database);int offset=0;
-                    for(Stage stage:stages) {
-                        var ids=new ArrayList<String>();for(int i=0;i<stage.receipts().size();i++)ids.add(Long.toString(receipts.get(offset++).connection()));
-                        if(stage.calls()>=0)require(number(database,"SELECT count(*) FROM sibench_sql_calls WHERE kind='query' AND error_code=0 AND connection_id IN ("+String.join(",",ids)+")")==stage.calls(),"sysbench source summary/receipt count mismatch");
+                    timings.put("workload_and_projection_seconds",seconds(workloadStart));
+                    timings.put("facts_and_projection_seconds",projectionSeconds);
+                    json(out.resolve("request-budget.json"),budget.finish());
+                    Path diagnosticFile=out.resolve("source-diagnostics.json");json(diagnosticFile,Map.of("windows",diagnostics));
+                    var evidence=new LinkedHashMap<String,Object>();evidence.put("engine",engine);evidence.put("client",input.buildIdentity());
+                    evidence.put("effective_config_sha256",Digests.sha256(out.resolve("effective-config.json")));
+                    evidence.put("raw_files_sha256",rawHashes);evidence.put("receipt_sha256",receiptsHashes);
+                    evidence.put("source_diagnostics_sha256",Digests.sha256(diagnosticFile));
+                    evidence.put("baseline_rows",expected);evidence.put("request_budget",budget.finish());
+                    if(hybench) {
+                        evidence.put("load_inputs_sha256",Digests.sha256(load.resolve("inputs.json")));
+                        evidence.put("parameters_sha256",Digests.sha256(out.resolve("native/parameters/parameters.toml")));
                     }
+                    draft=trace.finish(database,evidence);
                 }
-                Path diagnostics=out.resolve("source-diagnostics.json");
-                json(diagnostics,DuckDbDiagnostics.summarize(database,input.selection().mode()));
-                DuckDbTransactions.bind(database,"data");DuckDbIdentities.bind(database);
-                DuckDbAccesses.bind(database,IndexCatalog.duckDbDefinitions(input.source()));DuckDbMutations.bind(database);
-                var evidence=new LinkedHashMap<String,Object>();evidence.put("engine",engine);evidence.put("client",input.buildIdentity());
-                evidence.put("effective_config_sha256",Digests.sha256(out.resolve("effective-config.json")));
-                evidence.put("raw_sha256",Digests.sha256(out.resolve("native.csv")));
-                evidence.put("source_diagnostics_sha256",Digests.sha256(diagnostics));
-                if(input.selection().benchmark().equals("hybench")) {
-                    evidence.put("load_inputs_sha256",Digests.sha256(load.resolve("inputs.json")));
-                    evidence.put("parameters_sha256",Digests.sha256(out.resolve("native/parameters/parameters.toml")));
-                }
-                var hashes=new LinkedHashMap<String,String>();for(Path file:files)hashes.put(out.relativize(file).toString(),Digests.sha256(file));
-                evidence.put("receipt_sha256",hashes);evidence.put("baseline_rows",expected);
-                draft=trace.workload(database,evidence);
-                timings.put("facts_and_projection_seconds",seconds(projectionStart));
             }
             long closeStart=System.nanoTime();
             stop(host);host=null;Files.move(out.resolve("data"),out.resolve("trace/data"));
@@ -291,7 +316,7 @@ public final class Generation {
         var files=files(receipts);require(!files.isEmpty(),"sysbench missing session receipts");return new Stage(files,calls,0);
     }
 
-    private static Stage hybench(Plan plan,Input input,Path socket,Path stage,boolean load)throws Exception {
+    private static Stage hybench(Plan plan,Input input,Path socket,Path stage,boolean load,String selectedPhase)throws Exception {
         Path nativeDirectory=input.output().resolve("native");Files.createDirectories(nativeDirectory);
         if(!load)HybenchInputs.requireRuntimeInputs(nativeDirectory.resolve("Data_"+string(input.nativeConfig(),"sf")),
                 input.output().resolve("load/inputs.json"));
@@ -307,6 +332,7 @@ public final class Generation {
         properties.setProperty("tpclient",Long.toString(positive(n,"clients")));properties.setProperty("apclient",Long.toString(positive(n,"ap_clients")));
         properties.setProperty("xtpclient",Long.toString(positive(n,"xp_transaction_clients")));properties.setProperty("xapclient",Long.toString(positive(n,"xp_query_clients")));
         for(String phase:List.of("ap","tp","xp"))properties.setProperty(phase+"RunMins",Long.toString(n.containsKey("phase_duration_minutes")&&object(n,"phase_duration_minutes").containsKey(phase)?positive(object(n,"phase_duration_minutes"),phase):positive(n,"duration_minutes")));
+        if(selectedPhase!=null)properties.setProperty("sibench.phase",selectedPhase);
         Path receipts=Files.createDirectory(stage.resolve("clients"));properties.setProperty("sibench.receipts",receipts.toString());
         Path resolved=stage.resolve("resolved.props");try(var file=Files.newOutputStream(resolved,StandardOpenOption.CREATE_NEW)){properties.store(file,"Effective native HyBench configuration");}
         String cp=parameters+":"+input.build().resolve("target/classes")+":"+input.build().resolve("lib/*")+":"+NativeProcess.runtimeClasspath();
