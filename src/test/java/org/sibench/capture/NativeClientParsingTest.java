@@ -1,5 +1,6 @@
 package org.sibench.capture;
 
+import org.sibench.config.Digests;
 import static org.junit.Assert.*;
 
 import org.junit.Rule;
@@ -205,11 +206,11 @@ public class NativeClientParsingTest {
         assertThrows(IOException.class, () -> NativeBuildCheck.verify(
                 folder.getRoot().toPath(), "sysbench", pinned, build, "source-identity"));
         var manifest = Map.of("benchmark", "sysbench", "source_commit", "source-identity",
-                "native_stop_patch_sha256", FileDigests.sha256(patch),
-                "duckdb_driver_sha256", FileDigests.sha256(driver),
-                "duckdb_retry_policy_sha256", FileDigests.sha256(retry),
-                "duckdb_error_types_sha256", FileDigests.sha256(errorTypes),
-                "artifacts", Map.of("src/sysbench", FileDigests.sha256(executable)));
+                "native_stop_patch_sha256", Digests.sha256(patch),
+                "duckdb_driver_sha256", Digests.sha256(driver),
+                "duckdb_retry_policy_sha256", Digests.sha256(retry),
+                "duckdb_error_types_sha256", Digests.sha256(errorTypes),
+                "artifacts", Map.of("src/sysbench", Digests.sha256(executable)));
         Files.writeString(build.resolve("native-build.json"), new com.google.gson.Gson().toJson(manifest));
         NativeBuildCheck.verify(folder.getRoot().toPath(), "sysbench", pinned, build, "source-identity");
         Files.writeString(build.resolve("src/a.c"), "int main() { return 1; }\nint unrelated;\n");

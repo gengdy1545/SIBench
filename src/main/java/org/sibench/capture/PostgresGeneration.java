@@ -1,5 +1,6 @@
 package org.sibench.capture;
 
+import org.sibench.config.Digests;
 import com.google.gson.GsonBuilder;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -33,7 +34,7 @@ final class PostgresGeneration {
                 try(var setup=database.connect("load-schema")) { PostgresDatabase.unloggedTables(setup); }
                 PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,output.resolve("load"),"oltp_read_write",null);
                 timings.put("native_load_seconds",seconds(loadStart));long baselineStart=System.nanoTime();
-                var trace=new PostgresTrace(output.resolve("trace"),input.source());
+                var trace=new PostgresTrace(output.resolve("trace"),input.source(),Generation.secondaryIndexes(input.document()));
                 try(var setup=database.connect("baseline")) {
                     PostgresDatabase.finishLoad(setup);
                     // Mark loaded pages visible before copying keys, avoiding another wide-table scan.
@@ -66,7 +67,7 @@ final class PostgresGeneration {
                 Files.move(database.data(),output.resolve("trace/data"));
                 timings.put("native_close_seconds",seconds(closeStart));long publicationStart=System.nanoTime();
                 var evidence=Map.<String,Object>of("engine",build.identity(),"client",input.buildIdentity(),"stages",stages,
-                        "effective_config_sha256",FileDigests.sha256(output.resolve("effective-config.json")),"baseline_rows",input.baselineRows());
+                        "effective_config_sha256",Digests.sha256(output.resolve("effective-config.json")),"baseline_rows",input.baselineRows());
                 var manifest=trace.publish(runtime,evidence);
                 timings.put("publication_seconds",seconds(publicationStart));timings.put("total_seconds",seconds(started));
                 json(output.resolve("result.json"),Map.of("status","complete","trace",output.resolve("trace").toString(),"timings",timings));

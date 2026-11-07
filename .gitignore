@@ -43,3 +43,6 @@ __pycache__/
 
 # Local development context; excluded from the source deliverable.
 /develop/
+
+# AI
+/.claude/

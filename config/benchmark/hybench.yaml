@@ -16,5 +16,7 @@ native:
   phase_duration_minutes:
     tp: 5
     xp: 5
+trace:
+  secondary_indexes: false
 artifacts:
   directory: results/capture/hybench

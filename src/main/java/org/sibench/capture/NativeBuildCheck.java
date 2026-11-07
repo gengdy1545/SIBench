@@ -1,5 +1,6 @@
 package org.sibench.capture;
 
+import org.sibench.config.Digests;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -12,13 +13,13 @@ public final class NativeBuildCheck {
         var recorded = org.sibench.config.ConfigValues.parse(Files.readString(build.resolve("engine-build.json")));
         var inputs = org.sibench.config.ConfigValues.object(recorded, "inputs");
         var expected = new java.util.TreeMap<String,Object>();
-        expected.put("bridge_sha256", FileDigests.sha256(root.resolve("src/main/native/rocksdb/timestamps_jni.cc")));
-        expected.put("build_script_sha256", FileDigests.sha256(root.resolve("scripts/build-rocksdb.sh")));
+        expected.put("bridge_sha256", Digests.sha256(root.resolve("src/main/native/rocksdb/timestamps_jni.cc")));
+        expected.put("build_script_sha256", Digests.sha256(root.resolve("scripts/build-rocksdb.sh")));
         Path headers = root.resolve("index/rocksdb-cloud/include");
         var hashes = new java.util.TreeMap<String,String>();
         try (var paths = Files.walk(headers)) {
             for (Path file : paths.filter(p -> Files.isRegularFile(p) && p.toString().endsWith(".h")).sorted().toList())
-                hashes.put(headers.relativize(file).toString(), FileDigests.sha256(file));
+                hashes.put(headers.relativize(file).toString(), Digests.sha256(file));
         }
         expected.put("headers", hashes);
         if (!inputs.equals(expected)) throw new IOException("RocksDB bridge inputs differ from verified build");
@@ -28,7 +29,7 @@ public final class NativeBuildCheck {
         for (var artifact : artifacts.entrySet()) {
             Path name = Path.of(artifact.getKey());
             if (name.getNameCount() != 1 || name.isAbsolute() || name.toString().equals("..")
-                    || !FileDigests.sha256(build.resolve(name)).equals(artifact.getValue()))
+                    || !Digests.sha256(build.resolve(name)).equals(artifact.getValue()))
                 throw new IOException("RocksDB runtime artifact differs: " + name);
         }
         try (var runtime = org.rocksdb.RocksDB.class.getResourceAsStream("/librocksdbjni-linux64.so")) {
@@ -72,8 +73,8 @@ public final class NativeBuildCheck {
                     if (SOURCE_SUFFIXES.stream().noneMatch(name::endsWith)) continue;
                     Path copy = build.resolve(pinned.relativize(file));
                     if (!Files.isRegularFile(copy)
-                            || !FileDigests.sha256(copy).equals(patched.getOrDefault(
-                                    pinned.relativize(file).toString(), FileDigests.sha256(file))))
+                            || !Digests.sha256(copy).equals(patched.getOrDefault(
+                                    pinned.relativize(file).toString(), Digests.sha256(file))))
                         throw new IOException(
                                 "Build copy differs from the pinned source: " + pinned.relativize(file));
                     checked++;
@@ -125,7 +126,7 @@ public final class NativeBuildCheck {
                 throw new IOException("Native stop patch check interrupted", interrupted);
             } finally { if (process.isAlive()) process.destroyForcibly(); }
             var hashes = new java.util.HashMap<String, String>();
-            for (String name : names) hashes.put(name, FileDigests.sha256(expected.resolve(name)));
+            for (String name : names) hashes.put(name, Digests.sha256(expected.resolve(name)));
             return hashes;
         } finally {
             try (var files = Files.walk(expected)) {
@@ -179,26 +180,26 @@ public final class NativeBuildCheck {
             try (var files = Files.walk(root)) {
                 var artifacts = files.filter(Files::isRegularFile).sorted().toList();
                 if (artifacts.isEmpty()) throw new IOException("Native build is empty: " + root);
-                for (Path file : artifacts) hashes.put(build.directory().relativize(file).toString(), FileDigests.sha256(file));
+                for (Path file : artifacts) hashes.put(build.directory().relativize(file).toString(), Digests.sha256(file));
             }
         }
         var identity = new java.util.LinkedHashMap<String, Object>();
         identity.put("benchmark", build.benchmark());
         identity.put("source_commit", build.commit());
         identity.put("artifacts", hashes);
-        identity.put("native_stop_patch_sha256", FileDigests.sha256(stopPatch(build)));
+        identity.put("native_stop_patch_sha256", Digests.sha256(stopPatch(build)));
         if (build.benchmark().equals("ycsb")) identity.put("api_binding_sha256",
-                FileDigests.sha256(build.root().resolve("src/main/native/ycsb/YcsbBinding.java")));
+                Digests.sha256(build.root().resolve("src/main/native/ycsb/YcsbBinding.java")));
         if (build.benchmark().equals("sysbench")) {
-            String driver = FileDigests.sha256(build.root().resolve("src/main/native/sysbench/drv_duckdb.cc"));
-            if (!driver.equals(FileDigests.sha256(build.directory().resolve("src/drivers/duckdb/drv_duckdb.cc"))))
+            String driver = Digests.sha256(build.root().resolve("src/main/native/sysbench/drv_duckdb.cc"));
+            if (!driver.equals(Digests.sha256(build.directory().resolve("src/drivers/duckdb/drv_duckdb.cc"))))
                 throw new IOException("Built sysbench driver differs from the project source");
             identity.put("duckdb_driver_sha256", driver);
-            String retry = FileDigests.sha256(build.root().resolve("src/main/native/sysbench/retryable_error.hpp"));
-            if (!retry.equals(FileDigests.sha256(build.directory().resolve("src/drivers/duckdb/retryable_error.hpp"))))
+            String retry = Digests.sha256(build.root().resolve("src/main/native/sysbench/retryable_error.hpp"));
+            if (!retry.equals(Digests.sha256(build.directory().resolve("src/drivers/duckdb/retryable_error.hpp"))))
                 throw new IOException("Built sysbench retry policy differs from the project source");
             identity.put("duckdb_retry_policy_sha256", retry);
-            identity.put("duckdb_error_types_sha256", FileDigests.sha256(build.root().resolve(
+            identity.put("duckdb_error_types_sha256", Digests.sha256(build.root().resolve(
                     "third_party/duckdb/src/include/duckdb/common/exception.hpp")));
         }
         return identity;
@@ -274,7 +275,7 @@ public final class NativeBuildCheck {
         var hashes = new java.util.TreeMap<String, String>();
         try (var files = Files.walk(directory)) {
             for (Path file : files.filter(Files::isRegularFile).toList())
-                hashes.put(directory.relativize(file).toString(), FileDigests.sha256(file));
+                hashes.put(directory.relativize(file).toString(), Digests.sha256(file));
         }
         if (hashes.isEmpty()) throw new IOException("Empty build source inventory: " + directory);
         return hashes;
@@ -292,7 +293,7 @@ public final class NativeBuildCheck {
             throw new IOException(engine+" source must be clean and at its gitlink");
         return java.util.Map.of("source_commit", pin,
                 "native_sources", tree(root.resolve("src/main/native/"+engine)),
-                "build_script_sha256", FileDigests.sha256(root.resolve("scripts/build-"+engine+".sh")));
+                "build_script_sha256", Digests.sha256(root.resolve("scripts/build-"+engine+".sh")));
     }
 
     private static void record(Path file, Object value) throws IOException {
@@ -310,7 +311,7 @@ public final class NativeBuildCheck {
         var hashes = new java.util.TreeMap<String, String>();
         for (String name : List.of("duckdb_host", "src/libduckdb.so", "duckdb", "CMakeCache.txt",
                 "compile_commands.json", "compiler-version.txt", "source-files.json"))
-            hashes.put(name, FileDigests.sha256(build.resolve(name)));
+            hashes.put(name, Digests.sha256(build.resolve(name)));
         if (!Files.isExecutable(build.resolve("duckdb_host"))) throw new IOException("DuckDB host is not executable");
         return hashes;
     }
@@ -320,8 +321,8 @@ public final class NativeBuildCheck {
         var inputs = engineInputs(root);
         requireRecord(build.resolve("engine-inputs.json"), inputs, "DuckDB build inputs");
         requireRecord(build.resolve("source-files.json"), tree(build.resolve("source")), "Prepared DuckDB source");
-        if (!FileDigests.sha256(build.resolve("duckdb_host.cpp")).equals(
-                FileDigests.sha256(root.resolve("src/main/native/duckdb/duckdb_host.cpp"))))
+        if (!Digests.sha256(build.resolve("duckdb_host.cpp")).equals(
+                Digests.sha256(root.resolve("src/main/native/duckdb/duckdb_host.cpp"))))
             throw new IOException("Compiled host source differs from project input");
         record(build.resolve("engine-build.json"), java.util.Map.of("inputs", inputs, "artifacts", engineArtifacts(build)));
     }
@@ -337,7 +338,7 @@ public final class NativeBuildCheck {
         var artifacts=new java.util.TreeMap<String,String>();
         for(var entry:tree(build.resolve("runtime")).entrySet())artifacts.put("runtime/"+entry.getKey(),entry.getValue());
         for(String file:List.of("source-files.json","compiler-version.txt","source/config.status"))
-            artifacts.put(file,FileDigests.sha256(build.resolve(file)));
+            artifacts.put(file,Digests.sha256(build.resolve(file)));
         for(String file:List.of("bin/postgres","bin/initdb","bin/pg_ctl","lib/row_capture.so"))
             if(!Files.isRegularFile(build.resolve("runtime/"+file)))throw new IOException("Missing PostgreSQL artifact: "+file);
         return java.util.Map.of("inputs",engineInputs(root,"postgres","postgresql"),"artifacts",artifacts);
@@ -360,7 +361,7 @@ public final class NativeBuildCheck {
                 for(var entry:sources.entrySet()) {
                     Path relative=Path.of(entry.getKey());
                     if(relative.isAbsolute()||!relative.normalize().equals(relative)||relative.startsWith("..")
-                            ||!entry.getValue().getAsString().equals(FileDigests.sha256(build.resolve("source").resolve(relative))))
+                            ||!entry.getValue().getAsString().equals(Digests.sha256(build.resolve("source").resolve(relative))))
                         throw new IOException("Prepared PostgreSQL source changed: "+entry.getKey());
                 }
                 record(build.resolve("engine-build.json"),postgresIdentity(root,build));

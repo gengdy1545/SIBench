@@ -20,19 +20,19 @@ final class RocksTrace implements AutoCloseable {
     private long commits, aborts, searches, changes, version;
     private boolean baselineClosed, closed;
 
-    RocksTrace(Path directory, SourceSchema source) throws IOException {
+    RocksTrace(Path directory, SourceSchema source, boolean secondaryIndexes) throws IOException {
         this.directory = directory;
         var catalog = IndexCatalog.fromSchema(source);
         manifest = new LinkedHashMap<>(IndexCatalog.provenance(source, catalog.definitions()));
         IndexCatalog.fromManifest(new Gson().toJsonTree(manifest).getAsJsonObject());
         Files.createDirectory(directory);
         Files.writeString(directory.resolve("INCOMPLETE"), "Native generation/publication pending\n", StandardOpenOption.CREATE_NEW);
-        baseline = new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"));
-        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"));
+        baseline = new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"),secondaryIndexes);
+        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes);
         units = WorkUnits.create(directory);
         manifest.put("output", "proto"); manifest.put("value_kinds", List.of("row_id"));
         manifest.put("mode", "api"); manifest.put("generation", "native_rocksdb");
-        manifest.put("secondary_index_coverage", "all_source_definitions");
+        manifest.put("secondary_index_coverage", secondaryIndexes ? "all_source_definitions" : "primary_only");
     }
     void baseline(RocksDbRows.Row row) throws IOException {
         IndexMutation.emit(write(0, INSERT, 1, 0, IndexKey.ofText(row.key()), 0, 0, 0, row.id())

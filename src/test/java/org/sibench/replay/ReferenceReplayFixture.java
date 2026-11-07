@@ -8,7 +8,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
-/** Component tests with hand-built detailed operations; never certifies a published Trace. */
+/** Component tests with hand-built protobuf operations; never certifies a published Trace. */
 final class ReferenceReplayFixture {
     private ReferenceReplayFixture() {}
 
@@ -28,6 +28,6 @@ final class ReferenceReplayFixture {
     }
 
     private static IndexOperationTrace.Source reader(Path file) {
-        return consumer -> IndexOperationTrace.read(file, consumer);
+        return consumer -> org.sibench.capture.ProtoTrace.read(file, null, null, consumer);
     }
 }

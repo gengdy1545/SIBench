@@ -70,10 +70,6 @@ public record ReplayConfig(
                 durationSeconds, plannedOperationsPerSecond, warmupOperations, reservePercent);
     }
 
-    public static ReplayConfig defaults() {
-        return new ReplayConfig(true, 0, 0, 0, 0);
-    }
-
     public static ReplayConfig read(Path root, Path path) throws java.io.IOException {
         return from(parse(Files.readString(root.resolve(path))));
     }

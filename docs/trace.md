@@ -37,7 +37,7 @@ snapshots and fixed RR snapshots within a single transaction.
 Committed local row versions are retained. Full row contents of rolled-back writes
 are not: a statement following such local writes explicitly rejects row retrieval.
 This does not remove the corresponding index operations or Abort from index-only
-Trace replay. The reader does not implement Parquet-style physical Locators.
+Trace replay. The native reader resolves RowIDs rather than physical Locators.
 Binary fields are detached byte arrays, including empty values; SQL NULL stays null.
 
 ## Native publication
@@ -82,16 +82,15 @@ source schema configuration are bound by `catalog_sha256`. Consumption validates
 this embedded identity and its table/index structure without opening the source
 checkout. The source directory is informational. Source/schema validation belongs
 to generation; the digest is an integrity identity, not independent certification
-of an untrusted producer's completeness. Existing historical artifacts require
-their retained matching readers; there is no legacy format branch.
+of an untrusted producer's completeness.
 
 ## Protobuf format
 
 Trace stores the Index Service request messages from
-`src/main/proto/index_service.proto`, wrapped by `index_trace.proto` source
+`proto/index_service.proto`, wrapped by `index_trace.proto` source
 positions. A query group is one SearchGroup request with one position per member.
 TraceBegin records preserve source transaction boundaries and are not RPCs.
-Stored commit counts describe unfiltered requests; replay adjusts IDs, routing,
+Stored commit counts describe exported requests; replay adjusts IDs, routing,
 positions and counts after filtering or batching. Native generation has one protobuf output format.
 
 Each protobuf file starts with big-endian int32 magic `0x53495042`. Each block has
@@ -110,6 +109,24 @@ and big-endian int64 operation count. No detailed-operation encoding is needed t
 compute these identities. Replay and locality analysis read the protobuf requests. Readers enforce file,
 logical and inventory identities, transaction positions, commit counts and
 complete source-member coverage.
+
+Each inventory entry also reports `bytes` for the complete compressed file and
+`statistics` computed during writing, separately for baseline and workload:
+
+| Statistic | Counting unit |
+| --- | --- |
+| `index_entries` | Index writes and search members; excludes transaction markers. |
+| `effective_requests` | Each write, Search or complete SearchGroup once; excludes markers. |
+| `primary_entries`, `secondary_entries` | Exported entries by index scope, including search members. |
+| `request_types` | Requests by `insert`, `upsert`, `logical_delete`, `relocate`, `point_search`, `range_search`, `union_search` or `intersection_search`; absent kinds have zero count. |
+| `transaction_markers` | Begin, Commit and Abort separately. |
+| `write_origins` | Exported write entries carrying business-insert/update flags, not distinct source rows. |
+| `uncompressed_message_bytes` | Length-delimited protobuf bytes, excluding file/block headers. |
+
+Requests from aborted transactions count because replay executes them before
+Abort. Request counts are independent of returned rows and transport batching.
+These producer statistics are informational, not substitutes for digest and
+semantic validation; preflight independently counts the consumed stream.
 
 ## Source facts
 
@@ -230,7 +247,11 @@ LogicalValue = RowID
 
 TableIDs start at 1 in source-schema order. IndexID 0 is the primary key;
 secondary IDs follow each table's source index order. The complete catalog and
-its identity are embedded in the manifest. Nonunique secondary predicates search
+its identity are embedded in the manifest even for primary-only export.
+`secondary_index_coverage` is `primary_only` or `all_source_definitions`.
+Benchmark setting `trace.secondary_indexes` defaults to false; true selects all
+source definitions. Source database indexes are retained in either case.
+Nonunique secondary predicates search
 all matching primary keys rather than becoming one PK lookup.
 
 `IndexKey` components are self-delimiting and order-preserving under unsigned
@@ -292,7 +313,7 @@ Replay preserves the source order and uses these IDs for configured client routi
 | Begin | Trace transaction boundary, not an RPC. |
 | Commit / Abort | Resolve the source transaction with exact operation/write accounting. |
 
-A row change expands to the primary index and every secondary index in increasing
+A row change expands to the primary index and every exported secondary index in increasing
 IndexID order. Changing an indexed value deletes the old secondary identity and
 upserts the new one. Unchanged secondary keys also receive the new row version.
 The service must not implicitly perform this expansion again.
@@ -302,7 +323,12 @@ and RowID. `expansionPosition` is consecutive from 0 and `expansionSize` is the
 complete width. Delete positions carry `deleted_row_id` for maintenance validation.
 A query or control cannot interrupt an expansion. SearchGroup has one source
 position per member, shared group expectations and complete member coverage.
-Preflight validates full expansions before secondary-index filtering.
+Primary-only export rewrites mutation expansions to one primary entry. It omits
+secondary searches and whole SearchGroups containing any secondary member,
+without changing the expected result of a remaining query. Begin/Commit/Abort
+and source mutation ordinals remain; stored request/write counts are recomputed.
+Preflight validates complete expansions for the declared export scope before
+applying any additional consumption-side secondary-index filtering.
 
 Search results use canonical key order, ascending unless the request specifies
 descending. A positive API limit is a maximum, with expected count no greater
@@ -313,6 +339,8 @@ relocation or GC workflow.
 
 ## Delivery selection
 
+Consumption requesting secondary indexes rejects a primary-only Trace before
+opening the backend. A full export can be consumed with either setting.
 Baseline loading drains before workload sending. Replay applies configured
 secondary-index filtering and client routing, then adjusts sent positions and
 transaction counts. The Index Service owns visibility; replay adds no synthetic
@@ -347,7 +375,11 @@ client coverage and operation supply. Runtime value capability is checked before
 creating/opening the target backend.
 
 Supply budgets count effective operations after filtering, excluding baseline and
-controls: warmup operations + ceil(rate × measurement seconds × (1 + margin)).
+controls; each SearchGroup counts once, including requests in aborted transactions.
+The budget is warmup operations + ceil(rate × measurement seconds × (1 + margin)).
+Replay dispatch timing currently uses target calls, including terminal markers
+and individual group members; its `warmup_calls` and call rates are not effective
+request rates. The supply budget alone does not normalize that timing window.
 Insufficient supply fails before loading/sending. Supply does not establish
 achievable throughput or sustained scheduling. Generation emits a finite Trace;
 segmented resume/checkpoints are unsupported.
@@ -373,7 +405,7 @@ those stated above, not arbitrary SQL support implied by DuckDB itself.
 
 One sealed `data/data.duckdb` holds current rows, committed before-images, RowIDs
 and source transaction/read-point metadata. DuckDB controls its native file layout;
-there is no Parquet export, row-file size target or second live SQL database.
+the selected native database owns loading, history and capture throughout generation.
 Logical historical versions are deliberately retained. Rolled-back full row images
 are not preserved for Locator retrieval, as described under native row consumption.
 

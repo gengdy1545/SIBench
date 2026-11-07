@@ -20,6 +20,12 @@ import org.sibench.schema.SourceSchema;
 public class PostgresGenerationCheck {
     @Rule public TemporaryFolder temporary=new TemporaryFolder();
     @Test public void sysbenchWritesFinalTraceDuringLoadAndWorkload()throws Exception {
+        run(true);
+    }
+    @Test public void primaryOnlyExportRetainsNativeSecondaryIndexesAndReplays() throws Exception {
+        run(false);
+    }
+    private void run(boolean secondaryIndexes) throws Exception {
         String runtime=System.getProperty("sibench.postgres.runtime"),client=System.getProperty("sibench.sysbench.build");
         assertNotNull(runtime);assertNotNull(client);
         Path root=Path.of("").toRealPath(),output=temporary.getRoot().toPath(),sockets=Files.createTempDirectory("pg-generation-");
@@ -35,7 +41,7 @@ public class PostgresGenerationCheck {
                 var database=PostgresDatabase.create(Path.of(runtime),output.resolve("source"),sockets.resolve("capture.sock"))) {
             try(var setup=database.connect("load-schema")){PostgresDatabase.unloggedTables(setup);}
             PostgresSysbench.run(root,root.resolve(client),config,database,output.resolve("load"),"oltp_read_write",null);
-            var trace=new PostgresTrace(output.resolve("trace"),source);
+            var trace=new PostgresTrace(output.resolve("trace"),source,secondaryIndexes);
             try(var setup=database.connect("load")) {
                 PostgresDatabase.finishLoad(setup);
                 setup.setAutoCommit(false);NativeHistory.initialize(setup,Engine.POSTGRES);int id=0;
@@ -62,9 +68,9 @@ public class PostgresGenerationCheck {
             try(var control=database.connect("independent-acceptance")){NativeHistory.verifyCommits(control);}
             database.seal();Files.move(database.data(),output.resolve("trace/data"));
             var manifest=trace.publish(Path.of(runtime),Map.of("stages",stages));
-            assertEquals(1024L,manifest.get("baseline_rows"));assertEquals(1536L,manifest.get("committed_transactions"));
+            assertEquals(1024L,manifest.get("baseline_rows"));assertEquals(secondaryIndexes?2048L:1024L,manifest.get("baseline_operations"));assertEquals(1536L,manifest.get("committed_transactions"));
             assertFalse(Files.exists(output.resolve("trace/INCOMPLETE")));
-            org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),new org.sibench.replay.ReplayConfig(true,0,0,0,0,"operation"),output.resolve("reference.json"));
+            org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),new org.sibench.replay.ReplayConfig(secondaryIndexes,0,0,0,0,"operation"),output.resolve("reference.json"));
             Path moved=output.resolve("moved");Files.move(output.resolve("trace"),moved);
             try(var rows=org.sibench.trace.TraceManifest.openData(moved,Path.of(runtime),output.resolve("reader"))) {
                 assertEquals(initialK,((Number)rows.snapshotRow(1,rowId,0).orElseThrow().get("k")).intValue());

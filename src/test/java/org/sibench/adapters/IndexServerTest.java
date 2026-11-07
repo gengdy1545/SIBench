@@ -144,7 +144,7 @@ public class IndexServerTest {
         try (var backend = RocksDbBackend.create(temporary.getRoot().toPath().resolve("capabilities"), ValueKind.ROW_ID)) {
             var description = backend.describe().toBuilder().setCompleteCommitPublication(true).build();
             var incomplete = assertThrows(java.io.IOException.class, () -> ServiceReplay.require(
-                    description.toBuilder().setCompleteCommitPublication(false).build(), ValueKind.ROW_ID, temporary.getRoot().toPath()));
+                    description.toBuilder().setCompleteCommitPublication(false).build(), ValueKind.ROW_ID, java.util.Map.of()));
             assertTrue(incomplete.getMessage().contains("complete commits"));
         }
     }

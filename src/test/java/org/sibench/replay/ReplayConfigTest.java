@@ -16,7 +16,8 @@ public class ReplayConfigTest {
         Path root = Path.of("").toAbsolutePath();
         String template = Files.readString(root.resolve("config/sibench.yaml"));
         var simple = ReplayConfig.read(root, Path.of("config/sibench.yaml"));
-        assertTrue(simple.secondaryIndexes());
+        assertFalse(simple.secondaryIndexes());
+        assertTrue(ReplayConfig.from(parse(template.replace("enabled: false", "enabled: true"))).secondaryIndexes());
         assertEquals(org.sibench.adapters.proto.ValueKind.ROW_ID,
                 org.sibench.adapters.ServiceConfig.ofReplay(root, parse(template)).value());
         assertEquals(org.sibench.adapters.proto.ValueKind.LOCATOR,
@@ -78,7 +79,7 @@ public class ReplayConfigTest {
                     text.replace("target:", "target:\n  value: locator"),
                     text.replace("replay:", "replay:\n  strategy: cycle"),
                     text.replace("replay:", "replay:\n  repeat: 2"),
-                    text.replace("enabled: true", "enabled: 'false'"),
+                    text.replace("enabled: false", "enabled: 'false'"),
                     text.replace("dispatch_mode: operation", "dispatch_mode: parallel"),
                     text.replace("client_count: 64", "client_count: 0"),
                     text.replace("max_in_flight: 4096", "max_in_flight: 0"),
@@ -92,6 +93,7 @@ public class ReplayConfigTest {
                     text + "\nversions:\n  gc:\n    owner: immediate\n",
                     text + "\nversions:\n  gc:\n    send_delete: false\n"
                 }) {
+            assertNotEquals("The invalid fixture must change the public template", text, invalid);
             assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(parse(invalid)));
         }
         var retired = parse(text);

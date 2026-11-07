@@ -51,7 +51,7 @@ public final class WorkUnits {
     static Output create(Path trace) throws IOException {
         MessageDigest digest = sha256();
         var file = Files.newOutputStream(trace.resolve(FILE), StandardOpenOption.CREATE_NEW);
-        var compressed = new ZstdOutputStream(new BufferedOutputStream(file, 1 << 20), IndexOperationTrace.ZSTD_LEVEL);
+        var compressed = new ZstdOutputStream(new BufferedOutputStream(file, 1 << 20), ProtoTrace.ZSTD_LEVEL);
         var lines = new BufferedWriter(
                 new OutputStreamWriter(new DigestOutputStream(compressed, digest), StandardCharsets.UTF_8), 1 << 16);
         return new Output(lines, digest);

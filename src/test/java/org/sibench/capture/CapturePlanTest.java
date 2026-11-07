@@ -21,25 +21,29 @@ public class CapturePlanTest {
         var manifest = calibration(trace, false);
         Files.writeString(root.resolve("sysbench.yaml"),
                 "benchmark: sysbench\nnative:\n  workloads:\n    oltp_insert: {events: 100}\n    oltp_point_select: {events: 300}\n");
-        var plan = CapturePlan.writeRatio(root, root.relativize(root.resolve("sysbench.yaml")), trace, 0.10);
+        Path replay = root.resolve("replay.yaml");
+        Files.writeString(replay, "schema_version: 1\npurpose: sibench\ntarget:\n  secondary_indexes: {enabled: false}\n"
+                + "replay:\n  trace_budget: {duration_seconds: 1, planned_operations_per_second: 25, warmup_operations: 0, reserve_percent: 0}\n");
+        var plan = CapturePlan.operations(root, Path.of("sysbench.yaml"), trace, replay);
         assertEquals(5.0, (Double) plan.get("factor"), 1e-9);
         assertEquals(Map.of("native.workloads.oltp_insert.events", 500L, "native.workloads.oltp_point_select.events", 1500L),
                 plan.get("parameters"));
         Files.writeString(root.resolve("hybench.yaml"),
                 "benchmark: hybench\nnative:\n  duration_minutes: 1\n  phase_duration_minutes: {tp: 2}\n");
-        var hybench = CapturePlan.writeRatio(root, root.relativize(root.resolve("hybench.yaml")), trace, 0.04);
-        // TP keeps its own duration, XP the default; both scale by the same factor of 2.
-        assertEquals(Map.of("native.phase_duration_minutes.tp", 4L, "native.phase_duration_minutes.xp", 2L),
+        var hybench = CapturePlan.operations(root, Path.of("hybench.yaml"), trace, replay);
+        // TP keeps its own duration, XP the default; both scale by the same factor of 5.
+        assertEquals(Map.of("native.phase_duration_minutes.tp", 10L, "native.phase_duration_minutes.xp", 5L),
                 hybench.get("parameters"));
         var aborted = Files.createDirectory(root.resolve("aborted"));
         calibration(aborted, true);
-        assertThrows(java.io.IOException.class,
-                () -> CapturePlan.writeRatio(root, Path.of("sysbench.yaml"), aborted, 0.10));
-        assertEquals(2L, plan.get("calibration_row_writes"));
+        // Aborted operations consumed service work too; outcomes do not change the request budget.
+        assertEquals(5L, CapturePlan.operations(root, Path.of("sysbench.yaml"), aborted, replay)
+                .get("calibration_effective_operations"));
+        assertEquals(5L, plan.get("calibration_effective_operations"));
         manifest.put("workload_operations", 999L);
         Files.writeString(trace.resolve("manifest.json"), new com.google.gson.Gson().toJson(manifest));
         assertThrows(java.io.IOException.class,
-                () -> CapturePlan.writeRatio(root, Path.of("sysbench.yaml"), trace, 0.10));
+                () -> CapturePlan.operations(root, Path.of("sysbench.yaml"), trace, replay));
     }
 
     private static Map<String, Object> calibration(Path directory, boolean abortAll) throws Exception {
@@ -64,6 +68,7 @@ public class CapturePlanTest {
         var manifest = new java.util.LinkedHashMap<String, Object>();
         manifest.put("value_kinds", java.util.List.of("row_id"));
         manifest.put("output", "proto");
+        manifest.put("secondary_index_coverage", "all_source_definitions");
         manifest.put("baseline_rows", 100);
         manifest.put("baseline_operations", 200);
         manifest.put("baseline_trace_sha256", "0".repeat(64));
@@ -104,6 +109,7 @@ public class CapturePlanTest {
         Files.writeString(root.resolve("sysbench.yaml"),
                 "benchmark: sysbench\nnative:\n  workloads:\n    oltp_point_select: {events: 100}\n");
         manifest.put("output", "proto");
+        manifest.put("secondary_index_coverage", "all_source_definitions");
         var files = new com.google.gson.JsonArray();
         files.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("workload.pb.zst", protocol)));
         manifest.put("proto_files", Map.of("workload", files));
@@ -113,5 +119,9 @@ public class CapturePlanTest {
         assertEquals(1000L, plan.get("calibration_effective_operations"));
         assertEquals(3000L, plan.get("target_effective_operations"));
         assertEquals(Map.of("native.workloads.oltp_point_select.events", 300L), plan.get("parameters"));
+        manifest.put("secondary_index_coverage", "primary_only");
+        Files.writeString(trace.resolve("manifest.json"), new com.google.gson.Gson().toJson(manifest));
+        assertThrows(java.io.IOException.class,
+                () -> CapturePlan.operations(root, Path.of("sysbench.yaml"), trace, Path.of("replay.yaml")));
     }
 }

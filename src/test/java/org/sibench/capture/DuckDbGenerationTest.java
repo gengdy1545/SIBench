@@ -9,6 +9,19 @@ import java.util.Map;
 import org.junit.Test;
 
 public class DuckDbGenerationTest {
+    @Test public void exportDefaultsToPrimaryWithoutChangingSourceIndexes() throws Exception {
+        assertFalse(Generation.secondaryIndexes(Map.of()));
+        for (String benchmark : new String[]{"ycsb", "sysbench", "hybench"}) {
+            var document = profile(benchmark);
+            assertFalse(Generation.secondaryIndexes(document));
+            document.put("trace", Map.of("secondary_indexes", true));
+            assertTrue(Generation.secondaryIndexes(document));
+            if (benchmark.equals("sysbench")) assertTrue(bool(object(document,"native"),"create-secondary"));
+        }
+        for (var trace : java.util.List.of(Map.of("secondary_indexes","false"),
+                Map.of("secondary_indexes",false,"unknown",true), Map.of()))
+            assertThrows(IllegalArgumentException.class, () -> Generation.secondaryIndexes(Map.of("trace",trace)));
+    }
     static Map<String,Object> profile(String benchmark)throws Exception {
         var document=parse(Files.readString(Path.of("config/benchmark/"+benchmark+".yaml")));
         var nativeConfig=object(document,"native");

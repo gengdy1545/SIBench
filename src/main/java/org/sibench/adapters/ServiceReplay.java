@@ -2,7 +2,6 @@ package org.sibench.adapters;
 
 import org.sibench.replay.ReplayInput;
 import com.google.gson.GsonBuilder;
-import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 import org.sibench.adapters.proto.DescribeResponse;
@@ -57,7 +56,7 @@ public final class ServiceReplay {
                 local.bind(binding);
                 factory = InProcessService.factory(published, requests);
             }
-            require(description, service.value(), directory);
+            require(description, service.value(), (Map<?, ?>) preflight.get("workload"));
             // Held Baseline INSERTs stay below the in-flight bound, so some request is always sent.
             if (description.getBaselineWriteBatches())
                 requests.baselineBatch(Math.max(1, config.maxInFlight() / config.clientCount()));
@@ -184,7 +183,7 @@ public final class ServiceReplay {
                 description = local.describe().toBuilder().setCompleteCommitPublication(true).build();
                 factory = InProcessService.factory(published, requests);
             }
-            require(description, service.value(), directory);
+            require(description, service.value(), (Map<?, ?>) preflight.get("workload"));
             long publishedVersion;
             if (remote != null) {
                 var flushed = remote.flush(binding);
@@ -250,7 +249,7 @@ public final class ServiceReplay {
     /**
      * The minimal index manifest, next to the report: what the index holds (trace identity and
      * index definitions), up to which commit, where it lives, how it was checked, and with which
-     * build and configuration. There is no source snapshot yet (no lakehouse source): N/A.
+     * build and configuration.
      */
     private static void writeIndexManifest(
             Path report,
@@ -286,7 +285,6 @@ public final class ServiceReplay {
                 "build_sha256",
                 Files.isRegularFile(jar) ? org.sibench.config.Digests.sha256(jar) : "N/A (not a jar)");
         manifest.put("replay_configuration", config.describe());
-        manifest.put("source_snapshot_id", "N/A");
         Files.writeString(
                 report.resolveSibling(report.getFileName() + ".index-manifest.json"),
                 new GsonBuilder().setPrettyPrinting().create().toJson(manifest),
@@ -294,7 +292,7 @@ public final class ServiceReplay {
     }
 
     /** The service must implement every semantic the trace relies on. */
-    static void require(DescribeResponse description, ValueKind value, Path directory)
+    static void require(DescribeResponse description, ValueKind value, Map<?, ?> workload)
             throws IOException {
         if (!description.getCompleteCommitPublication())
             throw new IOException("Service must publish complete commits across client streams");
@@ -306,21 +304,12 @@ public final class ServiceReplay {
                         == org.sibench.adapters.proto.Acknowledgement.ACK_UNSPECIFIED
                 || !description.getFlushMakesDurable())
             throw new IOException("Service must declare its write acknowledgement and Flush durability");
-        JsonObject manifest = JsonParser.parseString(Files.readString(directory.resolve("manifest.json"))).getAsJsonObject();
-        if (!description.getTransactionAbort() && manifest.has("aborted_transactions")
-                && manifest.get("aborted_transactions").getAsLong() > 0)
+        if (!description.getTransactionAbort() && ((Number) workload.get("aborted_transactions")).longValue() > 0)
             throw new IOException("Trace has aborted transactions; the service does not implement Abort");
-        if (!description.getSearchGroups() && manifest.has("searched_accesses_by_shape")) {
-            var shapes = manifest.getAsJsonObject("searched_accesses_by_shape");
-            if (shapes.has("intersection") || shapes.has("union"))
-                throw new IOException("Trace has search groups; the service does not execute them");
-        }
-        if (!description.getTransactionLocalReads()
-                && manifest.has("transaction_local_searches")
-                && manifest.get("transaction_local_searches").getAsLong() != 0)
-            throw new IOException(
-                    "Trace has transaction-local searches; the service does not implement"
-                            + " snapshot-plus-own-writes reads");
+        if (!description.getSearchGroups() && ((Number) workload.get("search_groups")).longValue() > 0)
+            throw new IOException("Trace has search groups; the service does not execute them");
+        if (!description.getTransactionLocalReads() && ((Number) workload.get("transaction_local_searches")).longValue() > 0)
+            throw new IOException("Trace has transaction-local searches; the service does not implement snapshot-plus-own-writes reads");
     }
 
 }

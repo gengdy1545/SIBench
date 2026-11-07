@@ -7,6 +7,7 @@ import static org.junit.Assert.*;
 
 import org.junit.Test;
 import org.sibench.capture.IndexOperationTrace;
+import org.sibench.capture.ProtoTrace;
 import org.sibench.capture.TestOps;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexReferenceReplay;
@@ -147,7 +148,7 @@ public class VersionedLookupTest {
                     throws Exception {
         for (boolean rowIds : new boolean[] {false, true}) {
             var model = new IndexReferenceReplay(rowIds, true);
-            var replay = new ReplayProjection(ReplayConfig.defaults(), true, model::accept);
+            var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0), true, model::accept);
             org.sibench.capture.TransferIndexFixtures.expandRow(
                     TestOps.op(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0), model::accept);
             commit(replay, 100, row(5, 1, 100, 1, 50, 3, 1), row(5, 2, 100, 2, 51, 3, 2));
@@ -223,13 +224,13 @@ public class VersionedLookupTest {
             throws Exception {
         Path directory = Files.createTempDirectory("sibench-snapshots-");
         try {
-            Path baseline = directory.resolve("baseline.ops"),
-                    workload = directory.resolve("workload.ops");
-            try (var writer = new IndexOperationTrace.Writer(baseline)) {
+            Path baseline = directory.resolve("baseline.pb.zst"),
+                    workload = directory.resolve("workload.pb.zst");
+            try (var writer = new ProtoTrace.Writer(baseline)) {
                 org.sibench.capture.TransferIndexFixtures.appendRow(
                         writer, TestOps.op(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0));
             }
-            try (var writer = new IndexOperationTrace.Writer(workload)) {
+            try (var writer = new ProtoTrace.Writer(workload)) {
                 writer.append(IndexOperationTrace.transaction(100, 6, 100, 100, 0));
                 org.sibench.capture.TransferIndexFixtures.appendRow(
                         writer, row(5, 1, 100, 1, 50, 3, 1));

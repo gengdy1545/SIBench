@@ -14,6 +14,17 @@ import org.sibench.generation.DuckDbData;
 public final class TraceManifest {
     private TraceManifest() {}
 
+    public static boolean secondaryIndexes(JsonObject manifest) throws IOException {
+        var scope = manifest.get("secondary_index_coverage");
+        if (scope == null || !scope.isJsonPrimitive() || !scope.getAsJsonPrimitive().isString())
+            throw new IOException("Trace must declare its exported index coverage");
+        return switch (scope.getAsString()) {
+            case "all_source_definitions" -> true;
+            case "primary_only" -> false;
+            default -> throw new IOException("Unknown exported index coverage: " + scope);
+        };
+    }
+
     public static DuckDbData.Reader openData(Path directory) throws IOException,java.sql.SQLException {
         var manifest=read(directory);
         if(manifest.has("generation")&&!manifest.get("generation").getAsString().equals("native_duckdb"))

@@ -61,7 +61,7 @@ public class RocksYcsbCheck {
         var source=SourceSchema.of("ycsb",Path.of("benchmark/YCSB"),Map.of("fieldcount",2));
         assertTrue(source.fingerprints().containsKey("core/src/main/java/site/ycsb/DB.java"));
         assertFalse(source.fingerprints().keySet().stream().anyMatch(p->p.startsWith("jdbc/")));
-        try(var trace=new RocksTrace(root.resolve("trace"),source)) {
+        try(var trace=new RocksTrace(root.resolve("trace"),source,true)) {
             var rows=new RocksDbRows(root.resolve("trace/data"),2,settings(),trace::event);
             try(rows) {
                 var binding=new RocksYcsb(rows,trace::baseline,2);binding.stage(true);RocksYcsb.install(binding);

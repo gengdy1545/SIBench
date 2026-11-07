@@ -22,50 +22,10 @@ import java.util.Map;
  *
  * <p>The target of a formal capture is the replay budget ({@link #operations}): enough effective
  * workload operations for a replay configuration's measured duration at its planned rate, counted
- * exactly as {@code check-replay} counts them. A share of committed row writes ({@link #writeRatio})
- * remains for calibrations of another purpose.
+ * exactly as {@code check-replay} counts them.
  */
 public final class CapturePlan {
     private CapturePlan() {}
-
-    /** Parameters for committed row writes of {@code ratio} times the baseline. */
-    public static Map<String, Object> writeRatio(Path root, Path profile, Path calibration, double ratio) throws IOException {
-        if (!(ratio > 0 && ratio <= 10)) throw new IllegalArgumentException("Write ratio must be in (0, 10]");
-        Map<String, Object> document = parse(Files.readString(root.resolve(profile)));
-        var manifest = TraceManifest.read(calibration);
-        long baseline = manifest.get("baseline_rows").getAsLong();
-        if (baseline <= 0) throw new IOException("The calibration capture has no baseline rows");
-        long[] counts = {0, 0}; // Pending transaction writes, committed row writes.
-        try (var validation = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0, "operation"),
-                true, operation -> {})) {
-            long records = ProtoTrace.source(calibration, manifest, "workload").read(operation -> {
-                validation.accept(operation);
-                if (operation.index() == 0 && IndexOperationTrace.isMutation(operation)) counts[0]++;
-                if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) {
-                    counts[1] = Math.addExact(counts[1], counts[0]);
-                    counts[0] = 0;
-                } else if (operation.kind() == IndexOperationTrace.TRANSACTION_ABORT) counts[0] = 0;
-            });
-            validation.finish();
-            if (records != manifest.get("workload_operations").getAsLong())
-                throw new IOException("Calibration workload record count mismatch");
-        }
-        long writes = counts[1];
-        if (writes <= 0) throw new IOException("The calibration capture committed no row writes");
-        double measured = (double) writes / baseline, factor = ratio / measured;
-        var result = new LinkedHashMap<String, Object>();
-        result.put("benchmark", string(document, "benchmark"));
-        result.put("calibration", calibration.toString());
-        result.put("baseline_rows", baseline);
-        result.put("calibration_row_writes", writes);
-        result.put("calibration_ratio", measured);
-        result.put("target_ratio", ratio);
-        result.put("target_row_writes", (long) Math.ceil(ratio * baseline));
-        result.put("factor", factor);
-        result.put("parameters", scaled(document, factor));
-        result.put("note", "estimate from one calibration capture; the planned capture reports its actual ratio");
-        return result;
-    }
 
     /**
      * Parameters for the effective workload operations a replay configuration requires: its
@@ -78,10 +38,15 @@ public final class CapturePlan {
         if (target <= 0) throw new IllegalArgumentException("The replay configuration sets no operation budget: " + replay);
         long measured;
         try (var runtime = new ReplayProjection(config, true, operation -> {})) {
-            var manifest = org.sibench.trace.TraceManifest.read(calibration);
-            ProtoTrace.source(calibration, manifest, "workload").read(runtime);
+            var manifest = TraceManifest.read(calibration);
+            boolean secondary = TraceManifest.secondaryIndexes(manifest);
+            if (config.secondaryIndexes() && !secondary)
+                throw new IOException("Calibration Trace does not provide secondary indexes");
+            long records = ProtoTrace.source(calibration, manifest, "workload").read(runtime);
+            if (records != manifest.get("workload_operations").getAsLong())
+                throw new IOException("Calibration workload record count mismatch");
             runtime.finish();
-            measured = runtime.dispatched();
+            measured = runtime.effectiveRequests();
         }
         if (measured <= 0) throw new IOException("The calibration capture has no effective workload operations");
         double factor = (double) target / measured;

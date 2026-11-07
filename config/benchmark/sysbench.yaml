@@ -31,5 +31,7 @@ native:
       events: 351101
     oltp_point_select:
       events: 1404403
+trace:
+  secondary_indexes: false
 artifacts:
   directory: results/capture/sysbench

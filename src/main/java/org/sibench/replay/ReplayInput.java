@@ -36,9 +36,9 @@ public final class ReplayInput {
     /** Checks supply before a backend is touched; baseline verification is fused with its load. */
     public static Input prepare(Path directory, ReplayConfig config) throws IOException {
         var manifest = TraceManifest.read(directory);
-        if (!manifest.has("secondary_index_coverage")
-                || !manifest.get("secondary_index_coverage").getAsString().equals("all_source_definitions"))
-            throw new IOException("Trace must declare complete source index coverage");
+        boolean secondary = TraceManifest.secondaryIndexes(manifest);
+        if (config.secondaryIndexes() && !secondary)
+            throw new IOException("Trace does not provide secondary indexes; disable secondary consumption or regenerate with secondary export");
         var units = org.sibench.capture.WorkUnits.read(directory);
         if (!manifest.has("work_units_sha256")
                 || !units.sha256().equals(manifest.get("work_units_sha256").getAsString()))
@@ -51,6 +51,7 @@ public final class ReplayInput {
         if (manifest.get("workload_operations").getAsLong() != (long) counts.get("encoded_records"))
             throw new IOException("Trace record count mismatch: workload");
         var report = report(config, null, counts);
+        report.put("secondary_index_coverage", manifest.get("secondary_index_coverage").getAsString());
         report.put("status", "workload_integrity_and_supply_valid");
         IndexOperationTrace.Source baseline = consumer -> {
             report.remove("baseline");
@@ -226,6 +227,7 @@ public final class ReplayInput {
             var definition = item.getAsJsonObject();
             int table = definition.get("table_id").getAsInt(),
                     index = definition.get("index_id").getAsInt();
+            if (index != 0 && manifest.get("secondary_index_coverage").getAsString().equals("primary_only")) continue;
             if (!catalog.computeIfAbsent(table, ignored -> new java.util.TreeSet<>()).add(index))
                 throw new IOException("Duplicate index catalog identity");
         }
@@ -261,9 +263,9 @@ public final class ReplayInput {
             projection.finish();
             if (runtime) {
                 projection.requireClientCoverage();
-                if (projection.dispatched() < config.requiredOperations())
+                if (projection.effectiveRequests() < config.requiredOperations())
                     throw new IOException("Insufficient single-pass trace: requires " + config.requiredOperations()
-                            + " effective workload operations, found " + projection.dispatched()
+                            + " effective workload operations, found " + projection.effectiveRequests()
                             + "; continue native capture, trace repetition is not supported");
             }
             var counts = projection.describe();

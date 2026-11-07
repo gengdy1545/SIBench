@@ -1,5 +1,6 @@
 package org.sibench.capture;
 
+import org.sibench.config.Digests;
 import static org.sibench.config.ConfigValues.*;
 import com.google.gson.GsonBuilder;
 import java.io.IOException;
@@ -25,7 +26,7 @@ final class RocksGeneration {
         json(out.resolve("effective-config.json"), Map.of("runtime", plan.runtime(), "benchmark", input.document(), "engine", "rocksdb", "mode", "api"));
         json(out.resolve("engine-build.json"), build.identity()); json(out.resolve("client-build.json"), input.buildIdentity());
         var stages = new LinkedHashMap<String, Object>();
-        try (var trace = new RocksTrace(out.resolve("trace"), input.source())) {
+        try (var trace = new RocksTrace(out.resolve("trace"), input.source(), Generation.secondaryIndexes(input.document()))) {
             long closeStarted;
             var rows = new RocksDbRows(out.resolve("trace/data"), fields, settings, trace::event);
             try (rows) {
@@ -56,7 +57,7 @@ final class RocksGeneration {
             long publication = System.nanoTime();
             var manifest = trace.publish(library, rows.writtenFiles(), Map.of("engine", build.identity(), "settings", config,
                     "client", input.buildIdentity(), "stages", stages, "baseline_rows", input.baselineRows(),
-                    "effective_config_sha256", FileDigests.sha256(out.resolve("effective-config.json"))));
+                    "effective_config_sha256", Digests.sha256(out.resolve("effective-config.json"))));
             timings.put("publication_seconds", seconds(publication)); timings.put("total_seconds", seconds(start));
             json(out.resolve("result.json"), Map.of("status", "complete", "trace", out.resolve("trace").toString(), "timings", timings));
             return manifest;

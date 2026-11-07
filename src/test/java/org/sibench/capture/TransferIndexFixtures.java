@@ -25,7 +25,7 @@ public final class TransferIndexFixtures {
         IndexMutation.emit(row, delete ? values : Map.of(), delete ? Map.of() : values, consumer);
     }
 
-    public static void appendRow(IndexOperationTrace.Writer writer, Operation row)
+    public static void appendRow(ProtoTrace.Writer writer, Operation row)
             throws IOException {
         expandRow(row, writer::append);
     }

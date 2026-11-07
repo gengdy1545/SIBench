@@ -23,6 +23,8 @@ public final class ProtoTrace {
     private static final int MAX_BYTES = 32 << 20;
     private static final int BLOCK_BYTES = 1 << 20;
 
+    static final int ZSTD_LEVEL = 3;
+
     private ProtoTrace() {}
 
     public static IndexOperationTrace.Source source(Path directory, com.google.gson.JsonObject manifest,
@@ -82,7 +84,8 @@ public final class ProtoTrace {
 
     public static Map<String, Object> file(String path, Writer writer) {
         return Map.of("path", path, "sha256", writer.sha256(),
-                "logical_sha256", writer.logicalSha256(), "operations", writer.count());
+                "logical_sha256", writer.logicalSha256(), "operations", writer.count(),
+                "bytes", writer.bytesWritten(), "statistics", writer.statistics());
     }
 
     public static IndexOperationTrace.Source source(Path file, String physical, String logical) {
@@ -104,8 +107,19 @@ public final class ProtoTrace {
         private String sha256;
         private boolean closed;
         private volatile long bytesWritten = Integer.BYTES;
+        private final boolean secondaryIndexes;
+        private long indexEntries, primaryEntries, effectiveRequests, uncompressedBytes;
+        private final Map<String, Long> requestTypes = new LinkedHashMap<>();
+        private final Map<String, Long> controls = new LinkedHashMap<>();
+        private final Map<String, Long> writeOrigins = new LinkedHashMap<>();
 
         public Writer(Path file) throws IOException {
+            this(file, true);
+        }
+
+        /** Export filtering leaves source execution unchanged and keeps query groups indivisible. */
+        public Writer(Path file, boolean secondaryIndexes) throws IOException {
+            this.secondaryIndexes = secondaryIndexes;
             output = new DataOutputStream(new BufferedOutputStream(new DigestOutputStream(
                     Files.newOutputStream(file, StandardOpenOption.CREATE_NEW), physical)));
             output.writeInt(MAGIC);
@@ -119,7 +133,6 @@ public final class ProtoTrace {
         public void append(Operation operation) throws IOException {
             if (closed) throw new IOException("Proto Trace writer is closed");
             IndexOperationTrace.validate(operation);
-            count++;
             if (operation.grouped()) {
                 if (operation.expansionPosition() != group.size()
                         || !group.isEmpty() && (operation.expansionSize() != group.get(0).expansionSize()
@@ -127,14 +140,20 @@ public final class ProtoTrace {
                     throw new IOException("Invalid proto search group order");
                 group.add(operation);
                 if (group.size() == operation.expansionSize()) {
-                    var record = TraceRecord.newBuilder().setRequest(requests.group(0, group));
-                    for (Operation member : group) record.addPositions(position(member));
-                    write(record.build());
+                    if (secondaryIndexes || group.stream().allMatch(member -> member.index() == 0)) {
+                        var record = TraceRecord.newBuilder().setRequest(requests.group(0, group));
+                        for (Operation member : group) record.addPositions(position(member));
+                        write(record.build());
+                    }
                     group.clear();
                 }
                 return;
             }
             if (!group.isEmpty()) throw new IOException("Interrupted proto search group");
+            if (!secondaryIndexes && operation.index() != 0) return;
+            if (!secondaryIndexes && !IndexOperationTrace.isControl(operation)
+                    && operation.kind() != IndexOperationTrace.SEARCH)
+                operation = operation.withExpansion(0, 1);
             var record = TraceRecord.newBuilder().addPositions(position(operation));
             if (operation.kind() == IndexOperationTrace.TRANSACTION_BEGIN) {
                 if (transaction != 0) throw new IOException("Nested proto transaction");
@@ -165,11 +184,38 @@ public final class ProtoTrace {
                     || block.size() + record.getSerializedSize() + 5 > BLOCK_BYTES)) flush();
             record.writeDelimitedTo(messages);
             records++;
+            count += record.getPositionsCount();
+            var request = record.getRequest();
+            if (record.hasBegin() || request.hasCommit() || request.hasAbort()) {
+                controls.merge(record.hasBegin() ? "begin" : request.hasCommit() ? "commit" : "abort", 1L, Long::sum);
+                return;
+            }
+            effectiveRequests++;
+            indexEntries += record.getPositionsCount();
+            String type;
+            if (request.hasWrite()) {
+                var write = request.getWrite();
+                if (write.getKey().getIndex() == 0) primaryEntries++;
+                type = write.getKind().name().toLowerCase(Locale.ROOT);
+                int flags = record.getPositions(0).getFlags();
+                if ((flags & IndexOperationTrace.BUSINESS_INSERT) != 0) writeOrigins.merge("business_insert", 1L, Long::sum);
+                if ((flags & IndexOperationTrace.BUSINESS_UPDATE) != 0) writeOrigins.merge("business_update", 1L, Long::sum);
+            } else if (request.hasGroup()) {
+                for (Search member : request.getGroup().getMembersList()) if (member.getIndex() == 0) primaryEntries++;
+                type = request.getGroup().getMode().name().toLowerCase(Locale.ROOT) + "_search";
+            } else {
+                var search = request.getSearch();
+                if (search.getIndex() == 0) primaryEntries++;
+                type = search.hasLower() && search.hasUpper() && search.getLower().getInclusive()
+                        && search.getUpper().getInclusive() && search.getLower().getKey().equals(search.getUpper().getKey())
+                        ? "point_search" : "range_search";
+            }
+            requestTypes.merge(type, 1L, Long::sum);
         }
 
         private void flush() throws IOException {
             if (records == 0) return;
-            byte[] plain = block.toByteArray(), compressed = Zstd.compress(plain, 3);
+            byte[] plain = block.toByteArray(), compressed = Zstd.compress(plain, ZSTD_LEVEL);
             var crc = new CRC32C();
             crc.update(plain);
             output.writeInt(records);
@@ -178,12 +224,19 @@ public final class ProtoTrace {
             output.writeInt((int) crc.getValue());
             output.write(compressed);
             bytesWritten += 4L * Integer.BYTES + compressed.length;
+            uncompressedBytes += plain.length;
             block.reset();
             records = 0;
         }
 
         public long count() { return count; }
         long bytesWritten() { return bytesWritten; }
+        public Map<String, Object> statistics() {
+            return Map.of("index_entries", indexEntries, "effective_requests", effectiveRequests,
+                    "primary_entries", primaryEntries, "secondary_entries", indexEntries - primaryEntries,
+                    "request_types", Map.copyOf(requestTypes), "transaction_markers", Map.copyOf(controls),
+                    "write_origins", Map.copyOf(writeOrigins), "uncompressed_message_bytes", uncompressedBytes);
+        }
         public String logicalSha256() {
             if (logicalSha256 == null) throw new IllegalStateException("Proto Trace not closed successfully");
             return logicalSha256;
@@ -201,6 +254,7 @@ public final class ProtoTrace {
                 if (!group.isEmpty() || transaction != 0) throw new IOException("Incomplete proto transaction or search group");
                 flush();
                 for (int i = 0; i < 4; i++) output.writeInt(0);
+                bytesWritten += 4L * Integer.BYTES;
             } finally {
                 output.close();
             }

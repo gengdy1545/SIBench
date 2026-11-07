@@ -68,7 +68,7 @@ public final class BaselineCapacityCheck {
     }
     static Map<String,Object> run(Path trace,String endpoint,int clients,Path receiver,Path report,long windowSeconds,ReplayInput.Input prepared) throws Exception {
         long preparing=System.nanoTime();
-        var config=new ReplayConfig(true, 0,0,0,0,"operation",clients,4096,60);
+        var config=DriverCapacityCheck.config(trace, clients);
         var input=prepared==null?ReplayInput.prepare(trace,config):prepared;var expected=new Fingerprint();var requests=new TraceRequests(ValueKind.ROW_ID);var before=received(receiver);
         requests.baselineBatch(Math.max(1,config.maxInFlight()/clients));boolean complete=true;Map<String,Object> dispatch;
         double setupSeconds=(System.nanoTime()-preparing)/1e9;
@@ -102,7 +102,7 @@ public final class BaselineCapacityCheck {
             Runtime.getRuntime().addShutdownHook(new Thread(() -> { try {server.close();}catch(IOException ignored){} }));System.out.println("READY "+server.port());server.awaitTermination();
         } else if(args[0].equals("series")) {
             Path trace=Path.of(args[1]),receiver=Path.of(args[3]),output=Path.of(args[4]);
-            var config=new ReplayConfig(true, 0,0,0,0,"operation",128,4096,60);long start=System.nanoTime();
+            var config=DriverCapacityCheck.config(trace, 128);long start=System.nanoTime();
             var input=ReplayInput.prepare(trace,config);double setup=(System.nanoTime()-start)/1e9;var paths=new ArrayList<String>();
             int[] clients={64,1,128,128,1,64};
             for(int i=0;i<clients.length;i++){Path report=output.resolve("clients-"+clients[i]+"-"+i+".json");run(trace,args[2],clients[i],receiver,report,Long.parseLong(args[5]),input);paths.add(report.getFileName().toString());System.out.println("completed "+report.getFileName());}

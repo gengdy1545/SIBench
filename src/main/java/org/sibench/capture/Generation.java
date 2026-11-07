@@ -1,5 +1,6 @@
 package org.sibench.capture;
 
+import org.sibench.config.Digests;
 import static org.sibench.config.ConfigValues.*;
 import com.google.gson.GsonBuilder;
 import java.io.IOException;
@@ -63,7 +64,8 @@ public final class Generation {
             require(selection.engine()!=Engine.POSTGRES||selection.benchmark().equals("sysbench"),
                     "Native PostgreSQL generation supports sysbench capture");
             var document=parse(Files.readString(selection.config()));
-            keys(document,Set.of("schema_version","purpose","benchmark","source","native","artifacts"));
+            keys(document,Set.of("schema_version","purpose","benchmark","source","native","trace","artifacts"));
+            secondaryIndexes(document);
             require(integer(document,"schema_version")==1&&string(document,"purpose").equals("native_capture"),"Expected native_capture profile");
             keys(object(document,"source"),Set.of("path","commit"));keys(object(document,"artifacts"),Set.of("directory"));
             var source=SourceSchema.read(root,document);var nativeConfig=object(document,"native");
@@ -82,6 +84,13 @@ public final class Generation {
             inputs.add(new Input(selection,document,source,client,output,identity,Map.copyOf(baselineRows),parameters));
         }
         return new Plan(root,runtime,Map.copyOf(engines),List.copyOf(inputs));
+    }
+
+    static boolean secondaryIndexes(Map<String,Object> document) {
+        if (!document.containsKey("trace")) return false;
+        var trace = object(document,"trace");
+        keys(trace,Set.of("secondary_indexes"));
+        return bool(trace,"secondary_indexes");
     }
 
     static void validateNative(String benchmark,Map<String,Object> n) {
@@ -200,7 +209,7 @@ public final class Generation {
                 for(var table:input.source().tables())NativeHistory.install(database, org.sibench.config.Engine.DUCKDB,++tableId,"main",table.name(),
                         table.indexes().stream().filter(SourceSchema.Index::primary).findFirst().orElseThrow().column());
                 database.commit();
-                var trace=new DuckDbTrace(input.selection().mode(),input.source(),out.resolve("trace"));
+                var trace=new DuckDbTrace(input.selection().mode(),input.source(),out.resolve("trace"),secondaryIndexes(input.document()));
                 trace.baseline(database,expected);database.commit();database.setAutoCommit(true);
                 timings.put("baseline_indexes_seconds",seconds(baselineStart));long workloadStart=System.nanoTime();
                 sql(database,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation','SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path="+literal(out.resolve("native.csv").toString())+")");
@@ -229,14 +238,14 @@ public final class Generation {
                 DuckDbTransactions.bind(database,"data");DuckDbIdentities.bind(database);
                 DuckDbAccesses.bind(database,IndexCatalog.duckDbDefinitions(input.source()));DuckDbMutations.bind(database);
                 var evidence=new LinkedHashMap<String,Object>();evidence.put("engine",engine);evidence.put("client",input.buildIdentity());
-                evidence.put("effective_config_sha256",FileDigests.sha256(out.resolve("effective-config.json")));
-                evidence.put("raw_sha256",FileDigests.sha256(out.resolve("native.csv")));
-                evidence.put("source_diagnostics_sha256",FileDigests.sha256(diagnostics));
+                evidence.put("effective_config_sha256",Digests.sha256(out.resolve("effective-config.json")));
+                evidence.put("raw_sha256",Digests.sha256(out.resolve("native.csv")));
+                evidence.put("source_diagnostics_sha256",Digests.sha256(diagnostics));
                 if(input.selection().benchmark().equals("hybench")) {
-                    evidence.put("load_inputs_sha256",FileDigests.sha256(load.resolve("inputs.json")));
-                    evidence.put("parameters_sha256",FileDigests.sha256(out.resolve("native/parameters/parameters.toml")));
+                    evidence.put("load_inputs_sha256",Digests.sha256(load.resolve("inputs.json")));
+                    evidence.put("parameters_sha256",Digests.sha256(out.resolve("native/parameters/parameters.toml")));
                 }
-                var hashes=new LinkedHashMap<String,String>();for(Path file:files)hashes.put(out.relativize(file).toString(),FileDigests.sha256(file));
+                var hashes=new LinkedHashMap<String,String>();for(Path file:files)hashes.put(out.relativize(file).toString(),Digests.sha256(file));
                 evidence.put("receipt_sha256",hashes);evidence.put("baseline_rows",expected);
                 draft=trace.workload(database,evidence);
                 timings.put("facts_and_projection_seconds",seconds(projectionStart));

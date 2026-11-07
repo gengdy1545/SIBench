@@ -26,8 +26,8 @@ public interface ReplayTarget extends AutoCloseable {
     }
 
     /**
-     * Sends a complete-commit marker after the transaction's operations. Services that only use
-     * sequence ordering do not need it; the default fails rather than silently dropping it.
+     * Sends a complete-commit marker after the transaction's operations. Service targets must
+     * implement it; logical reference targets consume operation views without publication markers.
      */
     default SendHandle sendCommit(long dispatchSequence, long transactionId, long version)
             throws IOException {

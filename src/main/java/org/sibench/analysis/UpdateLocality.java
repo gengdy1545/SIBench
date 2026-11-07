@@ -33,7 +33,7 @@ import java.util.zip.GZIPOutputStream;
  * Static update-locality analysis over a trace. A baseline is placed in declared sorted runs of
  * {@code entries_per_block} entries and {@code blocks_per_file} blocks per file; committed workload
  * modifications are then mapped to those runs. The layout is an equal-entry-count approximation,
- * not a Parquet row group or a real SST byte layout.
+ * not a physical storage block or an SST byte layout.
  *
  * <p>Business row modifications and index maintenance are counted separately. A business row
  * change counts once, at its primary maintenance record; secondary entries are index maintenance.
@@ -150,7 +150,7 @@ public final class UpdateLocality {
         summary.put("analysis", analysis);
         summary.put(
                 "scope",
-                "static equal-entry layout only; block/file boundaries are not Parquet row groups or"
+                "static equal-entry layout only; block/file boundaries do not represent physical storage blocks or"
                         + " real SST bytes; no compaction selection, dynamic L1 or engine bytes are"
                         + " modelled; unique keys are 64-bit fingerprints");
         Files.writeString(

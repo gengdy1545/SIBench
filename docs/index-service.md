@@ -1,6 +1,6 @@
 # Index Service contract
 
-The protocol namespace is `sibench.index`, defined in `src/main/proto/index_service.proto`. The driver and service are built together from the same commit. The service executes operations by transaction position and resolves committed and aborted transaction slots as a contiguous sequence, using canonical Trace inputs.
+The protocol namespace is `sibench.index`, defined in `proto/index_service.proto`. The driver and service are built together from the same commit. The service executes operations by transaction position and resolves committed and aborted transaction slots as a contiguous sequence, using canonical Trace inputs.
 
 ## Interfaces and acknowledgment boundaries
 
@@ -32,7 +32,6 @@ An index entry is `(table, index, indexed_value, PK)`; the primary index, `index
 | Transaction-local `Search` | read_version preserves the original statement snapshot; local_version identifies this transaction's exact version. Only writes from earlier transaction_operation positions in the same transaction are overlaid. Other intervening commits remain invisible. The service checks that the transaction owns local_version. |
 | `SearchGroup` | The server intersects or unions members of the same source access by PK. Intersection follows the first member's order; union preserves first-occurrence order. Members must share the table, read point, and group identity. |
 | `Commit` | Declares the transaction version and actual sent write and operation counts. Operations include queries, groups, and writes. Transactions made empty by filtering still have commit markers. |
-
 | `Abort` | Declares the same version and sent counts as Commit, but discards the transaction logically. Earlier local searches still execute; none of its provisional writes enter committed snapshots. |
 
 A version is a canonical transaction-resolution slot, including aborted transactions. Resolving version V requires its Commit or Abort marker, completion of all its operations, matching write counts, and resolution of V−1. An Abort marker reaches the declared write durability before the watermark advances; the watermark does not assert that every preceding slot committed. The maximum observed version cannot replace the contiguous complete watermark. Snapshot reads wait for publication of read_version; transaction-local reads also wait for earlier positions in the same transaction.
@@ -48,13 +47,13 @@ Ordinary queries return chunks of 16,384 results. `more=true` indicates another 
 
 Each query checks the native expected count, response status and chunk completion. Missing or extra result items, invalid partial responses and incomplete request consumption fail the replay. Equal counts do not establish matching keys, versions, values or order; replay does not claim that guarantee.
 
-Replay consumes canonical requests and native counts, without per-query answer artifacts or a reference index. Input integrity, source bindings, capability checks, transaction ordering and exact Flush publication remain required.
+Replay consumes canonical requests and native counts, without per-query answer artifacts or a reference index. Input integrity, source bindings, capability checks, transaction ordering and exact Flush publication remain required. Required Abort, query-group and transaction-local-read capabilities come from the verified workload after secondary-index selection; source catalog statistics do not determine them.
 
 `request_bytes` sums `Request.getSerializedSize()`, including batch requests. `result_bytes` sums `Result.getSerializedSize()`, accounted after the final response arrives and its count is verified. These counters exclude response envelopes, repeated-field tags / lengths, empty responses, gRPC / HTTP2 / TCP overhead, and retransmissions; they do not measure network bytes.
 
 ## Publication and reopening
 
-`Flush` waits for requests accepted before the call began, then writes the publication watermark and Trace binding into the index and persists them with the data. An index rejects a binding for another Trace, value mode, or secondary-index configuration. A minimal index manifest beside the report records input identity, version coverage, key / value encoding, backend location, build identity, and replay configuration. Source snapshot is N/A until integrated.
+`Flush` waits for requests accepted before the call began, then writes the publication watermark and Trace binding into the index and persists them with the data. An index rejects a binding for another Trace, value mode, or secondary-index configuration. A minimal index manifest beside the report records input identity, version coverage, key / value encoding, backend location, build identity, and replay configuration.
 
 `reopen: true` opens an existing index and restores the last Flush watermark; versions above it remain invisible. Persisted Abort markers are restored on open and exclude aborted versions even when they are below the watermark. `verify-service` checks all replayable snapshot queries at their original read points. Transaction-local queries are reported separately and excluded from this check because they depend on live transaction prefixes that cannot be reconstructed by replay after the transaction has ended.
 

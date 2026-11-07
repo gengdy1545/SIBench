@@ -13,6 +13,25 @@ import org.sibench.trace.IndexKey;
 public class BaselineCapacityCheckTest {
     @Rule public TemporaryFolder temporary=new TemporaryFolder();
 
+    @Test
+    public void capacityChecksSelectOnlyIndexesProvidedByTheTrace() throws Exception {
+        Path trace = temporary.newFolder().toPath();
+        var manifest = new com.google.gson.JsonObject();
+        manifest.add("value_kinds", new com.google.gson.Gson().toJsonTree(java.util.List.of("row_id")));
+        manifest.addProperty("output", "proto");
+        for (String name : java.util.List.of("baseline", "workload")) manifest.addProperty(name + "_trace_sha256", "test");
+        for (String name : java.util.List.of("baseline_rows", "source_work_units", "baseline_operations", "workload_operations"))
+            manifest.addProperty(name, 0);
+        for (boolean secondary : new boolean[] {false, true}) {
+            manifest.addProperty("secondary_index_coverage", secondary ? "all_source_definitions" : "primary_only");
+            Files.writeString(trace.resolve("manifest.json"), manifest.toString());
+            assertEquals(secondary, DriverCapacityCheck.config(trace, 2).secondaryIndexes());
+        }
+        manifest.remove("secondary_index_coverage");
+        Files.writeString(trace.resolve("manifest.json"), manifest.toString());
+        assertThrows(java.io.IOException.class, () -> DriverCapacityCheck.config(trace, 2));
+    }
+
     @Test(timeout=15000)
     public void actualBatchAckPassesAndAcceptedButDroppedWriteFailsIndependentFieldCheck() throws Exception {
         for(boolean drop:new boolean[]{false,true}) {

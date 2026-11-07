@@ -20,9 +20,12 @@ public final class ReplayMatrixValidation {
     public static void validate(Path trace, Path output) throws IOException {
         Files.createDirectory(output);
         Files.writeString(output.resolve("INCOMPLETE"), "Replay matrix not verified\n");
+        var manifest = org.sibench.trace.TraceManifest.read(trace);
+        boolean[] scopes = org.sibench.trace.TraceManifest.secondaryIndexes(manifest)
+                ? new boolean[] {false, true} : new boolean[] {false};
         var reports = new ArrayList<Map<String, Object>>();
         var expected = new HashMap<String, String>();
-        for (boolean secondary : new boolean[] {false, true})
+        for (boolean secondary : scopes)
             for (String dispatch : List.of("operation", "transaction"))
                 for (int clients : new int[] {1, 2}) {
                     String name = "secondary-" + secondary + "-" + dispatch + "-" + clients;
@@ -58,7 +61,7 @@ public final class ReplayMatrixValidation {
                                     config.describe()));
                     System.out.println("Verified " + name);
                 }
-        for (boolean secondary : new boolean[] {false, true})
+        for (boolean secondary : scopes)
             SnapshotLookupValidation.run(
                     trace,
                     new ReplayConfig(secondary, 0, 0, 0, 0),
@@ -75,10 +78,10 @@ public final class ReplayMatrixValidation {
                                         "variants",
                                         reports,
                                         "scope",
-                                        "1/2 clients x both dispatch modes x secondary on/off;"
+                                        "1/2 clients x both dispatch modes x supported secondary settings;"
                                             + " declared value modes,"
                                             + " operation-order/state/count equivalence."
-                                            + " Independent native row oracle at 1 client for both"
+                                            + " Independent native row oracle at 1 client for supported"
                                             + " secondary settings; no real network or performance"
                                             + " claim.")),
                 StandardOpenOption.CREATE_NEW);

@@ -14,7 +14,7 @@ import org.sibench.capture.*;
 import org.sibench.config.Digests;
 import org.sibench.replay.*;
 
-/** Bounded diagnostic: record a committed prefix once, then replay its full responses over RPC. */
+/** Bounded diagnostic: record a transaction-complete prefix once, then replay its full responses over RPC. */
 public final class DriverCapacityCheck {
     private static final Gson JSON = new GsonBuilder().setPrettyPrinting().create();
     private static final long MAX_BYTES = 1L << 30;
@@ -67,21 +67,21 @@ public final class DriverCapacityCheck {
                 "first_event_index_sha256", java.util.HexFormat.of().formatHex(indexDigest.digest()))), StandardOpenOption.CREATE_NEW);
     }
 
-    private static ReplayConfig config(int clients) {
-        return new ReplayConfig(true, 0, 0, 0, 0, "operation", clients, 4096, 60);
+    static ReplayConfig config(Path trace, int clients) throws IOException {
+        boolean secondary = org.sibench.trace.TraceManifest.secondaryIndexes(org.sibench.trace.TraceManifest.read(trace));
+        return new ReplayConfig(secondary, 0, 0, 0, 0, "operation", clients, 4096, 60);
     }
 
     private static void plan(Path trace, long wanted, Path report) throws Exception {
         var candidates = new ArrayList<Map<String, Object>>();
-        var routing = new ReplayDispatcher(config(128), client -> { throw new IOException("Planning cannot send"); });
+        var routing = new ReplayDispatcher(config(trace, 128), client -> { throw new IOException("Planning cannot send"); });
         var clients = new BitSet();
         long[] records = {0}, queries = {0}, items = {0}, largest = {0};
         long[] next = {1000};
         try {
             ProtoTrace.source(trace, org.sibench.trace.TraceManifest.read(trace), "workload").read( operation -> {
                 records[0]++;
-                if (operation.kind() != IndexOperationTrace.TRANSACTION_BEGIN
-                        && operation.kind() != IndexOperationTrace.TRANSACTION_COMMIT)
+                if (!IndexOperationTrace.isControl(operation))
                     clients.set(routing.route(operation));
                 if (operation.kind() == IndexOperationTrace.SEARCH
                         && (!operation.grouped() || operation.expansionPosition() + 1 == operation.expansionSize())) {
@@ -89,7 +89,7 @@ public final class DriverCapacityCheck {
                     items[0] = Math.addExact(items[0], operation.expectedCount());
                     largest[0] = Math.max(largest[0], operation.expectedCount());
                 }
-                if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT && records[0] >= next[0]) {
+                if ((operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT || operation.kind() == IndexOperationTrace.TRANSACTION_ABORT) && records[0] >= next[0]) {
                     candidates.add(Map.of("records", records[0], "queries", queries[0], "expected_result_items", items[0],
                             "largest_query_items", largest[0], "used_clients_128", clients.cardinality()));
                     next[0] = Math.max(next[0] * 2, records[0] + 1);
@@ -97,7 +97,7 @@ public final class DriverCapacityCheck {
                 }
             });
         } catch (EndPrefix expected) {}
-        Files.writeString(report, JSON.toJson(Map.of("scope", "read-only committed-prefix planning; not a capacity measurement",
+        Files.writeString(report, JSON.toJson(Map.of("scope", "read-only transaction-complete-prefix planning; not a capacity measurement",
                 "trace", trace.toAbsolutePath().toString(), "candidates", candidates)), StandardOpenOption.CREATE_NEW);
     }
 
@@ -119,17 +119,17 @@ public final class DriverCapacityCheck {
         Files.writeString(output.resolve("INCOMPLETE"), "Response recording not committed\n");
         // The full directory check is outside measured dispatch, and remains part of setup cost.
         System.out.println("phase=preflight");
-        var inputTrace = ReplayInput.prepare(trace, config(128));
+        var inputTrace = ReplayInput.prepare(trace, config(trace, 128));
         long[] records = {0}, queries = {0};
         try {
             ProtoTrace.source(trace, org.sibench.trace.TraceManifest.read(trace), "workload").read( operation -> {
                 records[0]++;
                 if (operation.kind() == IndexOperationTrace.SEARCH
                         && (!operation.grouped() || operation.expansionPosition() + 1 == operation.expansionSize())) queries[0]++;
-                if (records[0] >= wanted && operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) throw new EndPrefix();
+                if (records[0] >= wanted && (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT || operation.kind() == IndexOperationTrace.TRANSACTION_ABORT)) throw new EndPrefix();
             });
         } catch (EndPrefix expected) {}
-        String binding = ReplayInput.binding(trace, config(128)) + " mode=rowid";
+        String binding = ReplayInput.binding(trace, config(trace, 128)) + " mode=rowid";
         // The serialized-byte cap is not an object-heap bound; setup also needs its external heap/deadline limits.
         var recorded = new ConcurrentHashMap<Request, List<Response>>();
         var bytes = new AtomicLong();
@@ -141,7 +141,7 @@ public final class DriverCapacityCheck {
             var baselineRequests = new TraceRequests(ValueKind.ROW_ID);
             baselineRequests.baselineBatch(64);
             System.out.println("phase=baseline");
-            try (var load = ReplayProjection.withClients(config(64), false,
+            try (var load = ReplayProjection.withClients(config(trace, 64), false,
                     InProcessService.factory(published, baselineRequests), true)) {
                 inputTrace.baseline().read(load);
                 load.finish();
@@ -162,7 +162,7 @@ public final class DriverCapacityCheck {
                             .thenApply(response -> { keep.accept(response); return response; });
                 }
             };
-            try (var replay = ReplayProjection.withClients(config(128), true, factory, true)) {
+            try (var replay = ReplayProjection.withClients(config(trace, 128), true, factory, true)) {
                 prefix(trace, records[0], replay);
                 replay.finish();
                 replay.requireClientCoverage();
@@ -192,7 +192,7 @@ public final class DriverCapacityCheck {
         manifest.put("rpc_requests", recorded.size());
         manifest.put("serialized_request_response_bytes", bytes.get());
         manifest.put("fixture_sha256", Digests.sha256(binary));
-        manifest.put("scope", "committed prefix of the original trace; recorded response counts matched Trace source counts; no trace looping");
+        manifest.put("scope", "transaction-complete prefix of the original trace; recorded response counts matched Trace source counts; no trace looping");
         Files.writeString(output.resolve("manifest.json"), JSON.toJson(manifest));
         Files.delete(output.resolve("INCOMPLETE"));
         System.out.println("fixture=complete requests=" + recorded.size());
@@ -273,10 +273,11 @@ public final class DriverCapacityCheck {
         if (!Digests.sha256(trace.resolve("manifest.json")).equals(manifest.get("trace_manifest_sha256").getAsString()))
             throw new IOException("Source trace manifest changed");
         var requests = new TraceRequests(ValueKind.ROW_ID);
+        var config = config(trace, clients);
         long started = System.nanoTime();
         Map<String, Object> dispatch;
         try (var remote = new GrpcService(endpoint, requests, manifest.get("binding").getAsString(), 60);
-                var replay = ReplayProjection.withClients(config(clients), true, remote.factory(), true)) {
+                var replay = ReplayProjection.withClients(config, true, remote.factory(), true)) {
             prefix(trace, manifest.get("records").getAsLong(), replay);
             replay.finish();
             replay.requireClientCoverage();

@@ -9,7 +9,7 @@ import java.io.IOException;
 import java.util.List;
 
 /**
- * A KV index service implementation behind the SIBench index protocol (src/main/proto). It owns
+ * A KV index service implementation behind the SIBench index protocol (proto). It owns
  * its physical layout; the semantics are docs/index-service.md. Implementations may be
  * called concurrently and must be thread-safe; the order requests run in is the caller's
  * (IndexServer, or the driver's sending thread in process).

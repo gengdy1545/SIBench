@@ -24,14 +24,15 @@ import org.sibench.schema.SourceSchema;
 public final class DuckDbTrace {
     private final Mode mode;
     private final Path directory;
+    private final boolean secondaryIndexes;
     private final List<IndexCatalog.Definition> catalog;
     private final LinkedHashMap<String,Object> manifest;
     private ProtoTrace.Writer base;
 
-    public DuckDbTrace(Mode mode,SourceSchema source,Path directory)throws IOException {
+    public DuckDbTrace(Mode mode,SourceSchema source,Path directory,boolean secondaryIndexes)throws IOException {
         if(mode!=Mode.CAPTURE || source.benchmark().equals("ycsb"))
             throw new IllegalArgumentException("Unsupported native benchmark mode");
-        this.mode=mode;this.directory=directory;catalog=IndexCatalog.duckDbDefinitions(source);
+        this.secondaryIndexes=secondaryIndexes;this.mode=mode;this.directory=directory;catalog=IndexCatalog.duckDbDefinitions(source);
         manifest=new LinkedHashMap<>(IndexCatalog.provenance(source,catalog));
         IndexCatalog.fromManifest(new Gson().toJsonTree(manifest).getAsJsonObject());
         Files.createDirectory(directory);
@@ -39,9 +40,9 @@ public final class DuckDbTrace {
     }
 
     public void baseline(Connection database,Map<String,Long> expected)throws SQLException,IOException {
-        var writer=new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"));base=writer;
+        var writer=new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"),secondaryIndexes);base=writer;
         try(writer) {
-            var counts=NativeBaseline.write(database,org.sibench.config.Engine.DUCKDB,catalog,writer);
+            var counts=NativeBaseline.write(database,org.sibench.config.Engine.DUCKDB,catalog.stream().filter(d->secondaryIndexes||d.indexId()==0).toList(),writer);
             Generation.requireRows(expected,counts);
             manifest.put("baseline_rows",counts.values().stream().mapToLong(Long::longValue).sum());
             manifest.put("baseline_operations",base.count());
@@ -78,7 +79,7 @@ public final class DuckDbTrace {
             var policy=new ReplayConfig(true,0,0,0,0,"operation");
             long[] commits={0},aborts={0},localSearches={0};
             var shapes=new LinkedHashMap<String,Long>();
-            var workload=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"));
+            var workload=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes);
             try(workload;var validation=new ReplayProjection(policy,true,operation->{})) {
                 IndexOperationTrace.Consumer output=operation->{
                     if(!IndexOperationTrace.isControl(operation)) {
@@ -98,7 +99,7 @@ public final class DuckDbTrace {
             }
             manifest.put("output","proto");manifest.put("value_kinds",List.of("row_id"));
             manifest.put("mode",mode.name().toLowerCase(java.util.Locale.ROOT));
-            manifest.put("generation","native_duckdb");manifest.put("secondary_index_coverage","all_source_definitions");
+            manifest.put("generation","native_duckdb");manifest.put("secondary_index_coverage",secondaryIndexes?"all_source_definitions":"primary_only");
             manifest.put("workload_operations",workload.count());manifest.put("committed_transactions",commits[0]);
             manifest.put("aborted_transactions",aborts[0]);manifest.put("transaction_local_searches",localSearches[0]);
             if(!shapes.isEmpty())manifest.put("searched_accesses_by_shape",shapes);

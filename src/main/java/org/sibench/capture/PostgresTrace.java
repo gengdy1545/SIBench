@@ -19,23 +19,24 @@ import org.sibench.schema.SourceSchema;
 /** Writes final Trace streams alongside load and workload; publication only seals their inventories. */
 final class PostgresTrace {
     private final Path directory;
+    private final boolean secondaryIndexes;
     private final IndexCatalog catalog;
     private final Map<String,Object> manifest;
 
-    PostgresTrace(Path directory,SourceSchema source)throws IOException {
-        this.directory=directory;catalog=IndexCatalog.fromSchema(source);
+    PostgresTrace(Path directory,SourceSchema source,boolean secondaryIndexes)throws IOException {
+        this.secondaryIndexes=secondaryIndexes;this.directory=directory;catalog=IndexCatalog.fromSchema(source);
         manifest=new LinkedHashMap<>(IndexCatalog.provenance(source,catalog.definitions()));
         IndexCatalog.fromManifest(new Gson().toJsonTree(manifest).getAsJsonObject());
         Files.createDirectory(directory);
         Files.writeString(directory.resolve("INCOMPLETE"),"Native generation/publication pending\n",StandardOpenOption.CREATE_NEW);
         manifest.put("output","proto");manifest.put("value_kinds",List.of("row_id"));
         manifest.put("mode","capture");manifest.put("generation","native_postgres");
-        manifest.put("secondary_index_coverage","all_source_definitions");
+        manifest.put("secondary_index_coverage",secondaryIndexes?"all_source_definitions":"primary_only");
     }
 
     void baseline(Connection database,Map<String,Long> expected)throws Exception {
-        var writer=new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"));
-        try(writer){Generation.requireRows(expected,NativeBaseline.write(database,org.sibench.config.Engine.POSTGRES,catalog.definitions(),writer::accept));}
+        var writer=new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"),secondaryIndexes);
+        try(writer){Generation.requireRows(expected,NativeBaseline.write(database,org.sibench.config.Engine.POSTGRES,catalog.definitions().stream().filter(d->secondaryIndexes||d.indexId()==0).toList(),writer::accept));}
         manifest.put("baseline_rows",expected.values().stream().mapToLong(Long::longValue).sum());
         stream("baseline",writer);
     }
@@ -43,7 +44,7 @@ final class PostgresTrace {
     /** One consumer runs concurrently with native clients; source counts are checked before seal. */
     void workload(Connection database,PostgresCapture capture)throws Exception {
         var units=WorkUnits.create(directory);
-        var writer=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"));
+        var writer=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes);
         try(var lines=units.lines();writer;var versions=new PostgresVersions(database);
                 var projection=new PostgresProjection(database,catalog,directory,versions,units,writer::accept)) {
             for(PostgresTransactions.Chunk next;(next=capture.transactions.next(()->capture.watermark(database)))!=null;)

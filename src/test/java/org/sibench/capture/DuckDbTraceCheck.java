@@ -174,7 +174,7 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
             sql(db,"CREATE TABLE sbtest1(id INTEGER PRIMARY KEY,k INTEGER NOT NULL,c VARCHAR NOT NULL,pad VARCHAR NOT NULL)");
             sql(db,"CREATE INDEX k_1 ON sbtest1(k)");sql(db,"INSERT INTO sbtest1 VALUES(10,1,'A',''),(20,1,'B',''),(30,2,'C','')");
             history(db,"sbtest1","id");row=number(db,"SELECT _sib_row_id FROM sibench_history.identities_1 WHERE id=10");
-            var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"));
+            var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"),true);
             db.setAutoCommit(false);trace.baseline(db,Map.of("sbtest1",3L));db.commit();db.setAutoCommit(true);
             logging(db);
             try(var worker=DuckDbHostDriver.open(socket,receipts);var older=DuckDbHostDriver.open(socket,receipts)) {
@@ -195,8 +195,6 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
             assertEquals(1L,draft.manifest().get("aborted_transactions"));
         }
         Path moved=publish(draft);
-        assertEquals(1L,CapturePlan.writeRatio(Path.of("."),Path.of("config/benchmark/sysbench.yaml"),moved,1)
-                .get("calibration_row_writes"));
         verifiesCoverageAndDeferredBaseline(moved);
         org.sibench.replay.ReplayMatrixValidation.validate(moved,output.resolve("matrix"));
         try(var data=TraceManifest.openData(moved)) {

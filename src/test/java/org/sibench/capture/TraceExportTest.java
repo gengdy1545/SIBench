@@ -1,0 +1,76 @@
+package org.sibench.capture;
+
+import static org.junit.Assert.*;
+import static org.sibench.capture.IndexOperationTrace.*;
+
+import com.google.gson.Gson;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Map;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+import org.sibench.replay.ReplayConfig;
+import org.sibench.replay.ReplayInput;
+import org.sibench.schema.SourceSchema;
+import org.sibench.trace.IndexKey;
+
+public class TraceExportTest {
+    @Rule public TemporaryFolder temporary = new TemporaryFolder();
+
+    @Test public void declaredCoverageControlsCompleteMaintenanceAndRejectsMissingIndexes() throws Exception {
+        for (boolean secondary : List.of(false, true)) {
+            Path directory = temporary.newFolder("export-" + secondary).toPath();
+            var baseline = new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"), secondary);
+            try (baseline) {
+                IndexMutation.emit(write(0, INSERT, 1, 0, IndexKey.ofInt(1), 0, 0, 0, 1).withWorkUnitId(1),
+                        Map.of(), Map.of(1, IndexKey.ofInt(2)), baseline);
+            }
+            var workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"), secondary);
+            try (workload) {
+                workload.accept(transaction(0, TRANSACTION_BEGIN, 1, 1, 0));
+                workload.accept(search(1, 1, 1, Range.equal(IndexKey.ofInt(2)), 0, 1, SNAPSHOT_SEARCH)
+                        .withTransaction(1, 0).withWorkUnitId(1));
+                IndexMutation.emit(write(1, UPSERT, 1, BUSINESS_UPDATE, IndexKey.ofInt(1), 1, 0, 0, 1)
+                                .withTransaction(1, 1).withWorkUnitId(1),
+                        Map.of(1, IndexKey.ofInt(2)), Map.of(1, IndexKey.ofInt(3)), workload);
+                workload.accept(transaction(0, TRANSACTION_COMMIT, 1, 1, 1));
+            }
+            var units = WorkUnits.create(directory);
+            try (var lines = units.lines()) {
+                lines.write("{\"work_unit_id\":1,\"source_event\":1,\"connection_id\":1,\"query_id\":1}\n");
+            }
+            var source = SourceSchema.of("sysbench", Path.of("benchmark/sysbench"), Map.of("tables", 1));
+            var manifest = IndexCatalog.fromSchema(source).provenance();
+            manifest.put("secondary_index_coverage", secondary ? "all_source_definitions" : "primary_only");
+            manifest.put("output", "proto");
+            manifest.put("value_kinds", List.of("row_id"));
+            manifest.put("baseline_rows", 1);
+            manifest.put("source_work_units", 1);
+            manifest.put("work_units_sha256", HexFormat.of().formatHex(units.digest().digest()));
+            manifest.put("baseline_operations", baseline.count());
+            manifest.put("workload_operations", workload.count());
+            var baseFiles = List.of(ProtoTrace.file("baseline.pb.zst", baseline));
+            var workFiles = List.of(ProtoTrace.file("workload.pb.zst", workload));
+            var gson = new Gson();
+            manifest.put("proto_files", Map.of("baseline", baseFiles, "workload", workFiles));
+            manifest.put("baseline_trace_sha256", ProtoTrace.identity(gson.toJsonTree(baseFiles).getAsJsonArray()));
+            manifest.put("workload_trace_sha256", ProtoTrace.identity(gson.toJsonTree(workFiles).getAsJsonArray()));
+            Path path = directory.resolve("manifest.json");
+            Files.writeString(path, gson.toJson(manifest));
+            var primary = new ReplayConfig(false, 0, 0, 0, 0, "operation");
+            var all = new ReplayConfig(true, 0, 0, 0, 0, "operation");
+            assertEquals("trace_integrity_and_supply_valid", ReplayInput.check(directory, primary).get("status"));
+            if (secondary) assertEquals("trace_integrity_and_supply_valid", ReplayInput.check(directory, all).get("status"));
+            else assertTrue(assertThrows(IOException.class, () -> ReplayInput.prepare(directory, all))
+                    .getMessage().contains("does not provide secondary indexes"));
+            // A false coverage claim must fail even when all file digests still match.
+            manifest.put("secondary_index_coverage", secondary ? "primary_only" : "all_source_definitions");
+            Files.writeString(path, gson.toJson(manifest));
+            assertThrows(IOException.class, () -> ReplayInput.check(directory, primary));
+        }
+    }
+}

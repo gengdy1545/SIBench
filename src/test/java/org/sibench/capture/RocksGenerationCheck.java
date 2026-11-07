@@ -29,10 +29,11 @@ public class RocksGenerationCheck {
         var result = Generation.run(root, config).get(0);
         assertEquals(1000L, result.get("baseline_rows")); assertEquals(1000L, result.get("baseline_operations"));
         assertEquals(0L, result.get("aborted_transactions"));
+        assertEquals("primary_only", result.get("secondary_index_coverage"));
         Path trace = run.resolve("generated/trace");
         assertFalse(Files.exists(trace.resolve("INCOMPLETE")));
-        org.sibench.replay.ReferenceReplay.run(trace, new org.sibench.replay.ReplayConfig(true, 0, 0, 0, 0, "operation"), run.resolve("reference.json"));
-        var replay = new org.sibench.replay.ReplayConfig(true, 0, 0, 0, 0, "operation", 2, 64, 10);
+        org.sibench.replay.ReferenceReplay.run(trace, new org.sibench.replay.ReplayConfig(false, 0, 0, 0, 0, "operation"), run.resolve("reference.json"));
+        var replay = new org.sibench.replay.ReplayConfig(false, 0, 0, 0, 0, "operation", 2, 64, 10);
         var service = new org.sibench.adapters.ServiceConfig("rocksdb", null, run.resolve("index"), 0,
                 org.sibench.adapters.proto.ValueKind.ROW_ID, null, false);
         assertEquals("passed", org.sibench.adapters.ServiceReplay.run(trace, replay, service, run.resolve("replay.json")).get("status"));

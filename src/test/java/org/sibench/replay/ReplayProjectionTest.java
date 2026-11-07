@@ -15,6 +15,23 @@ import java.util.List;
 
 public class ReplayProjectionTest {
     @Test
+    public void supplyBudgetCountsAQueryGroupOnce() throws Exception {
+        var operations = new ArrayList<Operation>();
+        for (int i = 0; i < 2; i++) operations.add(IndexOperationTrace.search(1, 1, 0,
+                Range.equal(IndexKey.ofInt(i + 1)), null, 0, 0,
+                IndexOperationTrace.UNION_GROUP, i, 2).withWorkUnitId(1));
+        IndexOperationTrace.Source source = consumer -> {
+            for (var operation : operations) consumer.accept(operation);
+            return operations.size();
+        };
+        var report = ReplayInput.checkStream(source, new ReplayConfig(false, 1, 1, 0, 0), true);
+        assertEquals(2L, report.get("dispatched_operations"));
+        assertEquals(1L, report.get("effective_requests"));
+        assertThrows(IOException.class,
+                () -> ReplayInput.checkStream(source, new ReplayConfig(false, 1, 2, 0, 0), true));
+    }
+
+    @Test
     public void preflightAcceptsAndCountsAbortedOperations() throws Exception {
         var operations = List.of(
                 IndexOperationTrace.transaction(1, IndexOperationTrace.TRANSACTION_BEGIN, 10, 1, 0),
@@ -272,12 +289,12 @@ public class ReplayProjectionTest {
                         mutation(3, 1, 2, 10, 1, 3),
                         mutation(3, 1, 1, 10, 2, 3))) {
             List<Operation> received = new ArrayList<>();
-            var replay = new ReplayProjection(ReplayConfig.defaults(), true, received::add);
+            var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0), true, received::add);
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
             assertThrows(IOException.class, () -> replay.accept(invalid));
             assertTrue(received.isEmpty());
         }
-        var replay = new ReplayProjection(ReplayConfig.defaults(), true, operation -> fail());
+        var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0), true, operation -> fail());
         replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
         replay.accept(mutation(3, 1, 1, 10, 1, 3));
         assertThrows(
@@ -296,7 +313,7 @@ public class ReplayProjectionTest {
                         local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 1),
                         local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 11, 1),
                         local(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 2))) {
-            var replay = new ReplayProjection(ReplayConfig.defaults(), true, operation -> fail());
+            var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0), true, operation -> fail());
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
             replay.accept(mutation(3, 1, 1, 10, 1, 3));
             assertThrows(IOException.class, () -> replay.accept(invalid));
@@ -366,7 +383,7 @@ public class ReplayProjectionTest {
                         IndexOperationTrace.transaction(10, 7, 10, 2, 1),
                         IndexOperationTrace.transaction(10, 7, 10, 1, 0),
                         IndexOperationTrace.transaction(11, 6, 11, 2, 0))) {
-            var replay = new ReplayProjection(ReplayConfig.defaults(), true, operation -> fail());
+            var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0), true, operation -> fail());
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
             replay.accept(mutation(3, 1, 1, 10, 1, 3));
             assertThrows(IOException.class, () -> replay.accept(invalid));
@@ -375,7 +392,7 @@ public class ReplayProjectionTest {
                 List.of(
                         IndexOperationTrace.transaction(11, 6, 11, 1, 0),
                         IndexOperationTrace.transaction(9, 6, 9, 2, 0))) {
-            var replay = new ReplayProjection(ReplayConfig.defaults(), true, operation -> fail());
+            var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0), true, operation -> fail());
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
             replay.accept(IndexOperationTrace.transaction(10, 7, 10, 1, 0));
             assertThrows(IOException.class, () -> replay.accept(invalid));

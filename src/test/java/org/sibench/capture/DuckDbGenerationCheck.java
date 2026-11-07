@@ -1,5 +1,6 @@
 package org.sibench.capture;
 
+import org.sibench.config.Digests;
 import static org.junit.Assert.*;
 import static org.sibench.config.ConfigValues.*;
 import java.nio.file.Files;
@@ -68,11 +69,13 @@ public class DuckDbGenerationCheck {
         assertEquals(2,com.google.gson.JsonParser.parseString(stdout.toString()).getAsJsonArray().size());
         Path relocated=Files.createDirectory(output.resolve("relocated"));
         Files.writeString(output.resolve("relocation.json"),"{\"rule\":\"<benchmark>/trace moved to relocated/<benchmark> after publication\"}\n");
-        var replay=new ReplayConfig(true,0,0,0,0,"operation",2,64,10);
+        var replay=new ReplayConfig(false,0,0,0,0,"operation",2,64,10);
         for(String benchmark:List.of("sysbench","hybench")) {
             Path directory=output.resolve(benchmark);Path trace=Files.move(directory.resolve("trace"),relocated.resolve(benchmark));
             var manifest=TraceManifest.read(trace);assertEquals(benchmark.equals("sysbench")?1024:8706,manifest.get("baseline_rows").getAsInt());
-            assertEquals(FileDigests.sha256(directory.resolve("source-diagnostics.json")),
+            assertEquals("primary_only",manifest.get("secondary_index_coverage").getAsString());
+            assertEquals(manifest.get("baseline_rows"),manifest.get("baseline_operations"));
+            assertEquals(Digests.sha256(directory.resolve("source-diagnostics.json")),
                     manifest.getAsJsonObject("source_evidence").get("source_diagnostics_sha256").getAsString());
             try(var data=TraceManifest.openData(trace)){assertTrue(data.snapshotRow(1,1,0).isPresent());}
             var service=new ServiceConfig("rocksdb",null,directory.resolve("index"),0,ValueKind.ROW_ID,null,false);

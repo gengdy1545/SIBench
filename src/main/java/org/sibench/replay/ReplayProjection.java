@@ -19,7 +19,8 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     private final List<Pending> pending = new ArrayList<>();
     private org.sibench.adapters.proto.Request storedRequest;
     private final Map<String, Long> kinds = new LinkedHashMap<>();
-    private long source, dispatched, primary, secondary, filtered, transactions, abortedTransactions, controls, groups;
+    private long source, dispatched, effectiveRequests, primary, secondary, filtered, transactions, abortedTransactions, controls, groups;
+    private long searchGroups, localSearches;
     private long peakPending, peakSearchGroup, peakExpansion;
     private long activeTransaction, activeVersion, lastVersion, lastOrdinal, lastTransactionId;
     private long lastSourceEvent;
@@ -273,6 +274,11 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
 
     private void countDispatch(Operation operation) {
         dispatched++;
+        if (!operation.grouped() || operation.expansionPosition() == 0) {
+            effectiveRequests++;
+            if (operation.grouped()) searchGroups++;
+            if (operation.kind() == IndexOperationTrace.SEARCH && local(operation)) localSearches++;
+        }
         kinds.merge(IndexOperationTrace.kindName(operation.kind()), 1L, Long::sum);
     }
 
@@ -401,12 +407,19 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         return dispatched;
     }
 
+    public long effectiveRequests() {
+        return effectiveRequests;
+    }
+
     public Map<String, Object> describe() {
         Map<String, Object> report = new LinkedHashMap<>();
         report.put("source_operations", source);
         report.put("source_primary_operations", primary);
         report.put("source_secondary_operations", secondary);
         report.put("dispatched_operations", dispatched);
+        report.put("effective_requests", effectiveRequests);
+        report.put("search_groups", searchGroups);
+        report.put("transaction_local_searches", localSearches);
         report.put("filtered_secondary_operations", filtered);
         report.put("committed_transactions", transactions);
         report.put("aborted_transactions", abortedTransactions);

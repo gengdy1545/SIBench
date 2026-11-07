@@ -24,9 +24,6 @@ public final class Sibench {
     private static void printServiceHelp(PrintStream out) {
         out.println("       java -jar build/sibench/sibench.jar generate [--root PATH] CONFIG");
         out.println(
-                "       java -jar build/sibench/sibench.jar plan-write-ratio PROFILE CALIBRATION_TRACE"
-                        + " RATIO   (native parameters for committed row writes = RATIO x baseline)");
-        out.println(
                 "       java -jar build/sibench/sibench.jar plan-operations PROFILE CALIBRATION_TRACE"
                         + " REPLAY_CONFIG   (native parameters for the replay configuration's operation budget)");
         out.println(
@@ -65,7 +62,6 @@ public final class Sibench {
                             "index-server",
                             "replay-service",
                             "verify-service",
-                            "plan-write-ratio",
                             "plan-operations",
                             "analyze-locality")
                     .contains(args[0])) {
@@ -99,19 +95,6 @@ public final class Sibench {
                 return 0;
             }
             root = root.toRealPath();
-            if (args[0].equals("plan-write-ratio")) {
-                if (profiles.size() != 3)
-                    throw new IllegalArgumentException(
-                            "plan-write-ratio requires PROFILE CALIBRATION_TRACE RATIO");
-                var plan =
-                        org.sibench.capture.CapturePlan.writeRatio(
-                                root,
-                                Path.of(profiles.get(0)),
-                                root.resolve(profiles.get(1)),
-                                Double.parseDouble(profiles.get(2)));
-                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(plan));
-                return 0;
-            }
             if (args[0].equals("plan-operations")) {
                 if (profiles.size() != 3)
                     throw new IllegalArgumentException(

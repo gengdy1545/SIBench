@@ -33,5 +33,7 @@ native:
       operationcount: 1475599
       properties:
         readallfields: false
+trace:
+  secondary_indexes: false
 artifacts:
   directory: results/capture/ycsb
