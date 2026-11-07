@@ -35,6 +35,34 @@ public class ScaleInspectorTest {
         }
     }
 
+    @Test public void hybenchOverridesDriveBothLoaderResourceAndExpectedCounts() throws Exception {
+        var config=parse(Files.readString(ROOT.resolve("config/benchmark/hybench.yaml")));
+        var parameters=object(config,"native");parameters.put("sf","1x");
+        parameters.put("parameters",java.util.Map.of("customer_number",300,"company_number",2,"transfer_number",6000,
+                "checking_number",600,"loanapps_number",600,"loantrans_number",600));
+        config.put("native",parameters);
+        var values=HybenchParameters.read(ROOT.resolve("benchmark/HyBench-2024"),parameters);
+        var rows=ScaleInspector.nativeRows(ROOT,config);
+        assertEquals(java.util.Map.of("customer",300L,"company",2L,"savingaccount",302L,"checkingaccount",302L,
+                "transfer",6000L,"checking",600L,"loanapps",600L,"loantrans",600L),rows);
+        assertEquals(8706L,rows.values().stream().mapToLong(Long::longValue).sum());
+        String text=new com.moandjiezana.toml.TomlWriter().write(java.util.Map.of("1x",values));
+        var loaded=new com.moandjiezana.toml.Toml().read(text).getTable("1x");
+        assertEquals(Long.valueOf(300),loaded.getLong("customer_number"));
+        assertEquals(Long.valueOf(6000),loaded.getLong("transfer_number"));
+        assertEquals("customer.csv",loaded.getString("customer_datapath"));
+        assertEquals(Double.valueOf(0.8),loaded.getDouble("cust_rate"));
+        assertEquals(Long.valueOf(100),loaded.getLong("company_size_upper"));
+        assertEquals(values,loaded.toMap());
+        for(var invalid:java.util.List.of(java.util.Map.of("customer_number",0),java.util.Map.of("customer_number",1.5),
+                java.util.Map.of("customer_datapath","elsewhere"),java.util.Map.of("unknown",1))) {
+            parameters.put("parameters",invalid);
+            assertThrows(IllegalArgumentException.class,()->HybenchParameters.read(ROOT.resolve("benchmark/HyBench-2024"),parameters));
+        }
+        parameters.remove("parameters");parameters.put("sf","999x");
+        assertThrows(IllegalArgumentException.class,()->HybenchParameters.read(ROOT.resolve("benchmark/HyBench-2024"),parameters));
+    }
+
     @Test
     public void rejectsUnsupportedPurposeAndVersion() throws Exception {
         String source = ycsb();

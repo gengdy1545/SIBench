@@ -5,8 +5,9 @@ source:
   path: benchmark/HyBench-2024
   commit: eaad91b52956fddd3d48ce49f792928056b7b360
 native:
+  timeout_minutes: 720
+  build_directory: build/benchmarks/HyBench-2024
   sf: 10x
-  work_dir: results/capture/hybench/native
   clients: 32
   ap_clients: 1
   xp_transaction_clients: 32
@@ -15,27 +16,5 @@ native:
   phase_duration_minutes:
     tp: 5
     xp: 5
-postgres:
-  schema: public
-  version: '14.24'
-  port: 55433
-  database: sibench_hybench_capture
-  user: postgres
-  isolation: read_committed
-  max_parallel_workers_per_gather: 0
-capture:
-  output: proto
-  mode: instrumented_native_execution
-  application_prefix: 'sibench:'
-  raw_directory: results/capture/hybench/raw
-  allow_event_loss: false
-data_layout:
-  target_file_size_bytes: 536870912
-  file_size_max_overshoot_percent: 5
-  row_group_max_rows: 1048576
-  row_group_buffer_bytes: 67108864
-  page_size_bytes: 1048576
-  compression: zstd
-  compression_level: 3
 artifacts:
   directory: results/capture/hybench

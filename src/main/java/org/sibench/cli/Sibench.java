@@ -2,29 +2,17 @@ package org.sibench.cli;
 
 import org.sibench.replay.ReplayInput;
 import com.google.gson.GsonBuilder;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 
-import org.sibench.capture.AccessLedger;
-import org.sibench.capture.CaptureCompleteness;
-import org.sibench.capture.CaptureProfile;
-import org.sibench.capture.LedgerComparison;
-import org.sibench.capture.RowStateAudit;
 import org.sibench.capture.RunTiming;
-import org.sibench.config.ConfigValues;
 import org.sibench.adapters.IndexServer;
 import org.sibench.adapters.ServiceConfig;
 import org.sibench.adapters.ServiceReplay;
 import org.sibench.replay.ReplayConfig;
-import org.sibench.schema.PgSchemaCheck;
-import org.sibench.schema.SourceSchema;
 import org.sibench.workloads.ScaleInspector;
 
-import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -34,7 +22,7 @@ public final class Sibench {
     private Sibench() {}
 
     private static void printServiceHelp(PrintStream out) {
-        out.println("       java -jar build/sibench/sibench.jar postgres-config CONFIG OUTPUT");
+        out.println("       java -jar build/sibench/sibench.jar generate [--root PATH] CONFIG");
         out.println(
                 "       java -jar build/sibench/sibench.jar plan-write-ratio PROFILE CALIBRATION_TRACE"
                         + " RATIO   (native parameters for committed row writes = RATIO x baseline)");
@@ -72,15 +60,8 @@ public final class Sibench {
         try {
             if (!List.of(
                             "inspect-scale",
-                            "postgres-config",
+                            "generate",
                             "check-replay",
-                            "check-schema",
-                            "audit-rows",
-                            "audit-baseline",
-                            "access-ledger",
-                            "compare-ledgers",
-                            "snapshot-index-counters",
-                            "check-capture-completeness",
                             "index-server",
                             "replay-service",
                             "verify-service",
@@ -92,23 +73,10 @@ public final class Sibench {
             }
             Path root = Path.of("").toAbsolutePath();
             List<String> profiles = new ArrayList<>();
-            String jdbc = null, user = null;
             for (int i = 1; i < args.length; i++) {
                 if (args[i].equals("--help") || args[i].equals("-h")) {
                     printHelp(out);
                     return 0;
-                } else if (List.of("check-schema", "audit-rows", "audit-baseline", "snapshot-index-counters")
-                                .contains(args[0])
-                        && args[i].equals("--jdbc")) {
-                    if (++i == args.length)
-                        throw new IllegalArgumentException("--jdbc requires a URL");
-                    jdbc = args[i];
-                } else if (List.of("check-schema", "audit-rows", "audit-baseline", "snapshot-index-counters")
-                                .contains(args[0])
-                        && args[i].equals("--user")) {
-                    if (++i == args.length)
-                        throw new IllegalArgumentException("--user requires a role");
-                    user = args[i];
                 } else if (args[i].equals("--root")) {
                     if (++i == args.length) {
                         throw new IllegalArgumentException("--root requires a path");
@@ -124,133 +92,13 @@ public final class Sibench {
                     profiles.add(args[i]);
                 }
             }
+            if (args[0].equals("generate")) {
+                if (profiles.size() != 1) throw new IllegalArgumentException("generate requires one runtime CONFIG");
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(
+                        org.sibench.capture.Generation.run(root,Path.of(profiles.get(0)))));
+                return 0;
+            }
             root = root.toRealPath();
-            if (args[0].equals("audit-baseline")) {
-                if (profiles.size() != 2 || jdbc == null || user == null || !jdbc.startsWith("jdbc:postgresql:"))
-                    throw new IllegalArgumentException("audit-baseline requires PROFILE BASELINE --jdbc URL --user ROLE");
-                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
-                org.sibench.capture.PgBaselineVerify.verify(jdbc, user, SourceSchema.read(root, document), root.resolve(profiles.get(1)));
-                out.println(Files.readString(root.resolve(profiles.get(1)).resolve("verified-manifest.json")));
-                return 0;
-            }
-            if (args[0].equals("audit-rows")) {
-                if ((profiles.size() != 3 && profiles.size() != 4) || jdbc == null || user == null)
-                    throw new IllegalArgumentException(
-                            "audit-rows requires PROFILE BASELINE RAW [REPORT] --jdbc URL --user"
-                                + " ROLE");
-                if (!jdbc.startsWith("jdbc:postgresql:"))
-                    throw new IllegalArgumentException("audit-rows requires a PostgreSQL JDBC URL");
-                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
-                Path raw = root.resolve(profiles.get(2));
-                var report =
-                        RowStateAudit.audit(
-                                jdbc,
-                                user,
-                                SourceSchema.read(root, document),
-                                root.resolve(profiles.get(1)),
-                                raw,
-                                profiles.size() == 4
-                                        ? root.resolve(profiles.get(3))
-                                        : RowStateAudit.defaultReport(raw));
-                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(report));
-                return 0;
-            }
-            if (args[0].equals("access-ledger")) {
-                if (profiles.size() != 2 && profiles.size() != 3)
-                    throw new IllegalArgumentException("access-ledger requires PROFILE RAW [REPORT]");
-                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
-                Path raw = root.resolve(profiles.get(1));
-                var report =
-                        AccessLedger.audit(
-                                SourceSchema.read(root, document),
-                                raw,
-                                profiles.size() == 3
-                                        ? root.resolve(profiles.get(2))
-                                        : AccessLedger.defaultReport(raw));
-                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(report));
-                return 0;
-            }
-            if (args[0].equals("compare-ledgers")) {
-                if (profiles.size() != 2 && profiles.size() != 3)
-                    throw new IllegalArgumentException(
-                            "compare-ledgers requires REPORT_A REPORT_B [OUTPUT]");
-                var report =
-                        LedgerComparison.compare(
-                                json(root.resolve(profiles.get(0))),
-                                json(root.resolve(profiles.get(1))));
-                if (profiles.size() == 2) {
-                    out.println(new GsonBuilder().setPrettyPrinting().create().toJson(report));
-                    return 0;
-                }
-                Path output = root.resolve(profiles.get(2));
-                if (Files.exists(output))
-                    throw new IOException("Ledger comparison already exists: " + output);
-                Files.writeString(
-                        output,
-                        new GsonBuilder().setPrettyPrinting().create().toJson(report),
-                        StandardOpenOption.CREATE_NEW);
-                return 0;
-            }
-            if (args[0].equals("snapshot-index-counters")) {
-                if (profiles.size() != 2 || jdbc == null || user == null)
-                    throw new IllegalArgumentException(
-                            "snapshot-index-counters requires PROFILE OUTPUT --jdbc URL --user"
-                                + " ROLE");
-                if (!jdbc.startsWith("jdbc:postgresql:"))
-                    throw new IllegalArgumentException(
-                            "snapshot-index-counters requires a PostgreSQL JDBC URL");
-                if (!Files.exists(root.resolve(profiles.get(0))))
-                    throw new IOException("Unknown capture profile: " + profiles.get(0));
-                var report =
-                        CaptureCompleteness.snapshot(
-                                jdbc, user, root.resolve(profiles.get(1)), profiles.get(0));
-                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(report));
-                return 0;
-            }
-            if (args[0].equals("check-capture-completeness")) {
-                if (profiles.size() != 4)
-                    throw new IllegalArgumentException(
-                            "check-capture-completeness requires PROFILE LEDGER BEFORE AFTER");
-                if (!Files.exists(root.resolve(profiles.get(0))))
-                    throw new IOException("Unknown capture profile: " + profiles.get(0));
-                var report =
-                        CaptureCompleteness.compare(
-                                json(root.resolve(profiles.get(1))),
-                                json(root.resolve(profiles.get(2))),
-                                json(root.resolve(profiles.get(3))));
-                out.println(
-                        new GsonBuilder()
-                                .serializeNulls()
-                                .setPrettyPrinting()
-                                .disableHtmlEscaping()
-                                .create()
-                                .toJson(report));
-                if (!"consistent".equals(report.get("status"))) {
-                    err.println(
-                            "Index counters disagree with the access ledger: "
-                                    + report.get("inconsistent_indexes"));
-                    return 1;
-                }
-                return 0;
-            }
-            if (args[0].equals("check-schema")) {
-                if (profiles.size() != 1 || jdbc == null || user == null)
-                    throw new IllegalArgumentException(
-                            "check-schema requires PROFILE --jdbc URL --user ROLE");
-                if (!jdbc.startsWith("jdbc:postgresql:"))
-                    throw new IllegalArgumentException(
-                            "check-schema requires a PostgreSQL JDBC URL");
-                var document = ConfigValues.parse(Files.readString(root.resolve(profiles.get(0))));
-                try {
-                    out.println(
-                            PgSchemaCheck.json(PgSchemaCheck.check(root, document, jdbc, user)));
-                    return 0;
-                } catch (PgSchemaCheck.Mismatch mismatch) {
-                    out.println(PgSchemaCheck.json(mismatch.report()));
-                    err.println(mismatch.getMessage());
-                    return 1;
-                }
-            }
             if (args[0].equals("plan-write-ratio")) {
                 if (profiles.size() != 3)
                     throw new IllegalArgumentException(
@@ -272,14 +120,6 @@ public final class Sibench {
                         org.sibench.capture.CapturePlan.operations(
                                 root, Path.of(profiles.get(0)), root.resolve(profiles.get(1)), Path.of(profiles.get(2)));
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(plan));
-                return 0;
-            }
-            if (args[0].equals("postgres-config")) {
-                if (profiles.size() != 2)
-                    throw new IllegalArgumentException("postgres-config requires CONFIG OUTPUT");
-                org.sibench.config.SibenchConfig.writePostgres(
-                        root.resolve(profiles.get(0)), root.resolve(profiles.get(1)));
-                out.println("PostgreSQL config written: " + profiles.get(1));
                 return 0;
             }
             if (args[0].equals("index-server")) {
@@ -375,10 +215,6 @@ public final class Sibench {
         }
     }
 
-    private static JsonObject json(Path path) throws IOException {
-        return JsonParser.parseString(Files.readString(path)).getAsJsonObject();
-    }
-
     private static void printHelp(PrintStream out) {
         printServiceHelp(out);
         out.println(
@@ -389,44 +225,6 @@ public final class Sibench {
                 "Every command accepts --timing FILE: its phase wall clock, event count and the"
                     + " facts noted by the command are appended to that one file, so a whole run"
                     + " leaves a single timing artifact.");
-        out.println(
-                "       java -jar build/sibench/sibench.jar check-schema [--root PATH]"
-                        + " PROFILE --jdbc URL --user ROLE");
-        out.println(
-                "       java -jar build/sibench/sibench.jar audit-rows [--root PATH]"
-                        + " PROFILE BASELINE RAW [REPORT] --jdbc URL --user ROLE");
-        out.println(
-                "audit-rows verifies source row state once; unchanged inputs reuse the report.");
-        out.println(
-                "       java -jar build/sibench/sibench.jar access-ledger [--root PATH]"
-                        + " PROFILE RAW [REPORT]");
-        out.println(
-                "access-ledger partitions raw PG index events into access units; it never touches PG.");
-        out.println(
-                "       java -jar build/sibench/sibench.jar compare-ledgers [--root PATH]"
-                        + " REPORT_A REPORT_B [OUTPUT]");
-        out.println(
-                "compare-ledgers aligns two access-ledger reports by query_id and reports plan and"
-                    + " access-path drift.");
-        out.println(
-                "       java -jar build/sibench/sibench.jar snapshot-index-counters [--root PATH]"
-                        + " PROFILE OUTPUT --jdbc URL --user ROLE");
-        out.println(
-                "snapshot-index-counters waits for other sessions to leave and the counters to"
-                    + " settle before reading them.");
-        out.println(
-                "       java -jar build/sibench/sibench.jar check-capture-completeness [--root PATH]"
-                        + " PROFILE LEDGER BEFORE AFTER");
-        out.println(
-                "check-capture-completeness cross-checks a ledger against the PG index counter"
-                    + " deltas of two snapshots; it never touches PG and exits 1 when they disagree.");
-        out.println("       java -jar build/sibench/sibench.jar audit-baseline [--root PATH]"
-                + " PROFILE BASELINE --jdbc URL --user ROLE");
-        out.println("audit-baseline independently compares Parquet values with the unchanged initial PostgreSQL database.");
-
-        out.println(
-                "check-schema reads the live PG catalog; it never creates or repairs"
-                        + " tables/indexes.");
         out.println(
                 "       java -jar build/sibench/sibench.jar check-replay [--root PATH]"
                         + " REPLAY_CONFIG TRACE_DIRECTORY");

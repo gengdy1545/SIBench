@@ -3,7 +3,6 @@ package org.sibench.analysis;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
 
-import org.sibench.capture.BaselineOperations;
 import org.sibench.capture.IndexCatalog;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
@@ -39,7 +38,7 @@ import java.util.zip.GZIPOutputStream;
  * <p>Business row modifications and index maintenance are counted separately. A business row
  * change counts once, at its primary maintenance record; secondary entries are index maintenance.
  * Windows contain a fixed number of business changes, so one source change's expansion is never
- * split. The analysis only reads existing Trace / Baseline products and never captures PG.
+ * split. The analysis only reads existing Trace / Baseline products and never runs source capture.
  */
 public final class UpdateLocality {
     public record Config(
@@ -170,7 +169,7 @@ public final class UpdateLocality {
         RunTiming.current().phase("locality-layout");
         var builders = new TreeMap<Long, LayoutBuilder>();
         try (var sort = new ExternalSort(sortDirectory, config.sortBytes())) {
-            BaselineOperations.of(trace)
+            org.sibench.capture.ProtoTrace.source(trace, TraceManifest.read(trace), "baseline")
                     .read(
                             operation -> {
                                 if (operation.kind() != IndexOperationTrace.INSERT
@@ -251,7 +250,7 @@ public final class UpdateLocality {
                         layouts,
                         baselineRows,
                         config,
-                        org.sibench.capture.ProtoTrace.source(trace, manifest, "workload"),
+                        committed(org.sibench.capture.ProtoTrace.source(trace, manifest, "workload")),
                         output);
         long encoded = ((Number) report.get("encoded_records")).longValue();
         long expected = manifest.get("workload_operations").getAsLong();
@@ -284,6 +283,29 @@ public final class UpdateLocality {
         return report;
     }
 
+    /** Resolve one transaction at a time; aborted attempts do not affect committed-write locality. */
+    static IndexOperationTrace.Source committed(IndexOperationTrace.Source source) {
+        return consumer -> {
+            var pending = new ArrayList<Operation>();
+            try (var validation = new org.sibench.replay.ReplayProjection(
+                    new org.sibench.replay.ReplayConfig(true, 0, 0, 0, 0, "operation"), true, ignored -> {})) {
+                long records = source.read(operation -> {
+                    validation.accept(operation);
+                    if (IndexOperationTrace.isMutation(operation)) pending.add(operation);
+                    else {
+                        if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT)
+                            for (var write : pending) consumer.accept(write);
+                        if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT
+                                || operation.kind() == IndexOperationTrace.TRANSACTION_ABORT) pending.clear();
+                        consumer.accept(operation);
+                    }
+                });
+                validation.finish();
+                return records;
+            }
+        };
+    }
+
     static Map<String, Object> analyzeSource(
             List<IndexCatalog.Definition> definitions,
             Map<Long, IndexLayout> layouts,
@@ -293,15 +315,10 @@ public final class UpdateLocality {
             Path output)
             throws IOException {
         var windows = new WindowWriter(output, definitions, layouts, config, baselineRows);
-        long[] encoded = {0};
-        workload.read(
-                operation -> {
-                    encoded[0]++;
-                    windows.accept(operation);
-                });
+        long encoded = workload.read(windows::accept);
         windows.finish();
         var report = new LinkedHashMap<String, Object>();
-        report.put("encoded_records", encoded[0]);
+        report.put("encoded_records", encoded);
         Map<String, Object> business = windows.businessByKind(), secondary = windows.secondaryByKind();
         report.put("business_changes", business);
         report.put("secondary_index_maintenance_operations", secondary);

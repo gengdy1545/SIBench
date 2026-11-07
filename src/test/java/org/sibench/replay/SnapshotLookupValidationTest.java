@@ -35,6 +35,39 @@ public class SnapshotLookupValidationTest {
     }
 
     @Test
+    public void nativeBeforeImagesReconstructRepeatedUpdatesAndReinsertWithoutTraceWrites() throws Exception {
+        var source = org.sibench.schema.SourceSchema.of("sysbench", java.nio.file.Path.of("benchmark/sysbench"), Map.of("tables", 1));
+        var definitions = org.sibench.capture.IndexCatalog.duckDbDefinitions(source);
+        var catalog = org.sibench.capture.IndexCatalog.fromManifest(new com.google.gson.Gson().toJsonTree(
+                org.sibench.capture.IndexCatalog.provenance(source, definitions)).getAsJsonObject());
+        try (var database = java.sql.DriverManager.getConnection("jdbc:duckdb:"); var sql = database.createStatement()) {
+            sql.execute("CREATE SCHEMA sibench_history");
+            sql.execute("CREATE TABLE sibench_history.tables AS SELECT 1 table_id,'main' schema_name,'sbtest1' table_name,'id' primary_key");
+            sql.execute("CREATE TABLE sibench_history.commits(transaction_id BIGINT,commit_version BIGINT)");
+            sql.execute("INSERT INTO sibench_history.commits VALUES(10,1),(30,3),(40,4)");
+            sql.execute("CREATE TABLE sbtest1(id INTEGER,k INTEGER)");
+            sql.execute("INSERT INTO sbtest1 VALUES(1,31),(2,20)");
+            sql.execute("CREATE TABLE sibench_history.identities_1(_sib_row_id BIGINT,id INTEGER,_sib_tx BIGINT,_sib_query BIGINT)");
+            sql.execute("INSERT INTO sibench_history.identities_1 VALUES(1,1,0,0),(2,2,0,0),(3,1,30,31),(4,3,40,40)");
+            sql.execute("CREATE TABLE sibench_history.rows_1(id INTEGER,k INTEGER,_sib_tx BIGINT,_sib_query BIGINT,_sib_kind VARCHAR)");
+            sql.execute("INSERT INTO sibench_history.rows_1 VALUES(1,10,10,11,'U'),(1,11,10,12,'U'),"
+                    + "(1,12,30,30,'D'),(1,NULL,30,31,'I'),(1,30,30,32,'U'),(3,NULL,40,40,'I'),(3,40,40,41,'D')");
+            var histories = SnapshotLookupValidation.nativeHistories(database, catalog).get(1);
+            var changed = histories.get(key(1));
+            assertEquals(new Row(0, 1, 0, 0, Map.of(1, key(10))), changed.at(0));
+            assertEquals(new Row(1, 1, 0, 0, Map.of(1, key(12))), changed.at(1));
+            assertEquals(changed.at(1), changed.at(2)); // An Abort slot changes no committed rows.
+            assertEquals(new Row(3, 3, 0, 0, Map.of(1, key(31))), changed.at(3));
+            assertEquals(changed.at(3), changed.at(4));
+            assertEquals(new Row(0, 2, 0, 0, Map.of(1, key(20))), histories.get(key(2)).at(4));
+            org.junit.Assert.assertNull(histories.get(key(3)).at(0));
+            org.junit.Assert.assertNull(histories.get(key(3)).at(4)); // Insert/delete in one commit.
+            sql.execute("DELETE FROM sibench_history.identities_1 WHERE _sib_row_id=3");
+            org.junit.Assert.assertThrows(IOException.class, () -> SnapshotLookupValidation.nativeHistories(database, catalog));
+        }
+    }
+
+    @Test
     public void spreadKeepsBothEndsAndSpacesTheRestEvenly() {
         var sorted = keys(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
         assertEquals(keys(0, 5, 10), SnapshotLookupValidation.spread(sorted, 3));

@@ -18,22 +18,63 @@ public class CapturePlanTest {
     public void scalesEachSourcesOwnKnobs() throws Exception {
         var root = temporary.getRoot().toPath();
         var trace = Files.createDirectory(root.resolve("trace"));
-        Files.writeString(trace.resolve("manifest.json"), "{\"baseline_rows\":1000000,\"logical_row_version_writes\":10000}");
+        var manifest = calibration(trace, false);
         Files.writeString(root.resolve("sysbench.yaml"),
                 "benchmark: sysbench\nnative:\n  workloads:\n    oltp_insert: {events: 100}\n    oltp_point_select: {events: 300}\n");
-        var plan = CapturePlan.writeRatio(root, root.relativize(root.resolve("sysbench.yaml")), trace, 0.05);
+        var plan = CapturePlan.writeRatio(root, root.relativize(root.resolve("sysbench.yaml")), trace, 0.10);
         assertEquals(5.0, (Double) plan.get("factor"), 1e-9);
         assertEquals(Map.of("native.workloads.oltp_insert.events", 500L, "native.workloads.oltp_point_select.events", 1500L),
                 plan.get("parameters"));
         Files.writeString(root.resolve("hybench.yaml"),
                 "benchmark: hybench\nnative:\n  duration_minutes: 1\n  phase_duration_minutes: {tp: 2}\n");
-        var hybench = CapturePlan.writeRatio(root, root.relativize(root.resolve("hybench.yaml")), trace, 0.02);
+        var hybench = CapturePlan.writeRatio(root, root.relativize(root.resolve("hybench.yaml")), trace, 0.04);
         // TP keeps its own duration, XP the default; both scale by the same factor of 2.
         assertEquals(Map.of("native.phase_duration_minutes.tp", 4L, "native.phase_duration_minutes.xp", 2L),
                 hybench.get("parameters"));
-        Files.writeString(trace.resolve("manifest.json"), "{\"baseline_rows\":1000000,\"logical_row_version_writes\":0}");
+        var aborted = Files.createDirectory(root.resolve("aborted"));
+        calibration(aborted, true);
         assertThrows(java.io.IOException.class,
-                () -> CapturePlan.writeRatio(root, root.relativize(root.resolve("sysbench.yaml")), trace, 0.05));
+                () -> CapturePlan.writeRatio(root, Path.of("sysbench.yaml"), aborted, 0.10));
+        assertEquals(2L, plan.get("calibration_row_writes"));
+        manifest.put("workload_operations", 999L);
+        Files.writeString(trace.resolve("manifest.json"), new com.google.gson.Gson().toJson(manifest));
+        assertThrows(java.io.IOException.class,
+                () -> CapturePlan.writeRatio(root, Path.of("sysbench.yaml"), trace, 0.10));
+    }
+
+    private static Map<String, Object> calibration(Path directory, boolean abortAll) throws Exception {
+        var writer = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"));
+        try (writer) {
+            for (long version = 1; version <= 2; version++) {
+                writer.accept(IndexOperationTrace.transaction(version, IndexOperationTrace.TRANSACTION_BEGIN, version, version, 0));
+                for (long ordinal = 1; ordinal <= version + 1; ordinal++) {
+                    int kind = ordinal == 1 ? IndexOperationTrace.UPSERT : IndexOperationTrace.LOGICAL_DELETE;
+                    var operation = IndexOperationTrace.write(version, kind, 1, 0,
+                            org.sibench.trace.IndexKey.ofInt(ordinal), version, 0, 0, ordinal)
+                            .withTransaction(version, ordinal).withWorkUnitId(version);
+                    var keys = Map.of(1, org.sibench.trace.IndexKey.ofInt(10));
+                    IndexMutation.emit(operation, kind == IndexOperationTrace.UPSERT ? Map.of() : keys,
+                            kind == IndexOperationTrace.UPSERT ? keys : Map.of(), writer);
+                }
+                writer.accept(IndexOperationTrace.transaction(version,
+                        abortAll || version == 2 ? IndexOperationTrace.TRANSACTION_ABORT : IndexOperationTrace.TRANSACTION_COMMIT,
+                        version, version, version + 1));
+            }
+        }
+        var manifest = new java.util.LinkedHashMap<String, Object>();
+        manifest.put("value_kinds", java.util.List.of("row_id"));
+        manifest.put("output", "proto");
+        manifest.put("baseline_rows", 100);
+        manifest.put("baseline_operations", 200);
+        manifest.put("baseline_trace_sha256", "0".repeat(64));
+        manifest.put("source_work_units", 2);
+        manifest.put("workload_operations", writer.count());
+        var files = new com.google.gson.JsonArray();
+        files.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("workload.pb.zst", writer)));
+        manifest.put("proto_files", Map.of("workload", files));
+        manifest.put("workload_trace_sha256", ProtoTrace.identity(files));
+        Files.writeString(directory.resolve("manifest.json"), new com.google.gson.Gson().toJson(manifest));
+        return manifest;
     }
 
     /** The replay budget is reached by scaling with the effective operations replay itself counts. */
@@ -49,6 +90,7 @@ public class CapturePlanTest {
             }
         }
         var manifest = new java.util.LinkedHashMap<String, Object>();
+        manifest.put("value_kinds", java.util.List.of("row_id", "locator"));
         manifest.put("baseline_rows", 0);
         manifest.put("source_work_units", 1);
         manifest.put("baseline_operations", 0);
@@ -61,17 +103,15 @@ public class CapturePlanTest {
                        );
         Files.writeString(root.resolve("sysbench.yaml"),
                 "benchmark: sysbench\nnative:\n  workloads:\n    oltp_point_select: {events: 100}\n");
-        for (String strategy : java.util.List.of("full", "proto")) {
-            manifest.put("output", strategy);
-            var files = new com.google.gson.JsonArray();
-            files.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("workload.pb.zst", protocol)));
-            manifest.put("proto_files", Map.of("workload", files));
-            manifest.put("workload_trace_sha256", ProtoTrace.identity(files));
-            Files.writeString(trace.resolve("manifest.json"), new com.google.gson.Gson().toJson(manifest));
-            var plan = CapturePlan.operations(root, Path.of("sysbench.yaml"), trace, Path.of("replay.yaml"));
-            assertEquals(1000L, plan.get("calibration_effective_operations"));
-            assertEquals(3000L, plan.get("target_effective_operations"));
-            assertEquals(Map.of("native.workloads.oltp_point_select.events", 300L), plan.get("parameters"));
-        }
+        manifest.put("output", "proto");
+        var files = new com.google.gson.JsonArray();
+        files.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("workload.pb.zst", protocol)));
+        manifest.put("proto_files", Map.of("workload", files));
+        manifest.put("workload_trace_sha256", ProtoTrace.identity(files));
+        Files.writeString(trace.resolve("manifest.json"), new com.google.gson.Gson().toJson(manifest));
+        var plan = CapturePlan.operations(root, Path.of("sysbench.yaml"), trace, Path.of("replay.yaml"));
+        assertEquals(1000L, plan.get("calibration_effective_operations"));
+        assertEquals(3000L, plan.get("target_effective_operations"));
+        assertEquals(Map.of("native.workloads.oltp_point_select.events", 300L), plan.get("parameters"));
     }
 }

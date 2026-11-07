@@ -16,7 +16,7 @@ public class WorkUnitsTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     private static String unit(long id, long event) {
-        return ("{\"work_unit_id\":%d,\"application\":\"sibench:test\",\"pid\":1,\"request\":%d,"
+        return ("{\"work_unit_id\":%d,\"application\":\"sibench:test\",\"connection_id\":1,\"query_id\":%d,"
                         + "\"source_event\":%d}\n")
                 .formatted(id, id, event);
     }
@@ -59,16 +59,16 @@ public class WorkUnitsTest {
     @Test
     public void skippedMetadataStillContributesToTheDigestAndRequiredFactsStayChecked() throws Exception {
         Path directory = temporary.newFolder().toPath();
-        String line = "{\"metadata\":{\"nested\":[1,true,null,\"ignored\"]},\"pid\":7,\"application\":\"sibench:\\\"escaped\",\"source_event\":19,\"work_unit_id\":1}\n";
+        String line = "{\"metadata\":{\"nested\":[1,true,null,\"ignored\"]},\"connection_id\":7,\"query_id\":3,\"application\":\"sibench:\\\"escaped\",\"source_event\":19,\"work_unit_id\":1}\n";
         var output = WorkUnits.create(directory);
         output.lines().write(line); output.lines().close();
         var catalog = WorkUnits.read(directory);
         assertEquals(19, catalog.firstEvent(1));
         assertEquals(digest(List.of(line)), catalog.sha256());
         for (String wrong : List.of(
-                unit(1, 7).replace("\"pid\":1", "\"pid\":0"),
+                unit(1, 7).replace("\"connection_id\":1", "\"connection_id\":-1"),
                 unit(1, 7).replace("\"source_event\":7", "\"missing_event\":7"),
-                unit(1, 7).replace("sibench:test", ""),
+                unit(1, 7).replace("\"query_id\":1", "\"missing_query\":1"),
                 unit(1, 7).stripTrailing() + " {}\n",
                 unit(1, 7).replace("\"work_unit_id\":1", "\"work_unit_id\":1.5"))) {
             Path invalid = temporary.newFolder().toPath();

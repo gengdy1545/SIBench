@@ -34,6 +34,7 @@ public final class ServiceReplay {
             throws IOException {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
         var input = ReplayInput.prepare(directory, config);
+        org.sibench.trace.TraceManifest.requireValue(directory,service.value());
         var preflight = input.preflight();
         String mode = service.value() == ValueKind.ROW_ID ? "rowid" : "locator";
         String binding = ReplayInput.binding(directory, config) + " mode=" + mode;
@@ -160,6 +161,7 @@ public final class ServiceReplay {
             throws IOException {
         if (Files.exists(report)) throw new IOException("Verification report already exists: " + report);
         var input = ReplayInput.prepare(directory, config);
+        org.sibench.trace.TraceManifest.requireValue(directory,service.value());
         var preflight = input.preflight();
         String mode = service.value() == ValueKind.ROW_ID ? "rowid" : "locator";
         String binding = ReplayInput.binding(directory, config) + " mode=" + mode;
@@ -235,7 +237,7 @@ public final class ServiceReplay {
     }
 
     private static long lastCommit(Map<String, Object> preflight) {
-        return ((Number) ((Map<?, ?>) preflight.get("workload")).get("last_commit_version")).longValue();
+        return ((Number) ((Map<?, ?>) preflight.get("workload")).get("last_resolved_version")).longValue();
     }
 
     static void requireFlush(org.sibench.adapters.proto.FlushResponse response, String binding, long version)
@@ -305,6 +307,9 @@ public final class ServiceReplay {
                 || !description.getFlushMakesDurable())
             throw new IOException("Service must declare its write acknowledgement and Flush durability");
         JsonObject manifest = JsonParser.parseString(Files.readString(directory.resolve("manifest.json"))).getAsJsonObject();
+        if (!description.getTransactionAbort() && manifest.has("aborted_transactions")
+                && manifest.get("aborted_transactions").getAsLong() > 0)
+            throw new IOException("Trace has aborted transactions; the service does not implement Abort");
         if (!description.getSearchGroups() && manifest.has("searched_accesses_by_shape")) {
             var shapes = manifest.getAsJsonObject("searched_accesses_by_shape");
             if (shapes.has("intersection") || shapes.has("union"))

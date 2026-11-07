@@ -34,6 +34,11 @@ public interface ReplayTarget extends AutoCloseable {
         throw new IOException("Replay target does not support complete-commit markers");
     }
 
+    default SendHandle sendAbort(long dispatchSequence, long transactionId, long version)
+            throws IOException {
+        throw new IOException("Replay target does not support Abort");
+    }
+
     /** Sends whatever the client still holds back, such as a partial batch, before a drain. */
     default void flush() throws IOException {}
 
@@ -57,11 +62,20 @@ public interface ReplayTarget extends AutoCloseable {
 
     /** In-process references execute immediately; they do not claim network send semantics. */
     static Factory immediate(IndexOperationTrace.Consumer consumer) {
-        return clientId ->
-                (sequence, operation) -> {
+        return clientId -> new ReplayTarget() {
+                @Override
+                public SendHandle send(long sequence, Operation operation) throws IOException {
                     consumer.accept(operation);
                     return SendHandle.completed();
-                };
+                }
+
+                @Override
+                public SendHandle sendAbort(long sequence, long transactionId, long version) throws IOException {
+                    consumer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_ABORT,
+                            transactionId, version, 0));
+                    return SendHandle.completed();
+                }
+            };
     }
 
     @Override

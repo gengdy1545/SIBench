@@ -17,7 +17,7 @@ import java.util.*;
 import java.util.function.Supplier;
 
 /**
- * An ordered-key reference service, not a PG MVCC or storage engine. Each (table, index) holds
+ * An ordered-key reference for serial Trace replay. Each (table, index) holds
  * entries keyed by the concatenated encoded components (indexed value, PK), which sort as the
  * tuple: an immutable sorted baseline plus an overlay of per-key version histories.
  *
@@ -438,9 +438,11 @@ public final class IndexReferenceReplay implements AutoCloseable {
      */
     private static final class Overlay implements Closeable {
         final SpillingMap map;
+        final SpillingMap aborted;
 
-        Overlay(Workspace workspace, String name, int memoryEntries) throws IOException {
+        Overlay(Workspace workspace, String name, int memoryEntries, SpillingMap aborted) throws IOException {
             map = new SpillingMap(workspace.directory(name + "-over"), memoryEntries, 4);
+            this.aborted = aborted;
         }
 
         boolean empty() {
@@ -474,21 +476,28 @@ public final class IndexReferenceReplay implements AutoCloseable {
 
         /** The latest version of the entry, or null when it has no history. */
         StoredVersion latest(Composite entry) throws IOException {
+            return floor(entry, Long.MAX_VALUE);
+        }
+
+        StoredVersion floor(Composite entry, long timestamp) throws IOException {
             if (empty()) return null;
-            var found = map.floor(key(entry, Long.MAX_VALUE));
-            return found != null && same(found.getKey(), entry)
-                    ? decode(found.getKey(), found.getValue())
-                    : null;
+            var found = map.floor(key(entry, timestamp));
+            while (found != null && same(found.getKey(), entry)) {
+                var version = decode(found.getKey(), found.getValue());
+                if (!isAborted(aborted, version.version())) return version;
+                found = map.floor(key(entry, version.version() - 1));
+            }
+            return null;
         }
 
         /** The version at or below the timestamp; {@code exists} tells a history from none. */
         StoredVersion at(Composite entry, long timestamp, boolean[] exists) throws IOException {
             exists[0] = false;
             if (empty()) return null;
-            var found = map.floor(key(entry, timestamp));
-            if (found != null && same(found.getKey(), entry)) {
+            var found = floor(entry, timestamp);
+            if (found != null) {
                 exists[0] = true;
-                return decode(found.getKey(), found.getValue());
+                return found;
             }
             // Nothing at or below the timestamp: only later versions, or no history at all.
             exists[0] = latest(entry) != null;
@@ -501,6 +510,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
 
         /** The entry's own version, or null when that version did not write it. */
         StoredVersion exact(Composite entry, long version) throws IOException {
+            if (isAborted(aborted, version)) return null;
             byte[] value = map.getBytes(key(entry, version));
             return value == null ? null : decode(key(entry, version), value);
         }
@@ -569,6 +579,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
     private final Workspace workspace;
     private final Budget budget;
     private final Map<Namespace, Store> stores = new LinkedHashMap<>();
+    private final SpillingMap aborted;
     /** Where entries were last written, kept for the transaction being applied only. */
     private final Map<EntryId, WritePosition> writePositions = new HashMap<>();
     private long positionsTransaction;
@@ -589,8 +600,17 @@ public final class IndexReferenceReplay implements AutoCloseable {
         this.secondaryIndexes = secondaryIndexes;
         this.settings = settings;
         this.workspace = new Workspace(settings);
+        this.aborted = new SpillingMap(workspace.directory("aborted"), settings.overlayEntries(), 4);
         this.budget = new Budget(settings.baselineEntries());
         if (settings.directory() != null) org.sibench.capture.RunTiming.current().measure(settings.directory());
+    }
+
+    private static byte[] abortKey(long version) {
+        return java.nio.ByteBuffer.allocate(Long.BYTES).putLong(version).array();
+    }
+
+    private static boolean isAborted(SpillingMap aborted, long version) throws IOException {
+        return aborted.get(abortKey(version)) != SpillingMap.ABSENT;
     }
 
     private Store store(int table, int index) throws IOException {
@@ -601,7 +621,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
             store =
                     new Store(
                             new Baseline(budget, workspace, name, settings.sortBytes(), !rowIds),
-                            new Overlay(workspace, name, settings.overlayEntries()));
+                            new Overlay(workspace, name, settings.overlayEntries(), aborted));
             stores.put(key, store);
         }
         return store;
@@ -617,6 +637,18 @@ public final class IndexReferenceReplay implements AutoCloseable {
     public void accept(Operation operation) throws IOException {
         if (!groupMembers.isEmpty() && !operation.grouped())
             throw new IOException("Search group interrupted before its last member");
+        if (operation.kind() == IndexOperationTrace.TRANSACTION_ABORT) {
+            if (operation.version() <= 0 || operation.transactionId() <= 0
+                    || operation.version() < lastAppliedVersion
+                    || operation.version() == lastAppliedVersion && operation.transactionId() != positionsTransaction
+                    || isAborted(aborted, operation.version()))
+                throw new IOException("Invalid reference Abort identity or order");
+            aborted.put(abortKey(operation.version()), 1);
+            lastAppliedVersion = operation.version();
+            writePositions.clear();
+            positionsTransaction = operation.transactionId();
+            return;
+        }
         if (IndexOperationTrace.isControl(operation))
             throw new IOException("Source controls must not reach the index");
         if (operation.table() < 1
@@ -660,7 +692,8 @@ public final class IndexReferenceReplay implements AutoCloseable {
             relocate(operation, store, entry, value, position);
             return;
         }
-        if (!IndexOperationTrace.isMutation(operation) || operation.version() == 0)
+        if (!IndexOperationTrace.isMutation(operation) || operation.version() == 0
+                || isAborted(aborted, operation.version()))
             throw new IOException("Unsupported index write");
         StoredVersion previous = store.current(entry);
         if (operation.kind() == IndexOperationTrace.LOGICAL_DELETE
@@ -801,6 +834,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
          */
         static final int SKIP_AFTER = 8;
 
+        private final Overlay overlay;
         private final SpillingMap map;
         private final SpillingMap.Entries entries;
         private final boolean descending;
@@ -809,7 +843,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
         private long skipped;
 
         HistoryScan(
-                SpillingMap map,
+                Overlay overlay,
                 boolean descending,
                 SpillingMap.Entries entries,
                 long timestamp,
@@ -817,7 +851,8 @@ public final class IndexReferenceReplay implements AutoCloseable {
                 long transaction,
                 long ordinal)
                 throws IOException {
-            this.map = map;
+            this.overlay = overlay;
+            this.map = overlay.map;
             this.descending = descending;
             this.entries = entries;
             this.timestamp = timestamp;
@@ -846,7 +881,8 @@ public final class IndexReferenceReplay implements AutoCloseable {
         }
 
         /** Selects the newest version at or below the snapshot, or the transaction's own write. */
-        private void consider(History history, StoredVersion version) {
+        private void consider(History history, StoredVersion version) throws IOException {
+            if (isAborted(overlay.aborted, version.version())) return;
             boolean local =
                     localVersion > timestamp
                             && version.version() == localVersion
@@ -861,9 +897,8 @@ public final class IndexReferenceReplay implements AutoCloseable {
         private void skipRest(History history) throws IOException {
             skipped++;
             var entry = new Composite(history.entry, history.split);
-            var floor = map.floor(Overlay.key(entry, timestamp));
-            if (floor != null && Overlay.same(floor.getKey(), entry))
-                consider(history, Overlay.decode(floor.getKey(), floor.getValue()));
+            var floor = overlay.floor(entry, timestamp);
+            if (floor != null) consider(history, floor);
             if (localVersion > timestamp) {
                 byte[] key = Overlay.key(entry, localVersion), value = map.getBytes(key);
                 if (value != null) consider(history, Overlay.decode(key, value));
@@ -945,7 +980,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
         try (BaselineScan baseline = store.baseline.scan(start, end, descending);
                 HistoryScan overlay =
                         new HistoryScan(
-                                store.overlay.map,
+                                store.overlay,
                                 descending,
                                 store.overlay.map.scan(start, end, descending),
                                 timestamp,
@@ -953,21 +988,48 @@ public final class IndexReferenceReplay implements AutoCloseable {
                                 transaction,
                                 ordinal)) {
             try {
-                return search(baseline, overlay, range, results);
+                scan(baseline, overlay, range, (entry, selected) -> results.add(
+                        new LookupResult(entry.key(), selected.version(), selected.value(), selected.position())));
+                return results;
             } finally {
                 skippedHistories += overlay.skipped();
             }
         }
     }
 
-    private List<LookupResult> search(
-            BaselineScan baseline, HistoryScan overlay, Range range, List<LookupResult> results)
+    @FunctionalInterface private interface VisibleConsumer {
+        void accept(Composite entry, StoredVersion version) throws IOException;
+    }
+
+    @FunctionalInterface public interface EntryConsumer {
+        void accept(int table, int index, IndexKey key, IndexKey value, LookupResult result) throws IOException;
+    }
+
+    /** Streams the complete visible state without materializing an unbounded range result. */
+    public void scanVisible(long timestamp, EntryConsumer consumer) throws IOException {
+        if (timestamp < 0) throw new IOException("Invalid snapshot");
+        var range = new Range(null, false, null, false, false, 0);
+        for (var item : stores.entrySet()) {
+            var namespace = item.getKey(); var store = item.getValue(); store.seal();
+            try (var base = store.baseline.scan(new byte[0], null, false);
+                    var overlay = new HistoryScan(store.overlay, false,
+                            store.overlay.map.scan(new byte[0], null, false), timestamp, 0, 0, 0)) {
+                scan(base, overlay, range, (entry, selected) -> consumer.accept(
+                        namespace.table(), namespace.index(), entry.key(), entry.split() == 0 ? null
+                                : IndexKey.decode(Arrays.copyOf(entry.bytes(), entry.split())),
+                        new LookupResult(entry.key(), selected.version(), selected.value(), selected.position())));
+            }
+        }
+    }
+
+    private void scan(BaselineScan baseline, HistoryScan overlay, Range range, VisibleConsumer consumer)
             throws IOException {
         int step = range.descending() ? -1 : 1;
         {
             boolean baselineLeft = baseline.next();
             History pending = overlay.next();
-            while (range.limit() == 0 || results.size() < range.limit()) {
+            long count = 0;
+            while (range.limit() == 0 || count < range.limit()) {
                 if (!baselineLeft && pending == null) break;
                 int order =
                         !baselineLeft
@@ -990,16 +1052,12 @@ public final class IndexReferenceReplay implements AutoCloseable {
                     if (order == 0) baselineLeft = baseline.next();
                     pending = overlay.next();
                 }
-                if (selected != null && selected.present())
-                    results.add(
-                            new LookupResult(
-                                    new Composite(entry, split).key(),
-                                    selected.version(),
-                                    selected.value(),
-                                    selected.position()));
+                if (selected != null && selected.present()) {
+                    consumer.accept(new Composite(entry, split), selected);
+                    count++;
+                }
             }
         }
-        return results;
     }
 
     /** The entries one search names: a range, or the single entry a pinned search names. */
@@ -1257,6 +1315,9 @@ public final class IndexReferenceReplay implements AutoCloseable {
             }
         }
         stores.clear();
+        try { aborted.close(); } catch (IOException error) {
+            if (failure == null) failure = error; else failure.addSuppressed(error);
+        }
         try {
             workspace.close();
         } catch (IOException error) {

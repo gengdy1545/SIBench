@@ -17,7 +17,7 @@
   for the source without a scale suffix. Defaults use 87,060,000 baseline rows
   (HyBench SF10); exact scale stays in the file and each run's effective snapshot.
   Keep index/backend configuration under `config/index/`, and tool runtime
-  settings, including PostgreSQL service settings, in `config/sibench.yaml`.
+  settings, including DuckDB engine settings, in `config/sibench.yaml`.
   Do not add scale, client-count or mode variants to the public directory.
   Keep experiment variants in `develop/configs/`
   and required test inputs in test resources or temporary directories.
@@ -97,15 +97,14 @@
 
 ## Current design and compatibility
 
-- Treat generation PostgreSQL as disposable, rebuildable working state. Do not
-  add crash recovery or durable-cache requirements to generation without an
-  explicit need. Use one fresh database for loading, export and native workload;
-  do not keep a reusable initial database or clone it. Reject existing database
-  directories, preserve normal transaction/snapshot semantics, and remove the
-  working database after success unless explicitly retained for diagnosis.
-  This policy does not weaken Index Service durability or successful
-  Trace publication. Keep independent full-data acceptance separate from normal
-  generation, whose input integrity and source-completeness checks remain required.
+- Use one fresh database of the explicitly selected native engine for loading,
+  history tracking and workload capture. Reject existing working/output directories,
+  preserve native transaction and snapshot semantics, then seal and publish its native files after
+  normal host shutdown. Retain failure diagnostics; do not add crash recovery or
+  reusable initial-state caches without an explicit need. Successful Trace data
+  are retained artifacts, not disposable working databases. Keep independent
+  full-data acceptance separate from normal generation, whose input integrity and
+  source-completeness checks remain required.
 - Maintain the current design by default. Do not add or retain superseded APIs,
   format readers, compatibility flags, fallback implementations or transition
   branches for backward compatibility that has not been explicitly required.

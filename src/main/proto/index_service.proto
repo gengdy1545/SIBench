@@ -17,7 +17,7 @@ service IndexService {
   rpc Describe(DescribeRequest) returns (DescribeResponse);
 
   // One stream per client. The service orders a transaction by transaction_operation and waits
-  // for complete commits before reading a version. Responses carry the request id and may arrive
+  // for complete transaction outcomes before reading a version. Responses carry the request id and may arrive
   // out of order across requests and streams.
   rpc Execute(stream Request) returns (stream Response);
 
@@ -55,6 +55,8 @@ message DescribeResponse {
   bool complete_commit_publication = 13;
   // WriteBatch requests of Baseline INSERTs (version 0) are accepted.
   bool baseline_write_batches = 14;
+  // Abort keeps the transaction's provisional versions out of all committed snapshots.
+  bool transaction_abort = 15;
 }
 
 enum Acknowledgement {
@@ -101,6 +103,7 @@ message Request {
     SearchGroup group = 4;
     Commit commit = 8;
     WriteBatch batch = 9;
+    Abort abort = 10;
   }
 }
 
@@ -115,6 +118,14 @@ message Commit {
   uint64 version = 1;
   uint64 writes = 2;      // index write requests in this transaction
   uint64 operations = 3;  // all requests in this transaction, writes + searches + groups
+}
+
+// Terminates a transaction without publishing its provisional writes. The version is a
+// resolved transaction slot, so publication can advance across both committed and aborted slots.
+message Abort {
+  uint64 version = 1;
+  uint64 writes = 2;
+  uint64 operations = 3;
 }
 
 message Write {
@@ -133,7 +144,7 @@ message Write {
 
 // An ordered search over one index. The bounds apply to the leading component: the primary key
 // for index 0, the indexed value otherwise. Results are entries in (indexed value, primary key)
-// order, descending when asked, each at the newest version <= read_version that is not deleted.
+// order, descending when asked, each at the newest version <= read_version that is neither aborted nor deleted.
 message Search {
   uint32 table = 1;
   uint32 index = 2;
@@ -146,7 +157,8 @@ message Search {
   // this primary key.
   bytes pinned_primary_key = 8;
   // Transaction-local read: the statement snapshot is read_version; the search also sees this
-  // exact version's writes at earlier transaction_operation positions. 0: snapshot only. A service advertising
+  // exact version's writes at earlier transaction_operation positions. The requesting transaction
+  // must own that version. 0: snapshot only. A service advertising
   // transaction_local_reads selects max(read_version, an existing local_version), without
   // exposing any version strictly between them.
   uint64 local_version = 9;

@@ -19,7 +19,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     private final List<Pending> pending = new ArrayList<>();
     private org.sibench.adapters.proto.Request storedRequest;
     private final Map<String, Long> kinds = new LinkedHashMap<>();
-    private long source, dispatched, primary, secondary, filtered, transactions, controls, groups;
+    private long source, dispatched, primary, secondary, filtered, transactions, abortedTransactions, controls, groups;
     private long peakPending, peakSearchGroup, peakExpansion;
     private long activeTransaction, activeVersion, lastVersion, lastOrdinal, lastTransactionId;
     private long lastSourceEvent;
@@ -356,6 +356,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
             lastSourceEvent = 0;
             transactionOperations = 0;
         } else {
+            boolean aborted = o.kind() == IndexOperationTrace.TRANSACTION_ABORT;
             if (activeTransaction == 0
                     || o.transactionId() != activeTransaction
                     || o.version() != activeVersion
@@ -369,12 +370,13 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
                 countDispatch(item.operation());
             }
             pending.clear();
-            if (publication)
-                dispatcher.sendCommit(activeTransaction, activeVersion);
+            if (publication || aborted && skipped == null)
+                dispatcher.sendTerminal(activeTransaction, activeVersion, aborted);
             lastVersion = activeVersion;
             lastTransactionId = activeTransaction;
             activeTransaction = 0;
-            transactions++;
+            if (aborted) abortedTransactions++;
+            else transactions++;
         }
     }
 
@@ -407,8 +409,9 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         report.put("dispatched_operations", dispatched);
         report.put("filtered_secondary_operations", filtered);
         report.put("committed_transactions", transactions);
-        report.put("last_commit_version", lastVersion);
-        report.put("change_delivery", sourceTransactions ? "committed_only" : "baseline");
+        report.put("aborted_transactions", abortedTransactions);
+        report.put("last_resolved_version", lastVersion);
+        report.put("change_delivery", sourceTransactions ? "transaction_outcomes" : "baseline");
         report.put("transaction_control_records", controls);
         report.put("dispatch_mode", dispatchMode);
         report.put("complete_commit_publication", publication);

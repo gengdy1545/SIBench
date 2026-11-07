@@ -168,9 +168,9 @@ public class IndexOperationTraceTest {
                     List.of(
                             IndexOperationTrace.search(1, 3, 0, point, 0, 0, 0).withWorkUnitId(-1),
                             IndexOperationTrace.transaction(1, 6, 1, 1, 0).withWorkUnitId(1),
-                            // A limited search returns exactly its limit.
+                            // A limited search cannot return more than its limit.
                             IndexOperationTrace.search(
-                                    1, 3, 0, new Range(null, false, null, false, false, 3), 0, 2, 0),
+                                    1, 3, 0, new Range(null, false, null, false, false, 3), 0, 4, 0),
                             // Inclusive flags need a bound.
                             IndexOperationTrace.search(
                                     1, 3, 0, new Range(null, true, null, false, false, 0), 0, 0, 0),

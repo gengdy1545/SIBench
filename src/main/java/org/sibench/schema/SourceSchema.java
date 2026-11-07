@@ -9,7 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 
-/** Reviewed PostgreSQL layouts for the three pinned benchmark sources, not arbitrary SQL. */
+/** Reviewed layouts for the three pinned benchmark sources, not arbitrary SQL. */
 public final class SourceSchema {
     public record DefaultValue(String kind, String value) {
         public static DefaultValue none() {
@@ -139,15 +139,10 @@ public final class SourceSchema {
         String table =
                 nativeConfig.containsKey("table") ? string(nativeConfig, "table") : "usertable";
         require(table.equals("usertable"), "Current YCSB layout requires usertable");
-        // The pin's JdbcDBCreateTable generates TEXT fields; its SQL template is a different path.
-        if (nativeConfig.containsKey("jdbc_table_creator"))
-            require(
-                    string(nativeConfig, "jdbc_table_creator").equals("JdbcDBCreateTable"),
-                    "Only the pinned JdbcDBCreateTable layout is supported");
         var columns = new ArrayList<Column>();
         columns.add(new Column("ycsb_key", "character varying", false, DefaultValue.none()));
         for (int i = 0; i < fields; i++)
-            columns.add(new Column("field" + i, "text", true, DefaultValue.none()));
+            columns.add(new Column("field" + i, "blob", true, DefaultValue.none()));
         return new SourceSchema(
                 "ycsb",
                 source,
@@ -158,8 +153,8 @@ public final class SourceSchema {
                                 List.of(new Index(table + "_pkey", "ycsb_key", true)))),
                 hashes(
                         source,
-                        "jdbc/src/main/java/site/ycsb/db/JdbcDBCreateTable.java",
-                        "jdbc/src/main/java/site/ycsb/db/flavors/DefaultDBFlavor.java"),
+                        "core/src/main/java/site/ycsb/DB.java",
+                        "core/src/main/java/site/ycsb/workloads/CoreWorkload.java"),
                 nativeConfig);
     }
 
@@ -169,15 +164,14 @@ public final class SourceSchema {
         require(count <= 10000, "sysbench schema table count exceeds 10000");
         require(
                 !nativeConfig.containsKey("secondary") || !bool(nativeConfig, "secondary"),
-                "sysbench secondary=true replaces the primary key and is outside the PG layout");
+                "sysbench secondary=true replaces the primary key and is unsupported");
         require(
                 !nativeConfig.containsKey("create-secondary")
                         || bool(nativeConfig, "create-secondary"),
                 "sysbench source must create all k secondary indexes");
         require(
-                !nativeConfig.containsKey("pgsql-variant")
-                        || string(nativeConfig, "pgsql-variant").isEmpty(),
-                "sysbench PG variants are outside the reviewed layout");
+                !nativeConfig.containsKey("pgsql-variant"),
+                "sysbench pgsql-variant is unsupported by the DuckDB driver");
         require(
                 !nativeConfig.containsKey("create-table-options")
                         || string(nativeConfig, "create-table-options").isEmpty(),

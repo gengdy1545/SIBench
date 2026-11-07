@@ -240,6 +240,44 @@ public class IndexServerTest {
         }
     }
 
+    @Test(timeout = 30000)
+    public void encodedAbortReplaysLocalSearchAndRestoresTheCommittedSnapshotOverGrpc() throws Exception {
+        var trace = temporary.getRoot().toPath().resolve("abort.pb.zst");
+        var writer = new org.sibench.capture.ProtoTrace.Writer(trace);
+        var key = IndexKey.ofInt(7);
+        try (writer) {
+            writer.append(IndexOperationTrace.transaction(1, IndexOperationTrace.TRANSACTION_BEGIN, 100, 1, 0));
+            writer.append(IndexOperationTrace.write(2, IndexOperationTrace.UPSERT, 1, 0, key, 1, 0, 0, 71)
+                    .withTransaction(100, 1).withExpansion(0, 1));
+            writer.append(IndexOperationTrace.search(3, 1, 0, IndexOperationTrace.Range.equal(key), 0, 1,
+                    IndexOperationTrace.TRANSACTION_LOCAL_SEARCH).withTransaction(100, 1).withVersion(1));
+            writer.append(IndexOperationTrace.transaction(4, IndexOperationTrace.TRANSACTION_ABORT, 100, 1, 1));
+        }
+        try (var backend = RocksDbBackend.create(temporary.getRoot().toPath().resolve("abort-grpc"), ValueKind.ROW_ID);
+                var server = IndexServer.start(0, backend);
+                var grpc = new GrpcService("127.0.0.1:" + server.port(), new TraceRequests(ValueKind.ROW_ID), "abort-trace", 5)) {
+            assertTrue(grpc.describe().getTransactionAbort());
+            try (var loader = grpc.factory().open(0)) {
+                loader.send(1, IndexOperationTrace.write(0, IndexOperationTrace.INSERT,
+                        1, 0, key, 0, 0, 0, 70)).response().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            }
+            try (var replay = org.sibench.replay.ReplayProjection.withClients(
+                    new org.sibench.replay.ReplayConfig(true, 0, 0, 0, 0), true, grpc.factory(), true)) {
+                org.sibench.capture.ProtoTrace.read(trace, writer.sha256(), writer.logicalSha256(), replay);
+                replay.finish();
+                assertEquals(1L, replay.describe().get("aborted_transactions"));
+                assertEquals(0L, replay.describe().get("committed_transactions"));
+                assertEquals(2L, replay.dispatched());
+            }
+            assertEquals(1, grpc.flush("abort-trace").getPublishedVersion());
+            var rows = backend.search(org.sibench.adapters.proto.Search.newBuilder()
+                    .setTable(1).setReadVersion(1).build());
+            assertEquals(1, rows.size());
+            assertEquals(70, rows.get(0).getValue().getRowId());
+            assertEquals(0, rows.get(0).getVersion());
+        }
+    }
+
     @Test(timeout = 60000)
     public void aLargeResultArrivesInChunksWhoseDigestMatchesTheReference() throws Exception {
         int rows = IndexExecution.CHUNK_RESULTS + 4_464;

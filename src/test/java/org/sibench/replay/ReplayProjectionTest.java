@@ -14,6 +14,23 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class ReplayProjectionTest {
+    @Test
+    public void preflightAcceptsAndCountsAbortedOperations() throws Exception {
+        var operations = List.of(
+                IndexOperationTrace.transaction(1, IndexOperationTrace.TRANSACTION_BEGIN, 10, 1, 0),
+                mutation(3, 1, 1, 10, 1, IndexOperationTrace.UPSERT),
+                IndexOperationTrace.transaction(2, IndexOperationTrace.TRANSACTION_ABORT, 10, 1, 1));
+        var report = ReplayInput.checkStream(consumer -> {
+            for (var operation : operations) consumer.accept(operation);
+            return operations.size();
+        }, new ReplayConfig(true, 0, 0, 0, 0), true);
+        assertEquals(1L, report.get("dispatched_operations"));
+        assertEquals(1L, report.get("aborted_transactions"));
+        assertEquals(1L, report.get("abort_markers"));
+        assertEquals(0L, report.get("committed_transactions"));
+        assertEquals(1L, report.get("last_resolved_version"));
+    }
+
     /** A search of one source transaction, at its position after the preceding mutations. */
     private static Operation local(Operation search, long transaction, long preceding) {
         return search.withTransaction(transaction, preceding);
@@ -48,9 +65,9 @@ public class ReplayProjectionTest {
                 List<Operation> received = new ArrayList<>();
                 var config = new ReplayConfig(secondary, 0, 0, 0, 0, mode);
                 var projection = new ReplayProjection(config, true, received::add);
-                assertEquals(0L, projection.describe().get("last_commit_version"));
+                assertEquals(0L, projection.describe().get("last_resolved_version"));
                 projection.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
-                assertEquals(0L, projection.describe().get("last_commit_version"));
+                assertEquals(0L, projection.describe().get("last_resolved_version"));
                 org.sibench.capture.TransferIndexFixtures.expandRow(
                         mutation(5, 1, 1, 10, 1, 3), projection);
                 org.sibench.capture.TransferIndexFixtures.expandRow(
@@ -61,7 +78,7 @@ public class ReplayProjectionTest {
                 projection.accept(mutation(3, 1, 1, 10, 5, 5));
                 assertTrue(received.isEmpty());
                 projection.accept(IndexOperationTrace.transaction(10, 7, 10, 1, 5));
-                assertEquals(1L, projection.describe().get("last_commit_version"));
+                assertEquals(1L, projection.describe().get("last_resolved_version"));
                 projection.finish();
                 var writes = received.stream().filter(IndexOperationTrace::isMutation).toList();
                 int transferWidth = secondary ? 3 : 1;
@@ -72,13 +89,13 @@ public class ReplayProjectionTest {
                 assertTrue(received.stream().noneMatch(IndexOperationTrace::isControl));
                 assertEquals((long) writes.size(), projection.describe().get("target_calls"));
                 projection.accept(IndexOperationTrace.transaction(11, 6, 11, 2, 0));
-                assertEquals(1L, projection.describe().get("last_commit_version"));
+                assertEquals(1L, projection.describe().get("last_resolved_version"));
                 projection.accept(mutation(3, 1, 2, 11, 1, 3));
                 projection.accept(IndexOperationTrace.transaction(11, 7, 11, 2, 1));
                 assertEquals(writes.size() + 1L, projection.dispatched());
                 assertEquals(2L, projection.describe().get("committed_transactions"));
-                assertEquals(2L, projection.describe().get("last_commit_version"));
-                assertEquals("committed_only", projection.describe().get("change_delivery"));
+                assertEquals(2L, projection.describe().get("last_resolved_version"));
+                assertEquals("transaction_outcomes", projection.describe().get("change_delivery"));
             }
         }
     }

@@ -30,17 +30,7 @@ public final class ScaleInspector {
         switch (string(config, "benchmark")) {
             case "hybench" -> {
                 Path source = root.resolve(string(object(config, "source"), "path"));
-                var parameters = new com.moandjiezana.toml.Toml()
-                        .read(source.resolve("src/main/resources/parameters.toml").toFile())
-                        .getTable(string(nativeConfig, "sf"));
-                require(parameters != null, "Unknown HyBench scale");
-                rows.put("customer", parameters.getLong("customer_number"));
-                rows.put("company", parameters.getLong("company_number"));
-                long accounts = Math.addExact(rows.get("customer"), rows.get("company"));
-                rows.put("savingaccount", accounts);
-                rows.put("checkingaccount", accounts);
-                for (String table : List.of("transfer", "checking", "loanapps", "loantrans"))
-                    rows.put(table, parameters.getLong(table + "_number"));
+                rows.putAll(HybenchParameters.rows(HybenchParameters.read(source, nativeConfig)));
             }
             case "ycsb" -> rows.put(string(nativeConfig, "table"), positive(nativeConfig, "recordcount"));
             case "sysbench" -> {

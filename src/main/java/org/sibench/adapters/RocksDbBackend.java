@@ -34,12 +34,14 @@ public final class RocksDbBackend implements IndexBackend {
     private static final int HEADER = 8, VERSION = 8, VALUE = 1 + 4 + 8 + 8 + 8;
     private static final byte[] VALUE_KIND = metadata("value_kind"),
             PUBLISHED_VERSION = metadata("published_version"),
-            TRACE_BINDING = metadata("trace_binding");
+            TRACE_BINDING = metadata("trace_binding"),
+            ABORTED_VERSION = metadata("aborted_version/");
     private final RocksStore store;
     private final ValueKind valueKind;
     /** One JSON line per Flush: the engine's state and object-storage requests so far. */
     private final Path engineStats;
     private long flushes;
+    private final java.util.Set<Long> aborted = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private RocksDbBackend(RocksStore store, ValueKind valueKind, Path path) {
         this.store = store;
@@ -101,7 +103,24 @@ public final class RocksDbBackend implements IndexBackend {
             store.close();
             throw new IOException("Reopened index does not hold " + valueKind + " values");
         }
-        return new RocksDbBackend(store, valueKind, path);
+        var backend = new RocksDbBackend(store, valueKind, path);
+        try (var entries = store.cursor(ABORTED_VERSION, successor(ABORTED_VERSION))) {
+            entries.seek(ABORTED_VERSION);
+            while (entries.valid()) {
+                byte[] key = entries.key();
+                if (key.length != ABORTED_VERSION.length + Long.BYTES
+                        || !Arrays.equals(entries.value(), new byte[] {1}))
+                    throw new IOException("Invalid aborted-version metadata");
+                long version = ByteBuffer.wrap(key, ABORTED_VERSION.length, Long.BYTES).getLong();
+                if (version <= 0) throw new IOException("Invalid aborted version");
+                backend.aborted.add(version);
+                entries.next();
+            }
+        } catch (IOException | RuntimeException error) {
+            store.close();
+            throw error;
+        }
+        return backend;
     }
 
     private static byte[] metadata(String name) {
@@ -123,11 +142,13 @@ public final class RocksDbBackend implements IndexBackend {
                 .setBaselineDurableOnlyAtFlush(true)
                 .setFlushMakesDurable(true)
                 .setBaselineWriteBatches(true)
+                .setTransactionAbort(true)
                 .build();
     }
 
     @Override
     public void write(Write write) throws IOException {
+        if (aborted.contains(write.getVersion())) throw new IllegalArgumentException("Write to an aborted version");
         var key = write.getKey();
         IndexExecution.validateKey(key);
         byte[] entry = entry(key.getTable(), key.getIndex(), key.getIndexedValue(), key.getPrimaryKey());
@@ -151,6 +172,15 @@ public final class RocksDbBackend implements IndexBackend {
             }
             default -> throw new IllegalArgumentException("Unknown write kind");
         }
+    }
+
+    @Override
+    public void abort(long version) throws IOException {
+        if (version <= 0) throw new IllegalArgumentException("Abort version must be positive");
+        byte[] key = ByteBuffer.allocate(ABORTED_VERSION.length + Long.BYTES)
+                .put(ABORTED_VERSION).putLong(version).array();
+        store.put(key, new byte[] {1}, true);
+        aborted.add(version);
     }
 
     @Override
@@ -221,7 +251,7 @@ public final class RocksDbBackend implements IndexBackend {
      * The newest version of {@code entry} at or below the read version, or the exact local version
      * when a transaction-local search asks for one above it, if that state is present.
      */
-    private static Result visible(
+    private Result visible(
             RocksStore.Cursor versions, byte[] entry, long readVersion, long localVersion)
             throws IOException {
         byte[] selected = versioned(entry, Math.max(readVersion, localVersion));
@@ -234,7 +264,7 @@ public final class RocksDbBackend implements IndexBackend {
                 && Arrays.equals(key, 0, entry.length, entry, 0, entry.length);
     }
 
-    private static Result visibleAt(
+    private Result visibleAt(
             RocksStore.Cursor versions, byte[] entry, long readVersion, long localVersion)
             throws IOException {
         if (!versions.valid()) return null;
@@ -247,6 +277,18 @@ public final class RocksDbBackend implements IndexBackend {
             if (!versions.valid()) return null;
             key = versions.key();
             if (!sameEntry(key, entry)) return null;
+        }
+        while (aborted.contains(~ByteBuffer.wrap(key, entry.length, VERSION).getLong())) {
+            versions.next();
+            if (!versions.valid()) return null;
+            key = versions.key();
+            if (!sameEntry(key, entry)) return null;
+            if (~ByteBuffer.wrap(key, entry.length, VERSION).getLong() > readVersion) {
+                versions.seek(versioned(entry, readVersion));
+                if (!versions.valid()) return null;
+                key = versions.key();
+                if (!sameEntry(key, entry)) return null;
+            }
         }
         ByteBuffer value = ByteBuffer.wrap(versions.value());
         if (value.get(0) == 0) return null;

@@ -2,21 +2,20 @@ package org.sibench.replay;
 
 import com.google.gson.*;
 
-import org.apache.parquet.example.data.Group;
-import org.apache.parquet.hadoop.ParquetReader;
-import org.apache.parquet.hadoop.example.GroupReadSupport;
 import org.sibench.capture.*;
-import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexOperationTrace.Range;
 import org.sibench.capture.IndexReferenceReplay.LookupResult;
-import org.sibench.config.Digests;
 import org.sibench.trace.IndexKey;
 
 import java.io.IOException;
+import java.sql.Connection;
+import java.sql.SQLException;
+import org.sibench.generation.DuckDbDatabase;
+import org.sibench.trace.TraceManifest;
 import java.nio.file.*;
 import java.util.*;
 
-/** Independent Parquet row oracle; derived probes are not native workload or timed performance. */
+/** Independent native row oracle; derived probes are not native workload or timed performance. */
 public final class SnapshotLookupValidation {
     private static final int SECONDARY_PREDICATES = 64;
     /** Baseline rows sampled per table, evenly in PK order, to describe each index's domain. */
@@ -319,7 +318,7 @@ public final class SnapshotLookupValidation {
 
     public static Map<String, Object> run(Path directory, ReplayConfig config, Path report)
             throws IOException {
-        return run(directory, config, List.of(false, true), report);
+        return run(directory, config, List.of(true), report);
     }
 
     /** {@code rowIdModes}: the value modes whose reference model is checked, as row-id flags. */
@@ -329,6 +328,11 @@ public final class SnapshotLookupValidation {
         if (rowIdModes.isEmpty()) throw new IOException("No value mode to check");
         if (Files.exists(report))
             throw new IOException("Snapshot report already exists: " + report);
+        for (boolean rowIds : rowIdModes) {
+            TraceManifest.requireValue(directory, rowIds ? org.sibench.adapters.proto.ValueKind.ROW_ID
+                    : org.sibench.adapters.proto.ValueKind.LOCATOR);
+            if (!rowIds) throw new IOException("Native row oracle requires RowID values");
+        }
         var input = ReplayInput.prepare(directory, config);
         var baseline = input.baseline();
         var preflight = input.preflight();
@@ -337,97 +341,21 @@ public final class SnapshotLookupValidation {
                         .getAsJsonObject();
         IndexCatalog catalog = IndexCatalog.fromManifest(manifest);
         var workload = org.sibench.capture.ProtoTrace.source(directory, manifest, "workload");
-        Path sourceBaseline = Path.of(manifest.get("baseline_directory").getAsString());
-        if (!Digests.sha256(sourceBaseline.resolve("baseline-manifest.json"))
-                .equals(manifest.get("baseline_manifest_sha256").getAsString()))
-            throw new IOException("Baseline identity mismatch");
-        JsonObject verification =
-                JsonParser.parseString(
-                                Files.readString(sourceBaseline.resolve("baseline-manifest.json")))
-                        .getAsJsonObject();
-        if (!verification.get("status").getAsString().equals("complete")
-                || !Digests.sha256(sourceBaseline.resolve("files.jsonl"))
-                        .equals(verification.get("files_manifest_sha256").getAsString()))
-            throw new IOException("Baseline manifests changed or are incomplete");
-        for (var item : verification.getAsJsonArray("files"))
-            verifyFile(sourceBaseline, item.getAsJsonObject());
+        Map<Integer, NavigableMap<IndexKey, History>> nativeRows;
+        try (var verified = TraceManifest.openData(directory);
+                var database = DuckDbDatabase.openReadOnly(directory.resolve("data"))) {
+            nativeRows = nativeHistories(database, catalog);
+        } catch (SQLException failure) { throw new IOException("Cannot read native oracle rows", failure); }
         Map<Key, History> histories = new LinkedHashMap<>();
-        Map<Key, Operation> pending = new LinkedHashMap<>();
-        Map<String, Operation> payloadOperations = new HashMap<>();
-        long[] lastCommit = {0};
-        workload.read(
-                operation -> {
-                    if (operation.kind() == IndexOperationTrace.RELOCATE)
-                        throw new IOException(
-                                "Source-row oracle does not infer relocation history");
-                    if (IndexOperationTrace.isMutation(operation) && operation.index() == 0) {
-                        pending.put(new Key(operation.table(), operation.key()), operation);
-                        if (operation.kind() != IndexOperationTrace.LOGICAL_DELETE
-                                && payloadOperations.put(
-                                                location(operation.file(), operation.position()),
-                                                operation)
-                                        != null)
-                            throw new IOException("Duplicate incremental payload location");
-                    } else if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) {
-                        for (var entry : pending.entrySet())
-                            histories
-                                    .computeIfAbsent(entry.getKey(), ignored -> new History())
-                                    .commits
-                                    .put(operation.version(), null);
-                        pending.clear();
-                        lastCommit[0] = operation.version();
-                    }
-                });
-        if (histories.isEmpty()) throw new IOException("No committed row changes to validate");
-        Map<String, Row> payloadRows = new HashMap<>();
-        for (var item : manifest.getAsJsonArray("incremental_files")) {
-            JsonObject file = item.getAsJsonObject();
-            verifyFile(directory, file);
-            long[] position = {0};
-            readFile(
-                    directory,
-                    file,
-                    catalog,
-                    (table, key, row) -> {
-                        String identity = location(file.get("file_id").getAsLong(), position[0]++);
-                        Operation operation = payloadOperations.get(identity);
-                        if (operation == null
-                                || operation.table() != table
-                                || !operation.key().equals(key)
-                                || operation.version() != row.version()
-                                || operation.rowId() != row.rowId())
-                            throw new IOException(
-                                    "Incremental source row identity/version mismatch");
-                        payloadRows.put(identity, row);
-                        histories.get(new Key(table, key)).remember(row);
-                    },
-                    payloadOperations);
-        }
-        if (payloadRows.size() != payloadOperations.size())
-            throw new IOException("Missing incremental Parquet payload");
-        pending.clear();
-        workload.read(
-                operation -> {
-                    if (IndexOperationTrace.isMutation(operation) && operation.index() == 0)
-                        pending.put(new Key(operation.table(), operation.key()), operation);
-                    else if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) {
-                        for (var entry : pending.entrySet()) {
-                            Operation write = entry.getValue();
-                            histories
-                                    .get(entry.getKey())
-                                    .commits
-                                    .put(
-                                            operation.version(),
-                                            write.kind() == IndexOperationTrace.LOGICAL_DELETE
-                                                    ? null
-                                                    : payloadRows.get(
-                                                            location(
-                                                                    write.file(),
-                                                                    write.position())));
-                        }
-                        pending.clear();
-                    }
-                });
+        nativeRows.forEach((table, rows) -> rows.forEach((key, history) -> {
+            if (!history.commits.isEmpty()) histories.put(new Key(table, key), history);
+        }));
+        long[] lastCommit = {manifest.get("last_resolved_version").getAsLong()};
+        for (History history : histories.values())
+            if (history.commits.lastKey() > lastCommit[0]) throw new IOException("History exceeds resolution watermark");
+        long rowCount = nativeRows.values().stream().flatMap(rows -> rows.values().stream())
+                .filter(history -> history.baseline != null).count();
+        if (rowCount != manifest.get("baseline_rows").getAsLong()) throw new IOException("Native baseline row count mismatch");
         Map<String, SortedSet<IndexKey>> changedValues = new TreeMap<>();
         Map<String, Domain> domains = new TreeMap<>();
         for (var definition : catalog.definitions()) {
@@ -444,23 +372,11 @@ public final class SnapshotLookupValidation {
                                     changedValues
                                             .get(entry.getKey().table() + "/" + index)
                                             .addAll(valuesForIndex));
-        List<JsonObject> sourceFiles =
-                Files.readAllLines(sourceBaseline.resolve("files.jsonl")).stream()
-                        .map(line -> JsonParser.parseString(line).getAsJsonObject())
-                        .toList();
         Map<Integer, Long> tableRows = new HashMap<>();
-        for (JsonObject file : sourceFiles)
-            tableRows.merge(
-                    catalog.tableId(file.get("table").getAsString()),
-                    file.get("rows").getAsLong(),
-                    Long::sum);
+        nativeRows.forEach((table, rows) -> tableRows.put(table,
+                rows.values().stream().filter(history -> history.baseline != null).count()));
         Map<Integer, long[]> seen = new HashMap<>();
-        for (JsonObject file : sourceFiles)
-            readFile(
-                    sourceBaseline,
-                    file,
-                    catalog,
-                    (table, key, row) -> {
+        readBaseline(nativeRows, (table, key, row) -> {
                         long position = seen.computeIfAbsent(table, ignored -> new long[1])[0]++;
                         boolean sampled =
                                 position % Math.max(1, tableRows.get(table) / VALUE_SAMPLE) == 0;
@@ -481,8 +397,7 @@ public final class SnapshotLookupValidation {
                                                             .get(table + "/" + index)
                                                             .add(value));
                         }
-                    },
-                    null);
+                    });
         Map<Predicate, Keys> buckets = new LinkedHashMap<>();
         if (config.secondaryIndexes())
             for (var definition : catalog.definitions()) {
@@ -516,12 +431,7 @@ public final class SnapshotLookupValidation {
             }
         }
         Locations locations = new Locations();
-        for (JsonObject file : sourceFiles)
-            readFile(
-                    sourceBaseline,
-                    file,
-                    catalog,
-                    (table, key, row) -> {
+        readBaseline(nativeRows, (table, key, row) -> {
                         if (!histories.containsKey(new Key(table, key))) {
                             for (RangeProbe probe : indexProbes.getOrDefault(table + "/0", List.of()))
                                 probe.offer(
@@ -550,8 +460,7 @@ public final class SnapshotLookupValidation {
                             }
                         }
                         if (retained) locations.add(table, key, row.rowId(), row.file(), row.position());
-                    },
-                    null);
+                    });
         // Every changed row under every value it holds, sorted once per index: probes and
         // predicates select from it instead of scanning every history.
         Map<Integer, Map<IndexKey, History>> changedRows = new HashMap<>();
@@ -718,7 +627,7 @@ public final class SnapshotLookupValidation {
         output.put("status", "passed");
         output.put(
                 "provenance",
-                "derived_history_validation_from_independent_parquet_rows_not_native_queries");
+                "derived_history_validation_from_native_before_images_not_trace_mutations");
         output.put("preflight", preflight);
         // A derived load was checked against this digest when it was read.
         output.put("baseline_trace_sha256", manifest.get("baseline_trace_sha256").getAsString());
@@ -731,7 +640,7 @@ public final class SnapshotLookupValidation {
         output.put("range_anchors_per_index", RANGE_ANCHORS);
         output.put("range_probe_limit", RANGE_LIMIT);
         output.put("range_probes", probes.size());
-        output.put("last_published_commit_version", lastCommit[0]);
+        output.put("last_resolved_version", lastCommit[0]);
         output.put("results", modes);
         output.put(
                 "scope",
@@ -742,9 +651,9 @@ public final class SnapshotLookupValidation {
                     + " domain quantiles (both ends inclusive and exclusive, ascending and"
                     + " descending), unbounded, and anchored at changed values; predicates and"
                     + " ranges at baseline, before/at first relevant change and final. Exact"
-                    + " key/version/Locator/RowID and result order against independently decoded"
-                    + " baseline and incremental Parquet, including old/new values; search groups"
-                    + " only through their member searches; not full HTAP snapshots,"
+                    + " key/version/RowID and result order against independently reconstructed"
+                    + " native row histories, including old/new values; search groups"
+                    + " only through their member searches; committed snapshots, not aborted local row contents,"
                     + " relocation/GC or performance.");
         Files.writeString(
                 report,
@@ -768,62 +677,19 @@ public final class SnapshotLookupValidation {
         return times;
     }
 
-    private static String location(long file, long position) {
-        return file + "/" + position;
-    }
-
-    private static void verifyFile(Path directory, JsonObject file) throws IOException {
-        Path path = directory.resolve(file.get("path").getAsString());
-        if (!Digests.sha256(path).equals(file.get("sha256").getAsString()))
-            throw new IOException("Parquet checksum mismatch: " + path);
-    }
-
-    private static void readFile(
-            Path directory,
-            JsonObject file,
-            IndexCatalog catalog,
-            RowConsumer consumer,
-            Map<String, Operation> writes)
+    private static void readBaseline(Map<Integer, NavigableMap<IndexKey, History>> tables, RowConsumer consumer)
             throws IOException {
-        String table = file.get("table").getAsString();
-        long fileId = file.get("file_id").getAsLong(), position = 0;
-        var path = new org.apache.hadoop.fs.Path(
-                directory.resolve(file.get("path").getAsString()).toUri());
-        var configuration = new org.apache.hadoop.conf.Configuration(false);
-        try (var footer = org.apache.parquet.hadoop.ParquetFileReader.open(
-                org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(path, configuration))) {
-            configuration.set(
-                    org.apache.parquet.hadoop.api.ReadSupport.PARQUET_READ_SCHEMA,
-                    BaselineOperations.projection(
-                                    catalog, table, footer.getFooter().getFileMetaData().getSchema(),
-                                    "_sib_timestamp", "_sib_mutation_ordinal")
-                            .toString());
-        }
-        try (ParquetReader<Group> reader =
-                ParquetReader.builder(new GroupReadSupport(), path)
-                        .withConf(configuration)
-                        .build()) {
-            Group group;
-            while ((group = reader.read()) != null) {
-                if (writes != null) {
-                    Operation operation = writes.get(location(fileId, position));
-                    if (operation == null
-                            || group.getLong("_sib_mutation_ordinal", 0)
-                                    != operation.mutationOrdinal())
-                        throw new IOException("Incremental mutation position mismatch");
-                }
-                consumer.accept(
-                        catalog.tableId(table),
-                        catalog.primaryKey(table, group),
-                        new Row(
-                                group.getLong("_sib_timestamp", 0),
-                                group.getLong("_sib_row_id", 0),
-                                fileId,
-                                position++,
-                                catalog.keys(table, group)));
-            }
-        }
-        if (position != file.get("rows").getAsLong())
-            throw new IOException("Parquet row count mismatch");
+        for (var table : tables.entrySet())
+            for (var row : table.getValue().entrySet())
+                if (row.getValue().baseline != null) consumer.accept(table.getKey(), row.getKey(), row.getValue().baseline);
+    }
+
+    /** Small predicate/range oracle; full-data acceptance uses the streaming reader directly. */
+    static Map<Integer, NavigableMap<IndexKey, History>> nativeHistories(Connection database, IndexCatalog catalog)
+            throws SQLException, IOException {
+        var result = new LinkedHashMap<Integer, NavigableMap<IndexKey, History>>();
+        for (var index : catalog.definitions()) result.computeIfAbsent(index.tableId(), ignored -> new TreeMap<>());
+        NativeRowHistories.read(database, catalog, (table, key, history) -> result.get(table).put(key, history));
+        return result;
     }
 }

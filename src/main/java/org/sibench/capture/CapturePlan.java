@@ -2,11 +2,9 @@ package org.sibench.capture;
 
 import static org.sibench.config.ConfigValues.*;
 
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-
 import org.sibench.replay.ReplayConfig;
 import org.sibench.replay.ReplayProjection;
+import org.sibench.trace.TraceManifest;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -34,9 +32,25 @@ public final class CapturePlan {
     public static Map<String, Object> writeRatio(Path root, Path profile, Path calibration, double ratio) throws IOException {
         if (!(ratio > 0 && ratio <= 10)) throw new IllegalArgumentException("Write ratio must be in (0, 10]");
         Map<String, Object> document = parse(Files.readString(root.resolve(profile)));
-        JsonObject manifest = JsonParser.parseString(Files.readString(calibration.resolve("manifest.json"))).getAsJsonObject();
+        var manifest = TraceManifest.read(calibration);
         long baseline = manifest.get("baseline_rows").getAsLong();
-        long writes = manifest.get("logical_row_version_writes").getAsLong();
+        if (baseline <= 0) throw new IOException("The calibration capture has no baseline rows");
+        long[] counts = {0, 0}; // Pending transaction writes, committed row writes.
+        try (var validation = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0, "operation"),
+                true, operation -> {})) {
+            long records = ProtoTrace.source(calibration, manifest, "workload").read(operation -> {
+                validation.accept(operation);
+                if (operation.index() == 0 && IndexOperationTrace.isMutation(operation)) counts[0]++;
+                if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) {
+                    counts[1] = Math.addExact(counts[1], counts[0]);
+                    counts[0] = 0;
+                } else if (operation.kind() == IndexOperationTrace.TRANSACTION_ABORT) counts[0] = 0;
+            });
+            validation.finish();
+            if (records != manifest.get("workload_operations").getAsLong())
+                throw new IOException("Calibration workload record count mismatch");
+        }
+        long writes = counts[1];
         if (writes <= 0) throw new IOException("The calibration capture committed no row writes");
         double measured = (double) writes / baseline, factor = ratio / measured;
         var result = new LinkedHashMap<String, Object>();

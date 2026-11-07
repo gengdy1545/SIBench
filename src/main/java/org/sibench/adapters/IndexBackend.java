@@ -20,6 +20,9 @@ public interface IndexBackend extends AutoCloseable {
     /** Applies one write; it is visible to every later request once this returns. */
     void write(Write write) throws IOException;
 
+    /** Marks an unpublished transaction version as aborted at the declared write durability; its writes remain invisible thereafter. */
+    void abort(long version) throws IOException;
+
     /** Receives search results one at a time, in result order. */
     @FunctionalInterface
     interface ResultSink {

@@ -1,6 +1,5 @@
 package org.sibench.adapters;
 
-import org.sibench.adapters.proto.Commit;
 import org.sibench.adapters.proto.Request;
 import org.sibench.adapters.proto.Response;
 import org.sibench.adapters.proto.Result;
@@ -28,8 +27,8 @@ import java.util.function.Consumer;
  * The complete-commit publication mode of the reference index service. Requests of one source
  * transaction execute in {@code Request.transaction_operation} order, while different
  * transactions run independently. A read runs once its {@code read_version} is published; a
- * version is published only after its Commit marker was received and every declared write was
- * applied. The highest version merely seen is never used as a watermark.
+ * version is resolved only after its Commit or Abort marker and every declared operation were
+ * applied. Abort becomes durable before publication advances past its slot.
  *
  * <p>The watermark is recorded in the backend at every {@link #flush()} and resumed from it when
  * the index is reopened; versions above it were never published and stay invisible.
@@ -49,13 +48,13 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
      */
     private final ExecutorService readers;
     private final Map<Long, Lane> lanes = new HashMap<>();
-    /** Committed source transactions, kept so a late request can still be refused. */
+    /** Resolved source transactions, kept so a late request can still be refused. */
     private final BitSet completedTransactions = new BitSet();
     /** Requests not yet answered, failed on close. */
     private final Set<Task> open = ConcurrentHashMap.newKeySet();
     /** Actions waiting for a version to be published, by that version. */
     private final TreeMap<Long, List<Consumer<Effects>>> waiting = new TreeMap<>();
-    private final TreeMap<Long, Commit> commits = new TreeMap<>();
+    private final TreeMap<Long, Marker> commits = new TreeMap<>();
     private final Map<Long, Long> applied = new HashMap<>();
     private final Map<Long, Long> active = new HashMap<>();
     private final Map<Long, Long> owners = new HashMap<>();
@@ -63,6 +62,19 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
     private boolean closed;
     private final Object flushLock = new Object();
     private IOException flushFailure;
+
+    private record Marker(long version, long writes, long operations, boolean aborted, boolean ready) {
+        static Marker from(Request request) {
+            if (request.hasAbort()) {
+                var end = request.getAbort();
+                return new Marker(end.getVersion(), end.getWrites(), end.getOperations(), true, false);
+            }
+            var end = request.getCommit();
+            return new Marker(end.getVersion(), end.getWrites(), end.getOperations(), false, true);
+        }
+
+        Marker resolved() { return new Marker(version, writes, operations, aborted, true); }
+    }
 
     public PublishedIndex(IndexBackend backend) throws IOException {
         this.backend = backend;
@@ -113,7 +125,8 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
 
         void dispatch(Request request, Runnable call) {
             var pool = request.getOperationCase() == Request.OperationCase.WRITE
-                    || request.getOperationCase() == Request.OperationCase.BATCH ? workers : readers;
+                    || request.getOperationCase() == Request.OperationCase.BATCH
+                    || request.hasAbort() ? workers : readers;
             actions.add(
                     () -> {
                         try {
@@ -192,7 +205,7 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
                     lane(request.getTransactionId()).add(task, first.getLocalVersion(), effects);
                 }
             }
-            case COMMIT -> {
+            case COMMIT, ABORT -> {
                 requireTransaction(request);
                 lane(request.getTransactionId()).commit(task, effects);
             }
@@ -241,7 +254,7 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
         if (transaction < 1 || transaction > Integer.MAX_VALUE - 8)
             throw new IOException("Transaction id is outside the supported range");
         if (completedTransactions.get((int) transaction))
-            throw new IOException("Transaction already committed");
+            throw new IOException("Transaction already resolved");
         return lanes.computeIfAbsent(transaction, Lane::new);
     }
 
@@ -332,7 +345,6 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
         private final TreeMap<Long, Task> pending = new TreeMap<>();
         private long version;
         private long total = -1;
-        private long declaredWrites = -1;
         /** The next operation to execute; every lower one has been applied. */
         private long next = 1;
         private boolean executing, parked, committing;
@@ -363,18 +375,17 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
         void commit(Task task, Effects effects) throws IOException {
             if (failure != null) throw failure;
             if (commit != null) throw new IOException("Repeated commit marker for the transaction");
-            Commit marker = task.request.getCommit();
-            if (version != 0 && version != marker.getVersion())
+            Marker marker = Marker.from(task.request);
+            if (version != 0 && version != marker.version())
                 throw new IOException("Transaction version differs from its writes");
-            if (marker.getOperations() < next - 1)
+            if (marker.operations() < next - 1)
                 throw new IOException("Commit has fewer operations than already applied");
-            if (marker.getOperations() < marker.getWrites())
+            if (marker.operations() < marker.writes())
                 throw new IOException("More writes than operations in a transaction");
-            if (!pending.isEmpty() && pending.lastKey() > marker.getOperations())
+            if (!pending.isEmpty() && pending.lastKey() > marker.operations())
                 throw new IOException("Operation beyond the committed transaction count");
-            version = marker.getVersion();
-            total = marker.getOperations();
-            declaredWrites = marker.getWrites();
+            version = marker.version();
+            total = marker.operations();
             commit = task;
             pump(effects);
         }
@@ -400,6 +411,14 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
                 return;
             }
             pending.remove(next);
+            long local = head.request.hasSearch() ? head.request.getSearch().getLocalVersion()
+                    : head.request.hasGroup() ? head.request.getGroup().getMembers(0).getLocalVersion() : 0;
+            if (local > 0 && !Long.valueOf(transaction).equals(owners.get(local))) {
+                var refused = new IOException("Transaction-local read does not own its provisional version");
+                effects.respond(head, failure(head.request, refused));
+                fail(refused, effects);
+                return;
+            }
             if (head.request.getOperationCase() == Request.OperationCase.WRITE) {
                 try {
                     reserve(head.request.getWrite().getVersion(), transaction);
@@ -430,8 +449,9 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
         /** Every operation is applied: register the marker and answer it once published. */
         private void publish(Effects effects) {
             committing = true;
+            Marker marker = Marker.from(commit.request);
             try {
-                registerCommit(version, transaction, declaredWrites, total);
+                registerCommit(marker, transaction);
             } catch (IOException refused) {
                 effects.respond(commit, failure(commit.request, refused));
                 return;
@@ -444,7 +464,26 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
                         ready.respond(commit, ok(commit.request, null));
                     },
                     effects);
-            publishReady(effects);
+            if (marker.aborted()) effects.dispatch(commit.request, () -> abortVersion(marker));
+            else publishReady(effects);
+        }
+
+        private void abortVersion(Marker marker) {
+            Throwable error = null;
+            try { backend.abort(marker.version()); }
+            catch (IOException | RuntimeException failed) { error = failed; }
+            var effects = new Effects();
+            synchronized (PublishedIndex.this) {
+                if (closed) return;
+                if (error == null) {
+                    commits.put(marker.version(), marker.resolved());
+                    publishReady(effects);
+                } else {
+                    failure = new IOException("Abort could not become durable", error);
+                    effects.respond(commit, failure(commit.request, failure));
+                }
+            }
+            effects.apply();
         }
 
         private void fail(IOException error, Effects effects) {
@@ -470,8 +509,9 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
 
     // ---- publication: commit markers, write ownership and applied-write counts ----
 
-    private void registerCommit(long version, long transaction, long writes, long operations)
+    private void registerCommit(Marker marker, long transaction)
             throws IOException {
+        long version = marker.version(), writes = marker.writes();
         if (version < 1) throw new IOException("Commit version must be positive");
         if (commits.containsKey(version))
             throw new IOException("Repeated commit marker for version " + version);
@@ -481,14 +521,8 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
         if (owner != null && owner != transaction)
             throw new IOException("Commit marker changes the version's transaction");
         long used = applied.getOrDefault(version, 0L) + active.getOrDefault(version, 0L);
-        if (used > writes) throw new IOException("Commit declares fewer writes than were accepted");
-        commits.put(
-                version,
-                Commit.newBuilder()
-                        .setVersion(version)
-                        .setWrites(writes)
-                        .setOperations(operations)
-                        .build());
+        if (used != writes) throw new IOException("Terminal marker write count differs from applied operations");
+        commits.put(version, marker);
     }
 
     /**
@@ -502,10 +536,10 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
         Long owner = owners.putIfAbsent(version, transaction);
         if (owner != null && owner != transaction)
             throw new IOException("Write belongs to another transaction's version");
-        Commit commit = commits.get(version);
+        Marker commit = commits.get(version);
         if (commit != null
                 && applied.getOrDefault(version, 0L) + active.getOrDefault(version, 0L)
-                        >= commit.getWrites())
+                        >= commit.writes())
             throw new IOException("Write exceeds the committed write count");
         active.merge(version, 1L, Long::sum);
     }
@@ -531,11 +565,11 @@ public final class PublishedIndex implements AutoCloseable, IndexExecution.Execu
     private void publishReady(Effects effects) {
         boolean advanced = false;
         while (active.getOrDefault(nextVersion, 0L) == 0) {
-            Commit commit = commits.get(nextVersion);
-            if (commit == null) break;
+            Marker commit = commits.get(nextVersion);
+            if (commit == null || !commit.ready()) break;
             long writes = applied.getOrDefault(nextVersion, 0L);
             // A count above the declaration is refused by reserve(); equality publishes.
-            if (writes < commit.getWrites()) break;
+            if (writes < commit.writes()) break;
             published = nextVersion;
             commits.remove(nextVersion);
             applied.remove(nextVersion);

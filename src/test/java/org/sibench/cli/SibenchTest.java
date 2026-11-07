@@ -41,7 +41,8 @@ public class SibenchTest {
             {"inspect-scale", "--root"},
             {"inspect-scale", "--unknown"},
             {"generate"},
-            {"generate", "--help"},
+            {"unknown-command", "--help"},
+            {"generate", "missing-config.yaml"},
             {"replay", "config/sibench.yaml"},
             {"check-replay", "config/sibench.yaml", "missing-trace"},
             {"replay", "--repeat", "2"},
@@ -108,13 +109,16 @@ public class SibenchTest {
     }
 
     @Test
-    public void rejectsRetiredPrepareCommand() {
-        var output = new ByteArrayOutputStream();
-        var errors = new ByteArrayOutputStream();
-        try (var out = new PrintStream(output); var err = new PrintStream(errors)) {
-            assertEquals(1, Sibench.run(new String[] {"prepare", "--help"}, out, err));
-            assertEquals(0, output.size());
-            assertTrue(errors.toString(StandardCharsets.UTF_8).contains("Unknown command: prepare"));
+    public void rejectsRetiredGenerationCommandsEvenForHelp() {
+        for(String command:new String[]{"prepare","postgres-config","check-schema","audit-rows",
+                "audit-baseline","access-ledger","compare-ledgers","snapshot-index-counters","check-capture-completeness"}) {
+            var output = new ByteArrayOutputStream();
+            var errors = new ByteArrayOutputStream();
+            try (var out = new PrintStream(output); var err = new PrintStream(errors)) {
+                assertEquals(1, Sibench.run(new String[] {command, "--help"}, out, err));
+                assertEquals(0, output.size());
+                assertTrue(errors.toString(StandardCharsets.UTF_8).contains("Unknown command: " + command));
+            }
         }
     }
 

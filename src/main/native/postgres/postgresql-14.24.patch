@@ -29,17 +29,17 @@
  		}
  	}
  	else
-@@ -2191,6 +2200,10 @@
+@@ -2190,6 +2199,10 @@
+ 		Page		dp = (Page) BufferGetPage(buffer);
  		OffsetNumber maxoff = PageGetMaxOffsetNumber(dp);
  		OffsetNumber offnum;
- 
++
 +		/* A lossy page has no candidate TIDs to attribute to an index. */
 +		if (sibench_bitmap_heap_node)
 +			sib_bitmap_lossy(scan->rs_rd, sibench_bitmap_heap_node);
-+
+ 
  		for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum = OffsetNumberNext(offnum))
  		{
- 			ItemId		lp;
 --- a/src/backend/access/index/indexam.c
 +++ b/src/backend/access/index/indexam.c
 @@ -42,6 +42,7 @@
@@ -206,15 +206,15 @@
  	MemoryContextSwitchTo(oldcontext);
  }
  
-@@ -464,6 +469,8 @@
+@@ -463,6 +468,8 @@
+ {
  	EState	   *estate;
  	MemoryContext oldcontext;
- 
-+	sib_executor_end(queryDesc->estate->es_processed);
 +
++	sib_executor_end(queryDesc->estate->es_processed);
+ 
  	/* sanity checks */
  	Assert(queryDesc != NULL);
- 
 --- a/src/backend/executor/nodeBitmapHeapscan.c
 +++ b/src/backend/executor/nodeBitmapHeapscan.c
 @@ -34,6 +34,7 @@
@@ -229,13 +229,15 @@
  				 * node->return_empty_tuples.
  				 */
  				node->return_empty_tuples = tbmres->ntuples;
-+				sib_bitmap_skipped(node, tbmres);
- 			}
+-			}
 -			else if (!table_scan_bitmap_next_block(scan, tbmres))
-+			else
- 			{
+-			{
 -				/* AM doesn't think this block is valid, skip */
 -				continue;
++				sib_bitmap_skipped(node, tbmres);
++			}
++			else
++			{
 +				volatile bool valid = false;
 +
 +				sibench_bitmap_heap_node = node;
@@ -338,16 +340,16 @@
  		 * If no run-time keys to calculate or they are ready, go ahead and
 --- a/src/backend/Makefile
 +++ b/src/backend/Makefile
-@@ -50,6 +50,9 @@
+@@ -49,6 +49,9 @@
+ 
  # The backend doesn't need everything that's in LIBS, however
  LIBS := $(filter-out -lz -lreadline -ledit -ltermcap -lncurses -lcurses, $(LIBS))
- 
++
 +# SIBench capture traces can be written as zstd streams (access/index/sibench_capture.c).
 +LIBS += -lzstd
-+
+ 
  ifeq ($(with_systemd),yes)
  LIBS += -lsystemd
- endif
 --- a/src/backend/nodes/tidbitmap.c
 +++ b/src/backend/nodes/tidbitmap.c
 @@ -37,6 +37,7 @@
@@ -369,12 +371,13 @@
  	{
 --- a/src/backend/storage/lmgr/proc.c
 +++ b/src/backend/storage/lmgr/proc.c
-@@ -389,0 +390,5 @@
+@@ -389,0 +390,6 @@
 +	MyProc->sibenchCaptureDirect = false;
 +	MyProc->sibenchCaptureProduced = 0;
 +	MyProc->sibenchCaptureCsn = 0;
 +	MyProc->sibenchCaptureAcked = 0;
 +	MyProc->sibenchCaptureAckCsn = 0;
++	MyProc->sibenchCaptureConsumed = 0;
 --- a/src/backend/storage/ipc/procarray.c
 +++ b/src/backend/storage/ipc/procarray.c
 @@ -787,6 +787,13 @@
@@ -421,7 +424,7 @@
  	if (serialized_snapshot.xcnt > 0)
 --- a/src/include/storage/proc.h
 +++ b/src/include/storage/proc.h
-@@ -265,6 +265,18 @@
+@@ -265,6 +265,19 @@
  	PGPROC	   *lockGroupLeader;	/* lock group leader, if I'm a member */
  	dlist_head	lockGroupMembers;	/* list of members, if I'm a leader */
  	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
@@ -437,6 +440,7 @@
 +	uint64		sibenchCaptureCsn;
 +	uint64		sibenchCaptureAcked;
 +	uint64		sibenchCaptureAckCsn;
++	uint64		sibenchCaptureConsumed;
  };
  
  /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */
@@ -484,7 +488,7 @@
  
  #include <ctype.h>
  #include <fcntl.h>
-@@ -1200,6 +1201,9 @@
+@@ -1202,6 +1203,9 @@
  	/* Make sure we've killed any active transaction */
  	AbortOutOfAnyTransaction();
  

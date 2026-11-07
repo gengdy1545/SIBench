@@ -16,34 +16,36 @@ public class NativeClientParsingTest {
     @Rule public TemporaryFolder folder = new TemporaryFolder();
 
     @Test
-    public void sourceFailureStopsTheNativeClientWithoutReplacingItsCause() throws Exception {
+    public void timeoutStopsTheNativeClientAndKeepsItsDiagnostics() throws Exception {
         Path root = folder.newFolder().toPath(), pid = root.resolve("client.pid");
-        var cause = new java.io.IOException("controlled source failure");
-        var worker = java.util.concurrent.Executors.newSingleThreadExecutor();
-        try (var run = CaptureRun.beginExternal(root.resolve("source"), "failure_probe")) {
-            var failure = worker.submit(() -> {
-                long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
-                while (!Files.exists(pid) && System.nanoTime() < deadline) Thread.yield();
-                if (!Files.exists(pid)) throw new AssertionError("Native client did not start");
-                run.fail(cause, Map.of("stage", "source_probe"));
-            });
-            long started = System.nanoTime();
-            var error = assertThrows(java.io.IOException.class, () -> NativeProcess.run("blocked",
-                    List.of("/bin/sh", "-c", "echo $$ > \"$1\"; exec sleep 30", "failure-probe", pid.toString()),
-                    Map.of(), root, root.resolve("logs"), java.time.Duration.ofSeconds(10)));
-            assertSame(cause, error);
-            failure.get(3, java.util.concurrent.TimeUnit.SECONDS);
-            assertTrue(System.nanoTime() - started < java.util.concurrent.TimeUnit.SECONDS.toNanos(3));
-            var child = ProcessHandle.of(Long.parseLong(Files.readString(pid).strip()));
-            if (child.isPresent()) child.get().onExit().get(3, java.util.concurrent.TimeUnit.SECONDS);
-            assertFalse(child.isPresent() && child.get().isAlive());
-        } finally { worker.shutdownNow(); }
+        long started = System.nanoTime();
+        var error = assertThrows(IOException.class, () -> NativeProcess.run("blocked",
+                List.of("/bin/sh", "-c", "echo $$ > \"$1\"; echo started; exec sleep 30", "timeout-probe", pid.toString()),
+                Map.of(), root, root.resolve("logs"), java.time.Duration.ofMillis(500)));
+        assertTrue(error.getMessage().contains("timed out: blocked"));
+        assertTrue(System.nanoTime() - started < java.util.concurrent.TimeUnit.SECONDS.toNanos(3));
+        assertEquals("started\n", Files.readString(root.resolve("logs/blocked.out")));
+        var child = ProcessHandle.of(Long.parseLong(Files.readString(pid).strip()));
+        if (child.isPresent()) child.get().onExit().get(3, java.util.concurrent.TimeUnit.SECONDS);
+        assertFalse(child.isPresent() && child.get().isAlive());
+    }
+
+    @Test
+    public void captureFailureStopsTheClientBeforeItsExecutionTimeout()throws Exception {
+        Path root=folder.newFolder().toPath();var failure=new IOException("capture failed");
+        var calls=new java.util.concurrent.atomic.AtomicInteger();long started=System.nanoTime();
+        var actual=assertThrows(IOException.class,()->NativeProcess.run("capture-failure",List.of("sleep","30"),
+                Map.of(),root,root.resolve("logs"),java.time.Duration.ofSeconds(30),()->{
+                    if(calls.incrementAndGet()>1)throw failure;
+                }));
+        assertSame(failure,actual);
+        assertTrue(System.nanoTime()-started<java.util.concurrent.TimeUnit.SECONDS.toNanos(3));
     }
 
     @Test
     public void readsYcsbOperationCountsAndIgnoresLatencies() {
         var parsed =
-                YcsbNativeRun.parse(
+                YcsbSummary.parse(
                         """
                         [OVERALL], RunTime(ms), 1500
                         [OVERALL], Throughput(ops/sec), 666.6666666666666
@@ -67,7 +69,7 @@ public class NativeClientParsingTest {
     @Test
     public void readsSysbenchCountersFromTheSqlStatisticsBlockOnly() {
         var parsed =
-                SysbenchNativeRun.parse(
+                SysbenchSummary.parse(
                         """
                         sysbench 1.1.0 (using bundled LuaJIT 2.1.0-beta3)
 
@@ -96,52 +98,11 @@ public class NativeClientParsingTest {
     }
 
     @Test
-    public void readsTheWorkloadThePinnedFileDeclares() throws Exception {
-        Path workloads = Path.of("benchmark/YCSB/workloads");
-        var a = YcsbNativeRun.declaration(workloads, 10, "workloada");
-        assertEquals("workloada", a.get("workload_file"));
-        @SuppressWarnings("unchecked")
-        var proportions = (Map<String, Double>) a.get("proportions");
-        assertEquals(0.5, proportions.get("read"), 0.0);
-        assertEquals(0.5, proportions.get("update"), 0.0);
-        assertEquals(0.0, proportions.get("insert"), 0.0);
-        assertEquals(0.0, proportions.get("scan"), 0.0);
-        assertEquals(0.0, proportions.get("read_modify_write"), 0.0);
-        assertEquals("zipfian", a.get("request_distribution"));
-        assertEquals(10L, a.get("fields_per_record"));
-        assertEquals(1L, a.get("fields_written_per_update"));
-        assertEquals(Boolean.TRUE, a.get("read_all_fields"));
-        // The scan bound of workload E, and the non-atomic read-modify-write of workload F.
-        var e = YcsbNativeRun.declaration(workloads, 10, "workloade");
-        assertEquals(100L, e.get("max_scan_length"));
-        assertEquals("uniform", e.get("scan_length_distribution"));
-        assertEquals(0.95, ((Map<String, Double>) e.get("proportions")).get("scan"), 0.0);
-        assertEquals(0.05, ((Map<String, Double>) e.get("proportions")).get("insert"), 0.0);
-        var f = YcsbNativeRun.declaration(workloads, 10, "workloadf");
-        assertEquals(Boolean.FALSE, f.get("read_modify_write_atomic"));
-        assertEquals(0.5, ((Map<String, Double>) f.get("proportions")).get("read_modify_write"), 0.0);
-        assertEquals("latest", YcsbNativeRun.declaration(workloads, 10, "workloadd")
-                .get("request_distribution"));
-        assertTrue(
-                assertThrows(
-                                IOException.class,
-                                () -> YcsbNativeRun.declaration(workloads, 10, "workloadz"))
-                        .getMessage()
-                        .contains("Unknown YCSB workload"));
-        assertTrue(
-                assertThrows(
-                                IOException.class,
-                                () -> YcsbNativeRun.declaration(workloads, 10, "../workloada"))
-                        .getMessage()
-                        .contains("Unknown YCSB workload"));
-    }
-
-    @Test
     public void observedOperationsSeparateTheReadAndUpdateOfAReadModifyWrite() {
         // DBWrapper measures every db.read / db.update, so workload F counts each RMW twice.
         var observed =
-                YcsbNativeRun.observed(
-                        YcsbNativeRun.parse(
+                YcsbSummary.observed(
+                        YcsbSummary.parse(
                                 """
                                 [READ], Operations, 150
                                 [UPDATE], Operations, 50
@@ -154,8 +115,8 @@ public class NativeClientParsingTest {
         assertEquals(
                 200L,
                 (long)
-                        YcsbNativeRun.observed(
-                                        YcsbNativeRun.parse(
+                        YcsbSummary.observed(
+                                        YcsbSummary.parse(
                                                 """
                                                 [SCAN], Operations, 190
                                                 [INSERT], Operations, 10
@@ -164,41 +125,25 @@ public class NativeClientParsingTest {
     }
 
     @Test
-    public void theDeclaredProportionsAreCrossCheckedAgainstTheServerObservedOnes() throws Exception {
-        Path workloads = Path.of("benchmark/YCSB/workloads");
-        var declared = YcsbNativeRun.declaration(workloads, 10, "workloada");
-        YcsbNativeRun.requireDeclared(
-                "workloada",
-                declared,
-                Map.of("read", 300L, "update", 300L, "insert", 0L, "scan", 0L,
-                        "read_modify_write", 0L, "total", 600L));
-        // Workload C reads only: an update would contradict the pinned file.
-        var c = YcsbNativeRun.declaration(workloads, 10, "workloadc");
-        assertTrue(
-                assertThrows(
-                                IOException.class,
-                                () ->
-                                        YcsbNativeRun.requireDeclared(
-                                                "workloadc",
-                                                c,
-                                                Map.of("read", 999L, "update", 1L, "insert", 0L,
-                                                        "scan", 0L, "read_modify_write", 0L,
-                                                        "total", 1000L)))
-                        .getMessage()
-                        .contains("declares no update"));
-        // Sampling is loose, but not this loose.
-        assertTrue(
-                assertThrows(
-                                IOException.class,
-                                () ->
-                                        YcsbNativeRun.requireDeclared(
-                                                "workloada",
-                                                declared,
-                                                Map.of("read", 550L, "update", 50L, "insert", 0L,
-                                                        "scan", 0L, "read_modify_write", 0L,
-                                                        "total", 600L)))
-                        .getMessage()
-                        .contains("declares a read proportion"));
+    public void failedYcsbCallsStillCountTowardSourceCompleteness() {
+        var measured=YcsbSummary.parse("""
+                [READ], Operations, 491
+                [UPDATE], Operations, 491
+                [UPDATE-FAILED], Operations, 18
+                [UPDATE], Return=OK, 491
+                [UPDATE], Return=ERROR, 18
+                [CLEANUP], Operations, 32
+                """);
+        assertEquals(509,YcsbSummary.operations(measured,"UPDATE"));
+        assertEquals(1000,(long)YcsbSummary.observed(measured).get("total"));
+        var rmw=YcsbSummary.parse("""
+                [READ], Operations, 100
+                [UPDATE], Operations, 95
+                [UPDATE-FAILED], Operations, 5
+                [READ-MODIFY-WRITE], Operations, 100
+                """);
+        assertEquals(100,(long)YcsbSummary.observed(rmw).get("total"));
+        assertEquals(0,(long)YcsbSummary.observed(rmw).get("update"));
     }
 
     @Test
@@ -209,7 +154,11 @@ public class NativeClientParsingTest {
         Files.writeString(pinned.resolve("src/lua/a.lua"), "print(1)\n");
         Files.writeString(pinned.resolve("src/lua/notes.txt"), "ignored\n");
         Files.writeString(build.resolve("src/lua/a.lua"), "print(1)\n");
+        index(pinned);
         NativeBuildCheck.require(pinned, build, List.of("src/lua"));
+        Files.createDirectories(pinned.resolve("target"));
+        Files.writeString(pinned.resolve("target/checkstyle-checker.xml"), "generated, not a pinned source");
+        NativeBuildCheck.require(pinned, build, List.of("."));
         Files.writeString(build.resolve("src/lua/a.lua"), "print(2)\n");
         assertTrue(
                 assertThrows(
@@ -223,6 +172,8 @@ public class NativeClientParsingTest {
         // A single pinned file is compared too.
         Files.writeString(pinned.resolve("src/one.c"), "int x;\n");
         Files.writeString(build.resolve("src/one.c"), "int x;\n");
+        Files.delete(pinned.resolve("target/checkstyle-checker.xml"));
+        index(pinned);
         NativeBuildCheck.require(pinned, build, List.of("src/one.c"));
     }
     @Test
@@ -234,18 +185,30 @@ public class NativeClientParsingTest {
         Files.createDirectories(build.resolve("src"));
         Files.writeString(pinned.resolve("src/a.c"), "int main() { return 0; }\n");
         Files.copy(pinned.resolve("src/a.c"), build.resolve("src/a.c"));
-        Path patch = folder.getRoot().toPath().resolve("scripts/patches/sysbench-1.1.0-stop.patch");
+        index(pinned);
+        Path patch = folder.getRoot().toPath().resolve("scripts/patches/sysbench-1.1.0.patch");
         Files.createDirectories(patch.getParent());
         Files.writeString(patch, "--- a/src/a.c\n+++ b/src/a.c\n@@ -1 +1 @@\n"
                 + "-int main() { return 0; }\n+int main() { return 1; }\n");
         Files.writeString(build.resolve("src/a.c"), "int main() { return 1; }\n");
         Path executable = build.resolve("src/sysbench");
         Files.writeString(executable, "compiled client");
+        Path driver = folder.getRoot().toPath().resolve("src/main/native/sysbench/drv_duckdb.cc");
+        Files.createDirectories(driver.getParent()); Files.writeString(driver, "driver source");
+        Files.createDirectories(build.resolve("src/drivers/duckdb"));
+        Files.copy(driver, build.resolve("src/drivers/duckdb/drv_duckdb.cc"));
+        Path retry = driver.resolveSibling("retryable_error.hpp"); Files.writeString(retry, "retry policy");
+        Files.copy(retry, build.resolve("src/drivers/duckdb/retryable_error.hpp"));
+        Path errorTypes = folder.getRoot().toPath().resolve("third_party/duckdb/src/include/duckdb/common/exception.hpp");
+        Files.createDirectories(errorTypes.getParent()); Files.writeString(errorTypes, "error types");
         assertTrue(executable.toFile().setExecutable(true));
         assertThrows(IOException.class, () -> NativeBuildCheck.verify(
                 folder.getRoot().toPath(), "sysbench", pinned, build, "source-identity"));
         var manifest = Map.of("benchmark", "sysbench", "source_commit", "source-identity",
                 "native_stop_patch_sha256", FileDigests.sha256(patch),
+                "duckdb_driver_sha256", FileDigests.sha256(driver),
+                "duckdb_retry_policy_sha256", FileDigests.sha256(retry),
+                "duckdb_error_types_sha256", FileDigests.sha256(errorTypes),
                 "artifacts", Map.of("src/sysbench", FileDigests.sha256(executable)));
         Files.writeString(build.resolve("native-build.json"), new com.google.gson.Gson().toJson(manifest));
         NativeBuildCheck.verify(folder.getRoot().toPath(), "sysbench", pinned, build, "source-identity");
@@ -253,26 +216,18 @@ public class NativeClientParsingTest {
         assertThrows(IOException.class, () -> NativeBuildCheck.verify(
                 folder.getRoot().toPath(), "sysbench", pinned, build, "source-identity"));
         Files.writeString(build.resolve("src/a.c"), "int main() { return 1; }\n");
-        var nativeConfig = new java.util.LinkedHashMap<String, Object>();
-        nativeConfig.put("build_directory", "build/benchmarks/sysbench");
-        nativeConfig.put("binary", "src/sysbench");
-        var config = new NativeCaptureConfig(folder.getRoot().toPath(), "sysbench", null, null,
-                "test", 5432, "postgres", null,
-                Map.of("source", Map.of("path", "pinned-binary", "commit", "source-identity")), nativeConfig);
-        assertEquals(executable, SysbenchNativeRun.binary(config));
-        Path substitute = build.resolve("another-client");
-        Files.copy(executable, substitute);
-        assertTrue(substitute.toFile().setExecutable(true));
-        for (String selected : List.of("another-client", "/usr/bin/true", "../../../pinned-binary/client")) {
-            nativeConfig.put("binary", selected);
-            assertTrue(assertThrows(IOException.class, () -> SysbenchNativeRun.binary(config))
-                    .getMessage().contains("not part of the verified native build"));
-        }
-        nativeConfig.put("binary", executable.toString());
-        assertEquals(executable, SysbenchNativeRun.binary(config));
         Files.writeString(executable, "#!/bin/sh\nexit 0\n");
-        assertTrue(assertThrows(IOException.class, () -> SysbenchNativeRun.binary(config))
+        assertTrue(assertThrows(IOException.class, () -> NativeBuildCheck.verify(
+                folder.getRoot().toPath(), "sysbench", pinned, build, "source-identity"))
                 .getMessage().contains("differs from its recorded build"));
+    }
+
+    private static void index(Path directory)throws Exception {
+        for(var arguments:List.of(List.of("git","-C",directory.toString(),"init","-q"),
+                List.of("git","-C",directory.toString(),"add","."))) {
+            var process=new ProcessBuilder(arguments).redirectErrorStream(true).start();
+            assertTrue(process.waitFor(5,java.util.concurrent.TimeUnit.SECONDS));assertEquals(0,process.exitValue());
+        }
     }
 
     @Test

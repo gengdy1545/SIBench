@@ -24,7 +24,7 @@ public final class ReferenceReplay {
 
     public static Map<String, Object> run(Path directory, ReplayConfig config, Path report)
             throws IOException {
-        return run(directory, config, List.of(false, true), report);
+        return run(directory, config, modes(directory), report);
     }
 
     /** {@code rowIdModes}: the value modes to replay, as row-id flags, in report order. */
@@ -37,7 +37,15 @@ public final class ReferenceReplay {
     /** Explicit matrix diagnostics also scan the complete final primary state. */
     static Map<String, Object> audit(Path directory, ReplayConfig config, Path report)
             throws IOException {
-        return runDirectory(directory, config, List.of(false, true), report, true);
+        return runDirectory(directory, config, modes(directory), report, true);
+    }
+
+    private static List<Boolean> modes(Path directory) throws IOException {
+        var declared = TraceManifest.read(directory).getAsJsonArray("value_kinds");
+        var modes = new ArrayList<Boolean>();
+        for (boolean rowIds : new boolean[]{false, true})
+            if (declared.contains(new com.google.gson.JsonPrimitive(rowIds ? "row_id" : "locator"))) modes.add(rowIds);
+        return List.copyOf(modes);
     }
 
     private static Map<String, Object> runDirectory(
@@ -45,6 +53,9 @@ public final class ReferenceReplay {
             boolean auditState) throws IOException {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
         var manifest = TraceManifest.read(directory);
+        for (boolean rowIds : rowIdModes)
+            TraceManifest.requireValue(directory, rowIds ? org.sibench.adapters.proto.ValueKind.ROW_ID
+                    : org.sibench.adapters.proto.ValueKind.LOCATOR);
         var input = prepare(directory, config);
         return runChecked(
                 input.baseline(),
@@ -112,11 +123,11 @@ public final class ReferenceReplay {
                 "scope",
                 "single-sender multi-client in-process correctness reference; clients share"
                     + " reference service state; not a network or cross-client visibility"
-                    + " implementation; committed-source version history and timestamp lookup,"
+                    + " implementation; resolved-source version history and timestamp lookup,"
                     + " ordered point/range/limited scans, pinned entries and intersection/union"
                     + " search groups over order-preserving keys of the complete declared source"
-                    + " indexes; no RPC, persistence, concurrent PG"
-                    + " MVCC, physical GC, rate scheduling or sustained-duration proof");
+                    + " indexes, including reads before Abort and exclusion of aborted writes;"
+                    + " no RPC, persistence, concurrent MVCC, physical GC, rate scheduling or sustained-duration proof");
         Files.writeString(
                 report,
                 new GsonBuilder().setPrettyPrinting().create().toJson(output),

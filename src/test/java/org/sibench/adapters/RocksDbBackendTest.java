@@ -299,6 +299,32 @@ public class RocksDbBackendTest {
     }
 
     @Test
+    public void abortedTombstonesAndSecondaryMovesAreSkippedInBothDirections() throws Exception {
+        var path = temporary.getRoot().toPath().resolve("aborted-ranges");
+        try (var backend = RocksDbBackend.create(path, ValueKind.ROW_ID)) {
+            put(backend, 1, 10, 1, 0, 11, false);
+            put(backend, 1, 10, 1, 1, 12, false);
+            put(backend, 1, 10, 1, 2, 12, true);
+            put(backend, 1, 20, 1, 2, 13, false);
+            put(backend, 1, 20, 2, 2, 22, false);
+            put(backend, 1, 10, 1, 3, 14, false);
+            backend.abort(2);
+            backend.abort(3);
+            backend.flush();
+        }
+        try (var backend = RocksDbBackend.open(path, ValueKind.ROW_ID)) {
+            for (boolean descending : new boolean[] {false, true}) {
+                Range all = new Range(null, false, null, false, descending, 0);
+                same("restored secondary", List.of(row(1, 1, 12)),
+                        backend.search(search(1, all, 3)), true);
+                same("aborted local cannot expose the intervening commit", List.of(row(1, 0, 11)),
+                        backend.search(search(1, all, 0).toBuilder().setLocalVersion(3).build()), true);
+            }
+            assertThrows(IllegalArgumentException.class, () -> put(backend, 1, 20, 2, 2, 99, false));
+        }
+    }
+
+    @Test
     public void groupsCombineMembersByPrimaryKey() throws Exception {
         var operations = IndexReferenceSpillTest.stream(true, 4);
         long last = operations.stream().mapToLong(Operation::version).max().orElse(0);

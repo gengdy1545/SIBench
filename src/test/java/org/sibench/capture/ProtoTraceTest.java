@@ -22,6 +22,40 @@ public class ProtoTraceTest {
                 .withTransaction(version == 0 ? 0 : 91, ordinal).withWorkUnitId(1);
     }
 
+    @Test public void limitedSearchCanExhaustItsRangeBeforeTheLimit() throws Exception {
+        var original=List.of(write(IndexOperationTrace.INSERT,1,0,0).withExpansion(0,1),
+                IndexOperationTrace.search(21,1,0,new IndexOperationTrace.Range(IndexKey.ofInt(1),true,null,false,false,3),
+                        0,1,IndexOperationTrace.SNAPSHOT_SEARCH),
+                IndexOperationTrace.search(22,1,0,new IndexOperationTrace.Range(IndexKey.ofInt(2),true,null,false,false,3),
+                        0,0,IndexOperationTrace.SNAPSHOT_SEARCH));
+        Path file=temporary.getRoot().toPath().resolve("short-scans.pb.zst");
+        var writer=new ProtoTrace.Writer(file);
+        try(writer){for(var operation:original)writer.append(operation);}
+        var decoded=new ArrayList<Operation>();
+        ProtoTrace.read(file,writer.sha256(),writer.logicalSha256(),decoded::add);
+        assertEquals(original,decoded);
+        try(var model=new IndexReferenceReplay(true,true,new IndexReferenceReplay.Settings(null,1,1,1024))){
+            for(var operation:decoded)model.accept(operation);
+        }
+    }
+
+    @Test
+    public void abortedWritesAndTheirLocalReadsSurviveEncoding() throws Exception {
+        Path file = temporary.getRoot().toPath().resolve("abort.pb.zst");
+        var original = List.of(
+                IndexOperationTrace.transaction(10, IndexOperationTrace.TRANSACTION_BEGIN, 91, 1, 0),
+                write(IndexOperationTrace.UPSERT, 2, 1, 1).withExpansion(0, 1),
+                IndexOperationTrace.search(13, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)),
+                        0, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
+                        .withTransaction(91, 1).withVersion(1).withWorkUnitId(1),
+                IndexOperationTrace.transaction(14, IndexOperationTrace.TRANSACTION_ABORT, 91, 1, 1));
+        var writer = new ProtoTrace.Writer(file);
+        try (writer) { for (var operation : original) writer.append(operation); }
+        var decoded = new ArrayList<Operation>();
+        ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add);
+        assertEquals(original, decoded);
+    }
+
     @Test
     public void serviceRequestsPreserveLocalReadsGroupsLocatorsAndDeleteReinsertIdentity() throws Exception {
         Path file = temporary.getRoot().toPath().resolve("trace.pb.zst");
@@ -172,17 +206,6 @@ public class ProtoTraceTest {
         group.append(IndexOperationTrace.search(1, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)),
                 null, 0, 0, IndexOperationTrace.UNION_GROUP, 0, 2).withWorkUnitId(1));
         assertThrows(IOException.class, group::close);
-    }
-
-    @Test
-    public void outputDefaultsToProtoAndRejectsMisspellings() {
-        assertEquals(TraceOutput.PROTO, TraceOutput.from(Map.of("capture", Map.of())));
-        assertEquals(TraceOutput.FULL, TraceOutput.from(Map.of("capture", Map.of("output", "full"))));
-        assertThrows(IllegalArgumentException.class,
-                () -> TraceOutput.from(Map.of("capture", Map.of("output", "all"))));
-        for (String name : List.of("trace", "baseline", "native", ""))
-            assertThrows(IllegalArgumentException.class, () -> TraceOutput.checkPaths(
-                    Map.of("capture", Map.of()), Path.of("artifacts"), Path.of("artifacts").resolve(name)));
     }
 
     @Test

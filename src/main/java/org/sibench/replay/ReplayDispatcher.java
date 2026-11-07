@@ -114,8 +114,8 @@ public final class ReplayDispatcher implements AutoCloseable {
     private final Map<Integer, long[]> counts = new TreeMap<>();
     private final Map<Long, Pending> inFlight = new LinkedHashMap<>();
     private final Map<CompletableFuture<Void>, Pending> baselineResponses = new IdentityHashMap<>();
-    private final Latency writeLatency = new Latency(), searchLatency = new Latency(), commitLatency = new Latency();
-    private long sent, completed, workUnitCount, peakInFlight, orderChecksum, backpressureNanos, commitMarkers;
+    private final Latency writeLatency = new Latency(), searchLatency = new Latency(), commitLatency = new Latency(), abortLatency = new Latency();
+    private long sent, completed, workUnitCount, peakInFlight, orderChecksum, backpressureNanos, commitMarkers, abortMarkers;
     private long inFlightMembers, peakCompletionGroups;
     private IOException failure;
     private CompletableFuture<Void> localSend;
@@ -146,6 +146,7 @@ public final class ReplayDispatcher implements AutoCloseable {
                 writeLatency.reset();
                 searchLatency.reset();
                 commitLatency.reset();
+                abortLatency.reset();
             }
     }
 
@@ -327,8 +328,8 @@ public final class ReplayDispatcher implements AutoCloseable {
         }
     }
 
-    /** Sends one complete-commit marker after its transaction's operations, on the control client. */
-    public void sendCommit(long transactionId, long version) throws IOException {
+    /** Sends the terminal marker after its transaction's operations, on the control client. */
+    public void sendTerminal(long transactionId, long version, boolean aborted) throws IOException {
         checkSender();
         int clientId = 0;
         long started = System.nanoTime();
@@ -350,7 +351,8 @@ public final class ReplayDispatcher implements AutoCloseable {
                     System.nanoTime() + TimeUnit.SECONDS.toNanos(config.requestTimeoutSeconds());
             beginCall(System.nanoTime());
             ReplayTarget.SendHandle handle =
-                    Objects.requireNonNull(client.sendCommit(sequence, transactionId, version));
+                    Objects.requireNonNull(aborted ? client.sendAbort(sequence, transactionId, version)
+                            : client.sendCommit(sequence, transactionId, version));
             localSend = handle.sent().toCompletableFuture();
             CompletableFuture<Void> response = handle.response().toCompletableFuture();
             synchronized (inFlight) {
@@ -359,7 +361,7 @@ public final class ReplayDispatcher implements AutoCloseable {
                         new Pending(
                                 deadline,
                                 response,
-                                "client " + clientId + ", commit marker, transaction "
+                                "client " + clientId + (aborted ? ", abort marker, transaction " : ", commit marker, transaction ")
                                         + transactionId + ", version " + version,
                                 clientId,
                                 null,
@@ -393,7 +395,7 @@ public final class ReplayDispatcher implements AutoCloseable {
                                 else {
                                     completed++;
                                     lastCompletion = System.nanoTime();
-                                    commitLatency.add(lastCompletion - started);
+                                    (aborted ? abortLatency : commitLatency).add(lastCompletion - started);
                                 }
                             }
                             inFlight.notifyAll();
@@ -405,7 +407,8 @@ public final class ReplayDispatcher implements AutoCloseable {
             localSend = null;
             sent++;
             lastSend = System.nanoTime();
-            commitMarkers++;
+            if (aborted) abortMarkers++;
+            else commitMarkers++;
             synchronized (inFlight) {
                 checkFailure();
             }
@@ -477,6 +480,7 @@ public final class ReplayDispatcher implements AutoCloseable {
         report.put("client_routing", "source_work_unit_round_robin");
         report.put("target_calls", sent);
         report.put("commit_markers", commitMarkers);
+        report.put("abort_markers", abortMarkers);
         report.put("operation_order_checksum", orderChecksum);
         report.put("local_send_boundary", "complete_local_transmission_not_service_execution");
         report.put("service_visibility_owner", "index_service");
@@ -491,6 +495,7 @@ public final class ReplayDispatcher implements AutoCloseable {
             report.put("search_latency", searchLatency.describe());
             report.put("write_latency", writeLatency.describe());
             report.put("commit_latency", commitLatency.describe());
+            report.put("abort_latency", abortLatency.describe());
         }
         report.put(
                 "per_client",

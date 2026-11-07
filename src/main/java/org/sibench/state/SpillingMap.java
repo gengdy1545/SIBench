@@ -64,7 +64,7 @@ public final class SpillingMap implements AutoCloseable {
     private final int memoryEntries, fanout;
     private final TreeMap<byte[], byte[]> table = new TreeMap<>(Arrays::compareUnsigned);
     private final List<Run> runs = new ArrayList<>();
-    private ByteBuffer scratch = ByteBuffer.allocate(LOOKUP_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+    private ByteBuffer scratch = ByteBuffer.allocate(0).order(ByteOrder.LITTLE_ENDIAN);
     private boolean directoryCreated;
     private Path resolved;
     private long nextRun, merges, flushes, lookups, runReads;

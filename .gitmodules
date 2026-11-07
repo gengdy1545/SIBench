@@ -16,3 +16,9 @@
 [submodule "index/rocksdb-cloud"]
 	path = index/rocksdb-cloud
 	url = https://github.com/rockset/rocksdb-cloud.git
+[submodule "third_party/duckdb"]
+	path = third_party/duckdb
+	url = https://github.com/duckdb/duckdb.git
+[submodule "third_party/postgresql"]
+	path = third_party/postgresql
+	url = https://github.com/postgres/postgres.git

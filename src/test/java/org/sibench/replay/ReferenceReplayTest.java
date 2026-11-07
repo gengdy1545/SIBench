@@ -57,7 +57,7 @@ public class ReferenceReplayTest {
             var config = new ReplayConfig(false, 1, 2, 0, 0);
             var checked = ReferenceReplayFixture.check(baseline, workload, config);
             assertEquals("trace_integrity_and_supply_valid", checked.get("status"));
-            assertEquals(7L, ((Map<?, ?>) checked.get("workload")).get("last_commit_version"));
+            assertEquals(7L, ((Map<?, ?>) checked.get("workload")).get("last_resolved_version"));
             var result = ReferenceReplayFixture.run(baseline, workload, config, report);
             assertEquals("passed", result.get("status"));
             assertThrows(

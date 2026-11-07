@@ -14,7 +14,7 @@ public class IndexKeyTest {
     }
 
     private static int compareTexts(String a, String b) {
-        // PostgreSQL C collation: memcmp of the UTF-8 bytes, shorter prefix first.
+        // Binary UTF-8 comparison, shorter prefix first.
         return Arrays.compareUnsigned(
                 a.getBytes(java.nio.charset.StandardCharsets.UTF_8),
                 b.getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -57,7 +57,7 @@ public class IndexKeyTest {
     }
 
     @Test
-    public void postgresTextFormsAndNullsLast() throws Exception {
+    public void sourceTextFormsAndNullsLast() throws Exception {
         assertEquals(
                 IndexKey.parse("timestamp", "2024-01-02 03:04:05.5"),
                 IndexKey.parse("timestamp", "2024-01-02T03:04:05.500000"));
@@ -72,8 +72,8 @@ public class IndexKeyTest {
                 IndexKey.parse("timestamp", "infinity")
                                 .compareTo(IndexKey.parse("timestamp", "9999-12-31 23:59:59"))
                         > 0);
-        // bpchar compares without trailing spaces; varchar keeps them.
-        assertEquals(IndexKey.parse("char(5)", "ab   "), IndexKey.parse("bpchar", "ab"));
+        assertThrows(IOException.class, () -> IndexKey.parse("bpchar", "ab"));
+        assertThrows(IOException.class, () -> IndexKey.parse("char(5)", "ab   "));
         assertNotEquals(IndexKey.parse("varchar", "ab "), IndexKey.parse("varchar", "ab"));
         for (String type : List.of("int", "timestamp", "text"))
             assertTrue(IndexKey.NULL.compareTo(IndexKey.parse(type, maximum(type))) > 0);

@@ -13,6 +13,7 @@ import org.sibench.trace.IndexKey;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -25,6 +26,38 @@ import java.util.zip.GZIPInputStream;
 
 public class UpdateLocalityTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
+
+    @Test public void abortedMaintenanceIsExcludedButRawRecordsAndSearchesRemain() throws Exception {
+        var operations = new ArrayList<Operation>();
+        for (long version = 1; version <= 2; version++) {
+            operations.add(IndexOperationTrace.transaction(version, IndexOperationTrace.TRANSACTION_BEGIN, version, version, 0));
+            operations.add(IndexOperationTrace.search(version, 1, 0,
+                    IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), version - 1, 1,
+                    IndexOperationTrace.SNAPSHOT_SEARCH).withTransaction(version, 0).withWorkUnitId(version));
+            var write = IndexOperationTrace.write(version, IndexOperationTrace.UPSERT, 1,
+                    IndexOperationTrace.BUSINESS_UPDATE, IndexKey.ofInt(1), version, 0, 0, 101)
+                    .withTransaction(version, 1).withWorkUnitId(version);
+            org.sibench.capture.IndexMutation.emit(write, Map.of(1, IndexKey.ofInt(10)), Map.of(1, IndexKey.ofInt(10)), operations::add);
+            operations.add(IndexOperationTrace.transaction(version,
+                    version == 1 ? IndexOperationTrace.TRANSACTION_ABORT : IndexOperationTrace.TRANSACTION_COMMIT,
+                    version, version, 1));
+        }
+        var selected = new ArrayList<Operation>();
+        IndexOperationTrace.Source source = consumer -> {
+            for (var operation : operations) consumer.accept(operation);
+            return operations.size();
+        };
+        assertEquals(operations.size(), UpdateLocality.committed(source).read(selected::add));
+        assertEquals(4, selected.stream().filter(IndexOperationTrace::isControl).count());
+        assertEquals(2, selected.stream().filter(operation -> operation.kind() == IndexOperationTrace.SEARCH).count());
+        var writes = selected.stream().filter(IndexOperationTrace::isMutation).toList();
+        assertEquals(2, writes.size());
+        assertTrue(writes.stream().allMatch(write -> write.version() == 2));
+        assertThrows(IOException.class, () -> UpdateLocality.committed(consumer -> {
+            for (var operation : operations.subList(0, operations.size() - 1)) consumer.accept(operation);
+            return operations.size() - 1;
+        }).read(ignored -> {}));
+    }
 
     private static byte[] composite(int value, int key) {
         byte[] prefix = IndexKey.ofInt(value).bytes(), suffix = IndexKey.ofInt(key).bytes();

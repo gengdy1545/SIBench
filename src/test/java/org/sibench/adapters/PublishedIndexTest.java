@@ -165,6 +165,52 @@ public class PublishedIndexTest {
     }
 
     @Test
+    public void abortPreservesLocalReadsButNeverPublishesTheirWrites() throws Exception {
+        Path path = temporary.getRoot().toPath().resolve("aborted");
+        try (var backend = RocksDbBackend.create(path, ValueKind.ROW_ID);
+                var published = new PublishedIndex(backend)) {
+            assertEquals(Status.OK, execute(published, insert(1, 1, 10)).getStatus());
+            // The terminal marker can arrive first; it must wait for the local read.
+            var aborted = published.submit(Request.newBuilder().setId(5).setTransactionId(100)
+                    .setAbort(org.sibench.adapters.proto.Abort.newBuilder()
+                            .setVersion(1).setWrites(2).setOperations(3)).build());
+            assertFalse(aborted.isDone());
+            assertEquals(Status.OK, execute(published, write(2, 100, 1, 1, 1, 11)).getStatus());
+            assertEquals(Status.OK, execute(published, write(3, 100, 2, 2, 1, 20)).getStatus());
+            assertEquals(10, execute(published, search(6, 0)).getResults(0).getValue().getRowId());
+            var local = execute(published, localSearch(4, 100, 3, 0, 1));
+            assertEquals(Status.OK, local.getStatus());
+            assertEquals(List.of(11L, 20L), local.getResultsList().stream()
+                    .map(r -> r.getValue().getRowId()).toList());
+            assertEquals(Status.OK, aborted.get(3, TimeUnit.SECONDS).getStatus());
+            var after = execute(published, search(7, 1));
+            assertEquals(1, after.getResultsCount());
+            assertEquals(10, after.getResults(0).getValue().getRowId());
+            assertEquals(0, after.getResults(0).getVersion());
+            assertEquals(Status.OK, execute(published, write(8, 101, 1, 3, 2, 30)).getStatus());
+            assertEquals(Status.OK, execute(published, commit(9, 101, 2, 1, 1)).getStatus());
+            assertEquals(2, published.flush());
+        }
+        try (var backend = RocksDbBackend.open(path, ValueKind.ROW_ID);
+                var published = new PublishedIndex(backend)) {
+            var after = execute(published, search(10, 2));
+            assertEquals(List.of(10L, 30L), after.getResultsList().stream()
+                    .map(r -> r.getValue().getRowId()).toList());
+        }
+    }
+
+    @Test
+    public void anotherTransactionCannotReadProvisionalWrites() throws Exception {
+        try (var backend = backend(); var published = new PublishedIndex(backend)) {
+            assertEquals(Status.OK, execute(published, write(1, 100, 1, 1, 1, 11)).getStatus());
+            var stolen = execute(published, localSearch(2, 101, 1, 0, 1));
+            assertNotEquals(Status.OK, stolen.getStatus());
+            assertEquals(0, stolen.getResultsCount());
+            assertTrue(execute(published, search(3, 0)).getResultsList().isEmpty());
+        }
+    }
+
+    @Test
     public void readWaitsForTheCompleteCommitMarkerNotForTheHighestSeenVersion() throws Exception {
         try (var backend = backend();
                 var published = new PublishedIndex(backend);
@@ -229,6 +275,9 @@ public class PublishedIndexTest {
             var blocked = new java.util.concurrent.atomic.AtomicBoolean();
             var backend =
                     new IndexBackend() {
+                        @Override
+                        public void abort(long version) throws IOException { delegate.abort(version); }
+
                         @Override
                         public org.sibench.adapters.proto.DescribeResponse describe() {
                             return delegate.describe();
@@ -322,7 +371,10 @@ public class PublishedIndexTest {
             var blocked = new java.util.concurrent.atomic.AtomicBoolean();
             var backend = new IndexBackend() {
                 @Override
-                public org.sibench.adapters.proto.DescribeResponse describe() {
+                public void abort(long version) throws IOException { delegate.abort(version); }
+
+                        @Override
+                        public org.sibench.adapters.proto.DescribeResponse describe() {
                     return delegate.describe();
                 }
 
@@ -542,7 +594,10 @@ public class PublishedIndexTest {
             var failAfter = new java.util.concurrent.atomic.AtomicInteger(-1);
             var backend = new IndexBackend() {
                 @Override
-                public org.sibench.adapters.proto.DescribeResponse describe() {
+                public void abort(long version) throws IOException { delegate.abort(version); }
+
+                        @Override
+                        public org.sibench.adapters.proto.DescribeResponse describe() {
                     return delegate.describe();
                 }
 

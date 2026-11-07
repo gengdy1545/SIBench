@@ -1,12 +1,12 @@
 # Index Service contract
 
-The protocol namespace is `sibench.index`, defined in `src/main/proto/index_service.proto`. The driver and service are built together from the same commit. The service executes operations by transaction position and publishes complete commits as a contiguous sequence, using canonical Trace inputs.
+The protocol namespace is `sibench.index`, defined in `src/main/proto/index_service.proto`. The driver and service are built together from the same commit. The service executes operations by transaction position and resolves committed and aborted transaction slots as a contiguous sequence, using canonical Trace inputs.
 
 ## Interfaces and acknowledgment boundaries
 
 | Interface | Semantics |
 | --- | --- |
-| `Describe` | Declares value types, versioned reads, overwrites at the same version, transaction-local reads, query groups, complete-commit publication, Baseline batch writes, and acknowledgment / Flush durability levels. The driver rejects services that lack complete-commit publication or capabilities required by the input. |
+| `Describe` | Declares value types, versioned reads, overwrites at the same version, transaction-local reads, query groups, complete-commit publication, Abort, Baseline batch writes, and acknowledgment / Flush durability levels. The driver rejects services that lack complete-commit publication or capabilities required by the input. |
 | `Execute` | One bidirectional stream per client. Initial metadata `sibench-index-binding` must carry the binding for this Trace, value mode, and secondary-index configuration. The service checks it and binds the index before accepting requests. Request IDs are unique within a stream; responses match by ID and may complete out of order. Operations within a transaction execute according to `transaction_id` / `transaction_operation`; different transactions may run in parallel. Connection arrival order cannot determine version visibility. |
 | `Flush` | Waits for accepted requests to reach the declared durability level, records the complete publication watermark and Trace binding, and returns the index location. It defines load, workload, and recovery boundaries; the driver does not use it as a per-request barrier to repair query ordering. |
 
@@ -28,12 +28,14 @@ An index entry is `(table, index, indexed_value, PK)`; the primary index, `index
 | Baseline `INSERT` | Version 0; bypasses WAL, with declared durability guaranteed only after Flush. `WriteBatch` is allowed. The entire batch is validated first, and an invalid member fails the batch. When a batch shares completion state, in-flight budgets, completion counts, and latency remain per member, using the earliest deadline in the batch. |
 | `UPSERT` / `LOGICAL_DELETE` | Writes at a new version. Operations on the same key and version overwrite according to transaction position. Deletion retains an invisible version and must not resurrect older values. |
 | `RELOCATE` | Must match an existing exact version. Changes its physical location without creating a logical version. This does not imply that the full Rewrite / GC protocol is implemented. |
-| `Search` | At read_version, selects the latest version at or below the read point, omitting entries whose selected version is deleted. Supports primary / secondary ranges, inclusive and exclusive bounds, direction, limit, and secondary lookups pinned to a PK. Results are ordered by indexed value and PK, reversed for descending queries. |
-| Transaction-local `Search` | read_version preserves the original statement snapshot; local_version identifies this transaction's exact version. Only writes from earlier transaction_operation positions in the same transaction are overlaid. Other intervening commits remain invisible. |
+| `Search` | At read_version, selects the latest non-aborted version at or below the read point, omitting entries whose selected version is deleted. Supports primary / secondary ranges, inclusive and exclusive bounds, direction, limit, and secondary lookups pinned to a PK. Results are ordered by indexed value and PK, reversed for descending queries. |
+| Transaction-local `Search` | read_version preserves the original statement snapshot; local_version identifies this transaction's exact version. Only writes from earlier transaction_operation positions in the same transaction are overlaid. Other intervening commits remain invisible. The service checks that the transaction owns local_version. |
 | `SearchGroup` | The server intersects or unions members of the same source access by PK. Intersection follows the first member's order; union preserves first-occurrence order. Members must share the table, read point, and group identity. |
 | `Commit` | Declares the transaction version and actual sent write and operation counts. Operations include queries, groups, and writes. Transactions made empty by filtering still have commit markers. |
 
-Publishing version V requires its commit marker, completion of all its operations, matching write counts, and publication of V−1. The maximum observed version cannot replace the contiguous complete watermark. Snapshot reads wait for publication of read_version; transaction-local reads also wait for earlier positions in the same transaction.
+| `Abort` | Declares the same version and sent counts as Commit, but discards the transaction logically. Earlier local searches still execute; none of its provisional writes enter committed snapshots. |
+
+A version is a canonical transaction-resolution slot, including aborted transactions. Resolving version V requires its Commit or Abort marker, completion of all its operations, matching write counts, and resolution of V−1. An Abort marker reaches the declared write durability before the watermark advances; the watermark does not assert that every preceding slot committed. The maximum observed version cannot replace the contiguous complete watermark. Snapshot reads wait for publication of read_version; transaction-local reads also wait for earlier positions in the same transaction.
 
 Late writes to published versions, version reuse across transactions, and duplicate
 pending/executing positions are rejected before reaching the backend. A rejected
@@ -54,13 +56,13 @@ Replay consumes canonical requests and native counts, without per-query answer a
 
 `Flush` waits for requests accepted before the call began, then writes the publication watermark and Trace binding into the index and persists them with the data. An index rejects a binding for another Trace, value mode, or secondary-index configuration. A minimal index manifest beside the report records input identity, version coverage, key / value encoding, backend location, build identity, and replay configuration. Source snapshot is N/A until integrated.
 
-`reopen: true` opens an existing index and restores the last Flush watermark; versions above it remain invisible. `verify-service` checks all replayable snapshot queries at their original read points. Transaction-local queries are reported separately and excluded from this check because they depend on live transaction prefixes that cannot be reconstructed by replay after the transaction has ended.
+`reopen: true` opens an existing index and restores the last Flush watermark; versions above it remain invisible. Persisted Abort markers are restored on open and exclude aborted versions even when they are below the watermark. `verify-service` checks all replayable snapshot queries at their original read points. Transaction-local queries are reported separately and excluded from this check because they depend on live transaction prefixes that cannot be reconstructed by replay after the transaction has ended.
 
 ## Local RocksDB
 
 Local RocksDB uses the [Trace key encoding](trace.md#identity-and-versions).
 Baseline bypasses WAL; other writes use local WAL without fsync. Acknowledgment
-therefore does not promise power-loss durability.
+therefore does not promise power-loss durability. Abort uses the same WAL path. Aborted entries and their markers remain stored; reads skip them without physical undo or GC. Marker memory grows with the number of aborted transactions.
 
 See [README](../README.md#replay-and-service) for service configuration and replay
 entry points. Both sides must agree on value mode and secondary-index filtering.

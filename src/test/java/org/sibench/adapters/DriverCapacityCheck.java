@@ -38,7 +38,11 @@ public final class DriverCapacityCheck {
             timing.phase("baseline-only");
             long[] operations = {0};
             long started = System.nanoTime();
-            BaselineOperations.of(trace).read(operation -> operations[0]++);
+            var manifest = org.sibench.trace.TraceManifest.read(trace);
+            IndexCatalog.fromManifest(manifest);
+            ProtoTrace.source(trace, manifest, "baseline").read(operation -> operations[0]++);
+            if (operations[0] != manifest.get("baseline_operations").getAsLong())
+                throw new IOException("Proto baseline record count mismatch");
             Files.writeString(report, JSON.toJson(Map.of("status", "passed", "operations", operations[0],
                     "seconds", (System.nanoTime() - started) / 1e9,
                     "scope", "full protobuf baseline count and digests matched its retained manifest; no RPC/backend execution")), StandardOpenOption.CREATE_NEW);

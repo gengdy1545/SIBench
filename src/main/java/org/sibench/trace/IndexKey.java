@@ -10,17 +10,16 @@ import java.util.Arrays;
 import java.util.HexFormat;
 
 /**
- * One order-preserving key component. Unsigned lexicographic order of the bytes is the PostgreSQL
- * btree order of the source value under the default ascending, NULLS LAST operator class (text
- * only under the C collation), and every component is self-delimiting, so concatenated components
+ * One order-preserving key component. Unsigned lexicographic order of the bytes preserves
+ * ascending source order with NULLS LAST and binary UTF-8 text comparison. Every component
+ * is self-delimiting, so concatenated components
  * compare as the tuple they encode.
  *
  * <pre>
  * NULL       0x02
  * integer    0x01, int64 big-endian with the sign bit flipped (int2/int4/int8 alike)
  * timestamp  0x01, microseconds since 1970-01-01 as above; -infinity/infinity are the extremes
- * text       0x01, UTF-8 bytes, 0x00 (PostgreSQL text never contains NUL); CHAR(n) drops
- *            trailing spaces first, as bpchar comparison does
+ * text       0x01, UTF-8 bytes, 0x00; NUL is unsupported, trailing spaces remain significant
  * </pre>
  */
 public final class IndexKey implements Comparable<IndexKey> {
@@ -40,13 +39,13 @@ public final class IndexKey implements Comparable<IndexKey> {
 
     public static IndexKey ofTimestamp(LocalDateTime value) throws IOException {
         if (value.getNano() % 1000 != 0)
-            throw new IOException("Timestamp is finer than PostgreSQL microseconds: " + value);
+            throw new IOException("Timestamp is finer than supported microseconds: " + value);
         try {
             long micros =
                     Math.addExact(
                             Math.multiplyExact(value.toEpochSecond(ZoneOffset.UTC), 1_000_000L),
                             value.getNano() / 1000);
-            // PostgreSQL reserves the int64 extremes for -infinity and infinity.
+            // The key encoding reserves the int64 extremes for infinities.
             if (micros == Long.MIN_VALUE || micros == Long.MAX_VALUE)
                 throw new IOException("Timestamp collides with an infinity: " + value);
             return fixed(micros ^ Long.MIN_VALUE);
@@ -69,12 +68,9 @@ public final class IndexKey implements Comparable<IndexKey> {
     }
 
     /**
-     * Encodes PostgreSQL text output (scan keys, row images and baseline values all use it) of a
-     * value of {@code type}: int, timestamp, date (compared as midnight with a timestamp column),
-     * char(n)/bpchar, varchar or text. A null value is {@link #NULL}.
+     * Encodes a source value of {@code type}: int, timestamp, date (midnight), varchar or text.
+     * A null value is {@link #NULL}.
      */
-    private static final java.util.regex.Pattern CHAR = java.util.regex.Pattern.compile("char\\([0-9]+\\)");
-
     public static IndexKey parse(String type, String text) throws IOException {
         if (text == null) return NULL;
         try {
@@ -85,11 +81,6 @@ public final class IndexKey implements Comparable<IndexKey> {
                 return ofTimestamp(LocalDateTime.parse(text.replace(' ', 'T')));
             }
             if (type.equals("date")) return ofTimestamp(LocalDate.parse(text).atStartOfDay());
-            if (type.equals("bpchar") || CHAR.matcher(type).matches()) {
-                int end = text.length();
-                while (end > 0 && text.charAt(end - 1) == ' ') end--;
-                return ofText(text.substring(0, end));
-            }
             if (type.equals("varchar") || type.equals("text")) return ofText(text);
         } catch (RuntimeException error) {
             throw new IOException("Invalid " + type + " key value: " + text, error);

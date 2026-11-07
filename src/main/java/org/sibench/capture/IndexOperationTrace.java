@@ -13,10 +13,10 @@ import java.nio.file.StandardOpenOption;
 import java.util.HexFormat;
 import java.util.zip.CRC32C;
 
-/** Normalized operation blocks, separate from raw PG access facts. */
+/** Normalized operation blocks, separate from raw source access facts. */
 public final class IndexOperationTrace {
     public static final int INSERT = 1, SEARCH = 2, UPSERT = 3, RELOCATE = 4, LOGICAL_DELETE = 5;
-    public static final int TRANSACTION_BEGIN = 6, TRANSACTION_COMMIT = 7;
+    public static final int TRANSACTION_BEGIN = 6, TRANSACTION_COMMIT = 7, TRANSACTION_ABORT = 8;
     public static final int BUSINESS_INSERT = 1, BUSINESS_UPDATE = 2;
     public static final int SNAPSHOT_SEARCH = 1;
     public static final int TRANSACTION_LOCAL_SEARCH = 4;
@@ -57,6 +57,7 @@ public final class IndexOperationTrace {
             case LOGICAL_DELETE -> "logical_delete";
             case TRANSACTION_BEGIN -> "transaction_begin";
             case TRANSACTION_COMMIT -> "transaction_commit";
+            case TRANSACTION_ABORT -> "transaction_abort";
             default -> throw new IllegalArgumentException("Unknown operation kind: " + kind);
         };
     }
@@ -351,7 +352,7 @@ public final class IndexOperationTrace {
     }
 
     public static boolean isControl(Operation o) {
-        return o.kind() == TRANSACTION_BEGIN || o.kind() == TRANSACTION_COMMIT;
+        return o.kind() == TRANSACTION_BEGIN || o.kind() == TRANSACTION_COMMIT || o.kind() == TRANSACTION_ABORT;
     }
 
     /** Format-level invariants checked on both write and read. */
@@ -359,7 +360,7 @@ public final class IndexOperationTrace {
         boolean control = isControl(o), search = o.kind() == SEARCH;
         boolean valid =
                 o.kind() >= INSERT
-                        && o.kind() <= TRANSACTION_COMMIT
+                        && o.kind() <= TRANSACTION_ABORT
                         && (control ? o.table() == 0 : o.table() >= 1 && o.table() <= MAX_TABLE)
                         && o.index() >= 0
                         && o.index() <= MAX_INDEX
@@ -396,7 +397,7 @@ public final class IndexOperationTrace {
                 && (o.upper() != null || (o.flags() & UPPER_INCLUSIVE) == 0)
                 && o.limit() >= 0
                 && o.expectedCount() >= 0
-                && (o.limit() == 0 || o.expectedCount() == o.limit())
+                && (o.limit() == 0 || o.expectedCount() <= o.limit())
                 && group != (INTERSECT_GROUP | UNION_GROUP)
                 && (group == 0
                         ? o.expansionPosition() == 0 && o.expansionSize() == 0

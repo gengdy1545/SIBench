@@ -194,6 +194,10 @@ public final class TraceRequests {
      * count the requests actually sent, after secondary filtering; a group is one operation.
      */
     public Request commit(long id, long transactionId, long version) throws IOException {
+        return finish(id, transactionId, version, false);
+    }
+
+    public Request finish(long id, long transactionId, long version, boolean aborted) throws IOException {
         if (transactionId <= 0 || version <= 0)
             throw new IOException("Invalid transaction commit marker");
         if (currentTransaction != 0 && currentTransaction != transactionId)
@@ -209,6 +213,8 @@ public final class TraceRequests {
                                         .setVersion(version)
                                         .setWrites(currentWrites)
                                         .setOperations(currentOperation));
+        if (aborted) request.setAbort(org.sibench.adapters.proto.Abort.newBuilder()
+                .setVersion(version).setWrites(currentWrites).setOperations(currentOperation));
         currentTransaction = 0;
         currentOperation = 0;
         currentWrites = 0;

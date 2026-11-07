@@ -46,6 +46,7 @@ public final class BaselineCapacityCheck {
         Sink(Path report,boolean dropFirst) { this.report=report;this.dropFirst=dropFirst; }
         public DescribeResponse describe() { return DescribeResponse.newBuilder().setName("baseline-transport-field-check-sink").setValueKind(ValueKind.ROW_ID).setBaselineWriteBatches(true).setWriteAck(Acknowledgement.ACK_MEMORY).setDurability("diagnostic field receiver; no index storage").build(); }
         public void write(Write write) throws IOException { if (dropFirst && dropped.compareAndSet(false,true)) return;received.write(write); }
+        public void abort(long version) throws IOException { throw new IOException("Baseline-only diagnostic receiver"); }
         public void search(Search search,ResultSink output) throws IOException { throw new IOException("Baseline-only diagnostic receiver"); }
         public void flush() throws IOException { Files.writeString(report,JSON.toJson(received.summary())+"\n"); }
         public void bind(String value) throws IOException { if (!binding.isEmpty()&&!binding.equals(value)) throw new IOException("Different binding");binding=value; }

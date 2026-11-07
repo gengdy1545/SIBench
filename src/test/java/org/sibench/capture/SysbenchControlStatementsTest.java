@@ -119,11 +119,11 @@ public class SysbenchControlStatementsTest {
         assertEquals(1L, explicit.describe().get("retry_begin_statements"));
         assertEquals(2L, explicit.describe().get("control_statements_per_event"));
         var counts = java.util.Map.of("ignored errors", 1L);
-        assertEquals(4, SysbenchNativeRun.certifiedExecutions("controlled", counts, 5, 1, 1));
+        assertEquals(4, PostgresSysbench.certifiedExecutions("controlled", counts, 5, 1, 1));
         assertEquals(5, SysbenchControlStatements.requireAgreement("controlled", 9, 4, explicit));
-        assertThrows(IOException.class, () -> SysbenchNativeRun.certifiedExecutions("controlled", counts, 5, 0, 1));
-        assertThrows(IOException.class, () -> SysbenchNativeRun.certifiedExecutions("controlled", counts, 5, 1, 0));
-        assertThrows(IOException.class, () -> SysbenchNativeRun.certifiedExecutions("controlled", java.util.Map.of(), 5, 1, 1));
+        assertThrows(IOException.class, () -> PostgresSysbench.certifiedExecutions("controlled", counts, 5, 0, 1));
+        assertThrows(IOException.class, () -> PostgresSysbench.certifiedExecutions("controlled", counts, 5, 1, 0));
+        assertThrows(IOException.class, () -> PostgresSysbench.certifiedExecutions("controlled", java.util.Map.of(), 5, 1, 1));
         assertThrows(IOException.class, () -> SysbenchControlStatements.requireAgreement("controlled", 10, 4, explicit));
         assertEquals(0, SysbenchControlStatements.derive(AUTOCOMMIT, false, 2, 1).controlStatements());
         assertEquals(0, SysbenchControlStatements.derive(EXPLICIT, true, 2, 1).controlStatements());

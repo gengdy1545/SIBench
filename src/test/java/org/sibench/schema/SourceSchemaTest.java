@@ -57,7 +57,7 @@ public class SourceSchemaTest {
         assertEquals(11, table.columns().size());
         assertEquals("character varying", table.columns().get(0).type());
         assertFalse(table.columns().get(0).nullable());
-        assertEquals("text", table.columns().get(1).type());
+        assertEquals("blob", table.columns().get(1).type());
         assertTrue(table.columns().get(1).nullable());
         assertEquals(1, table.indexes().size());
         IndexCatalog catalog = IndexCatalog.fromSchema(schema);

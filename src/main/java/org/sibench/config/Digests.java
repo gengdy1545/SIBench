@@ -11,7 +11,7 @@ import java.util.HexFormat;
 /**
  * The SHA256 of a file, read now. It lives below every other package so that code which only
  * needs a digest (the capture driver and its configuration, the source schema) does not depend on
- * the baseline generator and its Parquet writer.
+ * generation and Trace publication.
  */
 public final class Digests {
     private Digests() {}

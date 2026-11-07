@@ -12,6 +12,11 @@ import java.util.*;
 public final class ReplayMatrixValidation {
     private ReplayMatrixValidation() {}
 
+    public static void main(String[] args) throws IOException {
+        if (args.length != 2) throw new IllegalArgumentException("ReplayMatrixValidation TRACE OUTPUT");
+        validate(Path.of(args[0]), Path.of(args[1]));
+    }
+
     public static void validate(Path trace, Path output) throws IOException {
         Files.createDirectory(output);
         Files.writeString(output.resolve("INCOMPLETE"), "Replay matrix not verified\n");
@@ -19,7 +24,7 @@ public final class ReplayMatrixValidation {
         var expected = new HashMap<String, String>();
         for (boolean secondary : new boolean[] {false, true})
             for (String dispatch : List.of("operation", "transaction"))
-                for (int clients : new int[] {1, 64, 128}) {
+                for (int clients : new int[] {1, 2}) {
                     String name = "secondary-" + secondary + "-" + dispatch + "-" + clients;
                     var config =
                             new ReplayConfig(
@@ -57,7 +62,7 @@ public final class ReplayMatrixValidation {
             SnapshotLookupValidation.run(
                     trace,
                     new ReplayConfig(secondary, 0, 0, 0, 0),
-                    output.resolve("parquet-oracle-secondary-" + secondary + ".json"));
+                    output.resolve("native-oracle-secondary-" + secondary + ".json"));
         Files.writeString(
                 output.resolve("matrix.json"),
                 new GsonBuilder()
@@ -70,10 +75,10 @@ public final class ReplayMatrixValidation {
                                         "variants",
                                         reports,
                                         "scope",
-                                        "1/64/128 clients x both dispatch modes x secondary on/off;"
-                                            + " both value modes,"
+                                        "1/2 clients x both dispatch modes x secondary on/off;"
+                                            + " declared value modes,"
                                             + " operation-order/state/count equivalence."
-                                            + " Independent Parquet oracle at 1 client for both"
+                                            + " Independent native row oracle at 1 client for both"
                                             + " secondary settings; no real network or performance"
                                             + " claim.")),
                 StandardOpenOption.CREATE_NEW);

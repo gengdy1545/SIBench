@@ -4,7 +4,6 @@ import static org.junit.Assert.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import org.junit.Rule;
 import org.junit.Test;
@@ -31,51 +30,22 @@ public class SibenchConfigTest {
     }
 
     @Test
-    public void publicPostgresConfigurationSupportsDisposableGeneration() throws Exception {
-        Path output = temporary.getRoot().toPath().resolve("postgres.conf");
-        SibenchConfig.writePostgres(Path.of("config/sibench.yaml"), output);
-        String settings = Files.readString(output);
-        assertTrue(settings.contains("fsync = 'off'\n"));
-        assertTrue(settings.contains("full_page_writes = 'off'\n"));
-        assertTrue(settings.contains("restart_after_crash = 'off'\n"));
-    }
-
-    @Test
-    public void postgresSettingsAreEscapedAndNeverOverwriteAnExistingFile() throws Exception {
-        var settings = new LinkedHashMap<String, Object>();
-        settings.put("timezone", "O'Reilly\\Lab");
-        settings.put("compute_query_id", true);
-        settings.put("autovacuum", false);
-        settings.put("checkpoint_completion_target", 0.9);
-        Path config = config(settings);
-        Path output = temporary.getRoot().toPath().resolve("postgres.conf");
-        SibenchConfig.writePostgres(config, output);
-        String expected = "# Generated from the run's SIBench configuration.\n"
-                + "timezone = 'O''Reilly\\\\Lab'\n"
-                + "compute_query_id = 'on'\n"
-                + "autovacuum = 'off'\n"
-                + "checkpoint_completion_target = '0.9'\n";
-        assertEquals(expected, Files.readString(output));
-        assertThrows(java.nio.file.FileAlreadyExistsException.class,
-                () -> SibenchConfig.writePostgres(config, output));
-        assertEquals(expected, Files.readString(output));
-    }
-
-    @Test
-    public void unsafePostgresValuesFailBeforeCreatingOutput() throws Exception {
-        for (Object value : new Object[] {"UTC\ninclude 'other.conf'", "UTC\r", "UTC\0",
-                Double.NaN, Double.POSITIVE_INFINITY, Map.of("nested", "value")}) {
-            Path config = config(Map.of("timezone", value));
-            Path output = temporary.getRoot().toPath().resolve("rejected.conf");
-            assertThrows(IllegalArgumentException.class,
-                    () -> SibenchConfig.writePostgres(config, output));
-            assertFalse(Files.exists(output));
-        }
-        Path config = config(Map.of("include", "other.conf"));
-        Path output = temporary.getRoot().toPath().resolve("unknown.conf");
-        assertThrows(IllegalArgumentException.class,
-                () -> SibenchConfig.writePostgres(config, output));
-        assertFalse(Files.exists(output));
+    public void publicGenerationSelectsThreeNativeModesAndOwnsEngineBuildLocations() throws Exception {
+        var document = SibenchConfig.read(Path.of("config/sibench.yaml"));
+        var selected = BenchmarkSelection.read(Path.of(""), document);
+        assertEquals(java.util.List.of("ycsb", "sysbench", "hybench"),
+                selected.stream().map(BenchmarkSelection::benchmark).toList());
+        assertEquals(java.util.List.of(BenchmarkSelection.Mode.API, BenchmarkSelection.Mode.CAPTURE,
+                BenchmarkSelection.Mode.CAPTURE), selected.stream().map(BenchmarkSelection::mode).toList());
+        assertEquals("build/services/postgres",ConfigValues.string(ConfigValues.object(document,"postgres"),"build_directory"));
+        assertEquals(java.util.List.of(Engine.ROCKSDB, Engine.POSTGRES, Engine.DUCKDB),
+                selected.stream().map(BenchmarkSelection::engine).toList());
+        assertEquals("build/services/rocksdb", ConfigValues.string(ConfigValues.object(document,"rocksdb"),"build_directory"));
+        assertFalse(document.containsKey("generation"));
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(
+                Map.of("schema_version", 1, "purpose", "sibench", "postgres", Map.of())));
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(
+                Map.of("schema_version",1,"purpose","sibench","postgres",Map.of("build_directory","build/services/postgres","data_directory","data"))));
     }
 
     @Test
@@ -87,28 +57,11 @@ public class SibenchConfigTest {
                 Map.of("schema_version", 1, "purpose", "sibench", "replaay", Map.of())));
     }
 
-    private Path config(Map<String, Object> settings) throws Exception {
-        Path path = Files.createTempFile(temporary.getRoot().toPath(), "sibench-", ".yaml");
-        Files.writeString(path, new Yaml().dump(Map.of(
-                "schema_version", 1, "purpose", "sibench", "postgres", settings)));
-        return path;
-    }
-
     @Test
-    public void generationTargetsAreOptionalNonnegativeIntegers() {
-        var generation = new LinkedHashMap<String, Object>(Map.of(
-                "pending_transaction_bytes", 1000, "pending_transactions", 10));
-        var document = Map.<String, Object>of("schema_version", 1, "purpose", "sibench", "generation", generation);
-        SibenchConfig.validate(document);
-        generation.put("operation_target", 0);
-        generation.put("output_byte_target", Long.MAX_VALUE);
-        SibenchConfig.validate(document);
-        generation.put("operation_target", -1);
-        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(document));
-        generation.put("operation_target", 1.5);
-        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(document));
-        generation.put("operation_target", 1);
-        generation.put("unknown_budget", 1);
-        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(document));
+    public void rejectsRetiredPgGenerationSettings() {
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(Map.of(
+                "schema_version", 1, "purpose", "sibench", "generation", Map.of(
+                        "pending_transaction_bytes", 1000, "pending_transactions", 10,
+                        "operation_target", 100, "output_byte_target", 1000))));
     }
 }

@@ -15,9 +15,11 @@ class BenchmarkBuildTest(unittest.TestCase):
         self.root = Path(temporary.name)
         (self.root / "scripts").mkdir()
         shutil.copyfile(SCRIPT, self.root / "scripts" / SCRIPT.name)
+        driver = self.root / "src/main/native/sysbench/drv_duckdb.cc"
+        driver.parent.mkdir(parents=True)
+        driver.write_text("driver source\n")
+        driver.with_name("retryable_error.hpp").write_text("retry policy\n")
         (self.root / "scripts/patches").mkdir()
-        shutil.copyfile(SCRIPT.parent / "patches/hybench-1.0-snapshot.patch",
-                        self.root / "scripts/patches/hybench-1.0-snapshot.patch")
         self.source = self.root / "benchmark/source"
         self.source.mkdir(parents=True)
         for name in ("autogen.sh", "configure"):
@@ -46,19 +48,19 @@ case "$*" in
 esac
 ''')
         java.chmod(0o755)
-        for command in ("mvn", "make"):
+        for command in ("mvn", "make", "javac", "jar"):
             executable = self.jdk / "bin" / command
             executable.write_text('''#!/bin/sh
 printf "%s %s\\n" "$PWD" "$*" >> "$SIBENCH_FIXTURE_ROOT/build.log"
 [ "${SIBENCH_FIXTURE_EXIT:-0}" = 0 ] || exit "$SIBENCH_FIXTURE_EXIT"
 case "$*" in
-  *"-pl jdbc"*)
-    target=$SIBENCH_FIXTURE_ROOT/build/benchmarks/client/jdbc/target
-    mkdir -p "$target/ycsb-jdbc-binding-fixture/lib"
-    echo jar > "$target/ycsb-jdbc-binding-fixture/lib/client.jar"
-    tar -czf "$target/ycsb-jdbc-binding-fixture.tar.gz" -C "$target" ycsb-jdbc-binding-fixture
-    rm -rf "$target/ycsb-jdbc-binding-fixture"
+  *"-pl core"*)
+    target=$SIBENCH_FIXTURE_ROOT/build/benchmarks/client/core/target
+    mkdir -p "$target/dependency"
+    echo jar > "$target/core-fixture.jar"
+    echo dependency > "$target/dependency/runtime.jar"
     ;;
+  *"--create --file"*) echo binding > "$3" ;;
 esac
 ''')
             executable.chmod(0o755)
@@ -80,6 +82,10 @@ esac
                 self.assertEqual(0, result.returncode, result.stderr)
                 self.assertEqual("patched input\n", (build / "source.c").read_text())
                 self.assertTrue((build / "native-build.json").is_file())
+                if benchmark == "ycsb":
+                    self.assertTrue((build / "sibench-api/lib/sibench-ycsb.jar").is_file())
+                    self.assertTrue((build / "sibench-api/lib/core-fixture.jar").is_file())
+                    self.assertIn("-pl core -am -Psource-run", (self.root / "build.log").read_text())
                 self.assertEqual("", self.git("status", "--porcelain"))
                 shutil.rmtree(build)
         result = self.run_build("ycsb", 75)

@@ -1,10 +1,8 @@
 package org.sibench.capture;
 
 import com.google.gson.Gson;
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
-import org.apache.parquet.example.data.Group;
 import org.sibench.schema.SourceSchema;
 import org.sibench.trace.IndexKey;
 
@@ -25,35 +23,6 @@ public final class IndexCatalog {
             } catch (IOException error) {
                 throw new IOException("Invalid indexed value for " + name + ": " + value, error);
             }
-        }
-
-        /**
-         * Encodes a scan key of PG type {@code typeOid}. Only operators of the column's own btree
-         * family reach an index scan; date keys compare with a timestamp column as midnight.
-         */
-        public IndexKey encodeScanKey(int typeOid, String value) throws IOException {
-            String keyType =
-                    switch (typeOid) {
-                        case 20, 21, 23 -> "int";
-                        case 1114 -> "timestamp";
-                        case 1082 -> "date";
-                        case 1042 -> "bpchar";
-                        case 25, 1043 -> "text";
-                        default -> null;
-                    };
-            boolean compatible =
-                    keyType != null
-                            && switch (type) {
-                                case "int" -> keyType.equals("int");
-                                case "timestamp" ->
-                                        keyType.equals("timestamp") || keyType.equals("date");
-                                case "varchar", "text" -> keyType.equals("text");
-                                default -> keyType.equals("bpchar");
-                            };
-            if (!compatible)
-                throw new IOException(
-                        "Scan key type " + typeOid + " is outside the " + type + " family of " + name);
-            return IndexKey.parse(keyType, value);
         }
 
         public boolean textual() {
@@ -114,10 +83,9 @@ public final class IndexCatalog {
                             case "integer", "bigint", "smallint" -> "int";
                             case "timestamp without time zone" -> "timestamp";
                             case "character varying" -> "varchar";
-                            default -> column.type().replace("character(", "char(");
+                            default -> column.type().startsWith("character(") ? "varchar" : column.type();
                         };
-                if (!Set.of("int", "timestamp", "varchar", "text").contains(type)
-                        && !type.matches("char\\([0-9]+\\)"))
+                if (!Set.of("int", "timestamp", "varchar", "text").contains(type))
                     throw new IOException("Unsupported indexed column type: " + type);
                 var definition =
                         new Definition(
@@ -137,68 +105,79 @@ public final class IndexCatalog {
         return new IndexCatalog(schema, result);
     }
 
-    /** The source identity a compiled dataset records, re-verified by {@link #fromManifest}. */
+    /** Generation records the verified source identity; consumers need no source checkout. */
     public Map<String, Object> provenance() {
+        if (schema == null) throw new IllegalStateException("A consumed catalog has no source checkout");
+        return provenance(schema, definitions);
+    }
+
+    /** DuckDB CHAR is a VARCHAR alias, including its significant trailing spaces. */
+    public static List<Definition> duckDbDefinitions(SourceSchema schema) throws IOException {
+        return fromSchema(schema).definitions();
+    }
+
+    public static Map<String, Object> provenance(SourceSchema schema, List<Definition> definitions) {
         var result = new LinkedHashMap<String, Object>();
         result.put("benchmark", schema.benchmark());
         result.put("source_commit", schema.sourceCommit());
         result.put("source_directory", schema.source().toAbsolutePath().toString());
         result.put("source_schema_sha256", schema.fingerprints());
         if (schema.nativeConfig() != null) result.put("source_native_config", schema.nativeConfig());
-        result.put("index_definitions", describe());
+        result.put("index_definitions", definitions.stream().map(Definition::describe).toList());
+        result.put("catalog_sha256", identity(new Gson().toJsonTree(result).getAsJsonObject()));
         return result;
+    }
+
+    /** Binds the embedded source and index definitions, independent of the original filesystem path. */
+    public static String identity(JsonObject manifest) {
+        var bound = new JsonObject();
+        for (String name : List.of("benchmark", "source_commit", "source_schema_sha256", "source_native_config", "index_definitions"))
+            if (manifest.has(name)) bound.add(name, manifest.get(name));
+        var digest = org.sibench.config.Digests.digest();
+        return java.util.HexFormat.of().formatHex(digest.digest(bound.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)));
     }
 
     public static IndexCatalog fromManifest(JsonObject manifest) throws IOException {
-        for (String field :
-                List.of(
-                        "benchmark",
-                        "source_directory",
-                        "source_commit",
-                        "source_schema_sha256",
-                        "index_definitions"))
-            if (!manifest.has(field)) throw new IOException("Missing pinned source provenance");
-        String benchmark = manifest.get("benchmark").getAsString();
-        Map<String, Object> nativeConfig =
-                manifest.has("source_native_config")
-                        ? plain(manifest.getAsJsonObject("source_native_config"))
-                        : null;
-        IndexCatalog catalog =
-                fromSchema(
-                        SourceSchema.of(
-                                benchmark,
-                                Path.of(manifest.get("source_directory").getAsString()),
-                                nativeConfig));
-        if (!catalog.schema.sourceCommit().equals(manifest.get("source_commit").getAsString()))
-            throw new IOException("Source commit differs from the trace provenance");
-        Gson gson = new Gson();
-        if (!gson.toJsonTree(catalog.schema.fingerprints())
-                .equals(manifest.get("source_schema_sha256")))
-            throw new IOException("Source schema fingerprint mismatch");
-        if (!gson.toJsonTree(catalog.describe()).equals(manifest.get("index_definitions")))
-            throw new IOException("Declared index catalog differs from pinned source schema");
-        return catalog;
-    }
-
-    /** JSON numbers back as Long or Double, as the YAML configuration delivered them. */
-    private static Map<String, Object> plain(JsonObject object) {
-        var result = new LinkedHashMap<String, Object>();
-        for (var entry : object.entrySet()) result.put(entry.getKey(), plain(entry.getValue()));
-        return result;
-    }
-
-    private static Object plain(JsonElement value) {
-        if (value.isJsonObject()) return plain(value.getAsJsonObject());
-        if (value.isJsonArray()) {
-            var list = new ArrayList<Object>();
-            for (JsonElement item : value.getAsJsonArray()) list.add(plain(item));
-            return list;
+        try {
+            for (String field : List.of("benchmark", "source_commit", "source_schema_sha256", "index_definitions", "catalog_sha256"))
+                if (!manifest.has(field)) throw new IOException("Missing source catalog provenance: " + field);
+            if (!identity(manifest).equals(manifest.get("catalog_sha256").getAsString()))
+                throw new IOException("Index catalog identity mismatch");
+            if (!Set.of("ycsb", "sysbench", "hybench").contains(manifest.get("benchmark").getAsString())
+                    || manifest.get("source_commit").getAsString().isBlank()
+                    || !manifest.get("source_schema_sha256").isJsonObject())
+                throw new IOException("Invalid source catalog provenance");
+            var definitions = new ArrayList<Definition>();
+            var tableNames = new TreeMap<Integer, String>();
+            var tableIds = new HashMap<String, Integer>();
+            var indexes = new HashMap<Integer, TreeSet<Integer>>();
+            var names = new HashSet<String>();
+            for (var item : manifest.getAsJsonArray("index_definitions")) {
+                var d = item.getAsJsonObject();
+                int table = d.get("table_id").getAsBigDecimal().intValueExact();
+                int index = d.get("index_id").getAsBigDecimal().intValueExact();
+                String name = d.get("name").getAsString(), tableName = d.get("table").getAsString();
+                String column = d.get("column").getAsString(), type = d.get("type").getAsString();
+                if (table < 1 || table > 65535 || index < 0 || index > 65535 || tableName.isBlank()
+                        || name.isBlank() || column.isBlank() || !names.add(name)
+                        || !Set.of("int", "timestamp", "varchar", "text").contains(type))
+                    throw new IOException("Invalid source index definition");
+                if (tableNames.containsKey(table) && !tableNames.get(table).equals(tableName)
+                        || tableIds.containsKey(tableName) && tableIds.get(tableName) != table
+                        || !indexes.computeIfAbsent(table, ignored -> new TreeSet<>()).add(index))
+                    throw new IOException("Conflicting source index identity");
+                tableNames.put(table, tableName); tableIds.put(tableName, table);
+                definitions.add(new Definition(table, tableName, index, name, column, type));
+            }
+            if (tableNames.isEmpty() || tableNames.lastKey() != tableNames.size())
+                throw new IOException("Incomplete source table identities");
+            for (var ids : indexes.values())
+                if (ids.first() != 0 || ids.last() != ids.size() - 1)
+                    throw new IOException("Incomplete source index identities");
+            return new IndexCatalog(null, definitions);
+        } catch (RuntimeException invalid) {
+            throw new IOException("Invalid source catalog", invalid);
         }
-        var primitive = value.getAsJsonPrimitive();
-        if (primitive.isBoolean()) return primitive.getAsBoolean();
-        if (primitive.isString()) return primitive.getAsString();
-        var number = primitive.getAsBigDecimal();
-        return number.scale() <= 0 ? (Object) number.longValueExact() : number.doubleValue();
     }
 
     public SourceSchema schema() {
@@ -235,43 +214,4 @@ public final class IndexCatalog {
         return definitions.stream().map(Definition::describe).toList();
     }
 
-    public IndexKey primaryKey(String table, Group row) throws IOException {
-        return primary(tableId(table)).encode(text(row, primary(tableId(table)).column()));
-    }
-
-    public IndexKey primaryKey(String table, JsonObject row) throws IOException {
-        Definition definition = primary(tableId(table));
-        JsonElement value = row.get(definition.column());
-        if (value == null || value.isJsonNull())
-            throw new IOException("Row lacks its primary key: " + definition.column());
-        return definition.encode(value.getAsString());
-    }
-
-    public Map<Integer, IndexKey> keys(String table, Group row) throws IOException {
-        var keys = new LinkedHashMap<Integer, IndexKey>();
-        for (Definition definition : secondary(tableId(table)))
-            keys.put(definition.indexId(), definition.encode(text(row, definition.column())));
-        return keys;
-    }
-
-    public Map<Integer, IndexKey> keys(String table, JsonObject row) throws IOException {
-        var keys = new LinkedHashMap<Integer, IndexKey>();
-        for (Definition definition : secondary(tableId(table))) {
-            JsonElement value = row.get(definition.column());
-            if (value == null)
-                throw new IOException("Row change missing indexed column: " + definition.column());
-            keys.put(
-                    definition.indexId(),
-                    definition.encode(value.isJsonNull() ? null : value.getAsString()));
-        }
-        return keys;
-    }
-
-    private static String text(Group row, String column) throws IOException {
-        if (!row.getType().containsField(column))
-            throw new IOException("Row missing indexed column: " + column);
-        return row.getFieldRepetitionCount(column) == 0
-                ? null
-                : row.getValueToString(row.getType().getFieldIndex(column), 0);
-    }
 }

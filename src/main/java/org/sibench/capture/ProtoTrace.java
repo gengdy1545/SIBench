@@ -140,9 +140,11 @@ public final class ProtoTrace {
                 if (transaction != 0) throw new IOException("Nested proto transaction");
                 transaction = operation.transactionId();
                 record.setBegin(TraceBegin.newBuilder().setTransactionId(transaction).setVersion(operation.version()));
-            } else if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) {
+            } else if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT
+                    || operation.kind() == IndexOperationTrace.TRANSACTION_ABORT) {
                 if (transaction != operation.transactionId()) throw new IOException("Unmatched proto commit");
-                record.setRequest(requests.commit(0, transaction, operation.version()));
+                record.setRequest(requests.finish(0, transaction, operation.version(),
+                        operation.kind() == IndexOperationTrace.TRANSACTION_ABORT));
                 transaction = 0;
             } else {
                 var request = requests.request(0, operation);
@@ -288,14 +290,17 @@ public final class ProtoTrace {
             if (!record.hasRequest()) throw new IOException("Missing proto service request");
             var request = record.getRequest();
             if (request.getId() != 0) throw new IOException("Proto request IDs are assigned at replay");
-            if (request.hasCommit()) {
-                var commit = request.getCommit();
+            if (request.hasCommit() || request.hasAbort()) {
+                long terminalVersion = request.hasAbort() ? request.getAbort().getVersion() : request.getCommit().getVersion();
+                long terminalOperations = request.hasAbort() ? request.getAbort().getOperations() : request.getCommit().getOperations();
+                long terminalWrites = request.hasAbort() ? request.getAbort().getWrites() : request.getCommit().getWrites();
                 if (transaction == 0 || request.getTransactionId() != transaction
-                        || request.getTransactionOperation() != 0 || commit.getVersion() != version
-                        || commit.getOperations() != operations || commit.getWrites() != writes
-                        || record.getPositionsCount() != 1) throw new IOException("Invalid proto commit counts or identity");
+                        || request.getTransactionOperation() != 0 || terminalVersion != version
+                        || terminalOperations != operations || terminalWrites != writes
+                        || record.getPositionsCount() != 1) throw new IOException("Invalid proto terminal counts or identity");
                 consumer.accept(IndexOperationTrace.transaction(first.getSourceEvent(),
-                        IndexOperationTrace.TRANSACTION_COMMIT, transaction, version, first.getExpectedCount()));
+                        request.hasAbort() ? IndexOperationTrace.TRANSACTION_ABORT : IndexOperationTrace.TRANSACTION_COMMIT,
+                        transaction, version, first.getExpectedCount()));
                 transaction = 0;
                 return;
             }

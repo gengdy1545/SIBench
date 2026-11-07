@@ -1,0 +1,183 @@
+--- a/src/sysbench.c
++++ b/src/sysbench.c
+@@ -135,6 +135,7 @@
+ 
+ /* Wait at most this number of seconds for worker threads to initialize */
+ static int thread_init_timeout;
++static const char *sibench_budget_stop;
+ 
+ /* Barrier to signal reporting threads */
+ static sb_barrier_t report_barrier;
+@@ -690,6 +691,11 @@
+   (void) thread_id; /* unused */
+ 
+   if (sb_globals.error)
++    return false;
++
++  /* Stop only between complete native events. */
++  if (sibench_budget_stop != NULL && sibench_budget_stop[0] != 0 &&
++      access(sibench_budget_stop, F_OK) == 0)
+     return false;
+ 
+   /* Check if we have a time limit */
+@@ -1440,6 +1446,7 @@
+   sb_test_t *test = NULL;
+   int rc;
+ 
++  sibench_budget_stop = getenv("SIBENCH_BUDGET_STOP");
+   sb_globals.argc = argc;
+   sb_globals.argv = malloc(argc * sizeof(char *));
+   memcpy(sb_globals.argv, argv, argc * sizeof(char *));
+--- a/configure.ac
++++ b/configure.ac
+@@ -39,6 +39,7 @@
+ ACX_USE_SYSTEM_EXTENSIONS
+ 
+ AC_PROG_CC
++AC_PROG_CXX
+ AC_PROG_CPP
+ AM_PROG_CC_C_O
+ 
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -15,6 +15,9 @@
+ # along with this program; if not, write to the Free Software
+ # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ 
++AUTOMAKE_OPTIONS = subdir-objects
++AM_CXXFLAGS = $(PTHREAD_CFLAGS)
++
+ SUBDIRS = drivers tests lua .
+ 
+ AM_CPPFLAGS += -DDATADIR=\"$(pkgdatadir)\" -DLIBDIR=\"$(pkglibdir)\"
+@@ -30,7 +32,7 @@
+ pgsql_ldadd = drivers/pgsql/libsbpgsql.a $(PGSQL_LIBS)
+ endif
+ 
+-sysbench_SOURCES = sysbench.c sysbench.h sb_timer.c sb_timer.h \
++sysbench_SOURCES = drivers/duckdb/drv_duckdb.cc sysbench.c sysbench.h sb_timer.c sb_timer.h \
+ sb_options.c sb_options.h sb_logger.c sb_logger.h sb_list.h db_driver.h \
+ db_driver.c sb_histogram.c sb_histogram.h sb_rand.c sb_rand.h \
+ sb_thread.c sb_thread.h sb_barrier.c sb_barrier.h sb_lua.c \
+--- a/src/db_driver.h
++++ b/src/db_driver.h
+@@ -333,6 +333,8 @@
+ 
+ /* DB drivers registrars */
+ 
++int register_driver_duckdb(sb_list_t *);
++
+ #ifdef USE_MYSQL
+ int register_driver_mysql(sb_list_t *);
+ #endif
+--- a/src/db_driver.c
++++ b/src/db_driver.c
+@@ -97,6 +97,7 @@
+ 
+   /* Register database drivers */
+   SB_LIST_INIT(&drivers);
++  register_driver_duckdb(&drivers);
+ #ifdef USE_MYSQL
+   register_driver_mysql(&drivers);
+ #endif
+--- a/src/lua/oltp_common.lua
++++ b/src/lua/oltp_common.lua
+@@ -160,6 +160,10 @@
+    local extra_table_options = ""
+    local query
+ 
++   if drv:name() == "duckdb" and sysbench.opt.secondary then
++      error("DuckDB capture requires a primary key")
++   end
++
+    if sysbench.opt.secondary then
+      id_index_def = "KEY xid"
+    else
+@@ -174,6 +178,13 @@
+          id_def = "INTEGER NOT NULL"
+       end
+       engine_def = "/*! ENGINE = " .. sysbench.opt.mysql_storage_engine .. " */"
++   elseif drv:name() == "duckdb"
++   then
++      id_def = "INTEGER NOT NULL"
++      if sysbench.opt.auto_inc then
++         con:query(string.format("CREATE SEQUENCE sbtest%d_id_seq", table_num))
++         id_def = string.format("INTEGER DEFAULT nextval('sbtest%d_id_seq') NOT NULL", table_num)
++      end
+    elseif drv:name() == "pgsql"
+    then
+       if not sysbench.opt.auto_inc then
+@@ -397,6 +408,9 @@
+    for i = 1, sysbench.opt.tables do
+       print(string.format("Dropping table 'sbtest%d'...", i))
+       con:query("DROP TABLE IF EXISTS sbtest" .. i )
++      if drv:name() == "duckdb" then
++         con:query("DROP SEQUENCE IF EXISTS sbtest" .. i .. "_id_seq")
++      end
+    end
+ end
+ 
+--- a/src/lua/oltp_insert.lua
++++ b/src/lua/oltp_insert.lua
+@@ -46,7 +46,7 @@
+    local c_val = get_c_value()
+    local pad_val = get_pad_value()
+ 
+-   if (drv:name() == "pgsql" and sysbench.opt.auto_inc) then
++   if ((drv:name() == "pgsql" or drv:name() == "duckdb") and sysbench.opt.auto_inc) then
+       con:query(string.format("INSERT INTO %s (k, c, pad) VALUES " ..
+                                  "(%d, '%s', '%s')",
+                               table_name, k_val, c_val, pad_val))
+--- a/src/sysbench.h
++++ b/src/sysbench.h
+@@ -72,7 +72,7 @@
+ typedef struct
+ {
+   int              type;
+-  struct sb_test_t *test;
++  struct sb_test *test;
+ 
+   /* type-specific data */
+   union
+--- a/third_party/concurrency_kit/ck/include/spinlock/clh.h
++++ b/third_party/concurrency_kit/ck/include/spinlock/clh.h
+@@ -78,7 +78,7 @@
+ 	 * Mark current request as last request. Save reference to previous
+ 	 * request.
+ 	 */
+-	previous = ck_pr_fas_ptr(queue, thread);
++	previous = (struct ck_spinlock_clh *)ck_pr_fas_ptr(queue, thread);
+ 	thread->previous = previous;
+ 
+ 	/* Wait until previous thread is done with lock. */
+--- a/third_party/concurrency_kit/ck/include/spinlock/hclh.h
++++ b/third_party/concurrency_kit/ck/include/spinlock/hclh.h
+@@ -86,7 +86,7 @@
+ 	ck_pr_fence_store_atomic();
+ 
+ 	/* Mark current request as last request. Save reference to previous request. */
+-	previous = ck_pr_fas_ptr(local_queue, thread);
++	previous = (struct ck_spinlock_hclh *)ck_pr_fas_ptr(local_queue, thread);
+ 	thread->previous = previous;
+ 
+ 	/* Wait until previous thread from the local queue is done with lock. */
+@@ -103,7 +103,7 @@
+ 
+ 	/* Now we need to splice the local queue into the global queue. */
+ 	local_tail = ck_pr_load_ptr(local_queue);
+-	previous = ck_pr_fas_ptr(glob_queue, local_tail);
++	previous = (struct ck_spinlock_hclh *)ck_pr_fas_ptr(glob_queue, local_tail);
+ 
+ 	ck_pr_store_uint(&local_tail->splice, true);
+ 
+--- a/third_party/concurrency_kit/ck/include/spinlock/mcs.h
++++ b/third_party/concurrency_kit/ck/include/spinlock/mcs.h
+@@ -97,7 +97,7 @@
+ 	 * returns NULL, it means the queue was empty. If the queue was empty,
+ 	 * then the operation is complete.
+ 	 */
+-	previous = ck_pr_fas_ptr(queue, node);
++	previous = (struct ck_spinlock_mcs *)ck_pr_fas_ptr(queue, node);
+ 	if (previous != NULL) {
+ 		/*
+ 		 * Let the previous lock holder know that we are waiting on
