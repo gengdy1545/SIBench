@@ -71,8 +71,7 @@ public class DuckDbAccessesCheck extends DuckDbHostFixture {
                 session=marker(worker,1);assertEquals(10,number(worker,"SELECT id FROM items WHERE k=1 LIMIT 1"));
             }
             bind(observer,raw,session);
-            var diagnostics=DuckDbDiagnostics.summarize(observer,org.sibench.config.BenchmarkSelection.Mode.CAPTURE);
-            assertFalse(((List<?>)diagnostics.get("art_attempts")).isEmpty());
+            assertTrue(number(observer,"SELECT count(*) FROM "+DuckDbFacts.table("index")+" WHERE schema_name='main'")>0);
             DuckDbAccesses.bind(observer,CATALOG);
             assertEquals(2,number(observer,"SELECT count(*) FROM sibench_access_keys"));
             assertEquals(30,number(observer,"SELECT sum(CAST(key_sql AS BIGINT)) FROM sibench_access_keys"));

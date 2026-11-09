@@ -6,7 +6,7 @@ SIBench runs upstream benchmarks on native databases, exports a unified index Tr
 | --- | --- | --- |
 | YCSB | `api` / RocksDB | A/B/C/F/D/E; Read-modify-write remains two API calls. |
 | sysbench | `capture` / PostgreSQL or DuckDB | Six configured OLTP workloads. |
-| HyBench | `capture` / DuckDB | AP → TP → concurrent XP. |
+| HyBench | `capture` / DuckDB or PostgreSQL | AP → TP → concurrent XP. |
 
 ## Build
 
@@ -14,7 +14,7 @@ Use JDK 17, Maven and Git; set `JAVA_HOME`. Run from the repository root. Upstre
 
 | Component | Additional prerequisites |
 | --- | --- |
-| RocksDB | Linux/glibc x86-64, Python 3.9+, CMake 3.11.4+, make, patch, C++17, pkg-config; OpenSSL headers/static libcrypto; LZ4, Zstd, zlib, Snappy and bzip2 development libraries. Execution hosts need compatible C++ and compression libraries. |
+| RocksDB | Linux/glibc x86-64, Python 3.9+, CMake 3.11.4+, make, patch, C++17; LZ4, Zstd, zlib, Snappy and bzip2 development libraries. Execution hosts need compatible C++ and compression libraries. |
 | DuckDB | Linux/glibc x86-64, Python 3.9+, C++17, CMake 3.16+, make and patch. |
 | PostgreSQL | C compiler, make, patch, Perl, Bison, Flex and libzstd development headers; run PostgreSQL as an unprivileged user. |
 | Benchmark clients | HyBench/YCSB use Maven; sysbench also needs autotools, pkg-config, libtool, libaio and libpq development libraries. |
@@ -79,13 +79,13 @@ java -jar build/sibench/sibench.jar inspect-scale
 java -jar build/sibench/sibench.jar generate config/sibench.yaml
 ```
 
-`generate` validates every selected input before starting a host, ignores unselected profiles, runs selections in order and stops at the first failure. Each source uses one fresh database for loading, history and workload execution. Existing/overlapping outputs, changed build/source inputs and unsupported configurations are rejected. Successful publication requires normal shutdown; failures retain diagnostics and cannot resume.
+`generate` validates every selected input before starting a host, ignores unselected profiles, runs selections in order and stops at the first failure. Each source uses one fresh database for loading, RowID identities and workload execution, and deletes it after publication. Existing/overlapping outputs, changed build/source inputs and unsupported configurations are rejected. Successful publication requires normal shutdown; failures retain diagnostics and cannot resume.
 
-`trace.workload_requests` counts each exported write and SearchGroup member (or standalone Search) after committed-state coalescing and index filtering; baseline and source transaction markers are excluded. Generation repeats finite source batches on the same database, distributes remaining requests across remaining workloads, and drains admitted events/transactions. HyBench runs AP once before allocating the remainder to TP/XP. Actual output may exceed the target, especially by a whole DuckDB window; no-progress batches fail. Omitting the target runs each configured batch once. `request-budget.json` records actual counts and overshoot.
+`trace.workload_requests` counts each exported write and SearchGroup member (or standalone Search) after committed-state coalescing and index filtering; baseline and source transaction markers are excluded. Generation repeats finite source batches on the same database, distributes remaining requests across remaining workloads, and drains admitted events/transactions. HyBench runs AP once before allocating the remainder to TP/XP. Actual output may exceed the target by source activity already captured but not yet exported when the target is reached, especially by a whole DuckDB window or a PostgreSQL capture backlog; no-progress batches fail. Omitting the target runs each configured batch once. `request-budget.json` records actual counts and overshoot.
 
 `trace.secondary_indexes` defaults to false: only primary-index requests are exported, while source secondary indexes remain in use. Set true for all source indexes. Consumption has a separate `target.secondary_indexes.enabled` switch and cannot request indexes absent from the Trace. [Filtering and expansion rules](docs/trace.md#operations-and-index-expansion) preserve whole query groups and transaction outcomes.
 
-Published artifacts contain separate baseline/workload streams, work units, sealed native data and a manifest with identities and statistics; an `INCOMPLETE` marker prevents consumption. Native data remain available for historical row reads after relocation. See [publication](docs/trace.md#native-publication) and [row consumption](docs/trace.md#native-row-consumption-component). Current native output supports RowID values only.
+Published artifacts contain separate baseline/workload streams, work units and a manifest with identities and statistics; they contain no native database or row contents. An `INCOMPLETE` marker prevents consumption. See [publication](docs/trace.md#native-publication). Current native output supports RowID values only.
 
 Engine memory settings are not total process-memory caps; client `timeout_minutes` and separate setup/shutdown bounds are not whole-run resource quotas. Generation provides no crash recovery or reusable initial-state cache. Large-input capacity and performance require separate validation.
 
@@ -133,7 +133,7 @@ Native `*Check` and `*IT` classes are explicit opt-ins, not part of the default 
 | --- | --- |
 | `PostgresHistoryCheck,PostgresAccessesCheck,PostgresCaptureCheck,PostgresVersionsCheck,PostgresProjectionCheck,PostgresGenerationCheck` | `sibench.postgres.runtime=build/services/postgres/runtime`; generation also needs `sibench.sysbench.build=build/benchmarks/sysbench`. |
 | `RocksDbHistoryCheck,RocksYcsbCheck,RocksGenerationCheck` | `sibench.rocksdb.library=$PWD/build/services/rocksdb/libsibench_rocksdb.so`; generation also needs `sibench.rocksdb.build=build/services/rocksdb` and `sibench.ycsb.build=build/benchmarks/YCSB`. |
-| `DuckDbTraceCheck,DuckDbDataCheck,DuckDbAccessesCheck,DuckDbGenerationCheck,HybenchNativeCheck` | `sibench.duckdb.host=build/services/duckdb/duckdb_host`; source integration also needs `sibench.sysbench.build` and/or `sibench.hybench.build`. `HybenchSamplingCheck` needs only the HyBench build. |
+| `DuckDbTraceCheck,DuckDbAccessesCheck,DuckDbGenerationCheck,HybenchNativeCheck` | `sibench.duckdb.host=build/services/duckdb/duckdb_host`; source integration also needs `sibench.sysbench.build` and/or `sibench.hybench.build`. `HybenchSamplingCheck` needs only the HyBench build. |
 | `SlateDbStoreCheck` | Source-built `sibench.slatedb.library`; `sibench.slatedb.storage=PATH`, `sibench.slatedb.profile=NAME`, `sibench.slatedb.object_path=FRESH_PREFIX`, and that profile's environment credentials. Uses one Db against the configured S3 store; no independent reader. |
 
 Native component checks require Python 3 or C++17 and the built DuckDB engine:
@@ -150,8 +150,7 @@ After `mvn package`, explicit validation tools run with `java -cp build/sibench/
 
 | Tool under `org.sibench.` | Entry point / cost boundary |
 | --- | --- |
-| `replay.ReplayMatrixValidation` | `TRACE FRESH_OUTPUT`: small DuckDB Trace, dispatch/index-selection matrix and an in-memory row oracle. |
-| `replay.FullSnapshotValidation` | `TRACE FRESH_OUTPUT`: independent DuckDB full-data/history audit; reads the full input and uses temporary disk. |
+| `replay.ReplayMatrixValidation` | `TRACE FRESH_OUTPUT`: dispatch/index-selection matrix against the in-memory reference index. |
 | `adapters.IndexVersionCheck` | `SERVICE_CONFIG REPORT`: bounded hand-derived version/delete/reinsert checks on a fresh local or cloud backend. |
 | `adapters.IndexServerAcceptance` | `SERVICE_CONFIG`: starts a service; stdin `close` shuts it down. |
 | `adapters.StreamingLatencyCheck` | `ENDPOINT REPORT`: 64 baseline entries and 600 ordinary workload operations on a fresh service; verifies streaming completion, count/latency accounting and phase Flush. This is a small integration check, not a full-input or performance certification. |

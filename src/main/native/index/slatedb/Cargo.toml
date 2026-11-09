@@ -9,7 +9,10 @@ name = "slatedb_jni"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-slatedb = { path = "../../../../../index/slatedb/slatedb", default-features = false, features = ["aws"] }
+# foyer provides upstream's default in-memory block and metadata caches.
+slatedb = { path = "../../../../../index/slatedb/slatedb", default-features = false, features = ["aws", "foyer"] }
+slatedb-mirror = { path = "../../../../../index/slatedb/slatedb-mirror" }
+async-trait = "0.1.89"
 jni = "0.21.1"
 bytes = "1.7.1"
 futures = "0.3.30"

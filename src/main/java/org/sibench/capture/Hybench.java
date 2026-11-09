@@ -11,14 +11,18 @@ import java.util.List;
 import java.util.Map;
 import org.sibench.schema.SourceSchema;
 
-/** Loads upstream HyBench CSVs into native tables; sequences start after the actual loaded keys. */
-public final class HybenchDuckDb {
-    private HybenchDuckDb() {}
+/**
+ * Runs the pinned HyBench client against the selected native engine and loads its generated CSVs
+ * into native tables; sequences start after the actual loaded keys. DuckDB and PostgreSQL share the
+ * same DDL and COPY statements.
+ */
+public final class Hybench {
+    private Hybench() {}
 
     /** Separate JVM owns upstream globals and relative Data_<sf> paths. */
     public static void main(String[] args)throws Exception {
         if(args.length!=4||!List.of("generate","run").contains(args[0]))
-            throw new IllegalArgumentException("HybenchDuckDb generate|run PROPERTIES STATEMENTS SUMMARY");
+            throw new IllegalArgumentException("Hybench generate|run PROPERTIES STATEMENTS SUMMARY");
         Path resolved=Path.of(args[1]),statements=Path.of(args[2]);
         NativeBuildCheck.requireLoadedHybench(statements.getParent().getParent());
         var properties=new java.util.Properties();try(var file=Files.newInputStream(resolved)){properties.load(file);}

@@ -48,6 +48,8 @@ public class SlateDbStoreCheck {
             }
             assertArrayEquals(bytes("replacement"), store.get(bytes("b")));
             store.flush();
+            long[] writes = store.objectRequests().get("write");
+            assertTrue("Remote uploads and their bytes are counted", writes[0] > 0 && writes[2] > 0);
         }
         assertThrows(IOException.class, () -> SlateDbStore.create(local, objects));
         try (var reopened = SlateDbStore.open(local, objects)) {

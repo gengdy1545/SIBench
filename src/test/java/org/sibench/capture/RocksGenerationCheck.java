@@ -8,9 +8,9 @@ import java.util.*;
 import org.junit.Test;
 import org.sibench.trace.TraceManifest;
 
-/** Explicit real upstream A/B/C/F/D/E generation, independent replay and relocated native reads. */
+/** Explicit real upstream A/B/C/F/D/E generation and independent replay; the native database is discarded. */
 public class RocksGenerationCheck {
-    @Test public void upstreamApiExportsFinalTraceAndRetainedRows() throws Exception {
+    @Test public void upstreamApiExportsFinalTraceWithoutNativeData() throws Exception {
         Path root = Path.of("").toRealPath();
         String runtime = System.getProperty("sibench.rocksdb.build"), client = System.getProperty("sibench.ycsb.build");
         assertNotNull("Set sibench.rocksdb.build", runtime); assertNotNull("Set sibench.ycsb.build", client);
@@ -42,17 +42,9 @@ public class RocksGenerationCheck {
         var service = new org.sibench.adapters.ServiceConfig("rocksdb", null, run.resolve("index"), 0,
                 org.sibench.adapters.proto.ValueKind.ROW_ID, null, false);
         assertEquals("passed", org.sibench.adapters.ServiceReplay.run(trace, replay, service, run.resolve("replay.json")).get("status"));
-        var manifest = TraceManifest.read(trace);
-        var originals = new ArrayList<IndexOperationTrace.Operation>();
-        ProtoTrace.source(trace, manifest, "baseline").read(originals::add);
-        Path moved = run.resolve("relocated"); Files.move(trace, moved);
-        try (var rows = TraceManifest.openData(moved, root.resolve(runtime))) {
-            for (var original : originals) {
-                var row = rows.snapshotRow(1, original.rowId(), 0).orElseThrow();
-                assertEquals(original.key(), org.sibench.trace.IndexKey.ofText((String) row.get("ycsb_key")));
-                for (int i = 0; i < 10; i++) assertEquals(100, ((byte[]) row.get("field" + i)).length);
-            }
-        }
+        assertFalse(TraceManifest.read(trace).has("native_data"));
+        assertFalse(Files.exists(trace.resolve("data")));
+        assertFalse(Files.exists(run.resolve("generated/database")));
         var rejected = assertThrows(IllegalArgumentException.class, () -> Generation.run(root, config));
         assertTrue(rejected.getMessage().contains("output already exists"));
     }

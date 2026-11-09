@@ -104,16 +104,13 @@ public class DuckDbFactsCheck extends DuckDbHostFixture {
         }
     }
 
-    @Test public void mapsConcurrentNativeSnapshotsAndSealsHistoryWithoutReplayingDataWrites() throws Exception {
+    @Test public void mapsConcurrentNativeSnapshotsToResolutionVersions() throws Exception {
         Path capture = root.resolve("snapshots.csv");
-        long oldTransaction, oldLastQuery, rowOne, rowThree;
         try (var observer = connect()) {
             execute(observer, "CREATE TABLE items(id BIGINT PRIMARY KEY, k BIGINT)");
             execute(observer, "INSERT INTO items SELECT range,0 FROM range(1,1025)");
             observer.setAutoCommit(false); NativeHistory.initialize(observer, org.sibench.config.Engine.DUCKDB);
             NativeHistory.install(observer, org.sibench.config.Engine.DUCKDB, 1, "main", "items", "id"); observer.commit(); observer.setAutoCommit(true);
-            rowOne = number(observer, "SELECT _sib_row_id FROM sibench_history.identities_1 WHERE id=1");
-            rowThree = number(observer, "SELECT _sib_row_id FROM sibench_history.identities_1 WHERE id=3");
             execute(observer, "CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
                     + "'SibenchIndex','SibenchIndexRows','SibenchConsumption'], storage_path='" + capture + "')");
             long[] a, b, c;
@@ -142,24 +139,6 @@ public class DuckDbFactsCheck extends DuckDbHostFixture {
                     + " AND version=2 AND read_version=1 AND outcome='rollback'"));
             assertEquals(1, number(observer, "SELECT count(*) FROM sibench_transactions WHERE connection_id=" + b[0]
                     + " AND version=4 AND read_version=3 AND outcome='commit'"));
-            oldTransaction = number(observer, "SELECT transaction_id FROM sibench_transactions WHERE version=3");
-            oldLastQuery = number(observer, "SELECT max(query_id) FROM sibench_read_points WHERE version=3");
-            var commits = new java.util.ArrayList<long[]>();
-            try (var query = observer.createStatement(); var rows = query.executeQuery(
-                    "SELECT transaction_id,version FROM sibench_transactions WHERE outcome='commit' ORDER BY version")) {
-                while (rows.next()) commits.add(new long[] {rows.getLong(1),rows.getLong(2)});
-            }
-            observer.setAutoCommit(false);
-            for (var commit : commits) NativeHistory.recordCommit(observer, commit[0], commit[1]);
-            NativeHistory.seal(observer); observer.commit();
-        }
-        stop(); host = null;
-        try (var reader = DuckDbDatabase.openReadOnly(root.resolve("data"))) {
-            assertEquals(0L, NativeHistory.readRow(reader,1,rowOne,0,0,0).orElseThrow().get("k"));
-            assertEquals(1L, NativeHistory.readRow(reader,1,rowOne,1,0,0).orElseThrow().get("k"));
-            assertEquals(0L, NativeHistory.readRow(reader,1,rowThree,0,0,0).orElseThrow().get("k"));
-            assertEquals(30L, NativeHistory.readRow(reader,1,rowThree,0,oldTransaction,oldLastQuery).orElseThrow().get("k"));
-            assertEquals(30L, NativeHistory.readRow(reader,1,rowThree,3,0,0).orElseThrow().get("k"));
         }
     }
 
@@ -184,16 +163,11 @@ public class DuckDbFactsCheck extends DuckDbHostFixture {
             execute(observer, "CALL disable_logging()");
             DuckDbFacts.load(observer, capture);
             DuckDbStatements.bind(observer, List.of(new DuckDbStatements.Session(connection, marker, 2)));
-            var diagnostics=new com.google.gson.Gson().toJsonTree(DuckDbDiagnostics.summarize(observer,
-                    org.sibench.config.BenchmarkSelection.Mode.CAPTURE)).getAsJsonObject();
-            var failed=diagnostics.getAsJsonArray("mutation_scopes").asList().stream()
-                    .map(com.google.gson.JsonElement::getAsJsonObject)
-                    .filter(row->row.get("statement_outcome").getAsString().equals("failed")).findFirst().orElseThrow();
-            assertEquals(5000,failed.get("requested_rows").getAsInt());
-            assertTrue(failed.get("completed_scope_rows").getAsInt()>0);
-            assertTrue(failed.get("completed_scope_rows").getAsInt()<5000);
-            assertEquals(1,failed.get("scopes_without_completion").getAsInt());
-            assertEquals(1,failed.get("failed_records").getAsInt());
+            String failed = "FROM temp.main.sibench_mutation_statements WHERE statement_outcome='failed' AND schema_name<>'sibench_history'";
+            assertEquals(5000, number(observer, "SELECT sum(requested_rows) FILTER(WHERE event='begin') " + failed));
+            long completed = number(observer, "SELECT coalesce(sum(affected_rows) FILTER(WHERE event='complete'),0) " + failed);
+            assertTrue(completed > 0 && completed < 5000);
+            assertEquals(1, number(observer, "SELECT count(*) FILTER(WHERE event='failed') " + failed));
             assertTrue(number(observer, "SELECT count(*) FROM temp.main.sibench_mutation_statements "
                     + "WHERE event='complete' AND statement_outcome='failed' AND affected_rows>0") > 0);
             assertEquals(1, number(observer, "SELECT count(*) FROM temp.main.sibench_mutation_statements "

@@ -15,10 +15,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.sibench.config.BenchmarkSelection.Mode;
-import org.sibench.generation.DuckDbData;
 import org.sibench.schema.SourceSchema;
 
-/** Both native inputs publish the same baseline, workload and sealed data contract. */
+/** Both native inputs publish the same baseline and workload contract. */
 public final class DuckDbTrace implements AutoCloseable {
     private final Mode mode;
     private final Path directory;
@@ -62,17 +61,13 @@ public final class DuckDbTrace implements AutoCloseable {
         }
     }
 
-    /** The caller closes the host and moves its native data directory here before publishing. */
+    /** The caller closes the host and discards its native data before publishing. */
     public record Draft(Path directory,Map<String,Object> manifest) {
         public Draft {manifest=Map.copyOf(manifest);}
         public Map<String,Object> publish()throws IOException,SQLException {
             if(!Files.isRegularFile(directory.resolve("INCOMPLETE"))||Files.exists(directory.resolve("manifest.json")))
                 throw new IOException("Trace publication is not pending");
             var result=new LinkedHashMap<>(manifest);
-            var data=DuckDbData.inventory(directory.resolve("data"));
-            if(data.lastResolvedVersion()!=((Number)manifest.get("last_resolved_version")).longValue())
-                throw new IOException("Native data and Trace resolution watermarks differ");
-            result.put("native_data",data);
             result.put("status","complete_for_declared_projection");
             Path pending=directory.resolve("manifest.json.partial");
             Files.writeString(pending,new GsonBuilder().setPrettyPrinting().create().toJson(result),StandardOpenOption.CREATE_NEW);
@@ -153,7 +148,7 @@ public final class DuckDbTrace implements AutoCloseable {
                 previous=event;count++;unitCount++;
                 if(count>=events.length)events=Arrays.copyOf(events,Math.toIntExact(Math.min(Integer.MAX_VALUE-8L,events.length*2L)));
                 events[count]=event;
-                units.lines().write("{\"work_unit_id\":"+unitCount+",\"source_event\":"+event+",\"connection_id\":"+connection+",\"query_id\":"+sourceQuery+"}\n");
+                units.lines().write("{\"work_unit_id\":"+unitCount+",\"source_event\":"+event+"}\n");
             }
         }
         return Arrays.copyOf(events,count+1);

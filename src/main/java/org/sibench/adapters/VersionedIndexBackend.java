@@ -174,6 +174,21 @@ public final class VersionedIndexBackend implements IndexBackend {
     }
 
     @Override
+    public void writeBaseline(java.util.List<Write> inserts) throws IOException {
+        var keys = new java.util.ArrayList<byte[]>(inserts.size());
+        var values = new java.util.ArrayList<byte[]>(inserts.size());
+        for (var insert : inserts) {
+            var key = insert.getKey();
+            IndexExecution.validateKey(key);
+            if (insert.getKind() != Write.Kind.INSERT || insert.getVersion() != 0)
+                throw new IllegalArgumentException("Insert outside the baseline");
+            keys.add(versioned(entry(key.getTable(), key.getIndex(), key.getIndexedValue(), key.getPrimaryKey()), 0));
+            values.add(value(true, key.getIndexedValue().size(), insert.getValue()));
+        }
+        store.putBaseline(keys, values);
+    }
+
+    @Override
     public void search(Search search, ResultSink sink) throws IOException {
         if (!search.getUnknownFields().asMap().isEmpty())
             throw new IllegalArgumentException("Unsupported search fields");

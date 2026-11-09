@@ -63,7 +63,6 @@ public class PostgresGenerationCheck {
         for(String workload:object(config,"workloads").keySet())workloads.put(workload,Map.of("events",256L));
         config.put("workloads",workloads);document.put("native",config);
         var source=SourceSchema.read(root,document);var executor=Executors.newSingleThreadExecutor();
-        long rowId;int initialK;
         try(var capture=new PostgresCapture(sockets.resolve("capture.sock"),output.resolve("pending"),64L<<20,4096);
                 var database=PostgresDatabase.create(Path.of(runtime),output.resolve("source"),sockets.resolve("capture.sock"))) {
             try(var setup=database.connect("load-schema")){PostgresDatabase.unloggedTables(setup);}
@@ -75,10 +74,6 @@ public class PostgresGenerationCheck {
                 for(var table:source.tables())NativeHistory.install(setup,Engine.POSTGRES,++id,"public",table.name(),"id");
                 PostgresCapture.install(setup);setup.commit();
                 trace.baseline(setup,Map.of("sbtest1",512L,"sbtest2",512L));setup.commit();
-                try(var query=setup.createStatement();var row=query.executeQuery("SELECT i._sib_row_id,s.k FROM sbtest1 s JOIN sibench_history.identities_1 i USING(id) WHERE id=1")) {
-                    assertTrue(row.next());rowId=row.getLong(1);initialK=row.getInt(2);
-                }
-                setup.commit();
                 setup.setAutoCommit(true);try(var statement=setup.createStatement()){statement.execute("VACUUM ANALYZE");}
             }
             var projected=executor.submit(()->{
@@ -92,16 +87,11 @@ public class PostgresGenerationCheck {
                     PostgresSysbench.run(root,root.resolve(client),config,database,output.resolve(workload),workload,capture));
             try(var control=database.connect("finish")){capture.finishSources(control);}
             projected.get(30,TimeUnit.SECONDS);
-            try(var control=database.connect("independent-acceptance")){NativeHistory.verifyCommits(control);}
-            database.seal();Files.move(database.data(),output.resolve("trace/data"));
-            var manifest=trace.publish(Path.of(runtime),Map.of("stages",stages));
+            var manifest=trace.publish(Map.of("stages",stages));
             assertEquals(1024L,manifest.get("baseline_rows"));assertEquals(secondaryIndexes?2048L:1024L,manifest.get("baseline_operations"));assertEquals(1536L,manifest.get("committed_transactions"));
             assertFalse(Files.exists(output.resolve("trace/INCOMPLETE")));
             org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),new org.sibench.replay.ReplayConfig(secondaryIndexes,0,0,0,0,"operation"),output.resolve("reference.json"));
-            Path moved=output.resolve("moved");Files.move(output.resolve("trace"),moved);
-            try(var rows=org.sibench.trace.TraceManifest.openData(moved,Path.of(runtime),output.resolve("reader"))) {
-                assertEquals(initialK,((Number)rows.snapshotRow(1,rowId,0).orElseThrow().get("k")).intValue());
-            }
+            assertFalse(Files.exists(output.resolve("trace/data")));
         }finally{executor.shutdownNow();Files.deleteIfExists(sockets.resolve("capture.sock"));Files.delete(sockets);}
     }
 }

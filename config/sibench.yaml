@@ -22,7 +22,7 @@ benchmarks:
     engine: postgres
   - config: config/benchmark/hybench.yaml
     mode: capture
-    engine: duckdb
+    engine: postgres
 duckdb:
   build_directory: build/services/duckdb
   memory_limit: 16GiB

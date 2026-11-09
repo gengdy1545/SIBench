@@ -47,10 +47,18 @@ public final class IndexCatalog {
     private final Map<String, Integer> tableIds = new LinkedHashMap<>();
     private final Map<Integer, Definition> primary = new HashMap<>();
     private final Map<Integer, List<Definition>> secondary = new HashMap<>();
+    private final Set<String> blankPadded = new HashSet<>();
 
     private IndexCatalog(SourceSchema schema, List<Definition> definitions) {
         this.schema = schema;
         this.definitions = List.copyOf(definitions);
+        if (schema != null)
+            for (var table : schema.tables())
+                for (var column : table.columns())
+                    if (column.type().startsWith("character("))
+                        for (Definition definition : definitions)
+                            if (definition.table().equals(table.name()) && definition.column().equals(column.name()))
+                                blankPadded.add(definition.name());
         for (Definition definition : definitions) {
             if (names.put(definition.name(), definition) != null)
                 throw new IllegalArgumentException("Duplicate source index");
@@ -103,6 +111,19 @@ public final class IndexCatalog {
         var result = new ArrayList<Definition>(primaries);
         for (var index : schema.secondaryOrder()) result.add(secondaries.get(index.name()));
         return new IndexCatalog(schema, result);
+    }
+
+    /** Whether a PostgreSQL CHAR(n) column backs this index; it compares without trailing blanks. */
+    boolean blankPadded(Definition definition) {
+        return blankPadded.contains(definition.name());
+    }
+
+    /**
+     * A PostgreSQL index value as its KV key: CHAR(n) stores blank-padded values but orders and
+     * compares them without trailing blanks, so the key is the trimmed value. Other types are as-is.
+     */
+    public IndexKey postgresKey(Definition definition, String value) throws IOException {
+        return definition.encode(value != null && blankPadded(definition) ? value.replaceFirst(" +$", "") : value);
     }
 
     /** Generation records the verified source identity; consumers need no source checkout. */

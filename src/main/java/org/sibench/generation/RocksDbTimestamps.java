@@ -2,12 +2,11 @@ package org.sibench.generation;
 
 import java.nio.file.Path;
 import org.rocksdb.ColumnFamilyOptions;
-import org.rocksdb.DBOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.Transaction;
 
-/** Native timestamp and streaming file-checksum interfaces missing from RocksJava. */
+/** Native timestamp interfaces missing from RocksJava. */
 public final class RocksDbTimestamps {
     private static Path loaded;
 
@@ -38,11 +37,7 @@ public final class RocksDbTimestamps {
         comparator(options.getNativeHandle());
     }
 
-    public static void fileChecksums(DBOptions options) { fileChecksums(options.getNativeHandle()); }
     public static native void releaseMemory();
-    public static java.util.Map<String, RocksDbData.File> writtenFiles(DBOptions options) {
-        return writtenFiles(options.getNativeHandle());
-    }
 
     public static void commitTimestamp(Transaction transaction, long version) throws RocksDBException {
         if (loaded == null) throw new IllegalStateException("RocksDB timestamp bridge is not loaded");
@@ -57,7 +52,5 @@ public final class RocksDbTimestamps {
 
     private static native void requireVersion(String version);
     private static native void comparator(long options);
-    private static native void fileChecksums(long options);
-    private static native java.util.Map<String, RocksDbData.File> writtenFiles(long options);
     private static native void commitTimestamp(long transaction, long version) throws RocksDBException;
 }

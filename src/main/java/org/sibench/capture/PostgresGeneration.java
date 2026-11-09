@@ -14,7 +14,7 @@ import org.sibench.generation.NativeHistory;
 import org.sibench.generation.PostgresDatabase;
 import static org.sibench.config.ConfigValues.*;
 
-/** One fresh PG cluster: native load, online index export, normal shutdown and publication. */
+/** One fresh PG cluster: native load, online index export, normal shutdown and Trace publication. */
 final class PostgresGeneration {
     private PostgresGeneration() {}
     static Map<String,Object> generate(Generation.Plan plan,Generation.Input input)throws Exception {
@@ -31,8 +31,11 @@ final class PostgresGeneration {
                         "engine",input.selection().engine(),"mode",input.selection().mode()));
                 json(output.resolve("engine-build.json"),build.identity());json(output.resolve("client-build.json"),input.buildIdentity());
                 long loadStart=System.nanoTime();
+                boolean hybench=input.selection().benchmark().equals("hybench");
+                String url="jdbc:postgresql://127.0.0.1:"+database.port()+"/postgres?user=sibench&ApplicationName=sibench:hybench";
                 try(var setup=database.connect("load-schema")) { PostgresDatabase.unloggedTables(setup); }
-                PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,output.resolve("load"),"oltp_read_write",null);
+                if(hybench)loadHybench(plan,input,database,output,url);
+                else PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,output.resolve("load"),"oltp_read_write",null);
                 timings.put("native_load_seconds",seconds(loadStart));long baselineStart=System.nanoTime();
                 var budget=new RequestBudget(Generation.requestTarget(input.document()),input.timeout());
                 var trace=new PostgresTrace(output.resolve("trace"),input.source(),Generation.secondaryIndexes(input.document()),budget);
@@ -56,18 +59,23 @@ final class PostgresGeneration {
                     return null;
                 });
                 long workloadStart=System.nanoTime();var stages=new LinkedHashMap<String,Object>();
-                int remaining=object(input.nativeConfig(),"workloads").size();
-                for(String workload:object(input.nativeConfig(),"workloads").keySet()) {
+                // HyBench runs AP once, then shares the remaining requests between TP and XP.
+                var workloads=hybench?java.util.List.of("ap","tp","xp"):java.util.List.copyOf(object(input.nativeConfig(),"workloads").keySet());
+                int remaining=hybench?2:workloads.size();
+                for(String workload:workloads) {
                     Path stage=Files.createDirectory(output.resolve(workload));
-                    budget.begin(workload,remaining--,stage.resolve("budget.stop"));
+                    boolean setup=hybench&&workload.equals("ap");
+                    Path stop=setup?null:stage.resolve("budget.stop");
+                    budget.begin(workload,setup?0:remaining--,stop);
                     var batches=new java.util.ArrayList<Map<String,Object>>();
                     do {
                         budget.checkTime();long before=budget.count();
-                        batches.add(PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,
-                                stage.resolve("batch-"+batches.size()),workload,capture));
+                        Path batch=stage.resolve("batch-"+batches.size());
+                        batches.add(hybench?runHybench(plan,input,database,capture,batch,workload,url,stop)
+                                :PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,batch,workload,capture));
                         trace.awaitProjection(capture,input.timeout());
-                        if(budget.enabled())budget.requireProgress(before);
-                    } while(budget.enabled()&&!budget.reached());
+                        if(budget.enabled()&&!setup)budget.requireProgress(before);
+                    } while(budget.enabled()&&!setup&&!budget.reached());
                     budget.end();stages.put(workload,batches);
                 }
                 json(output.resolve("request-budget.json"),budget.finish());
@@ -75,12 +83,12 @@ final class PostgresGeneration {
                 try(var control=database.connect("source-drain")){capture.finishSources(control);}
                 projected.get(input.timeout().toMillis(),TimeUnit.MILLISECONDS);
                 timings.put("workload_and_export_seconds",seconds(workloadStart));
-                long closeStart=System.nanoTime();database.seal();
-                Files.move(database.data(),output.resolve("trace/data"));
+                // The Trace is complete without native rows: stop the cluster normally, then discard its data.
+                long closeStart=System.nanoTime();database.close();Generation.deleteTree(database.data());
                 timings.put("native_close_seconds",seconds(closeStart));long publicationStart=System.nanoTime();
                 var evidence=Map.<String,Object>of("engine",build.identity(),"client",input.buildIdentity(),"stages",stages,
                         "request_budget",budget.finish(),"effective_config_sha256",Digests.sha256(output.resolve("effective-config.json")),"baseline_rows",input.baselineRows());
-                var manifest=trace.publish(runtime,evidence);
+                var manifest=trace.publish(evidence);
                 timings.put("publication_seconds",seconds(publicationStart));timings.put("total_seconds",seconds(started));
                 json(output.resolve("result.json"),Map.of("status","complete","trace",output.resolve("trace").toString(),"timings",timings));
                 return manifest;
@@ -97,6 +105,33 @@ final class PostgresGeneration {
             }catch(Exception cleanup){if(primary!=null)primary.addSuppressed(cleanup);else throw cleanup;}
         }
     }
+    /** Upstream CSVs are generated once and loaded with the same native DDL/COPY as DuckDB. */
+    private static void loadHybench(Generation.Plan plan,Generation.Input input,PostgresDatabase database,Path output,String url)throws Exception {
+        Path load=Files.createDirectory(output.resolve("load"));
+        Generation.hybench(plan,input,load,true,null,Engine.POSTGRES,url,null,()->{});
+        Path data=output.resolve("native/Data_"+string(input.nativeConfig(),"sf"));
+        Path script=input.source().source().resolve("conf/load_data_pg.sql"),manifest=load.resolve("inputs.json");
+        HybenchInputs.record(data,script,manifest);
+        try(var setup=database.connect("load")){Generation.requireRows(input.baselineRows(),Hybench.load(setup,input.source().source(),data));}
+        HybenchInputs.requireRuntimeInputs(data,manifest);
+        HybenchInputs.dropLoadInputs(data,script);
+    }
+
+    /** One HyBench phase window; its source sessions must all close before the next window starts. */
+    private static Map<String,Object> runHybench(Generation.Plan plan,Generation.Input input,PostgresDatabase database,
+            PostgresCapture capture,Path batch,String phase,String url,Path stop)throws Exception {
+        Files.createDirectory(batch);var previous=capture.completedSessions();
+        Generation.hybench(plan,input,batch,false,phase,Engine.POSTGRES,url,stop,capture::check);
+        try(var control=database.connect("source-counts")){capture.awaitSources(control);}
+        var sessions=new java.util.ArrayList<>(capture.completedSessions());sessions.removeAll(previous);
+        if(sessions.isEmpty())throw new java.io.IOException("HyBench window opened no captured PG session: "+batch);
+        var source=new LinkedHashMap<String,Long>();
+        for(var session:sessions)for(var count:object(session,"counts").entrySet())
+            source.merge(count.getKey(),((Number)count.getValue()).longValue(),Math::addExact);
+        var client=com.google.gson.JsonParser.parseString(Files.readString(batch.resolve("summary.json"))).getAsJsonObject();
+        return Map.of("phase",phase,"client",new com.google.gson.Gson().fromJson(client,Map.class),"source",source,"sessions",sessions.size());
+    }
+
     private static double seconds(long start){return (System.nanoTime()-start)/1e9;}
     private static void json(Path path,Object value)throws java.io.IOException {
         Files.writeString(path,new GsonBuilder().setPrettyPrinting().create().toJson(value),StandardOpenOption.CREATE_NEW);

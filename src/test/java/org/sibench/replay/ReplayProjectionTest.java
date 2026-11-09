@@ -316,14 +316,17 @@ public class ReplayProjectionTest {
     }
 
     @Test
-    public void bufferLimitIncludesFilteredQueries() throws Exception {
-        var replay =
-                new ReplayProjection(
-                        new ReplayConfig(false, 0, 0, 0, 0), true, operation -> fail());
+    public void readOnlySourceTransactionsSendSearchesAndWritesBoundTheBuffer() throws Exception {
+        long[] sent = {0};
+        var replay = new ReplayProjection(new ReplayConfig(false, 0, 0, 0, 0), true, operation -> sent[0]++);
         replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
-        Operation query = sourceSearch(IndexOperationTrace.search(1, 5, 1, Range.equal(IndexKey.ofInt(10)), 0, 0, 0), 10, 0);
-        for (int i = 0; i < org.sibench.capture.ProtoTrace.MAX_TRANSACTION_OPERATIONS; i++) replay.accept(query);
-        assertThrows(IOException.class, () -> replay.accept(query));
-        assertEquals(0, replay.dispatched());
+        Operation query = sourceSearch(IndexOperationTrace.search(1, 3, 0, Range.equal(IndexKey.ofInt(10)), 0, 0, 0), 10, 0);
+        for (int i = 0; i <= org.sibench.capture.ProtoTrace.MAX_TRANSACTION_OPERATIONS; i++) replay.accept(query);
+        assertEquals(org.sibench.capture.ProtoTrace.MAX_TRANSACTION_OPERATIONS + 1L, sent[0]);
+        replay.accept(mutation(3, 1, 1, 10, 1, IndexOperationTrace.UPSERT));
+        Operation after = sourceSearch(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(10)), 0, 0, 0), 10, 1);
+        for (int i = 1; i < org.sibench.capture.ProtoTrace.MAX_TRANSACTION_OPERATIONS; i++) replay.accept(after);
+        assertThrows(IOException.class, () -> replay.accept(after));
+        assertEquals(org.sibench.capture.ProtoTrace.MAX_TRANSACTION_OPERATIONS + 1L, sent[0]);
     }
 }

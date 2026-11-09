@@ -2,7 +2,6 @@ package org.sibench.capture;
 
 import java.io.IOException;
 import java.util.*;
-import java.util.concurrent.atomic.AtomicLong;
 import org.sibench.generation.RocksDbRows;
 
 /** In-process YCSB binding sessions; the upstream client still owns every workload decision. */
@@ -14,7 +13,6 @@ public final class RocksYcsb {
     private final RocksDbRows rows;
     private final RocksDbRows.Baseline baseline;
     private final int fieldCount;
-    private final AtomicLong connections = new AtomicLong();
     private long opened, completed, calls;
     private boolean loading;
     private RequestBudget budget;
@@ -40,20 +38,18 @@ public final class RocksYcsb {
         if (active == null || baseline != active.loading || fields != active.fieldCount)
             throw new IllegalStateException("YCSB binding does not match its generation stage");
         synchronized (active) { active.opened++; }
-        return active.new Session(active.connections.incrementAndGet());
+        return active.new Session();
     }
     public final class Session implements AutoCloseable {
-        private final long connection;
         private final ArrayList<RocksDbRows.Row> buffered = new ArrayList<>();
         private long query;
         private int bufferedBytes;
         private boolean closed;
         private Exception failure;
-        Session(long connection) { this.connection = connection; }
 
         public Result read(String key, Set<String> fields, int limit) throws Exception {
             requireWorkload(); var selected = selected(fields);
-            var found = rows.read(key, limit, connection, ++query);
+            var found = rows.read(key, limit); query++;
             var result = new ArrayList<Row>(found.size());
             for (var row : found) {
                 var values = new LinkedHashMap<String, byte[]>();
@@ -77,7 +73,7 @@ public final class RocksYcsb {
                 if (buffered.size() >= 512 || bufferedBytes >= 1 << 20) flush();
                 return Status.OK;
             }
-            var changed = rows.change(kind, key, updates, connection, ++query);
+            var changed = rows.change(kind, key, updates); query++;
             return changed != null ? Status.OK : kind.equals("insert") ? Status.ERROR : Status.NOT_FOUND;
             } catch (Exception error) { failure = error; throw error; }
         }

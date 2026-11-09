@@ -369,4 +369,27 @@ public class IndexServerTest {
             assertEquals(3, backend.search(all).size());
         }
     }
+
+    @Test
+    public void aWriteBatchReachesTheBackendAsOneBaselineCall() throws Exception {
+        var calls = new java.util.ArrayList<Integer>();
+        IndexBackend backend = new IndexBackend() {
+            public org.sibench.adapters.proto.DescribeResponse describe() { throw new UnsupportedOperationException(); }
+            public void write(org.sibench.adapters.proto.Write write) { calls.add(1); }
+            public void writeBaseline(java.util.List<org.sibench.adapters.proto.Write> inserts) { calls.add(inserts.size()); }
+            public void search(Search search, ResultSink sink) { throw new UnsupportedOperationException(); }
+            public void flush() {}
+            public void bind(String binding) {}
+            public String location() { return "test"; }
+            public void close() {}
+        };
+        var batch = org.sibench.adapters.proto.WriteBatch.newBuilder();
+        for (long key = 1; key <= 3; key++)
+            batch.addWrites(org.sibench.adapters.proto.Write.newBuilder().setKind(org.sibench.adapters.proto.Write.Kind.INSERT)
+                    .setKey(EntryKey.newBuilder().setTable(1).setPrimaryKey(ByteString.copyFrom(IndexKey.ofInt(key).bytes())))
+                    .setValue(org.sibench.adapters.proto.Value.newBuilder().setRowId(key)));
+        assertEquals(Status.OK, IndexExecution.execute(backend, Request.newBuilder().setId(1).setBatch(batch).build()).getStatus());
+        // Stores such as SlateDB apply the whole request as one engine write batch.
+        assertEquals(java.util.List.of(3), calls);
+    }
 }

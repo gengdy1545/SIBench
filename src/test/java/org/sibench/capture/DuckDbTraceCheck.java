@@ -56,10 +56,7 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
     }
     private Path publish(DuckDbTrace.Draft draft)throws Exception {
         assertThrows(IOException.class,()->ReplayInput.check(draft.directory(),REPLAY));
-        retainSource();Files.move(output.resolve("data"),draft.directory().resolve("data"));
-        var wrong=new java.util.LinkedHashMap<>(draft.manifest());wrong.put("last_resolved_version",999L);
-        assertThrows(IOException.class,()->new DuckDbTrace.Draft(draft.directory(),wrong).publish());
-        assertFalse(Files.exists(draft.directory().resolve("manifest.json")));
+        retainSource();
         draft.publish();assertThrows(IOException.class,draft::publish);
         Path moved=Files.move(draft.directory(),output.resolve("moved"));
         var manifest=TraceManifest.read(moved);
@@ -77,45 +74,9 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
         assertEquals(1,((List<?>)reference.get("results")).size());
         assertThrows(IOException.class,()->org.sibench.replay.ReferenceReplay.run(moved,REPLAY,List.of(false),output.resolve("locator-reference.json")));
         assertFalse(Files.exists(output.resolve("locator-reference.json")));
-        assertEquals("passed",org.sibench.replay.SnapshotLookupValidation.run(moved,REPLAY,
-                output.resolve("native-oracle.json")).get("status"));
-        assertEquals("passed",org.sibench.replay.FullSnapshotValidation.run(moved,
-                output.resolve("full-native-oracle")).get("status"));
-        rejectsWrongBaselineRowIds(moved);
-        assertTrue(Files.isRegularFile(DuckDbDatabase.file(moved.resolve("data"))));
+        assertFalse(Files.exists(moved.resolve("data")));
+        assertFalse(TraceManifest.read(moved).has("native_data"));
         return moved;
-    }
-
-    private void rejectsWrongBaselineRowIds(Path trace)throws Exception {
-        Path wrong=Files.createDirectory(output.resolve("wrong-row-ids"));
-        try(var files=Files.walk(trace)) {
-            for(Path file:files.sorted().toList()) {
-                Path target=wrong.resolve(trace.relativize(file));
-                if(file.equals(trace))continue;
-                if(Files.isDirectory(file))Files.createDirectory(target);
-                else if(!file.getFileName().toString().equals("baseline.pb.zst"))Files.copy(file,target);
-            }
-        }
-        var manifest=TraceManifest.read(trace);
-        var writer=new ProtoTrace.Writer(wrong.resolve("baseline.pb.zst"));
-        try(writer) {
-            ProtoTrace.source(trace,manifest,"baseline").read(o->writer.accept(IndexOperationTrace.write(
-                    o.sourceEvent(),o.kind(),o.table(),o.flags(),o.key(),o.version(),o.file(),o.position(),o.rowId()+100000)
-                    .withIndex(o.index(),o.indexedValue(),o.kind()).withExpansion(o.expansionPosition(),o.expansionSize())
-                    .withWorkUnitId(o.workUnitId())));
-        }
-        var files=new com.google.gson.JsonArray();files.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("baseline.pb.zst",writer)));
-        manifest.getAsJsonObject("proto_files").add("baseline",files);
-        manifest.addProperty("baseline_trace_sha256",ProtoTrace.identity(files));
-        Files.writeString(wrong.resolve("manifest.json"),manifest.toString());
-        Path report=output.resolve("wrong-row-ids-report.json");
-        var failure=assertThrows(IOException.class,()->org.sibench.replay.SnapshotLookupValidation.run(wrong,REPLAY,report));
-        assertTrue(failure.toString(),failure.getMessage().contains("Historical primary mismatch"));
-        assertFalse(Files.exists(report));
-        Path full=output.resolve("wrong-full-row-ids");
-        assertThrows(IOException.class,()->org.sibench.replay.FullSnapshotValidation.run(wrong,full));
-        assertTrue(Files.exists(full.resolve("INCOMPLETE")));
-        assertFalse(Files.exists(full.resolve("report.json")));
     }
 
     private void verifiesCoverageAndDeferredBaseline(Path trace)throws Exception {
@@ -169,11 +130,11 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
     @Test public void capturePublishesAbortAndHistoricalRowsThroughOfficialConsumers()throws Exception {
         output("capture");Path receipts=Files.createDirectory(output.resolve("clients"));
         var source=SourceSchema.of("sysbench",Path.of("benchmark/sysbench"),Map.of("tables",1));
-        DuckDbTrace.Draft draft;long row;
+        DuckDbTrace.Draft draft;
         try(var db=connect()) {
             sql(db,"CREATE TABLE sbtest1(id INTEGER PRIMARY KEY,k INTEGER NOT NULL,c VARCHAR NOT NULL,pad VARCHAR NOT NULL)");
             sql(db,"CREATE INDEX k_1 ON sbtest1(k)");sql(db,"INSERT INTO sbtest1 VALUES(10,1,'A',''),(20,1,'B',''),(30,2,'C','')");
-            history(db,"sbtest1","id");row=number(db,"SELECT _sib_row_id FROM sibench_history.identities_1 WHERE id=10");
+            history(db,"sbtest1","id");
             var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"),true);
             db.setAutoCommit(false);trace.baseline(db,Map.of("sbtest1",3L));db.commit();db.setAutoCommit(true);
             logging(db);
@@ -197,11 +158,6 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
         Path moved=publish(draft);
         verifiesCoverageAndDeferredBaseline(moved);
         org.sibench.replay.ReplayMatrixValidation.validate(moved,output.resolve("matrix"));
-        try(var data=TraceManifest.openData(moved)) {
-            assertEquals("A",data.snapshotRow(1,row,0).orElseThrow().get("c"));
-            assertEquals("A",data.snapshotRow(1,row,1).orElseThrow().get("c"));
-            assertEquals("changed",data.snapshotRow(1,row,3).orElseThrow().get("c"));
-        }
     }
 
     @Test public void incrementalWindowsPreserveVersionsAndDeletedRowIdentities() throws Exception {
@@ -254,11 +210,12 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
         Path moved=publish(draft);
         ProtoTraceBenchmark.readTrace(moved,1,output.resolve("parse.json"));
         assertThrows(IllegalArgumentException.class,()->ProtoTraceBenchmark.readTrace(moved,0,output.resolve("invalid-parse.json")));
-        try(var data=TraceManifest.openData(moved)) {
-            assertEquals("original",data.snapshotRow(1,1,0).orElseThrow().get("c"));
-            assertEquals("committed",data.snapshotRow(1,1,2).orElseThrow().get("c"));
-            assertTrue(data.snapshotRow(1,1,3).isEmpty());
-        }
+        // The update keeps baseline RowID 1; delete and reinsert in one transaction publish a new RowID.
+        var operations=new java.util.ArrayList<IndexOperationTrace.Operation>();
+        ProtoTrace.source(moved,TraceManifest.read(moved),"workload").read(operations::add);
+        var rowIds=operations.stream().filter(o->IndexOperationTrace.isMutation(o)&&o.index()==0)
+                .map(IndexOperationTrace.Operation::rowId).toList();
+        assertEquals(2,rowIds.size());assertEquals(1L,(long)rowIds.get(0));assertNotEquals(1L,(long)rowIds.get(1));
     }
 
 }

@@ -107,13 +107,13 @@
 ## Current design and compatibility
 
 - Use one fresh database of the explicitly selected native engine for loading,
-  history tracking and workload capture. Reject existing working/output directories,
-  preserve native transaction and snapshot semantics, then seal and publish its native files after
-  normal host shutdown. Retain failure diagnostics; do not add crash recovery or
-  reusable initial-state caches without an explicit need. Successful Trace data
-  are retained artifacts, not disposable working databases. Keep independent
-  full-data acceptance separate from normal generation, whose input integrity and
-  source-completeness checks remain required.
+  RowID identities and workload capture. Reject existing working/output directories
+  and preserve native transaction and snapshot semantics. The database is working
+  state: keep only what Trace export needs, publish the Trace after normal host
+  shutdown and then delete the database. Retain failure diagnostics; do not add
+  crash recovery or reusable initial-state caches without an explicit need.
+  Published Traces are retained artifacts. Input integrity and source-completeness
+  checks remain required in normal generation.
 - Maintain the current design by default. Do not add or retain superseded APIs,
   format readers, compatibility flags, fallback implementations or transition
   branches for backward compatibility that has not been explicitly required.

@@ -63,8 +63,8 @@ public final class WorkUnits {
     }
 
     /**
-     * Reads and checks the catalog once. Unit identities must be {@code 1..count}, source events
-     * strictly increasing, and each unit must name its source connection and query.
+     * Reads and checks the catalog once. Unit identities must be {@code 1..count} and source events
+     * strictly increasing.
      */
     public static Catalog read(Path trace) throws IOException {
         MessageDigest digest = sha256();
@@ -77,7 +77,6 @@ public final class WorkUnits {
             for (String line; (line = reader.readLine()) != null; ) {
                 long id = 0, event = 0;
                 int fields = 0;
-                long connection = -1, query = -1;
                 // Hash all original bytes, but avoid a JSON tree for fields the catalog never retains.
                 try (var unit = new JsonReader(new java.io.StringReader(line))) {
                     unit.beginObject();
@@ -85,8 +84,6 @@ public final class WorkUnits {
                         switch (unit.nextName()) {
                             case "work_unit_id" -> { id = unit.nextLong(); fields |= 1; }
                             case "source_event" -> { event = unit.nextLong(); fields |= 2; }
-                            case "connection_id" -> { connection = unit.nextLong(); fields |= 4; }
-                            case "query_id" -> { query = unit.nextLong(); fields |= 8; }
                             default -> unit.skipValue();
                         }
                     }
@@ -97,7 +94,7 @@ public final class WorkUnits {
                 }
                 if (id != count + 1
                         || event <= lastEvent
-                        || fields != 15 || connection < 0 || query < 0)
+                        || fields != 3)
                     throw new IOException("Invalid source work-unit catalog order/identity");
                 if (id > Integer.MAX_VALUE - 8)
                     throw new IOException("Source work-unit catalog exceeds the in-memory index range");

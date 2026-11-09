@@ -101,6 +101,7 @@ def summarize(report, logs, after_flush_millis=None):
             "target_calls", "basic_operations", "completed_operations",
             "failed_response_operations",
             "timed_out_operations", "backpressure_seconds", "dependency_wait_seconds",
+            "deferred_search_operations", "search_deferral_seconds", "peak_deferred_operations",
             "local_send_boundary", "latency_boundary", "peak_in_flight", "measurement",
             "search_latency", "write_latency")})
     engines = engine_events(logs)

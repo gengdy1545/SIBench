@@ -9,7 +9,7 @@ import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 import org.rocksdb.*;
 
-/** Native timestamped rows and stable identities in one fresh RocksDB database. */
+/** Native timestamped rows and stable RowIDs in one fresh, disposable RocksDB database. */
 public final class RocksDbRows implements AutoCloseable {
     public record Settings(long cacheBytes, long writeBufferBytes, int backgroundJobs) {
         public Settings {
@@ -19,7 +19,7 @@ public final class RocksDbRows implements AutoCloseable {
     }
     public record Row(long id, String key, byte[][] fields) {}
     public record Event(String kind, String key, long rowId, long version, long readVersion,
-                        long connection, long query, long count, long limit, boolean committed) {}
+                        long count, long limit, boolean committed) {}
     @FunctionalInterface public interface Events { void accept(Event event) throws IOException; }
     @FunctionalInterface public interface Baseline { void accept(Row row) throws IOException; }
 
@@ -36,9 +36,8 @@ public final class RocksDbRows implements AutoCloseable {
     private final long workloadWriteBufferBytes;
     private final Events events;
     private volatile long version;
-    private volatile boolean loading = true, sealed, closed;
+    private volatile boolean loading = true, closed;
     private volatile Exception failure;
-    private Map<String, RocksDbData.File> writtenFiles;
 
     public RocksDbRows(Path directory, int fields, Settings settings, Events events) throws IOException, RocksDBException {
         if (fields < 1 || fields > 1024) throw new IllegalArgumentException("Invalid field count");
@@ -55,7 +54,7 @@ public final class RocksDbRows implements AutoCloseable {
                 .setMaxWriteBufferNumber(3).setCompressionType(CompressionType.LZ4_COMPRESSION)
                 .setTableFormatConfig(new BlockBasedTableConfig().setBlockCache(cache).setFilterPolicy(bloom));
         rowOptions = ColumnFamilyOptions.getColumnFamilyOptionsFromProps(history).setWriteBufferSize(settings.writeBufferBytes())
-                // Retain finite capture history without rewriting full rows in background merges.
+                // A finite, discarded run: skip background merges that would rewrite full rows.
                 .setCompactionStyle(CompactionStyle.NONE)
                 .setLevel0SlowdownWritesTrigger(Integer.MAX_VALUE).setLevel0StopWritesTrigger(Integer.MAX_VALUE)
                 .setMaxWriteBufferNumber(3)
@@ -67,7 +66,6 @@ public final class RocksDbRows implements AutoCloseable {
                 .setErrorIfExists(true).setMaxBackgroundJobs(settings.backgroundJobs())
                 .setMaxSubcompactions(settings.backgroundJobs() - 1);
         transactions = new TransactionDBOptions().setTransactionLockTimeout(30000);
-        RocksDbTimestamps.fileChecksums(options);
         try {
             database = TransactionDB.open(options, transactions, directory.toString(), descriptors(metadataOptions, rowOptions), handles);
         } catch (RocksDBException | RuntimeException error) {
@@ -95,7 +93,6 @@ public final class RocksDbRows implements AutoCloseable {
                     throw new IOException("Duplicate baseline key: " + supplied.key());
                 var row = new Row(nextIdentity(), supplied.key(), supplied.fields());
                 transaction.put(rows(), key, encode(row, fields));
-                transaction.put(identityKey(row.id()), key);
                 loaded.add(row);
             }
             RocksDbTimestamps.commitTimestamp(transaction, 0);
@@ -115,12 +112,7 @@ public final class RocksDbRows implements AutoCloseable {
     public long baselineRows() { return identities.get(); }
     public long version() { return version; }
 
-    public Map<String, String> statistics() throws RocksDBException {
-        return Map.of("metadata", database.getProperty(handles.get(0), "rocksdb.stats"),
-                "rows", database.getProperty(rows(), "rocksdb.stats"));
-    }
-
-    public List<Row> read(String key, int limit, long connection, long query) throws Exception {
+    public List<Row> read(String key, int limit) throws Exception {
         checkWorkload(); if (limit < 0) throw new IllegalArgumentException("Negative scan limit");
         long snapshot = version;
         var found = new ArrayList<Row>();
@@ -136,9 +128,7 @@ public final class RocksDbRows implements AutoCloseable {
             }
             synchronized (this) {
                 check(); long next = Math.incrementExact(version);
-                database.put(writes, pointKey(connection, query), number(snapshot));
-                events.accept(new Event(limit == 0 ? "read" : "scan", key, 0, next, snapshot,
-                        connection, query, found.size(), limit, true));
+                events.accept(new Event(limit == 0 ? "read" : "scan", key, 0, next, snapshot, found.size(), limit, true));
                 version = next;
             }
             return found;
@@ -146,7 +136,7 @@ public final class RocksDbRows implements AutoCloseable {
     }
 
     /** Returns null for an absent update/delete or a duplicate insertion, without inventing a write. */
-    public Row change(String kind, String key, Map<Integer, byte[]> updates, long connection, long query) throws Exception {
+    public Row change(String kind, String key, Map<Integer, byte[]> updates) throws Exception {
         checkWorkload();
         if (!Set.of("insert", "update", "delete").contains(kind)) throw new IllegalArgumentException("Unknown row change");
         try (var transaction = database.beginTransaction(writes);
@@ -168,38 +158,28 @@ public final class RocksDbRows implements AutoCloseable {
                     }
                     row = new Row(previous == null ? nextIdentity() : previous.id(), key, values);
                     transaction.put(rows(), encodedKey, encode(row, fields));
-                    if (previous == null) transaction.put(identityKey(row.id()), encodedKey);
                 }
             }
             synchronized (this) {
                 check(); long snapshot = version, next = Math.incrementExact(snapshot);
-                if (duplicate) {
-                    transaction.rollback();
-                    database.put(writes, pointKey(connection, query), number(snapshot));
-                } else {
-                    transaction.put(pointKey(connection, query), number(snapshot));
+                if (duplicate) transaction.rollback();
+                else {
                     RocksDbTimestamps.commitTimestamp(transaction, next);
                     transaction.commit();
                 }
                 events.accept(new Event(kind, key, row == null ? 0 : row.id(), next, snapshot,
-                        connection, query, changed ? 1 : 0, 0, !duplicate));
+                        changed ? 1 : 0, 0, !duplicate));
                 version = next;
             }
             return row;
         } catch (Exception error) { failure = error; throw error; }
     }
 
-    public synchronized void seal() throws Exception {
-        checkWorkload();
-        database.put(writes, bytes("sealed"), ByteBuffer.allocate(20).putInt(fields).putLong(version).putLong(identities.get()).array());
-        try (var flush = new FlushOptions().setWaitForFlush(true)) { database.flush(flush, handles); }
-        sealed = true;
-    }
     private long nextIdentity() throws IOException {
         long id = identities.incrementAndGet(); if (id <= 0) throw new IOException("Row identity overflow"); return id;
     }
     private void check() throws IOException {
-        if (closed || sealed) throw new IOException("RocksDB generation is closed");
+        if (closed) throw new IOException("RocksDB generation is closed");
         if (failure != null) throw new IOException("RocksDB generation already failed", failure);
     }
     private void checkWorkload() throws IOException {
@@ -207,24 +187,11 @@ public final class RocksDbRows implements AutoCloseable {
     }
     @Override public synchronized void close() throws RocksDBException {
         if (closed) return; closed = true;
-        try {
-            handles.forEach(ColumnFamilyHandle::close); database.closeE();
-            if (sealed) writtenFiles = Map.copyOf(RocksDbTimestamps.writtenFiles(options));
-        }
+        try { handles.forEach(ColumnFamilyHandle::close); database.closeE(); }
         finally { writes.close(); transactions.close(); options.close(); rowOptions.close(); metadataOptions.close(); bloom.close(); cache.close(); }
-    }
-    public Map<String, RocksDbData.File> writtenFiles() {
-        if (writtenFiles == null) throw new IllegalStateException("RocksDB has not sealed and closed successfully");
-        return writtenFiles;
     }
 
     static byte[] bytes(String value) { return value.getBytes(StandardCharsets.UTF_8); }
-    static byte[] number(long value) { return ByteBuffer.allocate(8).putLong(value).array(); }
-    static byte[] identityKey(long id) { return ByteBuffer.allocate(9).put((byte) 'i').putLong(id).array(); }
-    static byte[] pointKey(long connection, long query) {
-        if (connection <= 0 || query <= 0) throw new IllegalArgumentException("Invalid source operation identity");
-        return ByteBuffer.allocate(17).put((byte) 'p').putLong(connection).putLong(query).array();
-    }
     static byte[] encode(Row row, int fields) throws IOException {
         if (row.id() <= 0 || row.fields().length != fields) throw new IOException("Invalid native row layout");
         int size = 8 + 4 * fields;

@@ -25,13 +25,15 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
     private final PostgresVersions versions;
     private final Path scratch;
     private final Map<Integer,PostgresAccessUnits.Detail> details=new HashMap<>();
+    /** Backends with released read-only pieces whose transaction has not resolved yet. */
+    private final java.util.Set<Integer> pieces=new java.util.HashSet<>();
     private final Map<Integer,PreparedStatement> identities=new HashMap<>(),insertions=new HashMap<>();
     private final Map<PostgresAccessUnits.Unit,Search> live=new IdentityHashMap<>();
     private final Map<PostgresAccessUnits.BitmapGroup,Search> groups=new IdentityHashMap<>();
     private final ArrayDeque<Object> pending=new ArrayDeque<>();
     private PostgresTransactions.Chunk chunk;
     private SpillingMap local,allocated;
-    private long version,event,workUnits,currentUnit,unitEvent,query,readVersion,writes,statementWrites;
+    private long version,event,workUnits,currentUnit,unitEvent,readVersion,writes,statementWrites;
     private long commits,aborts,searches,mutations;
 
     private static final class Search {
@@ -59,9 +61,13 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
         }
     }
 
-    void accept(PostgresTransactions.Chunk source)throws IOException,SQLException {
+    /** Projects one chunk; returns whether it resolved a source transaction with requests. */
+    boolean accept(PostgresTransactions.Chunk source)throws IOException,SQLException {
         chunk=source;writes=0;statementWrites=0;currentUnit=0;
-        version=source.hasRequests?versions.begin(source):0;
+        // A piece's searches are standalone snapshot reads; its transaction resolves with its outcome.
+        if(source.piece)pieces.add(source.pid);
+        boolean split=!source.piece&&pieces.remove(source.pid);
+        version=split||!source.piece&&source.hasRequests?versions.begin(source):0;
         try(var rowIds=new SpillingMap(scratch.resolve("local-identities"),65536,4);
                 var abortIds=new SpillingMap(scratch.resolve("aborted-identities"),65536,4)) {
             local=rowIds;allocated=abortIds;
@@ -69,7 +75,7 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
             if(!source.committed)source.read(e->{
                 if(e.get("event").getAsString().equals("row_identity")&&e.get("req").getAsLong()<=source.lastCompletedRequest) {
                     int table=e.get("table_id").getAsInt();
-                    allocated.put(identityKey(table,catalog.primary(table).encode(text(e.get("primary_key"))),e.get("req").getAsLong()),e.get("row_id").getAsLong());
+                    allocated.put(identityKey(table,catalog.postgresKey(catalog.primary(table),text(e.get("primary_key"))),e.get("req").getAsLong()),e.get("row_id").getAsLong());
                 }
             });
             var tracker=new PostgresAccessUnits(this);
@@ -97,20 +103,20 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
                 versions.finish(source);if(source.committed)commits++;else aborts++;
             }
         }finally{local=null;allocated=null;chunk=null;}
+        return version>0;
     }
 
     @Override public void requestStarted(PostgresAccessUnits.Request request,JsonObject event)throws IOException {
-        startRequest(request.ordinal,event);
+        startRequest(event);
     }
-    private void startRequest(long ordinal,JsonObject event)throws IOException {
-        if(version==0)throw new IOException("PG request lacks a canonical transaction");
-        query=ordinal;currentUnit=++workUnits;unitEvent=this.event;statementWrites=0;
+    private void startRequest(JsonObject event)throws IOException {
+        if(version==0&&!chunk.piece)throw new IOException("PG request lacks a canonical transaction");
+        currentUnit=++workUnits;unitEvent=this.event;statementWrites=0;
         try {
             readVersion=versions.readVersion(event.get("snapshot_csn").getAsLong());
-            versions.statement(chunk.pid,query,readVersion,writes>0);
+            if(!chunk.piece&&readVersion>=version)throw new IOException("PG statement sees its own or a future Trace resolution");
         }catch(SQLException failure){throw new IOException("Cannot bind PG statement snapshot",failure);}
-        units.lines().write("{\"work_unit_id\":"+currentUnit+",\"source_event\":"+unitEvent
-                +",\"connection_id\":"+chunk.pid+",\"query_id\":"+query+"}\n");
+        units.lines().write("{\"work_unit_id\":"+currentUnit+",\"source_event\":"+unitEvent+"}\n");
     }
 
     @Override public void unitStarted(PostgresAccessUnits.Unit unit,JsonObject event)throws IOException {
@@ -119,7 +125,8 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
         if(unit.snapshotCsn<=0||unit.snapshotSuboverflowed)throw new IOException("PG access has no exact snapshot");
         try{if(versions.readVersion(unit.snapshotCsn)!=readVersion)throw new IOException("PG scan and statement snapshots differ");}
         catch(SQLException failure){throw new IOException(failure);}
-        if(unit.group!=null&&unit.group.members.get(0)!=unit)return;
+        // A group has one origin: the first unit it had, even when that unit later left it.
+        if(unit.group!=null&&groups.containsKey(unit.group))return;
         var search=new Search(unitEvent,currentUnit,readVersion,writes);pending.add(search);
         if(unit.group==null)live.put(unit,search);else groups.put(unit.group,search);
     }
@@ -127,7 +134,7 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
         if(unit.group!=null)return;
         var decision=PostgresAccessProjection.decide(unit,catalog,true);var search=live.remove(unit);
         if(decision.excluded()){if(search!=null)pending.remove(search);return;}
-        settle(search,decision);
+        settle(search,decision,unit.request);
     }
     @Override public void groupFormed(PostgresAccessUnits.BitmapGroup group)throws IOException {
         Search first=null;
@@ -138,10 +145,13 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
         groups.put(group,first);
     }
     @Override public void groupSettled(PostgresAccessUnits.BitmapGroup group)throws IOException {
-        settle(groups.remove(group),PostgresAccessProjection.decideGroup(group,catalog,true));
+        var decision=PostgresAccessProjection.decideGroup(group,catalog,true);var search=groups.remove(group);
+        if(decision.excluded()){if(search!=null)pending.remove(search);return;}
+        settle(search,decision,group.members.get(0).request);
     }
-    private void settle(Search search,PostgresAccessProjection.Decision decision)throws IOException {
-        if(search==null||!decision.projected())throw new IOException("Unsupported PG index access: "+decision.reason());
+    private void settle(Search search,PostgresAccessProjection.Decision decision,PostgresAccessUnits.Request request)throws IOException {
+        if(search==null||!decision.projected())throw new IOException("Unsupported PG index access: "+decision.reason()
+                +" (plan "+request.planSignature()+"; SQL "+request.sql+")");
         search.decision=decision;
     }
     private void drain()throws IOException {
@@ -173,8 +183,8 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
         if(!List.of("insert","update","delete").contains(action)||action.equals("insert")!=(before==null)
                 ||action.equals("delete")!=(after==null))throw new IOException("Invalid PG row-change images");
         var primary=catalog.primary(table);
-        IndexKey key=primary.encode(text((after==null?before:after).get(primary.column())));
-        if(key.equals(IndexKey.NULL)||before!=null&&!primary.encode(text(before.get(primary.column()))).equals(key))
+        IndexKey key=catalog.postgresKey(primary,text((after==null?before:after).get(primary.column())));
+        if(key.equals(IndexKey.NULL)||before!=null&&!catalog.postgresKey(primary,text(before.get(primary.column()))).equals(key))
             throw new IOException("PG row change has a missing or changed primary key");
         byte[] identity=identityKey(table,key,0);long rowId;
         try {
@@ -214,7 +224,7 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
         if(row==null)return Map.of();var keys=new LinkedHashMap<Integer,IndexKey>();
         for(var index:catalog.secondary(table)) {
             if(!row.has(index.column()))throw new IOException("Missing indexed source column");
-            keys.put(index.indexId(),index.encode(text(row.get(index.column()))));
+            keys.put(index.indexId(),catalog.postgresKey(index,text(row.get(index.column()))));
         }
         return keys;
     }

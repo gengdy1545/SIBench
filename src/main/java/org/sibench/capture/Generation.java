@@ -61,8 +61,6 @@ public final class Generation {
         }
         var inputs=new ArrayList<Input>();
         for(var selection:selections) {
-            require(selection.engine()!=Engine.POSTGRES||selection.benchmark().equals("sysbench"),
-                    "Native PostgreSQL generation supports sysbench capture");
             var document=parse(Files.readString(selection.config()));
             keys(document,Set.of("schema_version","purpose","benchmark","source","native","trace","artifacts"));
             secondaryIndexes(document);
@@ -204,13 +202,13 @@ public final class Generation {
                 long loadStart=System.nanoTime();
                 Path load=Files.createDirectory(out.resolve("load"));
                 if(input.selection().benchmark().equals("sysbench"))sysbench(plan,input,socket,load,"oltp_read_write",true);
-                else hybench(plan,input,socket,load,true,null);
+                else hybench(plan,input,load,true,null,Engine.DUCKDB,DuckDbHostDriver.PREFIX+socket,null,()->{});
                 if(input.selection().benchmark().equals("hybench")) {
                     Path data=out.resolve("native/Data_"+string(input.nativeConfig(),"sf"));
                     Path script=input.source().source().resolve("conf/load_data_pg.sql"),manifest=load.resolve("inputs.json");
                     HybenchInputs.record(data,script,manifest);
                     // COPY returns actual inserted counts; subsequent index/sequence setup does not change rows.
-                    requireRows(expected,HybenchDuckDb.load(database,input.source().source(),data));
+                    requireRows(expected,Hybench.load(database,input.source().source(),data));
                     HybenchInputs.requireRuntimeInputs(data,manifest);
                     HybenchInputs.dropLoadInputs(data,script);
                 }
@@ -226,8 +224,6 @@ public final class Generation {
                     boolean hybench=input.selection().benchmark().equals("hybench");
                     var names=hybench?List.of("ap","tp","xp"):List.copyOf(object(input.nativeConfig(),"workloads").keySet());
                     int remaining=hybench?2:names.size();long rawPrefix=0;double projectionSeconds=0;
-                    var rawHashes=new LinkedHashMap<String,String>();var receiptsHashes=new LinkedHashMap<String,String>();
-                    var diagnostics=new ArrayList<Map<String,Object>>();
                     Path workloads=Files.createDirectory(out.resolve("workload"));
                     for(String name:names) {
                         Path stageRoot=Files.createDirectory(workloads.resolve(name));
@@ -238,7 +234,7 @@ public final class Generation {
                             budget.checkTime();long before=budget.count();
                             Path window=Files.createDirectory(stageRoot.resolve("batch-"+batch++)),raw=window.resolve("native.csv");
                             sql(database,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation','SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path="+literal(raw.toString())+")");
-                            Stage stage=hybench?hybench(plan,input,socket,window,false,name):sysbench(plan,input,socket,window,name,false);
+                            Stage stage=hybench?hybench(plan,input,window,false,name,Engine.DUCKDB,DuckDbHostDriver.PREFIX+socket,null,()->{}):sysbench(plan,input,socket,window,name,false);
                             sql(database,"CALL disable_logging()");
                             sql(database,"SET logging_storage='memory'");
                             long projectionStart=System.nanoTime();
@@ -248,16 +244,13 @@ public final class Generation {
                                 var receipts=DuckDbReceipts.load(capture,stage.receipts(),window.resolve("receipts"));
                                 DuckDbStatements.bind(capture,receipts);DuckDbReceipts.bind(capture);
                                 if(stage.calls()>=0)require(number(capture,"SELECT count(*) FROM sibench_sql_calls WHERE kind='query' AND error_code=0")==stage.calls(),"sysbench source summary/receipt count mismatch");
-                                var diagnostic=DuckDbDiagnostics.summarize(capture,input.selection().mode());
-                                json(window.resolve("source-diagnostics.json"),diagnostic);
-                                diagnostics.add(Map.of("window",out.relativize(window).toString(),"diagnostics",diagnostic));
                                 DuckDbTransactions.bind(capture,"data",trace.lastVersion());DuckDbIdentities.bind(capture);
                                 DuckDbAccesses.bind(capture,IndexCatalog.duckDbDefinitions(input.source()));DuckDbMutations.bind(capture);
                                 trace.append(capture);
                             }
                             projectionSeconds+=seconds(projectionStart);
-                            rawHashes.put(out.relativize(raw).toString(),Digests.sha256(raw));
-                            for(Path receipt:stage.receipts())receiptsHashes.put(out.relativize(receipt).toString(),Digests.sha256(receipt));
+                            // The window's facts and receipts are projected and checked; they are not retained.
+                            Files.delete(raw);deleteTree(window.resolve("clients"));deleteTree(window.resolve("receipts"));
                             if(budget.enabled()&&!setup)budget.requireProgress(before);
                         } while(budget.enabled()&&!setup&&!budget.reached());
                         budget.end();
@@ -265,11 +258,8 @@ public final class Generation {
                     timings.put("workload_and_projection_seconds",seconds(workloadStart));
                     timings.put("facts_and_projection_seconds",projectionSeconds);
                     json(out.resolve("request-budget.json"),budget.finish());
-                    Path diagnosticFile=out.resolve("source-diagnostics.json");json(diagnosticFile,Map.of("windows",diagnostics));
                     var evidence=new LinkedHashMap<String,Object>();evidence.put("engine",engine);evidence.put("client",input.buildIdentity());
                     evidence.put("effective_config_sha256",Digests.sha256(out.resolve("effective-config.json")));
-                    evidence.put("raw_files_sha256",rawHashes);evidence.put("receipt_sha256",receiptsHashes);
-                    evidence.put("source_diagnostics_sha256",Digests.sha256(diagnosticFile));
                     evidence.put("baseline_rows",expected);evidence.put("request_budget",budget.finish());
                     if(hybench) {
                         evidence.put("load_inputs_sha256",Digests.sha256(load.resolve("inputs.json")));
@@ -279,7 +269,7 @@ public final class Generation {
                 }
             }
             long closeStart=System.nanoTime();
-            stop(host);host=null;Files.move(out.resolve("data"),out.resolve("trace/data"));
+            stop(host);host=null;deleteTree(out.resolve("data"));
             timings.put("native_close_seconds",seconds(closeStart));long publicationStart=System.nanoTime();
             var manifest=draft.publish();
             timings.put("publication_seconds",seconds(publicationStart));timings.put("total_seconds",seconds(started));
@@ -298,6 +288,10 @@ public final class Generation {
     }
 
     private static double seconds(long start){return (System.nanoTime()-start)/1e9;}
+    /** Removes a disposable working tree, such as a closed engine's data directory. */
+    static void deleteTree(Path root)throws IOException {
+        try(var paths=Files.walk(root)){for(Path path:paths.sorted(java.util.Comparator.reverseOrder()).toList())Files.delete(path);}
+    }
     record Stage(List<Path> receipts,long calls,long inserted) {}
     private static Stage sysbench(Plan plan,Input input,Path socket,Path stage,String workload,boolean load)throws Exception {
         var n=input.nativeConfig();Path receipts=Files.createDirectory(stage.resolve("clients"));
@@ -319,29 +313,33 @@ public final class Generation {
         var files=files(receipts);require(!files.isEmpty(),"sysbench missing session receipts");return new Stage(files,calls,0);
     }
 
-    private static Stage hybench(Plan plan,Input input,Path socket,Path stage,boolean load,String selectedPhase)throws Exception {
+    /** One upstream client process; DuckDB connections leave receipts, PG sessions are captured natively. */
+    static Stage hybench(Plan plan,Input input,Path stage,boolean load,String selectedPhase,Engine engine,String url,
+            Path stop,NativeProcess.Check check)throws Exception {
         Path nativeDirectory=input.output().resolve("native");Files.createDirectories(nativeDirectory);
         if(!load)HybenchInputs.requireRuntimeInputs(nativeDirectory.resolve("Data_"+string(input.nativeConfig(),"sf")),
                 input.output().resolve("load/inputs.json"));
         var properties=new java.util.Properties();try(var source=Files.newInputStream(input.source().source().resolve("conf/pg.props"))){properties.load(source);}
         for(String key:new ArrayList<>(properties.stringPropertyNames()))if(key.startsWith("url")||key.startsWith("username")||key.startsWith("password")||key.startsWith("classname"))properties.remove(key);
-        var n=input.nativeConfig();properties.setProperty("sf",string(n,"sf"));properties.setProperty("db","duckdb");
+        var n=input.nativeConfig();properties.setProperty("sf",string(n,"sf"));properties.setProperty("db",engine==Engine.DUCKDB?"duckdb":"postgreSQL");
         Path parameters=nativeDirectory.resolve("parameters"),parameterFile=parameters.resolve("parameters.toml");
         String parameterText=new com.moandjiezana.toml.TomlWriter().write(Map.of(string(n,"sf"),input.parameters()));
         if(load) {
             Files.createDirectory(parameters);Files.writeString(parameterFile,parameterText,StandardOpenOption.CREATE_NEW);
         }else require(Files.readString(parameterFile).equals(parameterText),"HyBench effective parameters changed after load");
-        properties.setProperty("url",DuckDbHostDriver.PREFIX+socket);properties.setProperty("url_ap",DuckDbHostDriver.PREFIX+socket);
+        properties.setProperty("url",url);properties.setProperty("url_ap",url);
         properties.setProperty("tpclient",Long.toString(positive(n,"clients")));properties.setProperty("apclient",Long.toString(positive(n,"ap_clients")));
         properties.setProperty("xtpclient",Long.toString(positive(n,"xp_transaction_clients")));properties.setProperty("xapclient",Long.toString(positive(n,"xp_query_clients")));
         for(String phase:List.of("ap","tp","xp"))properties.setProperty(phase+"RunMins",Long.toString(n.containsKey("phase_duration_minutes")&&object(n,"phase_duration_minutes").containsKey(phase)?positive(object(n,"phase_duration_minutes"),phase):positive(n,"duration_minutes")));
         if(selectedPhase!=null)properties.setProperty("sibench.phase",selectedPhase);
-        Path receipts=Files.createDirectory(stage.resolve("clients"));properties.setProperty("sibench.receipts",receipts.toString());
+        Path receipts=engine==Engine.DUCKDB?Files.createDirectory(stage.resolve("clients")):null;
+        if(receipts!=null)properties.setProperty("sibench.receipts",receipts.toString());
         Path resolved=stage.resolve("resolved.props");try(var file=Files.newOutputStream(resolved,StandardOpenOption.CREATE_NEW)){properties.store(file,"Effective native HyBench configuration");}
         String cp=parameters+":"+input.build().resolve("target/classes")+":"+input.build().resolve("lib/*")+":"+NativeProcess.runtimeClasspath();
-        var command=List.of(Path.of(System.getProperty("java.home"),"bin/java").toString(),"-Xmx512m","-cp",cp,HybenchDuckDb.class.getName(),load?"generate":"run",resolved.toString(),input.build().resolve("conf/stmt_postgres.toml").toString(),stage.resolve("summary.json").toString());
-        var result=NativeProcess.run(load?"generate":"run",command,Map.of(),nativeDirectory,stage,input.timeout());
-        require(result.exit()==0,"HyBench process failed: "+stage);return new Stage(files(receipts),-1,0);
+        var command=List.of(Path.of(System.getProperty("java.home"),"bin/java").toString(),"-Xmx512m","-cp",cp,Hybench.class.getName(),load?"generate":"run",resolved.toString(),input.build().resolve("conf/stmt_postgres.toml").toString(),stage.resolve("summary.json").toString());
+        var result=NativeProcess.run(load?"generate":"run",command,stop==null?Map.of():Map.of("SIBENCH_BUDGET_STOP",stop.toString()),
+                nativeDirectory,stage,input.timeout(),check);
+        require(result.exit()==0,"HyBench process failed: "+stage);return new Stage(receipts==null?List.of():files(receipts),-1,0);
     }
 
     static void requireRows(Map<String,Long> expected,Map<String,Long> actual) throws IOException {

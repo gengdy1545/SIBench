@@ -78,9 +78,9 @@ public class DuckDbGenerationCheck {
             assertEquals(manifest.get("baseline_rows"),manifest.get("baseline_operations"));
             assertTrue(manifest.getAsJsonObject("source_evidence").getAsJsonObject("request_budget")
                     .get("effective_requests").getAsLong()>=1000);
-            assertEquals(Digests.sha256(directory.resolve("source-diagnostics.json")),
-                    manifest.getAsJsonObject("source_evidence").get("source_diagnostics_sha256").getAsString());
-            try(var data=TraceManifest.openData(trace)){assertTrue(data.snapshotRow(1,1,0).isPresent());}
+            assertFalse(manifest.has("native_data"));
+            assertFalse(Files.exists(directory.resolve("data")));
+            try(var windows=Files.walk(directory.resolve("workload"))){assertTrue(windows.noneMatch(p->p.endsWith("native.csv")));}
             var service=new ServiceConfig("rocksdb",null,directory.resolve("index"),0,ValueKind.ROW_ID,null,false);
             assertEquals("passed",ServiceReplay.run(trace,replay,service,directory.resolve("replay.json")).get("status"));
             assertEquals("passed",org.sibench.replay.ReferenceReplay.run(trace,replay,

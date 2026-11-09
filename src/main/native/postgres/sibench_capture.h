@@ -48,6 +48,7 @@ extern void sib_capture_check_failure(void);
 extern void sib_transaction_abort(void);
 extern void sib_backend_exit(void);
 extern uint64 sib_capture_watermark(int pid, uint64 sequence, uint64 csn, uint64 consumed);
+extern void sib_capture_hold(bool hold);
 
 /* Index scans. */
 extern void sib_plan_scan(const char *kind, int plan_node_id, IndexScanDesc scan);
@@ -62,6 +63,7 @@ extern void sib_bitmap_candidates(IndexScanDesc scan, const ItemPointer tids, in
 extern void sib_bitmap_end(IndexScanDesc scan);
 extern void sib_bitmap_binding(BitmapHeapScanState *node);
 extern void sib_bitmap_skipped(BitmapHeapScanState *node, TBMIterateResult *tbmres);
+extern void sib_bitmap_rejected(BitmapHeapScanState *node, TBMIterateResult *tbmres);
 extern void sib_bitmap_verdict(Relation heap, void *node, ItemPointer tid, bool found);
 extern void sib_bitmap_lossy(Relation heap, void *node);
 

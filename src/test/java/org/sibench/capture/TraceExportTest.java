@@ -46,7 +46,7 @@ public class TraceExportTest {
             }
             var units = WorkUnits.create(directory);
             try (var lines = units.lines()) {
-                lines.write("{\"work_unit_id\":1,\"source_event\":1,\"connection_id\":1,\"query_id\":1}\n");
+                lines.write("{\"work_unit_id\":1,\"source_event\":1}\n");
             }
             var source = SourceSchema.of("sysbench", Path.of("benchmark/sysbench"), Map.of("tables", 1));
             var manifest = IndexCatalog.fromSchema(source).provenance();

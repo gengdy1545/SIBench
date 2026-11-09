@@ -88,4 +88,140 @@ public class PostgresAccessesCheck {
             }
         }
     }
+
+    /**
+     * HyBench AP-5 under a generic plan: a nested loop drives a BitmapAnd whose constant-key input
+     * was bound at plan start. Rescanning that never-fetched input must not end the cycle or seal
+     * the other input, so the heap verdict belongs to the intersection of both indexes.
+     */
+    @Test public void parameterizedBitmapAndKeepsAConstantInputBoundAtPlanStart()throws Exception {
+        String runtime=System.getProperty("sibench.postgres.runtime");assertNotNull("Set sibench.postgres.runtime",runtime);
+        Path root=temporary.getRoot().toPath().resolve("bitmap-and");
+        String query="SELECT cu.custid,sum(tr.amount) FROM company co,transfer tr,customer cu WHERE cu.custid=tr.targetid"
+                +" AND cu.companyid=co.companyid AND tr.sourceid=co.companyid AND co.companyid=$1 AND tr.type='salary'"
+                +" GROUP BY cu.custid";
+        try(var cluster=PostgresDatabase.create(Path.of(runtime),root)) {
+            try(var setup=cluster.connect("setup")) {
+                sql(setup,"CREATE TABLE company(companyid INT PRIMARY KEY)");sql(setup,"INSERT INTO company VALUES(301),(302)");
+                sql(setup,"CREATE TABLE customer(custid INT PRIMARY KEY,companyid INT)");
+                sql(setup,"INSERT INTO customer SELECT i,301 FROM generate_series(1,300) i");
+                sql(setup,"CREATE INDEX idx_customer_1 ON customer(companyid)");
+                sql(setup,"CREATE TABLE transfer(id INT PRIMARY KEY,sourceid INT,targetid INT,amount REAL,type CHAR(10))");
+                // 1200 transfers from company 301, 297 of them salaries; 4800 between customers.
+                sql(setup,"INSERT INTO transfer SELECT i,CASE WHEN i<=1200 THEN 301 ELSE 1+i%300 END,1+(i*7)%300,i,"
+                        +"CASE WHEN i<=297 THEN 'salary' ELSE (ARRAY['invest','donate','transfer','business'])[1+i%4] END"
+                        +" FROM generate_series(1,6000) i");
+                for(String index:List.of("idx_transfer_1 ON transfer(sourceid)","idx_transfer_2 ON transfer(targetid)",
+                        "idx_transfer_3 ON transfer(type)"))sql(setup,"CREATE INDEX "+index);
+                sql(setup,"VACUUM ANALYZE");
+                // The dev SF1 run chose this plan on its own; tiny tables need the joins pinned to reach it.
+                for(String setting:List.of("plan_cache_mode=force_generic_plan","enable_hashjoin=off","enable_mergejoin=off"))sql(setup,"SET "+setting);
+                sql(setup,"PREPARE q(int) AS "+query);
+                var plan=new StringBuilder();
+                try(var q=setup.createStatement();var rows=q.executeQuery("EXPLAIN (COSTS OFF) EXECUTE q(301)")){while(rows.next())plan.append(rows.getString(1)).append('\n');}
+                // An outer nested loop rescans the bitmap heap scan and so both BitmapAnd inputs.
+                assertTrue(plan.toString(),plan.toString().matches("(?s).*Nested Loop.*Seq Scan on company.*Bitmap Heap Scan on transfer.*BitmapAnd.*idx_transfer_1.*idx_transfer_3.*"));
+            }
+            try(var client=cluster.connect("sibench:bitmap-and")) {
+                for(String setting:List.of("plan_cache_mode=force_generic_plan","enable_hashjoin=off","enable_mergejoin=off"))sql(client,"SET "+setting);
+                sql(client,"PREPARE q(int) AS "+query);
+                assertEquals(297,values(client,"EXECUTE q(301)").size());
+            }
+        }
+        var catalog=IndexCatalog.fromSchema(SourceSchema.hybench(Path.of("benchmark/HyBench-2024")));
+        var accesses=new ArrayList<PostgresAccesses.Access>();
+        try(var files=Files.list(root.resolve("capture"))) {
+            for(Path file:files.toList())PostgresAccesses.read(file,catalog,true,accesses::add);
+        }
+        var intersections=accesses.stream().filter(a->a.projection().mode()==PostgresAccessProjection.Mode.INTERSECTION).toList();
+        assertEquals(1,intersections.size());
+        var group=intersections.get(0).projection();assertEquals(297,group.count());
+        assertEquals(List.of(catalog.named("idx_transfer_1").indexId(),catalog.named("idx_transfer_3").indexId()),
+                group.parts().stream().map(PostgresAccessProjection.Part::index).sorted().toList());
+        for(var part:group.parts())assertTrue(part.range().point());
+    }
+
+    @Test public void bitmapAndCyclesWithAnEmptyParameterizedInputKeepTheirOwnCandidates()throws Exception {
+        String runtime=System.getProperty("sibench.postgres.runtime");assertNotNull("Set sibench.postgres.runtime",runtime);
+        Path root=temporary.getRoot().toPath().resolve("bitmap-and-empty");
+        // HyBench IQ-4's first branch: the parameterized input runs first and is empty for company 302.
+        String query="SELECT co.name,t.amount FROM company co,transfer t WHERE t.sourceid=$1 AND t.type='invest'"
+                +" AND t.targetid=co.companyid";
+        var settings=List.of("plan_cache_mode=force_generic_plan","enable_hashjoin=off","enable_mergejoin=off");
+        try(var cluster=PostgresDatabase.create(Path.of(runtime),root)) {
+            try(var setup=cluster.connect("setup")) {
+                sql(setup,"CREATE TABLE company(companyid INT PRIMARY KEY,name VARCHAR(20))");
+                sql(setup,"INSERT INTO company VALUES(301,'a'),(302,'b')");
+                sql(setup,"CREATE TABLE transfer(id INT PRIMARY KEY,sourceid INT,targetid INT,amount REAL,type CHAR(10))");
+                // 1200 transfers from customer 1, of which the first 40 go to company 301 and are no investments.
+                sql(setup,"INSERT INTO transfer SELECT i,CASE WHEN i<=1200 THEN 1 ELSE 2+i%300 END,"
+                        +"CASE WHEN i<=40 THEN 301 ELSE 1+(i*7)%300 END,i,CASE WHEN i<=40 THEN 'salary'"
+                        +" ELSE (ARRAY['invest','donate','transfer','business'])[1+i%4] END FROM generate_series(1,6000) i");
+                for(String index:List.of("idx_transfer_1 ON transfer(sourceid)","idx_transfer_2 ON transfer(targetid)",
+                        "idx_transfer_3 ON transfer(type)"))sql(setup,"CREATE INDEX "+index);
+                sql(setup,"VACUUM ANALYZE");
+                for(String setting:settings)sql(setup,"SET "+setting);
+                sql(setup,"PREPARE q(int) AS "+query);
+                var plan=new StringBuilder();
+                try(var q=setup.createStatement();var rows=q.executeQuery("EXPLAIN (COSTS OFF) EXECUTE q(1)")){while(rows.next())plan.append(rows.getString(1)).append('\n');}
+                assertTrue(plan.toString(),plan.toString().matches(
+                        "(?s).*Nested Loop.*Seq Scan on company.*Bitmap Heap Scan on transfer.*Filter.*BitmapAnd.*idx_transfer_2.*idx_transfer_1.*"));
+            }
+            try(var client=cluster.connect("sibench:bitmap-and-empty")) {
+                for(String setting:settings)sql(client,"SET "+setting);
+                sql(client,"PREPARE q(int) AS "+query);
+                try(var q=client.createStatement();var rows=q.executeQuery("EXECUTE q(1)")){assertFalse(rows.next());}
+            }
+        }
+        var catalog=IndexCatalog.fromSchema(SourceSchema.hybench(Path.of("benchmark/HyBench-2024")));
+        var accesses=new ArrayList<PostgresAccesses.Access>();
+        try(var files=Files.list(root.resolve("capture"))) {
+            for(Path file:files.toList())PostgresAccesses.read(file,catalog,true,accesses::add);
+        }
+        // Company 301: all 40 candidates of the intersection are visible; the type filter runs after the index.
+        var intersections=accesses.stream().filter(a->a.projection().mode()==PostgresAccessProjection.Mode.INTERSECTION).toList();
+        assertEquals(1,intersections.size());
+        assertEquals(40,intersections.get(0).projection().count());
+        // Company 302: the empty targetid input ends the BitmapAnd before the sourceid input runs.
+        int targets=catalog.named("idx_transfer_2").indexId();
+        var alone=accesses.stream().filter(a->a.projection().mode()==PostgresAccessProjection.Mode.INDEPENDENT
+                &&a.projection().parts().get(0).index()==targets).toList();
+        assertEquals(1,alone.size());
+        assertEquals(0,alone.get(0).projection().count());
+    }
+
+    @Test public void bitmapCandidatesOnBlocksAddedAfterTheScanStartedAreInvisible()throws Exception {
+        String runtime=System.getProperty("sibench.postgres.runtime");assertNotNull("Set sibench.postgres.runtime",runtime);
+        Path root=temporary.getRoot().toPath().resolve("bitmap-extended");
+        // The one-time filter runs the insert after the bitmap heap scan opened and before its index
+        // scan: the new rows' index entries point past the heap's size at scan start.
+        String query="WITH ins AS (INSERT INTO transfer SELECT i,1,5,i,'invest' FROM generate_series(100001,104000) i RETURNING 1)"
+                +" SELECT count(*) FROM transfer WHERE sourceid=1 AND (SELECT count(*) FROM ins)>0";
+        try(var cluster=PostgresDatabase.create(Path.of(runtime),root)) {
+            try(var setup=cluster.connect("setup")) {
+                sql(setup,"CREATE TABLE transfer(id INT PRIMARY KEY,sourceid INT,targetid INT,amount REAL,type CHAR(10))");
+                sql(setup,"INSERT INTO transfer SELECT i,CASE WHEN i<=1200 THEN 1 ELSE 2+i%300 END,1+(i*7)%300,i,'invest'"
+                        +" FROM generate_series(1,6000) i");
+                sql(setup,"CREATE INDEX idx_transfer_1 ON transfer(sourceid)");
+                sql(setup,"VACUUM ANALYZE");
+                var plan=new StringBuilder();
+                try(var q=setup.createStatement();var rows=q.executeQuery("EXPLAIN (COSTS OFF) "+query)){while(rows.next())plan.append(rows.getString(1)).append('\n');}
+                assertTrue(plan.toString(),plan.toString().matches("(?s).*One-Time Filter.*Bitmap Heap Scan on transfer.*idx_transfer_1.*"));
+            }
+            try(var client=cluster.connect("sibench:bitmap-extended")) {
+                client.setAutoCommit(false);
+                assertEquals(List.of(1200L),values(client,query));
+                client.rollback();
+            }
+        }
+        var catalog=IndexCatalog.fromSchema(SourceSchema.hybench(Path.of("benchmark/HyBench-2024")));
+        var accesses=new ArrayList<PostgresAccesses.Access>();
+        try(var files=Files.list(root.resolve("capture"))) {
+            for(Path file:files.toList())PostgresAccesses.read(file,catalog,true,accesses::add);
+        }
+        int sources=catalog.named("idx_transfer_1").indexId();
+        var searches=accesses.stream().filter(a->a.projection().parts().get(0).index()==sources).toList();
+        assertEquals(1,searches.size());
+        assertEquals(1200,searches.get(0).projection().count());
+    }
 }

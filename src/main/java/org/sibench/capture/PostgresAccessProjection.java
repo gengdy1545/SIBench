@@ -80,14 +80,17 @@ final class PostgresAccessProjection {
 
     private PostgresAccessProjection() {}
 
-    private static IndexKey scanKey(IndexCatalog.Definition definition,int oid,String value)throws IOException {
-        String type=switch(oid) {case 20,21,23->"int";case 1114->"timestamp";case 1082->"date";case 25,1043->"text";default->null;};
+    private static IndexKey scanKey(IndexCatalog catalog,IndexCatalog.Definition definition,int oid,String value)throws IOException {
+        boolean padded=catalog.blankPadded(definition);
+        // A CHAR(n) operand (bpchar) only compares like the column on a CHAR(n) index.
+        String type=switch(oid) {case 20,21,23->"int";case 1114->"timestamp";case 1082->"date";case 25,1043->padded?null:"text";
+            case 1042->padded?"text":null;default->null;};
         boolean compatible=type!=null&&switch(definition.type()) {
             case "int"->type.equals("int");case "timestamp"->type.equals("timestamp")||type.equals("date");
             case "varchar","text"->type.equals("text");default->false;
         };
         if(!compatible)throw new IOException("Unsupported PostgreSQL index operand type "+oid+" for "+definition.name());
-        return IndexKey.parse(type,value);
+        return type.equals("text")?catalog.postgresKey(definition,value):IndexKey.parse(type,value);
     }
 
 
@@ -108,7 +111,7 @@ final class PostgresAccessProjection {
             if (unit.calls == 0) return Decision.exclude("rescan_without_fetch");
             if (unit.forward && unit.backward) return Decision.reject("scan_direction_changed");
         } else return Decision.reject("unbound_scan_kind");
-        Intervals intervals = intervals(unit, definition, cCollation);
+        Intervals intervals = intervals(unit, catalog, definition, cCollation);
         if (intervals.reason != null)
             return intervals.excluded
                     ? Decision.exclude(intervals.reason)
@@ -146,13 +149,25 @@ final class PostgresAccessProjection {
         if (group.lossy) return Decision.reject("bitmap_heap_lossy_page");
         if (group.verdictOutsideIntersection)
             return Decision.reject("bitmap_and_verdict_outside_intersection");
+        // PostgreSQL stops a BitmapAnd once its running intersection is empty: the inputs after
+        // that point in plan order never search, so the group is the empty intersection of the
+        // inputs that ran. Inputs without runtime keys rescan first, so arrival is not plan order.
+        var members = new ArrayList<>(group.members);
+        members.sort(java.util.Comparator.comparingInt(unit -> unit.position));
+        int ran = 0;
+        while (ran < members.size() && members.get(ran).bitmapEnded) ran++;
+        // A rescan that never fetched (for example under Memoize) searched no index and has no verdict.
+        if (ran == 0 && group.visible == 0 && members.stream().allMatch(u -> u.bitmapTids == 0))
+            return Decision.exclude("rescan_without_fetch");
         // A candidate every input produced but the heap never checked: the heap stopped early.
         if (group.unresolvedIntersection()) return Decision.reject("bitmap_heap_stopped_early");
+        for (Unit skipped : members.subList(ran, members.size()))
+            if (ran == 0 || skipped.bitmapEnded || skipped.bitmapTids != 0 || group.visible != 0)
+                return Decision.reject("bitmap_and_input_without_bitmap");
         var parts = new ArrayList<Part>();
-        for (Unit unit : group.members) {
-            if (!unit.bitmapEnded) return Decision.reject("bitmap_and_input_without_bitmap");
+        for (Unit unit : members.subList(0, ran)) {
             IndexCatalog.Definition definition = catalog.named(unit.scan.index);
-            Intervals intervals = intervals(unit, definition, cCollation);
+            Intervals intervals = intervals(unit, catalog, definition, cCollation);
             if (intervals.reason != null) return Decision.reject(intervals.reason);
             if (intervals.ranges.size() != 1)
                 return Decision.reject("bitmap_and_input_with_array_key");
@@ -214,12 +229,12 @@ final class PostgresAccessProjection {
             long visible)
             throws IOException {
         boolean backward = unit.backward;
-        IndexKey last = definition.encode(text(unit.lastValue));
+        IndexKey last = catalog.postgresKey(definition, text(unit.lastValue));
         // Earlier runs, with their values encoded once, attributed to the interval holding them.
         var runs = new ArrayList<IndexKey>();
         var counts = new ArrayList<Long>();
         for (Run run : unit.runs == null ? List.<Run>of() : unit.runs) {
-            runs.add(definition.encode(text(run.value())));
+            runs.add(catalog.postgresKey(definition, text(run.value())));
             counts.add(run.rows());
         }
         List<Range> ordered = new ArrayList<>(ranges);
@@ -269,7 +284,7 @@ final class PostgresAccessProjection {
             IndexCatalog.Definition primary = catalog.primary(definition.tableId());
             Set<IndexKey> pinned = new TreeSet<>();
             for (JsonElement pk : unit.lastPks == null ? List.<JsonElement>of() : unit.lastPks) {
-                IndexKey key = primary.encode(text(pk));
+                IndexKey key = catalog.postgresKey(primary, text(pk));
                 if (!pinned.add(key)) return Decision.reject("row_returned_twice");
                 parts.add(new Part(definition.tableId(), definition.indexId(), point, key, 1));
             }
@@ -300,7 +315,7 @@ final class PostgresAccessProjection {
     private record Intervals(List<Range> ranges, String reason, boolean excluded) {}
 
     private static Intervals intervals(
-            Unit unit, IndexCatalog.Definition definition, boolean cCollation) throws IOException {
+            Unit unit, IndexCatalog catalog, IndexCatalog.Definition definition, boolean cCollation) throws IOException {
         Bounds bounds = new Bounds();
         TreeSet<IndexKey> points = null;
         for (JsonElement item : unit.keys) {
@@ -318,7 +333,7 @@ final class PostgresAccessProjection {
                         if (element.isJsonNull()) continue;
                         try {
                             elements.add(
-                                    scanKey(definition,
+                                    scanKey(catalog, definition,
                                             key.get("array_type_oid").getAsInt(),
                                             element.getAsString()));
                         } catch (IOException error) {
@@ -329,7 +344,7 @@ final class PostgresAccessProjection {
                 else points.retainAll(elements);
                 continue;
             }
-            String reason = bounds.add(key, definition);
+            String reason = bounds.add(key, catalog, definition);
             if (reason != null) return new Intervals(null, reason, false);
         }
         Range interval =
@@ -352,7 +367,7 @@ final class PostgresAccessProjection {
         IndexKey lower, upper;
         boolean lowerInclusive, upperInclusive;
 
-        String add(JsonObject key, IndexCatalog.Definition definition) throws IOException {
+        String add(JsonObject key, IndexCatalog catalog, IndexCatalog.Definition definition) throws IOException {
             int flags = key.get("flags").getAsInt(), strategy = key.get("strategy").getAsInt();
             if ((flags & ~SUPPORTED_FLAGS) != 0) return "flagged_scan_key";
             if (flags == (PostgresAccessUnits.SK_ISNULL | PostgresAccessUnits.SK_SEARCHNULL)) {
@@ -368,7 +383,7 @@ final class PostgresAccessProjection {
             IndexKey value;
             try {
                 value =
-                        scanKey(definition,
+                        scanKey(catalog, definition,
                                 key.get("type_oid").getAsInt(), key.get("value").getAsString());
             } catch (IOException error) {
                 return "unsupported_key_type";

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build RocksJava, its native runtime and the timestamp/checksum bridge from one gitlink.
+# Build RocksJava, its native runtime and the timestamp bridge from one gitlink.
 set -euo pipefail
 [ "$#" -eq 1 ] || { echo "usage: $0 build/services/<fresh-rocksdb-directory>" >&2; exit 2; }
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -51,9 +51,6 @@ def inputs():
 
 expected = inputs()
 java = Path(os.environ['JAVA_HOME']) if os.environ.get('JAVA_HOME') else Path(shutil.which('javac')).resolve().parent.parent
-crypto = Path(subprocess.check_output(['pkg-config', '--variable=libdir', 'libcrypto'], text=True).strip()) / 'libcrypto.a'
-if not crypto.is_file():
-    raise SystemExit('OpenSSL development headers and static libcrypto are required')
 compiler = os.environ.get('CXX', 'c++')
 out.mkdir(parents=True)
 (out / 'engine-inputs.json').write_text(json.dumps(expected, indent=2) + '\n')
@@ -94,7 +91,7 @@ subprocess.run([str(java / 'bin/jar'), '--update', '--file', str(out / 'rocksdbj
 command = [compiler, '-std=c++17', '-O2', '-fPIC', '-shared', '-fno-rtti',
            '-I' + str(source / 'include'), '-I' + str(java / 'include'),
            '-I' + str(java / 'include/linux'), str(out / 'native/timestamps_jni.cc'), '-L' + str(out),
-           '-l:librocksdbjni-linux64.so', str(crypto), '-ldl', '-pthread', '-Wl,-rpath,$ORIGIN', '-Wl,--no-undefined',
+           '-l:librocksdbjni-linux64.so', '-ldl', '-pthread', '-Wl,-rpath,$ORIGIN', '-Wl,--no-undefined',
            '-o', str(out / 'libsibench_rocksdb.so')]
 subprocess.run(command, check=True)
 (out / 'compiler-version.txt').write_text(subprocess.check_output([compiler, '--version'], text=True))
@@ -107,9 +104,7 @@ artifacts = ['rocksdbjni.jar', library, 'libsibench_rocksdb.so', 'source-files.j
 identity = {'inputs': expected,
             'artifacts': {name: digest(out / name) for name in artifacts},
             'configure_command': configure,
-            'compile_command': command,
-            'openssl': {'version': subprocess.check_output(['pkg-config', '--modversion', 'libcrypto'], text=True).strip(),
-                        'static_library_sha256': digest(crypto)}}
+            'compile_command': command}
 (out / 'engine-build.json').write_text(json.dumps(identity, indent=2) + '\n')
 print(out)
 PY

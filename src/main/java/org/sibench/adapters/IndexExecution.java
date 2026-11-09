@@ -69,7 +69,7 @@ public final class IndexExecution {
                 throw new IllegalArgumentException("A write batch holds Baseline INSERTs only");
             validateKey(write.getKey());
         }
-        for (var write : batch.getWritesList()) backend.write(write);
+        backend.writeBaseline(batch.getWritesList());
     }
 
     static void validateKey(org.sibench.adapters.proto.EntryKey key) {

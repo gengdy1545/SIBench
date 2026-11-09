@@ -31,7 +31,7 @@ public class RocksYcsbCheck {
                     assertEquals(512,loaded.size());
                 }
                 assertEquals(513,binding.completed(1));assertEquals(513,loaded.size());rows.finishLoad();
-                for(int i=0;i<513;i++)assertArrayEquals(new byte[]{0,-1,(byte)i},rows.read("key'雪"+i,0,2,i+1).get(0).fields()[0]);
+                for(int i=0;i<513;i++)assertArrayEquals(new byte[]{0,-1,(byte)i},rows.read("key'雪"+i,0).get(0).fields()[0]);
             } finally { RocksYcsb.install(null); }
         }
     }
@@ -92,10 +92,10 @@ public class RocksYcsbCheck {
                         worker.close();
                         assertThrows(IllegalStateException.class,()->worker.change("insert","late",Map.of()));
                     }
-                    assertEquals(14,binding.completed(2));rows.seal();
+                    assertEquals(14,binding.completed(2));
                 } finally { RocksYcsb.install(null); }
             }
-            trace.close();var manifest=trace.publish(library,rows.writtenFiles(),Map.of("input","hand-controlled API"));
+            trace.close();var manifest=trace.publish(Map.of("input","hand-controlled API"));
             assertEquals(1L,manifest.get("aborted_transactions"));
         }
         org.sibench.replay.ReferenceReplay.run(root.resolve("trace"),new org.sibench.replay.ReplayConfig(true,0,0,0,0,"operation"),root.resolve("reference.json"));

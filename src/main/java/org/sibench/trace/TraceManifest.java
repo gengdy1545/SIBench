@@ -8,7 +8,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import org.sibench.adapters.proto.ValueKind;
-import org.sibench.generation.DuckDbData;
 
 /** Required identities and coverage counts shared by Trace consumers. */
 public final class TraceManifest {
@@ -23,37 +22,6 @@ public final class TraceManifest {
             case "primary_only" -> false;
             default -> throw new IOException("Unknown exported index coverage: " + scope);
         };
-    }
-
-    public static DuckDbData.Reader openData(Path directory) throws IOException,java.sql.SQLException {
-        var manifest=read(directory);
-        if(manifest.has("generation")&&!manifest.get("generation").getAsString().equals("native_duckdb"))
-            throw new IOException("PG/RocksDB data requires an explicit native runtime; PG also requires a fresh reader working directory");
-        if(!manifest.has("native_data"))throw new IOException("Trace has no sealed native data inventory");
-        try {
-            var inventory=new com.google.gson.Gson().fromJson(manifest.get("native_data"),DuckDbData.Inventory.class);
-            return DuckDbData.open(directory.resolve("data"),inventory);
-        }catch(RuntimeException invalid){throw new IOException("Invalid native data inventory",invalid);}
-    }
-
-    public static org.sibench.generation.NativeData openData(Path directory,Path runtime,Path working)throws IOException,java.sql.SQLException {
-        var manifest=read(directory);
-        if(!manifest.has("generation")||!manifest.get("generation").getAsString().equals("native_postgres"))
-            throw new IOException("Expected a native PostgreSQL Trace");
-        try {
-            var inventory=new com.google.gson.Gson().fromJson(manifest.get("native_data"),org.sibench.generation.PostgresData.Inventory.class);
-            return org.sibench.generation.PostgresData.open(directory.resolve("data"),inventory,runtime,working);
-        }catch(RuntimeException invalid){throw new IOException("Invalid PG data inventory",invalid);}
-    }
-
-    public static org.sibench.generation.NativeData openData(Path directory,Path runtime)throws IOException,java.sql.SQLException {
-        var manifest=read(directory);
-        if (!manifest.has("generation") || !manifest.get("generation").getAsString().equals("native_rocksdb"))
-            throw new IOException("Expected a native RocksDB Trace");
-        try {
-            var inventory=new com.google.gson.Gson().fromJson(manifest.get("native_data"),org.sibench.generation.RocksDbData.Inventory.class);
-            return org.sibench.generation.RocksDbData.open(directory.resolve("data"),inventory,runtime.resolve("libsibench_rocksdb.so"));
-        } catch(RuntimeException invalid) { throw new IOException("Invalid RocksDB data inventory",invalid); }
     }
 
     public static void requireValue(Path directory,ValueKind kind)throws IOException {

@@ -47,6 +47,30 @@ public class ProtoTraceTest {
                 .withTransaction(version == 0 ? 0 : 91, ordinal).withWorkUnitId(1);
     }
 
+    @Test public void readOnlySourceTransactionsStreamSearchesButWritesBoundTheBuffer() throws Exception {
+        Path file = temporary.getRoot().toPath().resolve("read-only.pb.zst");
+        var search = IndexOperationTrace.search(2, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 0, 0, 0)
+                .withTransaction(91, 0).withWorkUnitId(1);
+        int searches = ProtoTrace.MAX_TRANSACTION_OPERATIONS + 1;
+        var writer = new ProtoTrace.Writer(file);
+        try (writer) {
+            writer.accept(IndexOperationTrace.transaction(1, IndexOperationTrace.TRANSACTION_BEGIN, 91, 1, 0));
+            for (int i = 0; i < searches; i++) writer.accept(search);
+            writer.accept(IndexOperationTrace.transaction(3, IndexOperationTrace.TRANSACTION_COMMIT, 91, 1, 0));
+        }
+        long[] read = {0};
+        ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), operation -> read[0]++);
+        assertEquals(searches + 2, read[0]);
+        var buffered = new ProtoTrace.Writer(file.resolveSibling("buffered.pb.zst"));
+        buffered.accept(IndexOperationTrace.transaction(1, IndexOperationTrace.TRANSACTION_BEGIN, 91, 1, 0));
+        buffered.accept(write(IndexOperationTrace.UPSERT, 1, 1, 1).withExpansion(0, 1));
+        var after = IndexOperationTrace.search(13, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 0, 0, 0)
+                .withTransaction(91, 1).withWorkUnitId(1);
+        assertTrue(assertThrows(IOException.class, () -> {
+            for (int i = 0; i < ProtoTrace.MAX_TRANSACTION_OPERATIONS; i++) buffered.accept(after);
+        }).getMessage().contains("operation buffer limit"));
+    }
+
     @Test public void countsEachSearchMemberWithoutSplittingItsRequestOrBudgetBoundary() throws Exception {
         Path file = temporary.getRoot().toPath().resolve("primitive-count.pb.zst");
         Path stop = file.resolveSibling("primitive-count.stop");
@@ -275,7 +299,8 @@ public class ProtoTraceTest {
                         IndexOperationTrace.Range.equal(IndexKey.ofInt(member + 1)), null, 0, 1,
                         IndexOperationTrace.UNION_GROUP | IndexOperationTrace.TRANSACTION_LOCAL_SEARCH, member, 2)
                         .withTransaction(91, 1).withVersion(1).withWorkUnitId(1));
-            assertEquals(0, budget.count());
+            // The search before the first write is already exported; the local group waits for the outcome.
+            assertEquals(1, budget.count());
             writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_ABORT, 91, 1, 1));
         }
         var decoded = new ArrayList<Operation>();

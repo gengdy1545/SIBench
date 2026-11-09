@@ -23,7 +23,6 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     private long peakPending, peakSearchGroup;
     private long activeTransaction, activeVersion, lastVersion, lastTransactionId;
     private long lastSourceEvent, maxSourceOrdinal;
-    private int transactionOperations;
     private record WriteIdentity(int table, int index, org.sibench.trace.IndexKey key,
             org.sibench.trace.IndexKey indexedValue) {}
     private final java.util.Set<WriteIdentity> writes = new java.util.HashSet<>();
@@ -108,8 +107,6 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         dispatcher.route(operation);
         if (operation.index() == 0) primary++;
         else secondary++;
-        if (activeTransaction != 0 && ++transactionOperations > org.sibench.capture.ProtoTrace.MAX_TRANSACTION_OPERATIONS)
-            throw new IOException("Source transaction exceeds operation buffer limit");
         if (activeTransaction != 0) {
             if (operation.sourceEvent() < lastSourceEvent)
                 throw new IOException("Source operation order moved backwards");
@@ -147,7 +144,10 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
             else sendOperation(operation);
             return;
         }
-        if (activeTransaction != 0) {
+        // Searches before a transaction's first write do not wait for its outcome, as in generation.
+        if (activeTransaction != 0 && (!pending.isEmpty() || operation.kind() != IndexOperationTrace.SEARCH)) {
+            if (pending.size() >= org.sibench.capture.ProtoTrace.MAX_TRANSACTION_OPERATIONS)
+                throw new IOException("Source transaction exceeds operation buffer limit");
             pending.add(new Pending(operation, storedRequest));
             peakPending = Math.max(peakPending, pending.size());
         } else sendOperation(operation);
@@ -251,7 +251,6 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
             activeVersion = o.version();
             writes.clear();
             lastSourceEvent = maxSourceOrdinal = 0;
-            transactionOperations = 0;
         } else {
             boolean aborted = o.kind() == IndexOperationTrace.TRANSACTION_ABORT;
             if (activeTransaction == 0

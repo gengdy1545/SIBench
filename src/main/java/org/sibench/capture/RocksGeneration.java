@@ -10,7 +10,7 @@ import java.util.*;
 import org.sibench.generation.RocksDbRows;
 import org.sibench.generation.RocksDbTimestamps;
 
-/** One embedded native database from streaming upstream load through final publication. */
+/** One embedded native database from streaming upstream load through Trace publication; the database is discarded. */
 final class RocksGeneration {
     private RocksGeneration() {}
     static Map<String, Object> generate(Generation.Plan plan, Generation.Input input) throws Exception {
@@ -29,7 +29,7 @@ final class RocksGeneration {
         var budget = new RequestBudget(Generation.requestTarget(input.document()),input.timeout());
         try (var trace = new RocksTrace(out.resolve("trace"), input.source(), Generation.secondaryIndexes(input.document()),budget)) {
             long closeStarted;
-            var rows = new RocksDbRows(out.resolve("trace/data"), fields, settings, trace::event);
+            var rows = new RocksDbRows(out.resolve("database"), fields, settings, trace::event);
             try (rows) {
                 var binding = new RocksYcsb(rows, trace::baseline, fields);
                 binding.budget(budget);
@@ -60,15 +60,13 @@ final class RocksGeneration {
                     }
                     json(out.resolve("request-budget.json"),budget.finish());
                     timings.put("workload_and_export_seconds", seconds(workload));
-                    long seal = System.nanoTime(); rows.seal();
-                    timings.put("native_flush_seconds", seconds(seal));
-                    json(out.resolve("engine-statistics.json"), rows.statistics());
                 } finally { RocksYcsb.install(null); }
                 closeStarted = System.nanoTime();
             }
-            trace.close(); timings.put("native_close_seconds", seconds(closeStarted));
+            trace.close(); Generation.deleteTree(out.resolve("database"));
+            timings.put("native_close_seconds", seconds(closeStarted));
             long publication = System.nanoTime();
-            var manifest = trace.publish(library, rows.writtenFiles(), Map.of("engine", build.identity(), "settings", config,
+            var manifest = trace.publish(Map.of("engine", build.identity(), "settings", config,
                     "client", input.buildIdentity(), "stages", stages, "request_budget", budget.finish(), "baseline_rows", input.baselineRows(),
                     "effective_config_sha256", Digests.sha256(out.resolve("effective-config.json"))));
             timings.put("publication_seconds", seconds(publication)); timings.put("total_seconds", seconds(start));

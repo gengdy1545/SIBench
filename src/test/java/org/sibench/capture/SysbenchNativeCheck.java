@@ -109,22 +109,13 @@ public class SysbenchNativeCheck extends DuckDbHostFixture {
                 assertEquals((long) stats.get("total"), actual[0] - actual[1]);
                 assertEquals((long) stats.get("ignored errors"), actual[1]);
             }
-            for (int i = 1; i <= 2; i++) {
-                long expected = 512 + number(observer, "SELECT count(*) FILTER(WHERE _sib_kind='I')-"
-                        + "count(*) FILTER(WHERE _sib_kind='D') FROM sibench_history.rows_" + i);
-                assertEquals(expected, number(observer, "SELECT count(*) FROM sbtest" + i));
-                assertEquals(20, number(observer, "SELECT count(*) FROM sbtest1 WHERE id>512")
-                        + number(observer, "SELECT count(*) FROM sbtest2 WHERE id>512"));
-            }
-        }
-        stop(); host = null;
-        Path data = Files.createDirectory(output.resolve("data"));
-        assertFalse(Files.exists(root.resolve("data/data.duckdb.wal")));
-        Files.move(DuckDbDatabase.file(root.resolve("data")), DuckDbDatabase.file(data));
-        try (var reader = DuckDbDatabase.openReadOnly(data)) {
-            assertEquals(1024, number(reader, "SELECT (SELECT count(*) FROM sibench_history.identities_1 WHERE _sib_tx=0)"
+            assertEquals(20, number(observer, "SELECT count(*) FROM sbtest1 WHERE id>512")
+                    + number(observer, "SELECT count(*) FROM sbtest2 WHERE id>512"));
+            assertEquals(1024, number(observer, "SELECT (SELECT count(*) FROM sibench_history.identities_1 WHERE _sib_tx=0)"
                     + "+(SELECT count(*) FROM sibench_history.identities_2 WHERE _sib_tx=0)"));
         }
+        stop(); host = null;
+        assertFalse(Files.exists(root.resolve("data/data.duckdb.wal")));
     }
 
     @Test public void nativeConflictRollsBackBeforeTheUpstreamEventRetry() throws Exception {

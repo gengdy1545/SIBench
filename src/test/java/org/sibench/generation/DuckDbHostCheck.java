@@ -279,29 +279,6 @@ public class DuckDbHostCheck extends DuckDbHostFixture {
         }
     }
 
-    @Test public void nativeHistorySurvivesHostShutdownAndReadsIndependently() throws Exception {
-        long rowId;
-        try (var database = connect()) {
-            execute(database, "CREATE TABLE items(id BIGINT PRIMARY KEY, value VARCHAR)");
-            execute(database, "INSERT INTO items VALUES(1,'A')");
-            database.setAutoCommit(false);
-            NativeHistory.initialize(database, org.sibench.config.Engine.DUCKDB); NativeHistory.install(database, org.sibench.config.Engine.DUCKDB, 1, "main", "items", "id");
-            database.commit();
-            rowId = number(database, "SELECT _sib_row_id FROM sibench_history.identities_1");
-            execute(database, "UPDATE items SET value='B' WHERE id=1");
-            long transaction = number(database, "SELECT _sib_tx FROM sibench_history.rows_1");
-            database.commit(); NativeHistory.recordCommit(database, transaction, 1); database.commit();
-            execute(database, "UPDATE items SET value='discarded' WHERE id=1"); database.rollback();
-            NativeHistory.seal(database); database.commit(); database.setAutoCommit(true);
-            execute(database, "CHECKPOINT");
-        }
-        stop(); host = null;
-        try (var reader = DuckDbDatabase.openReadOnly(root.resolve("data"))) {
-            assertEquals("A", NativeHistory.readRow(reader, 1, rowId, 0, 0, 0).orElseThrow().get("value"));
-            assertEquals("B", NativeHistory.readRow(reader, 1, rowId, 1, 0, 0).orElseThrow().get("value"));
-        }
-    }
-
     @Test public void existingPathsAreNeverReplaced() throws Exception {
         String executable = System.getProperty("sibench.duckdb.host");
         for (Path directory : List.of(root.resolve("data"), root.resolve("second-data"))) {
@@ -329,7 +306,8 @@ public class DuckDbHostCheck extends DuckDbHostFixture {
             Thread.sleep(100);
             stop(); host = null;
             assertTrue(running.get(5, TimeUnit.SECONDS));
-            try (var reader = DuckDbDatabase.openReadOnly(root.resolve("data"))) {
+            var readOnly = new java.util.Properties(); readOnly.setProperty("duckdb.read_only", "true");
+            try (var reader = java.sql.DriverManager.getConnection("jdbc:duckdb:" + DuckDbDatabase.file(root.resolve("data")), readOnly)) {
                 assertEquals(0, number(reader, "SELECT count(*) FROM items"));
             }
             assertFalse(Files.exists(socket));

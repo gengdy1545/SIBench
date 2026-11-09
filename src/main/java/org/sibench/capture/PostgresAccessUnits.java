@@ -7,7 +7,6 @@ import com.google.gson.JsonObject;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -86,7 +85,8 @@ final class PostgresAccessUnits {
     /** The scans of one BitmapAnd that ran in one cycle, with the heap's verdict on their result. */
     static final class BitmapGroup {
         final List<Unit> members = new ArrayList<>();
-        final Set<Scan> scans = new HashSet<>();
+        /** The capture's number for this cycle of its BitmapAnd. */
+        long cycle;
         long visible;
         int settled;
         boolean sealed, lossy, verdictOutsideIntersection, reported;
@@ -190,6 +190,8 @@ final class PostgresAccessUnits {
         /** The bitmap combination this scan feeds, and its BitmapAnd group when it has one. */
         Combination combination = Combination.SINGLE;
         BitmapGroup group;
+        /** The scan's position among its bitmap heap node's inputs, in plan order. */
+        int position = -1;
         /** The ledger's decision label, held from the unit's decision until its request finishes. */
         String decision;
         /**
@@ -461,7 +463,7 @@ final class PostgresAccessUnits {
                 BitmapHeap previous = state.heaps.put(e.get("heap").getAsString(), heap);
                 if (previous != null) requireVerdictsSummarized(previous);
                 for (String id : heap.inputs) state.feeds.put(id, heap);
-                bindStarted(heap);
+                bindStarted(heap, e.has("cycle") ? e.get("cycle").getAsLong() : 0);
             }
             case "bitmap_heap_candidate" -> verdict(e);
             case "bitmap_heap_lossy" -> {
@@ -533,7 +535,7 @@ final class PostgresAccessUnits {
     }
 
     /** The inputs' units that already started belong to the node's first cycle. */
-    private void bindStarted(BitmapHeap heap) throws IOException {
+    private void bindStarted(BitmapHeap heap, long cycle) throws IOException {
         BitmapGroup group = null;
         for (String id : heap.inputs) {
             Scan scan = session.scans.get(id);
@@ -543,10 +545,14 @@ final class PostgresAccessUnits {
             if (unit.group != null || unit.events > 1)
                 throw new IOException("Bitmap input ran before its heap node bound it: " + id);
             unit.combination = heap.combination;
+            unit.position = heap.inputs.indexOf(id);
             if (heap.combination != Combination.AND) continue;
-            if (group == null) group = new BitmapGroup(session.detail != Detail.SUMMARY);
+            if (group == null) {
+                if (cycle <= 0) throw new IOException("BitmapAnd binding without its first cycle");
+                group = new BitmapGroup(session.detail != Detail.SUMMARY);
+                group.cycle = cycle;
+            }
             group.members.add(unit);
-            group.scans.add(scan);
             unit.group = group;
         }
         if (group == null) return;
@@ -609,13 +615,30 @@ final class PostgresAccessUnits {
             if (state.current == null)
                 throw new IOException("Index scan without a started request: " + index);
         }
-        // A BitmapAnd input that runs again starts the next cycle; PostgreSQL skips the remaining
-        // inputs once the intersection is empty, so a cycle holds the inputs that actually ran.
+        // The capture numbers each BitmapAnd cycle on its inputs' rescans: an input that runs again
+        // after its cycle ran starts the next one. Inputs without runtime keys rescan before the
+        // others, and PostgreSQL skips the remaining inputs once the intersection is empty.
         BitmapHeap heap = source == Source.PLANNER_PROBE ? null : state.feeds.get(id);
-        if (heap != null && heap.combination == Combination.AND
-                && heap.current != null && heap.current.scans.contains(scan))
-            heap.current.sealed = true;
-        if (scan.current != null) settle(scan.current);
+        boolean and = heap != null && heap.combination == Combination.AND;
+        long cycle = e.has("cycle") ? e.get("cycle").getAsLong() : 0;
+        if (and && cycle <= 0) throw new IOException("BitmapAnd input rescan without its cycle: " + index);
+        Unit previous = scan.current;
+        BitmapGroup ended = null, left = null;
+        if (and && heap.current != null && heap.current.cycle != cycle) {
+            ended = heap.current;
+            ended.sealed = true;
+        }
+        // An input that never fetched in its cycle (constant keys bound at plan start, or skipped
+        // after an empty intersection) searched nothing there, as the native capture records.
+        if (previous != null && previous.group != null && previous.calls == 0
+                && previous.bitmapTids == 0 && !previous.bitmapEnded) {
+            left = previous.group;
+            left.members.remove(previous);
+            previous.group = null;
+        }
+        if (previous != null) settle(previous);
+        if (left != null) report(left);
+        if (ended != null) report(ended);
         Unit unit =
                 new Unit(
                         scan,
@@ -626,11 +649,13 @@ final class PostgresAccessUnits {
         scan.current = unit;
         if (heap != null) {
             unit.combination = heap.combination;
+            unit.position = heap.inputs.indexOf(id);
             if (heap.combination == Combination.AND) {
-                if (heap.current == null || heap.current.sealed)
+                if (heap.current == null || heap.current.sealed) {
                     heap.current = new BitmapGroup(state.detail != Detail.SUMMARY);
+                    heap.current.cycle = cycle;
+                }
                 heap.current.members.add(unit);
-                heap.current.scans.add(scan);
                 unit.group = heap.current;
             }
         }
@@ -956,10 +981,15 @@ final class PostgresAccessUnits {
         BitmapGroup group = unit.group;
         if (group != null) {
             group.settled++;
-            if (group.sealed && group.settled == group.members.size() && !group.reported) {
-                group.reported = true;
-                listener.groupSettled(group);
-            }
+            report(group);
+        }
+    }
+
+    /** A sealed group is decided once its last member settles; a group left empty, at once. */
+    private void report(BitmapGroup group) throws IOException {
+        if (group.sealed && group.settled == group.members.size() && !group.reported) {
+            group.reported = true;
+            listener.groupSettled(group);
         }
     }
 

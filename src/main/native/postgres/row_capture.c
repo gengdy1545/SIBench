@@ -71,14 +71,13 @@ Datum sibench_row_capture(PG_FUNCTION_ARGS)
         old = trigger->tg_trigtuple; operation="delete";
     } else { next = trigger->tg_trigtuple; operation="insert"; }
     if (sib_enabled()) {
-        /* Native history owns row contents; projection needs only indexed attributes. */
+        /* Projection needs only indexed attributes; row contents are not retained. */
         Bitmapset *indexed = RelationGetIndexAttrBitmap(trigger->tg_relation,INDEX_ATTR_BITMAP_ALL);
         initStringInfo(&output);
         appendStringInfo(&output,"\"operation\":\"%s\",\"old\":",operation);
         append_tuple(&output, trigger->tg_relation, old, indexed);
         appendStringInfoString(&output,",\"new\":");
         append_tuple(&output, trigger->tg_relation, next, indexed);
-        if (old) appendStringInfo(&output,",\"old_tid\":\"(%u,%u)\"",ItemPointerGetBlockNumber(&old->t_self),ItemPointerGetOffsetNumber(&old->t_self));
         sib_emit("row_change",trigger->tg_relation,output.data);
         pfree(output.data);
         bms_free(indexed);
@@ -103,4 +102,11 @@ Datum sibench_capture_watermark(PG_FUNCTION_ARGS)
     if (pid < 0 || sequence < 0 || csn < 0 || consumed < 0 || consumed > sequence)
         elog(ERROR, "Invalid source acknowledgement");
     PG_RETURN_INT64((int64) sib_capture_watermark(pid, (uint64) sequence, (uint64) csn, (uint64) consumed));
+}
+
+PG_FUNCTION_INFO_V1(sibench_capture_hold);
+Datum sibench_capture_hold(PG_FUNCTION_ARGS)
+{
+    sib_capture_hold(PG_GETARG_BOOL(0));
+    PG_RETURN_VOID();
 }

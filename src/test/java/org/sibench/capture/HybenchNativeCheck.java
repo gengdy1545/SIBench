@@ -135,9 +135,9 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
         retainedOutput=output;
         var base=prepareInputs(repository,build,source,output);
         try(var observer=connect()) {
-            assertEquals(8706,HybenchDuckDb.load(observer,source,output.resolve("Data_1x")).values().stream().mapToLong(Long::longValue).sum());
+            assertEquals(8706,Hybench.load(observer,source,output.resolve("Data_1x")).values().stream().mapToLong(Long::longValue).sum());
             observer.setAutoCommit(false);NativeHistory.initialize(observer, org.sibench.config.Engine.DUCKDB);
-            for(var index:HybenchDuckDb.catalog(source))if(index.indexId()==0)
+            for(var index:Hybench.catalog(source))if(index.indexId()==0)
                 NativeHistory.install(observer, org.sibench.config.Engine.DUCKDB,index.tableId(),"main",index.table(),index.column());
             observer.commit();observer.setAutoCommit(true);
             Path raw=output.resolve("native.csv");
@@ -168,10 +168,10 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
         retainedOutput=output;
         var base=prepareInputs(repository,build,source,output);
         try(var observer=connect()) {
-            var loaded=HybenchDuckDb.load(observer,source,output.resolve("Data_1x"));
+            var loaded=Hybench.load(observer,source,output.resolve("Data_1x"));
             assertEquals(8706,loaded.values().stream().mapToLong(Long::longValue).sum());
             Files.writeString(output.resolve("loaded.json"),new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(loaded));
-            var catalog=HybenchDuckDb.catalog(source);
+            var catalog=Hybench.catalog(source);
             observer.setAutoCommit(false);NativeHistory.initialize(observer, org.sibench.config.Engine.DUCKDB);
             for(var index:catalog)if(index.indexId()==0)NativeHistory.install(observer, org.sibench.config.Engine.DUCKDB,index.tableId(),"main",index.table(),index.column());
             observer.commit();observer.setAutoCommit(true);

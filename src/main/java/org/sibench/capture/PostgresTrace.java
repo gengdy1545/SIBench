@@ -12,8 +12,6 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import org.sibench.generation.NativeHistory;
-import org.sibench.generation.PostgresData;
 import org.sibench.schema.SourceSchema;
 
 /** Writes final Trace streams alongside load and workload; publication only seals their inventories. */
@@ -43,12 +41,12 @@ final class PostgresTrace {
 
     void baseline(Connection database,Map<String,Long> expected)throws Exception {
         var writer=new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"),secondaryIndexes);
-        try(writer){Generation.requireRows(expected,NativeBaseline.write(database,org.sibench.config.Engine.POSTGRES,catalog.definitions().stream().filter(d->secondaryIndexes||d.indexId()==0).toList(),writer::accept));}
+        try(writer){Generation.requireRows(expected,NativeBaseline.write(database,org.sibench.config.Engine.POSTGRES,catalog.definitions().stream().filter(d->secondaryIndexes||d.indexId()==0).toList(),catalog::postgresKey,writer::accept));}
         manifest.put("baseline_rows",expected.values().stream().mapToLong(Long::longValue).sum());
         stream("baseline",writer);
     }
 
-    /** One consumer runs concurrently with native clients; source counts are checked before seal. */
+    /** One consumer runs concurrently with native clients; source counts are checked before publication. */
     void workload(Connection database,PostgresCapture capture)throws Exception {
         var units=WorkUnits.create(directory);
         var writer=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,budget);
@@ -56,8 +54,8 @@ final class PostgresTrace {
                 var projection=new PostgresProjection(database,catalog,directory,versions,units,writer::accept)) {
             for(PostgresTransactions.Chunk next;(next=capture.transactions.next(()->capture.watermark(database)))!=null;)
                 try(var chunk=next){
-                    projection.accept(chunk);
-                    if (chunk.hasRequests) projectedTransactions++;
+                    if (projection.accept(chunk)) projectedTransactions++;
+                    capture.updateHold(database);
                 }
             var counts=projection.counts();
             long requests=0,commits=0,aborts=0;
@@ -74,7 +72,7 @@ final class PostgresTrace {
             manifest.put("last_resolved_version",versions.version());
             manifest.put("capture_queue",capture.transactions.metrics());
         }
-        NativeHistory.seal(database);database.commit();
+        database.commit();
         manifest.put("work_units_sha256",HexFormat.of().formatHex(units.digest().digest()));
         manifest.put("work_unit_rule","one native statement origin; numbered in native transaction completion order");
         stream("workload",writer);
@@ -103,10 +101,8 @@ final class PostgresTrace {
         manifest.put(name+"_trace_sha256",ProtoTrace.identity(new Gson().toJsonTree(files).getAsJsonArray()));
     }
 
-    Map<String,Object> publish(Path runtime,Map<String,Object> evidence)throws Exception {
+    Map<String,Object> publish(Map<String,Object> evidence)throws Exception {
         if(!manifest.containsKey("workload_trace_sha256"))throw new IOException("PG workload did not finish");
-        manifest.put("native_data",PostgresData.inventory(directory.resolve("data"),runtime,
-                ((Number)manifest.get("last_resolved_version")).longValue()));
         manifest.put("source_evidence",evidence);manifest.put("status","complete_for_declared_projection");
         Path partial=directory.resolve("manifest.json.partial");
         Files.writeString(partial,new GsonBuilder().setPrettyPrinting().create().toJson(manifest),StandardOpenOption.CREATE_NEW);

@@ -21,7 +21,7 @@ public class CloudRocksStoreTest {
         counts[7] = 4;
         counts[9] = 2;
         String text = "write " + Arrays.stream(counts).mapToObj(Long::toString).collect(Collectors.joining(" "));
-        assertArrayEquals(counts, CloudRocksStore.parseRequests(text + "\n").get("write"));
+        assertArrayEquals(counts, OrderedStore.parseRequests(text + "\n").get("write"));
         var stats = VersionedIndexBackend.objectRequestStats(counts);
         assertEquals(9L, stats.get("requests"));
         assertEquals(1L, stats.get("failed"));
@@ -41,9 +41,9 @@ public class CloudRocksStoreTest {
 
     @Test
     public void rejectsMissingHistogramAndMalformedNativeStatistics() {
-        assertThrows(IOException.class, () -> CloudRocksStore.parseRequests("write 1 0 10 20"));
+        assertThrows(IOException.class, () -> OrderedStore.parseRequests("write 1 0 10 20"));
         String tail = " 0".repeat(35);
-        assertThrows(IOException.class, () -> CloudRocksStore.parseRequests("write -1" + tail));
-        assertThrows(IOException.class, () -> CloudRocksStore.parseRequests("write nope" + tail));
+        assertThrows(IOException.class, () -> OrderedStore.parseRequests("write -1" + tail));
+        assertThrows(IOException.class, () -> OrderedStore.parseRequests("write nope" + tail));
     }
 }

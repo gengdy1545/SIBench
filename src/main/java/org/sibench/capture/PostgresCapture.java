@@ -34,6 +34,8 @@ final class PostgresCapture implements AutoCloseable {
     private final Map<Integer,Session> sessions=new HashMap<>();
     private final java.util.Set<SocketChannel> sockets=new java.util.HashSet<>();
     final PostgresTransactions transactions;
+    /** Last hold state sent to the sources; only the ordered consumer thread changes it. */
+    private boolean held;
     private volatile boolean stopping;
     private Throwable failure;
     private boolean finished;
@@ -94,6 +96,10 @@ final class PostgresCapture implements AutoCloseable {
                     var ack=ByteBuffer.wrap(new byte[]{'E'});while(ack.hasRemaining())socket.write(ack);
                     session.ended.complete(null);return;
                 }
+                // A statement starts at its top-level executor; the previous one's end events precede it.
+                if(chunk!=null&&type.equals("executor_start")&&event.get("depth").getAsInt()==1&&transactions.splits(chunk)) {
+                    transactions.completePiece(chunk);chunk=null;
+                }
                 if(chunk==null)chunk=transactions.begin(pid);
                 chunk.append(line,event,encoded.length);
                 if(type.equals("transaction_commit")||type.equals("transaction_abort")) {
@@ -118,12 +124,24 @@ final class PostgresCapture implements AutoCloseable {
         try(var query=database.createStatement()) {
             query.execute("CREATE FUNCTION sibench_history.capture_watermark(integer,bigint,bigint,bigint) RETURNS BIGINT "
                     +"AS '$libdir/row_capture','sibench_capture_watermark' LANGUAGE C VOLATILE");
+            query.execute("CREATE FUNCTION sibench_history.capture_hold(boolean) RETURNS void "
+                    +"AS '$libdir/row_capture','sibench_capture_hold' LANGUAGE C VOLATILE");
         }
+    }
+
+    /** Called by the ordered consumer: tells sources to hold read-only statements while its queue is full. */
+    void updateHold(Connection database)throws SQLException {
+        boolean full=transactions.full();
+        if(full==held)return;
+        try(var query=database.prepareStatement("SELECT sibench_history.capture_hold(?)")) {
+            query.setBoolean(1,full);query.execute();
+        }
+        held=full;
     }
 
     /** Only the ordered consumer uses this connection; readers acknowledge queued facts, never guessed time. */
     long watermark(Connection database)throws SQLException,IOException {
-        check();List<Session> snapshot;
+        check();updateHold(database);List<Session> snapshot;
         synchronized(this){snapshot=List.copyOf(sessions.values());}
         long safe=-1;
         try(var query=database.prepareStatement("SELECT sibench_history.capture_watermark(?,?,?,?)")) {

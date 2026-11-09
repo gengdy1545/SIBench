@@ -9,8 +9,14 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.LongSupplier;
 
-/** One sender, deterministic work-unit routing, and bounded independently completed responses. */
+/**
+ * One sender, deterministic work-unit routing, and bounded independently completed responses.
+ * A snapshot search whose older writes are still unacknowledged is deferred, not sent, so later
+ * writes keep flowing; deferred searches leave in arrival order once those writes complete.
+ */
 public final class ReplayDispatcher implements AutoCloseable {
+    private record Deferred(Operation operation, org.sibench.adapters.proto.Request stored, long since) {}
+
     private static final class Pending {
         private final long deadline, started;
         private final CompletableFuture<Void> response;
@@ -124,7 +130,12 @@ public final class ReplayDispatcher implements AutoCloseable {
     private final Map<CompletableFuture<Void>, Pending> baselineResponses = new IdentityHashMap<>();
     private final Latency writeLatency = new Latency(), searchLatency = new Latency();
     private long sent, operationsSent, completed, completedOperations, workUnitCount, peakInFlight,
-            orderChecksum, backpressureNanos, dependencyWaitNanos;
+            orderChecksum, backpressureNanos, dependencyWaitNanos, deferredNanos, deferredOperations,
+            peakDeferred;
+    private final ArrayDeque<Deferred> deferred = new ArrayDeque<>();
+    /** Members still expected for the deferred group at the queue tail, or for a sent group. */
+    private int deferringGroup, directGroup;
+    private long deferredReadLimit = -1;
     private long inFlightMembers, peakCompletionGroups;
     private int pendingWriteResponses;
     private long failedOperations, timedOutOperations;
@@ -217,10 +228,104 @@ public final class ReplayDispatcher implements AutoCloseable {
 
     public void send(Operation operation, org.sibench.adapters.proto.Request stored) throws IOException {
         checkSender();
+        route(operation);
+        boolean member = operation.grouped() && operation.expansionPosition() > 0;
+        if (operation.kind() == IndexOperationTrace.SEARCH && member) {
+            if (deferringGroup > 0) defer(operation, stored, false);
+            else {
+                directGroup--;
+                dispatch(operation, stored);
+            }
+            return;
+        }
+        if (directGroup != 0 || deferringGroup != 0) throw new IOException("Incomplete search group");
+        releaseDeferred();
+        if (operation.kind() == IndexOperationTrace.SEARCH) {
+            if (needsDeferral(operation)) defer(operation, stored, true);
+            else {
+                directGroup = operation.grouped() ? operation.expansionSize() - 1 : 0;
+                dispatch(operation, stored);
+            }
+            return;
+        }
+        // A deferred snapshot at or after this version precedes it in source order.
+        if (operation.version() <= deferredReadLimit)
+            awaitDeferred(() -> deferred.stream().noneMatch(d -> d.operation().readTimestamp() >= operation.version()));
+        dispatch(operation, stored);
+    }
+
+    private boolean needsDeferral(Operation operation) {
+        synchronized (inFlight) {
+            return hasPendingWrites(operation.readTimestamp());
+        }
+    }
+
+    private void defer(Operation operation, org.sibench.adapters.proto.Request stored, boolean head)
+            throws IOException {
+        if (head) {
+            int size = operation.grouped() ? operation.expansionSize() : 1;
+            if (size > config.maxInFlight())
+                synchronized (inFlight) {
+                    throw fail(new IOException("Search group has " + size
+                            + " members, exceeding max_in_flight=" + config.maxInFlight()));
+                }
+            // Deferred members are bounded like in-flight ones; the sender waits for room.
+            if (deferred.size() + size > config.maxInFlight())
+                awaitDeferred(() -> deferred.size() + size <= config.maxInFlight());
+            // Held writes, such as a partial batch, must leave before a deferred search can.
+            if (deferred.isEmpty()) {
+                flushClients();
+                synchronized (inFlight) {
+                    checkFailure();
+                }
+            }
+            deferringGroup = size;
+            deferredReadLimit = Math.max(deferredReadLimit, operation.readTimestamp());
+        }
+        deferred.addLast(new Deferred(operation, stored, nanoTime.getAsLong()));
+        deferringGroup--;
+        peakDeferred = Math.max(peakDeferred, deferred.size());
+    }
+
+    /** Sends complete deferred groups from the queue head whose required writes are acknowledged. */
+    private void releaseDeferred() throws IOException {
+        while (!deferred.isEmpty()) {
+            var first = deferred.peekFirst().operation();
+            int size = first.grouped() ? first.expansionSize() : 1;
+            if (deferred.size() < size || needsDeferral(first)) return;
+            long now = nanoTime.getAsLong();
+            for (int i = 0; i < size; i++) {
+                var item = deferred.pollFirst();
+                deferredNanos += now - item.since();
+                deferredOperations++;
+                dispatch(item.operation(), item.stored());
+            }
+        }
+        deferredReadLimit = -1;
+    }
+
+    /** Blocks the sender, releasing deferred searches as writes complete, until {@code done}. */
+    private void awaitDeferred(java.util.function.BooleanSupplier done) throws IOException {
+        if (deferred.isEmpty()) return;
+        long start = nanoTime.getAsLong();
+        flushClients();
+        dependencyWaitNanos += nanoTime.getAsLong() - start;
+        while (true) {
+            releaseDeferred();
+            if (deferred.isEmpty() || done.getAsBoolean()) return;
+            synchronized (inFlight) {
+                checkFailure();
+                // A complete head group whose writes finished is released by the next pass.
+                if (!needsDeferral(deferred.peekFirst().operation())) continue;
+                start = nanoTime.getAsLong();
+                waitForResponse();
+                dependencyWaitNanos += nanoTime.getAsLong() - start;
+            }
+        }
+    }
+
+    private void dispatch(Operation operation, org.sibench.adapters.proto.Request stored) throws IOException {
         int clientId = route(operation);
-        if (operation.kind() == IndexOperationTrace.SEARCH
-                && (!operation.grouped() || operation.expansionPosition() == 0))
-            awaitWrites(operation.readTimestamp());
         synchronized (inFlight) {
             // A buffered search group cannot produce responses until its last member arrives.
             // Projection delivers complete groups contiguously on this single sender.
@@ -368,23 +473,7 @@ public final class ReplayDispatcher implements AutoCloseable {
         }
     }
 
-    /** Snapshot reads depend on acknowledged writes at or before their read timestamp. */
-    private void awaitWrites(long readTimestamp) throws IOException {
-        synchronized (inFlight) {
-            if (!hasPendingWrites(readTimestamp)) return;
-        }
-        long start = nanoTime.getAsLong();
-        flushClients();
-        synchronized (inFlight) {
-            while (hasPendingWrites(readTimestamp)) {
-                checkFailure();
-                waitForResponse();
-            }
-            checkFailure();
-        }
-        dependencyWaitNanos += nanoTime.getAsLong() - start;
-    }
-
+    // Snapshot reads depend on acknowledged writes at or before their read timestamp.
     // Called only at query boundaries under inFlight; bounded by max_in_flight.
     private boolean hasPendingWrites(long readTimestamp) {
         if (pendingWriteResponses == 0) return false;
@@ -420,6 +509,8 @@ public final class ReplayDispatcher implements AutoCloseable {
 
     public void drain() throws IOException {
         checkSender();
+        if (directGroup != 0 || deferringGroup != 0) throw new IOException("Incomplete search group");
+        awaitDeferred(() -> false);
         long start = nanoTime.getAsLong();
         flushClients();
         synchronized (inFlight) {
@@ -455,6 +546,9 @@ public final class ReplayDispatcher implements AutoCloseable {
         report.put("service_visibility_owner", "index_service");
         report.put("backpressure_seconds", backpressureNanos / 1e9);
         report.put("dependency_wait_seconds", dependencyWaitNanos / 1e9);
+        report.put("deferred_search_operations", deferredOperations);
+        report.put("search_deferral_seconds", deferredNanos / 1e9);
+        report.put("peak_deferred_operations", peakDeferred);
         report.put("latency_boundary", "client_api_entry_to_final_response_excluding_replay_waits");
         synchronized (inFlight) {
             report.put("completed_responses", completed);
@@ -502,6 +596,7 @@ public final class ReplayDispatcher implements AutoCloseable {
                 pending.response().cancel(false);
             }
             inFlight.clear();
+            deferred.clear();
             baselineResponses.clear();
             inFlightMembers = 0;
             pendingWriteResponses = 0;

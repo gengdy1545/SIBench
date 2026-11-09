@@ -8,7 +8,7 @@ import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.Properties;
 
-/** Native row storage connections. Publication and retained row versions belong to the generator. */
+/** In-process DuckDB connections and the loaded engine identity. */
 public final class DuckDbDatabase {
     private DuckDbDatabase() {}
 
@@ -23,16 +23,6 @@ public final class DuckDbDatabase {
         // Use the pinned engine's native format, including persistent transition-table triggers.
         properties.setProperty("storage_compatibility_version", "latest");
         return DriverManager.getConnection("jdbc:duckdb:" + file(root), properties);
-    }
-
-    /** Opens existing native data without creating a missing file or granting write access. */
-    public static Connection openReadOnly(Path directory) throws IOException, SQLException {
-        Path database = file(directory.toRealPath());
-        if (!Files.isRegularFile(database) || Files.size(database) == 0)
-            throw new IOException("Missing DuckDB data file: " + database);
-        var properties = new Properties();
-        properties.setProperty("duckdb.read_only", "true");
-        return DriverManager.getConnection("jdbc:duckdb:" + database, properties);
     }
 
     public static Path file(Path directory) {

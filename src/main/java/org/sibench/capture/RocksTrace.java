@@ -5,7 +5,6 @@ import com.google.gson.GsonBuilder;
 import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
-import org.sibench.generation.RocksDbData;
 import org.sibench.generation.RocksDbRows;
 import org.sibench.schema.SourceSchema;
 import org.sibench.trace.IndexKey;
@@ -51,8 +50,7 @@ final class RocksTrace implements AutoCloseable {
         if (!baselineClosed || event.version() != version + 1 || event.readVersion() > version)
             throw new IOException("Invalid RocksDB source publication order");
         version = event.version();
-        units.lines().write("{\"work_unit_id\":" + version + ",\"source_event\":" + version
-                + ",\"connection_id\":" + event.connection() + ",\"query_id\":" + event.query() + "}\n");
+        units.lines().write("{\"work_unit_id\":" + version + ",\"source_event\":" + version + "}\n");
         workload.accept(transaction(0, TRANSACTION_BEGIN, version, version, 0));
         long writes = 0;
         if (event.kind().equals("read") || event.kind().equals("scan")) {
@@ -83,7 +81,7 @@ final class RocksTrace implements AutoCloseable {
         try (baseline; workload; var lines = units.lines()) { }
         closed = true;
     }
-    Map<String, Object> publish(Path library, Map<String, RocksDbData.File> writtenFiles, Map<String, Object> evidence) throws Exception {
+    Map<String, Object> publish(Map<String, Object> evidence) throws Exception {
         if (!closed || !baselineClosed) throw new IOException("RocksDB streams have not finished");
         stream("workload", workload);
         manifest.put("source_work_units", version); manifest.put("source_statements", version);
@@ -92,7 +90,6 @@ final class RocksTrace implements AutoCloseable {
         manifest.put("last_resolved_version", version);
         manifest.put("work_units_sha256", HexFormat.of().formatHex(units.digest().digest()));
         manifest.put("work_unit_rule", "one YCSB API call; numbered in native publication order");
-        manifest.put("native_data", RocksDbData.seal(directory.resolve("data"), library, version, writtenFiles));
         manifest.put("source_evidence", evidence); manifest.put("status", "complete_for_declared_projection");
         Path partial = directory.resolve("manifest.json.partial");
         Files.writeString(partial, new GsonBuilder().setPrettyPrinting().create().toJson(manifest), StandardOpenOption.CREATE_NEW);

@@ -38,7 +38,7 @@ public class SibenchConfigTest {
         assertEquals(java.util.List.of(BenchmarkSelection.Mode.API, BenchmarkSelection.Mode.CAPTURE,
                 BenchmarkSelection.Mode.CAPTURE), selected.stream().map(BenchmarkSelection::mode).toList());
         assertEquals("build/services/postgres",ConfigValues.string(ConfigValues.object(document,"postgres"),"build_directory"));
-        assertEquals(java.util.List.of(Engine.ROCKSDB, Engine.POSTGRES, Engine.DUCKDB),
+        assertEquals(java.util.List.of(Engine.ROCKSDB, Engine.POSTGRES, Engine.POSTGRES),
                 selected.stream().map(BenchmarkSelection::engine).toList());
         assertEquals("build/services/rocksdb", ConfigValues.string(ConfigValues.object(document,"rocksdb"),"build_directory"));
         assertFalse(document.containsKey("generation"));

@@ -10,36 +10,18 @@ A complete artifact contains:
 | --- | --- |
 | `baseline.pb.zst` | Initial exported index entries at version 0. |
 | `workload.pb.zst` | Committed index operations with source transaction boundaries/outcomes. |
-| `work-units.jsonl.zst` | Operation origins and client-routing identities. |
-| `data/` | Sealed native rows, committed history and identity/read-point metadata. |
+| `work-units.jsonl.zst` | Operation origins (`work_unit_id`, first `source_event`) for coverage checks and client routing. |
 | `manifest.json` | Catalog, source/configuration/build identities, file inventories, statistics and version coverage. |
 
-Generation keeps `INCOMPLETE` until the engine closes normally, data and Trace resolution watermarks agree, and the manifest is atomically published. Consumers reject incomplete, altered or unsealed artifacts. Failure retains diagnostics, stops later benchmarks and cannot resume; crash recovery and reusable initial-state databases are unsupported.
+Generation keeps `INCOMPLETE` until the engine closes normally and the manifest is atomically published. Consumers reject incomplete or altered artifacts. Failure retains diagnostics, stops later benchmarks and cannot resume; crash recovery and reusable initial-state databases are unsupported.
 
-`native_data` binds required native files, sizes, SHA-256, engine/bridge identities and the last resolution slot. `source_evidence` binds effective configuration, client/engine identities, expected per-table baseline counts and source-completeness evidence. PostgreSQL exports online without retaining all raw facts; DuckDB retains facts and count-only receipts; YCSB exports API operations directly. These identities do not independently certify an untrusted producer's completeness.
+The native database is a working state of generation, not part of the artifact. Each engine keeps only what export needs: RowID identities (a baseline mapping and one identity per inserted row), commit-to-version mapping and the transient capture facts of the current window. It retains no earlier row versions, read points or raw capture logs, and its data directory is deleted after normal shutdown. A Trace therefore supports index replay, not reading native row contents.
+
+`source_evidence` binds effective configuration, client/engine identities, expected per-table baseline counts and source-completeness evidence. Source facts are checked while they are projected and then discarded; YCSB exports API operations directly. These identities do not independently certify an untrusted producer's completeness.
 
 `catalog_sha256` binds the complete table/index definitions, benchmark, source commit, schema digests and source schema configuration, even for primary-only export. Consumers validate the embedded catalog without opening the source checkout. The source directory is informational. `value_kinds` currently declares only `row_id`; native replay rejects `locator` before creating/opening a backend.
 
-## Native row consumption component
-
-`TraceManifest.openData` verifies the native inventory and opens the appropriate row resolver:
-
-| Engine | Opening requirements |
-| --- | --- |
-| DuckDB | Read-only `data/data.duckdb`, matching engine identity, no remaining WAL/spill dependency; no capture host or re-import. |
-| PostgreSQL | Normally stopped cluster, matching explicit runtime and fresh working directory. The reader starts a private reflink/full copy with read-only transactions, leaving the artifact unchanged; normal close removes the copy. |
-| RocksDB | Read-only native files with matching runtime/timestamp bridge; no mutable copy or recovery. Empty engine-created WAL files are allowed, actual WAL records prevent publication. |
-
-`openData(trace)` opens DuckDB; `openData(trace, rocksdbBuildDirectory)` opens RocksDB; PostgreSQL uses `openData(trace, runtime, freshWorkingDirectory)`. Historical row reading is separate from index-only replay; PostgreSQL copy/startup cost belongs to row consumption.
-
-- `NativeData.snapshotRow(table, rowId, readVersion)` resolves a committed snapshot.
-- `rowBeforeStatement(table, rowId, connectionId, queryId)` resolves the actual statement-start snapshot plus preceding local writes, not arbitrary intra-statement reads. PostgreSQL preserves changing RC snapshots and fixed RR snapshots.
-- Unknown statement points, versions beyond the watermark and mismatched native identities are errors.
-- Updates retain RowID; delete/reinsert allocates a new identity. Old RowIDs never resolve to replacement rows.
-- Committed local row versions are retained. Full rolled-back row images are not: retrieval after such local writes is rejected, and those local searches and aborted writes are excluded from exported Trace.
-- Binary fields are detached byte arrays, including empty values; SQL NULL remains null. Readers resolve RowIDs, not physical Locators.
-
-Native file layout belongs to the selected engine. History is retained without Rewrite, physical version GC or file-relocation maintenance. Business Delete does not reclaim history; backend SST/WAL/MANIFEST files are separate index state.
+Updates retain their RowID; a deleted and reinserted key receives a new one, so an old RowID never names a replacement row.
 
 ## Protobuf format
 
@@ -78,7 +60,7 @@ LogicalValue = RowID
 
 TableIDs start at 1 in source-schema order; secondary IndexIDs follow each table's source index order. Nonunique secondary predicates search all matching primary keys.
 
-`IndexKey` components are self-delimiting and preserve unsigned byte order. NULL is `0x02`; non-NULL values start with `0x01`. Signed integers use sign-bit-flipped big-endian int64; timestamps use microseconds from 1970 with supported infinities at the extremes. Text uses UTF-8 terminated by `0x00`; embedded NUL is unsupported. DuckDB CHAR preserves trailing spaces. Supported families are signed integers, timestamps and binary-ordered text; arbitrary collations and composite/expression indexes are unsupported.
+`IndexKey` components are self-delimiting and preserve unsigned byte order. NULL is `0x02`; non-NULL values start with `0x01`. Signed integers use sign-bit-flipped big-endian int64; timestamps use microseconds from 1970 with supported infinities at the extremes. Text uses UTF-8 terminated by `0x00`; embedded NUL is unsupported. DuckDB CHAR preserves trailing spaces; PostgreSQL CHAR(n) compares without them, so its CHAR keys omit trailing blanks. Supported families are signed integers, timestamps and binary-ordered text; arbitrary collations and composite/expression indexes are unsupported.
 
 Backend keys are `Table(uint32 BE) ++ IndexID(uint32 BE) ++ [IndexedValue] ++ PK ++ (~Version int64 BE)`. Component-prefix equality is `[value, prefixSuccessor(value))`; inclusive/exclusive bounds adjust that endpoint.
 
@@ -113,7 +95,7 @@ Baseline expansion members share source identity, RowID and a complete consecuti
 
 `trace.secondary_indexes` defaults to false. The manifest declares `secondary_index_coverage` as `primary_only` or `all_source_definitions`; source database indexes remain intact. Primary-only export omits secondary writes/searches and whole groups containing secondary members. It preserves source outcomes, including empty transactions, read points and original provenance; exported request/write counts are recomputed.
 
-The writer buffers one source transaction, bounded by 1,000,000 source operations. It validates source accounting, expansions, groups and read points before excluding operations. Preflight validates exported counts, provenance, unique physical keys per commit version and snapshot-only searches before consumption-side filtering. Secondary-enabled consumption rejects a primary-only Trace before backend access; full exports support either setting. Baseline loading drains before workload sending. Snapshot queries wait for required pending write ACKs in replay; no synthetic request or server-side transaction control is added. Failures stop/cancel outstanding work.
+Searches before a source transaction's first write cannot depend on its outcome and are exported at once, so long read-only transactions are not buffered. PostgreSQL capture likewise releases a long transaction's statements before its first write in bounded pieces: they become standalone snapshot searches ordered after every commit they observed, and the transaction keeps one resolution slot at its outcome. From the first write, the writer buffers the transaction, bounded by 1,000,000 source operations. It validates source accounting, expansions, groups and read points before excluding operations. Preflight validates exported counts, provenance, unique physical keys per commit version and snapshot-only searches before consumption-side filtering. Secondary-enabled consumption rejects a primary-only Trace before backend access; full exports support either setting. Baseline loading drains before workload sending. Snapshot queries wait for required pending write ACKs in replay; no synthetic request or server-side transaction control is added. Failures stop/cancel outstanding work.
 
 Search uses canonical key order, ascending unless requested otherwise; a positive API limit is a maximum. The protocol's Locator/Relocate capability does not imply native relocation/GC support.
 
@@ -150,6 +132,6 @@ Only clean pinned benchmark sources with supported native schemas/configurations
 | --- | --- |
 | YCSB / api | UTF-8 keys, configured binary fields, one primary index; real A/B/C/F/D/E calls. Baseline-only buffering requires successful worker completion and matching committed/emitted insert counts; workload calls are not batched. F remains separate Read and Update calls. |
 | sysbench / capture | Configured sbtest tables, id primary and k secondary indexes; six configured OLTP scripts including delete/reinsert and native conflict retry. |
-| HyBench / capture | Eight tables, eight primary and thirteen secondary indexes; AP → TP → concurrent XP. Native write conflicts roll back that transaction and continue, retaining source diagnostics/outcomes; other SQL errors fail. |
+| HyBench / capture | Eight tables, eight primary and thirteen secondary indexes; AP → TP → concurrent XP. Native transaction conflicts (DuckDB write conflicts; PostgreSQL deadlocks and serialization failures) roll back that transaction and continue, retaining source diagnostics/outcomes; other SQL errors fail. |
 
 Source retries require matching outcomes; the generator does not invent accesses by rerunning SQL or silently retry failed SQL. Setup, execution and shutdown have separate bounds; cleanup errors cannot replace the first failure. Successful publication requires normal shutdown, not crash recovery.

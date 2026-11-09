@@ -36,19 +36,20 @@ final class SlateDbStore implements OrderedStore {
         Path absolute = path.toAbsolutePath();
         Files.createDirectories(absolute.getParent());
         Files.createDirectory(absolute);
-        return open(store, true);
+        return open(absolute, store, true);
     }
 
     static SlateDbStore open(Path path, ObjectStore store) throws IOException {
         load();
         Files.createDirectories(path.toAbsolutePath());
-        return open(store, false);
+        return open(path.toAbsolutePath(), store, false);
     }
 
-    private static SlateDbStore open(ObjectStore store, boolean create) throws IOException {
+    /** The local path mirrors the compacted SSTs, as rocksdb-cloud keeps its SST files locally. */
+    private static SlateDbStore open(Path mirror, ObjectStore store, boolean create) throws IOException {
         return new SlateDbStore(nativeOpen(store.bucket(), store.objectPath(), store.region(),
                 store.endpoint(), store.virtualHosted(), store.accessKey(), store.secretKey(),
-                store.sessionToken(), create), store);
+                store.sessionToken(), mirror.toString(), create), store);
     }
 
     @Override public String name() { return nativeVersion(); }
@@ -56,7 +57,8 @@ final class SlateDbStore implements OrderedStore {
     @Override public Acknowledgement writeAck() { return Acknowledgement.ACK_MEMORY; }
     @Override public String durability() {
         return "acknowledged writes are visible through the same SlateDB instance's memory read path;"
-                + " Flush waits for object-store persistence; independent readers may lag";
+                + " Flush waits for object-store persistence; compacted SSTs are also mirrored to the local"
+                + " path; independent readers may lag";
     }
 
     @Override public void put(byte[] key, byte[] value, boolean wal) throws IOException {
@@ -64,10 +66,18 @@ final class SlateDbStore implements OrderedStore {
         // SlateDB uses its in-memory WAL for both baseline and workload writes.
         nativePut(handle, key, value);
     }
+    /** One SlateDB write batch per baseline request instead of one write per entry. */
+    @Override public void putBaseline(java.util.List<byte[]> keys, java.util.List<byte[]> values) throws IOException {
+        requireOpen();
+        nativePutAll(handle, keys.toArray(byte[][]::new), values.toArray(byte[][]::new));
+    }
     @Override public byte[] get(byte[] key) throws IOException { requireOpen(); return nativeGet(handle, key); }
     @Override public void flush() throws IOException { requireOpen(); nativeFlush(handle); }
     @Override public String property(String name) throws IOException { requireOpen(); return null; }
-    @Override public Map<String, long[]> objectRequests() throws IOException { requireOpen(); return null; }
+    @Override public Map<String, long[]> objectRequests() throws IOException {
+        requireOpen();
+        return OrderedStore.parseRequests(nativeRequests(handle));
+    }
 
     @Override public Cursor cursor(byte[] lower, byte[] upper) throws IOException {
         requireOpen();
@@ -94,8 +104,11 @@ final class SlateDbStore implements OrderedStore {
     private void requireOpen() throws IOException { if (closed) throw new IOException("SlateDB store is closed"); }
     private static native String nativeVersion();
     private static native long nativeOpen(String bucket, String prefix, String region, String endpoint,
-            boolean virtualHosted, String access, String secret, String token, boolean create) throws IOException;
+            boolean virtualHosted, String access, String secret, String token, String mirror, boolean create)
+            throws IOException;
+    private static native String nativeRequests(long handle) throws IOException;
     private static native void nativePut(long handle, byte[] key, byte[] value) throws IOException;
+    private static native void nativePutAll(long handle, byte[][] keys, byte[][] values) throws IOException;
     private static native byte[] nativeGet(long handle, byte[] key) throws IOException;
     private static native void nativeFlush(long handle) throws IOException;
     private static native void nativeClose(long handle) throws IOException;

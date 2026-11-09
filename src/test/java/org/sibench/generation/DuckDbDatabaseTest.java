@@ -14,34 +14,6 @@ import org.junit.rules.TemporaryFolder;
 public class DuckDbDatabaseTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
-    @Test public void persistsTypedDataForIndependentReadOnlyConsumption() throws Exception {
-        Path root = temporary.getRoot().toPath().resolve("rows");
-        DuckDbDatabase.Identity identity;
-        try (var database = DuckDbDatabase.create(root); var sql = database.createStatement()) {
-            identity = DuckDbDatabase.identity(database);
-            sql.execute("CREATE TABLE rows(id BIGINT PRIMARY KEY, amount DECIMAL(18, 4), label VARCHAR)");
-            sql.execute("INSERT INTO rows VALUES (1, 12.3400, '原生数据'), (2, NULL, NULL)");
-        }
-        assertTrue(Files.size(DuckDbDatabase.file(root)) > 0);
-        Path copied = temporary.getRoot().toPath().resolve("independent");
-        Files.createDirectory(copied);
-        Files.copy(DuckDbDatabase.file(root), DuckDbDatabase.file(copied));
-        try (var database = DuckDbDatabase.openReadOnly(copied); var sql = database.createStatement()) {
-            assertEquals(identity, DuckDbDatabase.identity(database));
-            try (var rows = sql.executeQuery("SELECT id, amount, label FROM rows ORDER BY id")) {
-                assertTrue(rows.next());
-                assertEquals(1, rows.getLong(1));
-                assertEquals(new java.math.BigDecimal("12.3400"), rows.getBigDecimal(2));
-                assertEquals("原生数据", rows.getString(3));
-                assertTrue(rows.next());
-                assertNull(rows.getBigDecimal(2));
-                assertNull(rows.getString(3));
-                assertFalse(rows.next());
-            }
-            assertThrows(SQLException.class, () -> sql.execute("DELETE FROM rows"));
-        }
-    }
-
     @Test public void engineIdentityMatchesThePinnedNativeSource() throws Exception {
         Path root = temporary.getRoot().toPath().resolve("identity");
         try (var database = DuckDbDatabase.create(root)) {
@@ -73,20 +45,11 @@ public class DuckDbDatabaseTest {
         }
     }
 
-    @Test public void rejectsExistingRunDirectoriesAndMissingOrInvalidInputs() throws Exception {
+    @Test public void rejectsExistingRunDirectories() throws Exception {
         Path root = temporary.getRoot().toPath().resolve("fresh");
         try (var ignored = DuckDbDatabase.create(root)) {
             assertThrows(java.nio.file.FileAlreadyExistsException.class, () -> DuckDbDatabase.create(root));
         }
-        Path missing = temporary.getRoot().toPath().resolve("missing");
-        assertThrows(java.io.IOException.class, () -> DuckDbDatabase.openReadOnly(missing));
-        assertFalse(Files.exists(missing));
-        Files.createDirectory(missing);
-        assertThrows(java.io.IOException.class, () -> DuckDbDatabase.openReadOnly(missing));
-        assertFalse(Files.exists(DuckDbDatabase.file(missing)));
-        Files.writeString(DuckDbDatabase.file(missing), "not a database");
-        assertThrows(SQLException.class, () -> DuckDbDatabase.openReadOnly(missing));
-        assertEquals("not a database", Files.readString(DuckDbDatabase.file(missing)));
     }
 
     @Test public void preservesSnapshotsAndRejectsConcurrentWritesWithoutImplicitRetry() throws Exception {
@@ -118,7 +81,6 @@ public class DuckDbDatabaseTest {
             assertEquals("B", value(writer));
             writer.commit();
         }
-        try (var database = DuckDbDatabase.openReadOnly(root)) { assertEquals("B", value(database)); }
     }
 
     private static String value(Connection connection) throws SQLException {

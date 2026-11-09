@@ -225,7 +225,7 @@
  
  #include <math.h>
  
-@@ -236,11 +237,27 @@
+@@ -236,11 +237,28 @@
  				 * node->return_empty_tuples.
  				 */
  				node->return_empty_tuples = tbmres->ntuples;
@@ -252,13 +252,14 @@
 +				PG_END_TRY();
 +				if (!valid)
 +				{
++					sib_bitmap_rejected(node, tbmres);
 +					/* AM doesn't think this block is valid, skip */
 +					continue;
 +				}
  			}
  
  			/* Adjust the prefetch target */
-@@ -813,6 +830,8 @@
+@@ -813,6 +831,8 @@
  		get_tablespace_io_concurrency(currentRelation->rd_rel->reltablespace);
  
  	scanstate->ss.ss_currentRelation = currentRelation;
@@ -371,13 +372,14 @@
  	{
 --- a/src/backend/storage/lmgr/proc.c
 +++ b/src/backend/storage/lmgr/proc.c
-@@ -389,0 +390,6 @@
+@@ -389,0 +390,7 @@
 +	MyProc->sibenchCaptureDirect = false;
 +	MyProc->sibenchCaptureProduced = 0;
 +	MyProc->sibenchCaptureCsn = 0;
 +	MyProc->sibenchCaptureAcked = 0;
 +	MyProc->sibenchCaptureAckCsn = 0;
 +	MyProc->sibenchCaptureConsumed = 0;
++	MyProc->sibenchCaptureHold = false;
 --- a/src/backend/storage/ipc/procarray.c
 +++ b/src/backend/storage/ipc/procarray.c
 @@ -787,6 +787,13 @@
@@ -424,7 +426,7 @@
  	if (serialized_snapshot.xcnt > 0)
 --- a/src/include/storage/proc.h
 +++ b/src/include/storage/proc.h
-@@ -265,6 +265,19 @@
+@@ -265,6 +265,21 @@
  	PGPROC	   *lockGroupLeader;	/* lock group leader, if I'm a member */
  	dlist_head	lockGroupMembers;	/* list of members, if I'm a leader */
  	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
@@ -441,6 +443,8 @@
 +	uint64		sibenchCaptureAcked;
 +	uint64		sibenchCaptureAckCsn;
 +	uint64		sibenchCaptureConsumed;
++	/* Set by the consumer while its queue is full: hold read-only statements at their start. */
++	bool		sibenchCaptureHold;
  };
  
  /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */

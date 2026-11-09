@@ -18,6 +18,7 @@ class IndexRunSummaryTest(unittest.TestCase):
             "basic_operations", "completed_operations",
             "failed_response_operations",
             "timed_out_operations", "backpressure_seconds", "dependency_wait_seconds",
+            "deferred_search_operations", "search_deferral_seconds", "peak_deferred_operations",
             "peak_in_flight"), 0)
         dispatch.update(local_send_boundary="transport_acceptance_not_service_execution",
             latency_boundary="client_api_entry_to_final_response_excluding_replay_waits",
@@ -84,7 +85,8 @@ class IndexRunSummaryTest(unittest.TestCase):
             phase = self.phase()
             phase.update(operations=4, execute_requests=3)
             phase["dispatch"].update(target_calls=4, completed_responses=4,
-                basic_operations=4, completed_operations=4, dependency_wait_seconds=0.02)
+                basic_operations=4, completed_operations=4, dependency_wait_seconds=0.02,
+                deferred_search_operations=1, search_deferral_seconds=0.5)
             phase["dispatch"]["measurement"].update(warmup_operations=1, measured_operations=3,
                                                    completed_operations=3)
             phase["dispatch"]["search_latency"].update(count=3, p99_ms=0.125)
@@ -94,6 +96,8 @@ class IndexRunSummaryTest(unittest.TestCase):
             workload = summary.summarize(path, [])["phases"]["workload"]
             self.assertEqual(4, workload["basic_operations"])
             self.assertEqual(0.02, workload["dependency_wait_seconds"])
+            self.assertEqual(1, workload["deferred_search_operations"])
+            self.assertEqual(0.5, workload["search_deferral_seconds"])
             self.assertEqual(3, workload["execute_requests"])
             self.assertEqual(3, workload["measurement"]["measured_operations"])
             self.assertEqual(0.125, workload["search_latency"]["p99_ms"])

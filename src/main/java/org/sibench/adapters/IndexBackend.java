@@ -20,6 +20,11 @@ public interface IndexBackend extends AutoCloseable {
     /** Applies one write; later normal reads at applicable versions see its effect once this returns. */
     void write(Write write) throws IOException;
 
+    /** Applies validated Baseline INSERTs; all are visible once this returns. */
+    default void writeBaseline(List<Write> inserts) throws IOException {
+        for (var insert : inserts) write(insert);
+    }
+
     /** Receives search results one at a time, in result order. */
     @FunctionalInterface
     interface ResultSink {

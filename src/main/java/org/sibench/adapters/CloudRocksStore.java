@@ -175,28 +175,7 @@ final class CloudRocksStore implements OrderedStore {
     @Override
     public java.util.Map<String, long[]> objectRequests() throws IOException {
         requireOpen();
-        return parseRequests(requests(handle));
-    }
-
-    static java.util.Map<String, long[]> parseRequests(String text) throws IOException {
-        var requests = new java.util.LinkedHashMap<String, long[]>();
-        for (String line : text.split("\n")) {
-            if (line.isEmpty()) continue;
-            String[] fields = line.split(" ");
-            if (fields.length != 37)
-                throw new IOException("Unexpected request statistics format; rebuild the rocksdb-cloud JNI library for this jar");
-            long[] counts = new long[36];
-            try {
-                for (int i = 0; i < counts.length; i++) {
-                    counts[i] = Long.parseLong(fields[i + 1]);
-                    if (counts[i] < 0) throw new NumberFormatException("Negative request statistic");
-                }
-            } catch (NumberFormatException invalid) {
-                throw new IOException("Invalid rocksdb-cloud request statistic", invalid);
-            }
-            requests.put(fields[0], counts);
-        }
-        return requests;
+        return OrderedStore.parseRequests(requests(handle));
     }
 
     @Override

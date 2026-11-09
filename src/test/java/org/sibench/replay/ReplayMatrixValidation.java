@@ -61,11 +61,6 @@ public final class ReplayMatrixValidation {
                                     config.describe()));
                     System.out.println("Verified " + name);
                 }
-        for (boolean secondary : scopes)
-            SnapshotLookupValidation.run(
-                    trace,
-                    new ReplayConfig(secondary, 0, 0, 0, 0),
-                    output.resolve("native-oracle-secondary-" + secondary + ".json"));
         Files.writeString(
                 output.resolve("matrix.json"),
                 new GsonBuilder()
@@ -80,10 +75,8 @@ public final class ReplayMatrixValidation {
                                         "scope",
                                         "1/2 clients x both dispatch modes x supported secondary settings;"
                                             + " declared value modes,"
-                                            + " operation-order/state/count equivalence."
-                                            + " Independent native row oracle at 1 client for supported"
-                                            + " secondary settings; no real network or performance"
-                                            + " claim.")),
+                                            + " operation-order/state/count equivalence;"
+                                            + " no real network or performance claim.")),
                 StandardOpenOption.CREATE_NEW);
         Files.delete(output.resolve("INCOMPLETE"));
     }

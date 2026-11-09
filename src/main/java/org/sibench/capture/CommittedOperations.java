@@ -45,7 +45,10 @@ final class CommittedOperations {
         else if (isMutation(operation)) mutation(operation);
         else if (transaction != 0 || operation.transactionId() != 0 || operation.mutationOrdinal() != 0)
             throw new IOException("Unexpected source transaction metadata");
-        if (transaction == 0) output.accept(operation);
+        // Until a transaction writes, its snapshot searches cannot depend on its outcome, and
+        // emitting them now keeps the output order: a read-only transaction is never buffered.
+        if (transaction == 0 || pending.isEmpty() && operation.kind() == SEARCH
+                && (operation.flags() & TRANSACTION_LOCAL_SEARCH) == 0) output.accept(operation);
         else {
             if (isMutation(operation)) lastWrites.put(new Entry(operation), pending.size());
             pending.add(operation);

@@ -26,6 +26,7 @@ final class PostgresAccesses {
                 emit(unit,origin,decision);
             }
             @Override public void groupSettled(PostgresAccessUnits.BitmapGroup group)throws IOException {
+                if(group.members.isEmpty())return;
                 var first=group.members.get(0);Long origin=null;
                 for(var member:group.members) {
                     Long current=origins.remove(member);
@@ -33,7 +34,8 @@ final class PostgresAccesses {
                         throw new IOException("PostgreSQL bitmap group crosses source read points");
                     origin=origin==null?current:Math.min(origin,current);
                 }
-                emit(first,origin,PostgresAccessProjection.decideGroup(group,catalog,cCollation));
+                var decision=PostgresAccessProjection.decideGroup(group,catalog,cCollation);
+                if(!decision.excluded())emit(first,origin,decision);
             }
             private void emit(PostgresAccessUnits.Unit unit,Long origin,PostgresAccessProjection.Decision decision)throws IOException {
                 if(!decision.projected())throw new IOException("Unsupported PostgreSQL index access: "+decision.reason());

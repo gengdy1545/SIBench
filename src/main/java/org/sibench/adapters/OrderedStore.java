@@ -1,6 +1,7 @@
 package org.sibench.adapters;
 
 import java.io.IOException;
+import java.util.List;
 
 /**
  * The ordered byte store under {@link VersionedIndexBackend}. It only
@@ -23,6 +24,11 @@ interface OrderedStore extends AutoCloseable {
 
     void put(byte[] key, byte[] value, boolean wal) throws IOException;
 
+    /** Baseline entries, without the WAL where the store has one; {@code keys} and {@code values} pair up. */
+    default void putBaseline(List<byte[]> keys, List<byte[]> values) throws IOException {
+        for (int i = 0; i < keys.size(); i++) put(keys.get(i), values.get(i), false);
+    }
+
     /** The value of the exact key, or null. */
     byte[] get(byte[] key) throws IOException;
 
@@ -40,6 +46,28 @@ interface OrderedStore extends AutoCloseable {
      * with power-of-two microsecond upper bounds (last bucket overflows); null for a local store.
      */
     java.util.Map<String, long[]> objectRequests() throws IOException;
+
+    /** Parses the native request-statistics text of the cloud JNI libraries: one line per type. */
+    static java.util.Map<String, long[]> parseRequests(String text) throws IOException {
+        var requests = new java.util.LinkedHashMap<String, long[]>();
+        for (String line : text.split("\n")) {
+            if (line.isEmpty()) continue;
+            String[] fields = line.split(" ");
+            if (fields.length != 37)
+                throw new IOException("Unexpected request statistics format; rebuild the cloud JNI library for this jar");
+            long[] counts = new long[36];
+            try {
+                for (int i = 0; i < counts.length; i++) {
+                    counts[i] = Long.parseLong(fields[i + 1]);
+                    if (counts[i] < 0) throw new NumberFormatException("Negative request statistic");
+                }
+            } catch (NumberFormatException invalid) {
+                throw new IOException("Invalid cloud request statistic", invalid);
+            }
+            requests.put(fields[0], counts);
+        }
+        return requests;
+    }
 
     @Override
     void close() throws IOException;

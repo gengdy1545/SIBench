@@ -255,6 +255,96 @@ public class ReplayDispatcherTest {
         }
     }
 
+    private static Operation write(long unit, long version) {
+        return baseline(unit).withVersion(version).withWorkUnitId(unit);
+    }
+
+    private static Operation read(long unit, long readTimestamp) {
+        return IndexOperationTrace.search(unit, 3, 0, Range.equal(IndexKey.ofInt(1)), readTimestamp, 0, 0)
+                .withWorkUnitId(unit);
+    }
+
+    private static Operation groupMember(long unit, long readTimestamp, int position, int size) {
+        return IndexOperationTrace.search(unit, 3, 0, Range.equal(IndexKey.ofInt(position)),
+                null, readTimestamp, 0, IndexOperationTrace.UNION_GROUP, position, size).withWorkUnitId(unit);
+    }
+
+    /** Records the global send order; writes at the given versions stay pending until completed. */
+    private static ReplayTarget.Factory recording(List<String> order, Map<Long, CompletableFuture<Void>> pending) {
+        return client -> (seq, op) -> {
+            synchronized (order) {
+                order.add(op.kind() == IndexOperationTrace.SEARCH
+                        ? "S" + op.readTimestamp() + (op.grouped() ? "." + op.expansionPosition() : "") : "W" + op.version());
+            }
+            var response = op.kind() == IndexOperationTrace.SEARCH ? CompletableFuture.<Void>completedFuture(null)
+                    : pending.getOrDefault(op.version(), CompletableFuture.completedFuture(null));
+            return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response);
+        };
+    }
+
+    @Test
+    public void laterWritesProceedWhileASnapshotWaitsForItsOlderWrite() throws Exception {
+        var order = new ArrayList<String>();
+        var first = new CompletableFuture<Void>();
+        try (var dispatcher = new ReplayDispatcher(config(4, 8), recording(order, Map.of(1L, first)))) {
+            dispatcher.send(write(1, 1));
+            dispatcher.send(read(2, 1));
+            // The previous single blocking sender could not reach these writes before first completed.
+            dispatcher.send(write(3, 2));
+            dispatcher.send(write(4, 3));
+            assertEquals(List.of("W1", "W2", "W3"), order);
+            first.complete(null);
+            dispatcher.drain();
+            assertEquals(List.of("W1", "W2", "W3", "S1"), order);
+            var report = dispatcher.describe();
+            assertEquals(1L, report.get("deferred_search_operations"));
+            assertEquals(4L, report.get("completed_operations"));
+        }
+    }
+
+    @Test
+    public void writeAtOrBelowADeferredSnapshotWaitsForThatSnapshot() throws Exception {
+        var order = new ArrayList<String>();
+        var first = new CompletableFuture<Void>();
+        var error = new AtomicReference<Throwable>();
+        try (var dispatcher = new ReplayDispatcher(config(4, 8), recording(order, Map.of(1L, first)))) {
+            var sender = new Thread(() -> {
+                try {
+                    dispatcher.send(write(1, 1));
+                    dispatcher.send(read(2, 5));
+                    dispatcher.send(write(3, 5));
+                    dispatcher.drain();
+                } catch (Throwable failure) { error.set(failure); }
+            });
+            sender.start();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+            while (sender.getState() != Thread.State.TIMED_WAITING && System.nanoTime() < deadline) Thread.sleep(1);
+            synchronized (order) { assertEquals(List.of("W1"), order); }
+            first.complete(null);
+            sender.join(3000);
+            assertNull(error.get());
+            assertEquals(List.of("W1", "S5", "W5"), order);
+        }
+    }
+
+    @Test
+    public void deferredGroupsLeaveWholeAndNeverInterleaveASentGroup() throws Exception {
+        var order = new ArrayList<String>();
+        var first = new CompletableFuture<Void>();
+        try (var dispatcher = new ReplayDispatcher(config(4, 8), recording(order, Map.of(2L, first)))) {
+            dispatcher.send(write(1, 2));
+            dispatcher.send(groupMember(2, 2, 0, 2));
+            first.complete(null);
+            dispatcher.send(groupMember(2, 2, 1, 2));
+            // The deferred group became ready mid-group; it must not split itself or this sent group.
+            dispatcher.send(groupMember(3, 0, 0, 2));
+            dispatcher.send(groupMember(3, 0, 1, 2));
+            dispatcher.drain();
+            assertEquals(List.of("W2", "S2.0", "S2.1", "S0.0", "S0.1"), order);
+            assertEquals(2L, dispatcher.describe().get("deferred_search_operations"));
+        }
+    }
+
     @Test
     public void dependencyWaitFlushesBufferedWritesAndPreservesTheirFailures() throws Exception {
         for (boolean rejected : List.of(false, true)) {

@@ -346,7 +346,7 @@ public final class ProtoTrace {
     }
 
     private static final class Decoder {
-        long transaction, version, operations, writes;
+        long transaction, version, operations, writes, buffered;
 
         void accept(TraceRecord record, IndexOperationTrace.Consumer consumer) throws IOException {
             if (!record.getUnknownFields().asMap().isEmpty() || record.getPositionsCount() == 0)
@@ -358,7 +358,7 @@ public final class ProtoTrace {
                         || record.getPositionsCount() != 1) throw new IOException("Invalid proto transaction begin");
                 transaction = begin.getTransactionId();
                 version = begin.getVersion();
-                operations = writes = 0;
+                operations = writes = buffered = 0;
                 consumer.accept(IndexOperationTrace.transaction(first.getSourceEvent(),
                         IndexOperationTrace.TRANSACTION_BEGIN, transaction, version, first.getExpectedCount()));
                 return;
@@ -381,9 +381,11 @@ public final class ProtoTrace {
             if (!request.getUnknownFields().asMap().isEmpty()) throw new IOException("Unsupported proto service fields");
             int members = request.hasGroup() ? request.getGroup().getMembersCount() : 1;
             if (transaction != 0) {
-                operations += members;
                 if (request.hasWrite()) writes++;
-                if (operations > MAX_TRANSACTION_OPERATIONS) throw new IOException("Proto source group exceeds operation buffer limit");
+                operations += members;
+                // Generation buffers a source group only from its first write; earlier searches stream.
+                if (writes > 0) buffered += members;
+                if (buffered > MAX_TRANSACTION_OPERATIONS) throw new IOException("Proto source group exceeds operation buffer limit");
             }
             if (record.getPositionsCount() != members) throw new IOException("Proto source-member count mismatch");
             if (request.hasGroup() && (members < 2 || request.getGroup().getMode() == SearchGroup.Mode.MODE_UNSPECIFIED

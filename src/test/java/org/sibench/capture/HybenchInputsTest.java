@@ -19,7 +19,7 @@ public class HybenchInputsTest {
     @Test
     public void recordsEveryConsumedInputAndNeverOverwritesItsIdentity() throws Exception {
         Path data=temporary.newFolder().toPath(),manifest=data.resolve("inputs.json");
-        HybenchDuckDbTest.fixture(data);
+        HybenchTest.fixture(data);
         Path script=SOURCE.resolve("conf/load_data_pg.sql");
         assertThrows(java.io.IOException.class,()->HybenchInputs.record(data,script,manifest));
         assertFalse(Files.exists(manifest));

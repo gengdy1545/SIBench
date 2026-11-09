@@ -10,7 +10,7 @@ import java.util.List;
 import org.junit.Test;
 import org.rocksdb.*;
 
-/** Real-engine counterexamples: native history survives close; concurrent partial updates do not vanish. */
+/** Real-engine counterexamples: timestamped reads, RowIDs and concurrent partial updates. */
 public class RocksDbHistoryCheck {
     @org.junit.Test public void bridgeAndRocksJavaShareOneNativeRuntime() throws Exception {
         RocksDbTimestamps.load(Path.of(System.getProperty("sibench.rocksdb.library")));
@@ -57,92 +57,6 @@ public class RocksDbHistoryCheck {
                     } finally { handles.forEach(ColumnFamilyHandle::close); }
                 }
             }
-        }
-    }
-
-    @Test public void nativeVersionsSurviveCompactionAndReadOnlyReopen() throws Exception {
-        Path library = Path.of(System.getProperty("sibench.rocksdb.library"));
-        RocksDbTimestamps.load(library);
-        Path directory = Files.createTempDirectory("rocks-history-").resolve("data");
-        try (var options = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
-             var metadata = new ColumnFamilyOptions();
-             var columns = new ColumnFamilyOptions().setCompactionStyle(CompactionStyle.UNIVERSAL)
-                     .setEnableBlobFiles(true).setMinBlobSize(0)
-                     .setBlobCompressionType(CompressionType.LZ4_COMPRESSION);
-             var transactions = new TransactionDBOptions();
-             var writes = new WriteOptions().setDisableWAL(true)) {
-            RocksDbTimestamps.configure(columns);
-            RocksDbTimestamps.fileChecksums(options);
-            var descriptors = RocksDbRows.descriptors(metadata, columns);
-            var handles = new ArrayList<ColumnFamilyHandle>();
-            try (var db = TransactionDB.open(options, transactions, directory.toString(), descriptors, handles)) {
-                var rows = handles.get(1);
-                try {
-                    writeRow(db, rows, writes, 0, 1, "original");
-                    flush(db, rows);
-                    writeRow(db, rows, writes, 2, 1, "changed");
-                    flush(db, rows);
-                    try (var transaction = db.beginTransaction(writes)) {
-                        transaction.put(rows, bytes("a"), encodedRow(1, "aborted"));
-                        RocksDbTimestamps.commitTimestamp(transaction, 3);
-                        transaction.rollback();
-                    }
-                    try (var transaction = db.beginTransaction(writes)) {
-                        transaction.delete(rows, bytes("a"));
-                        RocksDbTimestamps.commitTimestamp(transaction, 4);
-                        transaction.commit();
-                    }
-                    writeRow(db, rows, writes, 6, 2, "reinserted");
-                    flush(db, rows);
-                    var before = db.getLiveFilesMetaData().stream().map(SstFileMetaData::fileName).toList();
-                    assertTrue("History must span multiple SST inputs", before.size() > 1);
-                    db.compactRange(rows);
-                    assertNotEquals("Compaction must rewrite actual SST inputs", before,
-                            db.getLiveFilesMetaData().stream().map(SstFileMetaData::fileName).toList());
-                    db.put(writes, bytes("sealed"), java.nio.ByteBuffer.allocate(20).putInt(1).putLong(6).putLong(2).array());
-                    db.put(writes, RocksDbRows.identityKey(1), bytes("a"));
-                    db.put(writes, RocksDbRows.identityKey(2), bytes("a"));
-                    flush(db, handles.get(0));
-                } finally { handles.forEach(ColumnFamilyHandle::close); }
-            }
-            var written = RocksDbTimestamps.writtenFiles(options);
-            try (var files = Files.list(directory)) {
-                var data = files.filter(p -> p.toString().endsWith(".sst") || p.toString().endsWith(".blob")).toList();
-                assertTrue(data.stream().anyMatch(p -> p.toString().endsWith(".sst")));
-                assertTrue(data.stream().anyMatch(p -> p.toString().endsWith(".blob")));
-                for (Path file : data) {
-                    var identity = written.get(file.getFileName().toString());
-                    assertNotNull(identity);
-                    assertEquals(Files.size(file), identity.bytes());
-                    assertEquals(org.sibench.config.Digests.sha256(file), identity.sha256());
-                }
-            }
-            var inventory = RocksDbData.seal(directory, library, 6, written);
-            Path moved = directory.resolveSibling("moved"); Files.move(directory, moved);
-            try (var data = RocksDbData.open(moved, inventory, library)) {
-                assertArrayEquals(bytes("original"), (byte[]) data.snapshotRow(1, 1, 0).orElseThrow().get("field0"));
-                assertArrayEquals(bytes("original"), (byte[]) data.snapshotRow(1, 1, 1).orElseThrow().get("field0"));
-                assertArrayEquals(bytes("changed"), (byte[]) data.snapshotRow(1, 1, 2).orElseThrow().get("field0"));
-                assertArrayEquals(bytes("changed"), (byte[]) data.snapshotRow(1, 1, 3).orElseThrow().get("field0"));
-                assertTrue(data.snapshotRow(1, 1, 4).isEmpty());
-                assertTrue(data.snapshotRow(1, 1, 6).isEmpty());
-                assertArrayEquals(bytes("reinserted"), (byte[]) data.snapshotRow(1, 2, 6).orElseThrow().get("field0"));
-            }
-            assertEquals(inventory, RocksDbData.inventory(moved, library, 6));
-        }
-    }
-
-    private static byte[] encodedRow(long id, String value) {
-        byte[] field = bytes(value);
-        return java.nio.ByteBuffer.allocate(12 + field.length).putLong(id).putInt(field.length).put(field).array();
-    }
-
-    private static void writeRow(TransactionDB db, ColumnFamilyHandle rows, WriteOptions options,
-            long timestamp, long id, String value) throws Exception {
-        try (var transaction = db.beginTransaction(options)) {
-            transaction.put(rows, bytes("a"), encodedRow(id, value));
-            RocksDbTimestamps.commitTimestamp(transaction, timestamp);
-            transaction.commit();
         }
     }
 
@@ -203,59 +117,35 @@ public class RocksDbHistoryCheck {
         try (var options = new FlushOptions().setWaitForFlush(true)) { db.flush(options, handle); }
     }
 
-    @Test public void apiRowsRetainIdentityAndReadPointsAfterRelocation() throws Exception {
-        Path library = Path.of(System.getProperty("sibench.rocksdb.library"));
-        RocksDbTimestamps.load(library);
+    @Test public void apiRowsKeepRowIdsAcrossUpdatesAndAllocateNewOnesOnReinsert() throws Exception {
+        RocksDbTimestamps.load(Path.of(System.getProperty("sibench.rocksdb.library")));
         Path directory = Files.createTempDirectory("rocks-rows-").resolve("data");
         var events = new ArrayList<RocksDbRows.Event>();
         var baseline = new ArrayList<RocksDbRows.Row>();
         byte[] tail = bytes("base".repeat(256));
-        long last;
-        var rows = new RocksDbRows(directory, 2, new RocksDbRows.Settings(8L << 20, 1L << 20, 2), events::add);
-        try (rows) {
-            assertThrows(IllegalStateException.class, rows::writtenFiles);
+        try (var rows = new RocksDbRows(directory, 2, new RocksDbRows.Settings(8L << 20, 1L << 20, 2), events::add)) {
             rows.load(List.of(new RocksDbRows.Row(0, "user2", new byte[][]{bytes("two"), tail}),
                     new RocksDbRows.Row(0, "user10", new byte[][]{bytes("ten"), tail})), baseline::add);
             rows.finishLoad();
             try (var files = Files.list(directory)) {
                 assertTrue("Baseline values must be flushed before workloads", files.anyMatch(p -> p.toString().endsWith(".sst")));
             }
-            assertEquals(List.of("user10", "user2"), rows.read("user1", 3, 1, 1).stream().map(RocksDbRows.Row::key).toList());
-            assertEquals(1, rows.read("user10", 1, 1, 2).size());
-            assertTrue(rows.read("missing", 0, 1, 3).isEmpty());
-            var updated = rows.change("update", "user2", java.util.Map.of(0, bytes("updated")), 1, 4);
+            assertEquals(List.of("user10", "user2"), rows.read("user1", 3).stream().map(RocksDbRows.Row::key).toList());
+            assertEquals(1, rows.read("user10", 1).size());
+            assertTrue(rows.read("missing", 0).isEmpty());
+            var updated = rows.change("update", "user2", java.util.Map.of(0, bytes("updated")));
             assertEquals(baseline.get(0).id(), updated.id());
             assertArrayEquals(tail, updated.fields()[1]);
-            assertNull(rows.change("insert", "user2", java.util.Map.of(0, bytes("duplicate")), 1, 5));
+            assertNull(rows.change("insert", "user2", java.util.Map.of(0, bytes("duplicate"))));
             assertFalse(events.get(4).committed());
-            rows.change("delete", "user2", java.util.Map.of(), 1, 6);
-            var reinserted = rows.change("insert", "user2", java.util.Map.of(0, bytes("new")), 1, 7);
+            rows.change("delete", "user2", java.util.Map.of());
+            var reinserted = rows.change("insert", "user2", java.util.Map.of(0, bytes("new")));
             assertNotEquals(updated.id(), reinserted.id());
-            assertNull(rows.change("update", "missing", java.util.Map.of(0, bytes("x")), 1, 8));
-            rows.seal(); last = rows.version();
+            assertNull(rows.change("update", "missing", java.util.Map.of(0, bytes("x"))));
+            assertEquals(8, rows.version());
+            // Calls are serialized here, so each reads at the version just before its own.
+            assertEquals(List.of(0L, 1L, 2L, 3L, 4L, 5L, 6L, 7L), events.stream().map(RocksDbRows.Event::readVersion).toList());
         }
-        var inventory = RocksDbData.seal(directory, library, last, rows.writtenFiles());
-        assertEquals(RocksDbData.inventory(directory, library, last), inventory);
-        assertThrows(java.io.IOException.class, () -> RocksDbData.seal(directory, library, last, java.util.Map.of()));
-        String name = inventory.files().keySet().stream()
-                .filter(file -> file.endsWith(".sst") || file.endsWith(".blob")).findFirst().orElseThrow();
-        var wrong = new java.util.HashMap<>(rows.writtenFiles());
-        wrong.put(name, new RocksDbData.File(wrong.get(name).bytes() + 1, wrong.get(name).sha256()));
-        assertThrows(java.io.IOException.class, () -> RocksDbData.seal(directory, library, last, wrong));
-        wrong.put(name, new RocksDbData.File(rows.writtenFiles().get(name).bytes(), "0".repeat(64)));
-        var incorrect = RocksDbData.seal(directory, library, last, wrong);
-        assertThrows(java.io.IOException.class, () -> RocksDbData.open(directory, incorrect, library));
-        Path moved = directory.resolveSibling("moved"); Files.move(directory, moved);
-        try (var data = RocksDbData.open(moved, inventory, library)) {
-            long original = baseline.get(0).id();
-            assertArrayEquals(bytes("two"), (byte[]) data.snapshotRow(1, original, 0).orElseThrow().get("field0"));
-            assertArrayEquals(tail, (byte[]) data.snapshotRow(1, original, 0).orElseThrow().get("field1"));
-            assertArrayEquals(bytes("updated"), (byte[]) data.snapshotRow(1, original, 4).orElseThrow().get("field0"));
-            assertArrayEquals(bytes("two"), (byte[]) data.rowBeforeStatement(1, original, 1, 4).orElseThrow().get("field0"));
-            assertTrue(data.snapshotRow(1, original, 7).isEmpty());
-            assertThrows(IllegalArgumentException.class, () -> data.snapshotRow(1, original, last + 1));
-        }
-        assertEquals(inventory, RocksDbData.inventory(moved, library, last));
     }
 
     private static String read(RocksDB db, long version, String key) throws Exception {

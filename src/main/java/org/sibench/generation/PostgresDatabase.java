@@ -25,31 +25,18 @@ public final class PostgresDatabase implements AutoCloseable {
     }
 
     public static PostgresDatabase create(Path runtime,Path root,Path captureSocket)throws IOException,InterruptedException {
-        return new PostgresDatabase(runtime.toRealPath(),root.toAbsolutePath().normalize(),captureSocket,null);
+        return new PostgresDatabase(runtime.toRealPath(),root.toAbsolutePath().normalize(),captureSocket);
     }
 
-    static PostgresDatabase copy(Path runtime,Path root,Path source)throws IOException,InterruptedException {
-        return new PostgresDatabase(runtime.toRealPath(),root.toAbsolutePath().normalize(),null,source.toRealPath());
-    }
-
-    private PostgresDatabase(Path runtime,Path root,Path captureSocket,Path source)throws IOException,InterruptedException {
+    private PostgresDatabase(Path runtime,Path root,Path captureSocket)throws IOException,InterruptedException {
         this.runtime=runtime;this.root=root;this.data=root.resolve("data");
         if(Files.exists(root))throw new IOException("PostgreSQL output already exists: "+root);
         Files.createDirectories(root.getParent());Files.createDirectory(root);
         socket=Files.createTempDirectory("sibench-pg-");
         try(var reserved=new ServerSocket(0,1,InetAddress.getLoopbackAddress())) {port=reserved.getLocalPort();}
         try {
-            if(source==null)command("initdb",List.of("-D",data.toString(),"--no-locale","--encoding=UTF8","--auth-local=trust",
+            command("initdb",List.of("-D",data.toString(),"--no-locale","--encoding=UTF8","--auth-local=trust",
                     "--auth-host=reject","--username=sibench"),Map.of(),60);
-            else {
-                Files.createDirectory(data);
-                var process=new ProcessBuilder("cp","--reflink=auto","-a",source+"/.",data.toString())
-                        .redirectErrorStream(true).redirectOutput(root.resolve("copy.log").toFile()).start();
-                try {
-                    if(!process.waitFor(300,TimeUnit.SECONDS)||process.exitValue()!=0)
-                        throw new IOException("PG reader copy failed or exceeded 300 seconds; see "+root);
-                }finally{if(process.isAlive()){process.destroyForcibly();process.waitFor(5,TimeUnit.SECONDS);}}
-            }
             // Only the private loopback port accepts the dedicated local benchmark role.
             Files.writeString(data.resolve("pg_hba.conf"),"local all sibench trust\nhost all sibench 127.0.0.1/32 trust\n");
             Files.createDirectory(root.resolve("capture"));
@@ -58,9 +45,8 @@ public final class PostgresDatabase implements AutoCloseable {
                     +"shared_buffers = '256MB'\nwork_mem = '32MB'\nmax_parallel_workers_per_gather = 0\n"
                     +"max_parallel_maintenance_workers = 0\n"
                     +"wal_level = minimal\nmax_wal_senders = 0\n"
-                    +(source==null?"fsync = off\nsynchronous_commit = off\nfull_page_writes = off\n":"")
-                    +"compute_query_id = on\nautovacuum = off\n"
-                    +(source==null?"":"default_transaction_read_only = on\n"));
+                    +"fsync = off\nsynchronous_commit = off\nfull_page_writes = off\n"
+                    +"compute_query_id = on\nautovacuum = off\n");
             command("pg_ctl",List.of("-D",data.toString(),"-l",root.resolve("server.log").toString(),"-w","-t","30","start"),
                     captureSocket==null?Map.of("SIBENCH_CAPTURE_DIR",root.resolve("capture").toString())
                             :Map.of("SIBENCH_CAPTURE_SOCKET",captureSocket.toAbsolutePath().toString()),35);
@@ -137,11 +123,5 @@ public final class PostgresDatabase implements AutoCloseable {
         if(stopped)return;
         command("pg_ctl",List.of("-D",data.toString(),"-m","fast","-w","-t","30","stop"),Map.of(),35);
         stopped=true;Files.deleteIfExists(socket);
-    }
-
-    /** Successful artifacts become durable once, after the disposable generation cluster stops. */
-    public void seal()throws IOException,InterruptedException {
-        close();
-        command("initdb",List.of("-D",data.toString(),"--sync-only"),Map.of(),300);
     }
 }
