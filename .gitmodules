@@ -46,3 +46,7 @@
 	path = third_party/pixels-sink
 	url = https://github.com/pixelsdb/pixels-sink.git
 	branch = master
+[submodule "third_party/pixels-trino"]
+	path = third_party/pixels-trino
+	url = https://github.com/pixelsdb/pixels-trino.git
+	branch = master

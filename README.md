@@ -48,6 +48,8 @@ scripts/build-pixels.sh java build/services/pixels
 scripts/build-pixels.sh native build/services/pixels
 ```
 
+The [Pixels Trino connector and event listener](third_party/pixels-trino/README.md) are registered as pinned upstream sources only. Their upstream build requires Maven, JDK 23 and locally installed Pixels modules; use the upstream build/deployment instructions with its declared Trino version. They are not built by the root JDK 17 project or `build-pixels.sh`, and SIBench has no Trino experiment entry point yet. License: [pixels-trino](third_party/pixels-trino/LICENSE).
+
 Runtime engine paths come from each engine configuration's `build_directory`; clients build under `build/benchmarks/`. Builds use pinned inputs and fresh destinations, leave upstream checkouts untouched, retain diagnostics on failure, and record input/artifact identities checked by generation. `JOBS` controls parallel compilation. Upstream licenses remain in [RocksDB](third_party/rocksdb/COPYING), [DuckDB](third_party/duckdb/LICENSE), [DuckDB Java](third_party/duckdb-java/LICENSE), [PostgreSQL](third_party/postgresql/COPYRIGHT), [Pixels](third_party/pixels/LICENSE) and [pixels-sink](third_party/pixels-sink/LICENSE); both embedded runtime JARs include their license texts.
 
 ### rocksdb-cloud JNI
