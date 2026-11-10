@@ -1,0 +1,11 @@
+schema_version: 1
+purpose: index_service
+# Use a fresh local path and object prefix for each run. Configure storage.yaml first.
+service:
+  backend: slatedb
+  path: build/services/index/slatedb
+  port: 50551
+  value: row_id
+  storage: config/index/storage.yaml
+  profile: local_s3
+  object_path: sibench/dev/slatedb/

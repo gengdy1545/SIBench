@@ -4,7 +4,6 @@ import static org.sibench.config.ConfigValues.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.sibench.config.SibenchConfig;
@@ -12,7 +11,6 @@ import org.sibench.config.SibenchConfig;
 /** Dispatch policy is independent of capture and never changes the source trace. */
 public record ReplayConfig(
         boolean secondaryIndexes,
-        String gcOwner,
         long durationSeconds,
         long plannedOperationsPerSecond,
         long warmupOperations,
@@ -23,7 +21,6 @@ public record ReplayConfig(
         long requestTimeoutSeconds) {
     public ReplayConfig(
             boolean secondaryIndexes,
-            String gcOwner,
             long durationSeconds,
             long plannedOperationsPerSecond,
             long warmupOperations,
@@ -31,7 +28,6 @@ public record ReplayConfig(
             String dispatchMode) {
         this(
                 secondaryIndexes,
-                gcOwner,
                 durationSeconds,
                 plannedOperationsPerSecond,
                 warmupOperations,
@@ -44,14 +40,12 @@ public record ReplayConfig(
 
     public ReplayConfig(
             boolean secondaryIndexes,
-            String gcOwner,
             long durationSeconds,
             long plannedOperationsPerSecond,
             long warmupOperations,
             int reservePercent) {
         this(
                 secondaryIndexes,
-                gcOwner,
                 durationSeconds,
                 plannedOperationsPerSecond,
                 warmupOperations,
@@ -66,7 +60,6 @@ public record ReplayConfig(
         require(
                 requestTimeoutSeconds > 0 && requestTimeoutSeconds <= 86400,
                 "Request timeout must be between 1 and 86400 seconds");
-        require(Set.of("benchmark", "backend", "none").contains(gcOwner), "Invalid GC owner");
         require(durationSeconds >= 0 && plannedOperationsPerSecond >= 0, "Invalid trace budget");
         require(
                 (durationSeconds == 0) == (plannedOperationsPerSecond == 0),
@@ -77,10 +70,6 @@ public record ReplayConfig(
                 durationSeconds, plannedOperationsPerSecond, warmupOperations, reservePercent);
     }
 
-    public static ReplayConfig defaults() {
-        return new ReplayConfig(true, "none", 0, 0, 0, 0);
-    }
-
     public static ReplayConfig read(Path root, Path path) throws java.io.IOException {
         return from(parse(Files.readString(root.resolve(path))));
     }
@@ -88,17 +77,13 @@ public record ReplayConfig(
     public static ReplayConfig from(Map<String, Object> document) {
         SibenchConfig.validate(document);
         var target = object(document, "target");
-        keys(target, Set.of("secondary_indexes", "service", "value"));
-        require(
-                !(target.containsKey("value") && target.containsKey("service")),
-                "A service replay names its value in target.service");
+        keys(target, Set.of("secondary_indexes", "service"));
         var secondary = object(target, "secondary_indexes");
         keys(secondary, Set.of("enabled"));
         var replay = object(document, "replay");
         keys(
                 replay,
                 Set.of(
-                        "strategy",
                         "dispatch_mode",
                         "client_count",
                         "max_in_flight",
@@ -106,13 +91,6 @@ public record ReplayConfig(
                         "trace_budget"));
         String dispatchMode =
                 replay.containsKey("dispatch_mode") ? string(replay, "dispatch_mode") : "operation";
-        require(
-                string(replay, "strategy").equals("single_pass"),
-                "Only single_pass replay is supported");
-        var versions = object(document, "versions");
-        keys(versions, Set.of("gc"));
-        var gc = object(versions, "gc");
-        keys(gc, Set.of("owner"));
         long seconds = 0, rate = 0, warmup = 0;
         int reserve = 0;
         if (replay.containsKey("trace_budget")) {
@@ -131,7 +109,6 @@ public record ReplayConfig(
         }
         return new ReplayConfig(
                 bool(secondary, "enabled"),
-                string(gc, "owner"),
                 seconds,
                 rate,
                 warmup,
@@ -148,21 +125,6 @@ public record ReplayConfig(
                         : 60);
     }
 
-    /**
-     * The service's value mode is also the reference/oracle mode; a standalone reference may
-     * select {@code target.value}, or leave it absent to exercise both modes.
-     */
-    public static List<Boolean> rowIdModes(Map<String, Object> document) {
-        var target = object(document, "target");
-        if (target.containsKey("service")) target = object(target, "service");
-        else if (!target.containsKey("value")) return List.of(false, true);
-        return switch (string(target, "value")) {
-            case "locator" -> List.of(false);
-            case "row_id" -> List.of(true);
-            default -> throw new IllegalArgumentException("target.value must be locator or row_id");
-        };
-    }
-
     public long requiredOperations() {
         return requiredOperations(
                 durationSeconds, plannedOperationsPerSecond, warmupOperations, reservePercent);
@@ -175,13 +137,6 @@ public record ReplayConfig(
         return Math.addExact(warmup, Math.addExact(measurement, extra));
     }
 
-    public void requireReferenceCapabilities() {
-        require(
-                gcOwner.equals("none"),
-                "Reference replay supports GC owner none only; physical GC/backend retention is not"
-                        + " implemented");
-    }
-
     public Map<String, Object> describe() {
         var report = new java.util.LinkedHashMap<String, Object>();
         report.put("strategy", "single_pass");
@@ -191,7 +146,6 @@ public record ReplayConfig(
         report.put("client_routing", "source_work_unit_round_robin");
         report.put("max_in_flight", maxInFlight);
         report.put("request_timeout_seconds", requestTimeoutSeconds);
-        report.put("gc_owner", gcOwner);
         report.put("duration_seconds", durationSeconds);
         report.put("planned_operations_per_second", plannedOperationsPerSecond);
         report.put("warmup_operations", warmupOperations);

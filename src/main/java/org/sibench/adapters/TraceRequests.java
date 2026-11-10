@@ -3,7 +3,6 @@ package org.sibench.adapters;
 import com.google.protobuf.ByteString;
 
 import org.sibench.adapters.proto.Bound;
-import org.sibench.adapters.proto.Commit;
 import org.sibench.adapters.proto.EntryKey;
 import org.sibench.adapters.proto.Request;
 import org.sibench.adapters.proto.Response;
@@ -16,98 +15,24 @@ import org.sibench.adapters.proto.ValueKind;
 import org.sibench.adapters.proto.Write;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
-import org.sibench.replay.QueryDigest;
 import org.sibench.trace.IndexKey;
 
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * Maps canonical trace operations to protocol requests and checks each response against the
- * trace. A search's native count remains the source fact; when an expected-result stream is
- * supplied, its ordered {@code (PK, version, value)} digest must also match, so equal counts with
- * a wrong key, version, Locator, order or a query swapped with another cannot pass.
- */
+/** Maps Trace operations to requests and checks response status, shape and native counts. */
 public final class TraceRequests {
-    private record Expected(
-            long sourceEvent, long workUnitId, String digest, List<Operation> members) {}
-
     private final ValueKind valueKind;
     private final AtomicLong results = new AtomicLong(), queries = new AtomicLong();
-    private final BufferedReader expectedInput;
-    private String pendingExpectedLine;
-    private final Map<Long, Expected> expected = new ConcurrentHashMap<>();
-    private final AtomicLong skippedQueries = new AtomicLong();
-    private boolean snapshotReads;
-    private final AtomicLong digestChecks = new AtomicLong(), digestMismatches = new AtomicLong();
     private final AtomicLong requestBytes = new AtomicLong(), resultBytes = new AtomicLong();
-    private final AtomicLong maxResults = new AtomicLong(), maxExpected = new AtomicLong(), maxGroupMembers = new AtomicLong();
+    private final AtomicLong returnedResults = new AtomicLong();
+    private final AtomicLong rpcRequests = new AtomicLong();
+    private final java.util.concurrent.ConcurrentHashMap<String, AtomicLong> rpcKinds = new java.util.concurrent.ConcurrentHashMap<>();
+    private final AtomicLong maxResults = new AtomicLong(), maxGroupMembers = new AtomicLong();
     private volatile int baselineBatch = 1;
-    /** The source transaction of the requests being built and its sent-operation counters. */
-    private long currentTransaction, currentOperation, currentWrites;
-
     public TraceRequests(ValueKind valueKind) {
         this.valueKind = valueKind;
-        this.expectedInput = null;
-    }
-
-    /** {@code expectedResults}: a {@link QueryDigest} stream in trace order, or null. */
-    public TraceRequests(ValueKind valueKind, Path expectedResults) throws IOException {
-        this(valueKind, expectedResults, null);
-    }
-
-    /**
-     * {@code binding} must equal the digest stream's header: trace / baseline identity, operation
-     * value mode and secondary-index coverage. It stops a digest stream generated
-     * for another trace or filter setting from being accepted by query order alone.
-     */
-    public TraceRequests(ValueKind valueKind, Path expectedResults, String binding)
-            throws IOException {
-        this.valueKind = valueKind;
-        if (expectedResults == null) {
-            this.expectedInput = null;
-            return;
-        }
-        this.expectedInput =
-                Files.newBufferedReader(expectedResults, StandardCharsets.UTF_8);
-        String first = expectedInput.readLine();
-        if (binding != null) {
-            if (first == null || !first.equals("# " + binding)) {
-                expectedInput.close();
-                throw new IOException(
-                        "Expected query digest header does not match this trace/replay: "
-                                + first);
-            }
-        } else if (first != null && !first.startsWith("# ")) {
-            pendingExpectedLine = first;
-        }
-    }
-
-    /**
-     * Searches of an index that already holds the whole trace: they go out as plain snapshot reads
-     * at their read version, without the transaction position a live replay sends.
-     */
-    public void snapshotReads() {
-        snapshotReads = true;
-    }
-
-    /** Consumes the expected digest of a search that is deliberately not sent, keeping order. */
-    public void skipExpected(List<Operation> members) throws IOException {
-        if (expectedInput == null) return;
-        expect(-1, members);
-        expected.remove(-1L);
-        skippedQueries.incrementAndGet();
-    }
-
-    public long skippedQueries() {
-        return skippedQueries.get();
     }
 
     public ValueKind valueKind() {
@@ -118,23 +43,51 @@ public final class TraceRequests {
     public Request request(long id, Operation operation) throws IOException {
         var request = Request.newBuilder().setId(id);
         if (operation.kind() == IndexOperationTrace.SEARCH) {
-            if (operation.grouped()) throw new IOException("Group members are sent as one group");
-            expect(id, List.of(operation));
-            transaction(request, operation);
-            return countRequest(request.setSearch(search(operation)).build());
+            if (operation.grouped()) throw new IOException("Grouped searches require complete member metadata");
+            return request.setSearch(search(operation)).build();
         }
-        transaction(request, operation);
-        return countRequest(request.setWrite(write(operation)).build());
+        return request.setWrite(write(operation)).build();
+    }
+
+    /** Reuses a validated Trace payload; only replay IDs and value representation change. */
+    public Request forward(long id, Request stored, List<Operation> members) throws IOException {
+        Operation first = members.get(0);
+        if (first.grouped()) {
+            if (!stored.hasGroup() || stored.getGroup().getMembersCount() != members.size()
+                    || members.size() != first.expansionSize()) throw new IOException("Incomplete stored search group");
+            maxGroupMembers.accumulateAndGet(members.size(), Math::max);
+        } else if (members.size() != 1 || (first.kind() == IndexOperationTrace.SEARCH
+                ? !stored.hasSearch() : !stored.hasWrite())) {
+            throw new IOException("Stored service payload disagrees with operation view");
+        }
+        var request = stored.toBuilder().setId(id);
+        if (stored.hasWrite() && stored.getWrite().getKind() != Write.Kind.LOGICAL_DELETE)
+            request.setWrite(forwardWrite(stored.getWrite(), first));
+        return request.build();
     }
 
     /** Baseline INSERTs sent as one request; a batch takes one send position. */
     public Request batch(long id, List<Operation> inserts) throws IOException {
+        return batch(id, inserts, List.of());
+    }
+
+    Request batch(long id, List<Operation> inserts, List<Write> stored) throws IOException {
+        if (!stored.isEmpty() && stored.size() != inserts.size())
+            throw new IOException("Invalid stored Baseline batch");
         var batch = org.sibench.adapters.proto.WriteBatch.newBuilder();
-        for (Operation insert : inserts) {
+        for (int i = 0; i < inserts.size(); i++) {
+            Operation insert = inserts.get(i);
             if (!baselineInsert(insert)) throw new IOException("Only Baseline INSERTs travel in a batch");
-            batch.addWrites(write(insert));
+            if (stored.isEmpty()) batch.addWrites(write(insert));
+            else batch.addWrites(forwardWrite(stored.get(i), insert));
         }
-        return countRequest(Request.newBuilder().setId(id).setBatch(batch).build());
+        return Request.newBuilder().setId(id).setBatch(batch).build();
+    }
+
+    private Write forwardWrite(Write stored, Operation operation) {
+        if (valueKind == ValueKind.ROW_ID && stored.getValue().getFile() == 0
+                && stored.getValue().getPosition() == 0) return stored;
+        return stored.toBuilder().setValue(value(operation)).build();
     }
 
     static boolean baselineInsert(Operation operation) {
@@ -144,7 +97,9 @@ public final class TraceRequests {
     }
 
     /** A write batch response carries no results. */
-    public void checkBatch(Response response) throws IOException {
+    public void checkBatch(Response response, long id) throws IOException {
+        if (response.getId() != id || response.getMore())
+            throw new IOException("Invalid final response for write batch " + id);
         if (response.getStatus() != Status.OK)
             throw new IOException("Service " + response.getStatus() + " for a write batch: " + response.getMessage());
         if (response.getResultsCount() != 0) throw new IOException("Write batch returned results");
@@ -184,71 +139,25 @@ public final class TraceRequests {
     public Request group(long id, List<Operation> members) throws IOException {
         Operation first = members.get(0);
         if (members.size() != first.expansionSize()) throw new IOException("Incomplete search group");
-        expect(id, members);
         var group = SearchGroup.newBuilder()
                 .setMode((first.flags() & IndexOperationTrace.INTERSECT_GROUP) != 0
                         ? SearchGroup.Mode.INTERSECTION
                         : SearchGroup.Mode.UNION);
         for (Operation member : members) group.addMembers(search(member));
         var request = Request.newBuilder().setId(id);
-        transaction(request, first);
         maxGroupMembers.accumulateAndGet(members.size(), Math::max);
-        return countRequest(request.setGroup(group).build());
+        return request.setGroup(group).build();
     }
 
-    /** Marks the request with its source transaction and sent-operation position. */
-    private void transaction(Request.Builder request, Operation operation) throws IOException {
-        long transaction = operation.transactionId();
-        if (transaction <= 0 || snapshotReads) return;
-        if (currentTransaction != transaction) {
-            currentTransaction = transaction;
-            currentOperation = 0;
-            currentWrites = 0;
-        }
-        currentOperation++;
-        if (operation.kind() == IndexOperationTrace.UPSERT
-                || operation.kind() == IndexOperationTrace.LOGICAL_DELETE
-                || operation.kind() == IndexOperationTrace.RELOCATE) currentWrites++;
-        request.setTransactionId(transaction).setTransactionOperation(currentOperation);
-    }
-
-    /**
-     * The complete-commit marker of one source transaction. {@code writes} and {@code operations}
-     * count the requests actually sent, after secondary filtering; a group is one operation.
-     */
-    public Request commit(long id, long transactionId, long version) throws IOException {
-        if (transactionId <= 0 || version <= 0)
-            throw new IOException("Invalid transaction commit marker");
-        if (currentTransaction != 0 && currentTransaction != transactionId)
-            throw new IOException("Commit marker does not follow its transaction");
-        var request =
-                Request.newBuilder()
-                        .setId(id)
-
-                        .setTransactionId(transactionId)
-                        .setTransactionOperation(0)
-                        .setCommit(
-                                Commit.newBuilder()
-                                        .setVersion(version)
-                                        .setWrites(currentWrites)
-                                        .setOperations(currentOperation));
-        currentTransaction = 0;
-        currentOperation = 0;
-        currentWrites = 0;
-        return countRequest(request.build());
-    }
-
-    private Search search(Operation operation) {
+    Search search(Operation operation) throws IOException {
+        if ((operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0)
+            throw new IOException("Only committed-snapshot searches may reach the service");
         var search = Search.newBuilder()
                 .setTable(operation.table())
                 .setIndex(operation.index())
                 .setDescending((operation.flags() & IndexOperationTrace.DESCENDING) != 0)
                 .setLimit(operation.limit())
-                .setReadVersion(operation.readTimestamp())
-                .setLocalVersion(
-                        (operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0
-                                ? operation.version()
-                                : 0);
+                .setReadVersion(operation.readTimestamp());
         if (operation.lower() != null)
             search.setLower(Bound.newBuilder().setKey(bytes(operation.lower()))
                     .setInclusive((operation.flags() & IndexOperationTrace.LOWER_INCLUSIVE) != 0));
@@ -270,44 +179,7 @@ public final class TraceRequests {
         return ByteString.copyFrom(key.bytes());
     }
 
-    /** Reads the next expected digest, bound to the request's source event and work unit. */
-    private void expect(long id, List<Operation> members) throws IOException {
-        if (expectedInput == null) return;
-        String line = pendingExpectedLine;
-        pendingExpectedLine = null;
-        if (line == null) line = expectedInput.readLine();
-        Operation first = members.get(0);
-        if (line == null)
-            throw new IOException(
-                    "Expected query digests exhausted at source event "
-                            + first.sourceEvent()
-                            + " (work unit "
-                            + first.workUnitId()
-                            + ")");
-        String[] fields = line.split("\t", -1);
-        if (fields.length != 3)
-            throw new IOException("Invalid expected query digest record: " + line);
-        long event = Long.parseLong(fields[0]), unit = Long.parseLong(fields[1]);
-        if (event != first.sourceEvent() || unit != first.workUnitId())
-            throw new IOException(
-                    "Expected query digest order mismatch at request "
-                            + id
-                            + ": trace "
-                            + first.sourceEvent()
-                            + "/"
-                            + first.workUnitId()
-                            + ", expected stream "
-                            + event
-                            + "/"
-                            + unit);
-        expected.put(id, new Expected(event, unit, fields[2], members));
-        maxExpected.accumulateAndGet(expected.size(), Math::max);
-    }
-
-    /**
-     * Checks one response; {@code operation} is the search (a group's last member) or the write
-     * it answers. Writes and requests without an expected stream check only the native shape.
-     */
+    /** Checks one complete response against its Trace operation. */
     public void check(Operation operation, Response response) throws IOException {
         receive(operation, response.getId()).finish(response);
     }
@@ -317,30 +189,16 @@ public final class TraceRequests {
         return new Received(operation, id);
     }
 
-    /**
-     * One response being received: counts and digest accumulate per chunk, so a large
-     * result is never held whole. The digest starts from the native expected count; a different
-     * number of results fails the count check before the digest is compared.
-     */
+    /** Counts streamed results without retaining a complete query result. */
     public final class Received {
         private final Operation operation;
         private final long id;
-        private final Expected wanted;
-        private final QueryDigest.Incremental digest;
-        private long count, bytes;
+        private long count;
         private IOException failure;
 
         private Received(Operation operation, long id) {
             this.operation = operation;
             this.id = id;
-            this.wanted = operation.kind() == IndexOperationTrace.SEARCH ? expected.get(id) : null;
-            this.digest =
-                    wanted == null
-                            ? null
-                            : new QueryDigest.Incremental(
-                                    wanted.members(),
-                                    operation.expectedCount(),
-                                    valueKind == ValueKind.ROW_ID);
         }
 
         /** Chunks as a transport delivers them; a failure is reported by {@link #finish}. */
@@ -369,23 +227,18 @@ public final class TraceRequests {
             if (count > operation.expectedCount())
                 throw new IOException("Search count mismatch at source event " + operation.sourceEvent()
                         + ": expected " + operation.expectedCount() + ", found more");
-            for (Result result : chunk.getResultsList()) {
-                bytes += result.getSerializedSize();
-                if (digest != null) digest.add(result);
-            }
         }
 
         /** The final response (more = false): status, the remaining results and every check. */
         public void finish(Response response) throws IOException {
             if (failure != null) throw failure;
+            if (response.getId() != id) throw new IOException("Response ID differs from request " + id);
             if (response.getMore()) throw new IOException("Final response marked partial");
             if (response.getStatus() != Status.OK)
                 throw new IOException("Service " + response.getStatus() + " at source event "
                         + operation.sourceEvent() + ": " + response.getMessage());
             if (operation.kind() != IndexOperationTrace.SEARCH) {
                 if (count + response.getResultsCount() != 0) throw new IOException("Write returned results");
-                if (expected.remove(response.getId()) != null)
-                    throw new IOException("Expected a search result but the request was a write");
                 return;
             }
             accept(response);
@@ -394,36 +247,8 @@ public final class TraceRequests {
                         + ": expected " + operation.expectedCount() + ", found " + count);
             results.addAndGet(count);
             queries.incrementAndGet();
-            resultBytes.addAndGet(bytes);
             maxResults.accumulateAndGet(count, Math::max);
-            if (wanted != null) {
-                expected.remove(id);
-                String actual = digest.hex();
-                if (!actual.equals(wanted.digest())) {
-                    digestMismatches.incrementAndGet();
-                    throw new IOException(
-                            "Search results differ at source event "
-                                    + wanted.sourceEvent()
-                                    + " (work unit "
-                                    + wanted.workUnitId()
-                                    + "): expected digest "
-                                    + wanted.digest()
-                                    + ", got "
-                                    + actual);
-                }
-                digestChecks.incrementAndGet();
-            }
         }
-    }
-
-    /** A commit marker response carries no results. */
-    public void checkCommit(Response response) throws IOException {
-        if (response.getStatus() != Status.OK)
-            throw new IOException(
-                    "Service " + response.getStatus() + " for commit marker: "
-                            + response.getMessage());
-        if (response.getResultsCount() != 0)
-            throw new IOException("Commit marker returned results");
     }
 
     public long checkedResults() {
@@ -432,14 +257,6 @@ public final class TraceRequests {
 
     public long queries() {
         return queries.get();
-    }
-
-    public long digestChecks() {
-        return digestChecks.get();
-    }
-
-    public long digestMismatches() {
-        return digestMismatches.get();
     }
 
     public long requestBytes() {
@@ -454,37 +271,33 @@ public final class TraceRequests {
         return maxResults.get();
     }
 
-    public long maxExpected() {
-        return maxExpected.get();
-    }
-
     public long maxGroupMembers() {
         return maxGroupMembers.get();
     }
 
-    /**
-     * Ends an expected-result comparison: no line may remain and every expected response must
-     * have been checked.
-     */
-    public void finish() throws IOException {
-        if (expectedInput == null) return;
-        if (pendingExpectedLine != null || expectedInput.readLine() != null)
-            throw new IOException("Expected query digests have unused records");
-        if (!expected.isEmpty())
-            throw new IOException(
-                    "Expected query digests have no response for request " + expected.keySet());
-        if (digestChecks.get() != queries.get())
-            throw new IOException(
-                    "Query digest coverage mismatch: "
-                            + digestChecks
-                            + " checked of "
-                            + queries
-                            + " queries");
-        expectedInput.close();
+
+
+    void rpcRequest(com.google.protobuf.MessageLite request, String kind) {
+        rpcRequests.incrementAndGet();
+        requestBytes.addAndGet(request.getSerializedSize());
+        rpcKinds.computeIfAbsent(kind, key -> new AtomicLong()).incrementAndGet();
     }
 
-    private Request countRequest(Request request) {
-        requestBytes.addAndGet(request.getSerializedSize());
-        return request;
+    void rpcResults(List<Result> items) {
+        returnedResults.addAndGet(items.size());
+        for (var item : items) resultBytes.addAndGet(item.getSerializedSize());
+    }
+
+    public long returnedResults() { return returnedResults.get(); }
+
+    public java.util.Map<String, Long> rpcKinds() {
+        var result = new java.util.TreeMap<String, Long>();
+        rpcKinds.forEach((kind, count) -> result.put(kind, count.get()));
+        return result;
+    }
+
+    /** Actual data RPC calls, including one call per batch or search-group member. */
+    public long rpcRequests() {
+        return rpcRequests.get();
     }
 }

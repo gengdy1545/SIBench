@@ -1,8 +1,8 @@
 /*
  * PostgreSQL 14.24 capture instrumentation, linked into the backend (see sibench_capture.h).
  *
- * Every event is one JSON line in SIBENCH_CAPTURE_DIR/pg-<pid>.jsonl.zst. The first line of a file is
- * capture_start, naming whether per-row detail is kept.
+ * Production streams facts directly to Java; explicit diagnostic runs write zstd files.
+ * Streams have explicit opening/closing records; failed or truncated output cannot be published.
  *
  * An index access unit starts with a scan_rescan and ends before the next rescan, the scan's end,
  * a transaction abort or backend exit. Its facts are accumulated here and written as one
@@ -17,13 +17,19 @@
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include "storage/lwlock.h"
 #include <zstd.h>
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
+#include "catalog/namespace.h"
 #include "datatype/timestamp.h"
 #include "executor/execdesc.h"
 #include "fmgr.h"
@@ -41,6 +47,7 @@
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 #define SIB_MAX_INPUTS 64
 #define SIB_PENDING_SETS 16
@@ -51,6 +58,12 @@ int			sibench_depth = 0;
 uint64		sibench_request = 0;
 
 static FILE *sib_stream = NULL;
+static bool sib_ended = false;
+static bool sib_direct = false;
+static uint64 sib_sequence = 0;
+static bool sib_failed = false;
+static bool sib_committing = false;
+static const char *sib_failure_message = NULL;
 static int	sib_detail_mode = -1;
 
 /* Buffered zstd output ends its frame at backend exit; an incomplete frame fails the audit. */
@@ -66,13 +79,21 @@ static bool sib_zstd_open_frame = false;
 bool
 sib_enabled(void)
 {
-	return application_name && strncmp(application_name, "sibench:", 8) == 0;
+	return !sib_failed && application_name && strncmp(application_name, "sibench:", 8) == 0;
 }
 
 bool
 sib_relation(Relation relation)
 {
-	return sib_enabled() && relation && RelationGetRelid(relation) >= FirstNormalObjectId;
+	static Oid history_namespace = InvalidOid;
+	if (!sib_enabled() || !relation || RelationGetRelid(relation) < FirstNormalObjectId)
+		return false;
+	/* API projection uses explicit intent; executor snapshots and row changes remain captured. */
+	if (strcmp(application_name, "sibench:api") == 0)
+		return false;
+	if (!OidIsValid(history_namespace))
+		history_namespace = get_namespace_oid("sibench_history", true);
+	return RelationGetNamespace(relation) != history_namespace;
 }
 
 /* Per-row events are kept only on request: they are what makes a capture large and slow. */
@@ -89,6 +110,43 @@ sib_detail(void)
 }
 
 static void sib_flush_all(void);
+static void sib_await_room(void);
+
+/* Commit callbacks cannot raise errors: finish the native commit before closing the backend. */
+void
+sib_capture_check_failure(void)
+{
+    if (sib_failed)
+        ereport(FATAL, (errmsg_internal("%s", sib_failure_message)));
+    /* Called after transaction completion; API receipts provide their own bounded flow control. */
+    if (sib_direct && strcmp(application_name, "sibench:api") != 0)
+    {
+        for (;;)
+        {
+            uint64 pending;
+            ResetLatch(MyLatch);
+            LWLockAcquire(ProcArrayLock, LW_SHARED);
+            pending = MyProc->sibenchCaptureProduced - MyProc->sibenchCaptureConsumed;
+            LWLockRelease(ProcArrayLock);
+            if (pending < 128) break;
+            (void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                             1000L, PG_WAIT_EXTENSION);
+            CHECK_FOR_INTERRUPTS();
+        }
+    }
+}
+
+static void
+sib_output_error(const char *message)
+{
+    FILE *stream = sib_stream;
+
+    sib_failed = true;
+    sib_failure_message = message;
+    sib_stream = NULL;
+    if (stream) fclose(stream);
+    if (!sib_committing) sib_capture_check_failure();
+}
 
 /* Feeds input to the zstd stream with the given directive and writes what it produced. */
 static bool
@@ -113,9 +171,15 @@ sib_zstd_feed(const char *data, size_t length, ZSTD_EndDirective directive)
 static void
 sib_write(const char *data, size_t length)
 {
+    if (sib_direct)
+    {
+        if (fwrite(data, 1, length, sib_stream) != length)
+            sib_output_error("SIBench direct capture write failed");
+        return;
+    }
 	sib_zstd_open_frame = true;
 	if (!sib_zstd_feed(data, length, ZSTD_e_continue))
-		elog(ERROR, "SIBench trace write failed");
+		sib_output_error("SIBench trace write failed");
 }
 
 /* Ends the zstd frame; anything written later starts a new frame of the same stream. */
@@ -127,19 +191,38 @@ sib_finish(void)
 	if (sib_zstd && sib_zstd_open_frame)
 	{
 		if (!sib_zstd_feed(NULL, 0, ZSTD_e_end))
-			elog(ERROR, "SIBench trace finalization failed");
+        {
+            sib_output_error("SIBench trace finalization failed");
+            return;
+        }
 		sib_zstd_open_frame = false;
 	}
 	if (fflush(sib_stream) != 0)
-		elog(ERROR, "SIBench trace flush failed");
+		sib_output_error("SIBench trace flush failed");
 }
 
 /* Open units and pending verdicts are still facts when the connection closes mid-request. */
-static void
-sib_before_exit(int code, Datum arg)
+void
+sib_backend_exit(void)
 {
+	if (!sib_stream || sib_failed) return;
 	sib_flush_all();
+	if (!sib_ended)
+	{
+		sib_emit("capture_end", NULL, NULL);
+		sib_ended = true;
+	}
 	sib_finish();
+    if (sib_direct)
+    {
+        char acknowledgement;
+        if (!sib_stream || read(fileno(sib_stream), &acknowledgement, 1) != 1 || acknowledgement != 'E')
+            sib_output_error("SIBench source stream did not complete");
+        LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+        MyProc->sibenchCaptureDirect = false;
+        LWLockRelease(ProcArrayLock);
+        sib_direct = false;
+    }
 }
 
 static void
@@ -157,35 +240,66 @@ sib_open(void)
 
 	if (sib_stream)
 		return true;
-	if (!directory || !directory[0])
+	if ((!directory || !directory[0]) && !getenv("SIBENCH_CAPTURE_SOCKET"))
 		return false;
+	if (getenv("SIBENCH_CAPTURE_SOCKET"))
 	{
-		const char *compress = getenv("SIBENCH_CAPTURE_COMPRESS");
-		if (compress && strcmp(compress, "zstd") != 0)
-			elog(ERROR, "SIBench capture requires zstd compression");
+		struct sockaddr_un address;
+		int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+		const char *endpoint = getenv("SIBENCH_CAPTURE_SOCKET");
+		memset(&address, 0, sizeof(address));
+		address.sun_family = AF_UNIX;
+		if (fd < 0 || strlen(endpoint) >= sizeof(address.sun_path))
+        {
+            if (fd >= 0) close(fd);
+            sib_output_error("SIBench direct capture socket is unavailable");
+            return false;
+        }
+		strlcpy(address.sun_path, endpoint, sizeof(address.sun_path));
+		if (connect(fd, (struct sockaddr *) &address, sizeof(address)) != 0)
+        {
+            close(fd);
+            sib_output_error("SIBench cannot connect to capture socket");
+            return false;
+        }
+		sib_stream = fdopen(fd, "w");
+		if (!sib_stream) {
+            close(fd);
+            sib_output_error("SIBench cannot open capture socket stream");
+            return false;
+        }
+		sib_direct = true;
+		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+		MyProc->sibenchCaptureProduced = 0;
+		MyProc->sibenchCaptureAcked = 0;
+		MyProc->sibenchCaptureConsumed = 0;
+		MyProc->sibenchCaptureCsn = ShmemVariableCache->xactCompletionCount;
+		MyProc->sibenchCaptureAckCsn = MyProc->sibenchCaptureCsn;
+		MyProc->sibenchCaptureDirect = true;
+		LWLockRelease(ProcArrayLock);
+		setvbuf(sib_stream, NULL, _IOFBF, 1 << 20);
+		fprintf(sib_stream, "pg-%d.jsonl.zst\n", MyProcPid);
+	}
+	else
+	{
+		int fd;
 		snprintf(path, sizeof(path), "%s/pg-%d.jsonl.zst", directory, MyProcPid);
-		sib_stream = fopen(path, "a");
-		if (!sib_stream)
-			elog(ERROR, "SIBench cannot open trace file %s", path);
+		fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		if (fd < 0) elog(ERROR, "SIBench cannot create trace file %s", path);
+		sib_stream = fdopen(fd, "w");
+		if (!sib_stream) { close(fd); elog(ERROR, "SIBench cannot open trace stream %s", path); }
 		sib_zstd = ZSTD_createCCtx();
-		/* The fastest regular level: compression runs inside every captured backend. */
-		if (!sib_zstd || ZSTD_isError(ZSTD_CCtx_setParameter(sib_zstd, ZSTD_c_compressionLevel, 1)))
+		if (!sib_zstd || ZSTD_isError(ZSTD_CCtx_setParameter(sib_zstd, ZSTD_c_compressionLevel, 1))
+			|| ZSTD_isError(ZSTD_CCtx_setParameter(sib_zstd, ZSTD_c_checksumFlag, 1)))
 			elog(ERROR, "SIBench cannot start zstd for %s", path);
 		sib_zstd_out_size = ZSTD_CStreamOutSize();
 		sib_zstd_out = MemoryContextAlloc(TopMemoryContext, sib_zstd_out_size);
 	}
-	/*
-	 * Written out only when buffers fill and at exit, where the zstd frame ends: the audit waits
-	 * for every backend to exit before it reads a trace, and a lost backend fails the capture
-	 * anyway. A flush per transaction cost a zstd block and a write per commit on the CPUs the
-	 * native run is bound by.
-	 */
-	setvbuf(sib_stream, NULL, _IOFBF, 1 << 20);
-	before_shmem_exit(sib_before_exit, (Datum) 0);
+	if (!sib_direct) setvbuf(sib_stream, NULL, _IOFBF, 1 << 20);
 	on_proc_exit(sib_proc_exit, (Datum) 0);
 	initStringInfo(&header);
 	appendStringInfo(&header,
-					 "{\"event\":\"capture_start\",\"pid\":%d,\"xid\":0,\"cid\":0,\"req\":%llu,\"depth\":%d,"
+					 "{\"event\":\"capture_start\",\"sequence\":0,\"pid\":%d,\"xid\":0,\"cid\":0,\"req\":%llu,\"depth\":%d,"
 					 "\"application\":",
 					 MyProcPid, (unsigned long long) sibench_request, sibench_depth);
 	escape_json(&header, application_name);
@@ -193,7 +307,7 @@ sib_open(void)
 					 sib_detail() ? "rows" : "summary");
 	sib_write(header.data, header.len);
 	pfree(header.data);
-	return true;
+	return !sib_failed;
 }
 
 /* A non-negative integer in decimal, as %u / %llu / %d print it, without printf. */
@@ -203,19 +317,6 @@ sib_append_uint(StringInfo out, uint64 value)
 	char		digits[MAXINT8LEN + 1];
 
 	appendBinaryStringInfo(out, digits, pg_ulltoa_n(value, digits));
-}
-
-/* A 64-bit value as 16 lower-case hex digits, as %016llx prints it. */
-static inline void
-sib_append_hex16(StringInfo out, uint64 value)
-{
-	static const char hex[] = "0123456789abcdef";
-	char		digits[16];
-	int			i;
-
-	for (i = 15; i >= 0; i--, value >>= 4)
-		digits[i] = hex[value & 0xf];
-	appendBinaryStringInfo(out, digits, 16);
 }
 
 /*
@@ -280,7 +381,9 @@ sib_emit_named(const char *event, Oid relid, const char *relname, const char *de
 		appendStringInfoString(&message, "\",\"pid\":");
 		sib_append_uint(&message, (uint64) MyProcPid);
 		appendStringInfoString(&message, ",\"xid\":");
-		sib_append_uint(&message, GetTopTransactionIdIfAny());
+		sib_append_uint(&message, U64FromFullTransactionId(GetTopFullTransactionIdIfAny()));
+		appendStringInfoString(&message, ",\"sequence\":");
+		sib_append_uint(&message, ++sib_sequence);
 		appendStringInfoString(&message, ",\"cid\":");
 		sib_append_uint(&message, GetCurrentCommandId(false));
 		appendStringInfoString(&message, ",\"req\":");
@@ -559,6 +662,7 @@ typedef struct SibUnit
 	NameData	index_name;
 	void	   *heap;			/* the bitmap heap node the scan feeds, as of its latest binding */
 	int			position;		/* the scan's position among that node's inputs */
+	uint64		cycle;			/* the BitmapAnd cycle the unit belongs to; 0 for none */
 	/*
 	 * Both live with the scan and are siblings: resetting a context deletes its children. The unit
 	 * context is reset when a unit starts or ends, the run context also when the value changes.
@@ -632,7 +736,9 @@ typedef struct SibHeap
 	/* A BitmapAnd's current cycle, as the ledger forms it: the inputs that started in it. */
 	bool		cycle_open;
 	bool		cycle_sealed;
-	bool		cycle_reported;
+	uint64		cycle;			/* the current cycle's number */
+	bool		cycle_ran;		/* an input of the current cycle produced its bitmap */
+	uint64		reported_cycle; /* the latest cycle with an intersection verdict */
 	uint64		cycle_members;
 	SibVerdictSet pending[SIB_PENDING_SETS];
 	int			npending;
@@ -886,11 +992,11 @@ sib_heap_input_unit(SibHeap *heap, int position)
 }
 
 /*
- * Whether one candidate TID was produced, and is still unchecked, by every member of the current
+ * Whether one candidate TID was produced, and is still unchecked, by every member of one
  * BitmapAnd cycle: the heap scan stopped before checking it.
  */
 static bool
-sib_heap_unresolved_intersection(SibHeap *heap)
+sib_heap_unresolved_intersection(SibHeap *heap, uint64 cycle)
 {
 	SibUnit    *members[SIB_MAX_INPUTS];
 	SibUnit    *smallest = NULL;
@@ -905,10 +1011,8 @@ sib_heap_unresolved_intersection(SibHeap *heap)
 		SibUnit    *unit;
 		int64		count;
 
-		if (!(heap->cycle_members & (UINT64CONST(1) << i)))
-			continue;
 		unit = sib_heap_input_unit(heap, i);
-		if (!unit)
+		if (!unit || unit->cycle != cycle)
 			continue;
 		members[n++] = unit;
 		count = sib_tids_unresolved(unit);
@@ -1002,12 +1106,16 @@ sib_unit_flush(SibUnit *unit)
 			appendStringInfoChar(&out, ']');
 		}
 	}
-	if (heap && heap->combination == SIB_AND && heap->cycle_open && !heap->cycle_reported
-		&& unit->position >= 0 && (heap->cycle_members & (UINT64CONST(1) << unit->position)))
+	/*
+	 * The cycle's first input that fetched reports its verdict, while every input of the cycle is
+	 * still live; a unit that never fetched is not an input, and its siblings may not have either.
+	 */
+	if (heap && heap->combination == SIB_AND && unit->cycle > heap->reported_cycle
+		&& (unit->bitmap_ended || unit->bitmap_tids > 0))
 	{
 		appendStringInfo(&out, ",\"group_unresolved_intersection\":%s",
-						 SIB_BOOL(sib_heap_unresolved_intersection(heap)));
-		heap->cycle_reported = true;
+						 SIB_BOOL(sib_heap_unresolved_intersection(heap, unit->cycle)));
+		heap->reported_cycle = unit->cycle;
 	}
 	sib_emit_named("scan_summary", unit->index_oid, NameStr(unit->index_name), out.data);
 	pfree(out.data);
@@ -1062,24 +1170,31 @@ sib_plan_scan(const char *kind, int plan_node_id, IndexScanDesc scan)
 	sib_emit("plan_scan", scan->indexRelation, detail);
 }
 
-/* A BitmapAnd input that runs again starts the next cycle, as in the ledger. */
-static void
+/*
+ * A BitmapAnd input that runs again after its cycle ran starts the next cycle; the ledger follows
+ * the number each rescan reports. Before the BitmapAnd runs (constant keys bound at plan start, or
+ * a rescan without a fetch) a rescan only replaces the input's unit in the cycle. An input the
+ * BitmapAnd skipped after an empty intersection searched nothing in the cycle that ran.
+ */
+static uint64
 sib_cycle_join(SibHeap *heap, int position)
 {
 	uint64		bit = UINT64CONST(1) << position;
 
 	if (heap->combination != SIB_AND)
-		return;
-	if (heap->cycle_open && (heap->cycle_members & bit))
+		return 0;
+	if (heap->cycle_open && (heap->cycle_members & bit) && heap->cycle_ran)
 		heap->cycle_sealed = true;
 	if (!heap->cycle_open || heap->cycle_sealed)
 	{
 		heap->cycle_open = true;
 		heap->cycle_sealed = false;
-		heap->cycle_reported = false;
+		heap->cycle_ran = false;
+		heap->cycle++;
 		heap->cycle_members = 0;
 	}
 	heap->cycle_members |= bit;
+	return heap->cycle;
 }
 
 void
@@ -1087,6 +1202,8 @@ sib_index_rescan(IndexScanDesc scan, ScanKey keys, int nkeys)
 {
 	SibUnit    *unit;
 	SibHeap    *heap;
+	uint64		cycle = 0;
+	StringInfoData out;
 
 	if (!sib_relation(scan->indexRelation))
 		return;
@@ -1095,10 +1212,16 @@ sib_index_rescan(IndexScanDesc scan, ScanKey keys, int nkeys)
 	if (heap)
 		sib_heap_flush(heap);
 	sib_unit_flush(unit);
-	sib_scan("scan_rescan", scan, keys, nkeys, NULL, 0, false);
 	if (heap && unit->position >= 0)
-		sib_cycle_join(heap, unit->position);
+		cycle = sib_cycle_join(heap, unit->position);
+	initStringInfo(&out);
+	sib_scan_detail(&out, scan, keys, nkeys, NULL, 0, false);
+	if (cycle > 0)
+		appendStringInfo(&out, ",\"cycle\":%llu", (unsigned long long) cycle);
+	sib_emit("scan_rescan", scan->indexRelation, out.data);
+	pfree(out.data);
 	sib_unit_start(unit, keys, nkeys);
+	unit->cycle = cycle;
 }
 
 void
@@ -1304,7 +1427,7 @@ sib_heap_visibility(IndexScanDesc scan, TupleTableSlot *slot, bool found)
 	}
 }
 
-/* An all-visible index-only row is returned without reading the heap: it has no identity. */
+/* Count all-visible entries without fetching their heap tuples. */
 void
 sib_vm_visible(IndexScanDesc scan, ItemPointer tid)
 {
@@ -1376,6 +1499,13 @@ sib_bitmap_end(IndexScanDesc scan)
 		return;
 	unit->bitmap_ended = true;
 	sib_tids_seal(unit);
+	if (unit->cycle > 0)
+	{
+		SibHeap    *heap = sib_heap_find(unit->heap);
+
+		if (heap && heap->cycle == unit->cycle)
+			heap->cycle_ran = true;
+	}
 }
 
 /* Collects the index scans that feed a bitmap: one BitmapIndexScan, or BitmapAnd/Or inputs. */
@@ -1489,7 +1619,9 @@ sib_bitmap_binding(BitmapHeapScanState *node)
 	heap->lossy_pages = 0;
 	heap->cycle_open = false;
 	heap->cycle_sealed = false;
-	heap->cycle_reported = false;
+	heap->cycle = 0;
+	heap->cycle_ran = false;
+	heap->reported_cycle = 0;
 	heap->cycle_members = 0;
 	heap->combination = sib_bitmap_combination(outerPlanState(node));
 	initStringInfo(&out);
@@ -1501,8 +1633,6 @@ sib_bitmap_binding(BitmapHeapScanState *node)
 	appendStringInfoChar(&out, ']');
 	if (heap->overflow)
 		appendStringInfo(&out, ",\"inputs_over_limit\":%d", SIB_MAX_INPUTS);
-	sib_emit("plan_bitmap_heap", node->ss.ss_currentRelation, out.data);
-	pfree(out.data);
 	/* PostgreSQL passes constant keys to the inputs before this node exists: their first cycle. */
 	for (i = 0; i < heap->ninputs; i++)
 	{
@@ -1517,11 +1647,12 @@ sib_bitmap_binding(BitmapHeapScanState *node)
 		if (unit->calls > 0 || unit->bitmap_tids > 0 || unit->bitmap_ended)
 			unit->fetched_before_binding = true;
 		if (heap->combination == SIB_AND)
-		{
-			heap->cycle_open = true;
-			heap->cycle_members |= UINT64CONST(1) << i;
-		}
+			unit->cycle = sib_cycle_join(heap, i);
 	}
+	if (heap->cycle > 0)
+		appendStringInfo(&out, ",\"cycle\":%llu", (unsigned long long) heap->cycle);
+	sib_emit("plan_bitmap_heap", node->ss.ss_currentRelation, out.data);
+	pfree(out.data);
 }
 
 /* Adds one verdict to the node's pending sets, claiming the TID in every input that has it. */
@@ -1607,6 +1738,32 @@ sib_bitmap_skipped(BitmapHeapScanState *node, TBMIterateResult *tbmres)
 	}
 }
 
+/*
+ * The heap AM rejects a block it does not check: one past the relation's size when the scan
+ * started. That block was added later, so its tuples were inserted after the scan's snapshot and
+ * every candidate on it is invisible. Any other rejected block was checked, with its verdicts.
+ */
+void
+sib_bitmap_rejected(BitmapHeapScanState *node, TBMIterateResult *tbmres)
+{
+	HeapScanDesc scan = (HeapScanDesc) node->ss.ss_currentScanDesc;
+	int			i;
+	ItemPointerData tid;
+
+	if (IsolationIsSerializable() || tbmres->blockno < scan->rs_nblocks)
+		return;
+	if (tbmres->ntuples < 0)
+	{
+		sib_bitmap_lossy(node->ss.ss_currentRelation, node);
+		return;
+	}
+	for (i = 0; i < tbmres->ntuples; i++)
+	{
+		ItemPointerSet(&tid, tbmres->blockno, tbmres->offsets[i]);
+		sib_bitmap_verdict(node->ss.ss_currentRelation, node, &tid, false);
+	}
+}
+
 /* A lossy page has no candidate TIDs to attribute to an index. */
 void
 sib_bitmap_lossy(Relation relation, void *node)
@@ -1684,11 +1841,15 @@ sib_executor_start(QueryDesc *queryDesc)
 
 	if (!sib_enabled())
 		return;
+	sib_await_room();
 	initStringInfo(&detail);
 	appendStringInfoString(&detail, "\"sql\":");
 	escape_json(&detail, queryDesc->sourceText ? queryDesc->sourceText : "");
 	/* Core query jumbling (compute_query_id = on): constants do not change the identity. */
 	appendStringInfo(&detail, ",\"query_id\":%lld", (long long) queryDesc->plannedstmt->queryId);
+	appendStringInfo(&detail, ",\"snapshot_csn\":%llu",
+		(unsigned long long)(queryDesc->snapshot && queryDesc->snapshot->snapshot_type == SNAPSHOT_MVCC
+			? queryDesc->snapshot->sibenchCsn : 0));
 	sib_emit("executor_start", NULL, detail.data);
 	pfree(detail.data);
 }
@@ -1704,173 +1865,20 @@ sib_executor_end(uint64 processed)
 	sib_emit("executor_end", NULL, detail);
 }
 
-/*
- * Result rows are recorded as one 64-bit FNV-1a hash per row over canonical column text, which the
- * capture driver computes the same way from what the client read. Canonical text removes only the
- * representation differences of a binary JDBC transfer: float bits, numeric without trailing
- * fraction zeros, timestamps with six fraction digits, char without its padding.
- */
-#define SIB_FNV_OFFSET UINT64CONST(14695981039346656037)
-#define SIB_FNV_PRIME UINT64CONST(1099511628211)
-
-static uint64
-sib_fnv(uint64 hash, const char *data, size_t length)
-{
-	size_t		i;
-
-	for (i = 0; i < length; i++)
-	{
-		hash ^= (unsigned char) data[i];
-		hash *= SIB_FNV_PRIME;
-	}
-	return hash;
-}
-
-static uint64
-sib_canonical(uint64 hash, Oid type, FmgrInfo *output, Datum value)
-{
-	char		buffer[64];
-	char	   *text;
-	size_t		length;
-
-	switch (type)
-	{
-		case FLOAT4OID:
-			{
-				float4		f = DatumGetFloat4(value);
-				uint32		bits;
-
-				if (isnan(f))
-					bits = 0x7fc00000;
-				else
-					memcpy(&bits, &f, sizeof(bits));
-				snprintf(buffer, sizeof(buffer), "%08x", bits);
-				return sib_fnv(hash, buffer, strlen(buffer));
-			}
-		case FLOAT8OID:
-			{
-				float8		f = DatumGetFloat8(value);
-				uint64		bits;
-
-				if (isnan(f))
-					bits = UINT64CONST(0x7ff8000000000000);
-				else
-					memcpy(&bits, &f, sizeof(bits));
-				snprintf(buffer, sizeof(buffer), "%016llx", (unsigned long long) bits);
-				return sib_fnv(hash, buffer, strlen(buffer));
-			}
-		case TIMESTAMPOID:
-			{
-				Timestamp	ts = DatumGetTimestamp(value);
-				struct pg_tm tm;
-				fsec_t		fsec;
-
-				if (!TIMESTAMP_NOT_FINITE(ts) && timestamp2tm(ts, NULL, &tm, &fsec, NULL, NULL) == 0
-					&& tm.tm_year > 0 && tm.tm_year <= 9999)
-				{
-					snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02d.%06d",
-							 tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
-							 (int) fsec);
-					return sib_fnv(hash, buffer, strlen(buffer));
-				}
-				break;
-			}
-		default:
-			break;
-	}
-	text = OutputFunctionCall(output, value);
-	length = strlen(text);
-	if (type == BPCHAROID)
-		while (length > 0 && text[length - 1] == ' ')
-			length--;
-	else if (type == NUMERICOID && strchr(text, '.'))
-	{
-		while (length > 0 && text[length - 1] == '0')
-			length--;
-		if (length > 0 && text[length - 1] == '.')
-			length--;
-	}
-	if (type == NUMERICOID && length == 2 && strncmp(text, "-0", 2) == 0)
-		hash = sib_fnv(hash, "0", 1);
-	else
-		hash = sib_fnv(hash, text, length);
-	pfree(text);
-	return hash;
-}
-
+/* Count delivered rows without inspecting or retaining their values. */
 typedef struct SibReceiver
 {
 	DestReceiver pub;
 	DestReceiver *original;
-	int			natts;
-	Oid		   *types;
-	FmgrInfo   *outputs;
 	uint64		returned;
-	StringInfoData hashes;
 } SibReceiver;
-
-static void
-sib_prepare_columns(SibReceiver *self, TupleDesc typeinfo)
-{
-	int			i;
-	Oid			output;
-	bool		variable;
-
-	self->natts = typeinfo->natts;
-	self->types = palloc(sizeof(Oid) * Max(1, typeinfo->natts));
-	self->outputs = palloc(sizeof(FmgrInfo) * Max(1, typeinfo->natts));
-	for (i = 0; i < typeinfo->natts; i++)
-	{
-		self->types[i] = TupleDescAttr(typeinfo, i)->atttypid;
-		getTypeOutputInfo(self->types[i], &output, &variable);
-		fmgr_info(output, &self->outputs[i]);
-	}
-}
 
 static bool
 sib_receive(TupleTableSlot *slot, DestReceiver *receiver)
 {
 	SibReceiver *self = (SibReceiver *) receiver;
-	uint64		hash = SIB_FNV_OFFSET;
-	int			i;
 
-	slot_getallattrs(slot);
-	if (sib_detail())
-	{
-		StringInfoData out;
-
-		initStringInfo(&out);
-		appendStringInfoString(&out, "\"values\":[");
-		for (i = 0; i < slot->tts_tupleDescriptor->natts; i++)
-		{
-			if (i)
-				appendStringInfoChar(&out, ',');
-			sib_datum(&out, TupleDescAttr(slot->tts_tupleDescriptor, i)->atttypid,
-					  slot->tts_values[i], slot->tts_isnull[i]);
-		}
-		appendStringInfoChar(&out, ']');
-		sib_emit("result_row", NULL, out.data);
-		pfree(out.data);
-	}
-	if (self->natts != slot->tts_tupleDescriptor->natts)
-		sib_prepare_columns(self, slot->tts_tupleDescriptor);
-	for (i = 0; i < self->natts; i++)
-	{
-		if (slot->tts_isnull[i])
-			hash = sib_fnv(hash, "N", 1);
-		else
-		{
-			hash = sib_fnv(hash, "V", 1);
-			hash = sib_canonical(hash, self->types[i], &self->outputs[i], slot->tts_values[i]);
-		}
-		hash = sib_fnv(hash, "\x1f", 1);
-	}
 	self->returned++;
-	if (self->returned > 1)
-		appendStringInfoChar(&self->hashes, ',');
-	appendStringInfoChar(&self->hashes, '"');
-	sib_append_hex16(&self->hashes, hash);
-	appendStringInfoChar(&self->hashes, '"');
 	return self->original->receiveSlot(slot, self->original);
 }
 
@@ -1879,7 +1887,6 @@ sib_start(DestReceiver *receiver, int operation, TupleDesc typeinfo)
 {
 	SibReceiver *self = (SibReceiver *) receiver;
 
-	sib_prepare_columns(self, typeinfo);
 	self->original->rStartup(self->original, operation, typeinfo);
 }
 
@@ -1914,11 +1921,10 @@ sib_wrap_receiver(DestReceiver *original)
 	receiver->pub.rShutdown = sib_shutdown;
 	receiver->pub.rDestroy = sib_destroy;
 	receiver->pub.mydest = original->mydest;
-	initStringInfo(&receiver->hashes);
 	return (DestReceiver *) receiver;
 }
 
-/* The rows this execution returned, as a count and their hashes in order. */
+/* The number of rows this execution returned. */
 void
 sib_executor_run_end(DestReceiver *dest, uint64 processed)
 {
@@ -1932,12 +1938,9 @@ sib_executor_run_end(DestReceiver *dest, uint64 processed)
 	{
 		SibReceiver *self = (SibReceiver *) dest;
 
-		appendStringInfo(&detail, ",\"returned\":%llu,\"row_hashes\":[",
+		appendStringInfo(&detail, ",\"returned\":%llu",
 						 (unsigned long long) self->returned);
-		appendBinaryStringInfo(&detail, self->hashes.data, self->hashes.len);
-		appendStringInfoChar(&detail, ']');
 		self->returned = 0;
-		resetStringInfo(&self->hashes);
 	}
 	sib_emit("executor_run_end", NULL, detail.data);
 	pfree(detail.data);
@@ -1955,25 +1958,133 @@ sib_completion(void)
 {
 	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
 		return MyProc->sibenchCompletion;
-	return ShmemVariableCache->xactCompletionCount;
+	if (sib_direct)
+	{
+		uint64 csn;
+		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+		csn = ShmemVariableCache->xactCompletionCount;
+		MyProc->sibenchCaptureProduced++;
+		MyProc->sibenchCaptureCsn = csn;
+		LWLockRelease(ProcArrayLock);
+		return csn;
+	}
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	uint64 csn = ShmemVariableCache->xactCompletionCount;
+	LWLockRelease(ProcArrayLock);
+	return csn;
+}
+
+/* Acknowledgements advance only after completed transaction facts are queued in Java. */
+uint64
+sib_capture_watermark(int pid, uint64 sequence, uint64 csn, uint64 consumed)
+{
+	uint64 safe;
+	uint32 i;
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	safe = ShmemVariableCache->xactCompletionCount;
+	for (i = 0; i < ProcGlobal->allProcCount; i++)
+	{
+		PGPROC *proc = &ProcGlobal->allProcs[i];
+		if (proc->pid == 0 || !proc->sibenchCaptureDirect) continue;
+		if (proc->pid == pid && sequence > proc->sibenchCaptureAcked)
+		{
+			if (sequence > proc->sibenchCaptureProduced || csn > proc->sibenchCaptureCsn
+				|| csn < proc->sibenchCaptureAckCsn)
+			{
+				LWLockRelease(ProcArrayLock);
+				elog(ERROR, "SIBench source acknowledgement exceeds its producer");
+			}
+			proc->sibenchCaptureAcked = sequence;
+			proc->sibenchCaptureAckCsn = csn;
+		}
+		if (proc->pid == pid && consumed > proc->sibenchCaptureConsumed)
+		{
+			if (consumed > proc->sibenchCaptureAcked)
+			{
+				LWLockRelease(ProcArrayLock);
+				elog(ERROR, "SIBench consumption exceeds received source facts");
+			}
+			proc->sibenchCaptureConsumed = consumed;
+			SetLatch(&proc->procLatch);
+		}
+		if (proc->sibenchCaptureProduced > proc->sibenchCaptureAcked)
+			safe = Min(safe, proc->sibenchCaptureAckCsn);
+	}
+	LWLockRelease(ProcArrayLock);
+	return safe;
+}
+
+/*
+ * The consumer's queue is full: direct sources hold read-only statements at their start. Only the
+ * source process waits; the consumer keeps reading every stream, so completions already produced
+ * are still received and acknowledged, and the queue drains.
+ */
+void
+sib_capture_hold(bool hold)
+{
+	uint32		i;
+
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	for (i = 0; i < ProcGlobal->allProcCount; i++)
+	{
+		PGPROC	   *proc = &ProcGlobal->allProcs[i];
+
+		if (proc->pid == 0 || !proc->sibenchCaptureDirect || proc->sibenchCaptureHold == hold)
+			continue;
+		proc->sibenchCaptureHold = hold;
+		if (!hold)
+			SetLatch(&proc->procLatch);
+	}
+	LWLockRelease(ProcArrayLock);
+}
+
+/* Completion backpressure cannot bound a transaction that never writes; this holds its next statement. */
+static void
+sib_await_room(void)
+{
+	if (!sib_direct || sibench_depth != 0 || strcmp(application_name, "sibench:api") == 0
+		|| TransactionIdIsValid(GetTopTransactionIdIfAny()))
+		return;
+	/* Everything already produced, including the last completion, reaches the consumer first. */
+	sib_finish();
+	for (;;)
+	{
+		bool		hold;
+
+		ResetLatch(MyLatch);
+		LWLockAcquire(ProcArrayLock, LW_SHARED);
+		hold = MyProc->sibenchCaptureHold;
+		LWLockRelease(ProcArrayLock);
+		if (!hold)
+			break;
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 1000L, PG_WAIT_EXTENSION);
+		CHECK_FOR_INTERRUPTS();
+	}
 }
 
 void
 sib_transaction_commit(void)
 {
-	char		detail[64];
+    char detail[160];
 
-	if (!sib_enabled())
-		return;
-	snprintf(detail, sizeof(detail), "\"csn\":%llu", (unsigned long long) sib_completion());
-	sib_emit("transaction_commit", NULL, detail);
+    if (!sib_enabled()) return;
+    sib_committing = true;
+    if (sib_open())
+    {
+        uint64 csn = sib_completion();
+        snprintf(detail, sizeof(detail), "\"csn\":%llu,\"capture_sequence\":%llu", (unsigned long long) csn,
+                 (unsigned long long) (sib_direct ? MyProc->sibenchCaptureProduced : 0));
+        sib_emit("transaction_commit", NULL, detail);
+        if (sib_direct) sib_finish();
+    }
+    sib_committing = false;
 }
 
 /* A failed statement never ends its scans: their units end with the abort, after their summaries. */
 void
 sib_transaction_abort(void)
 {
-	char		detail[64];
+	char		detail[160];
 	HASH_SEQ_STATUS status;
 	SibUnit    *unit;
 	SibHeap    *heap;
@@ -1992,6 +2103,11 @@ sib_transaction_abort(void)
 			if (heap->cycle_open)
 				heap->cycle_sealed = true;
 	}
-	snprintf(detail, sizeof(detail), "\"csn\":%llu", (unsigned long long) sib_completion());
+	{
+		uint64 csn = sib_completion();
+		snprintf(detail, sizeof(detail), "\"csn\":%llu,\"capture_sequence\":%llu", (unsigned long long) csn,
+                 (unsigned long long) (sib_direct ? MyProc->sibenchCaptureProduced : 0));
+	}
 	sib_emit("transaction_abort", NULL, detail);
+    if (sib_direct) sib_finish();
 }

@@ -11,6 +11,26 @@ spec.loader.exec_module(summary)
 
 
 class IndexRunSummaryTest(unittest.TestCase):
+    @staticmethod
+    def phase():
+        dispatch = dict.fromkeys(("pending_responses", "completed_responses", "target_calls",
+            "source_operations", "filtered_secondary_operations", "transaction_control_records",
+            "basic_operations", "completed_operations",
+            "failed_response_operations",
+            "timed_out_operations", "backpressure_seconds", "dependency_wait_seconds",
+            "deferred_search_operations", "search_deferral_seconds", "peak_deferred_operations",
+            "peak_in_flight"), 0)
+        dispatch.update(local_send_boundary="transport_acceptance_not_service_execution",
+            latency_boundary="client_api_entry_to_final_response_excluding_replay_waits",
+            measurement={"unit": "basic_index_operation", "warmup_operations": 0, "measured_operations": 0,
+                         "completed_operations": 0})
+        for kind in ("search", "write"):
+            dispatch[kind + "_latency"] = {"count": 0, "mean_ms": 0.0, "p99_ms": 0.0,
+                "percentile_bound": "upper", "percentile_relative_error_bound": 1 / 1024,
+                "exact_below_ns": 2048, "mean_and_max": "unquantized"}
+        return {**dict.fromkeys(("operations", "rpc_requests", "seconds", "operations_per_second",
+            "request_bytes", "result_bytes"), 0), "rpc_by_kind": {}, "dispatch": dispatch}
+
     def test_missing_logs_mean_unmeasured_not_zero_engine_work(self):
         result = summary.engine_events([])
         self.assertEqual("not_collected", result["coverage"])
@@ -47,14 +67,9 @@ class IndexRunSummaryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "service.json"
             log = Path(directory) / "unrelated.LOG"
-            dispatch = dict.fromkeys(("pending_responses", "completed_responses", "target_calls",
-                "source_operations", "filtered_secondary_operations", "transaction_control_records",
-                "commit_markers", "backpressure_seconds", "peak_in_flight", "measurement",
-                "search_latency", "write_latency", "commit_latency"), 0)
-            phase = {**dict.fromkeys(("operations", "seconds", "operations_per_second", "request_bytes",
-                "result_bytes", "flush_seconds", "published_version"), 0), "dispatch": dispatch}
+            phase = self.phase()
             path.write_text(json.dumps({"status": "passed", "result": {
-                "per_query_digest_checks": 0, "per_query_digest_mismatches": 0, "search_requests": 0,
+                "search_requests": 0,
                 "service": "test", "baseline": phase, "workload": phase, "queries": 0,
                 "checked_result_items": 0}}))
             log.write_text('prefix EVENT_LOG_v1 {"event":"compaction_finished","job":1,'
@@ -64,20 +79,60 @@ class IndexRunSummaryTest(unittest.TestCase):
             self.assertEqual("unverified", result["engine"]["same_run_provenance"])
             self.assertEqual("passed", result["correctness_status"])
 
-    def test_deliberately_wrong_result_and_partial_run_are_rejected(self):
+    def test_baseline_batches_and_individual_workload_rpcs_remain_distinct(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "service.json"
+            phase = self.phase()
+            phase.update(operations=4, rpc_requests=4, rpc_by_kind={"Get": 3, "Put": 1})
+            phase["dispatch"].update(target_calls=4, completed_responses=4,
+                basic_operations=4, completed_operations=4, dependency_wait_seconds=0.02,
+                deferred_search_operations=1, search_deferral_seconds=0.5)
+            phase["dispatch"]["measurement"].update(warmup_operations=1, measured_operations=3,
+                                                   completed_operations=3)
+            phase["dispatch"]["search_latency"].update(count=3, p99_ms=0.125)
+            baseline = self.phase()
+            baseline.update(operations=4, rpc_requests=2, rpc_by_kind={"BatchWrite": 2})
+            baseline["dispatch"].update(target_calls=4, completed_responses=4, basic_operations=4, completed_operations=4)
+            path.write_text(json.dumps({"status": "passed", "result": {
+                "service": "test", "baseline": baseline, "workload": phase,
+                "queries": 1, "checked_result_items": 1}}))
+            workload = summary.summarize(path, [])["phases"]["workload"]
+            self.assertEqual(4, workload["basic_operations"])
+            self.assertEqual(0.02, workload["dependency_wait_seconds"])
+            self.assertEqual(1, workload["deferred_search_operations"])
+            self.assertEqual(0.5, workload["search_deferral_seconds"])
+            self.assertEqual(4, workload["rpc_requests"])
+            self.assertEqual({"Get": 3, "Put": 1}, workload["rpc_by_kind"])
+            self.assertEqual(2, summary.summarize(path, [])["phases"]["baseline"]["rpc_requests"])
+            self.assertEqual(3, workload["measurement"]["measured_operations"])
+            self.assertEqual(0.125, workload["search_latency"]["p99_ms"])
+            self.assertEqual("upper", workload["search_latency"]["percentile_bound"])
+            self.assertEqual(1 / 1024, workload["search_latency"]["percentile_relative_error_bound"])
+
+    def test_success_label_cannot_hide_recorded_response_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "service.json"
+            for field in ("failed_response_operations",
+                          "timed_out_operations", "failure"):
+                phase = self.phase()
+                phase["dispatch"][field] = 1
+                path.write_text(json.dumps({"status": "passed", "result": {"baseline": phase}}))
+                with self.assertRaisesRegex(ValueError, "failed or timed-out"):
+                    summary.summarize(path, [])
+
+    def test_incomplete_responses_and_failed_run_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "service.json"
             path.write_text(json.dumps({"status": "failed"}))
             with self.assertRaisesRegex(ValueError, "failed or incomplete"):
                 summary.summarize(path, [])
-            path.write_text(json.dumps({"status": "passed", "result": {
-                "per_query_digest_mismatches": 1, "per_query_digest_checks": 2, "search_requests": 2}}))
-            with self.assertRaisesRegex(ValueError, "mismatched"):
-                summary.summarize(path, [])
-            path.write_text(json.dumps({"status": "passed", "result": {
-                "per_query_digest_mismatches": 0, "per_query_digest_checks": 1, "search_requests": 2}}))
-            with self.assertRaisesRegex(ValueError, "incomplete"):
-                summary.summarize(path, [])
+            for pending, completed in ((1, 1), (0, 1)):
+                path.write_text(json.dumps({"status": "passed", "result": {
+                    "baseline": {"dispatch": {"pending_responses": pending,
+                        "completed_responses": completed, "target_calls": 2}}}}))
+                with self.assertRaisesRegex(ValueError, "responses are incomplete"):
+                    summary.summarize(path, [])
+
 
 
 if __name__ == "__main__":

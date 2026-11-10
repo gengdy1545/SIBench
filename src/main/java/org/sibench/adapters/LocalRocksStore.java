@@ -13,7 +13,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 
 /** A RocksDB instance in a local directory, through RocksJava. */
-final class LocalRocksStore implements RocksStore {
+final class LocalRocksStore implements OrderedStore {
     static {
         RocksDB.loadLibrary();
     }
@@ -62,7 +62,7 @@ final class LocalRocksStore implements RocksStore {
     @Override
     public String durability() {
         return "acknowledged writes are in the memtable and WAL without fsync;"
-                + " baseline inserts skip the WAL until Flush";
+                + " persistence is maintained internally";
     }
 
     @Override

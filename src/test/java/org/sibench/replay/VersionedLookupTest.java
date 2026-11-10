@@ -4,14 +4,14 @@ import org.sibench.capture.IndexOperationTrace.Range;
 import org.sibench.trace.IndexKey;
 import static org.junit.Assert.*;
 
-import com.google.gson.Gson;
 
 import org.junit.Test;
 import org.sibench.capture.IndexOperationTrace;
+import org.sibench.capture.ProtoTrace;
 import org.sibench.capture.TestOps;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexReferenceReplay;
-import org.sibench.generation.BaselineGenerator;
+import org.sibench.config.Digests;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -43,9 +43,19 @@ public class VersionedLookupTest {
 
     private static void commit(ReplayProjection target, long version, Operation... rows)
             throws Exception {
-        target.accept(IndexOperationTrace.transaction(version, 6, version, version, 0));
-        for (Operation row : rows) org.sibench.capture.TransferIndexFixtures.expandRow(row, target);
-        target.accept(IndexOperationTrace.transaction(version, 7, version, version, rows.length));
+        Path directory = Files.createTempDirectory("sibench-committed-lookup-");
+        Path trace = directory.resolve("workload.pb.zst");
+        try {
+            try (var writer = new ProtoTrace.Writer(trace)) {
+                writer.append(IndexOperationTrace.transaction(version, 6, version, version, 0));
+                for (Operation row : rows) org.sibench.capture.TransferIndexFixtures.appendRow(writer, row);
+                writer.append(IndexOperationTrace.transaction(version, 7, version, version, rows.length));
+            }
+            ProtoTrace.read(trace, null, null, target);
+        } finally {
+            Files.deleteIfExists(trace);
+            Files.deleteIfExists(directory);
+        }
     }
 
     private static Operation snapshot(int table, int index, long key, long timestamp, long count) {
@@ -67,9 +77,9 @@ public class VersionedLookupTest {
                 var model = new IndexReferenceReplay(rowIds, false);
                 var replay =
                         new ReplayProjection(
-                                new ReplayConfig(false, "none", 0, 0, 0, 0, dispatchMode),
+                                new ReplayConfig(false, 0, 0, 0, 0, dispatchMode),
                                 true,
-                                model::accept);
+                                model::acceptCommitted);
                 model.accept(TestOps.op(0, 1, 3, 0, 0, 2, 0, 3, 0, 52, 0, 0, 0));
                 commit(replay, 100, row(3, 1, 100, 0, 50, 3, 1));
                 commit(replay, 110, row(3, 1, 110, 1, 50, 3, 1));
@@ -148,7 +158,7 @@ public class VersionedLookupTest {
                     throws Exception {
         for (boolean rowIds : new boolean[] {false, true}) {
             var model = new IndexReferenceReplay(rowIds, true);
-            var replay = new ReplayProjection(ReplayConfig.defaults(), true, model::accept);
+            var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0), true, model::acceptCommitted);
             org.sibench.capture.TransferIndexFixtures.expandRow(
                     TestOps.op(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0), model::accept);
             commit(replay, 100, row(5, 1, 100, 1, 50, 3, 1), row(5, 2, 100, 2, 51, 3, 2));
@@ -159,7 +169,7 @@ public class VersionedLookupTest {
             assertEquals(
                     List.of(TestOps.key(2)),
                     model.lookupSecondary(5, 1, TestOps.key(10), 130).stream()
-                            .map(IndexReferenceReplay.LookupResult::key)
+                            .map(org.sibench.capture.IndexReferenceReplay.LookupResult::key)
                             .toList());
             replay.accept(snapshot(5, 1, 10, 105, 2));
             replay.accept(snapshot(5, 2, 20, 0, 1));
@@ -205,12 +215,12 @@ public class VersionedLookupTest {
                         snapshot(5, 1, 10, -1, 0))) {
             var rejected =
                     new ReplayProjection(
-                            new ReplayConfig(false, "none", 0, 0, 0, 0), true, o -> {});
+                            new ReplayConfig(false, 0, 0, 0, 0), true, o -> {});
             commit(rejected, 100);
             assertThrows(IOException.class, () -> rejected.accept(invalid));
         }
         var replay =
-                new ReplayProjection(new ReplayConfig(false, "none", 0, 0, 0, 0), true, o -> {});
+                new ReplayProjection(new ReplayConfig(false, 0, 0, 0, 0), true, o -> {});
         commit(replay, 100);
         replay.accept(snapshot(5, 1, 10, 99, 0));
         replay.accept(IndexOperationTrace.search(0, 3, 0, Range.equal(IndexKey.ofInt(1)), 100, 0, 0));
@@ -224,13 +234,13 @@ public class VersionedLookupTest {
             throws Exception {
         Path directory = Files.createTempDirectory("sibench-snapshots-");
         try {
-            Path baseline = directory.resolve("baseline.ops"),
-                    workload = directory.resolve("workload.ops");
-            try (var writer = new IndexOperationTrace.Writer(baseline)) {
+            Path baseline = directory.resolve("baseline.pb.zst"),
+                    workload = directory.resolve("workload.pb.zst");
+            try (var writer = new ProtoTrace.Writer(baseline)) {
                 org.sibench.capture.TransferIndexFixtures.appendRow(
                         writer, TestOps.op(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0));
             }
-            try (var writer = new IndexOperationTrace.Writer(workload)) {
+            try (var writer = new ProtoTrace.Writer(workload)) {
                 writer.append(IndexOperationTrace.transaction(100, 6, 100, 100, 0));
                 org.sibench.capture.TransferIndexFixtures.appendRow(
                         writer, row(5, 1, 100, 1, 50, 3, 1));
@@ -246,34 +256,14 @@ public class VersionedLookupTest {
                 writer.append(snapshot(5, 2, 20, 0, 1));
                 writer.append(snapshot(5, 0, 1, 110, 0));
             }
-            try (var out =
-                    new com.github.luben.zstd.ZstdOutputStream(
-                            Files.newOutputStream(directory.resolve("work-units.jsonl.zst")))) {
-                out.write(new byte[0]);
-            }
-            Files.writeString(
-                    directory.resolve("manifest.json"),
-                    new Gson()
-                            .toJson(
-                                    Map.of(
-                                            "baseline_operations",
-                                            3,
-                                            "workload_operations",
-                                            17,
-                                            "baseline_trace_sha256",
-                                            org.sibench.capture.IndexOperationTrace.sha256(baseline),
-                                            "workload_trace_sha256",
-                                            org.sibench.capture.IndexOperationTrace.sha256(workload),
-                                            "work_units_sha256",
-                                            org.sibench.capture.WorkUnits.read(directory).sha256())));
             for (boolean secondary : new boolean[] {false, true}) {
                 List<?> previous = null;
                 for (String dispatchMode : new String[] {"operation", "transaction"}) {
                     var result =
-                            ReferenceReplay.runFiles(
+                            ReferenceReplayFixture.run(
                                     baseline,
                                     workload,
-                                    new ReplayConfig(secondary, "none", 0, 0, 0, 0, dispatchMode),
+                                    new ReplayConfig(secondary, 0, 0, 0, 0, dispatchMode),
                                     directory.resolve(
                                             "report-" + secondary + "-" + dispatchMode + ".json"));
                     var modes = (List<?>) result.get("results");
@@ -283,8 +273,6 @@ public class VersionedLookupTest {
                         assertEquals(secondary ? 9L : 3L, report.get("retained_index_versions"));
                         if (previous != null) {
                             var before = (Map<?, ?>) previous.get(mode);
-                            assertEquals(
-                                    before.get("query_digest_sha256"), report.get("query_digest_sha256"));
                             assertEquals(
                                     before.get("selected_version_checksum"),
                                     report.get("selected_version_checksum"));

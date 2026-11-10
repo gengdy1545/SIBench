@@ -1,0 +1,702 @@
+--- a/src/storage/local_storage.cpp
++++ b/src/storage/local_storage.cpp
+@@ -1,3 +1,4 @@
++#include "sibench_mutation_log.hpp"
+ #include "duckdb/transaction/local_storage.hpp"
+ #include "duckdb/catalog/catalog.hpp"
+ #include "duckdb/transaction/commit_state.hpp"
+@@ -157,7 +158,7 @@
+ 
+ ErrorData LocalTableStorage::AppendToIndexes(DuckTransaction &transaction, RowGroupCollection &source,
+                                              TableIndexList &index_list, const vector<LogicalType> &table_types,
+-                                             row_t &start_row) {
++                                             row_t &start_row, optional_ptr<SibenchMutation> sibench_mutation) {
+ 	// We only scan the indexed columns: mapped_column_ids lists them (sorted for a deterministic order),
+ 	// and the scan below produces index_chunk in that order, i.e., index_chunk.data[i] holds the data of
+ 	// the table's physical column mapped_column_ids[i].
+@@ -188,6 +189,7 @@
+ 		if (error.HasError()) {
+ 			break;
+ 		}
++		if (sibench_mutation) sibench_mutation->AppendRows(table_chunk, start_row);
+ 		start_row += UnsafeNumericCast<row_t>(index_chunk.size());
+ 	}
+ 	return error;
+@@ -463,6 +465,8 @@
+ 	storage->table_entry = &table_entry;
+ 	auto offset = NumericCast<idx_t>(MAX_ROW_ID) + storage->GetCollection().GetNextRowId();
+ 	idx_t base_id = offset + state.append_state.total_append_count;
++	SibenchMutation sibench_mutation(*storage->context.GetClientContext(), table_entry, "append", table_chunk.size());
++	sibench_mutation.BeginAppend(table_chunk, NumericCast<row_t>(base_id));
+ 
+ 	if (!storage->append_indexes.Empty()) {
+ 		auto error = storage->append_indexes.Append(storage->delete_indexes, table_chunk, NumericCast<row_t>(base_id),
+@@ -474,6 +478,7 @@
+ 
+ 	// Append the chunk to the local storage.
+ 	auto flushed_row_group_idx = storage->GetCollection().Append(table_chunk, state.append_state);
++	sibench_mutation.Complete(table_chunk.size());
+ 
+ 	// Check if we should pre-emptively flush blocks to disk.
+ 	if (flushed_row_group_idx.IsValid()) {
+@@ -488,17 +493,21 @@
+ void LocalStorage::LocalMerge(DataTable &table, DuckTableEntry &table_entry, OptimisticWriteCollection &collection) {
+ 	auto &storage = table_manager.GetOrCreateStorage(context, table);
+ 	storage.table_entry = &table_entry;
++	auto sibench_count = collection.collection->GetTotalRows();
++	SibenchMutation sibench_mutation(context, table_entry, "merge", sibench_count);
++	sibench_mutation.BeginMerge();
+ 	if (!storage.append_indexes.Empty()) {
+ 		// append data to indexes if required
+ 		row_t base_id = MAX_ROW_ID + NumericCast<row_t>(storage.GetCollection().GetNextRowId());
+ 		auto error = storage.AppendToIndexes(transaction, *collection.collection, storage.append_indexes,
+-		                                     table.GetTypes(), base_id);
++		                                     table.GetTypes(), base_id, &sibench_mutation);
+ 		if (error.HasError()) {
+ 			error.Throw();
+ 		}
+ 	}
+ 	auto &target = storage.GetPrimaryCollection();
+ 	target.MergeStorage(collection);
++	sibench_mutation.Complete(sibench_count);
+ }
+ 
+ PhysicalIndex LocalStorage::CreateOptimisticCollection(DataTable &table,
+--- a/src/include/duckdb/transaction/local_storage.hpp
++++ b/src/include/duckdb/transaction/local_storage.hpp
+@@ -14,6 +14,7 @@
+ #include "duckdb/common/reference_map.hpp"
+ 
+ namespace duckdb {
++class SibenchMutation;
+ class AttachedDatabase;
+ class Allocator;
+ class BoundConstraint;
+@@ -99,7 +100,8 @@
+ 	void AppendToIndexes(DuckTransaction &transaction, TableAppendState &append_state);
+ 	void AppendToTable(DuckTransaction &transaction, TableAppendState &append_state);
+ 	ErrorData AppendToIndexes(DuckTransaction &transaction, RowGroupCollection &source, TableIndexList &index_list,
+-	                          const vector<LogicalType> &table_types, row_t &start_row);
++	                          const vector<LogicalType> &table_types, row_t &start_row,
++	                          optional_ptr<SibenchMutation> sibench_mutation = nullptr);
+ 	void AppendToDeleteIndexes(Vector &row_ids, DataChunk &delete_chunk);
+ 
+ 	//! Create an optimistic row group collection for this table.
+--- a/src/storage/data_table.cpp
++++ b/src/storage/data_table.cpp
+@@ -1,3 +1,4 @@
++#include "sibench_mutation_log.hpp"
+ #include "duckdb/storage/data_table.hpp"
+ #include "duckdb/planner/binder.hpp"
+ #include "duckdb/storage/table/data_table_info.hpp"
+@@ -1340,6 +1341,8 @@
+ 		return 0;
+ 	}
+ 
++	SibenchMutation sibench_mutation(context, table_entry, "delete", count);
++	sibench_mutation.BeginExisting(row_identifiers);
+ 	auto &transaction = DuckTransaction::Get(context, db);
+ 	auto &local_storage = LocalStorage::Get(transaction);
+ 	auto storage = local_storage.GetStorage(*this);
+@@ -1386,6 +1389,7 @@
+ 		}
+ 		delete_count += row_groups->Delete(transaction, table_entry, ids + current_offset, current_count);
+ 	}
++	sibench_mutation.Complete(delete_count);
+ 	return delete_count;
+ }
+ 
+@@ -1499,6 +1503,9 @@
+ 	// first verify that no constraints are violated
+ 	VerifyUpdateConstraints(*state.constraint_state, context, updates, column_ids);
+ 
++	SibenchMutation sibench_mutation(context, table_entry, "update", count);
++	sibench_mutation.BeginExisting(row_ids);
++
+ 	// now perform the actual update
+ 	Vector max_row_id_vec(Value::BIGINT(MAX_ROW_ID), count_t(count));
+ 	Vector row_ids_slice(LogicalType::BIGINT);
+@@ -1531,6 +1538,7 @@
+ 		row_groups->Update(transaction, table_entry, FlatVector::GetDataMutable<row_t>(row_ids_slice), column_ids,
+ 		                   updates_slice);
+ 	}
++	sibench_mutation.CompleteUpdate(row_ids);
+ }
+ 
+ void DataTable::UpdateColumn(DuckTableEntry &table, ClientContext &context, Vector &row_ids,
+--- a/src/main/client_context_execution.cpp
++++ b/src/main/client_context_execution.cpp
+@@ -1,4 +1,5 @@
+ #include "duckdb/main/client_context.hpp"
++#include "sibench_query_log.hpp"
+ #include "duckdb/common/operator/add.hpp"
+ 
+ #include "duckdb/common/chrono.hpp"
+@@ -74,6 +75,9 @@
+ 
+ void ClientContext::BeginStatementInternal(ClientContextLock &lock, const string &query) {
+ 	transaction.SetActiveQuery(db->GetDatabaseManager().GetNewQueryNumber());
++	if (!active_query->sibench_root_query.IsValid()) {
++		active_query->sibench_root_query = transaction.GetActiveQuery();
++	}
+ 	LogQueryInternal(lock, query);
+ 	active_query->query = query;
+ }
+@@ -89,6 +93,8 @@
+ 	logging_context.query_id = transaction.GetActiveQuery();
+ 	logger = db->GetLogManager().CreateLogger(logging_context, true);
+ 	DUCKDB_LOG(*this, QueryLogType, active_query->query);
++	DUCKDB_LOG(*this, SibenchQueryLogType, active_query->sibench_root_query.GetIndex(), "begin", "running",
++	           false, false, active_query->query, "");
+ }
+ 
+ ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success, bool invalidate_transaction,
+@@ -98,6 +104,7 @@
+ 	}
+ 	active_query->progress_bar.reset();
+ 	D_ASSERT(active_query.get());
++	auto sibench_root_query = active_query->sibench_root_query;
+ 	active_query.reset();
+ 	query_deadline.SetInvalid();
+ 	query_progress.Initialize();
+@@ -132,6 +139,14 @@
+ 
+ 	client_data->profiler->EndQuery();
+ 
++	if (sibench_root_query.IsValid()) {
++		auto query_error = error.HasError() ? &error : previous_error.get();
++		auto failed = query_error && query_error->HasError();
++		DUCKDB_LOG(*this, SibenchQueryLogType, sibench_root_query.GetIndex(), "end",
++		           failed ? "failed" : (success ? "completed" : "abandoned"), true, invalidate_transaction,
++		           "", failed ? query_error->RawMessage() : "");
++	}
++
+ 	// Refresh the logger
+ 	logger->Flush();
+ 	LoggingContext context(LogContextScope::CONNECTION);
+@@ -537,6 +552,8 @@
+ }
+ 
+ void ClientContext::EndStatementInternal(ClientContextLock &lock) {
++	DUCKDB_LOG(*this, SibenchQueryLogType, active_query->sibench_root_query.GetIndex(), "end", "completed",
++	           false, false, "", "");
+ 	active_query->executor->CancelTasks();
+ 	active_query->executor.reset();
+ 	active_query->progress_bar.reset();
+--- a/src/include/duckdb/main/active_query_context.hpp
++++ b/src/include/duckdb/main/active_query_context.hpp
+@@ -27,6 +27,7 @@
+ 	explicit ActiveQueryContext(PreprocessedStatement statements_p) : statements(std::move(statements_p.statements)) {
+ 	}
+ 
++	optional_idx sibench_root_query;
+ 	//! The text of the statement that is running
+ 	string query;
+ 	//! Prepared statement data of the statement that is running
+--- a/src/function/table/table_scan.cpp
++++ b/src/function/table/table_scan.cpp
+@@ -1,4 +1,9 @@
+ #include "duckdb/function/table/table_scan.hpp"
++#include "duckdb/logging/logger.hpp"
++#include "sibench_index_log.hpp"
++#include "sibench_index_rows_log.hpp"
++#include "sibench_scan_consumption.hpp"
++#include "duckdb/parser/constraints/unique_constraint.hpp"
+ #include "duckdb/catalog/catalog.hpp"
+ #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+ 
+@@ -125,10 +130,6 @@
+ 	DataChunk all_columns;
+ 	//! The row fetch state.
+ 	ColumnFetchState fetch_state;
+-	//! The current position in the local storage scan.
+-	TableScanState scan_state;
+-	//! The column IDs of the local storage scan.
+-	vector<StorageIndex> column_ids;
+ 	bool in_charge_of_final_stretch {false};
+ 	idx_t rows_scanned = 0;
+ };
+@@ -176,6 +177,50 @@
+ 	DuckIndexScanState(ClientContext &context, const FunctionData *bind_data_p)
+ 	    : TableScanGlobalState(context, bind_data_p), next_batch_index(0), arena(Allocator::Get(context)),
+ 	      row_ids(nullptr), row_id_count(0), finished_first_phase(false), started_last_phase(false) {
++	}
++
++	idx_t sibench_access_id = 0;
++	atomic<idx_t> sibench_next_batch {0};
++	idx_t sibench_rowid_column = 0;
++	optional_idx sibench_primary_column;
++	string sibench_primary_type;
++	shared_ptr<Logger> sibench_logger;
++	atomic<bool> sibench_local_drained {false};
++
++	~DuckIndexScanState() override {
++		if (!sibench_logger) {
++			return;
++		}
++		try {
++			vector<Value> empty;
++			DUCKDB_LOG(sibench_logger, SibenchIndexRowsLogType, sibench_access_id, 0, "closed", 0, 0,
++			           empty, empty, sibench_primary_type, empty, finished_first_phase && sibench_local_drained);
++		} catch (...) {
++			// The capture consumer must reject an adopted access without its closing record.
++		}
++	}
++
++	void SibenchRows(const char *phase, idx_t offset, idx_t candidates, DataChunk &chunk) {
++		if (!sibench_logger) {
++			return;
++		}
++		auto batch_id = ++sibench_next_batch;
++		if (SibenchBatchScope::current) {
++			SibenchBatchScope::current->batch = {sibench_access_id, batch_id, chunk.size()};
++		}
++		vector<Value> candidate_rows, row_ids, keys;
++		for (idx_t i = 0; i < candidates; i++) {
++			candidate_rows.push_back(Value::BIGINT(this->row_ids[offset + i]));
++		}
++
++		for (idx_t i = 0; i < chunk.size(); i++) {
++			row_ids.push_back(chunk.GetValue(sibench_rowid_column, i));
++			if (sibench_primary_column.IsValid()) {
++				keys.emplace_back(chunk.GetValue(sibench_primary_column.GetIndex(), i).ToSQLString());
++			}
++		}
++		DUCKDB_LOG(sibench_logger, SibenchIndexRowsLogType, sibench_access_id, batch_id, phase, offset, candidates,
++		           candidate_rows, row_ids, sibench_primary_type, keys, false);
+ 	}
+ 
+ 	//! The batch index of the next Sink.
+@@ -194,6 +239,8 @@
+ 	bool started_last_phase;
+ 	//! Synchronize changes to the global index scan state.
+ 	mutex index_scan_lock;
++	//! One local snapshot, initialized before any worker can emit rows to a mutating sink.
++	unique_ptr<TableScanState> statement_local_scan;
+ 	//! Keep ART rowids and row-group trees paired while rowid-shifting index vacuum can run.
+ 	unique_ptr<StorageLockKey> vacuum_lock;
+ 
+@@ -201,10 +248,9 @@
+ 	unique_ptr<LocalTableFunctionState> InitLocalState(ExecutionContext &context,
+ 	                                                   TableFunctionInitInput &input) override {
+ 		auto l_state = make_uniq<IndexScanLocalState>();
+-		if (input.CanRemoveFilterColumns()) {
++		if (CanRemoveFilterColumns()) {
+ 			l_state->all_columns.Initialize(context.client, scanned_types);
+ 		}
+-		l_state->scan_state.options.force_fetch_row = Settings::Get<DebugForceFetchRowSetting>(context.client);
+ 
+ 		// Initialize the local storage scan.
+ 		auto &bind_data = input.bind_data->Cast<TableScanBindData>();
+@@ -212,11 +258,18 @@
+ 		auto &storage = duck_table.GetStorage();
+ 		auto &local_storage = LocalStorage::Get(context.client, duck_table.catalog);
+ 
+-		for (const auto &col_idx : input.column_indexes) {
+-			l_state->column_ids.push_back(bind_data.table.GetStorageIndex(col_idx));
+-		}
+-		l_state->scan_state.Initialize(l_state->column_ids, context.client, input.filters.get());
+-		local_storage.InitializeScan(storage, l_state->scan_state.local_state, input.filters);
++		{
++			lock_guard<mutex> guard(index_scan_lock);
++			if (!statement_local_scan) {
++				auto snapshot = make_uniq<TableScanState>();
++				snapshot->options.force_fetch_row = Settings::Get<DebugForceFetchRowSetting>(context.client);
++				snapshot->Initialize(column_ids, context.client, input.filters.get());
++				local_storage.InitializeScan(storage, snapshot->local_state, input.filters);
++				// Late workers must not include rows appended by this statement's own UPDATE.
++				statement_local_scan = std::move(snapshot);
++				if (local_storage.AddedRows(storage) == 0) sibench_local_drained = true;
++			}
++		}
+ 		return std::move(l_state);
+ 	}
+ 
+@@ -272,6 +325,7 @@
+ 				if (CanRemoveFilterColumns()) {
+ 					l_state.all_columns.Reset();
+ 					storage.Fetch(tx, l_state.all_columns, column_ids, local_vector, scan_count, l_state.fetch_state);
++					SibenchRows("storage", offset, scan_count, l_state.all_columns);
+ 					output.ReferenceColumns(l_state.all_columns, projection_ids);
+ 				} else {
+ 					storage.Fetch(tx, output, column_ids, local_vector, scan_count, l_state.fetch_state);
+@@ -297,10 +351,14 @@
+ 				{
+ 					if (CanRemoveFilterColumns()) {
+ 						l_state.all_columns.Reset();
+-						local_storage.Scan(l_state.scan_state.local_state, column_ids, l_state.all_columns);
++						local_storage.Scan(statement_local_scan->local_state, column_ids, l_state.all_columns);
++						SibenchRows("local", 0, 0, l_state.all_columns);
+ 						output.ReferenceColumns(l_state.all_columns, projection_ids);
+ 					} else {
+-						local_storage.Scan(l_state.scan_state.local_state, column_ids, output);
++						local_storage.Scan(statement_local_scan->local_state, column_ids, output);
++					}
++					if (output.size() == 0) {
++						sibench_local_drained = true;
+ 					}
+ 					l_state.rows_scanned += output.size();
+ 				}
+@@ -706,7 +764,7 @@
+ 
+ unique_ptr<GlobalTableFunctionState> DuckIndexScanInitGlobal(ClientContext &context, TableFunctionInitInput &input,
+                                                              const TableScanBindData &bind_data, set<row_t> &row_ids,
+-                                                             unique_ptr<StorageLockKey> vacuum_lock) {
++                                                             unique_ptr<StorageLockKey> vacuum_lock, idx_t sibench_access_id) {
+ 	auto g_state = make_uniq<DuckIndexScanState>(context, input.bind_data.get());
+ 	g_state->vacuum_lock = std::move(vacuum_lock);
+ 	g_state->finished_first_phase = row_ids.empty() ? true : false;
+@@ -737,6 +795,32 @@
+ 			g_state->scanned_types.emplace_back(col_idx.GetScanType());
+ 		} else {
+ 			g_state->scanned_types.push_back(columns.GetColumn(col_idx.ToLogical()).Type());
++		}
++	}
++
++	if (sibench_access_id && Logger::Get(context).ShouldLog(SibenchIndexRowsLogType::NAME,
++	                                                       SibenchIndexRowsLogType::LEVEL)) {
++		g_state->sibench_access_id = sibench_access_id;
++		g_state->sibench_logger = context.logger;
++		if (g_state->projection_ids.empty()) {
++			for (idx_t i = 0; i < g_state->column_ids.size(); i++) {
++				g_state->projection_ids.push_back(i);
++			}
++		}
++		g_state->sibench_rowid_column = g_state->column_ids.size();
++		g_state->column_ids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
++		g_state->scanned_types.push_back(LogicalType::ROW_TYPE);
++		auto primary = duck_table.GetPrimaryKey();
++		if (primary) {
++			auto keys = primary->Cast<UniqueConstraint>().GetLogicalIndexes(columns);
++			if (keys.size() == 1) {
++				auto column = ColumnIndex(keys[0].index);
++				g_state->sibench_primary_column = g_state->column_ids.size();
++				g_state->column_ids.push_back(bind_data.table.GetStorageIndex(column));
++				auto type = columns.GetColumn(keys[0]).Type();
++				g_state->scanned_types.push_back(type);
++				g_state->sibench_primary_type = type.ToString();
++			}
+ 		}
+ 	}
+ 
+@@ -905,7 +989,7 @@
+ }
+ 
+ bool TryScanIndex(const IndexReadHandle<ART> &art, const ColumnList &column_list, TableFunctionInitInput &input,
+-                  TableFilterSet &filter_set, idx_t max_count, set<row_t> &row_ids) {
++                  TableFilterSet &filter_set, idx_t max_count, set<row_t> &row_ids, SibenchIndexAttempt &attempt) {
+ 	// FIXME: No support for index scans on compound ARTs.
+ 	// See note above on multi-filter support.
+ 	if (art->UnboundExpressionCount() > 1) {
+@@ -960,7 +1044,7 @@
+ 			return false;
+ 		}
+ 
+-		if (!art->Scan(*scan_state, max_count, row_ids)) {
++		if (!attempt.Scan(art, *scan_state, max_count, row_ids, "base")) {
+ 			row_ids.clear();
+ 			return false;
+ 		}
+@@ -975,7 +1059,8 @@
+ 			}
+ 
+ 			// Check if we can use an index scan, and already retrieve the matching row ids.
+-			if (!delta_index->Scan(*delta_scan_state, max_count, row_ids)) {
++			if (!attempt.Scan(delta_index, *delta_scan_state, max_count, row_ids,
++			                  delta == IndexDeltaType::DELETED_ROWS_IN_USE ? "deleted_rows" : "checkpoint_added")) {
+ 				row_ids.clear();
+ 				return false;
+ 			}
+@@ -1033,6 +1118,7 @@
+ 
+ 	auto &column_list = duck_table.GetColumns();
+ 	bool index_scan = false;
++	idx_t sibench_access_id = 0;
+ 	set<row_t> row_ids;
+ 
+ 	info->BindIndexes(context, ART::TYPE_NAME);
+@@ -1052,8 +1138,24 @@
+ 			continue;
+ 		}
+ 		auto index = entry->GetReadHandle<ART>();
+-		index_scan = TryScanIndex(index, column_list, input, filter_set, max_count, row_ids);
++		SibenchIndexAttempt attempt(Logger::Get(context).ShouldLog(SibenchIndexLogType::NAME, SibenchIndexLogType::LEVEL));
++		index_scan = TryScanIndex(index, column_list, input, filter_set, max_count, row_ids, attempt);
++		if (attempt.scan_calls) {
++			auto &transaction = DuckTransaction::Get(context, attached);
++			vector<Value> index_columns;
++			for (auto column : index->GetColumnIds()) {
++				auto &definition = column_list.GetColumn(PhysicalIndex(column));
++				index_columns.push_back(Value::STRUCT({{"name", Value(definition.Name().GetIdentifierName())},
++				                                       {"type", Value(definition.Type().ToString())}}));
++			}
++			DUCKDB_LOG(context, SibenchIndexLogType, attached.name.GetIdentifierName(),
++			           info->GetSchemaName().GetIdentifierName(), info->GetTableName().GetIdentifierName(),
++			           index->GetIndexName().GetIdentifierName(), index->IsPrimary(),
++			           index->CopyUnboundExpression(0)->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF,
++			           index_columns, index_scan, transaction.start_time, max_count, attempt);
++		}
+ 		if (index_scan) {
++			sibench_access_id = attempt.access_id;
+ 			// found an index - break
+ 			break;
+ 		}
+@@ -1062,7 +1164,7 @@
+ 	if (!index_scan) {
+ 		return DuckTableScanInitGlobal(context, input, storage, bind_data);
+ 	}
+-	return DuckIndexScanInitGlobal(context, input, bind_data, row_ids, std::move(vacuum_lock));
++	return DuckIndexScanInitGlobal(context, input, bind_data, row_ids, std::move(vacuum_lock), sibench_access_id);
+ }
+ 
+ static unique_ptr<BaseStatistics> TableScanStatistics(ClientContext &context, TableFunctionGetStatisticsInput &input) {
+--- a/src/logging/log_manager.cpp
++++ b/src/logging/log_manager.cpp
+@@ -1,3 +1,9 @@
++#include "sibench_index_log.hpp"
++#include "sibench_index_rows_log.hpp"
++#include "sibench_scan_consumption.hpp"
++#include "sibench_transaction_log.hpp"
++#include "sibench_query_log.hpp"
++#include "sibench_mutation_log.hpp"
+ #include "duckdb/logging/log_type.hpp"
+ #include "duckdb/logging/log_manager.hpp"
+ #include "duckdb/logging/log_storage.hpp"
+@@ -276,6 +282,12 @@
+ }
+ 
+ void LogManager::RegisterDefaultLogTypes() {
++	RegisterLogType(make_uniq<SibenchIndexLogType>());
++	RegisterLogType(make_uniq<SibenchIndexRowsLogType>());
++	RegisterLogType(make_uniq<SibenchConsumptionLogType>());
++	RegisterLogType(make_uniq<SibenchTransactionLogType>());
++	RegisterLogType(make_uniq<SibenchQueryLogType>());
++	RegisterLogType(make_uniq<SibenchMutationLogType>());
+ 	RegisterLogType(make_uniq<DefaultLogType>());
+ 	RegisterLogType(make_uniq<FileSystemLogType>());
+ 	RegisterLogType(make_uniq<HTTPLogType>());
+--- a/src/transaction/duck_transaction_manager.cpp
++++ b/src/transaction/duck_transaction_manager.cpp
+@@ -1,4 +1,5 @@
+ #include "duckdb/transaction/duck_transaction_manager.hpp"
++#include "sibench_transaction_log.hpp"
+ #include "duckdb/logging/log_manager.hpp"
+ 
+ #include "duckdb/main/client_data.hpp"
+@@ -102,6 +103,13 @@
+ 
+ 	// store it in the set of active transactions
+ 	active_transactions.push_back(std::move(transaction));
++	if (!db.IsSystem() && !db.IsTemporary()) {
++		DUCKDB_LOG(context, SibenchTransactionLogType, db.name.GetIdentifierName(), "begin",
++		           transaction_id, start_time, 0, 0);
++		if (Logger::Get(context).ShouldLog(SibenchTransactionLogType::NAME, SibenchTransactionLogType::LEVEL)) {
++			transaction_ref.sibench_logger = context.logger;
++		}
++	}
+ 	return transaction_ref;
+ }
+ 
+@@ -408,6 +416,11 @@
+ 		transaction.commit_id = 0;
+ 
+ 		auto rollback_error = transaction.Rollback();
++		if (!rollback_error.HasError() && !db.IsSystem() && !db.IsTemporary()) {
++			auto logger = transaction.sibench_logger ? transaction.sibench_logger : context.logger;
++			DUCKDB_LOG(logger, SibenchTransactionLogType, db.name.GetIdentifierName(), "rollback",
++			           transaction.GetTransactionId(), transaction.start_time, 0, ++sibench_resolution_order);
++		}
+ 		if (rollback_error.HasError()) {
+ 			throw FatalException(
+ 			    "Failed to rollback transaction. Cannot continue operation.\nOriginal Error: %s\nRollback Error: %s",
+@@ -416,6 +429,11 @@
+ 	} else {
+ 		DUCKDB_LOG(context, TransactionLogType, db, "Commit", info.commit_id);
+ 		last_commit = info.commit_id;
++		if (!db.IsSystem() && !db.IsTemporary()) {
++			auto logger = transaction.sibench_logger ? transaction.sibench_logger : context.logger;
++			DUCKDB_LOG(logger, SibenchTransactionLogType, db.name.GetIdentifierName(), "commit",
++			           transaction.GetTransactionId(), transaction.start_time, info.commit_id, ++sibench_resolution_order);
++		}
+ 
+ 		// check if catalog changes were made
+ 		if (transaction.catalog_version >= TRANSACTION_ID_START) {
+@@ -490,6 +508,15 @@
+ 		// Obtain the transaction lock and roll back.
+ 		lock_guard<mutex> t_lock(transaction_lock);
+ 		error = transaction.Rollback();
++		if (!error.HasError() && !db.IsSystem() && !db.IsTemporary()) {
++			auto context = transaction.context.lock();
++			auto logger = transaction.sibench_logger;
++			if (!logger && context) logger = context->logger;
++			if (logger) {
++				DUCKDB_LOG(logger, SibenchTransactionLogType, db.name.GetIdentifierName(), "rollback",
++				           transaction.GetTransactionId(), transaction.start_time, 0, ++sibench_resolution_order);
++			}
++		}
+ 
+ 		// Remove the transaction from the list of active transactions and gather cleanup information.
+ 		QueueCleanup(RemoveTransaction(transaction, CreateCleanupInfo()));
+--- a/src/execution/index/art/art.cpp
++++ b/src/execution/index/art/art.cpp
+@@ -1,3 +1,4 @@
++#include "sibench_index_log.hpp"
+ #include "duckdb/execution/index/art/art.hpp"
+ #include "duckdb/main/attached_database.hpp"
+ 
+@@ -42,6 +43,20 @@
+ 	//! All scanned row IDs.
+ 	set<row_t> row_ids;
+ };
++
++Value SibenchArtPredicates(IndexScanState &state) {
++	auto &scan = state.Cast<ARTIndexScanState>();
++	vector<Value> predicates;
++	for (idx_t i = 0; i < 2; i++) {
++		if (scan.values[i].IsNull()) {
++			continue;
++		}
++		predicates.push_back(Value::STRUCT({{"comparison", Value(ExpressionTypeToString(scan.expressions[i]))},
++		                                    {"value_type", Value(scan.values[i].type().ToString())},
++		                                    {"value_sql", Value(scan.values[i].ToSQLString())}}));
++	}
++	return Value::LIST(SibenchPredicateType(), predicates);
++}
+ 
+ //===--------------------------------------------------------------------===//
+ // ART
+--- a/src/include/duckdb/transaction/duck_transaction_manager.hpp
++++ b/src/include/duckdb/transaction/duck_transaction_manager.hpp
+@@ -84,6 +84,8 @@
+ 	void PushAttach(Transaction &transaction_p, AttachedDatabase &db);
+ 
+ protected:
++	//! Capture ordering only; guarded by transaction_lock and never used for data visibility.
++	uint64_t sibench_resolution_order = 0;
+ 	struct CheckpointDecision {
+ 		explicit CheckpointDecision(string reason_p);
+ 		explicit CheckpointDecision(CheckpointType type);
+--- a/src/include/duckdb/transaction/duck_transaction.hpp
++++ b/src/include/duckdb/transaction/duck_transaction.hpp
+@@ -33,11 +33,16 @@
+ 	optional_ptr<CommitDropState> drop_state;
+ };
+ 
++class Logger;
++
+ class DuckTransaction : public Transaction {
+ public:
+ 	DuckTransaction(DuckTransactionManager &manager, ClientContext &context, transaction_t start_time,
+ 	                SnapshotView view, idx_t catalog_version);
+ 	~DuckTransaction() override;
++
++	//! Retain logging context for rollback after ClientContext destruction begins.
++	shared_ptr<Logger> sibench_logger;
+ 
+ 	//! The start timestamp of this transaction
+ 	transaction_t start_time;
+--- a/src/include/duckdb/parallel/pipeline_executor.hpp
++++ b/src/include/duckdb/parallel/pipeline_executor.hpp
+@@ -7,6 +7,8 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #pragma once
++
++#include "sibench_scan_consumption.hpp"
+ 
+ #include "duckdb/common/types/data_chunk.hpp"
+ #include "duckdb/parallel/interrupt.hpp"
+@@ -56,6 +58,7 @@
+ 
+ //! The Pipeline class represents an execution pipeline
+ class PipelineExecutor {
++	SibenchIndexBatch sibench_batch;
+ public:
+ 	PipelineExecutor(ClientContext &context, Pipeline &pipeline, optional_idx reserved_batch_index = optional_idx());
+ 
+--- a/src/parallel/pipeline_executor.cpp
++++ b/src/parallel/pipeline_executor.cpp
+@@ -78,6 +78,7 @@
+ }
+ 
+ void PipelineExecutor::Reset() {
++	sibench_batch = {};
+ 	auto allow_reuse = Settings::Get<EnableCachingOperatorsSetting>(context.client);
+ 
+ 	// Reset execution flags
+@@ -538,6 +539,12 @@
+ }
+ 
+ void PipelineExecutor::FinishProcessing(int32_t operator_idx) {
++	if (sibench_batch.access) {
++		auto name = operator_idx > 0 ? pipeline.operators[operator_idx - 1].get().GetName()
++		                            : pipeline.sink ? pipeline.sink->GetName() : "pipeline";
++		DUCKDB_LOG(context.client, SibenchConsumptionLogType, sibench_batch, "stop", name,
++		           operator_idx == 1 || (operator_idx < 0 && pipeline.operators.empty()), sibench_batch.rows, 0);
++	}
+ 	finished_processing_idx = operator_idx < 0 ? NumericLimits<int32_t>::Maximum() : operator_idx;
+ 	in_process_operators = stack<idx_t>();
+ 
+@@ -777,6 +784,7 @@
+ 			// if current_idx > source_idx, we pass the previous operators' output through the Execute of the current
+ 			// operator
+ 			StartOperator(current_operator);
++			SibenchBatchScope sibench_scope(sibench_batch, operator_idx == 0);
+ 			auto result = current_operator.Execute(context, prev_chunk, current_chunk, *current_operator.op_state,
+ 			                                       *intermediate_states[current_intermediate - 1]);
+ 			EndOperator(current_operator, &current_chunk);
+@@ -842,6 +850,7 @@
+ 		return SinkResultType::BLOCKED;
+ 	}
+ #endif
++	SibenchBatchScope sibench_scope(sibench_batch, pipeline.operators.empty());
+ 	return pipeline.sink->Sink(context, chunk, input);
+ }
+ 
+@@ -856,6 +865,8 @@
+ }
+ 
+ PipelineExecutor::SourceFetchResult PipelineExecutor::FetchFromSource(DataChunk &result) {
++	sibench_batch = {};
++	SibenchBatchScope sibench_scope(sibench_batch, true);
+ 	D_ASSERT(!pipeline.IsExternalInput());
+ 	D_ASSERT(global_source_state);
+ 	D_ASSERT(local_source_state);
+--- a/src/execution/operator/helper/physical_streaming_limit.cpp
++++ b/src/execution/operator/helper/physical_streaming_limit.cpp
+@@ -1,3 +1,4 @@
++#include "sibench_scan_consumption.hpp"
+ #include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
+ #include "duckdb/execution/operator/helper/physical_limit.hpp"
+ 
+@@ -49,8 +50,11 @@
+ 	idx_t max_element;
+ 	if (!PhysicalLimit::ComputeOffset(context, input, limit, offset, current_offset, max_element, limit_val,
+ 	                                  offset_val)) {
++		SibenchLimitConsumption(context.client, "STREAMING_LIMIT", input.size(), 0);
+ 		return OperatorResultType::FINISHED;
+ 	}
++	SibenchLimitConsumption(context.client, "STREAMING_LIMIT", input.size(),
++	                       MinValue<idx_t>(input.size(), max_element - current_offset));
+ 	if (PhysicalLimit::HandleOffset(input, current_offset, offset.GetIndex(), limit.GetIndex())) {
+ 		chunk.Reference(input);
+ 	}
+--- a/src/execution/operator/helper/physical_limit.cpp
++++ b/src/execution/operator/helper/physical_limit.cpp
+@@ -1,3 +1,4 @@
++#include "sibench_scan_consumption.hpp"
+ #include "duckdb/execution/operator/helper/physical_limit.hpp"
+ 
+ #include "duckdb/common/algorithm.hpp"
+@@ -118,8 +119,11 @@
+ 
+ 	idx_t max_element;
+ 	if (!ComputeOffset(context, chunk, limit, offset, state.current_offset, max_element, limit_val, offset_val)) {
++		SibenchLimitConsumption(context.client, "LIMIT", chunk.size(), 0);
+ 		return SinkResultType::FINISHED;
+ 	}
++	SibenchLimitConsumption(context.client, "LIMIT", chunk.size(),
++	                       MinValue<idx_t>(chunk.size(), max_element - state.current_offset));
+ 	auto max_cardinality = max_element - state.current_offset;
+ 	if (max_cardinality < chunk.size()) {
+ 		// truncate the chunk to the first max_cardinality rows

@@ -13,7 +13,7 @@ import java.util.*;
 
 public class IndexCatalogTest {
     @Test
-    public void sourceCatalogCoversEveryIndexAndEncodesPostgresValues() throws Exception {
+    public void sourceCatalogCoversEveryIndexAndEncodesNativeValues() throws Exception {
         var catalog = IndexCatalog.fromSchema(org.sibench.schema.SourceSchema.hybench(Path.of("benchmark/HyBench-2024")));
         assertEquals(21, catalog.definitions().size());
         assertEquals(3, catalog.secondary(5).size());
@@ -23,26 +23,16 @@ public class IndexCatalogTest {
         assertEquals(
                 IndexKey.parse("timestamp", "2024-01-01T00:00"),
                 catalog.named("idx_loanapps_2").encode("2024-01-01 00:00:00"));
-        // CHAR(n) compares without trailing spaces; other whitespace and VARCHAR spaces stay.
-        assertEquals(IndexKey.ofText("value"), catalog.named("idx_transfer_3").encode("value   "));
+        // DuckDB CHAR is a VARCHAR alias; trailing spaces remain significant.
+        assertEquals(IndexKey.ofText("value   "), catalog.named("idx_transfer_3").encode("value   "));
         assertEquals(
-                IndexKey.ofText("value\t"), catalog.named("idx_transfer_3").encode("value\t "));
+                IndexKey.ofText("value\t "), catalog.named("idx_transfer_3").encode("value\t "));
         assertEquals(IndexKey.ofText("value "), catalog.named("idx_company_1").encode("value "));
         assertTrue(catalog.named("idx_transfer_3").encode(null).isNull());
         assertThrows(
                 IOException.class,
                 () -> catalog.named("idx_loanapps_2").encode("not a timestamp"));
-        // Scan keys must come from the column's own btree family.
-        assertEquals(
-                IndexKey.parse("timestamp", "2024-01-02 00:00:00"),
-                catalog.named("idx_loanapps_2").encodeScanKey(1082, "2024-01-02"));
-        assertEquals(IndexKey.ofInt(7), catalog.named("idx_transfer_1").encodeScanKey(20, "7"));
-        assertThrows(
-                IOException.class,
-                () -> catalog.named("idx_transfer_1").encodeScanKey(25, "7"));
-        assertThrows(
-                IOException.class,
-                () -> catalog.named("idx_transfer_1").encodeScanKey(1700, "7"));
+
     }
 
     @Test
@@ -52,6 +42,22 @@ public class IndexCatalogTest {
         IndexCatalog.fromManifest(manifest);
         manifest.addProperty("source_commit", "different-build-of-the-same-schema");
         assertThrows(IOException.class, () -> IndexCatalog.fromManifest(manifest));
+    }
+
+    @Test
+    public void consumesAnEmbeddedCatalogWithoutTheSourceCheckoutAndRejectsConflictingIdentities() throws Exception {
+        var catalog = IndexCatalog.fromSchema(org.sibench.schema.SourceSchema.hybench(Path.of("benchmark/HyBench-2024")));
+        var manifest = new com.google.gson.Gson().toJsonTree(catalog.provenance()).getAsJsonObject();
+        manifest.addProperty("source_directory", "/missing/generation-host/source-checkout");
+        assertEquals(catalog.definitions(), IndexCatalog.fromManifest(manifest).definitions());
+        var duplicate = manifest.deepCopy();
+        duplicate.getAsJsonArray("index_definitions").add(duplicate.getAsJsonArray("index_definitions").get(0).deepCopy());
+        duplicate.addProperty("catalog_sha256", IndexCatalog.identity(duplicate));
+        assertThrows(IOException.class, () -> IndexCatalog.fromManifest(duplicate));
+        var hole = manifest.deepCopy();
+        hole.getAsJsonArray("index_definitions").get(0).getAsJsonObject().addProperty("index_id", 99);
+        hole.addProperty("catalog_sha256", IndexCatalog.identity(hole));
+        assertThrows(IOException.class, () -> IndexCatalog.fromManifest(hole));
     }
 
     @Test

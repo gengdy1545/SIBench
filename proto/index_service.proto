@@ -1,0 +1,44 @@
+// Versioned index data API. ACK means visible through the same service instance.
+// Persistence and storage maintenance are internal service responsibilities.
+syntax = "proto3";
+
+package sibench.index;
+
+option java_multiple_files = true;
+option java_package = "org.sibench.adapters.proto";
+
+import "index_types.proto";
+
+service IndexService {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (WriteResponse);
+  rpc Delete(DeleteRequest) returns (WriteResponse);
+  rpc Scan(ScanRequest) returns (stream ScanResponse);
+  rpc BatchWrite(BatchWriteRequest) returns (WriteResponse);
+}
+
+// Exact index identity, including the PK for a secondary entry. Version zero is valid.
+message GetRequest { EntryKey key = 1; uint64 read_version = 2; }
+// A missing result means not found; RowID/Locator zero remains a valid value.
+message GetResponse { Result result = 1; }
+message PutRequest { EntryKey key = 1; uint64 version = 2; Value value = 3; }
+message DeleteRequest { EntryKey key = 1; uint64 version = 2; }
+message Mutation { oneof operation { PutRequest put = 1; DeleteRequest delete = 2; } }
+// Success covers all members. No atomic visibility or rollback is promised.
+// Invalid input is refused before application; execution failure may be partial.
+message BatchWriteRequest { repeated Mutation mutations = 1; }
+message WriteResponse {}
+
+// Bounds use the primary key for index 0 and the indexed value otherwise.
+// Results select the latest version <= read_version, excluding selected deletions.
+message ScanRequest {
+  uint32 table = 1;
+  uint32 index = 2;
+  Bound lower = 3;
+  Bound upper = 4;
+  bool descending = 5;
+  uint64 limit = 6; // 0: unbounded
+  uint64 read_version = 7;
+}
+// Concatenate chunks in order. Only normal gRPC completion establishes success.
+message ScanResponse { repeated Result results = 1; }

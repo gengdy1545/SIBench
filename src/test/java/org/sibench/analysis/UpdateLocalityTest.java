@@ -9,10 +9,12 @@ import org.junit.rules.TemporaryFolder;
 import org.sibench.capture.IndexCatalog;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
+import org.sibench.capture.ProtoTrace;
 import org.sibench.trace.IndexKey;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -26,21 +28,93 @@ import java.util.zip.GZIPInputStream;
 public class UpdateLocalityTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
-    @Test
-    public void fusedWorkloadReadRejectsAChangedButWellFormedInput() throws Exception {
-        Path file = temporary.newFolder().toPath().resolve("workload.ops");
-        var original = new IndexOperationTrace.Writer(file);
-        try (var writer = original) {
-            writer.append(primary(1, IndexOperationTrace.BUSINESS_UPDATE, IndexOperationTrace.UPSERT, 1, 1));
+    @Test public void exportedAbortedSourceKeepsSnapshotQueriesWithoutMaintenance() throws Exception {
+        var operations = new ArrayList<Operation>();
+        for (long version = 1; version <= 2; version++) {
+            operations.add(IndexOperationTrace.transaction(version, IndexOperationTrace.TRANSACTION_BEGIN, version, version, 0));
+            operations.add(IndexOperationTrace.search(version, 1, 0,
+                    IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), version - 1, 1,
+                    IndexOperationTrace.SNAPSHOT_SEARCH).withTransaction(version, 0).withWorkUnitId(version));
+            var write = IndexOperationTrace.write(version, IndexOperationTrace.UPSERT, 1,
+                    IndexOperationTrace.BUSINESS_UPDATE, IndexKey.ofInt(1), version, 0, 0, 101)
+                    .withTransaction(version, 1).withWorkUnitId(version);
+            org.sibench.capture.IndexMutation.emit(write, Map.of(1, IndexKey.ofInt(10)), Map.of(1, IndexKey.ofInt(10)), operations::add);
+            operations.add(IndexOperationTrace.transaction(version,
+                    version == 1 ? IndexOperationTrace.TRANSACTION_ABORT : IndexOperationTrace.TRANSACTION_COMMIT,
+                    version, version, 1));
         }
-        String expected = original.sha256();
-        var source = IndexOperationTrace.Source.file(file, expected);
-        source.read(operation -> {});
-        Files.delete(file);
-        try (var writer = new IndexOperationTrace.Writer(file)) {
-            writer.append(primary(2, IndexOperationTrace.BUSINESS_UPDATE, IndexOperationTrace.UPSERT, 1, 1));
+        var selected = new ArrayList<Operation>();
+        IndexOperationTrace.Source source = export(operations);
+        assertEquals(8, UpdateLocality.committed(source).read(selected::add));
+        assertEquals(4, selected.stream().filter(IndexOperationTrace::isControl).count());
+        assertEquals(2, selected.stream().filter(operation -> operation.kind() == IndexOperationTrace.SEARCH).count());
+        var writes = selected.stream().filter(IndexOperationTrace::isMutation).toList();
+        assertEquals(2, writes.size());
+        assertTrue(writes.stream().allMatch(write -> write.version() == 2));
+        assertThrows(IOException.class, () -> UpdateLocality.committed(consumer -> {
+            for (var operation : selected.subList(0, selected.size() - 1)) consumer.accept(operation);
+            return selected.size() - 1;
+        }).read(ignored -> {}));
+    }
+
+    private IndexOperationTrace.Source export(List<Operation> operations) throws Exception {
+        Path file = temporary.newFolder().toPath().resolve("workload.pb.zst");
+        try (var writer = new ProtoTrace.Writer(file)) {
+            for (var operation : operations) writer.append(operation);
         }
-        assertThrows(java.io.IOException.class, () -> source.read(operation -> {}));
+        return consumer -> ProtoTrace.read(file, null, null, consumer);
+    }
+
+    @Test public void finalSecondaryChangesStayWithTheirPrimaryAcrossWindows() throws Exception {
+        var operations = new ArrayList<Operation>();
+        operations.add(IndexOperationTrace.transaction(1, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
+        // Row 1 moves A -> B -> C, with row 2's A -> D update between those source changes.
+        for (int[] update : List.of(new int[] {1, 1, 10, 20}, new int[] {2, 2, 10, 40},
+                new int[] {3, 1, 20, 30})) {
+            var write = IndexOperationTrace.write(update[0], IndexOperationTrace.UPSERT, 1,
+                    IndexOperationTrace.BUSINESS_UPDATE, IndexKey.ofInt(update[1]), 1, 0, 0, 100 + update[1])
+                    .withTransaction(1, update[0]).withWorkUnitId(1);
+            org.sibench.capture.IndexMutation.emit(write, Map.of(1, IndexKey.ofInt(update[2])),
+                    Map.of(1, IndexKey.ofInt(update[3])), operations::add);
+        }
+        operations.add(IndexOperationTrace.transaction(4, IndexOperationTrace.TRANSACTION_COMMIT, 1, 1, 3));
+        var source = export(operations);
+        var encoded = new ArrayList<Operation>();
+        source.read(encoded::add);
+        assertEquals(IndexOperationTrace.LOGICAL_DELETE, encoded.get(1).kind());
+        assertEquals(1, encoded.get(1).index()); // Final Trace legitimately starts with secondary A's delete.
+        var grouped = new ArrayList<Operation>();
+        assertEquals(9, UpdateLocality.committed(source).read(grouped::add));
+        var writes = grouped.stream().filter(IndexOperationTrace::isMutation).toList();
+        assertEquals(List.of(1, 1, 1, 1, 2, 2, 2), writes.stream()
+                .map(write -> write.key().equals(IndexKey.ofInt(1)) ? 1 : 2).toList());
+        assertEquals(List.of(0, 1, 1, 1, 0, 1, 1), writes.stream().map(Operation::index).toList());
+        assertEquals(List.of(IndexKey.ofInt(10), IndexKey.ofInt(20), IndexKey.ofInt(30)),
+                writes.subList(1, 4).stream().map(Operation::indexedValue).toList());
+        assertEquals(List.of(IndexOperationTrace.LOGICAL_DELETE, IndexOperationTrace.LOGICAL_DELETE,
+                        IndexOperationTrace.UPSERT), writes.subList(1, 4).stream().map(Operation::kind).toList());
+
+        Path output = temporary.newFolder().toPath();
+        var definitions = List.of(new IndexCatalog.Definition(1, "t", 0, "pk", "id", "int"),
+                new IndexCatalog.Definition(1, "t", 1, "sec", "k", "int"));
+        var secondaryKeys = new ArrayList<byte[]>();
+        for (int value : new int[] {10, 20, 30, 40})
+            for (int key : new int[] {1, 2}) secondaryKeys.add(composite(value, key));
+        var report = UpdateLocality.analyzeSource(definitions,
+                Map.of(1L << 32, layout(0, "pk", primaryKeys()),
+                        (1L << 32) | 1L, layout(1, "sec", secondaryKeys)),
+                8, new UpdateLocality.Config(2, 2, 1, 4, 1 << 20, 1),
+                UpdateLocality.committed(source), output);
+        assertEquals(2L, report.get("windows"));
+        assertEquals(Map.of("insert", 0L, "update", 2L, "delete", 0L), report.get("business_changes"));
+        var windows = csv(output.resolve("windows.csv"));
+        assertEquals("1", row(windows, 1, 0, "business").get("modifications"));
+        assertEquals("3", row(windows, 1, 1, "secondary_index").get("modifications"));
+        assertEquals("1", row(windows, 2, 0, "business").get("modifications"));
+        assertEquals("2", row(windows, 2, 1, "secondary_index").get("modifications"));
+        var batches = csv(output.resolve("l0-batches.csv"));
+        assertEquals(List.of("1", "1", "2", "2"), batches.stream().map(row -> row.get("batch")).toList());
+        assertEquals(List.of("1", "3", "1", "2"), batches.stream().map(row -> row.get("entries")).toList());
     }
 
     private static byte[] composite(int value, int key) {

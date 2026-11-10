@@ -9,37 +9,31 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** Validates committed source groups, then serializes local sends without waiting for execution. */
+/** Validates committed Trace writes and snapshot searches, preserving source send order. */
 public final class ReplayProjection implements IndexOperationTrace.Consumer, AutoCloseable {
-    public static final int MAX_TRANSACTION_OPERATIONS = 1_000_000;
-    private final boolean secondaryIndexes, sourceTransactions, publication;
+    private final boolean secondaryIndexes, sourceTransactions, snapshotOnly;
     private final String dispatchMode;
     private final ReplayDispatcher dispatcher;
-    private final List<Operation> pending = new ArrayList<>();
+    private record Pending(Operation operation, org.sibench.adapters.proto.Request request) {}
+    private final List<Pending> pending = new ArrayList<>();
+    private org.sibench.adapters.proto.Request storedRequest;
     private final Map<String, Long> kinds = new LinkedHashMap<>();
-    private long source, dispatched, primary, secondary, filtered, transactions, controls, groups;
-    private long peakPending, peakSearchGroup, peakExpansion;
-    private long activeTransaction, activeVersion, lastVersion, lastOrdinal, lastTransactionId;
-    private long lastSourceEvent;
-    private int transactionOperations;
-    private Operation lastMutation;
-    private final List<Operation> expansion = new ArrayList<>();
+    private long source, dispatched, effectiveRequests, primary, secondary, filtered, transactions, abortedTransactions, controls, groups;
+    private long searchGroups;
+    private long peakPending, peakSearchGroup;
+    private long activeTransaction, activeVersion, lastVersion, lastTransactionId;
+    private long lastSourceEvent, maxSourceOrdinal;
+    private record WriteIdentity(int table, int index, org.sibench.trace.IndexKey key,
+            org.sibench.trace.IndexKey indexedValue) {}
+    private final java.util.Set<WriteIdentity> writes = new java.util.HashSet<>();
     /** The members of the open search group, sent or filtered together once complete. */
     private final List<Operation> searchGroup = new ArrayList<>();
     private Thread owner;
     private boolean failed;
-    /** Snapshot verification: receives each transaction-local search instead of sending it. */
-    private final Skipped skipped;
-    private long skippedWrites, skippedLocalSearches;
-
-    /** A search (one, or a whole group) deliberately not sent, in trace order. */
-    @FunctionalInterface
-    public interface Skipped {
-        void skip(List<Operation> members) throws IOException;
-    }
+    private long skippedWrites;
 
     public ReplayProjection(boolean secondaryIndexes, IndexOperationTrace.Consumer target) {
-        this(new ReplayConfig(secondaryIndexes, "none", 0, 0, 0, 0), false, target);
+        this(new ReplayConfig(secondaryIndexes, 0, 0, 0, 0), false, target);
     }
 
     public ReplayProjection(
@@ -49,47 +43,27 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
 
     public static ReplayProjection withClients(
             ReplayConfig config, boolean sourceTransactions, ReplayTarget.Factory target) {
-        return new ReplayProjection(config, sourceTransactions, target, false, null);
+        return new ReplayProjection(config, sourceTransactions, target, false);
     }
 
-    /** {@code publication}: send complete-commit markers to a service that declares them. */
-    public static ReplayProjection withClients(
-            ReplayConfig config,
-            boolean sourceTransactions,
-            ReplayTarget.Factory target,
-            boolean publication) {
-        return new ReplayProjection(config, sourceTransactions, target, publication, null);
-    }
-
-    /**
-     * The workload validated as usual, but only its snapshot searches are sent, to an index that
-     * already holds the whole trace: writes are not sent, and a transaction-local search, whose
-     * answer depends on its transaction's state at that point, goes to {@code skipped}.
-     */
-    public static ReplayProjection snapshotSearches(
-            ReplayConfig config, ReplayTarget.Factory target, Skipped skipped) {
-        return new ReplayProjection(config, true, target, false, java.util.Objects.requireNonNull(skipped));
+    /** Sends snapshot searches to an index that already holds the complete Trace. */
+    public static ReplayProjection snapshotSearches(ReplayConfig config, ReplayTarget.Factory target) {
+        return new ReplayProjection(config, true, target, true);
     }
 
     private ReplayProjection(
             ReplayConfig config, boolean sourceTransactions, ReplayTarget.Factory target) {
-        this(config, sourceTransactions, target, false, null);
+        this(config, sourceTransactions, target, false);
     }
 
-    private ReplayProjection(
-            ReplayConfig config,
-            boolean sourceTransactions,
-            ReplayTarget.Factory target,
-            boolean publication,
-            Skipped skipped) {
-        this.skipped = skipped;
+    private ReplayProjection(ReplayConfig config, boolean sourceTransactions,
+            ReplayTarget.Factory target, boolean snapshotOnly) {
+        this.snapshotOnly = snapshotOnly;
         this.secondaryIndexes = config.secondaryIndexes();
         this.sourceTransactions = sourceTransactions;
-        this.publication = publication;
         this.dispatchMode = config.dispatchMode();
-        // The warmup budget applies to the workload, never to the baseline load.
-        this.dispatcher =
-                new ReplayDispatcher(config, target, sourceTransactions ? config.warmupOperations() : 0);
+        this.dispatcher = new ReplayDispatcher(config, target,
+                sourceTransactions ? config.warmupOperations() : 0);
     }
 
     public boolean includes(Operation operation) {
@@ -114,6 +88,16 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         }
     }
 
+    @Override
+    public void accept(org.sibench.adapters.proto.TraceRecord record, List<Operation> views) throws IOException {
+        storedRequest = record.hasRequest() ? record.getRequest() : null;
+        try {
+            for (Operation operation : views) accept(operation);
+        } finally {
+            storedRequest = null;
+        }
+    }
+
     private void acceptOrdered(Operation operation) throws IOException {
         if (IndexOperationTrace.isControl(operation)) {
             control(operation);
@@ -123,12 +107,11 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         dispatcher.route(operation);
         if (operation.index() == 0) primary++;
         else secondary++;
-        if (activeTransaction != 0 && ++transactionOperations > MAX_TRANSACTION_OPERATIONS)
-            throw new IOException("Source transaction exceeds operation buffer limit");
         if (activeTransaction != 0) {
             if (operation.sourceEvent() < lastSourceEvent)
                 throw new IOException("Source operation order moved backwards");
             lastSourceEvent = operation.sourceEvent();
+            maxSourceOrdinal = Math.max(maxSourceOrdinal, operation.mutationOrdinal());
         }
         if (activeTransaction != 0
                 && !IndexOperationTrace.isMutation(operation)
@@ -156,23 +139,16 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     }
 
     private void deliver(Operation operation) throws IOException {
-        if (skipped != null) {
-            if (operation.kind() != IndexOperationTrace.SEARCH) {
-                skippedWrites++;
-                return;
-            }
-            if (local(operation)) {
-                skipped.skip(List.of(operation));
-                skippedLocalSearches++;
-                return;
-            }
-            // Snapshot reads of a loaded index need no commit; sending now keeps the trace order
-            // of sent and skipped searches.
-            sendOperation(operation);
+        if (snapshotOnly) {
+            if (operation.kind() != IndexOperationTrace.SEARCH) skippedWrites++;
+            else sendOperation(operation);
             return;
         }
-        if (activeTransaction != 0) {
-            pending.add(operation);
+        // Searches before a transaction's first write do not wait for its outcome, as in generation.
+        if (activeTransaction != 0 && (!pending.isEmpty() || operation.kind() != IndexOperationTrace.SEARCH)) {
+            if (pending.size() >= org.sibench.capture.ProtoTrace.MAX_TRANSACTION_OPERATIONS)
+                throw new IOException("Source transaction exceeds operation buffer limit");
+            pending.add(new Pending(operation, storedRequest));
             peakPending = Math.max(peakPending, pending.size());
         } else sendOperation(operation);
     }
@@ -204,12 +180,6 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         if (searchGroup.size() < o.expansionSize()) return;
         boolean included = true;
         for (Operation member : searchGroup) included &= includes(member);
-        if (included && skipped != null && local(o)) {
-            skipped.skip(List.copyOf(searchGroup));
-            skippedLocalSearches++;
-            searchGroup.clear();
-            return;
-        }
         for (Operation member : searchGroup) {
             if (included) deliver(member);
             else filtered++;
@@ -220,106 +190,47 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     private static final int GROUP_SHARED =
             IndexOperationTrace.INTERSECT_GROUP
                     | IndexOperationTrace.UNION_GROUP
-                    | IndexOperationTrace.SNAPSHOT_SEARCH
-                    | IndexOperationTrace.TRANSACTION_LOCAL_SEARCH;
-
-    private static boolean local(Operation o) {
-        return (o.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0;
-    }
+                    | IndexOperationTrace.SNAPSHOT_SEARCH;
 
     private void validateSearch(Operation o) throws IOException {
-        boolean local = local(o);
-        if (o.readTimestamp() < 0
+        if (o.readTimestamp() < 0 || o.version() != 0
                 || (o.flags() & ~IndexOperationTrace.SEARCH_FLAGS) != 0
-                || o.expectedCount() < 0
-                || (!local && o.version() != 0))
-            throw new IOException("Invalid search timestamp/flags/count");
+                || (o.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0
+                || o.expectedCount() < 0)
+            throw new IOException("Only snapshot searches are supported in Trace replay");
         if (activeTransaction != 0) {
-            requireCompleteExpansion();
-            if (o.transactionId() != activeTransaction || o.mutationOrdinal() != lastOrdinal)
-                throw new IOException("Search source transaction position mismatch");
-        } else if (o.transactionId() != 0 || o.mutationOrdinal() != 0 || local)
-            throw new IOException("Transaction-local search outside source group");
-        if (local) {
-            // A local search names its own version and keeps the statement snapshot.
-            if (lastOrdinal == 0
-                    || o.version() != activeVersion
-                    || o.readTimestamp() >= activeVersion
-                    || (o.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0)
-                throw new IOException("Invalid transaction-local read point");
-        } else if (sourceTransactions
-                && (o.readTimestamp() > lastVersion
-                        || (o.readTimestamp() != lastVersion
-                                && (o.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) == 0)))
+            if (o.transactionId() != activeTransaction || o.mutationOrdinal() < 0)
+                throw new IOException("Search source transaction identity mismatch");
+        } else if (o.transactionId() != 0 || o.mutationOrdinal() != 0)
+            throw new IOException("Search provenance outside source boundary");
+        if (sourceTransactions && (o.readTimestamp() > lastVersion
+                || o.readTimestamp() != lastVersion
+                    && (o.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) == 0))
             throw new IOException("Search requires an available read point");
     }
 
     private void sendOperation(Operation operation) throws IOException {
-        dispatcher.send(operation);
+        dispatcher.send(operation, storedRequest);
         countDispatch(operation);
     }
 
     private void countDispatch(Operation operation) {
         dispatched++;
+        effectiveRequests++;
+        if (!operation.grouped() || operation.expansionPosition() == 0) {
+            if (operation.grouped()) searchGroups++;
+        }
         kinds.merge(IndexOperationTrace.kindName(operation.kind()), 1L, Long::sum);
     }
 
     private void validateMutation(Operation o) throws IOException {
-        if (activeTransaction == 0
-                || o.transactionId() != activeTransaction
-                || o.version() != activeVersion
-                || o.mutationOrdinal() < 1)
-            throw new IOException("Mutation missing matching source group/version");
-        if (o.expansionSize() < 1) throw new IOException("Mutation outside a maintenance unit");
-        if (o.mutationOrdinal() != lastOrdinal) {
-            requireCompleteExpansion();
-            if (o.mutationOrdinal() != lastOrdinal + 1
-                    || o.index() != 0
-                    || o.expansionPosition() != 0)
-                throw new IOException("Non-contiguous source mutation");
-            expansion.clear();
-            lastOrdinal = o.mutationOrdinal();
-            lastMutation = o;
-        } else if (lastMutation == null
-                || o.expansionSize() != lastMutation.expansionSize()
-                || o.expansionPosition() != expansion.size()
-                || o.table() != lastMutation.table()
-                || !o.key().equals(lastMutation.key())
-                || o.rowId() != lastMutation.rowId()
-                || o.sourceEvent() != lastMutation.sourceEvent()
-                || o.workUnitId() != lastMutation.workUnitId()
-                || o.index() <= 0
-                || o.flags() != lastMutation.flags()
-                || (o.kind() != lastMutation.kind()
-                        && o.kind() != IndexOperationTrace.LOGICAL_DELETE)
-                || (o.kind() != IndexOperationTrace.LOGICAL_DELETE
-                        && (o.file() != lastMutation.file()
-                                || o.position() != lastMutation.position()))
-                || (o.kind() == IndexOperationTrace.LOGICAL_DELETE
-                        && (o.file() != 0 || o.position() != 0)))
-            throw new IOException("Invalid index maintenance identity/position");
-        if (o.expansionSize() > MAX_TRANSACTION_OPERATIONS
-                || o.expansionPosition() < 0
-                || o.expansionPosition() >= o.expansionSize())
-            throw new IOException("Invalid index maintenance width");
-        if (o.index() > 0 && !expansion.isEmpty()) {
-            Operation previous = expansion.get(expansion.size() - 1);
-            if (o.index() < previous.index()
-                    || o.index() > previous.index() + 1
-                    || (o.index() == previous.index()
-                            && (previous.kind() != IndexOperationTrace.LOGICAL_DELETE
-                                    || o.kind() != IndexOperationTrace.UPSERT
-                                    || java.util.Objects.equals(
-                                            previous.indexedValue(), o.indexedValue()))))
-                throw new IOException("Invalid secondary delete/write expansion");
-        }
-        expansion.add(o);
-        peakExpansion = Math.max(peakExpansion, expansion.size());
-    }
-
-    private void requireCompleteExpansion() throws IOException {
-        if (lastMutation != null && expansion.size() != lastMutation.expansionSize())
-            throw new IOException("Incomplete index maintenance unit");
+        if (activeTransaction == 0 || o.transactionId() != activeTransaction
+                || o.version() != activeVersion || o.mutationOrdinal() < 1)
+            throw new IOException("Mutation missing matching source boundary/version");
+        if (o.expansionSize() != 1 || o.expansionPosition() != 0)
+            throw new IOException("Committed Trace writes must be singleton final entries");
+        if (!writes.add(new WriteIdentity(o.table(), o.index(), o.key(), o.indexedValue())))
+            throw new IOException("Repeated physical index entry in one committed version");
     }
 
     private void control(Operation o) throws IOException {
@@ -338,28 +249,27 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
                 throw new IOException("Invalid source group begin/order");
             activeTransaction = o.transactionId();
             activeVersion = o.version();
-            lastOrdinal = 0;
-            lastMutation = null;
-            expansion.clear();
-            lastSourceEvent = 0;
-            transactionOperations = 0;
+            writes.clear();
+            lastSourceEvent = maxSourceOrdinal = 0;
         } else {
+            boolean aborted = o.kind() == IndexOperationTrace.TRANSACTION_ABORT;
             if (activeTransaction == 0
                     || o.transactionId() != activeTransaction
-                    || o.version() != activeVersion
-                    || o.expectedCount() != lastOrdinal)
-                throw new IOException("Source commit or mutation count mismatch");
-            requireCompleteExpansion();
+                    || o.version() != activeVersion || maxSourceOrdinal > o.expectedCount())
+                throw new IOException("Source boundary identity or ordinal bound mismatch");
+            if (aborted && !writes.isEmpty()) throw new IOException("Aborted source contains exported writes");
             if (!searchGroup.isEmpty()) throw new IOException("Search group crosses its commit");
             if (dispatchMode.equals("transaction") && !pending.isEmpty()) groups++;
-            for (Operation operation : pending) sendOperation(operation);
+            for (Pending item : pending) {
+                dispatcher.send(item.operation(), item.request());
+                countDispatch(item.operation());
+            }
             pending.clear();
-            if (publication)
-                dispatcher.sendCommit(activeTransaction, activeVersion);
             lastVersion = activeVersion;
             lastTransactionId = activeTransaction;
             activeTransaction = 0;
-            transactions++;
+            if (aborted) abortedTransactions++;
+            else transactions++;
         }
     }
 
@@ -384,32 +294,36 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         return dispatched;
     }
 
+    public long effectiveRequests() {
+        return effectiveRequests;
+    }
+
     public Map<String, Object> describe() {
         Map<String, Object> report = new LinkedHashMap<>();
         report.put("source_operations", source);
         report.put("source_primary_operations", primary);
         report.put("source_secondary_operations", secondary);
         report.put("dispatched_operations", dispatched);
+        report.put("effective_requests", effectiveRequests);
+        report.put("search_groups", searchGroups);
         report.put("filtered_secondary_operations", filtered);
         report.put("committed_transactions", transactions);
-        report.put("last_commit_version", lastVersion);
-        report.put("change_delivery", sourceTransactions ? "committed_only" : "baseline");
+        report.put("aborted_transactions", abortedTransactions);
+        report.put("last_resolved_version", lastVersion);
+        report.put("change_delivery", sourceTransactions ? "committed_updates_and_snapshot_searches" : "baseline");
         report.put("transaction_control_records", controls);
         report.put("dispatch_mode", dispatchMode);
-        report.put("complete_commit_publication", publication);
         report.put("source_dispatch_groups", groups);
         report.put("peak_pending_operations", peakPending);
         report.put("peak_search_group_members", peakSearchGroup);
-        report.put("peak_expansion_members", peakExpansion);
         report.putAll(dispatcher.describe());
         report.put("sending_threads", 1);
-        report.put("ordering", "source_transaction_and_operation_local_send_order");
+        report.put("ordering", "source_order_with_snapshot_write_dependencies");
         report.put("downstream_transaction_api_required", false);
         report.put("dispatched_by_kind", new LinkedHashMap<>(kinds));
-        if (skipped != null) {
+        if (snapshotOnly) {
             report.put("snapshot_verification", true);
             report.put("unsent_writes", skippedWrites);
-            report.put("unsent_transaction_local_searches", skippedLocalSearches);
         }
         return report;
     }

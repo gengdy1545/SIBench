@@ -1,0 +1,403 @@
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/PixelsSinkApp.java b/src/main/java/io/pixelsdb/pixels/sink/PixelsSinkApp.java
+index a55afb4..6bf4701 100644
+--- a/src/main/java/io/pixelsdb/pixels/sink/PixelsSinkApp.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/PixelsSinkApp.java
+@@ -74,6 +74,8 @@ public class PixelsSinkApp
+ 
+         }));
+ 
++        Thread.setDefaultUncaughtExceptionHandler((thread, error) ->
++                io.pixelsdb.pixels.sink.SibenchReport.fail("Uncaught exception in " + thread.getName(), error));
+         init(args);
+         PixelsSinkConfig config = PixelsSinkConfigFactory.getInstance();
+         sinkSource = SinkSourceFactory.createSinkSource();
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/SibenchReport.java b/src/main/java/io/pixelsdb/pixels/sink/SibenchReport.java
+new file mode 100644
+index 0000000..bbe1b71
+--- /dev/null
++++ b/src/main/java/io/pixelsdb/pixels/sink/SibenchReport.java
+@@ -0,0 +1,89 @@
++/*
++ * SIBench CDC generation support for pixels-sink; distributed under the pixels-sink license.
++ */
++package io.pixelsdb.pixels.sink;
++
++import java.io.BufferedWriter;
++import java.io.IOException;
++import java.io.OutputStreamWriter;
++import java.net.InetSocketAddress;
++import java.net.Socket;
++import java.nio.charset.StandardCharsets;
++
++/**
++ * Reports the Pixels timestamp of every source transaction at BEGIN and after its successful
++ * commit to the SIBench generator. Any write, commit or rollback failure is reported and halts
++ * the process, so a stalled or partially applied transaction never looks complete.
++ */
++public final class SibenchReport
++{
++    private static final BufferedWriter OUTPUT = connect();
++
++    private SibenchReport() {}
++
++    private static BufferedWriter connect()
++    {
++        String endpoint = System.getProperty("sibench.report.endpoint"), token = System.getProperty("sibench.report.token");
++        try
++        {
++            if (endpoint == null || token == null) throw new IOException("Missing sibench.report.endpoint/token");
++            int colon = endpoint.lastIndexOf(':');
++            Socket socket = new Socket();
++            socket.connect(new InetSocketAddress(endpoint.substring(0, colon), Integer.parseInt(endpoint.substring(colon + 1))), 30_000);
++            socket.setTcpNoDelay(true);
++            BufferedWriter output = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
++            output.write("T " + token + "\n");
++            output.flush();
++            return output;
++        } catch (IOException | RuntimeException error)
++        {
++            System.err.println("SIBench report connection failed: " + error);
++            Runtime.getRuntime().halt(70);
++            throw new IllegalStateException(error);
++        }
++    }
++
++    public static void begin(long timestamp)
++    {
++        line("B " + timestamp);
++    }
++
++    public static void commit(long timestamp)
++    {
++        line("C " + timestamp);
++    }
++
++    public static void fail(String message, Throwable cause)
++    {
++        System.err.println("SIBench generation stops: " + message);
++        if (cause != null) cause.printStackTrace();
++        try
++        {
++            synchronized (OUTPUT)
++            {
++                OUTPUT.write("F " + message.replace('\n', ' ') + (cause == null ? "" : ": " + String.valueOf(cause).replace('\n', ' ')) + "\n");
++                OUTPUT.flush();
++            }
++        } catch (IOException ignored)
++        {
++            // The halt below still stops the generation; the connection loss is itself a failure signal.
++        }
++        Runtime.getRuntime().halt(70);
++    }
++
++    private static void line(String text)
++    {
++        try
++        {
++            synchronized (OUTPUT)
++            {
++                OUTPUT.write(text);
++                OUTPUT.write('\n');
++                OUTPUT.flush();
++            }
++        } catch (IOException error)
++        {
++            fail("SIBench report connection lost", error);
++        }
++    }
++}
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaWriter.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaWriter.java
+index 8e20f91..0dfe9dd 100644
+--- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaWriter.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaWriter.java
+@@ -68,7 +68,7 @@ public class RetinaWriter implements PixelsSinkWriter
+             }
+         } catch (SinkException e)
+         {
+-            LOGGER.error(e.getMessage(), e);
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Sink transaction handling failed", e);
+             return false;
+         }
+         return true;
+@@ -111,7 +111,7 @@ public class RetinaWriter implements PixelsSinkWriter
+             }
+         } catch (SinkException e)
+         {
+-            LOGGER.error(e.getMessage(), e);
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Sink transaction handling failed", e);
+             return false;
+         }
+ 
+@@ -144,6 +144,7 @@ public class RetinaWriter implements PixelsSinkWriter
+ 
+     private void handleNonTxEvent(RowChangeEvent event) throws SinkException
+     {
++        io.pixelsdb.pixels.sink.SibenchReport.fail("Row change without source transaction metadata", null);
+         // virtual tx
+         String randomId = Long.toString(System.currentTimeMillis()) + RandomUtils.nextLong();
+         writeTrans(buildBeginTransactionMetadata(randomId));
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/SinkContextManager.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/SinkContextManager.java
+index 5389cc2..005ed4b 100644
+--- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/SinkContextManager.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/SinkContextManager.java
+@@ -115,6 +115,11 @@ public class SinkContextManager
+     {
+         LOGGER.trace("Start trans {}", sourceTxId);
+         TransContext pixelsTransContext = transactionProxy.getNewTransContext(sourceTxId);
++        if (pixelsTransContext == null)
++        {
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Cannot begin Pixels transaction for " + sourceTxId, null);
++        }
++        io.pixelsdb.pixels.sink.SibenchReport.begin(pixelsTransContext.getTimestamp());
+         activeTxContexts.compute(
+                 sourceTxId,
+                 (k, oldCtx) ->
+@@ -204,6 +209,7 @@ public class SinkContextManager
+             }
+         } else
+         {
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Source transaction failed in Pixels: " + txId, null);
+             LOGGER.info("Abort transaction: {}", txId);
+             CompletableFuture.runAsync(() ->
+             {
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableCrossTxWriter.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableCrossTxWriter.java
+index 1c90b06..4ef8604 100644
+--- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableCrossTxWriter.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableCrossTxWriter.java
+@@ -158,6 +158,7 @@ public class TableCrossTxWriter extends TableWriter
+ 
+     private void failCtxs(List<String> txIds)
+     {
++        io.pixelsdb.pixels.sink.SibenchReport.fail("Retina write failed for source transactions " + txIds, null);
+         for (String writeTxId : txIds)
+         {
+             SinkContext sinkContext = SinkContextManager.getInstance().getSinkContext(writeTxId);
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TransactionProxy.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TransactionProxy.java
+index 5c8713d..d4c3248 100644
+--- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TransactionProxy.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TransactionProxy.java
+@@ -165,6 +165,7 @@ public class TransactionProxy
+     public void commitTransSync(SinkContext transContext)
+     {
+         commitTrans(transContext.getPixelsTransCtx());
++        io.pixelsdb.pixels.sink.SibenchReport.commit(transContext.getPixelsTransCtx().getTimestamp());
+         metricsFacade.recordTransaction();
+         long txEndTime = System.currentTimeMillis();
+ 
+@@ -179,10 +180,13 @@ public class TransactionProxy
+         commitCount.incrementAndGet();
+         try
+         {
+-            transService.commitTrans(ctx.getTransId(), false);
++            if (!transService.commitTrans(ctx.getTransId(), false))
++            {
++                io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels commit rejected " + ctx.getTransId(), null);
++            }
+         } catch (TransException e)
+         {
+-            LOGGER.error("Batch commit failed: {}", e.getMessage(), e);
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels commit failed " + ctx.getTransId(), e);
+         }
+     }
+ 
+@@ -195,6 +199,7 @@ public class TransactionProxy
+         {
+             LOGGER.error("Rollback transaction failed: {}", e.getMessage(), e);
+         }
++        io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels transaction rolled back " + ctx.getTransId(), null);
+     }
+ 
+     private void batchCommitWorker()
+@@ -237,7 +242,15 @@ public class TransactionProxy
+                     txStartTimes.add(ctx.getStartTime());
+                 }
+ 
+-                transService.commitTransBatch(batchTransIds, false);
++                List<Boolean> committed = transService.commitTransBatch(batchTransIds, false);
++                if (committed.size() != batchContexts.size() || committed.contains(false))
++                {
++                    io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels batch commit rejected " + batchTransIds, null);
++                }
++                for (TransContext committedContext : batchContexts)
++                {
++                    io.pixelsdb.pixels.sink.SibenchReport.commit(committedContext.getTimestamp());
++                }
+                 metricsFacade.recordTransaction(batchTransIds.size());
+                 long txEndTime = System.currentTimeMillis();
+ 
+@@ -264,10 +277,10 @@ public class TransactionProxy
+                 break;
+             } catch (TransException e)
+             {
+-                LOGGER.error("Batch commit failed: {}", e.getMessage(), e);
++                io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels batch commit failed", e);
+             } catch (Exception e)
+             {
+-                LOGGER.error("Unexpected error in batch commit worker", e);
++                io.pixelsdb.pixels.sink.SibenchReport.fail("Unexpected error in batch commit worker", e);
+             }
+         }
+     }
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/util/concurrent/StreamOrderedDecoder.java b/src/main/java/io/pixelsdb/pixels/sink/util/concurrent/StreamOrderedDecoder.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/util/concurrent/StreamOrderedDecoder.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/util/concurrent/StreamOrderedDecoder.java
+@@ -98,35 +98,28 @@
+             Consumer<DecodeResult<O>> afterDecode)
+     {
+-        CompletableFuture<Void> previous;
+-        CompletableFuture<Void> completion = new CompletableFuture<>();
++        CompletableFuture<DecodeResult<O>> decoded = new CompletableFuture<>();
++        CompletableFuture<Void> completion;
+         synchronized (lifecycleLock)
+         {
+             ensureAccepting();
+-            previous = streamTails.getOrDefault(
++            CompletableFuture<Void> previous = streamTails.getOrDefault(
+                     streamKey, CompletableFuture.completedFuture(null));
++            // Direct chaining lets CompletableFuture drain long streams without recursive complete calls.
++            completion = previous.thenCombine(decoded, (ignored, result) ->
++            {
++                publish(result, afterDecode);
++                return null;
++            });
+             streamTails.put(streamKey, completion);
+             activeCompletions.add(completion);
+         }
+-
+-        CompletableFuture<DecodeResult<O>> decoded = CompletableFuture.supplyAsync(
+-                () -> decode(input, decoder), decodeExecutor);
+-
+-        previous.thenCombine(decoded, (ignored, result) ->
+-                {
+-                    publish(result, afterDecode);
+-                    return null;
+-                })
+-                .whenComplete((ignored, failure) ->
+-                {
+-                    if (failure != null)
+-                    {
+-                        completion.completeExceptionally(failure);
+-                    }
+-                    else
+-                    {
+-                        completion.complete(null);
+-                    }
+-                    removeCompletion(streamKey, completion);
+-                });
++        completion.whenComplete((ignored, failure) -> removeCompletion(streamKey, completion));
++        try
++        {
++            decoded.completeAsync(() -> decode(input, decoder), decodeExecutor);
++        } catch (RuntimeException failure)
++        {
++            decoded.completeExceptionally(failure);
++        }
+         return completion;
+     }
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java b/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java
+@@ -68,0 +69,2 @@
++    private final io.pixelsdb.pixels.sink.SibenchSourceTransactions sourceTransactions =
++            new io.pixelsdb.pixels.sink.SibenchSourceTransactions();
+@@ -129,0 +132,8 @@
++            try
++            {
++                sourceTransactions.accept(sourceRecord, recordType);
++            } catch (RuntimeException failure)
++            {
++                io.pixelsdb.pixels.sink.SibenchReport.fail("Invalid PostgreSQL CDC source event", failure);
++                throw failure;
++            }
+@@ -177,3 +187,2 @@
+-            LOGGER.warn("Skipping invalid Debezium ROW event from topic {}",
+-                    record.topic(), result.failure());
+-            return;
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Cannot decode Debezium ROW event", result.failure());
++            throw new IllegalStateException(result.failure());
+@@ -183 +192,2 @@
+-            return;
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Decoded CDC event is absent", null);
++            throw new IllegalStateException("Decoded CDC event is absent");
+@@ -195,3 +205,2 @@
+-            LOGGER.warn("Skipping invalid Debezium TRANSACTION event from topic {}",
+-                    record.topic(), result.failure());
+-            return;
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Cannot decode Debezium TRANSACTION event", result.failure());
++            throw new IllegalStateException(result.failure());
+@@ -201 +210,2 @@
+-            return;
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Decoded CDC event is absent", null);
++            throw new IllegalStateException("Decoded CDC event is absent");
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/SibenchSourceTransactions.java b/src/main/java/io/pixelsdb/pixels/sink/SibenchSourceTransactions.java
+new file mode 100644
+--- /dev/null
++++ b/src/main/java/io/pixelsdb/pixels/sink/SibenchSourceTransactions.java
+@@ -0,0 +1,67 @@
++/* SIBench source-completeness guard; distributed under the pixels-sink license. */
++package io.pixelsdb.pixels.sink;
++
++import io.pixelsdb.pixels.sink.source.engine.DebeziumRecordType;
++import io.pixelsdb.pixels.sink.conversion.debezium.dialect.PostgresSourceAdapter;
++import java.util.HashMap;
++import java.util.Map;
++import org.apache.kafka.connect.data.Struct;
++import org.apache.kafka.connect.source.SourceRecord;
++
++/** Checks the ordered PostgreSQL envelope before parallel decoding or offset acknowledgement. */
++public final class SibenchSourceTransactions
++{
++    private String transaction;
++    private long rows;
++    private final Map<String, Long> tables = new HashMap<>();
++
++    public void accept(SourceRecord record, DebeziumRecordType type)
++    {
++        if (type == DebeziumRecordType.TOMBSTONE) return;
++        if (!(record.value() instanceof Struct value)) throw invalid();
++        if (type == DebeziumRecordType.TRANSACTION)
++        {
++            String id = PostgresSourceAdapter.INSTANCE.normalizeTransactionId(value.getString("id"));
++            if (id == null || id.isBlank()) throw invalid();
++            if (value.getString("status").equals("BEGIN"))
++            {
++                if (transaction != null) throw invalid();
++                transaction = id;
++                rows = 0;
++                tables.clear();
++            }
++            else if (value.getString("status").equals("END"))
++            {
++                if (!id.equals(transaction) || value.getInt64("event_count") != rows) throw invalid();
++                var counts = new HashMap<String, Long>();
++                for (Object item : value.getArray("data_collections"))
++                {
++                    Struct collection = (Struct) item;
++                    if (counts.put(collection.getString("data_collection"), collection.getInt64("event_count")) != null)
++                        throw invalid();
++                }
++                if (!tables.equals(counts)) throw invalid();
++                transaction = null;
++                tables.clear();
++            }
++            else throw invalid();
++        }
++        else if (type == DebeziumRecordType.ROW)
++        {
++            Struct tx = value.getStruct("transaction"), source = value.getStruct("source");
++            if (tx == null || source == null || !PostgresSourceAdapter.INSTANCE.normalizeTransactionId(tx.getString("id")).equals(transaction)
++                    || tx.getInt64("total_order") != rows + 1) throw invalid();
++            String table = source.getString("schema") + "." + source.getString("table");
++            long count = tables.getOrDefault(table, 0L) + 1;
++            if (tx.getInt64("data_collection_order") != count) throw invalid();
++            tables.put(table, count);
++            rows++;
++        }
++        else throw invalid();
++    }
++
++    private static IllegalArgumentException invalid()
++    {
++        return new IllegalArgumentException("Incomplete or unordered PostgreSQL CDC transaction");
++    }
++}

@@ -1,0 +1,29 @@
+--- a/java/CMakeLists.txt
++++ b/java/CMakeLists.txt
+@@ -521,0 +522,7 @@
++if(NOT WITH_TESTS)
++  list(FILTER JAVA_MAIN_CLASSES INCLUDE REGEX "^src/main/")
++  list(REMOVE_ITEM JNI_NATIVE_SOURCES
++    rocksjni/native_comparator_wrapper_test.cc rocksjni/rocksdb_exception_test.cc
++    rocksjni/testable_event_listener.cc rocksjni/write_batch_test.cc)
++endif()
++
+@@ -572 +579 @@
+-      INCLUDE_JARS ${ROCKSDBJNI_CLASSES_JAR_FILE} ${JAVA_TESTCLASSPATH}
++      INCLUDE_JARS ${ROCKSDBJNI_CLASSES_JAR_FILE}
+@@ -590,0 +598 @@
++if(WITH_TESTS)
+@@ -651,0 +660,2 @@
++endif()
++
+--- a/java/src/main/java/org/rocksdb/RocksDB.java
++++ b/java/src/main/java/org/rocksdb/RocksDB.java
+@@ -70,7 +70,7 @@
+         }
+       }
+       try {
+-        NativeLibraryLoader.getInstance().loadLibrary(tmpDir);
++        NativeLibraryLoader.getInstance().loadLibraryFromJar(tmpDir);
+       } catch (final IOException e) {
+         libraryLoaded.set(LibraryState.NOT_LOADED);
+         throw new RuntimeException("Unable to load the RocksDB shared library",

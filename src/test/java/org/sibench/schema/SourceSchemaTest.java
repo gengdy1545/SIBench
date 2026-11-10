@@ -51,13 +51,13 @@ public class SourceSchemaTest {
     @Test
     public void ycsbUsesConfiguredFieldCountAndStringPrimaryWithoutInventedSecondary()
             throws Exception {
-        SourceSchema schema = read("src/test/resources/config/ycsb_1b.yaml");
+        SourceSchema schema = read("src/test/resources/config/ycsb_1k.yaml");
         assertEquals(1, schema.tables().size());
         var table = schema.tables().get(0);
         assertEquals(11, table.columns().size());
         assertEquals("character varying", table.columns().get(0).type());
         assertFalse(table.columns().get(0).nullable());
-        assertEquals("text", table.columns().get(1).type());
+        assertEquals("blob", table.columns().get(1).type());
         assertTrue(table.columns().get(1).nullable());
         assertEquals(1, table.indexes().size());
         IndexCatalog catalog = IndexCatalog.fromSchema(schema);
@@ -65,7 +65,7 @@ public class SourceSchemaTest {
                 org.sibench.trace.IndexKey.ofText("user010 "),
                 catalog.named("usertable_pkey").encode("user010 "));
         assertTrue(catalog.secondary(1).isEmpty());
-        var config = config("src/test/resources/config/ycsb_1b.yaml");
+        var config = config("src/test/resources/config/ycsb_1k.yaml");
         var nativeConfig = ConfigValues.object(config, "native");
         nativeConfig.put("fieldcount", 3);
         config.put("native", nativeConfig);
@@ -75,7 +75,11 @@ public class SourceSchemaTest {
     @Test
     public void sysbenchResolvesAllConfiguredTableNamespacesAndAutoIncrementOption()
             throws Exception {
-        SourceSchema schema = read("src/test/resources/config/sysbench_1b.yaml");
+        var manyTables = config("src/test/resources/config/sysbench_2k.yaml");
+        var parameters = ConfigValues.object(manyTables, "native");
+        parameters.put("tables", 100);
+        manyTables.put("native", parameters);
+        SourceSchema schema = SourceSchema.read(Path.of(""), manyTables);
         assertEquals(100, schema.tables().size());
         assertEquals(200, IndexCatalog.fromSchema(schema).definitions().size());
         assertEquals("k_100", schema.tables().get(99).indexes().get(1).name());
@@ -85,7 +89,7 @@ public class SourceSchemaTest {
         assertEquals(
                 org.sibench.trace.IndexKey.ofInt(10),
                 IndexCatalog.fromSchema(schema).named("k_100").encode("010"));
-        var config = config("src/test/resources/config/sysbench_1b.yaml");
+        var config = config("src/test/resources/config/sysbench_2k.yaml");
         var nativeConfig = ConfigValues.object(config, "native");
         nativeConfig.put("tables", 2);
         nativeConfig.put("auto-inc", false);
@@ -110,14 +114,14 @@ public class SourceSchemaTest {
                                 "create-table-options",
                                 "WITH (fillfactor=50)")
                         .entrySet()) {
-            var config = config("src/test/resources/config/sysbench_1b.yaml");
+            var config = config("src/test/resources/config/sysbench_2k.yaml");
             var nativeConfig = ConfigValues.object(config, "native");
             nativeConfig.put(option.getKey(), option.getValue());
             config.put("native", nativeConfig);
             assertThrows(
                     IllegalArgumentException.class, () -> SourceSchema.read(Path.of(""), config));
         }
-        var config = config("src/test/resources/config/ycsb_1b.yaml");
+        var config = config("src/test/resources/config/ycsb_1k.yaml");
         var source = ConfigValues.object(config, "source");
         source.put("commit", "unreviewed");
         config.put("source", source);

@@ -12,7 +12,7 @@ public final class DispatcherCapacityCheck {
     public static void main(String[] args) throws Exception {
         long count = Long.parseLong(args[0]);
         Path report = Path.of(args[1]);
-        var config = new ReplayConfig(true, "none", 0, 0, 0, 0, "operation", 64, 4096, 60);
+        var config = new ReplayConfig(true, 0, 0, 0, 0, "operation", 64, 4096, 60);
         long[] received = {0};
         long start = System.nanoTime();
         Map<String, Object> result;

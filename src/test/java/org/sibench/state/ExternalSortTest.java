@@ -99,6 +99,22 @@ public class ExternalSortTest {
     }
 
     @Test
+    public void truncatedRunHeaderIsNotAnEmptyRun() throws Exception {
+        for (int bytes = 1; bytes < Integer.BYTES; bytes++) {
+            Path directory = temporary.newFolder().toPath();
+            try (var sort = new ExternalSort(directory, 1)) {
+                sort.add(new byte[] {1}, new byte[] {2});
+                try (var files = Files.list(directory)) {
+                    Files.write(files.findFirst().orElseThrow(), new byte[bytes]);
+                }
+                assertThrows(java.io.EOFException.class, () -> {
+                    try (var sorted = sort.sorted()) { drain(sorted); }
+                });
+            }
+        }
+    }
+
+    @Test
     public void emptyInputsAndOneSortedCallOnly() throws Exception {
         try (var sort = new ExternalSort(temporary.newFolder().toPath(), 100)) {
             try (var sorted = sort.sorted()) {

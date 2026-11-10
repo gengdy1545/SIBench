@@ -4,7 +4,6 @@ import static org.junit.Assert.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import org.junit.Rule;
 import org.junit.Test;
@@ -16,6 +15,15 @@ import org.yaml.snakeyaml.Yaml;
 
 public class SibenchConfigTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
+
+    @Test public void remoteHostPortMustFitTheNetworkPortRange() throws Exception {
+        var root = Path.of("").toAbsolutePath();
+        var settings = new java.util.LinkedHashMap<>(ConfigValues.parse(Files.readString(root.resolve("config/engine/pixels/pixels.yaml"))));
+        settings.remove("schema_version"); settings.remove("purpose"); settings.remove("engine");
+        settings.put("pixels_host", "host:65536");
+        var failure = assertThrows(IllegalArgumentException.class, () -> PixelsConfig.read(root.resolve("config/engine/pixels"), settings));
+        assertEquals("Invalid Pixels host port", failure.getMessage());
+    }
 
     @Test
     public void replayServiceAndAnalysisUseTheSameConfiguration() throws Exception {
@@ -31,51 +39,57 @@ public class SibenchConfigTest {
     }
 
     @Test
-    public void publicPostgresConfigurationSupportsDisposableGeneration() throws Exception {
-        Path output = temporary.getRoot().toPath().resolve("postgres.conf");
-        SibenchConfig.writePostgres(Path.of("config/sibench.yaml"), output);
-        String settings = Files.readString(output);
-        assertTrue(settings.contains("fsync = 'off'\n"));
-        assertTrue(settings.contains("full_page_writes = 'off'\n"));
-        assertTrue(settings.contains("restart_after_crash = 'off'\n"));
+    public void publicGenerationSelectsThreeNativeModesAndOwnsEngineBuildLocations() throws Exception {
+        Path root = Path.of("").toAbsolutePath();
+        var document = SibenchConfig.read(root.resolve("config/sibench.yaml"));
+        var selected = BenchmarkSelection.read(root, document);
+        assertEquals(java.util.List.of("ycsb", "sysbench", "hybench"),
+                selected.stream().map(BenchmarkSelection::benchmark).toList());
+        assertEquals(java.util.List.of(BenchmarkSelection.Mode.API, BenchmarkSelection.Mode.CAPTURE,
+                BenchmarkSelection.Mode.CDC), selected.stream().map(BenchmarkSelection::mode).toList());
+        assertEquals(java.util.List.of(Engine.ROCKSDB, Engine.POSTGRES, Engine.PIXELS),
+                selected.stream().map(BenchmarkSelection::engine).toList());
+        var postgres = SibenchConfig.engine(root, document, Engine.POSTGRES);
+        assertEquals("build/services/postgres", ConfigValues.string(postgres, "build_directory"));
+        assertEquals("off", SibenchConfig.postgresSettings(ConfigValues.object(postgres, "settings")).get("fsync"));
+        assertEquals("build/services/rocksdb", ConfigValues.string(SibenchConfig.engine(root, document, Engine.ROCKSDB), "build_directory"));
+        assertEquals("16GiB", ConfigValues.string(SibenchConfig.engine(root, document, Engine.DUCKDB), "memory_limit"));
+        assertFalse(document.containsKey("generation"));
+        // Engine settings live in their own files; the runtime only selects them.
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(
+                Map.of("schema_version", 1, "purpose", "sibench", "postgres", Map.of("build_directory", "build/services/postgres"))));
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(
+                Map.of("schema_version", 1, "purpose", "sibench", "engines", Map.of("mysql", "config/engine/mysql.yaml"))));
     }
 
     @Test
-    public void postgresSettingsAreEscapedAndNeverOverwriteAnExistingFile() throws Exception {
-        var settings = new LinkedHashMap<String, Object>();
-        settings.put("timezone", "O'Reilly\\Lab");
-        settings.put("compute_query_id", true);
-        settings.put("autovacuum", false);
-        settings.put("checkpoint_completion_target", 0.9);
-        Path config = config(settings);
-        Path output = temporary.getRoot().toPath().resolve("postgres.conf");
-        SibenchConfig.writePostgres(config, output);
-        String expected = "# Generated from the run's SIBench configuration.\n"
-                + "timezone = 'O''Reilly\\\\Lab'\n"
-                + "compute_query_id = 'on'\n"
-                + "autovacuum = 'off'\n"
-                + "checkpoint_completion_target = '0.9'\n";
-        assertEquals(expected, Files.readString(output));
-        assertThrows(java.nio.file.FileAlreadyExistsException.class,
-                () -> SibenchConfig.writePostgres(config, output));
-        assertEquals(expected, Files.readString(output));
+    public void engineConfigsRejectUnknownOptionsAndGeneratorOwnedPostgresSettings() throws Exception {
+        Path root = temporary.getRoot().toPath();
+        Files.writeString(root.resolve("postgres.yaml"), "schema_version: 1\npurpose: engine\nengine: postgres\n"
+                + "build_directory: build/services/postgres\nsettings:\n  port: 5432\n");
+        var runtime = Map.<String, Object>of("engines", Map.of("postgres", "postgres.yaml", "duckdb", "postgres.yaml"));
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.engine(root, runtime, Engine.POSTGRES));
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.engine(root, runtime, Engine.DUCKDB));
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.engine(root, runtime, Engine.ROCKSDB));
+        Files.writeString(root.resolve("postgres.yaml"), "schema_version: 1\npurpose: engine\nengine: postgres\n"
+                + "build_directory: build/services/postgres\nsettings: {}\ndata_directory: data\n");
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.engine(root, runtime, Engine.POSTGRES));
     }
 
-    @Test
-    public void unsafePostgresValuesFailBeforeCreatingOutput() throws Exception {
-        for (Object value : new Object[] {"UTC\ninclude 'other.conf'", "UTC\r", "UTC\0",
-                Double.NaN, Double.POSITIVE_INFINITY, Map.of("nested", "value")}) {
-            Path config = config(Map.of("timezone", value));
-            Path output = temporary.getRoot().toPath().resolve("rejected.conf");
-            assertThrows(IllegalArgumentException.class,
-                    () -> SibenchConfig.writePostgres(config, output));
-            assertFalse(Files.exists(output));
+    @Test public void postgresSettingsCannotRedirectWorkingStateOrDisableSourceTriggers() {
+        var accepted=new java.util.ArrayList<String>();
+        for (String key:java.util.List.of("data_directory","hba_file","ident_file","external_pid_file","session_replication_role")) {
+            try { SibenchConfig.postgresSettings(Map.of(key,"external")); accepted.add(key); }
+            catch (IllegalArgumentException expected) { }
         }
-        Path config = config(Map.of("include", "other.conf"));
-        Path output = temporary.getRoot().toPath().resolve("unknown.conf");
-        assertThrows(IllegalArgumentException.class,
-                () -> SibenchConfig.writePostgres(config, output));
-        assertFalse(Files.exists(output));
+        assertEquals(java.util.List.of(),accepted);
+    }
+
+    @Test public void cdcSecondaryExportFailsDuringSelectionBeforeAnyBuildOrRun() throws Exception {
+        var root=temporary.getRoot().toPath();
+        Files.writeString(root.resolve("hybench.yaml"),"benchmark: hybench\ntrace:\n  secondary_indexes: true\n");
+        assertThrows(IllegalArgumentException.class,()->BenchmarkSelection.read(root,Map.of("benchmarks",java.util.List.of(
+                Map.of("config","hybench.yaml","mode","cdc","engine","pixels")))));
     }
 
     @Test
@@ -87,10 +101,11 @@ public class SibenchConfigTest {
                 Map.of("schema_version", 1, "purpose", "sibench", "replaay", Map.of())));
     }
 
-    private Path config(Map<String, Object> settings) throws Exception {
-        Path path = Files.createTempFile(temporary.getRoot().toPath(), "sibench-", ".yaml");
-        Files.writeString(path, new Yaml().dump(Map.of(
-                "schema_version", 1, "purpose", "sibench", "postgres", settings)));
-        return path;
+    @Test
+    public void rejectsRetiredPgGenerationSettings() {
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(Map.of(
+                "schema_version", 1, "purpose", "sibench", "generation", Map.of(
+                        "pending_transaction_bytes", 1000, "pending_transactions", 10,
+                        "operation_target", 100, "output_byte_target", 1000))));
     }
 }

@@ -1,0 +1,29 @@
+# Pixels CDC generation engine. HyBench runs on an uninstrumented source PostgreSQL; pixels-sink
+# applies its committed changes to Pixels Retina, whose primary-index calls form the Trace.
+# Endpoints, run directories and semantic switches are assigned by the generator; the property
+# files below hold only overrides of the upstream defaults pinned by third_party/.
+schema_version: 1
+purpose: engine
+engine: pixels
+build_directory: build/services/pixels
+# "local" runs Pixels next to the generator; HOST:PORT names a `sibench pixels-host` agent.
+pixels_host: local
+memory:
+  coordinator_heap: 2g
+  retina_heap: 16g
+  sink_heap: 4g
+load:
+  rows_per_file: 1048576
+  threads: 8
+source:
+  settings:
+    shared_buffers: 256MB
+    work_mem: 32MB
+    max_parallel_workers_per_gather: 0
+    max_parallel_maintenance_workers: 0
+    fsync: off
+    synchronous_commit: off
+    full_page_writes: off
+    autovacuum: off
+properties: pixels.properties
+sink_properties: pixels-sink.properties

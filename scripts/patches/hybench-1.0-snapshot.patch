@@ -1,3 +1,23 @@
+--- a/conf/stmt_postgres.toml
++++ b/conf/stmt_postgres.toml
+@@ -124,7 +124,7 @@
+ from customer c, transfer t
+ where date(t.timestamp::timestamp) between '2023-11-01' and (cast('2023-11-01' as date) + 60)
+ and c.custid=t.targetid
+-group by name, id
++group by c.name, t.id, t.targetid
+ order by amount DESC limit 10),
+ big_account_outbound as (select b.id, b.name as name, sum(t.amount) as amount
+ from big_account_inbound b, transfer t
+@@ -207,7 +207,7 @@
+     "SELECT custID FROM CUSTOMER WHERE COMPANYID = ?",
+     "UPDATE SAVINGACCOUNT SET BALANCE = BALANCE - ? WHERE ACCOUNTID = ?",
+     "UPDATE SAVINGACCOUNT SET BALANCE = BALANCE + ? WHERE ACCOUNTID = ?",
+-    "INSERT INTO TRANSFER VALUES (DEFAULT, ?,?,?,?,?)"
++    "INSERT INTO TRANSFER(id,sourceID,targetID,amount,type,timestamp) VALUES (DEFAULT, ?,?,?,?,?)"
+ ]
+ 
+ [TP-11]
 --- a/pom.xml
 +++ b/pom.xml
 @@ -9,6 +9,16 @@
@@ -25,7 +45,30 @@
                  <configuration>
                      <source>16</source>
                      <target>16</target>
-@@ -90,6 +101,13 @@
+@@ -48,22 +59,6 @@
+             <groupId>com.moandjiezana.toml</groupId>
+             <artifactId>toml4j</artifactId>
+             <version>0.7.2</version>
+-        </dependency>
+-        <dependency>
+-            <groupId>org.postgresql</groupId>
+-            <artifactId>postgresql</artifactId>
+-            <version>42.5.0</version>
+-        </dependency>
+-	 <dependency>
+-	    <groupId>mysql</groupId>
+-	    <artifactId>mysql-connector-java</artifactId>
+-	    <version>5.1.30</version>
+-	</dependency>
+-        <dependency>
+-            <groupId>com.oracle.database.jdbc</groupId>
+-            <artifactId>ojdbc8-production</artifactId>
+-            <version>19.7.0.0</version>
+-            <type>pom</type>
+         </dependency>
+         <dependency>
+             <groupId>commons-cli</groupId>
+@@ -90,6 +85,13 @@
              <groupId>ca.umontreal.iro</groupId>
              <artifactId>ssj</artifactId>
              <version>2.5</version>
@@ -39,3 +82,2350 @@
          </dependency>
      </dependencies>
  </project>
+--- a/src/main/java/com/hybench/Constant.java
++++ b/src/main/java/com/hybench/Constant.java
+@@ -12,11 +12,15 @@
+     final public static int DB_MYSQL = 3;
+     final public static int DB_ORACLE = 4;
+     final public static int DB_PG = 5;
++    final public static int DB_DUCKDB = 6;
+     final public static int DB_UNKNOW = 0;
+ 
+     public static int getDbType(String db){
+ 
+-        if(db.equalsIgnoreCase("postgreSQL")){
++        if(db.equalsIgnoreCase("duckdb")){
++            return Constant.DB_DUCKDB;
++        }
++        else if(db.equalsIgnoreCase("postgreSQL")){
+             return Constant.DB_PG;
+         }
+         else if(db.equalsIgnoreCase("mysql")){
+--- a/src/main/java/com/hybench/HyBench.java
++++ b/src/main/java/com/hybench/HyBench.java
+@@ -83,13 +83,13 @@
+         }
+         for(int flength=0;flength < future.size();flength++) {
+             Future f = future.get(flength);
+-            if (f != null && !f.isCancelled() && !f.isDone()) {
++            if (f != null && !f.isCancelled()) {
+                 try {
+                     f.get();
+                 } catch (InterruptedException e) {
+-                    e.printStackTrace();
++                    Client.recordFailure(e);
+                 } catch (ExecutionException e) {
+-                    e.printStackTrace();
++                    Client.recordFailure(e);
+                 }
+             }
+         }
+@@ -98,6 +98,7 @@
+             es.shutdownNow();
+         }
+         res.setEndTs(dateFormat.format(new Date()));
++        Client.checkFailure();
+         logger.info("TP Workload is done.");
+     }
+ 
+@@ -118,13 +119,13 @@
+             }}
+         );
+ 
+-        if (future != null && !future.isCancelled() && !future.isDone()) {
++        if (future != null && !future.isCancelled()) {
+             try {
+                 future.get();
+             } catch (InterruptedException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             } catch (ExecutionException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+ 
+@@ -132,6 +133,7 @@
+             es.shutdownNow();
+         }
+         res.setEndTs(dateFormat.format(new Date()));
++        Client.checkFailure();
+         logger.info("AP Workload is done.");
+     }
+ 
+@@ -153,13 +155,13 @@
+             }}
+         );
+ 
+-        if (future != null && !future.isCancelled() && !future.isDone()) {
++        if (future != null && !future.isCancelled()) {
+             try {
+                 future.get();
+             } catch (InterruptedException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             } catch (ExecutionException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+ 
+@@ -167,6 +169,7 @@
+             es.shutdownNow();
+         }
+         res.setEndTs(dateFormat.format(new Date()));
++        Client.checkFailure();
+         logger.info("AP Workload is done.");
+     }
+ 
+@@ -245,7 +248,7 @@
+                         } catch (InterruptedException e) {
+                             logger.info("Freshness checker was stopped in force");
+                         } catch (Exception e){
+-                            e.printStackTrace();
++                            Client.recordFailure(e);
+                         }
+                     }
+                     if(!hasGetFreshness){
+@@ -259,7 +262,7 @@
+                             conn_tp.close();
+                         }
+                     } catch (SQLException e) {
+-                        e.printStackTrace();
++                        Client.recordFailure(e);
+                     }
+                 }
+             };
+@@ -268,13 +271,13 @@
+ 
+         for(int flength=0;flength < future.size();flength++) {
+             Future f = future.get(flength);
+-            if (f != null && !f.isCancelled() && !f.isDone()) {
++            if (f != null && !f.isCancelled()) {
+                 try {
+                     f.get();
+                 } catch (InterruptedException e) {
+-                    e.printStackTrace();
++                    Client.recordFailure(e);
+                 } catch (ExecutionException e) {
+-                    e.printStackTrace();
++                    Client.recordFailure(e);
+                 }
+             }
+         }
+@@ -287,6 +290,7 @@
+             es.shutdownNow();
+         }
+         res.setEndTs(dateFormat.format(new Date()));
++        Client.checkFailure();
+         logger.info("XP Workload is done");
+     }
+ 
+--- a/src/main/java/com/hybench/dbconn/ConnectionMgr.java
++++ b/src/main/java/com/hybench/dbconn/ConnectionMgr.java
+@@ -1,106 +1,40 @@
+ package com.hybench.dbconn;
+-/**
+- *
+- * @time 2023-03-04
+- * @version 1.0.0
+- * @file ConnectionMgr.java
+- * @description
+- *   use to get db connection
+- **/
+ 
+ import com.hybench.ConfigLoader;
+-import org.apache.logging.log4j.LogManager;
+-import org.apache.logging.log4j.Logger;
+-import java.io.FileInputStream;
+-import java.io.FileNotFoundException;
+-import java.io.IOException;
+ import java.sql.Connection;
+ import java.sql.DriverManager;
+ import java.sql.SQLException;
+ import java.util.Properties;
+ 
++/** Connections to the selected native engine: the DuckDB host or PostgreSQL; the engine owns transaction state. */
+ public class ConnectionMgr {
+-   static Logger logger = LogManager.getLogger(ConnectionMgr.class);
+-    // get connection from default url
+-    public static Connection getConnection(){
+-        Connection conn = null;
+-        Properties prop = new Properties();
+-        try {
+-            FileInputStream fis = new FileInputStream(ConfigLoader.confFile);
+-            prop.load(fis);
+-        } catch (FileNotFoundException e) {
+-            // TODO Auto-generated catch block
+-            logger.error("Read configure failed : " + ConfigLoader.confFile,e  );
+-            e.printStackTrace();
+-        } catch (IOException e) {
+-            // TODO Auto-generated catch block
+-            logger.error("Read configure failed : " + ConfigLoader.confFile,e);
+-            e.printStackTrace();
+-        }
++    public static Connection getConnection() { return getConnection(0); }
+ 
++    public static Connection getConnection(int type) {
++        Properties config = ConfigLoader.prop;
++        String url = config.getProperty(type == 1 ? "url_ap" : "url");
++        String receipts = config.getProperty("sibench.receipts");
++        Properties options = new Properties();
++        String driver;
++        if (url != null && url.startsWith("jdbc:sibench:duckdb:") && receipts != null && !receipts.isBlank()) {
++            driver = "org.sibench.generation.DuckDbHostDriver";
++            options.setProperty("receipts", receipts);
++        } else if (url != null && url.startsWith("jdbc:postgresql:") && receipts == null) {
++            // Native PostgreSQL capture identifies sessions by their application_name in the URL.
++            driver = "org.postgresql.Driver";
++            // Fetch results in batches, as the DuckDB host streams them, instead of holding each in the heap.
++            options.setProperty("defaultRowFetchSize", "4096");
++        } else throw new IllegalArgumentException("HyBench requires a DuckDB host URL with sibench.receipts or a PostgreSQL URL");
+         try {
+-            Class.forName(prop.getProperty("classname"));
+-            //DriverManager.registerDriver(new oracle.jdbc.OracleDriver());
+-            conn = DriverManager.getConnection(
+-                    prop.getProperty("url"),
+-                    prop.getProperty("username"),
+-                    prop.getProperty("password"));
+-            conn.setAutoCommit(false);
+-        } catch (SQLException e) {
+-            // TODO Auto-generated catch block
+-            logger.error( "Getting connection failed! " + prop.getProperty("url")+" : " + prop.getProperty("username")+" : " + prop.getProperty("password"));
+-            e.printStackTrace();
+-        }
+-        catch (ClassNotFoundException e) {
+-            // TODO Auto-generated catch block
+-            e.printStackTrace();
+-        }
+-        return conn;
+-    }
+-    // type = 0 means get connection from tp url and type =1 means get conneciton from ap url
+-    public static Connection getConnection(int type){
+-        Connection conn = null;
+-        Properties prop = new Properties();
+-        try {
+-            FileInputStream fis = new FileInputStream(ConfigLoader.confFile);
+-            prop.load(fis);
+-        } catch (FileNotFoundException e) {
+-            // TODO Auto-generated catch block
+-            logger.error("Read configure failed : " + ConfigLoader.confFile,e  );
+-            e.printStackTrace();
+-        } catch (IOException e) {
+-            // TODO Auto-generated catch block
+-            logger.error("Read configure failed : " + ConfigLoader.confFile,e);
+-            e.printStackTrace();
+-        }
+-        String url = prop.getProperty("url");
+-        String username = prop.getProperty("username");
+-        String password = prop.getProperty("password");
+-        try {
+-            if( 1 == type){
+-                Class.forName(prop.getProperty("classname_ap"));
+-                url = prop.getProperty("url_ap");
+-                username = prop.getProperty("username_ap");
+-                password = prop.getProperty("password_ap");
++            Class.forName(driver);
++            Connection connection = DriverManager.getConnection(url, options);
++            try { connection.setAutoCommit(false); return connection; }
++            catch (SQLException failure) {
++                try { connection.close(); } catch (SQLException close) { failure.addSuppressed(close); }
++                throw failure;
+             }
+-            else
+-                Class.forName(prop.getProperty("classname"));
+-            conn = DriverManager.getConnection(
+-                    url,
+-                    username,
+-                    password);
+-            conn.setAutoCommit(false);
+-        } catch (SQLException e) {
+-            // TODO Auto-generated catch block
+-            logger.error( "Getting connection failed! " + url +" : " + username +" : " + password );
+-            e.printStackTrace();
+-        }
+-        catch (ClassNotFoundException e) {
+-            // TODO Auto-generated catch block
+-            e.printStackTrace();
++        } catch (ClassNotFoundException | SQLException failure) {
++            throw new IllegalStateException("Cannot open HyBench native connection", failure);
+         }
+-        return conn;
+     }
+-
+-
+ }
+--- a/src/main/java/com/hybench/workload/APClient.java
++++ b/src/main/java/com/hybench/workload/APClient.java
+@@ -79,7 +79,7 @@
+             pstmt.setInt(1,custid);
+             pstmt.setInt(2,custid);
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             logger.debug(pstmt.toString());
+@@ -88,16 +88,16 @@
+             iqTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -121,7 +121,7 @@
+             pstmt.setInt(1,companyid);
+             pstmt.setInt(2,companyid);
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             logger.debug(pstmt.toString());
+@@ -130,16 +130,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -155,7 +155,7 @@
+             companyid = rg.getRandomint(customer_no,customer_no+company_no);
+             pstmt.setInt(1,companyid);
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             logger.debug(pstmt.toString());
+@@ -164,7 +164,7 @@
+             iqTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            Client.recordFailure(e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -173,7 +173,7 @@
+             try {
+                 pstmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -190,7 +190,7 @@
+             pstmt.setInt(1,companyid);
+             pstmt.setInt(2,companyid);
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             hist.getXPIQItem(3).addValue(responseTime);
+@@ -199,16 +199,16 @@
+             iqTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -223,9 +223,9 @@
+             stmt = conn.createStatement();;
+             ResultSet rs = stmt.executeQuery(sqls.ap_iq5_1());
+             while ( rs.next() ) {
+-                applicantid= rs.getInt(1);
+-            }
+-            rs.close();
++                applicantid= integer(rs,1);
++            }
++            drain(rs);
+         } catch (SQLException throwables) {
+             throwables.printStackTrace();
+         }finally {
+@@ -233,7 +233,7 @@
+             try {
+                 stmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+ 
+@@ -243,7 +243,7 @@
+             pstmt = conn.prepareStatement(sqls.ap_iq5());
+             pstmt.setInt(1,applicantid);
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             hist.getXPIQItem(4).addValue(responseTime);
+@@ -252,16 +252,16 @@
+             iqTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -275,7 +275,7 @@
+         try {
+             pstmt = conn.prepareStatement(sqls.ap_iq6());
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             hist.getXPIQItem(5).addValue(responseTime);
+@@ -284,15 +284,15 @@
+             iqTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -312,7 +312,7 @@
+             pstmt.setInt(3,custid);
+             pstmt.setInt(4,custid);
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             logger.debug(pstmt.toString());
+             responseTime = currentEndTs - currentStarttTs;
+@@ -321,16 +321,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -346,16 +346,16 @@
+             stmt.setInt(1,customer_no);
+             ResultSet rs = stmt.executeQuery();
+             if ( rs.next() ) {
+-                custid= rs.getInt(1);
+-            }
+-            rs.close();
++                custid= integer(rs,1);
++            }
++            drain(rs);
+         } catch (SQLException throwables) {
+             throwables.printStackTrace();
+         }finally {
+             try {
+                 stmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+ 
+@@ -364,7 +364,7 @@
+             pstmt = conn.prepareStatement(sqls.ap_q2());
+             pstmt.setInt(1,custid);
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             hist.getAPItem(1).addValue(responseTime);
+@@ -373,16 +373,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -399,7 +399,7 @@
+             pstmt.setInt(1,custid);
+             pstmt.setInt(2,custid);
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             logger.debug(pstmt.toString());
+@@ -408,16 +408,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -434,7 +434,7 @@
+             pstmt.setInt(1,custid);
+             pstmt.setInt(2,custid);
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             logger.debug(pstmt.toString());
+@@ -443,16 +443,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -469,7 +469,7 @@
+             pstmt.setInt(1,companyid);
+ 
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             logger.debug(pstmt.toString());
+@@ -478,16 +478,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -500,7 +500,7 @@
+         try {
+             pstmt = conn.prepareStatement(sqls.ap_q6());
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             logger.debug(pstmt.toString());
+@@ -509,16 +509,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -539,7 +539,7 @@
+             pstmt.setInt(4,companyid);
+ 
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             logger.debug(pstmt.toString());
+@@ -548,16 +548,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -570,7 +570,7 @@
+         try {
+             pstmt = conn.prepareStatement(sqls.ap_q8());
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             logger.debug(pstmt.toString());
+@@ -579,16 +579,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -601,7 +601,7 @@
+         try {
+             pstmt = conn.prepareStatement(sqls.ap_q9());
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             logger.debug(pstmt.toString());
+@@ -610,16 +610,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -632,7 +632,7 @@
+         try {
+             pstmt = conn.prepareStatement(sqls.ap_q10());
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             logger.debug(pstmt.toString());
+@@ -641,16 +641,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -663,7 +663,7 @@
+         try {
+             pstmt = conn.prepareStatement(sqls.ap_q11());
+             long currentStarttTs = System.currentTimeMillis();
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             logger.debug(pstmt.toString());
+@@ -672,16 +672,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -696,7 +696,7 @@
+             pstmt = conn.prepareStatement(sqls.ap_q12());
+             long currentStarttTs = System.currentTimeMillis();
+             pstmt.setString(1, Category);
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             logger.debug(pstmt.toString());
+             responseTime = currentEndTs - currentStarttTs;
+@@ -705,16 +705,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -730,7 +730,7 @@
+             custid = rg.getRandomint(customer_no);
+             long currentStarttTs = System.currentTimeMillis();
+             pstmt.setInt(1,custid);
+-            pstmt.execute();
++            execute(pstmt);
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+             logger.debug(pstmt.toString());
+@@ -739,16 +739,16 @@
+             apTotalCount++;
+             lock.unlock();
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            cr.setRt(responseTime);
+-            try {
+-                pstmt.close();
+-            } catch (SQLException e) {
+-                e.printStackTrace();
++            Client.recordFailure(e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            cr.setRt(responseTime);
++            try {
++                pstmt.close();
++            } catch (SQLException e) {
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -763,9 +763,9 @@
+         try {
+             Class<APClient> apClass = (Class<APClient>)Class.forName("com.hybench.workload.APClient");
+             if(type == 2){
+-                for(int r = 1;r <= round ;r++) {
++                for(int r = 1;r <= round && !budgetStopped() ;r++) {
+                     long roundElapsedTime = 0L;
+-                    for (int i = 1; i <= 13; i++) {
++                    for (int i = 1; i <= 13 && !budgetStopped(); i++) {
+                         Method method = apClass.getMethod("execQ" + i, Connection.class);
+                         ClientResult cr = (ClientResult) method.invoke(this, conn);
+                         logger.info("AP Task Q" + i + " elapsed time is  " + String.format("%.2f", cr.getRt()) + "(ms)");
+@@ -781,7 +781,7 @@
+             }
+             else if(type == 7){
+                 int round = 1;
+-                while(!exitFlag){
++                while(!exitFlag && !budgetStopped()){
+                     long roundElapsedTime = 0L;
+                     ArrayList<Integer> runList = getRandomList(1,13);
+                     StringBuilder sb = new StringBuilder("Current thread " + Thread.currentThread().getName() + " - Run List in current round "+ round+" : ");
+@@ -790,7 +790,7 @@
+                     }
+                     logger.info(sb.toString());
+                     int i = 0;
+-                    for ( i = 0; i < 13; i++) {
++                    for ( i = 0; i < 13 && !budgetStopped(); i++) {
+                         Method method = apClass.getMethod("execQ" + runList.get(i), Connection.class);
+                         ClientResult cr = (ClientResult) method.invoke(this, conn);
+                         totalElapsedTime += cr.getRt();
+@@ -807,7 +807,7 @@
+                 ret.setRt(totalElapsedTime);
+             }
+             else if(type== 0 || type == 4) {
+-                while(!exitFlag){
++                while(!exitFlag && !budgetStopped()){
+                     int i = rg.getRandomint(1, 7);
+                     Method method = apClass.getMethod("execIQ" + i,Connection.class);
+                     ClientResult cr = (ClientResult) method.invoke(this, conn);
+@@ -819,21 +819,21 @@
+             }
+ 
+         } catch (ClassNotFoundException e) {
+-            e.printStackTrace();
++            Client.recordFailure(e);
+         } catch (NoSuchMethodException e) {
+-            e.printStackTrace();
++            Client.recordFailure(e);
+         } catch (InvocationTargetException e) {
+-            e.printStackTrace();
++            Client.recordFailure(e);
+         } catch (IllegalAccessException e) {
+-            e.printStackTrace();
++            Client.recordFailure(e);
+         } catch (Exception e) {
+-            e.printStackTrace();
++            Client.recordFailure(e);
+         } finally {
+             if(conn!=null){
+                 try {
+                     conn.close();
+                 } catch (SQLException e) {
+-                    e.printStackTrace();
++                    Client.recordFailure(e);
+                 }
+             }
+         }
+--- a/src/main/java/com/hybench/workload/Client.java
++++ b/src/main/java/com/hybench/workload/Client.java
+@@ -28,7 +28,24 @@
+ public abstract class Client {
+     public static Logger logger = LogManager.getLogger(Client.class);
+ 
+-    protected boolean exitFlag = false;
++    protected volatile boolean exitFlag = false;
++    private static final String STOP_NAME = System.getenv("SIBENCH_BUDGET_STOP");
++    private static final File STOP_FILE = STOP_NAME == null || STOP_NAME.isEmpty() ? null : new File(STOP_NAME);
++
++    private static final java.util.concurrent.atomic.AtomicReference<Throwable> failure =
++            new java.util.concurrent.atomic.AtomicReference<>();
++
++    public static void recordFailure(Throwable cause) {
++        if (failure.compareAndSet(null, cause)) logger.error("HyBench source failed", cause);
++    }
++
++    public static void checkFailure() {
++        if (failure.get() != null) throw new IllegalStateException("HyBench source failed", failure.get());
++    }
++
++    protected boolean budgetStopped() {
++        return failure.get() != null || (STOP_FILE != null && STOP_FILE.exists());
++    }
+     protected Properties prop = null;
+     CompletionService<ClientResult> cs = null;
+     Future<ClientResult>[] fs = null;
+@@ -161,21 +178,21 @@
+         return boolParameter(paraName, false);
+     }
+ 
+-    // get db type, only mysql/oracle/pg supported
+-    public int getDbType(String db){
+-
+-        if(db.equalsIgnoreCase("postgreSQL")){
+-            return Constant.DB_PG;
+-        }
+-        else if(db.equalsIgnoreCase("mysql")){
+-            return Constant.DB_MYSQL;
+-        }
+-        else if(db.equalsIgnoreCase("oracle")){
+-            return Constant.DB_ORACLE;
+-        }
+-        else{
+-            return Constant.DB_UNKNOW;
+-        }
++    public int getDbType(String db) { return Constant.getDbType(db); }
++
++    // Finish the SQL before discarding its rows; the host streams one result per connection.
++    protected static void drain(java.sql.ResultSet rows) throws java.sql.SQLException {
++        if (!rows.isClosed()) try (rows) { while (rows.next()) {} }
++    }
++
++    protected static void execute(java.sql.PreparedStatement statement) throws java.sql.SQLException {
++        if (statement.execute()) drain(statement.getResultSet());
++    }
++    // Preserve the upstream numeric JDBC conversion: truncate fractions, reject overflow.
++    protected static int integer(java.sql.ResultSet rows, int column) throws java.sql.SQLException {
++        java.math.BigDecimal value = rows.getBigDecimal(column);
++        try { return value == null ? 0 : value.toBigInteger().intValueExact(); }
++        catch (ArithmeticException failure) { throw new java.sql.SQLDataException("HyBench integer overflow", "22003", failure); }
+     }
+     // get data size and create thread pool according to client number
+     public void doInit_wrapper(String clientName) {
+@@ -247,9 +264,9 @@
+             fi2.close();
+ 
+         } catch (FileNotFoundException e) {
+-            logger.error("File not found");
++            recordFailure(e);
+         } catch (IOException | ClassNotFoundException e) {
+-            logger.error("Error initializing stream");
++            recordFailure(e);
+         }
+ 
+         doInit();
+@@ -264,16 +281,17 @@
+             client.setTaskType(taskType);
+             client.doInit_wrapper(name);
+         } catch (InstantiationException e) {
+-            e.printStackTrace();
++            Client.recordFailure(e);
+         } catch (IllegalAccessException e) {
+-            e.printStackTrace();
++            Client.recordFailure(e);
+         } catch (InvocationTargetException e) {
+-            e.printStackTrace();
++            Client.recordFailure(e);
+         } catch (NoSuchMethodException e) {
+-            e.printStackTrace();
++            Client.recordFailure(e);
+         } catch (ClassNotFoundException e) {
+-            e.printStackTrace();
+-        }
++            Client.recordFailure(e);
++        }
++        checkFailure();
+         return client;
+     }
+     // client work from here. A new thread named timer to output response time histogram every 1/10 duration
+@@ -379,7 +397,7 @@
+                         logger.warn("Test Duration Timer was stopped in force");
+                         return;
+                     } catch (Exception e) {
+-                        e.printStackTrace();
++                        Client.recordFailure(e);
+                     }
+                 }
+             };
+@@ -389,6 +407,7 @@
+         int _num_thread = threads;
+ 
+         fs = new Future[_num_thread];
++        int submitted = 0;
+         for (int i = 1; i <= _num_thread; i++) {
+             final String threadId = "T" + i;
+             Callable<ClientResult> r = new Callable<ClientResult>() {
+@@ -402,26 +421,30 @@
+             };
+             try {
+                 fs[i-1] = cs.submit(r);
++                submitted++;
+             }  catch(Exception e) {
+-                logger.error("create thread failed " ,e );
++                recordFailure(e);
++                break;
+             }
+ 
+         }
+ 
+         double maxElapsedTime = 0L;
+-        for (int i = 0; i < _num_thread; i++) {
++        for (int i = 0; i < submitted; i++) {
+             try {
+                 fs[i] = cs.take();
+                 if(fs[i] != null && !fs[i].isCancelled() && fs[i].isDone() ) {
+                     _res = fs[i].get();
++                    if (!_res.isSucceed()) recordFailure(new IllegalStateException("Failed HyBench worker result"));
+                     if(_res.getRt() > maxElapsedTime)
+                         maxElapsedTime = _res.getRt();
+                 }
+             } catch (Exception e) {
+-                logger.error("Waiting for load worker", e);
+-            }
+-        }
+-
++                recordFailure(e);
++            }
++        }
++
++        if (failure.get() == null) {
+         if(clientName.equalsIgnoreCase("APClient")){
+             if(taskType == 2){
+                 ret.setApRound(round);
+@@ -451,6 +474,8 @@
+             }
+         }
+ 
++        }
++
+         if (timer != null) {
+             timer.interrupt();
+         }
+@@ -458,6 +483,7 @@
+         if (!es.isShutdown() || !es.isTerminated()) {
+             es.shutdownNow();
+         }
++        checkFailure();
+         logger.info( "Finished to execute " + clientName );
+     }
+     public abstract void doInit();
+@@ -465,15 +491,7 @@
+     public abstract ClientResult execute();
+ 
+     public void stopTask() {
+-        exitFlag =  true;
+-        int p = 0;
+-        if(taskType != 7){
+-            if(fs != null){
+-                for(Future ft:fs){
+-                    ft.cancel(true);
+-                }
+-            }
+-        }
++        exitFlag = true;
+     }
+ 
+     public ArrayList<Integer> getRandomList(int minValue, int maxValue){
+--- a/src/main/java/com/hybench/workload/TPClient.java
++++ b/src/main/java/com/hybench/workload/TPClient.java
+@@ -22,6 +22,22 @@
+ 
+ 
+ public class TPClient extends Client {
++    private static void transactionFailure(Connection connection, SQLException error) {
++        try {
++            if (!connection.getAutoCommit()) connection.rollback();
++        } catch (SQLException rollback) {
++            error.addSuppressed(rollback);
++            Client.recordFailure(error);
++            return;
++        }
++        // Only native transaction conflicts are expected outcomes: DuckDB write conflicts and PostgreSQL
++        // deadlocks or serialization failures (SQLSTATE 40P01/40001); other failures stop the source.
++        boolean conflict = "40P01".equals(error.getSQLState()) || "40001".equals(error.getSQLState())
++                || error.getErrorCode() == 10 && error.getMessage() != null
++                && error.getMessage().startsWith("TransactionContext Error: Conflict on ");
++        if (!conflict) Client.recordFailure(error);
++    }
++
+     int at1_percent = 35;
+     int at2_percent = 25;
+     int at3_percent = 15;
+@@ -184,7 +200,7 @@
+             responseTime = currentEndTs - currentStarttTs;
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -192,7 +208,7 @@
+             try {
+                 pstmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -224,7 +240,7 @@
+             int idx = 1;
+             int custId = 0;
+             while(rs.next()){
+-                custId = rs.getInt(1);
++                custId = integer(rs,1);
+                 idx++;
+                 if(idx == stopId){
+                     break;
+@@ -241,7 +257,7 @@
+             responseTime = currentEndTs - currentStarttTs;
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -249,7 +265,7 @@
+             try {
+                 pstmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -281,7 +297,7 @@
+             int idx = 1;
+             int custId = 0;
+             while(rs.next()){
+-                custId = rs.getInt(1);
++                custId = integer(rs,1);
+                 idx++;
+                 if(idx == stopId){
+                     break;
+@@ -300,7 +316,7 @@
+             responseTime = currentEndTs - currentStarttTs;
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -308,7 +324,7 @@
+             try {
+                 pstmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -363,9 +379,10 @@
+             int flag = 0;
+             double balance = 0;
+             if (rs.next()){
+-                flag = rs.getInt(1);
++                flag = integer(rs,1);
+                 balance = rs.getDouble(2);
+             }
++            drain(rs);
+             if (flag == 1 || balance < amount){
+                 conn.rollback();
+             }
+@@ -375,8 +392,9 @@
+                 rs= pstmt.executeQuery();
+                 int count = 0;
+                 if (rs.next()){
+-                    count = rs.getInt(1);
+-                }
++                    count = integer(rs,1);
++                }
++                drain(rs);
+                 if (count > 0){
+                     conn.rollback();
+                 }
+@@ -405,7 +423,7 @@
+                     pstmt.setTimestamp(5, ts);
+                     pstmt.executeUpdate();
+                     pstmt.close();
+-                    rs.close();
++                    drain(rs);
+                     conn.commit();
+                 }
+             }
+@@ -420,7 +438,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -428,7 +446,7 @@
+             try {
+                 pstmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -483,9 +501,10 @@
+             int flag = 0;
+             double balance = 0;
+             if (rs.next()){
+-                flag = rs.getInt(1);
+-                balance = rs.getInt(2);
+-            }
++                flag = integer(rs,1);
++                balance = integer(rs,2);
++            }
++            drain(rs);
+             if (flag==1 || balance<amount){
+                 conn.rollback();
+             }
+@@ -495,8 +514,9 @@
+                 rs= pstmt.executeQuery();
+                 int count = 0 ;
+                 if (rs.next()){
+-                    count = rs.getInt(1);
+-                }
++                    count = integer(rs,1);
++                }
++                drain(rs);
+                 if (count>0){
+                     conn.rollback();
+                 }
+@@ -525,7 +545,7 @@
+                     pstmt.setTimestamp(5, ts);
+                     pstmt.executeUpdate();
+                     pstmt.close();
+-                    rs.close();
++                    drain(rs);
+                     conn.commit();
+                 }
+             }
+@@ -538,7 +558,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -546,7 +566,7 @@
+             try {
+                 pstmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -569,25 +589,25 @@
+             // Get random sourceid
+             rs = stmt.executeQuery( sqls.tp_at3_1());
+             while (rs.next()) {
+-                AT3_applicantid= rs.getInt(1);
+-                AT3_loanid=rs.getInt(2);
++                AT3_applicantid= integer(rs,1);
++                AT3_loanid=integer(rs,2);
+                 old_ts = rs.getTimestamp(3);
+                 if(old_ts.getTime()<CR.endDate.getTime())
+                     date = rg.getRandomTimestamp(old_ts.getTime(), CR.endDate.getTime());
+                 else
+                     date = CR.endDate;
+                 new_ts = new Timestamp(date.getTime());
+-                duration = rs.getInt(4);
++                duration = integer(rs,4);
+                 break;
+             }
+-            rs.close();
++            drain(rs);
+         } catch (SQLException throwables) {
+             throwables.printStackTrace();
+         }finally {
+             try {
+                 stmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+ 
+@@ -606,8 +626,9 @@
+             rs = pstmt.executeQuery();
+             int flag = 0;
+             if (rs.next()){
+-                flag = rs.getInt(1);
+-            }
++                flag = integer(rs,1);
++            }
++            drain(rs);
+             if (flag==1){
+                 pstmt = conn.prepareStatement(sql5);
+                 pstmt.setTimestamp(1,new_ts);
+@@ -622,7 +643,7 @@
+                 rs = pstmt.executeQuery();
+                 int amount = 0;
+                 while (rs.next()){
+-                    amount = rs.getInt(1);
++                    amount = integer(rs,1);
+                 }
+                 if (amount<0){
+                     // reject the loanapps
+@@ -663,7 +684,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -671,7 +692,7 @@
+             try {
+                 pstmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -693,9 +714,9 @@
+             // Get random sourceid
+             ResultSet rs = stmt.executeQuery(sqls.tp_at4_1());
+             while (rs.next()) {
+-                AT4_applicantid= rs.getInt(1);
++                AT4_applicantid= integer(rs,1);
+                 AT4_amount = rs.getDouble(2);
+-                AT4_loanid = rs.getInt(3);
++                AT4_loanid = integer(rs,3);
+                 old_ts = rs.getTimestamp(4);
+                 if(old_ts != null && old_ts.getTime()<CR.endDate.getTime() )
+                     date = rg.getRandomTimestamp(old_ts.getTime(), CR.endDate.getTime());
+@@ -703,14 +724,14 @@
+                     date = CR.endDate;
+                 new_ts = new Timestamp(date.getTime());
+             }
+-            rs.close();
++            drain(rs);
+         } catch (SQLException throwables) {
+             throwables.printStackTrace();
+         }finally {
+             try {
+                 stmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+ 
+@@ -731,8 +752,9 @@
+             pstmt = conn.prepareStatement(sql1);
+             pstmt.setInt(1,AT4_applicantid);
+             rs= pstmt.executeQuery();
+-            while (rs.next()){
+-                int flag = rs.getInt(1);
++            if (rs.next()){
++                int flag = integer(rs,1);
++                drain(rs);
+                 // current threshold is set to 5
+                 if (flag>5){
+                     conn.rollback();
+@@ -760,7 +782,7 @@
+             pstmt.executeUpdate();
+ 
+             pstmt.close();
+-            rs.close();
++            drain(rs);
+             conn.commit();
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+@@ -770,7 +792,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -778,7 +800,7 @@
+             try {
+                 pstmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -793,16 +815,16 @@
+             stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery( sqls.tp_at5_1());
+             if (rs.next()) {
+-                AT5_applicantid= rs.getInt(1);
+-            }
+-            rs.close();
++                AT5_applicantid= integer(rs,1);
++            }
++            drain(rs);
+         } catch (SQLException throwables) {
+             throwables.printStackTrace();
+         }finally {
+             try {
+                 stmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+ 
+@@ -821,11 +843,11 @@
+             pstmt1 = conn.prepareStatement(sql1);
+             pstmt1.setInt(1,AT5_applicantid);
+             rs= pstmt1.executeQuery();
+-            while(rs.next()){
+-                PreparedStatement pstmt2=conn.prepareStatement(sql2);
+-                int id = rs.getInt(1);
+-                pstmt2.setInt(1,id);
+-                pstmt2.executeUpdate();
++            java.util.List<Integer> loans = new java.util.ArrayList<>();
++            while (rs.next()) loans.add(integer(rs,1));
++            drain(rs);
++            try (PreparedStatement pstmt2=conn.prepareStatement(sql2)) {
++                for (int id : loans) { pstmt2.setInt(1,id); pstmt2.executeUpdate(); }
+             }
+             conn.commit();
+             long currentEndTs = System.currentTimeMillis();
+@@ -836,7 +858,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -845,7 +867,7 @@
+                 pstmt1.close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -860,16 +882,16 @@
+             stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sqls.tp_at6_1());
+             if (rs.next()) {
+-                AT6_applicantid= rs.getInt(1);
+-            }
+-            rs.close();
++                AT6_applicantid= integer(rs,1);
++            }
++            drain(rs);
+         } catch (SQLException throwables) {
+             throwables.printStackTrace();
+         }finally {
+             try {
+                 stmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+ 
+@@ -890,8 +912,9 @@
+             pstmt1 = conn.prepareStatement(sql1);
+             pstmt1.setInt(1, AT6_applicantid);
+             rs= pstmt1.executeQuery();
+-            while(rs.next()){
+-                int count = rs.getInt(1);
++            if(rs.next()){
++                int count = integer(rs,1);
++                drain(rs);
+                 if (count>0) {
+                     // block the savingaccount
+                     PreparedStatement pstmt2 = conn.prepareStatement(sql2);
+@@ -921,16 +944,16 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
+-            cr.setResult(false);
+-            cr.setErrorMsg(e.getMessage());
+-            cr.setErrorCode(String.valueOf(e.getErrorCode()));
+-        }  finally {
+-            try {
+-                rs.close();
++            transactionFailure(conn, e);
++            cr.setResult(false);
++            cr.setErrorMsg(e.getMessage());
++            cr.setErrorCode(String.valueOf(e.getErrorCode()));
++        }  finally {
++            try {
++                drain(rs);
+                 pstmt1.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -952,7 +975,7 @@
+             pstmt = conn.prepareStatement(sqls.tp_txn1());
+             pstmt.setInt(1,custid);
+             ResultSet rs = pstmt.executeQuery();
+-            rs.close();
++            drain(rs);
+             conn.commit();
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+@@ -962,7 +985,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -971,7 +994,7 @@
+                 pstmt.close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -993,7 +1016,7 @@
+             pstmt = conn.prepareStatement(sqls.tp_txn2());
+             pstmt.setInt(1, companyid);
+             ResultSet rs = pstmt.executeQuery();
+-            rs.close();
++            drain(rs);
+ 
+             conn.commit();
+             long currentEndTs = System.currentTimeMillis();
+@@ -1004,7 +1027,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1013,7 +1036,7 @@
+                 pstmt.close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1033,7 +1056,7 @@
+             pstmt = conn.prepareStatement(sqls.tp_txn3());
+             pstmt.setInt(1,accountId);
+             ResultSet rs = pstmt.executeQuery();
+-            rs.close();
++            drain(rs);
+             conn.commit();
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+@@ -1043,7 +1066,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1052,7 +1075,7 @@
+                 pstmt.close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1072,7 +1095,7 @@
+             pstmt = conn.prepareStatement(sqls.tp_txn4());
+             pstmt.setInt(1,accountId);
+             ResultSet rs = pstmt.executeQuery();
+-            rs.close();
++            drain(rs);
+             conn.commit();
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+@@ -1082,7 +1105,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1091,7 +1114,7 @@
+                 pstmt.close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1111,7 +1134,7 @@
+             pstmt.setInt(1,accountId);
+             pstmt.setInt(2,accountId);
+             ResultSet rs = pstmt.executeQuery();
+-            rs.close();
++            drain(rs);
+             conn.commit();
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+@@ -1121,7 +1144,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1129,7 +1152,7 @@
+             try {
+                 pstmt.close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1149,7 +1172,7 @@
+             pstmt.setInt(1,accountId);
+             pstmt.setInt(2,accountId);
+             ResultSet rs = pstmt.executeQuery();
+-            rs.close();
++            drain(rs);
+             conn.commit();
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+@@ -1159,7 +1182,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1168,7 +1191,7 @@
+                 pstmt.close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1187,7 +1210,7 @@
+             pstmt = conn.prepareStatement(sqls.tp_txn7());
+             pstmt.setInt(1,accountId);
+             ResultSet rs = pstmt.executeQuery();
+-            rs.close();
++            drain(rs);
+ 
+             conn.commit();
+             long currentEndTs = System.currentTimeMillis();
+@@ -1198,7 +1221,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1207,7 +1230,7 @@
+                 pstmt.close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1226,7 +1249,7 @@
+             pstmt = conn.prepareStatement(sqls.tp_txn8());
+             pstmt.setInt(1,accountId);
+             ResultSet rs = pstmt.executeQuery();
+-            rs.close();
++            drain(rs);
+             conn.commit();
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+@@ -1236,7 +1259,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1245,7 +1268,7 @@
+                 pstmt.close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1294,7 +1317,7 @@
+             if (rs.next()){
+                 balance = rs.getDouble(1);
+             }
+-            rs.close();
++            drain(rs);
+ 
+             if (balance<amount){ // Check the balance
+                 conn.rollback();
+@@ -1317,7 +1340,7 @@
+                 pstmt[3].setDouble(3,amount);
+                 pstmt[3].setString(4,type);
+                 pstmt[3].setTimestamp(5, ts);
+-                if(dbType == 5){
++                if(dbType == 5 || dbType == com.hybench.Constant.DB_DUCKDB){
+                     pstmt[3].setTimestamp(6,null);
+                 }
+                 pstmt[3].executeUpdate();
+@@ -1332,7 +1355,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1344,7 +1367,7 @@
+                 pstmt[3].close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1379,8 +1402,10 @@
+             //get all employees
+             pstmt[0].setInt(1,companyid);
+             rs= pstmt[0].executeQuery();
+-            while(rs.next()) {
+-                int custid = rs.getInt(1);
++            java.util.List<Integer> employees = new java.util.ArrayList<>();
++            while (rs.next()) employees.add(integer(rs,1));
++            drain(rs);
++            for (int custid : employees) {
+ 
+                 // update company savingaccount
+                 pstmt[1].setDouble(1, salary);
+@@ -1400,7 +1425,6 @@
+                 pstmt[3].setTimestamp(5, ts);
+                 pstmt[3].executeUpdate();
+             }
+-            rs.close();
+             conn.commit();
+             long currentEndTs = System.currentTimeMillis();
+             responseTime = currentEndTs - currentStarttTs;
+@@ -1410,7 +1434,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1422,7 +1446,7 @@
+                 pstmt[3].close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1472,7 +1496,7 @@
+                 balance = rs.getDouble(1);
+                 break;
+             }
+-            rs.close();
++            drain(rs);
+ 
+             if (balance<amount){ // Check the balance
+                 conn.rollback();
+@@ -1508,7 +1532,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1520,7 +1544,7 @@
+                 pstmt[3].close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1570,7 +1594,7 @@
+                     balance = rs.getDouble(1);
+                     break;
+                 }
+-                rs.close();
++                drain(rs);
+                 if (balance<amount){ // Check the balance
+                     conn.rollback();
+                 }
+@@ -1591,7 +1615,7 @@
+                     balance = rs.getDouble(1);
+                     break;
+                 }
+-                rs.close();
++                drain(rs);
+                 if (balance<amount){ // Check the balance
+                     conn.rollback();
+                 }
+@@ -1620,7 +1644,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1634,7 +1658,7 @@
+                     pstmt[2].close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1682,13 +1706,13 @@
+             // get loanapps info
+             rs = pstmt[0].executeQuery();
+             if(rs.next()) {
+-                appid = rs.getInt(1);
+-                applicantID=rs.getInt(2);
+-                amount = rs.getInt(3);
+-                duration =rs.getInt(4);
++                appid = integer(rs,1);
++                applicantID=integer(rs,2);
++                amount = integer(rs,3);
++                duration =integer(rs,4);
+                 appts = rs.getTimestamp(5);
+             }
+-            rs.close();
++            drain(rs);
+ 
+             if(status=="accept") {
+                 Date date=null;
+@@ -1736,7 +1760,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1755,7 +1779,7 @@
+ 
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1784,8 +1808,8 @@
+             pstmt[0]=conn.prepareStatement(sql1);
+             rs= pstmt[0].executeQuery();
+             if (rs.next()){
+-                id = rs.getInt(1);
+-                applicantid = rs.getInt(2);
++                id = integer(rs,1);
++                applicantid = integer(rs,2);
+                 amount = rs.getDouble(3);
+                 contract_ts =rs.getTimestamp(4);
+                 Date date = CR.endDate;
+@@ -1798,7 +1822,7 @@
+ 
+                 current_ts = new Timestamp(date.getTime());
+             }
+-            rs.close();
++            drain(rs);
+             pstmt[1]=conn.prepareStatement(sql2);
+             pstmt[1].setDouble(1,amount);
+             pstmt[1].setInt(2, applicantid);
+@@ -1816,7 +1840,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1830,7 +1854,7 @@
+                     pstmt[2].close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1862,12 +1886,12 @@
+             // get loantrans info
+             rs = pstmt[0].executeQuery();
+             if(rs.next()) {
+-                id = rs.getInt(1);
+-                applicantID=rs.getInt(2);
+-                duration =rs.getInt(3);
++                id = integer(rs,1);
++                applicantID=integer(rs,2);
++                duration =integer(rs,3);
+                 contract_ts = rs.getTimestamp(4);
+             }
+-            rs.close();
++            drain(rs);
+             Long duration_ts = Long.valueOf(duration * 24 * 60 * 60 * 1000);
+             // check if it is overdued
+             if(contract_ts != null && duration_ts + contract_ts.getTime() < current_date) {
+@@ -1885,7 +1909,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1897,7 +1921,7 @@
+                     pstmt[1].close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -1932,9 +1956,9 @@
+             // get loantrans info
+             rs = pstmt[0].executeQuery();
+             while(rs.next()) {
+-                id = rs.getInt(1);
+-                applicantID = rs.getInt(2);
+-                duration = rs.getInt(3);
++                id = integer(rs,1);
++                applicantID = integer(rs,2);
++                duration = integer(rs,3);
+                 amount = rs.getDouble(4);
+                 ts = rs.getTimestamp(5);
+                 if(ts != null && ts.getTime()<CR.endDate.getTime())
+@@ -1944,7 +1968,7 @@
+                 current_ts = new Timestamp(date.getTime());
+                 break;
+             }
+-            rs.close();
++            drain(rs);
+             // get the balance
+             pstmt[1].setInt(1, applicantID);
+             rs = pstmt[1].executeQuery();
+@@ -1952,7 +1976,7 @@
+                 balance = rs.getDouble(1);
+                 break;
+             }
+-            rs.close();
++            drain(rs);
+             if (balance < amount){
+                 conn.rollback();
+             }
+@@ -1976,7 +2000,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -1991,7 +2015,7 @@
+                 if(pstmt[3] != null)
+                     pstmt[3].close();
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -2039,9 +2063,9 @@
+             rs= pstmt[0].executeQuery();
+             if (rs.next()){
+                 balance = rs.getDouble(1);
+-                isBlocked = rs.getInt(2);
+-            }
+-            rs.close();
++                isBlocked = integer(rs,2);
++            }
++            drain(rs);
+ 
+             if (balance < amount || isBlocked == 1){ // Check the balance
+                 conn.rollback();
+@@ -2051,9 +2075,9 @@
+                 pstmt[0].setInt(1,accountid);
+                 rs= pstmt[0].executeQuery();
+                 if (rs.next()){
+-                    isBlocked = rs.getInt(1);
+-                }
+-                rs.close();
++                    isBlocked = integer(rs,1);
++                }
++                drain(rs);
+ 
+                 if ( isBlocked == 1){ // Check checking account is blocked or not
+                     conn.rollback();
+@@ -2081,7 +2105,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -2093,7 +2117,7 @@
+                 pstmt[3].close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -2141,9 +2165,9 @@
+             rs= pstmt[0].executeQuery();
+             if (rs.next()){
+                 balance = rs.getDouble(1);
+-                isBlocked = rs.getInt(2);
+-            }
+-            rs.close();
++                isBlocked = integer(rs,2);
++            }
++            drain(rs);
+ 
+             if (balance < amount || isBlocked == 1){ // Check the balance
+                 conn.rollback();
+@@ -2153,9 +2177,9 @@
+                 pstmt[0].setInt(1,accountid);
+                 rs= pstmt[0].executeQuery();
+                 if (rs.next()){
+-                    isBlocked = rs.getInt(1);
+-                }
+-                rs.close();
++                    isBlocked = integer(rs,1);
++                }
++                drain(rs);
+ 
+                 if ( isBlocked == 1){ // Check checking account is blocked or not
+                     conn.rollback();
+@@ -2183,7 +2207,7 @@
+             lock.unlock();
+             cr.setRt(responseTime);
+         } catch (SQLException e) {
+-            e.printStackTrace();
++            transactionFailure(conn, e);
+             cr.setResult(false);
+             cr.setErrorMsg(e.getMessage());
+             cr.setErrorCode(String.valueOf(e.getErrorCode()));
+@@ -2195,7 +2219,7 @@
+                 pstmt[3].close();
+ 
+             } catch (SQLException e) {
+-                e.printStackTrace();
++                Client.recordFailure(e);
+             }
+         }
+         return cr;
+@@ -2212,7 +2236,7 @@
+             Class<TPClient> tpClass = (Class<TPClient>)Class.forName("com.hybench.workload.TPClient");
+             if(type == 1){
+ 
+-                while(!exitFlag) {
++                while(!exitFlag && !budgetStopped()) {
+                     int rand = ThreadLocalRandom.current().nextInt(1, 100);
+                     if(rand < tp1_percent){
+                         cr = execTxn1(conn);
+@@ -2296,7 +2320,7 @@
+                 ret.setRt(totalElapsedTime);
+             }
+             else if(type == 0 || type == 4){
+-                while(!exitFlag){
++                while(!exitFlag && !budgetStopped()){
+                     int rand = ThreadLocalRandom.current().nextInt(1, 100);
+                     if(type == 4 && Thread.currentThread().getName().equalsIgnoreCase("T1")){
+ //                        if(rand < fresh_percent){
+@@ -2339,13 +2363,13 @@
+             }
+ 
+         } catch (ClassNotFoundException e) {
+-            e.printStackTrace();
++            Client.recordFailure(e);
+         }finally {
+             if(conn != null) {
+                 try {
+                     conn.close();
+                 } catch (SQLException e) {
+-                    e.printStackTrace();
++                    Client.recordFailure(e);
+                 }
+             }
+         }
+--- a/src/main/java/com/hybench/load/DataGenerator_RiskControlling.java
++++ b/src/main/java/com/hybench/load/DataGenerator_RiskControlling.java
+@@ -40,7 +40,8 @@
+                 list[r] = Integer.parseInt(l);
+         }
+         b.close();
+-        return list;
++        if (c == 0) throw new IllegalStateException("No risk-account candidates in " + filename);
++        return Arrays.copyOf(list, Math.min(c, list.length));
+     }
+ 
+     public void dataGenerator() {

@@ -1,0 +1,100 @@
+// Compressed Trace files carry logical index operations and source facts for replay.
+syntax = "proto3";
+
+package sibench.index;
+
+import "index_types.proto";
+
+option java_multiple_files = true;
+option java_package = "org.sibench.adapters.proto";
+
+message TracePosition {
+  uint64 source_event = 1;
+  uint64 work_unit_id = 2;
+  uint64 mutation_ordinal = 3;
+  uint32 flags = 4;
+  uint64 expected_count = 5;
+  uint32 expansion_position = 6;
+  uint32 expansion_size = 7;
+  // Deletes have no service value, but their source maintenance unit still names its RowID.
+  int64 deleted_row_id = 8;
+}
+
+message TraceBegin {
+  uint64 transaction_id = 1;
+  uint64 version = 2;
+}
+
+// Source resolution only: never sent to the Index Service. Counts describe exported members.
+message TraceEnd {
+  uint64 transaction_id = 1;
+  uint64 version = 2;
+  bool aborted = 3;
+  uint64 operations = 4;
+  uint64 writes = 5;
+}
+
+message TraceRecord {
+  oneof operation {
+    Request request = 1;
+    TraceBegin begin = 2;
+    TraceEnd end = 4;
+  }
+  // One position per logical member; a SearchGroup is one source access.
+  repeated TracePosition positions = 3;
+}
+
+// Stored operation messages retain their field layout independently of the data RPCs.
+message Request {
+  uint64 id = 1;  // unique per stream
+  reserved 5, 6, 7, 8, 10;
+  oneof operation {
+    Write write = 2;
+    Search search = 3;
+    SearchGroup group = 4;
+    WriteBatch batch = 9;
+  }
+}
+
+message Write {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    INSERT = 1;          // baseline load at version 0
+    UPSERT = 2;          // a new version of the entry
+    LOGICAL_DELETE = 3;  // the entry does not exist from this version on; no value
+    RELOCATE = 4;        // replace the value of this exact, existing version
+  }
+  Kind kind = 1;
+  EntryKey key = 2;
+  uint64 version = 3;
+  Value value = 4;
+}
+
+message WriteBatch {
+  repeated Write writes = 1;
+}
+
+message Search {
+  uint32 table = 1;
+  uint32 index = 2;
+  Bound lower = 3;  // absent: unbounded
+  Bound upper = 4;  // absent: unbounded
+  bool descending = 5;
+  uint64 limit = 6;  // 0: no limit
+  uint64 read_version = 7;
+  // A pinned search names exactly one secondary entry: lower == upper == the indexed value, and
+  // this primary key.
+  bytes pinned_primary_key = 8;
+  reserved 9;
+
+}
+
+message SearchGroup {
+  enum Mode {
+    MODE_UNSPECIFIED = 0;
+    INTERSECTION = 1;
+    UNION = 2;
+  }
+  Mode mode = 1;
+  repeated Search members = 2;  // all of one table, at one read_version
+}

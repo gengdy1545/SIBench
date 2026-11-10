@@ -9,8 +9,11 @@
   <properties>
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <sibench.build.directory>${project.basedir}/build/sibench</sibench.build.directory>
     <grpc.version>1.74.0</grpc.version>
     <protobuf.version>3.25.5</protobuf.version>
+    <duckdb.build.directory>${project.basedir}/build/services/duckdb</duckdb.build.directory>
+    <rocksdb.build.directory>${project.basedir}/build/services/rocksdb</rocksdb.build.directory>
   </properties>
   <dependencies>
     <dependency>
@@ -19,19 +22,11 @@
       <version>42.7.8</version>
     </dependency>
     <dependency>
-      <groupId>org.apache.parquet</groupId>
-      <artifactId>parquet-hadoop</artifactId>
-      <version>1.15.2</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-common</artifactId>
-      <version>3.4.2</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-mapreduce-client-core</artifactId>
-      <version>3.4.2</version>
+      <groupId>org.sibench.native</groupId>
+      <artifactId>duckdb_jdbc</artifactId>
+      <version>source</version>
+      <scope>system</scope>
+      <systemPath>${duckdb.build.directory}/duckdb_jdbc.jar</systemPath>
     </dependency>
     <dependency>
       <groupId>com.moandjiezana.toml</groupId>
@@ -69,15 +64,18 @@
       <version>${protobuf.version}</version>
     </dependency>
     <dependency>
-      <!-- Reads zstd backend traces; the version parquet-hadoop already resolves. -->
+      <!-- Compresses canonical protobuf Trace blocks. -->
       <groupId>com.github.luben</groupId>
       <artifactId>zstd-jni</artifactId>
       <version>1.5.6-6</version>
     </dependency>
     <dependency>
-      <groupId>org.rocksdb</groupId>
+      <!-- The gitlink owns the engine version; this is the locally built JNI artifact. -->
+      <groupId>org.sibench.native</groupId>
       <artifactId>rocksdbjni</artifactId>
-      <version>9.1.1</version>
+      <version>source</version>
+      <scope>system</scope>
+      <systemPath>${rocksdb.build.directory}/rocksdbjni.jar</systemPath>
     </dependency>
     <dependency>
       <groupId>junit</groupId>
@@ -87,7 +85,7 @@
     </dependency>
   </dependencies>
   <build>
-    <directory>${project.basedir}/build/sibench</directory>
+    <directory>${sibench.build.directory}</directory>
     <finalName>sibench</finalName>
     <extensions>
       <extension>
@@ -102,6 +100,7 @@
         <artifactId>protobuf-maven-plugin</artifactId>
         <version>0.6.1</version>
         <configuration>
+          <protoSourceRoot>${project.basedir}/proto</protoSourceRoot>
           <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
           <pluginId>grpc-java</pluginId>
           <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
@@ -146,6 +145,10 @@
             <goals><goal>shade</goal></goals>
             <configuration>
               <createDependencyReducedPom>false</createDependencyReducedPom>
+              <extraJars>
+                <extraJar>${duckdb.build.directory}/duckdb_jdbc.jar</extraJar>
+                <extraJar>${rocksdb.build.directory}/rocksdbjni.jar</extraJar>
+              </extraJars>
               <filters>
                 <filter>
                   <artifact>*:*</artifact>

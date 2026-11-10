@@ -1,0 +1,7 @@
+# Native DuckDB generation engine: source build and engine budget.
+schema_version: 1
+purpose: engine
+engine: duckdb
+build_directory: build/services/duckdb
+memory_limit: 16GiB
+threads: 8

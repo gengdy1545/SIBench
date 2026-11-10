@@ -15,9 +15,11 @@ class BenchmarkBuildTest(unittest.TestCase):
         self.root = Path(temporary.name)
         (self.root / "scripts").mkdir()
         shutil.copyfile(SCRIPT, self.root / "scripts" / SCRIPT.name)
+        driver = self.root / "src/main/native/sysbench/drv_duckdb.cc"
+        driver.parent.mkdir(parents=True)
+        driver.write_text("driver source\n")
+        driver.with_name("retryable_error.hpp").write_text("retry policy\n")
         (self.root / "scripts/patches").mkdir()
-        shutil.copyfile(SCRIPT.parent / "patches/hybench-1.0-snapshot.patch",
-                        self.root / "scripts/patches/hybench-1.0-snapshot.patch")
         self.source = self.root / "benchmark/source"
         self.source.mkdir(parents=True)
         for name in ("autogen.sh", "configure"):
@@ -25,6 +27,8 @@ class BenchmarkBuildTest(unittest.TestCase):
             path.write_text("#!/bin/sh\nexit 0\n")
             path.chmod(0o755)
         (self.source / "source.c").write_text("pinned input\n")
+        (self.root / "scripts/patches/native-stop-fixture.patch").write_text(
+            "--- a/source.c\n+++ b/source.c\n@@ -1 +1 @@\n-pinned input\n+patched input\n")
         shutil.copyfile(SCRIPT.parent.parent / "benchmark/HyBench-2024/pom.xml", self.source / "pom.xml")
         self.git("init", "-q")
         self.git("add", ".")
@@ -37,25 +41,26 @@ class BenchmarkBuildTest(unittest.TestCase):
 case "$*" in
   *" paths "*)
     printf "BENCHMARK='%s'\\nSOURCE='%s/benchmark/source'\\nBUILD='%s/build/benchmarks/client'\\n" \
-      "$SIBENCH_FIXTURE_BENCHMARK" "$SIBENCH_FIXTURE_ROOT" "$SIBENCH_FIXTURE_ROOT" ;;
+      "$SIBENCH_FIXTURE_BENCHMARK" "$SIBENCH_FIXTURE_ROOT" "$SIBENCH_FIXTURE_ROOT"
+    printf "NATIVE_STOP_PATCH='%s/scripts/patches/native-stop-fixture.patch'\\n" "$SIBENCH_FIXTURE_ROOT" ;;
   *" record "*) echo recorded > "$SIBENCH_FIXTURE_ROOT/build/benchmarks/client/native-build.json" ;;
   *) exit 74 ;;
 esac
 ''')
         java.chmod(0o755)
-        for command in ("mvn", "make"):
+        for command in ("mvn", "make", "javac", "jar"):
             executable = self.jdk / "bin" / command
             executable.write_text('''#!/bin/sh
 printf "%s %s\\n" "$PWD" "$*" >> "$SIBENCH_FIXTURE_ROOT/build.log"
 [ "${SIBENCH_FIXTURE_EXIT:-0}" = 0 ] || exit "$SIBENCH_FIXTURE_EXIT"
 case "$*" in
-  *"-pl jdbc"*)
-    target=$SIBENCH_FIXTURE_ROOT/build/benchmarks/client/jdbc/target
-    mkdir -p "$target/ycsb-jdbc-binding-fixture/lib"
-    echo jar > "$target/ycsb-jdbc-binding-fixture/lib/client.jar"
-    tar -czf "$target/ycsb-jdbc-binding-fixture.tar.gz" -C "$target" ycsb-jdbc-binding-fixture
-    rm -rf "$target/ycsb-jdbc-binding-fixture"
+  *"-pl core"*)
+    target=$SIBENCH_FIXTURE_ROOT/build/benchmarks/client/core/target
+    mkdir -p "$target/dependency"
+    echo jar > "$target/core-fixture.jar"
+    echo dependency > "$target/dependency/runtime.jar"
     ;;
+  *"--create --file"*) echo binding > "$3" ;;
 esac
 ''')
             executable.chmod(0o755)
@@ -75,8 +80,12 @@ esac
             with self.subTest(benchmark=benchmark):
                 result = self.run_build(benchmark)
                 self.assertEqual(0, result.returncode, result.stderr)
-                self.assertEqual("pinned input\n", (build / "source.c").read_text())
+                self.assertEqual("patched input\n", (build / "source.c").read_text())
                 self.assertTrue((build / "native-build.json").is_file())
+                if benchmark == "ycsb":
+                    self.assertTrue((build / "sibench-api/lib/sibench-ycsb.jar").is_file())
+                    self.assertTrue((build / "sibench-api/lib/core-fixture.jar").is_file())
+                    self.assertIn("-pl core -am -Psource-run", (self.root / "build.log").read_text())
                 self.assertEqual("", self.git("status", "--porcelain"))
                 shutil.rmtree(build)
         result = self.run_build("ycsb", 75)

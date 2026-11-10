@@ -1,0 +1,316 @@
+package org.sibench.replay;
+
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonParser;
+
+import org.sibench.capture.IndexCatalog;
+import org.sibench.capture.IndexOperationTrace;
+
+import org.sibench.capture.RunTiming;
+import org.sibench.trace.TraceManifest;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/** Verified Trace inputs shared by service execution and independent acceptance. */
+public final class ReplayInput {
+    private ReplayInput() {}
+
+    /** Workload preflight plus a baseline source that verifies coverage while its caller loads it. */
+    public record Input(IndexOperationTrace.Source baseline, IndexOperationTrace.Source workload,
+            Map<String, Object> preflight) {}
+
+    public static Map<String, Object> check(Path directory, ReplayConfig config) throws IOException {
+        var input = prepare(directory, config);
+        var counts = checkStream(input.baseline(), config, false);
+        input.preflight().put("baseline", counts);
+        return input.preflight();
+    }
+
+    /** Checks supply before a backend is touched; baseline verification is fused with its load. */
+    public static Input prepare(Path directory, ReplayConfig config) throws IOException {
+        var manifest = TraceManifest.read(directory);
+        boolean secondary = TraceManifest.secondaryIndexes(manifest);
+        if (config.secondaryIndexes() && !secondary)
+            throw new IOException("Trace does not provide secondary indexes; disable secondary consumption or regenerate with secondary export");
+        var units = org.sibench.capture.WorkUnits.read(directory);
+        if (!manifest.has("work_units_sha256")
+                || !units.sha256().equals(manifest.get("work_units_sha256").getAsString()))
+            throw new IOException("Source work-unit identity checksum mismatch");
+        var catalog = catalog(manifest, units);
+        var coverage = new Coverage("workload", catalog, units);
+        var workload = org.sibench.capture.ProtoTrace.source(directory, manifest, "workload");
+        var counts = checkStream(tee(workload, coverage), config, true);
+        coverage.finish(manifest);
+        if (manifest.get("workload_operations").getAsLong() != (long) counts.get("encoded_records"))
+            throw new IOException("Trace record count mismatch: workload");
+        if (manifest.get("last_resolved_version").getAsLong() != (long) counts.get("last_resolved_version"))
+            throw new IOException("Trace resolution watermark mismatch");
+        var report = report(config, null, counts);
+        report.put("secondary_index_coverage", manifest.get("secondary_index_coverage").getAsString());
+        report.put("status", "workload_integrity_and_supply_valid");
+        IndexOperationTrace.Source baseline = consumer -> {
+            report.remove("baseline");
+            report.put("status", "workload_integrity_and_supply_valid");
+            var baselineCoverage = new Coverage("baseline", catalog, null);
+            long records = tee(org.sibench.capture.ProtoTrace.source(directory, manifest, "baseline"), baselineCoverage).read(consumer);
+            baselineCoverage.finish(manifest);
+            if (manifest.get("baseline_operations").getAsLong() != records)
+                throw new IOException("Trace record count mismatch: baseline");
+            report.put("baseline", Map.of("encoded_records", records));
+            report.put("status", "trace_integrity_and_supply_valid");
+            return records;
+        };
+        return new Input(baseline, workload, report);
+    }
+
+    /**
+     * Validates source catalog membership and source-request binding, plus complete baseline
+     * maintenance units, during the supply check. Workload writes are final singleton entries.
+     */
+    private static final class Coverage implements IndexOperationTrace.Consumer {
+        private final String name;
+        private final Map<Integer, java.util.Set<Integer>> catalog;
+        private final org.sibench.capture.WorkUnits.Catalog units;
+        private final java.util.Set<Integer> seen = new java.util.HashSet<>();
+        private final java.util.Set<Integer> loadedTables = new java.util.HashSet<>();
+        private IndexOperationTrace.Operation primary, previous;
+        private int position, group;
+        private long rows, groupEvent, resolution;
+
+        Coverage(
+                String name,
+                Map<Integer, java.util.Set<Integer>> catalog,
+                org.sibench.capture.WorkUnits.Catalog units) {
+            this.name = name;
+            this.catalog = catalog;
+            this.units = units;
+        }
+
+        @Override
+        public void accept(IndexOperationTrace.Operation operation) throws IOException {
+                if (name.equals("baseline") && (operation.kind() != IndexOperationTrace.INSERT || operation.version() != 0))
+                    throw new IOException("Baseline requires version-zero Inserts");
+                if (operation.kind() == IndexOperationTrace.TRANSACTION_BEGIN
+                        && operation.version() != ++resolution)
+                    throw new IOException("Incomplete Trace resolution sequence");
+                if (!IndexOperationTrace.isControl(operation) && name.equals("workload")) {
+                    long start = units.firstEvent(operation.workUnitId());
+                    long next = units.firstEvent(operation.workUnitId() + 1);
+                    if (start < 0
+                            || operation.sourceEvent() < start
+                            || next >= 0 && operation.sourceEvent() >= next)
+                        throw new IOException(
+                                "Operation not bound to its source SQL request");
+                }
+                if (operation.kind() == IndexOperationTrace.SEARCH
+                        || IndexOperationTrace.isControl(operation)) {
+                    if (primary != null)
+                        throw new IOException("Interrupted index maintenance unit");
+                    if (!operation.grouped()
+                            && (operation.expansionSize() != 0
+                                    || operation.expansionPosition() != 0))
+                        throw new IOException("Unexpected search/control expansion");
+                    if (group > 0 && !operation.grouped())
+                        throw new IOException("Interrupted search group");
+                }
+                if (operation.kind() == IndexOperationTrace.SEARCH) {
+                    if (!catalog.getOrDefault(operation.table(), java.util.Set.of())
+                            .contains(operation.index()))
+                        throw new IOException("Search outside source catalog");
+                    // Group members are consecutive: positions 0..size-1, one source access.
+                    if (operation.grouped()) {
+                        if (operation.expansionPosition() != group
+                                || group > 0 && operation.sourceEvent() != groupEvent)
+                            throw new IOException("Search group out of order");
+                        groupEvent = operation.sourceEvent();
+                        group = operation.expansionPosition() + 1 == operation.expansionSize()
+                                ? 0
+                                : group + 1;
+                    }
+                    return;
+                }
+                if (group > 0) throw new IOException("Interrupted search group");
+                if (IndexOperationTrace.isControl(operation)) return;
+                if (name.equals("workload")) {
+                    if (operation.expansionSize() != 1 || operation.expansionPosition() != 0)
+                        throw new IOException("Workload requires final singleton index writes");
+                    if (!catalog.getOrDefault(operation.table(), java.util.Set.of()).contains(operation.index()))
+                        throw new IOException("Write outside source catalog");
+                    return;
+                }
+                if (operation.expansionSize() < 1)
+                    throw new IOException(
+                            "Current index write missing complete maintenance unit");
+                if (operation.expansionPosition() == 0) {
+                    if (primary != null)
+                        throw new IOException("Truncated index maintenance unit");
+                    if (operation.index() != 0)
+                        throw new IOException("Maintenance unit missing primary");
+                    seen.clear();
+                    primary = operation;
+                    previous = null;
+                    position = 0;
+                    if (name.equals("baseline")) {
+                        if (operation.workUnitId()
+                                != 1 + rows++ / IndexOperationTrace.BLOCK_RECORDS)
+                            throw new IOException(
+                                    "Invalid baseline source-row work-unit assignment");
+                        loadedTables.add(operation.table());
+                    }
+                }
+                if (primary == null
+                        || operation.table() != primary.table()
+                        || !operation.key().equals(primary.key())
+                        || operation.expansionSize() != primary.expansionSize()
+                        || operation.expansionPosition() != position++
+                        || operation.rowId() != primary.rowId()
+                        || operation.version() != primary.version()
+                        || operation.transactionId() != primary.transactionId()
+                        || operation.mutationOrdinal() != primary.mutationOrdinal()
+                        || operation.workUnitId() != primary.workUnitId()
+                        || operation.sourceEvent() != primary.sourceEvent()
+                        || operation.flags() != primary.flags()
+                        || (operation.index() == 0 && operation.indexedValue() != null)
+                        || (operation.kind() != primary.kind()
+                                && operation.kind() != IndexOperationTrace.LOGICAL_DELETE))
+                    throw new IOException("Invalid maintenance unit identity");
+                if (operation.index() > 0
+                        && operation.kind() != IndexOperationTrace.LOGICAL_DELETE
+                        && (operation.file() != primary.file()
+                                || operation.position() != primary.position()))
+                    throw new IOException("Secondary value location differs from primary");
+                if (operation.kind() == IndexOperationTrace.LOGICAL_DELETE
+                        && (operation.file() != 0 || operation.position() != 0))
+                    throw new IOException("Logical deletion has a physical location");
+                if (!catalog.getOrDefault(operation.table(), java.util.Set.of())
+                        .contains(operation.index()))
+                    throw new IOException("Write outside source catalog");
+                if (previous != null) {
+                    var prior = previous;
+                    if (operation.index() < prior.index()
+                            || operation.index() > prior.index() + 1
+                            || (operation.index() != prior.index()
+                                    && prior.kind() != primary.kind())
+                            || (operation.index() == prior.index()
+                                    && (prior.kind() != IndexOperationTrace.LOGICAL_DELETE
+                                            || operation.kind()
+                                                    != IndexOperationTrace.UPSERT
+                                            || java.util.Objects.equals(
+                                                    prior.indexedValue(),
+                                                    operation.indexedValue()))))
+                        throw new IOException("Invalid source index maintenance order");
+                }
+                previous = operation;
+                seen.add(operation.index());
+                if (operation.expansionPosition() == operation.expansionSize() - 1) {
+                    if (!seen.equals(catalog.get(operation.table()))
+                            || operation.kind() != primary.kind())
+                        throw new IOException(
+                                "Partial source index maintenance is not supported");
+                    primary = null;
+                }
+        }
+
+        void finish(com.google.gson.JsonObject manifest) throws IOException {
+            if (primary != null) throw new IOException("Unfinished index maintenance unit");
+            if (group > 0) throw new IOException("Unfinished search group");
+            if (name.equals("baseline")
+                    && (manifest.get("baseline_rows").getAsLong() != rows
+                            || !loadedTables.equals(catalog.keySet())))
+                throw new IOException("Baseline row/table coverage mismatch");
+        }
+    }
+
+    private static Map<Integer, java.util.Set<Integer>> catalog(
+            com.google.gson.JsonObject manifest, org.sibench.capture.WorkUnits.Catalog units)
+            throws IOException {
+        IndexCatalog.fromManifest(manifest);
+        if (manifest.get("source_work_units").getAsLong() != units.count())
+            throw new IOException("Source work-unit count mismatch");
+        Map<Integer, java.util.Set<Integer>> catalog = new LinkedHashMap<>();
+        for (var item : manifest.getAsJsonArray("index_definitions")) {
+            var definition = item.getAsJsonObject();
+            int table = definition.get("table_id").getAsInt(),
+                    index = definition.get("index_id").getAsInt();
+            if (index != 0 && manifest.get("secondary_index_coverage").getAsString().equals("primary_only")) continue;
+            if (!catalog.computeIfAbsent(table, ignored -> new java.util.TreeSet<>()).add(index))
+                throw new IOException("Duplicate index catalog identity");
+        }
+        return catalog;
+    }
+
+    /** The stream with every operation also shown to {@code also}, first. */
+    private static IndexOperationTrace.Source tee(
+            IndexOperationTrace.Source source, IndexOperationTrace.Consumer also) {
+        return consumer ->
+                source.read(
+                        new IndexOperationTrace.Consumer() {
+                            @Override
+                            public void accept(IndexOperationTrace.Operation operation) throws IOException {
+                                also.accept(operation);
+                                consumer.accept(operation);
+                            }
+
+                            @Override
+                            public void accept(org.sibench.adapters.proto.TraceRecord record,
+                                    List<IndexOperationTrace.Operation> views) throws IOException {
+                                also.accept(record, views);
+                                consumer.accept(record, views);
+                            }
+                        });
+    }
+
+    static Map<String, Object> checkStream(
+            IndexOperationTrace.Source source, ReplayConfig config, boolean runtime) throws IOException {
+        try (var projection = new ReplayProjection(config, runtime, operation -> {})) {
+            RunTiming.current().phase(runtime ? "preflight-workload" : "preflight-baseline");
+            long records = source.read(projection);
+            projection.finish();
+            if (runtime) {
+                projection.requireClientCoverage();
+                if (projection.effectiveRequests() < config.requiredOperations())
+                    throw new IOException("Insufficient single-pass trace: requires " + config.requiredOperations()
+                            + " effective workload operations, found " + projection.effectiveRequests()
+                            + "; continue native capture, trace repetition is not supported");
+            }
+            var counts = projection.describe();
+            counts.put("encoded_records", records);
+            return counts;
+        }
+    }
+
+    static Map<String, Object> report(ReplayConfig config, Map<String, Object> baseline,
+            Map<String, Object> workload) {
+        var report = new LinkedHashMap<String, Object>();
+        report.put("status", "trace_integrity_and_supply_valid");
+        report.put("configuration", config.describe());
+        if (baseline != null) report.put("baseline", baseline);
+        report.put("workload", workload);
+        report.put("budget_scope", "input supply only; no rate scheduling or duration guarantee");
+        report.put("validation_scope", "canonical proto integrity and supply, source catalog,"
+                + " work-unit binding and complete maintenance units; baseline verification completes during its load");
+        return report;
+    }
+
+    /** Binds an index to its Trace and replay settings. */
+    public static String binding(Path directory, ReplayConfig config) throws IOException {
+        var manifest =
+                JsonParser.parseString(
+                                Files.readString(directory.resolve("manifest.json")))
+                        .getAsJsonObject();
+        return "workload="
+                + manifest.get("workload_trace_sha256").getAsString()
+                + " baseline="
+                + manifest.get("baseline_trace_sha256").getAsString()
+                + " secondary="
+                + config.secondaryIndexes();
+    }
+
+}

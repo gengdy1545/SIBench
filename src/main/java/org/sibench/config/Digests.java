@@ -11,10 +11,18 @@ import java.util.HexFormat;
 /**
  * The SHA256 of a file, read now. It lives below every other package so that code which only
  * needs a digest (the capture driver and its configuration, the source schema) does not depend on
- * the baseline generator and its Parquet writer.
+ * generation and Trace publication.
  */
 public final class Digests {
     private Digests() {}
+
+    public static MessageDigest digest() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException error) {
+            throw new IllegalStateException(error);
+        }
+    }
 
     public static String sha256(Path path) throws IOException {
         try {

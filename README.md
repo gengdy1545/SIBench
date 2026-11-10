@@ -1,168 +1,188 @@
 # SIBench
 
-SIBench captures index accesses from native HyBench, YCSB JDBC, and sysbench PostgreSQL executions. It generates Parquet data and deterministic Trace artifacts for update-locality analysis and KV Index Service evaluation. It supports local RocksDB and rocksdb-cloud, with service replay checking each query's result count and complete ordered SHA-256 digest.
+SIBench runs upstream benchmarks on native databases, exports a unified index Trace, and replays it against an Index Service. It measures index workloads, not end-to-end SQL performance or original client arrival timing. See the [Trace contract](docs/trace.md) and [Index Service contract](docs/index-service.md).
 
-The pipeline is native generation and loading → Baseline export and identity checks → native execution capture → Trace compilation → analysis or replay. Trace represents index accesses under fixed PG execution plans; it does not represent end-to-end SQL performance or the original session arrival timing.
+| Source | Mode / engine | Workload |
+| --- | --- | --- |
+| YCSB | `api` / RocksDB | A/B/C/F/D/E; Read-modify-write remains two API calls. |
+| sysbench | Default `capture` / PostgreSQL; optional DuckDB | Six configured OLTP workloads. |
+| HyBench | Default `cdc` / Pixels; optional native `capture` / PostgreSQL or DuckDB | CDC uses the HyBench TP/AT subset with AP/IQ disabled. Native capture retains AP → TP → concurrent XP. CDC exports Pixels' primary-index calls while applying changes from an uninstrumented PostgreSQL. |
 
 ## Build
 
-JDK 17, Maven, and Git are required. Set `JAVA_HOME` to the selected JDK.
+Use JDK 17, Maven and Git; set `JAVA_HOME`. Run from the repository root. Upstream sources are pinned by submodule gitlinks; Java dependencies belong to `pom.xml`.
+
+| Component | Additional prerequisites |
+| --- | --- |
+| RocksDB | Linux/glibc x86-64, Python 3.9+, CMake 3.11.4+, make, patch, C++17; LZ4, Zstd, zlib, Snappy and bzip2 development libraries. Execution hosts need compatible C++ and compression libraries. |
+| DuckDB | Linux/glibc x86-64, Python 3.9+, C++17, CMake 3.16+, make and patch. |
+| PostgreSQL | C compiler, make, patch, Perl, Bison, Flex and libzstd development headers; run PostgreSQL as an unprivileged user. |
+| Benchmark clients | HyBench/YCSB use Maven; sysbench also needs autotools, pkg-config, libtool, libaio and libpq development libraries. |
+| Pixels | Java phase: Maven with network access to Maven Central, and CMake/C++ for the Retina library built by Pixels' Maven build. Native phase, on the operating system that runs Pixels: CMake, C/C++, make, the PostgreSQL build tools above, curl and network access to GitHub (jemalloc, googletest and the pinned etcd release). |
+
+Build the embedded native runtimes before the Java application:
 
 ```bash
 git submodule update --init --recursive
+bash scripts/build-rocksdb.sh build/services/rocksdb
+bash scripts/build-duckdb.sh build/services/duckdb
 mvn package
 java -jar build/sibench/sibench.jar --help
 ```
 
-The build produces `build/sibench/sibench.jar` with its dependencies. Commands use the current repository by default; use `--root PATH` to select another root. Failures return a nonzero status. Configured output directories, report files, and new index directories must not already exist, preserving failed runs for diagnosis.
+The application JAR includes source-built RocksJava and DuckDB JDBC runtimes. Their loaders require the packaged native resources. DuckDB JDBC uses the same patched core sources and static archives as the capture host. For different fresh build directories, pass absolute paths with `-Drocksdb.build.directory=PATH` and `-Dduckdb.build.directory=PATH` to Maven, and select the corresponding directories in `config/sibench.yaml`.
 
-### Native capture components
-
-C/C++, make, and zstd development libraries are required. Extract clean PostgreSQL 14.24 sources into `build/benchmarks/postgresql-14.24`, then build the instrumented server:
+Build the engines and clients needed by the selected sources:
 
 ```bash
-make -C src/main/native/postgres install extension
-```
-
-The patch changes PG internal structures; extract a fresh source tree before rebuilding an older tree or reusing object files. Artifacts are written to `build/services/postgresql-capture/`. Source clients also require patch, tar, and either Maven (HyBench / YCSB) or autotools, pkg-config, libtool, and libpq development libraries (sysbench). Build the required clients from clean submodules:
-
-```bash
-scripts/build-benchmarks.sh config/benchmark/hybench.yaml
+scripts/build-postgres.sh config/sibench.yaml
 scripts/build-benchmarks.sh config/benchmark/ycsb.yaml
 scripts/build-benchmarks.sh config/benchmark/sysbench.yaml
+scripts/build-benchmarks.sh config/benchmark/hybench.yaml
 ```
 
-Builds use fresh copies under `build/benchmarks/` and reject existing build destinations. `native-build.json` pins the source commit and SHA digests of the actual executable, classes, and dependency JARs. Capture verifies this record; capture identities also include the actual client. sysbench's `native.binary` must select a file in that inventory; the standard build uses `src/sysbench`. A missing build-time inventory requires rebuilding the client from source. HyBench resolves dependencies through its POM. Its build copy applies `scripts/patches/hybench-1.0-snapshot.patch` to exclude the dsol XML simulator unused by `PowerDist`; the actual POM also contributes to the build digest. YCSB's distribution path is determined by the build output.
+Build the Pixels CDC engine in two phases; the native phase may run on another host after copying the directory:
+
+```bash
+scripts/build-pixels.sh java build/services/pixels
+scripts/build-pixels.sh native build/services/pixels
+```
+
+Runtime engine paths come from each engine configuration's `build_directory`; clients build under `build/benchmarks/`. Builds use pinned inputs and fresh destinations, leave upstream checkouts untouched, retain diagnostics on failure, and record input/artifact identities checked by generation. `JOBS` controls parallel compilation. Upstream licenses remain in [RocksDB](third_party/rocksdb/COPYING), [DuckDB](third_party/duckdb/LICENSE), [DuckDB Java](third_party/duckdb-java/LICENSE), [PostgreSQL](third_party/postgresql/COPYRIGHT), [Pixels](third_party/pixels/LICENSE) and [pixels-sink](third_party/pixels-sink/LICENSE); both embedded runtime JARs include their license texts.
 
 ### rocksdb-cloud JNI
 
-This component is required only for the cloud backend. Source revisions are pinned by the `index/rocksdb-cloud` and `third_party/aws-sdk-cpp` submodule gitlinks; Java dependencies are pinned in `pom.xml`. The build script requires both submodules to be clean and at their pinned commits.
-
-The script targets yum-based systems and requires patch, C/C++, CMake, make, and JDK 17. It installs curl, OpenSSL, and compression development dependencies as root, and applies the SDK path patch shipped with the JNI code to the build copy so that it uses this build's SDK headers. SDK and RocksDB build copies and JNI artifacts all live under `build/index/`; the AWS SDK is installed into its `aws-sdk/` subdirectory. The SDK builds the core, s3, transfer, and kinesis components; see the script for exact options. The build environment must be ABI-compatible with the runtime host.
+Only the cloud backend needs this build. It requires clean pinned `index/rocksdb-cloud` and `third_party/aws-sdk-cpp` submodules, patch, C/C++, CMake, make and JDK 17. The script targets yum-based systems and installs development dependencies as root; use a build host ABI-compatible with execution hosts.
 
 ```bash
 scripts/build-rocksdb-cloud.sh
 ```
 
-The output is `build/index/librocksdb_cloud_jni.so`; select it at runtime with `-Dsibench.rocksdb_cloud.library=PATH`. Upstream licenses remain in their submodules: [rocksdb-cloud](index/rocksdb-cloud/COPYING), [AWS SDK](third_party/aws-sdk-cpp/LICENSE.txt).
+Outputs include `build/index/librocksdb_cloud_jni.so` and `build/index/rocksdb-cloud-build.json`, binding pinned sources, project inputs, compiler and artifacts. Existing build outputs are rejected. Override with `-Dsibench.rocksdb_cloud.library=PATH`. Licenses: [rocksdb-cloud](index/rocksdb-cloud/COPYING), [AWS SDK](third_party/aws-sdk-cpp/LICENSE.txt).
 
-## Native capture
+### SlateDB JNI
+
+Requires Linux x86-64, Python 3, a C/C++ linker, `rustup` with the toolchain pinned by `index/slatedb/rust-toolchain.toml`, and the clean SlateDB submodule at its gitlink. Cargo uses the adapter's locked dependencies. Build on an ABI-compatible host:
 
 ```bash
-scripts/native-capture.sh config/benchmark/ycsb.yaml
+JOBS=4 scripts/build-slatedb.sh build/index/slatedb-build
+java -Dsibench.slatedb.library=build/index/slatedb-build/libslatedb_jni.so \
+  -jar build/sibench/sibench.jar index-server config/index/slatedb.yaml
 ```
 
-Run as a non-root user able to manage its own PG cluster. Java selection prefers `SIBENCH_JAVA_HOME`, then `JAVA_HOME`, then PATH. `SIBENCH_HEAP` defaults to `-Xmx12g`.
+The destination must be fresh. It retains source/build identities, native test results through the build exit status, and the JNI library. License: [SlateDB](index/slatedb/LICENSE).
 
-All three sources default to **87,060,000 rows**, corresponding to HyBench SF10. Filenames remain stable; each file declares the scale, table count, and concurrency:
+## Native generation
 
 | Configuration | Responsibility |
 | --- | --- |
-| `config/benchmark/hybench.yaml`, `ycsb.yaml`, `sysbench.yaml` | Native workloads, capture database identities, and source execution constraints |
-| `config/sibench.yaml` | PG server settings, reference / service replay drivers, and locality analysis |
-| `config/index/rocksdb.yaml`, `storage.yaml` | Index service and object storage backends |
+| [sibench.yaml](config/sibench.yaml) | Explicit benchmark/mode/engine selection, the engine configuration files, replay and analysis. |
+| [postgres.yaml](config/engine/postgres.yaml), [duckdb.yaml](config/engine/duckdb.yaml), [rocksdb.yaml](config/engine/rocksdb.yaml), [pixels/](config/engine/pixels/pixels.yaml) | Engine build directory and resources. PostgreSQL server settings and Pixels/pixels-sink resource overrides of the pinned upstream defaults live here; sink row filters, rewrites and unknown overrides are rejected; the generator assigns endpoints, run directories and settings that define Trace semantics, and rejects them in these files. |
+| [ycsb.yaml](config/benchmark/ycsb.yaml), [sysbench.yaml](config/benchmark/sysbench.yaml), [hybench.yaml](config/benchmark/hybench.yaml) | Source, schema, scale, workloads, concurrency, timeout, build/output paths and Trace export. |
+| [rocksdb_cloud.yaml](config/index/rocksdb_cloud.yaml), [slatedb.yaml](config/index/slatedb.yaml), [storage.yaml](config/index/storage.yaml) | Index Service and object storage. |
 
-All three sources use the same generation entry point: native baseline loading, initial-state export, native workload capture, and Trace compilation. Source adapters retain their own native clients and loading methods. Each run creates one fresh database, exports its initial state, and executes the native workloads in that same database. HyBench does not restore data between workload phases. Dedicated clusters use local trust authentication and empty client passwords; inherited `PGPASSWORD` is never written to command lines or logs.
+Public profiles use **87,060,000 baseline rows** and **10,000,000 effective workload requests** each: these are substantial runs. For shorter runs, use separate configurations with adjusted source scale/workloads and fresh output paths. HyBench `sf` selects the upstream parameter table; `native.parameters` can override positive `customer_number`, `company_number`, `transfer_number`, `checking_number`, `loanapps_number` and `loantrans_number`.
 
-Generation PostgreSQL is disposable. Source tables and their indexes are unlogged, and the default settings disable `fsync` and `full_page_writes`. Native table creation is converted while tables are empty, before loading. Failed or crashed state must be rebuilt; existing database directories are never reused. This policy does not change Index Service durability. WAL and checkpoint settings remain targets, not hard disk limits.
+```bash
+java -jar build/sibench/sibench.jar inspect-scale
+java -jar build/sibench/sibench.jar generate config/sibench.yaml
+```
 
-Production checks source provenance, client builds, schema, input files, request/session completion, transaction semantics, and the access ledger against PostgreSQL index counters. Baseline file identity is recorded in `baseline-manifest.json`; this is not an independent value-audit claim. Full baseline/row-state comparisons are explicit acceptance commands. Production writes Baseline, raw capture, Trace, timing and effective configurations, stops PG before compilation, and removes the database after success unless `SIBENCH_KEEP_DATABASE=1`. Failed artifacts remain for diagnosis and cannot be resumed. Use a fresh output path for each run.
+`generate` validates every selected input before starting a host, ignores unselected profiles, runs selections in order and stops at the first failure. Native API/capture uses one fresh database per source. Pixels CDC uses a fresh source PostgreSQL and a fresh Pixels database loaded independently from the same inputs. Working databases are deleted after publication. Existing/overlapping outputs, changed build/source inputs and unsupported configurations are rejected. Successful publication requires normal shutdown; failures retain diagnostics and cannot resume.
 
-Native execution stdout is saved as `native-run.log`. Structured capture status and build identities are recorded in `raw/capture-run.json`.
+`trace.workload_requests` counts each exported write and SearchGroup member (or standalone Search) after committed-state coalescing and index filtering; baseline and source transaction markers are excluded. Generation repeats finite source batches on the same database, distributes remaining requests across remaining workloads, and drains admitted events/transactions. HyBench native capture runs AP once before allocating the remainder to TP/XP; Pixels CDC shares the budget between TP and AT, with AP/IQ disabled. Actual output may exceed the target by source activity already captured but not yet exported when the target is reached, especially by a whole DuckDB window or a PostgreSQL capture backlog; no-progress batches fail. Omitting the target runs each configured batch once. `request-budget.json` records actual counts and overshoot.
 
-Provision disk capacity for one working database, Parquet / Trace artifacts, and compiler workspaces. Generation does not retain a reusable initial database or copy it into a capture database. Explicit acceptance needs additional audit workspace.
+`trace.secondary_indexes` defaults to false: only primary-index requests are exported, while source secondary indexes remain in use. Set true for all source indexes in native capture; Pixels CDC rejects secondary-index export. Consumption has a separate `target.secondary_indexes.enabled` switch and cannot request indexes absent from the Trace. [Filtering and expansion rules](docs/trace.md#operations-and-index-expansion) preserve whole query groups and transaction outcomes.
 
-For YCSB databases with `C` or `POSIX` collation, Baseline export reads ordered primary-index ranges from one snapshot and forbids PG temporary spills in those transactions. Two read windows share 128 MiB of encoded-row queue credit; a row must fit one reader's share of a 64 MiB window. This bounds the queues, not total JVM memory or all pipeline disk use. Other database collations use explicit `C` sorting and still require temporary space proportional to the input.
+Published artifacts contain separate baseline/workload streams, work units and a manifest with identities and statistics; they contain no native database or row contents. An `INCOMPLETE` marker prevents consumption. See [publication](docs/trace.md#native-publication). SQL and RocksDB generation export RowID values; Pixels CDC exports both RowID and Locator values.
 
-### Independent source acceptance
+The public runtime generates HyBench with `cdc` / Pixels, using a [TP/AT transaction subset](docs/trace.md#native-publication) rather than full HyBench HTAP; select `capture` with `postgres` or `duckdb` in a runtime copy for the native-capture Trace. Pixels CDC runs Pixels next to the generator when `pixels_host` is `local`. To run Pixels on another host, start the agent there with the same build and a token file, set `pixels_host: HOST:PORT` in an experiment copy of the engine configuration, and export `SIBENCH_PIXELS_HOST_TOKEN` for `generate`; the source PostgreSQL, HyBench and pixels-sink stay with the generator:
 
-Normal generation checks Baseline row coverage, file boundaries and file SHA-256 identities. Independent value and row-state audits are separate workflows:
+```bash
+java -jar build/sibench/sibench.jar pixels-host ADDRESS:PORT build/services/pixels WORK_ROOT TOKEN_FILE
+```
 
-| Check | Entry point | Required source state |
-| --- | --- | --- |
-| Initial Parquet values | `java -jar build/sibench/sibench.jar audit-baseline PROFILE BASELINE --jdbc URL --user ROLE` | The unchanged initial database, before workload execution. |
-| Captured row changes and final values | `java -jar build/sibench/sibench.jar audit-rows PROFILE BASELINE RAW --jdbc URL --user ROLE` | The same run's final database, with business clients stopped. |
+The generator checks the agent's Java build and native source/capacity identity before loading, and records the agent's actual build in the Trace. Host requests have deadlines covering uploads and responses. Each uploaded shard is limited to 4 GiB; failed uploads remove only their own partial file and terminate the session. Commands redact tracer tokens. Deletion requires a run directory created and stopped by that session. PostgreSQL and Pixels load independently from the same generated CSVs. The generator converts Pixels inputs into bounded text shards, using `load.rows_per_file` for the shard size and `load.threads` for parallel file consumers. Workloads start after both baselines and per-table counts pass. `source-load.json`, `baseline-load.json`, `pixels-schema.tsv` and `progress.jsonl` record the effective schema, overlapping phases and capture progress.
 
-Use `scripts/native-capture.sh --audit-baseline PROFILE` to run the initial comparison immediately after export. It records the audit command, timing and result separately and stops on failure. To retain the final database for `audit-rows`, set `SIBENCH_KEEP_DATABASE=1`; restart the cleanly stopped database on the same host boot before auditing. A final-state audit cannot replace the initial comparison.
+Optional resource sampling: `scripts/sample-pixels-resources.sh OUT STOP_FILE [INTERVAL_SECONDS]`, with `WAL_DIR` set to the source WAL directory. Create `STOP_FILE` to stop. `pod_anon_metric` distinguishes cgroup v2 `anon` from v1 `total_rss`; unavailable readings are `null`. CLI `--timing` also records unavailable process/directory measurements as `null`; sampled disk peaks include only successful observations. Per-process RSS sums count shared pages repeatedly and are not exclusive memory usage.
 
-These audits read full inputs and require additional workspace. Measure normal generation in a separate run: subtracting audit time does not remove its cache effects. Trace conversion and service acceptance are described below and in the [Trace](docs/trace.md#validation-responsibilities) and [Index Service](docs/index-service.md#validation-boundaries) contracts.
+Engine memory settings are not total process-memory caps; client `timeout_minutes` and separate setup/shutdown bounds are not whole-run resource quotas. Generation provides no crash recovery or reusable initial-state cache. Large-input capacity and performance require separate validation.
 
 ## Replay and service
 
-The following commands reuse an existing Trace without connecting to PG:
+Start a service, then replay a published Trace from another terminal:
 
 ```bash
-T=results/poc/ycsb/trace
-java -jar build/sibench/sibench.jar replay config/sibench.yaml "$T" results/reference.json
-```
-
-`replay` performs an in-process reference check and generates per-query expectations for the service. Reuse the reference report and digest file for the same Trace, value mode, and secondary-index filtering configuration. Changing the client count, dispatch mode, or backend does not require regenerating answers. Adjust `client_count`, `dispatch_mode`, and the secondary-index switch in the reference configuration instead of maintaining a template for every combination.
-
-`replay-service` requires `--reference REPORT`. Prepare the reference explicitly; service replay rejects a missing reference before reading the configuration or Trace and does not generate answers implicitly.
-
-Replay entry points include input preflight, load verification, and result checks. `check-replay CONFIG TRACE` is a standalone input diagnostic that fully consumes Baseline; it need not run separately before every replay. For changes to compilation or reader semantics, backend integration, and formal acceptance, explicitly run `validate-snapshots CONFIG TRACE REPORT` at the affected boundary to check results against an independent Parquet row-history oracle.
-
-`validate-snapshots` also writes the per-query expectations during its reference-model pass. Its report can be passed directly to `replay-service --reference REPORT` and `verify-service`; a separate `replay` run is unnecessary when the oracle already prepares the required value mode.
-
-Start the actual service, then replay from another terminal:
-
-```bash
-java -jar build/sibench/sibench.jar index-server config/index/rocksdb.yaml
+java -jar build/sibench/sibench.jar index-server config/index/rocksdb_cloud.yaml
 ```
 
 ```bash
-T=results/poc/ycsb/trace
 java -jar build/sibench/sibench.jar replay-service config/sibench.yaml \
-  "$T" results/service.json --reference results/reference.json
+  results/capture/ycsb/trace results/service.json
 ```
 
-Reference and service replay share `config/sibench.yaml`; the command selects the execution target. The public template uses row_id, 64 clients, complete-commit publication, and a 600-second request timeout for full source inputs. The timeout includes local sending and waiting for the service response. Open an existing index with `service.reopen: true`, then use `verify-service` to check persisted snapshot queries. See above for the JNI build and the [Index Service contract](docs/index-service.md) for storage configuration and acknowledgment levels. The COS bucket is a placeholder; configure your own storage and environment credentials before running.
+The runtime template selects gRPC, RowID values and explicit client/in-flight limits. Both ends must agree on value mode and secondary-index filtering. The comparison backends are RocksDB-Cloud and SlateDB; select their configuration under `config/index/`. Replace storage placeholders and supply credentials through the environment. Each run needs a fresh local path and object prefix; buckets must already exist. Local RocksDB remains an in-process test fixture and the YCSB generation engine, outside the Index Service comparison.
 
-## Analysis and derived generation
+The data API is Get/Put/Delete/Scan/BatchWrite. Replay batches baseline loading and sends each incremental operation as a separate concurrent RPC. Services own asynchronous persistence and expose no Flush RPC. Replay checks input integrity, deployment/value mode and binding, response completion and native result counts. Equal counts do not certify matching keys, versions, values or order. The same immutable Trace can be reused across backends and client settings.
+
+`check-replay CONFIG TRACE` is an optional preflight-only diagnostic; replay already performs these checks. `plan-operations PROFILE TRACE REPLAY_CONFIG` estimates source batch parameters from a calibration Trace, not achievable throughput. Request supply, dispatch warmup and operation rates count the same basic operations; see [replay preflight](docs/trace.md#replay-preflight). To check persisted snapshots explicitly, use `service.reopen: true` and `verify-service`; [only committed-snapshot queries are exported](docs/index-service.md#internal-persistence-and-reopening).
+
+## Analysis
 
 ```bash
 java -jar build/sibench/sibench.jar analyze-locality \
-  results/poc/ycsb/trace config/sibench.yaml results/locality
+  results/capture/ycsb/trace config/sibench.yaml results/locality
 python3 scripts/plot_update_locality.py results/locality --out results/locality/plots
-java -jar build/sibench/sibench.jar inspect-scale
 ```
 
-Plotting requires Python 3, pandas, and matplotlib. Static block / file overlap does not measure actual SST or compaction costs. `inspect-scale` checks default source configurations and displays row counts without generating data. `prepare --dry-run PROFILE` is a separate derived-generation entry point that does not accept native capture configurations. Derived examples are development / test inputs; their scale does not indicate compressed file size.
+Locality windows count final primary-entry changes per committed version, classified by the surviving source operation; intermediate row updates are not counted. Plotting requires Python 3, pandas and matplotlib. Static layout overlap does not measure actual SST/compaction cost. `inspect-scale` reports configured native source counts without generating data.
 
 ## Tests
+
+After building both embedded native runtimes, run the default checks; Python requires 3.9+, and socket tests require local port access:
 
 ```bash
 mvn test
 python3 -m unittest discover -s src/test/python -p 'test_*.py'
-bash -n scripts/native-capture.sh
-bash -n scripts/build-benchmarks.sh
-bash -n scripts/build-rocksdb-cloud.sh
 ```
 
-Run standalone native measurement tests for the cloud JNI with `make -C src/main/native/index/rocksdb_cloud test`. They require the cloud backend build above and the same build dependencies, and do not connect to cloud services.
+Use `-Dsibench.build.directory=ABSOLUTE_PATH` for an isolated Maven build/test/package output; each concurrent invocation needs its own directory. Child-process checks use the invoking test's classpath. Native `*Check` and `*IT` classes are explicit opt-ins, not part of the default suite. Use `mvn -Dtest=CLASS_LIST -DPROPERTY=PATH ... test`:
 
-Maven runs Java unit tests by default, excluding `*IT` and capacity-diagnostic `main` entry points. Python tests check script behavior and report analysis without starting external services. Select integration tests explicitly with `mvn -Dtest=ClassName test`, connect to an existing isolated PG14.24 instance, and use a fresh evidence directory:
-
-| Integration test | Required configuration |
+| Checks | Required builds / properties |
 | --- | --- |
-| `PgSchemaIntegrationIT` | `SIBENCH_SCHEMA_TEST_JDBC`; `-Dsibench.schema.evidence=DIR` |
-| `PgBaselineExportIntegrationIT` | The same JDBC variable; the current fixture uses postgres / an empty password; `-Dsibench.layout.evidence=DIR` |
-| `RowStateAuditIntegrationIT` | `SIBENCH_ROW_TEST_JDBC`, `SIBENCH_ROW_CAPTURE_DIR`; `-Dsibench.row.evidence=DIR` |
-| `IndexKeyOrderIT` | `SIBENCH_KEY_TEST_JDBC`; creates temporary tables only |
-| `NativeLoadIntegrationIT` | `SIBENCH_SCHEMA_TEST_JDBC`, `SIBENCH_SCHEMA_TEST_USER`, and `PGPASSWORD`; checks unlogged loading against native DDL. |
+| `PostgresHistoryCheck,PostgresAccessesCheck,PostgresCaptureCheck,PostgresVersionsCheck,PostgresProjectionCheck,PostgresGenerationCheck` | `sibench.postgres.runtime=build/services/postgres/runtime`; generation also needs `sibench.sysbench.build=build/benchmarks/sysbench`. |
+| `RocksDbHistoryCheck,RocksYcsbCheck,RocksGenerationCheck` | `sibench.rocksdb.library=$PWD/build/services/rocksdb/libsibench_rocksdb.so`; generation also needs `sibench.rocksdb.build=build/services/rocksdb` and `sibench.ycsb.build=build/benchmarks/YCSB`. |
+| `DuckDbTraceCheck,DuckDbAccessesCheck,DuckDbGenerationCheck,HybenchNativeCheck` | `sibench.duckdb.host=build/services/duckdb/duckdb_host`; source integration also needs `sibench.sysbench.build` and/or `sibench.hybench.build`. `HybenchSamplingCheck` needs only the HyBench build. |
+| `PixelsGenerationCheck` | `sibench.pixels.build=build/services/pixels` (both build phases) and `sibench.hybench.build=build/benchmarks/HyBench-2024`; runs Pixels locally with small HyBench parameters and replays both value kinds. |
+| `PixelsCdcCheck` | `sibench.pixels.build=build/services/pixels`; eight hand-written baseline rows, real PostgreSQL → sink → Pixels update/delete/reinsert/rollback, historical RowID/Locator checks and an injected LOAD visibility-publication failure. |
+| `PixelsSourceCheck` | `sibench.postgres.runtime=build/services/pixels/postgres/runtime`; source-only PostgreSQL checks for key-change rejection, unchanged-key updates without guard function calls, rollback, preceding triggers and preservation of the original indexes. |
+| `SlateDbStoreCheck` | Source-built `sibench.slatedb.library`; `sibench.slatedb.storage=PATH`, `sibench.slatedb.profile=NAME`, `sibench.slatedb.object_path=FRESH_PREFIX`, and that profile's environment credentials. Uses one Db against the configured S3 store; no independent reader. |
 
-Schema, row-audit, and key-order tests select users through `SIBENCH_SCHEMA_TEST_USER`, `SIBENCH_ROW_TEST_USER`, and `SIBENCH_KEY_TEST_USER` respectively, defaulting to postgres; the password comes from `PGPASSWORD`. The first three test classes create and remove their own randomly named databases; the evidence directory's parent must exist. The row-audit trigger library defaults to `build/services/postgresql-capture/row_capture.so`; select a separately built library with `-Dsibench.row.library=FILE`. Row-audit tests also require the instrumented PG server to start with `SIBENCH_CAPTURE_DIR` set to that same capture directory, `SIBENCH_CAPTURE_COMPRESS=zstd`, and `SIBENCH_CAPTURE_DETAIL=summary`, with `compute_query_id=on` enabled.
+Native component checks require the indicated built engine and Python 3, C++17 or JDK 17:
 
-Check the capture script's load WAL limit, clean in-place restart, and backend-crash shutdown explicitly as a non-root service user. This creates isolated PG clusters, needs an unused port and at least 20 GiB free, and has a three-minute execution limit:
+| Entry point in [src/test/native](src/test/native) | Invocation / compile inputs |
+| --- | --- |
+| `duckdb_index_attempts.py`, `duckdb_mutations.py` | `python3 SCRIPT build/services/duckdb/duckdb`. |
+| `sysbench_errors.cc` | Compile with `-I src/main/native/sysbench -I third_party/duckdb/src/include`, then run the binary. |
+| `duckdb_snapshot_attempts.cc` | Compile with `-pthread -I build/services/duckdb/source/src/include -L build/services/duckdb/src -lduckdb`; make that library directory available at runtime. |
+| `pixels/DecoderChainProbe.java` | Compile with `javac --release 17 -cp BUILD/jars/pixels-sink.jar -d TEST_CLASSES src/test/native/pixels/DecoderChainProbe.java`, then run `java -cp TEST_CLASSES:BUILD/jars/pixels-sink.jar org.sibench.pixels.DecoderChainProbe`. Checks FIFO completion of 8,192 same-stream events without starting services. |
+| `pixels/SourceTransactionsProbe.java` | Compile and run with the same sink classpath as DecoderChainProbe. Hand-built BEGIN/ROW/END records check transaction identity, global/table order, exact totals and malformed-control rejection without starting services. |
+| `pixels/SourceFailureProbe.java` | Run in a separate JVM with the sink classpath, a sink properties file and `sibench.report.endpoint`/`sibench.report.token`. A malformed update must report failure and exit 70 before offset acknowledgement; Optional `row-failure`, `row-null`, `transaction-failure` and `transaction-null` arguments inject invalid decoded results and require a failure report/exit 70; no database is started. |
 
-```bash
-python3 src/test/python/native_capture_it.py \
-  --postgres-bin build/services/postgresql-capture/runtime/bin \
-  --capture-script scripts/native-capture.sh --work-directory /path/to/new-evidence-directory
-```
+Cloud JNI checks use `make -C src/main/native/index/rocksdb_cloud test` after that backend's build.
+
+After `mvn package`, explicit validation tools run with `java -cp build/sibench/test-classes:build/sibench/sibench.jar CLASS ARGS`:
+
+| Tool under `org.sibench.` | Entry point / cost boundary |
+| --- | --- |
+| `replay.ReplayMatrixValidation` | `TRACE FRESH_OUTPUT`: dispatch/index-selection matrix against the in-memory reference index. |
+| `adapters.IndexVersionCheck` | `SERVICE_CONFIG REPORT`: bounded hand-derived version/delete/reinsert checks on a fresh local or cloud backend. |
+| `adapters.IndexServerAcceptance` | `SERVICE_CONFIG`: starts a service; stdin `close` shuts it down. |
+| `adapters.StreamingLatencyCheck` | `ENDPOINT REPORT`: 64 baseline entries and 600 ordinary workload operations on a fresh service; verifies individual RPC completion and count/latency accounting with batched baseline loading. This is a small integration check, not a full-input or performance certification. |
+| [ProtoTraceBenchmark](src/test/java/org/sibench/capture/ProtoTraceBenchmark.java), [DispatcherCapacityCheck](src/test/java/org/sibench/replay/DispatcherCapacityCheck.java), [DriverCapacityCheck](src/test/java/org/sibench/adapters/DriverCapacityCheck.java), [BaselineCapacityCheck](src/test/java/org/sibench/adapters/BaselineCapacityCheck.java) | Explicit parser/driver diagnostics; invocation forms are in each class's usage checks. Bound input, duration, heap and output before running. |
+
+Production generation, backend evaluation and independent acceptance are separate workflows. Native checks cover small inputs; they do not certify full-scale capacity. Full backend acceptance requires complete local and real-cloud replay of the same Trace with response/count checks and an independent check of internal persistence/reopening. Fault recovery and performance studies require separate runs and budgets.
 
 ## Supported scope
 
-The current [Trace](docs/trace.md) and [Index Service](docs/index-service.md) support fixed source layouts and reject additional index types, dynamic DDL, and primary-key value UPDATEs. YCSB has no secondary indexes; standard sysbench scripts do not query by k; HyBench does not run freshness DELETE by default. The default data-file target is 512 MiB. Layout changes require rebuilding the corresponding physical inputs.
-
-Data-file Rewrite, physical version GC, resumable segmented compilation, and automatic recovery of writes with unknown outcomes are not implemented. Default tests and short inputs do not establish sustained saturation capacity, support for huge query groups, crash recovery at the target scale, power-loss durability, or backend performance rankings.
+Only the pinned sources and supported schemas/access shapes are accepted; see [source scope](docs/trace.md#source-scope) and [access projection](docs/trace.md#access-projection). Primary-key updates, ambiguous ordering and incomplete index output fail explicitly. Rewrite, physical version GC and automatic retries of writes with unknown outcomes are unsupported.

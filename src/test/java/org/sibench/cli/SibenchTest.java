@@ -27,12 +27,9 @@ public class SibenchTest {
                             },
                             out,
                             err));
-            assertEquals(
-                    3,
-                    JsonParser.parseString(output.toString(StandardCharsets.UTF_8))
-                            .getAsJsonObject()
-                            .getAsJsonArray("profiles")
-                            .size());
+            var report = JsonParser.parseString(output.toString(StandardCharsets.UTF_8)).getAsJsonObject();
+            assertEquals("profiles_valid", report.get("status").getAsString());
+            assertEquals(3, report.getAsJsonArray("profiles").size());
             assertEquals(0, errors.size());
         }
     }
@@ -44,7 +41,8 @@ public class SibenchTest {
             {"inspect-scale", "--root"},
             {"inspect-scale", "--unknown"},
             {"generate"},
-            {"generate", "--help"},
+            {"unknown-command", "--help"},
+            {"generate", "missing-config.yaml"},
             {"replay", "config/sibench.yaml"},
             {"check-replay", "config/sibench.yaml", "missing-trace"},
             {"replay", "--repeat", "2"},
@@ -55,14 +53,14 @@ public class SibenchTest {
                 "missing-trace",
                 "missing-report.json"
             },
-            {"check-schema", "src/test/resources/config/ycsb_1b.yaml"},
+            {"check-schema", "src/test/resources/config/ycsb_1k.yaml"},
             {"check-schema", "--jdbc"},
             {"check-schema", "--user"},
-            {"audit-rows", "src/test/resources/config/ycsb_1b.yaml"},
+            {"audit-rows", "src/test/resources/config/ycsb_1k.yaml"},
             {"audit-rows", "--jdbc"},
             {
                 "audit-rows",
-                "src/test/resources/config/ycsb_1b.yaml",
+                "src/test/resources/config/ycsb_1k.yaml",
                 "missing-baseline",
                 "missing-raw",
                 "--jdbc",
@@ -72,17 +70,17 @@ public class SibenchTest {
             },
             {
                 "check-schema",
-                "src/test/resources/config/ycsb_1b.yaml",
+                "src/test/resources/config/ycsb_1k.yaml",
                 "--jdbc",
                 "jdbc:mysql:localhost",
                 "--user",
                 "postgres"
             },
-            {"inspect-scale", "src/test/resources/config/ycsb_1b.yaml", "missing.yaml"},
+            {"inspect-scale", "src/test/resources/config/ycsb_1k.yaml", "missing.yaml"},
             {"compare-ledgers"},
-            {"compare-ledgers", "src/test/resources/config/ycsb_1b.yaml"},
-            {"snapshot-index-counters", "src/test/resources/config/ycsb_1b.yaml"},
-            {"check-capture-completeness", "src/test/resources/config/ycsb_1b.yaml"}
+            {"compare-ledgers", "src/test/resources/config/ycsb_1k.yaml"},
+            {"snapshot-index-counters", "src/test/resources/config/ycsb_1k.yaml"},
+            {"check-capture-completeness", "src/test/resources/config/ycsb_1k.yaml"}
         };
         for (String[] args : invalid) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
@@ -97,16 +95,30 @@ public class SibenchTest {
     }
 
     @Test
-    public void serviceReplayRequiresReferenceBeforeReadingInputs() {
+    public void serviceReplayRejectsExternalReferenceOption() {
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         ByteArrayOutputStream errors = new ByteArrayOutputStream();
         try (PrintStream out = new PrintStream(output, true, StandardCharsets.UTF_8);
                 PrintStream err = new PrintStream(errors, true, StandardCharsets.UTF_8)) {
             assertEquals(1, Sibench.run(new String[] {
-                    "replay-service", "missing-config.yaml", "missing-trace", "missing-report.json"
+                    "replay-service", "missing-config.yaml", "missing-trace", "missing-report.json", "--reference", "old.json"
             }, out, err));
             assertEquals(0, output.size());
-            assertTrue(errors.toString(StandardCharsets.UTF_8).contains("--reference REPORT"));
+            assertTrue(errors.toString(StandardCharsets.UTF_8).contains("Unknown option: --reference"));
+        }
+    }
+
+    @Test
+    public void rejectsRetiredGenerationCommandsEvenForHelp() {
+        for(String command:new String[]{"prepare","postgres-config","check-schema","audit-rows",
+                "audit-baseline","access-ledger","compare-ledgers","snapshot-index-counters","check-capture-completeness"}) {
+            var output = new ByteArrayOutputStream();
+            var errors = new ByteArrayOutputStream();
+            try (var out = new PrintStream(output); var err = new PrintStream(errors)) {
+                assertEquals(1, Sibench.run(new String[] {command, "--help"}, out, err));
+                assertEquals(0, output.size());
+                assertTrue(errors.toString(StandardCharsets.UTF_8).contains("Unknown command: " + command));
+            }
         }
     }
 

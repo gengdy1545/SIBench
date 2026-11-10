@@ -23,8 +23,8 @@ class IndexBuildTest(unittest.TestCase):
         shutil.copyfile(SCRIPT, self.root / "scripts" / SCRIPT.name)
         native = self.root / "src/main/native/index/rocksdb_cloud"
         native.mkdir(parents=True)
-        shutil.copyfile(SCRIPT.parent.parent / "src/main/native/index/rocksdb_cloud/rocksdb-cloud-9.1.1.patch",
-                        native / "rocksdb-cloud-9.1.1.patch")
+        for name in ("Makefile", "rocksdb_cloud_jni.cc", "jni_exports.map", "rocksdb-cloud-9.1.1.patch"):
+            shutil.copyfile(SCRIPT.parent.parent / "src/main/native/index/rocksdb_cloud" / name, native / name)
         self.sources = [self.root / "third_party/aws-sdk-cpp", self.root / "index/rocksdb-cloud"]
         self.pins = {}
         for source in self.sources:
@@ -70,7 +70,8 @@ class IndexBuildTest(unittest.TestCase):
             executable.write_text('#!/bin/sh\nprintf "%s %s %s\\n" "$PWD" "$0" "$* SDK=${AWS_SDK:-}" >> "' +
                                   str(self.root / "build.log") + '"\n'
                                   'for arg in "$@"; do case "$arg" in OUT=*) '
-                                  'printf "native fixture" > "${arg#OUT=}";; esac; done\n')
+                                  'printf "native fixture" > "${arg#OUT=}";; esac; done\n'
+                                  'case "$PWD" in */rocksdb-cloud) printf archive > librocksdb.a;; esac\n')
             executable.chmod(0o755)
         result = self.run_build()
         self.assertEqual(0, result.returncode, result.stderr)

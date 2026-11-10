@@ -1,42 +1,33 @@
-# SIBench runtime settings; benchmark database identities stay with their workload.
+# SIBench runtime settings and the explicit benchmark selection.
 schema_version: 1
 purpose: sibench
 target:
   secondary_indexes:
-    enabled: true
+    enabled: false
   service:
     adapter: grpc
     endpoint: 127.0.0.1:50551
     value: row_id
 replay:
-  strategy: single_pass
   dispatch_mode: operation
   client_count: 64
   max_in_flight: 4096
   request_timeout_seconds: 600
-versions:
-  gc:
-    owner: none
-postgres:
-  listen_addresses: 127.0.0.1
-  timezone: UTC
-  log_statement: none
-  compute_query_id: 'on'
-  max_parallel_workers_per_gather: '0'
-  max_parallel_maintenance_workers: '0'
-  autovacuum: 'off'
-  shared_buffers: 16GB
-  # Generation databases are disposable; completed Trace artifacts are the retained output.
-  fsync: 'off'
-  full_page_writes: 'off'
-  restart_after_crash: 'off'
-  max_wal_size: 1GB
-  min_wal_size: 80MB
-  checkpoint_timeout: 30min
-  checkpoint_completion_target: '0.9'
-  wal_buffers: 64MB
-  synchronous_commit: 'off'
-  maintenance_work_mem: 2GB
+benchmarks:
+  - config: config/benchmark/ycsb.yaml
+    mode: api
+    engine: rocksdb
+  - config: config/benchmark/sysbench.yaml
+    mode: capture
+    engine: postgres
+  - config: config/benchmark/hybench.yaml
+    mode: cdc
+    engine: pixels
+engines:
+  duckdb: config/engine/duckdb.yaml
+  postgres: config/engine/postgres.yaml
+  rocksdb: config/engine/rocksdb.yaml
+  pixels: config/engine/pixels/pixels.yaml
 analysis:
   layout:
     entries_per_block: 256

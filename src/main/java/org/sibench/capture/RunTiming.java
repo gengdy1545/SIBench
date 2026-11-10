@@ -59,7 +59,7 @@ public final class RunTiming implements AutoCloseable {
         }
     }
 
-    private record DirectoryMeasure(long bytes, long peakBytes, long files) {}
+    private record DirectoryMeasure(Long bytes, Long peakBytes, Long files) {}
 
     private static final RunTiming NONE = new RunTiming(null);
     private static volatile RunTiming current = NONE;
@@ -102,7 +102,6 @@ public final class RunTiming implements AutoCloseable {
         if (path == null || directory == null) return this;
         Path absolute = directory.toAbsolutePath().normalize();
         if (measured.putIfAbsent(absolute, 0L) != null) return this;
-        peaks.put(absolute, 0L);
         if (sampler == null) {
             sampler =
                     new Thread(
@@ -126,8 +125,8 @@ public final class RunTiming implements AutoCloseable {
 
     private synchronized void sampleDirectories() {
         for (Path directory : measured.keySet()) {
-            long bytes = size(directory);
-            peaks.merge(directory, bytes, Math::max);
+            Long bytes = measureDirectory(directory).bytes();
+            if (bytes != null) peaks.merge(directory, bytes, Math::max);
         }
     }
 
@@ -181,46 +180,45 @@ public final class RunTiming implements AutoCloseable {
     private synchronized Map<Path, DirectoryMeasure> directoryMeasures() {
         var result = new LinkedHashMap<Path, DirectoryMeasure>();
         for (var entry : measured.entrySet()) {
-            long bytes = size(entry.getKey());
-            long peak = Math.max(peaks.getOrDefault(entry.getKey(), 0L), bytes);
-            result.put(entry.getKey(), new DirectoryMeasure(bytes, peak, files(entry.getKey())));
+            var sample = measureDirectory(entry.getKey());
+            if (sample.bytes() != null) peaks.merge(entry.getKey(), sample.bytes(), Math::max);
+            result.put(entry.getKey(), new DirectoryMeasure(sample.bytes(), peaks.get(entry.getKey()), sample.files()));
         }
         return result;
     }
 
-    private static long size(Path directory) {
-        if (!Files.isDirectory(directory)) return 0;
-        long[] total = {0};
+    private static DirectoryMeasure measureDirectory(Path directory) {
+        var unknown = new DirectoryMeasure(null, null, null);
+        try {
+            if (!Files.readAttributes(directory, java.nio.file.attribute.BasicFileAttributes.class).isDirectory()) return unknown;
+        } catch (java.nio.file.NoSuchFileException removed) {
+            return new DirectoryMeasure(0L, 0L, 0L);
+        } catch (IOException | RuntimeException unavailable) { return unknown; }
+        long bytes = 0, files = 0;
         try (var paths = Files.walk(directory)) {
-            paths.filter(Files::isRegularFile)
-                    .forEach(
-                            file -> {
-                                try {
-                                    total[0] += Files.size(file);
-                                } catch (IOException ignored) {
-                                    // A file disappearing during a run is not a timing failure.
-                                }
-                            });
+            var iterator = paths.iterator();
+            while (iterator.hasNext()) {
+                try {
+                    var attributes = Files.readAttributes(iterator.next(), java.nio.file.attribute.BasicFileAttributes.class);
+                    if (attributes.isRegularFile()) { bytes += attributes.size(); files++; }
+                } catch (java.nio.file.NoSuchFileException removed) {
+                    // Concurrent cleanup is expected; other read failures make this sample unknown.
+                }
+            }
+            return new DirectoryMeasure(bytes, bytes, files);
         } catch (IOException | RuntimeException ignored) {
-            return total[0];
-        }
-        return total[0];
-    }
-
-    private static long files(Path directory) {
-        if (!Files.isDirectory(directory)) return 0;
-        try (var paths = Files.walk(directory)) {
-            return paths.filter(Files::isRegularFile).count();
-        } catch (IOException | RuntimeException ignored) {
-            return 0;
+            return unknown;
         }
     }
 
     /** Process and filesystem facts at close, so a run's resource envelope is not guessed. */
     private static Map<String, Object> process() {
+        return process(Path.of("/proc/self/status"), ProcessHandle.current().info().totalCpuDuration());
+    }
+
+    static Map<String, Object> process(Path status, java.util.Optional<Duration> cpu) {
         var report = new LinkedHashMap<String, Object>();
-        long peakRss = 0, rss = 0, threads = 0;
-        Path status = Path.of("/proc/self/status");
+        Long peakRss = null, rss = null, threads = null;
         if (Files.isRegularFile(status)) {
             try {
                 for (String line : Files.readAllLines(status)) {
@@ -232,10 +230,8 @@ public final class RunTiming implements AutoCloseable {
                 // /proc is best-effort and absent on some platforms.
             }
         }
-        var handle = ProcessHandle.current();
-        Duration cpu = handle.info().totalCpuDuration().orElse(Duration.ZERO);
         var runtime = Runtime.getRuntime();
-        report.put("cpu_seconds", cpu.toNanos() / 1e9);
+        report.put("cpu_seconds", cpu.map(value -> value.toNanos() / 1e9).orElse(null));
         report.put("peak_rss_bytes", peakRss);
         report.put("rss_bytes", rss);
         report.put("threads", threads);
@@ -255,12 +251,14 @@ public final class RunTiming implements AutoCloseable {
 
     private static long kilobytes(String line) {
         String[] fields = line.trim().split("\\s+");
-        return fields.length < 2 ? 0 : Long.parseLong(fields[1]);
+        if (fields.length < 2) throw new IllegalArgumentException("Missing process metric");
+        return Long.parseLong(fields[1]);
     }
 
     private static long number(String line) {
         String[] fields = line.trim().split("\\s+");
-        return fields.length < 2 ? 0 : Long.parseLong(fields[1]);
+        if (fields.length < 2) throw new IllegalArgumentException("Missing process metric");
+        return Long.parseLong(fields[1]);
     }
 
     /** Merges into an existing file, so every stage of one run lands in the same artifact. */

@@ -2,21 +2,12 @@ package org.sibench.capture;
 
 import org.sibench.trace.IndexKey;
 
-import java.io.Closeable;
-import java.io.EOFException;
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.channels.FileChannel;
-import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import java.util.HexFormat;
-import java.util.zip.CRC32C;
 
-/** Normalized operation blocks, separate from raw PG access facts. */
+/** Normalized operation views shared by generation, Trace validation and replay. */
 public final class IndexOperationTrace {
     public static final int INSERT = 1, SEARCH = 2, UPSERT = 3, RELOCATE = 4, LOGICAL_DELETE = 5;
-    public static final int TRANSACTION_BEGIN = 6, TRANSACTION_COMMIT = 7;
+    public static final int TRANSACTION_BEGIN = 6, TRANSACTION_COMMIT = 7, TRANSACTION_ABORT = 8;
     public static final int BUSINESS_INSERT = 1, BUSINESS_UPDATE = 2;
     public static final int SNAPSHOT_SEARCH = 1;
     public static final int TRANSACTION_LOCAL_SEARCH = 4;
@@ -35,16 +26,8 @@ public final class IndexOperationTrace {
                     | DESCENDING
                     | INTERSECT_GROUP
                     | UNION_GROUP;
-    public static final int RECORD_BYTES = 128, BLOCK_RECORDS = 4096;
+    public static final int BLOCK_RECORDS = 4096;
     public static final int MAX_TABLE = 65535, MAX_INDEX = 1024;
-    private static final int MAGIC = 0x53494f50;
-    /**
-     * A file of zstd-compressed blocks: the same records, each block compressed on its own. Its
-     * digest, like that of a derived stream, is the logical one: the SHA256 of the plain file the
-     * same operations form ({@link #sha256}), so it does not depend on the compressor.
-     */
-    private static final int MAGIC_ZSTD = 0x53494f5a;
-    static final int ZSTD_LEVEL = 3;
 
     private IndexOperationTrace() {}
 
@@ -57,6 +40,7 @@ public final class IndexOperationTrace {
             case LOGICAL_DELETE -> "logical_delete";
             case TRANSACTION_BEGIN -> "transaction_begin";
             case TRANSACTION_COMMIT -> "transaction_commit";
+            case TRANSACTION_ABORT -> "transaction_abort";
             default -> throw new IllegalArgumentException("Unknown operation kind: " + kind);
         };
     }
@@ -105,8 +89,7 @@ public final class IndexOperationTrace {
      * value; searches carry a {@link Range} in lower/upper/flags/limit instead. A secondary point
      * search may also carry a PK in {@code key}: it then names exactly one index entry, the row a
      * scan its consumer stopped early returned among equal indexed values.
-     */
-    /**
+     *
      * One canonical index operation. For SEARCH, {@code version} is 0 unless the read is
      * transaction-local, when it is the source transaction's CommitVersion; writes use it as the
      * new entry version.
@@ -351,7 +334,7 @@ public final class IndexOperationTrace {
     }
 
     public static boolean isControl(Operation o) {
-        return o.kind() == TRANSACTION_BEGIN || o.kind() == TRANSACTION_COMMIT;
+        return o.kind() == TRANSACTION_BEGIN || o.kind() == TRANSACTION_COMMIT || o.kind() == TRANSACTION_ABORT;
     }
 
     /** Format-level invariants checked on both write and read. */
@@ -359,7 +342,7 @@ public final class IndexOperationTrace {
         boolean control = isControl(o), search = o.kind() == SEARCH;
         boolean valid =
                 o.kind() >= INSERT
-                        && o.kind() <= TRANSACTION_COMMIT
+                        && o.kind() <= TRANSACTION_ABORT
                         && (control ? o.table() == 0 : o.table() >= 1 && o.table() <= MAX_TABLE)
                         && o.index() >= 0
                         && o.index() <= MAX_INDEX
@@ -396,7 +379,7 @@ public final class IndexOperationTrace {
                 && (o.upper() != null || (o.flags() & UPPER_INCLUSIVE) == 0)
                 && o.limit() >= 0
                 && o.expectedCount() >= 0
-                && (o.limit() == 0 || o.expectedCount() == o.limit())
+                && (o.limit() == 0 || o.expectedCount() <= o.limit())
                 && group != (INTERSECT_GROUP | UNION_GROUP)
                 && (group == 0
                         ? o.expansionPosition() == 0 && o.expansionSize() == 0
@@ -414,301 +397,18 @@ public final class IndexOperationTrace {
 
     public interface Consumer {
         void accept(Operation operation) throws IOException;
+
+        /** Keeps the stored service payload beside the views used by semantic validators. */
+        default void accept(org.sibench.adapters.proto.TraceRecord record, java.util.List<Operation> views)
+                throws IOException {
+            for (Operation operation : views) accept(operation);
+        }
     }
 
     /** A stream of operations: a trace file, or one derived when it is read. Returns the count. */
     @FunctionalInterface
     public interface Source {
         long read(Consumer consumer) throws IOException;
-
-        static Source file(Path file) {
-            return consumer -> IndexOperationTrace.read(file, consumer);
-        }
-
-        static Source file(Path file, String expectedSha256) {
-            java.util.Objects.requireNonNull(expectedSha256);
-            return consumer -> IndexOperationTrace.read(file, consumer, expectedSha256);
-        }
     }
 
-    /**
-     * Encodes operations exactly as a trace file holds them. A writer without a file only counts
-     * them and takes the SHA256 of the file they would form, for a stream derived when it is read.
-     */
-    public static final class Writer implements Closeable {
-        private final FileChannel channel;
-        /** The current block's records, encoded in place; grown when a record does not fit. */
-        private ByteBuffer block = ByteBuffer.allocate(BLOCK_RECORDS * (RECORD_BYTES + 32)).order(ByteOrder.LITTLE_ENDIAN);
-        /** The file's SHA256, taken from the bytes as they are written instead of a reread. */
-        private final java.security.MessageDigest digest;
-        private String sha256;
-        private long count;
-
-        /** {@code file}: where the trace is written, or null to only digest it. */
-        public Writer(Path file) throws IOException {
-            try {
-                digest = java.security.MessageDigest.getInstance("SHA-256");
-            } catch (java.security.NoSuchAlgorithmException error) {
-                throw new IllegalStateException(error);
-            }
-            channel =
-                    file == null
-                            ? null
-                            : FileChannel.open(file, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
-            digest.update(header(MAGIC));
-            if (channel != null) write(channel, header(MAGIC_ZSTD));
-        }
-
-        private static ByteBuffer header(int magic) {
-            ByteBuffer header = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
-            header.putInt(magic).putInt(RECORD_BYTES).putInt(BLOCK_RECORDS).flip();
-            return header;
-        }
-
-        /** The logical SHA256 of the closed stream: that of its plain file. */
-        public String sha256() {
-            if (sha256 == null) throw new IllegalStateException("Trace writer is still open");
-            return sha256;
-        }
-
-        public void append(Operation o) throws IOException {
-            validate(o);
-            int size = RECORD_BYTES + length(o.key()) + length(o.indexedValue()) + length(o.lower()) + length(o.upper());
-            if (block.remaining() < size) {
-                ByteBuffer larger = ByteBuffer.allocate(Math.max(block.capacity() * 2, block.position() + size))
-                        .order(ByteOrder.LITTLE_ENDIAN);
-                block.flip();
-                larger.put(block);
-                block = larger;
-            }
-            ByteBuffer record = block;
-            record.putLong(o.sourceEvent())
-                    .putInt(o.kind())
-                    .putInt(o.table())
-                    .putInt(o.index())
-                    .putInt(o.flags())
-                    .putLong(o.version())
-                    .putLong(o.file())
-                    .putLong(o.position())
-                    .putLong(o.rowId())
-                    .putLong(o.expectedCount())
-                    .putLong(o.transactionId())
-                    .putLong(o.mutationOrdinal())
-                    .putLong(o.readTimestamp())
-                    .putLong(o.workUnitId())
-                    .putLong(o.limit())
-                    .putInt(o.expansionPosition())
-                    .putInt(o.expansionSize());
-            record.putInt(o.key() == null ? -1 : o.key().length())
-                    .putInt(o.indexedValue() == null ? -1 : o.indexedValue().length())
-                    .putInt(o.lower() == null ? -1 : o.lower().length())
-                    .putInt(o.upper() == null ? -1 : o.upper().length());
-            if (o.key() != null) o.key().writeTo(record);
-            if (o.indexedValue() != null) o.indexedValue().writeTo(record);
-            if (o.lower() != null) o.lower().writeTo(record);
-            if (o.upper() != null) o.upper().writeTo(record);
-            count++;
-            if (count % BLOCK_RECORDS == 0) flush();
-        }
-
-        private static int length(IndexKey key) {
-            return key == null ? 0 : key.length();
-        }
-
-        public long count() {
-            return count;
-        }
-
-        private void flush() throws IOException {
-            if (block.position() == 0) return;
-            byte[] payload = block.array();
-            int length = block.position();
-            CRC32C crc = new CRC32C();
-            crc.update(payload, 0, length);
-            int records = (int) ((count - 1) % BLOCK_RECORDS + 1);
-            ByteBuffer header = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
-            header.putInt(length).putInt(records).putInt((int) crc.getValue()).flip();
-            digest.update(header);
-            digest.update(payload, 0, length);
-            if (channel != null) {
-                // The checksum covers the records, so it holds whatever compressed them.
-                byte[] compressed = com.github.luben.zstd.Zstd.compress(java.util.Arrays.copyOf(payload, length), ZSTD_LEVEL);
-                ByteBuffer stored = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
-                stored.putInt(compressed.length).putInt(records).putInt((int) crc.getValue()).putInt(length).flip();
-                write(channel, stored);
-                write(channel, ByteBuffer.wrap(compressed));
-            }
-            block.clear();
-        }
-
-        @Override
-        public void close() throws IOException {
-            if (sha256 != null || channel != null && !channel.isOpen()) return;
-            try {
-                flush();
-                sha256 = HexFormat.of().formatHex(digest.digest());
-            } finally {
-                if (channel != null) channel.close();
-            }
-        }
-    }
-
-    /** One block's records, as the plain format holds them. */
-    private interface Blocks {
-        void block(int records, int checksum, ByteBuffer payload) throws IOException;
-    }
-
-    /** The zstd blocks of a trace, each checked against its checksum. */
-    private static void blocks(Path file, Blocks blocks) throws IOException {
-        try (FileChannel channel = FileChannel.open(file)) {
-            ByteBuffer header = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
-            header.limit(12);
-            fill(channel, header);
-            header.flip();
-            int magic = header.getInt();
-            if (magic != MAGIC_ZSTD
-                    || header.getInt() != RECORD_BYTES
-                    || header.getInt() != BLOCK_RECORDS)
-                throw new IOException("Unknown index Trace header");
-            while (channel.position() < channel.size()) {
-                header.clear().limit(16);
-                fill(channel, header);
-                header.flip();
-                int stored = header.getInt(), records = header.getInt(), checksum = header.getInt();
-                int bytes = header.getInt();
-                // Records carry variable-length keys, so only a lower bound is fixed.
-                if (bytes <= 0
-                        || stored <= 0
-                        || records < 1
-                        || bytes > (long) records * (RECORD_BYTES + 4L * IndexKey.MAX_BYTES)
-                        || records > BLOCK_RECORDS
-                        || bytes < (long) records * RECORD_BYTES)
-                    throw new IOException("Invalid index Trace block length");
-                ByteBuffer block = ByteBuffer.allocate(stored).order(ByteOrder.LITTLE_ENDIAN);
-                fill(channel, block);
-                byte[] payload;
-                try {
-                    payload = com.github.luben.zstd.Zstd.decompress(block.array(), bytes);
-                } catch (RuntimeException corrupt) {
-                    throw new IOException("Normalized block does not decompress", corrupt);
-                }
-                if (payload.length != bytes) throw new IOException("Invalid index Trace block length");
-                CRC32C crc = new CRC32C();
-                crc.update(payload, 0, bytes);
-                if ((int) crc.getValue() != checksum)
-                    throw new IOException("Normalized block checksum mismatch");
-                blocks.block(records, checksum, ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN));
-            }
-        }
-    }
-
-    /**
-     * The logical SHA256 of a trace: that of the plain file its operations form.
-     */
-    public static String sha256(Path file) throws IOException {
-        var digest = logicalDigest();
-        var header = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
-        blocks(file, (records, checksum, payload) -> digestBlock(digest, header, records, checksum, payload));
-        return HexFormat.of().formatHex(digest.digest());
-    }
-
-    private static java.security.MessageDigest logicalDigest() {
-        try {
-            var digest = java.security.MessageDigest.getInstance("SHA-256");
-            digest.update(Writer.header(MAGIC));
-            return digest;
-        } catch (java.security.NoSuchAlgorithmException error) {
-            throw new IllegalStateException(error);
-        }
-    }
-
-    private static void digestBlock(java.security.MessageDigest digest, ByteBuffer header,
-            int records, int checksum, ByteBuffer payload) {
-        header.clear();
-        header.putInt(payload.remaining()).putInt(records).putInt(checksum).flip();
-        digest.update(header);
-        digest.update(payload.duplicate());
-    }
-
-    /** Reads a trace of the current record format, in zstd blocks. */
-    public static long read(Path file, Consumer consumer) throws IOException {
-        return read(file, consumer, null);
-    }
-
-    /** Checks the logical identity in the same block traversal as decoding and CRC verification. */
-    private static long read(Path file, Consumer consumer, String expectedSha256) throws IOException {
-        long[] count = {0};
-        var digest = expectedSha256 == null ? null : logicalDigest();
-        var header = expectedSha256 == null ? null : ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
-        blocks(file, (records, checksum, block) -> {
-                if (digest != null) digestBlock(digest, header, records, checksum, block);
-                int[] lengths = new int[4];
-                IndexKey[] parts = new IndexKey[4];
-                for (int i = 0; i < records; i++) {
-                    if (block.remaining() < RECORD_BYTES)
-                        throw new IOException("Truncated index operation prefix");
-                    long sourceEvent = block.getLong();
-                    int kind = block.getInt(), table = block.getInt(), index = block.getInt();
-                    int flags = block.getInt();
-                    long version = block.getLong(), file1 = block.getLong();
-                    long position = block.getLong(), rowId = block.getLong();
-                    long expectedCount = block.getLong(), transactionId = block.getLong();
-                    long mutationOrdinal = block.getLong(), readTimestamp = block.getLong();
-                    long workUnitId = block.getLong(), limit = block.getLong();
-                    int expansionPosition = block.getInt(), expansionSize = block.getInt();
-                    long variable = 0;
-                    for (int part = 0; part < 4; part++) {
-                        lengths[part] = block.getInt();
-                        if (lengths[part] < -1 || lengths[part] > IndexKey.MAX_BYTES)
-                            throw new IOException("Invalid key length");
-                        variable += Math.max(0, lengths[part]);
-                    }
-                    if (variable > block.remaining() - (long) (records - i - 1) * RECORD_BYTES)
-                        throw new IOException("Invalid key length");
-                    for (int part = 0; part < 4; part++) {
-                        parts[part] = lengths[part] < 0
-                                ? null : IndexKey.decode(block, lengths[part]);
-                    }
-                    Operation o =
-                            new Operation(
-                                    sourceEvent,
-                                    kind,
-                                    table,
-                                    index,
-                                    flags,
-                                    parts[0],
-                                    parts[1],
-                                    version,
-                                    file1,
-                                    position,
-                                    rowId,
-                                    expectedCount,
-                                    transactionId,
-                                    mutationOrdinal,
-                                    readTimestamp,
-                                    workUnitId,
-                                    expansionPosition,
-                                    expansionSize,
-                                    parts[2],
-                                    parts[3],
-                                    limit);
-                    validate(o);
-                    consumer.accept(o);
-                    count[0]++;
-                }
-                if (block.hasRemaining()) throw new IOException("Trailing operation block bytes");
-        });
-        if (digest != null && !HexFormat.of().formatHex(digest.digest()).equals(expectedSha256))
-            throw new IOException("Trace checksum mismatch: " + file.getFileName());
-        return count[0];
-    }
-
-    private static void fill(FileChannel channel, ByteBuffer target) throws IOException {
-        while (target.hasRemaining())
-            if (channel.read(target) < 0) throw new EOFException("Truncated operation trace");
-    }
-
-    private static void write(FileChannel channel, ByteBuffer source) throws IOException {
-        while (source.hasRemaining()) channel.write(source);
-    }
 }

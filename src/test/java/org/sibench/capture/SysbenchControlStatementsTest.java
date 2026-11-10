@@ -57,7 +57,7 @@ public class SysbenchControlStatementsTest {
 
     @Test
     public void anExplicitTransactionScriptIssuesTwoControlStatementsPerEvent() {
-        var derived = SysbenchControlStatements.derive(EXPLICIT, false, 8000);
+        var derived = SysbenchControlStatements.derive(EXPLICIT, false, 8000, 0);
         assertFalse(derived.skipTrx());
         assertEquals(1, derived.beginCallsPerEvent());
         assertEquals(1, derived.commitCallsPerEvent());
@@ -69,14 +69,14 @@ public class SysbenchControlStatementsTest {
                 SysbenchControlStatements.derive(
                         "function begin()\n  stmt.begin:execute()\nend\nfunction commit()\nend\n",
                         false,
-                        10);
+                        10, 0);
         assertEquals(0, definitions.beginCallsPerEvent());
         assertEquals(0, definitions.commitCallsPerEvent());
     }
 
     @Test
     public void skipTrxOnRemovesEveryControlStatementOfTheSameScript() {
-        var derived = SysbenchControlStatements.derive(EXPLICIT, true, 8000);
+        var derived = SysbenchControlStatements.derive(EXPLICIT, true, 8000, 0);
         assertTrue(derived.skipTrx());
         assertEquals(1, derived.beginCallsPerEvent());
         assertEquals(1, derived.commitCallsPerEvent());
@@ -88,7 +88,7 @@ public class SysbenchControlStatementsTest {
     @Test
     public void anAutocommitScriptHasNoControlStatementsEitherWay() {
         for (boolean skipTrx : new boolean[] {false, true}) {
-            var derived = SysbenchControlStatements.derive(AUTOCOMMIT, skipTrx, 5000);
+            var derived = SysbenchControlStatements.derive(AUTOCOMMIT, skipTrx, 5000, 0);
             assertEquals(0, derived.beginCallsPerEvent());
             assertEquals(0, derived.commitCallsPerEvent());
             assertEquals(0L, derived.controlStatements());
@@ -104,10 +104,29 @@ public class SysbenchControlStatementsTest {
                 "-- begin() in a comment\n"
                         + "--[[ begin() in a block comment\n commit() ]]\n"
                         + "function event()\n  begin()  -- the real one\n  commit()\nend\n");
-        var derived = SysbenchControlStatements.derive(lua, false, 3);
+        var derived = SysbenchControlStatements.derive(lua, false, 3, 0);
         assertEquals(1, derived.beginCallsPerEvent());
         assertEquals(1, derived.commitCallsPerEvent());
         assertEquals(6L, derived.controlStatements());
+    }
+
+    @Test
+    public void ignoredStatementIsExcludedButItsRetriedBeginIsCounted() throws Exception {
+        // Two commits plus one aborted attempt: 5 counted BEGIN/COMMIT calls; the driver's
+        // direct PQexec(ROLLBACK) bypasses its counters, and the failed INSERT is only an error.
+        var explicit = SysbenchControlStatements.derive(EXPLICIT, false, 2, 1);
+        assertEquals(5L, explicit.controlStatements());
+        assertEquals(1L, explicit.describe().get("retry_begin_statements"));
+        assertEquals(2L, explicit.describe().get("control_statements_per_event"));
+        var counts = java.util.Map.of("ignored errors", 1L);
+        assertEquals(4, PostgresSysbench.certifiedExecutions("controlled", counts, 5, 1, 1));
+        assertEquals(5, SysbenchControlStatements.requireAgreement("controlled", 9, 4, explicit));
+        assertThrows(IOException.class, () -> PostgresSysbench.certifiedExecutions("controlled", counts, 5, 0, 1));
+        assertThrows(IOException.class, () -> PostgresSysbench.certifiedExecutions("controlled", counts, 5, 1, 0));
+        assertThrows(IOException.class, () -> PostgresSysbench.certifiedExecutions("controlled", java.util.Map.of(), 5, 1, 1));
+        assertThrows(IOException.class, () -> SysbenchControlStatements.requireAgreement("controlled", 10, 4, explicit));
+        assertEquals(0, SysbenchControlStatements.derive(AUTOCOMMIT, false, 2, 1).controlStatements());
+        assertEquals(0, SysbenchControlStatements.derive(EXPLICIT, true, 2, 1).controlStatements());
     }
 
     @Test
@@ -142,7 +161,7 @@ public class SysbenchControlStatementsTest {
 
     @Test
     public void theResidualCrossCheckFailsWhenTheServerObservedAnotherCount() throws Exception {
-        var explicit = SysbenchControlStatements.derive(EXPLICIT, false, 100);
+        var explicit = SysbenchControlStatements.derive(EXPLICIT, false, 100, 0);
         // 100 events x (10 point selects + 1 index update + 1 non-index update + delete + insert)
         // plus 200 control statements; the server sees only the executed statements.
         long clientStatements = 1400L;
@@ -152,7 +171,7 @@ public class SysbenchControlStatementsTest {
                 SysbenchControlStatements.requireAgreement(
                         "oltp_read_write", clientStatements, serverExecutions, explicit));
 
-        var autocommit = SysbenchControlStatements.derive(AUTOCOMMIT, false, 50);
+        var autocommit = SysbenchControlStatements.derive(AUTOCOMMIT, false, 50, 0);
         assertEquals(
                 0L,
                 SysbenchControlStatements.requireAgreement(
@@ -176,7 +195,7 @@ public class SysbenchControlStatementsTest {
                                                 "oltp_read_write",
                                                 1200L,
                                                 1000L,
-                                                SysbenchControlStatements.derive(EXPLICIT, true, 100)))
+                                                SysbenchControlStatements.derive(EXPLICIT, true, 100, 0)))
                         .getMessage()
                         .contains("skip_trx=true"));
     }
@@ -186,26 +205,26 @@ public class SysbenchControlStatementsTest {
         Path lua = Path.of("benchmark/sysbench/src/lua");
         assertEquals(
                 200L,
-                SysbenchControlStatements.derive(lua.resolve("oltp_read_write.lua"), false, 100)
+                SysbenchControlStatements.derive(lua.resolve("oltp_read_write.lua"), false, 100, 0)
                         .controlStatements());
         assertEquals(
                 0L,
-                SysbenchControlStatements.derive(lua.resolve("oltp_read_write.lua"), true, 100)
+                SysbenchControlStatements.derive(lua.resolve("oltp_read_write.lua"), true, 100, 0)
                         .controlStatements());
         for (String script :
                 List.of("oltp_delete", "oltp_update_index", "oltp_update_non_index", "oltp_insert"))
             assertEquals(
                     script,
                     0L,
-                    SysbenchControlStatements.derive(lua.resolve(script + ".lua"), false, 100)
+                    SysbenchControlStatements.derive(lua.resolve(script + ".lua"), false, 100, 0)
                             .controlStatements());
         assertEquals(
                 200L,
-                SysbenchControlStatements.derive(lua.resolve("oltp_write_only.lua"), false, 100)
+                SysbenchControlStatements.derive(lua.resolve("oltp_write_only.lua"), false, 100, 0)
                         .controlStatements());
         assertEquals(
                 200L,
-                SysbenchControlStatements.derive(lua.resolve("oltp_read_only.lua"), false, 100)
+                SysbenchControlStatements.derive(lua.resolve("oltp_read_only.lua"), false, 100, 0)
                         .controlStatements());
     }
 }

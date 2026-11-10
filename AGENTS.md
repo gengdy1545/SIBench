@@ -13,11 +13,15 @@
   licenses in the submodules. Keep historical toolchains and test-service binary
   identities in local development notes. Build index backends and their
   dependencies into `build/index/`.
+- For new submodules, record the verified upstream default branch in
+  `.gitmodules`; the gitlink remains the authoritative source pin. Branch settings
+  guide explicit updates, not automatic upgrades during builds or tests.
 - Keep one public configuration per benchmark under `config/benchmark/`, named
   for the source without a scale suffix. Defaults use 87,060,000 baseline rows
   (HyBench SF10); exact scale stays in the file and each run's effective snapshot.
-  Keep index/backend configuration under `config/index/`, and tool runtime
-  settings, including PostgreSQL service settings, in `config/sibench.yaml`.
+  Keep index/backend configuration under `config/index/`, generation engine
+  settings under `config/engine/` (one file or folder per engine), and tool
+  runtime settings and engine selection in `config/sibench.yaml`.
   Do not add scale, client-count or mode variants to the public directory.
   Keep experiment variants in `develop/configs/`
   and required test inputs in test resources or temporary directories.
@@ -29,16 +33,26 @@
   Use explicit settings and simple orchestration, not an inheritance framework.
 - Give each setting and dependency pin one authoritative owner; derive required
   copies rather than maintaining parallel values. Use the owning language's build
-  system for managed dependencies and gitlinks for upstream source dependencies.
+  system for published dependencies and gitlinks for upstream source dependencies.
   Keep build dependencies with the component that consumes them; runtime
   configuration is not a dependency inventory. Preserve effective run snapshots.
+- Build PostgreSQL, DuckDB, RocksDB and Pixels (with pixels-sink) generation
+  engines from their pinned `third_party/` sources. Keep project patches under `src/main/native/` and apply
+  them to build copies, leaving upstream checkouts clean. Use matching source and
+  build inputs for headers, native libraries and JNI; bind artifacts to their
+  build identities. Maven consumes and packages the resulting Java/JNI artifacts
+  without a separate upstream runtime pin or prebuilt fallback. Choose source or
+  published artifacts for other dependencies according to their integration needs.
 - Implement the core in Java under `src/main/java/org/sibench/`, organized by
   responsibility, including configuration, generation, trace, replay and adapters.
   Keep Java tests under `src/test/java/org/sibench/` and core builds under
   `build/sibench/`. Use JDK 17 and the root Maven project.
 - Keep necessary native instrumentation and thin backend adapters under
-  `src/main/native/`. They may use C/C++, but must not duplicate the core Trace
-  interpretation or workload semantics implemented in Java.
+  `src/main/native/`. Use the backend's required language for thin bindings, but
+  do not duplicate core Trace interpretation or workload semantics outside Java.
+  SIBench owns replay scheduling, adaptation and result validation; backend
+  repositories own their engines. Replay integration does not by itself authorize
+  redesigning a backend engine.
 - Use Python/Shell for orchestration, offline analysis and reporting; call the
   Java CLI instead of duplicating core configuration or workload semantics.
 - Keep build, capture, plotting and report entry points in `scripts/`. Put manual
@@ -90,22 +104,17 @@
   named current use or necessary evidence; verify recoverable copies before
   removing unique inputs. Keep proposed workflow changes distinct from behavior
   already implemented and validated.
-- README and contracts describe current behavior; local development guides
-  describe detailed checks and measurement procedures. Do not link delivered
-  documentation to ignored local notes or results. Publish experiment claims only
-  with the matching reproducible evidence available to readers.
 
 ## Current design and compatibility
 
-- Treat generation PostgreSQL as disposable, rebuildable working state. Do not
-  add crash recovery or durable-cache requirements to generation without an
-  explicit need. Use one fresh database for loading, export and native workload;
-  do not keep a reusable initial database or clone it. Reject existing database
-  directories, preserve normal transaction/snapshot semantics, and remove the
-  working database after success unless explicitly retained for diagnosis.
-  This policy does not weaken Index Service durability or successful
-  Trace publication. Keep independent full-data acceptance separate from normal
-  generation, whose input integrity and source-completeness checks remain required.
+- Use one fresh database of the explicitly selected native engine for loading,
+  RowID identities and workload capture. Reject existing working/output directories
+  and preserve native transaction and snapshot semantics. The database is working
+  state: keep only what Trace export needs, publish the Trace after normal host
+  shutdown and then delete the database. Retain failure diagnostics; do not add
+  crash recovery or reusable initial-state caches without an explicit need.
+  Published Traces are retained artifacts. Input integrity and source-completeness
+  checks remain required in normal generation.
 - Maintain the current design by default. Do not add or retain superseded APIs,
   format readers, compatibility flags, fallback implementations or transition
   branches for backward compatibility that has not been explicitly required.
@@ -150,13 +159,22 @@
 - Keep Chinese reading notes only in the ignored `develop/` directory. Do not
   stage or commit those notes, force-add them, or link delivered documentation
   to them.
-- Use `README.md` for build, usage, supported inputs and test entry points.
-  Keep only externally relevant format and service semantics in `docs/`.
-  Put source investigations, detailed validation procedures, performance studies
-  and environment notes in `develop/`, indexed for reading on demand.
+- Keep `README.md` concise: build prerequisites, usage, supported inputs and test
+  entry points. Keep externally relevant formats, service semantics, failure
+  behavior and limits in `docs/`. Readers must be able to build, use and test the
+  delivered project without local development notes.
+- Put source investigations, build implementation details, tuning, detailed
+  validation procedures and experiment records in `develop/`, indexed for reading
+  on demand. When moving prose there, preserve public prerequisites and contracts;
+  required scripts, checks and fixtures remain delivered repository files.
+- Give each documented fact one maintained home; summarize and link instead of
+  duplicating configuration inventories, contracts or test procedures. Do not link
+  delivered documentation to ignored notes or results. Publish experiment claims
+  only with matching reproducible evidence available to readers.
 - Update affected documentation with a behavior change. Keep current behavior and
   limits explicit; retain only the historical conclusions and evidence still needed.
-  Keep machine-specific setup and changing experiment parameters out of AGENTS.md.
+  Keep AGENTS.md focused on durable working rules; put task progress, machine
+  setup, dependency versions and experiment parameters in their owning files.
 
 ## Evidence retention
 
@@ -185,6 +203,21 @@
   development-only reference, oracle or recovery suite to every generation run.
   Normal generation stops on failure and retains diagnostics; cross-host fault
   migration is not part of that workflow.
+- Distinguish source registration, build/deployment, semantic integration and
+  full acceptance. Adding a backend submodule does not enroll it in formal tests
+  or certify support. Keep the selected test roster and readiness in the current
+  development plan, separate from research references and engines under development.
+- Before admitting a backend to a shared comparison, verify its mapping of read
+  timestamps, retained versions, deletion, Abort, transaction-local reads and
+  complete-commit publication. Native snapshots or batch/file APIs alone do not
+  establish equivalent semantics. Report unsupported capabilities and resolve
+  the comparison scope rather than dropping operations or weakening the contract.
+- Verify required storage publication primitives on the actual deployment;
+  S3-compatible access alone does not establish atomic publication or fencing.
+  Measure acknowledgment, remote durability and cross-instance visibility
+  separately. Align resource/cache budgets and include adapter, coordination,
+  storage and maintenance costs. Report different storage environments separately
+  and identify ports that change an upstream system's data path.
 - Review validation across benchmark data generation, capture, index-operation
   extraction, Trace compilation and Index Service replay. For each production
   check, identify the failure it detects, the boundary responsible for it, its

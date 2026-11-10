@@ -1,26 +1,28 @@
 package org.sibench.workloads;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertThrows;
-import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.*;
+import static org.sibench.config.ConfigValues.*;
 
 import org.junit.Test;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Map;
 
 public class ScaleInspectorTest {
     private static final Path ROOT = Path.of("").toAbsolutePath();
-    private static final java.util.List<String> DERIVED_PROFILES = java.util.List.of(
-            "src/test/resources/config/hybench_sf1000.yaml",
-            "src/test/resources/config/ycsb_1b.yaml",
-            "src/test/resources/config/sysbench_1b.yaml");
 
     private String ycsb() throws Exception {
-        return Files.readString(ROOT.resolve(DERIVED_PROFILES.get(1)));
+        return Files.readString(ROOT.resolve("src/test/resources/config/ycsb_1k.yaml"));
+    }
+
+    private java.util.Map<String, Object> inspect(String text) throws Exception {
+        Path profile = Files.createTempFile(ROOT.resolve("build/sibench"), "native-profile-", ".yaml");
+        try {
+            Files.writeString(profile, text);
+            return ScaleInspector.inspect(ROOT, profile);
+        } finally {
+            Files.delete(profile);
+        }
     }
 
     @Test
@@ -33,103 +35,66 @@ public class ScaleInspectorTest {
         }
     }
 
-    @Test
-    public void rejectsAnUnknownNativeProfileVersion() throws Exception {
-        Path profile = Files.createTempFile(ROOT.resolve("build/sibench"), "native-version-", ".yaml");
-        try {
-            String source = Files.readString(ROOT.resolve(ScaleInspector.DEFAULT_PROFILES.get(1)));
-            assertTrue(source.contains("schema_version: 1"));
-            Files.writeString(profile, source.replace("schema_version: 1", "schema_version: 2"));
-            assertThrows(IllegalArgumentException.class, () -> ScaleInspector.inspect(ROOT, profile));
-        } finally {
-            Files.delete(profile);
+    @Test public void hybenchOverridesDriveBothLoaderResourceAndExpectedCounts() throws Exception {
+        var config=parse(Files.readString(ROOT.resolve("config/benchmark/hybench.yaml")));
+        var parameters=object(config,"native");parameters.put("sf","1x");
+        parameters.put("parameters",java.util.Map.of("customer_number",300,"company_number",2,"transfer_number",6000,
+                "checking_number",600,"loanapps_number",600,"loantrans_number",600));
+        config.put("native",parameters);
+        var values=HybenchParameters.read(ROOT.resolve("benchmark/HyBench-2024"),parameters);
+        var rows=ScaleInspector.nativeRows(ROOT,config);
+        assertEquals(java.util.Map.of("customer",300L,"company",2L,"savingaccount",302L,"checkingaccount",302L,
+                "transfer",6000L,"checking",600L,"loanapps",600L,"loantrans",600L),rows);
+        assertEquals(8706L,rows.values().stream().mapToLong(Long::longValue).sum());
+        String text=new com.moandjiezana.toml.TomlWriter().write(java.util.Map.of("1x",values));
+        var loaded=new com.moandjiezana.toml.Toml().read(text).getTable("1x");
+        assertEquals(Long.valueOf(300),loaded.getLong("customer_number"));
+        assertEquals(Long.valueOf(6000),loaded.getLong("transfer_number"));
+        assertEquals("customer.csv",loaded.getString("customer_datapath"));
+        assertEquals(Double.valueOf(0.8),loaded.getDouble("cust_rate"));
+        assertEquals(Long.valueOf(100),loaded.getLong("company_size_upper"));
+        assertEquals(values,loaded.toMap());
+        for(var invalid:java.util.List.of(java.util.Map.of("customer_number",0),java.util.Map.of("customer_number",1.5),
+                java.util.Map.of("customer_datapath","elsewhere"),java.util.Map.of("unknown",1))) {
+            parameters.put("parameters",invalid);
+            assertThrows(IllegalArgumentException.class,()->HybenchParameters.read(ROOT.resolve("benchmark/HyBench-2024"),parameters));
         }
+        parameters.remove("parameters");parameters.put("sf","999x");
+        assertThrows(IllegalArgumentException.class,()->HybenchParameters.read(ROOT.resolve("benchmark/HyBench-2024"),parameters));
     }
 
     @Test
-    public void profilesPreserveLargeIntegerCounts() throws Exception {
-        long[] counts = {8706000000L, 1000000000L, 1000000000L};
-        for (int i = 0; i < counts.length; i++) {
-            Map<String, Object> report =
-                    ScaleInspector.inspect(ROOT, Path.of(DERIVED_PROFILES.get(i)));
-            assertEquals(counts[i], report.get("baseline_rows"));
-            assertEquals(DERIVED_PROFILES.get(i), report.get("profile"));
-            assertFalse((Boolean) report.get("generation_verified"));
-            assertTrue(report.containsKey("estimated_parquet_bytes"));
-            assertNull(report.get("estimated_parquet_bytes"));
-        }
+    public void rejectsUnsupportedPurposeAndVersion() throws Exception {
+        String source = ycsb();
+        for (String invalid : new String[] {
+                source.replace("schema_version: 1", "schema_version: 2"),
+                source.replace("purpose: native_capture", "purpose: baseline_generation")})
+            assertThrows(IllegalArgumentException.class, () -> inspect(invalid));
+    }
+
+    @Test
+    public void preservesNativeInt64CountsAndRejectsOverflow() throws Exception {
+        assertEquals(3_000_000_000L, inspect(ycsb().replace("recordcount: 1000", "recordcount: 3000000000"))
+                .get("baseline_rows"));
+        assertThrows(ArithmeticException.class, () -> inspect(ycsb()
+                .replace("recordcount: 1000", "recordcount: 9223372036854775808")));
+        String sysbench = Files.readString(ROOT.resolve("src/test/resources/config/sysbench_2k.yaml"));
+        assertThrows(ArithmeticException.class, () -> inspect(sysbench
+                .replace("table-size: 1000", "table-size: 9223372036854775807")));
     }
 
     @Test
     public void rejectsInvalidCountsAndScalarTypes() throws Exception {
-        String text = ycsb();
-        for (String invalid : new String[] {"0", "true", "1.5"}) {
-            assertThrows(
-                    IllegalArgumentException.class,
-                    () ->
-                            ScaleInspector.validate(
-                                    ScaleInspector.parse(
-                                            text.replace(
-                                                    "total_rows: 1000000000",
-                                                    "total_rows: " + invalid))));
-        }
-        assertThrows(
-                IllegalArgumentException.class,
-                () ->
-                        ScaleInspector.validate(
-                                ScaleInspector.parse(
-                                        text.replace(
-                                                "recordcount: 1000000000", "recordcount: 1"))));
+        String source = ycsb();
+        for (String invalid : new String[] {"0", "true", "1.5"})
+            assertThrows(IllegalArgumentException.class, () -> inspect(source
+                    .replace("recordcount: 1000", "recordcount: " + invalid)));
     }
 
     @Test
-    public void rejectsPayloadOverflow() throws Exception {
-        String text = ycsb().replace("1000000000", "9223372036854775807");
-        assertThrows(
-                ArithmeticException.class,
-                () -> ScaleInspector.validate(ScaleInspector.parse(text)));
-        String outOfRange =
-                ycsb().replace("total_rows: 1000000000", "total_rows: 9223372036854775808");
-        assertThrows(
-                ArithmeticException.class,
-                () -> ScaleInspector.validate(ScaleInspector.parse(outOfRange)));
-    }
-
-    @Test
-    public void rejectsSysbenchSeedAndIdMismatch() throws Exception {
-        String text = Files.readString(ROOT.resolve(DERIVED_PROFILES.get(2)));
-        assertThrows(
-                IllegalArgumentException.class,
-                () ->
-                        ScaleInspector.validate(
-                                ScaleInspector.parse(
-                                        text.replace("rand-seed: 7", "rand-seed: 0"))));
-        String tooLarge =
-                text.replace("total_rows: 1000000000", "total_rows: 300000000000")
-                        .replace("table-size: 10000000", "table-size: 3000000000");
-        assertThrows(
-                IllegalArgumentException.class,
-                () -> ScaleInspector.validate(ScaleInspector.parse(tooLarge)));
-    }
-
-    @Test
-    public void rejectsSourceFingerprintChanges() throws Exception {
-        Path temporary = Files.createTempFile(ROOT.resolve("build/sibench"), "profile-", ".yaml");
-        try {
-            String text = ycsb();
-            Map<String, Object> source =
-                    ScaleInspector.object(ScaleInspector.parse(text), "source");
-            Files.writeString(
-                    temporary,
-                    text.replace((String) source.get("definition_sha256"), "0".repeat(64)));
-            assertThrows(
-                    IllegalArgumentException.class, () -> ScaleInspector.inspect(ROOT, temporary));
-            Files.writeString(
-                    temporary, text.replace((String) source.get("commit"), "0".repeat(40)));
-            assertThrows(
-                    IllegalArgumentException.class, () -> ScaleInspector.inspect(ROOT, temporary));
-        } finally {
-            Files.deleteIfExists(temporary);
-        }
+    public void rejectsSourcePinChanges() throws Exception {
+        String source = ycsb();
+        String commit = string(object(parse(source), "source"), "commit");
+        assertThrows(IllegalArgumentException.class, () -> inspect(source.replace(commit, "0".repeat(40))));
     }
 }

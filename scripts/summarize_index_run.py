@@ -83,22 +83,26 @@ def summarize(report, logs, after_flush_millis=None):
     if data.get("status") != "passed":
         raise ValueError("A failed or incomplete service run cannot be a successful measurement")
     result = data["result"]
-    if (result["per_query_digest_mismatches"] != 0
-            or result["per_query_digest_checks"] != result["search_requests"]):
-        raise ValueError("Service query checks are incomplete or mismatched")
     phases = {}
     for name in ("baseline", "workload"):
         phase = result[name]
         dispatch = phase["dispatch"]
         if dispatch["pending_responses"] or dispatch["completed_responses"] != dispatch["target_calls"]:
             raise ValueError("Service responses are incomplete")
+        if "failure" in dispatch or any(dispatch[key] for key in (
+                "failed_response_operations",
+                "timed_out_operations")):
+            raise ValueError("Service dispatch contains failed or timed-out requests")
         phases[name] = {key: phase[key] for key in (
-            "operations", "seconds", "operations_per_second", "request_bytes", "result_bytes",
-            "flush_seconds", "published_version")}
+            "operations", "rpc_requests", "rpc_by_kind", "seconds", "operations_per_second", "request_bytes", "result_bytes")}
         phases[name].update({key: dispatch[key] for key in (
             "source_operations", "filtered_secondary_operations", "transaction_control_records",
-            "target_calls", "commit_markers", "backpressure_seconds", "peak_in_flight", "measurement",
-            "search_latency", "write_latency", "commit_latency")})
+            "target_calls", "basic_operations", "completed_operations",
+            "failed_response_operations",
+            "timed_out_operations", "backpressure_seconds", "dependency_wait_seconds",
+            "deferred_search_operations", "search_deferral_seconds", "peak_deferred_operations",
+            "local_send_boundary", "latency_boundary", "peak_in_flight", "measurement",
+            "search_latency", "write_latency")})
     engines = engine_events(logs)
     engines["same_run_provenance"] = "unverified" if logs else "not_collected"
     if after_flush_millis is not None:
@@ -115,7 +119,8 @@ def summarize(report, logs, after_flush_millis=None):
             "report": {"path": str(report), "sha256": hashlib.sha256(report.read_bytes()).hexdigest()},
             "status": "unverified_engine_provenance" if logs else "passed",
             "correctness_status": "passed", "service": result["service"], "phases": phases,
-            "queries": result["queries"], "digest_checks": result["per_query_digest_checks"],
+            "queries": result["queries"],
+            "validation_scope": "response status, native counts and complete consumption; no per-row answer comparison",
             "checked_result_items": result["checked_result_items"], "engine": engines}
 
 

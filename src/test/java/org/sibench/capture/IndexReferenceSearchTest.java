@@ -15,7 +15,7 @@ public class IndexReferenceSearchTest {
         return IndexKey.ofInt(value);
     }
 
-    private static List<Long> keys(List<IndexReferenceReplay.LookupResult> results)
+    private static List<Long> keys(List<org.sibench.capture.IndexReferenceReplay.LookupResult> results)
             throws Exception {
         var keys = new ArrayList<Long>();
         for (var result : results) keys.add(result.key().intValue());

@@ -24,7 +24,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 
 /**
- * The source work-unit catalog of a trace, one JSON line per source SQL request, stored as a zstd
+ * The source work-unit catalog of a trace, one JSON line per source operation origin, stored as a zstd
  * stream. Its digest ({@code work_units_sha256}) is that of the plain lines, so it does not depend
  * on the compressor.
  *
@@ -51,7 +51,7 @@ public final class WorkUnits {
     static Output create(Path trace) throws IOException {
         MessageDigest digest = sha256();
         var file = Files.newOutputStream(trace.resolve(FILE), StandardOpenOption.CREATE_NEW);
-        var compressed = new ZstdOutputStream(new BufferedOutputStream(file, 1 << 20), IndexOperationTrace.ZSTD_LEVEL);
+        var compressed = new ZstdOutputStream(new BufferedOutputStream(file, 1 << 20), ProtoTrace.ZSTD_LEVEL);
         var lines = new BufferedWriter(
                 new OutputStreamWriter(new DigestOutputStream(compressed, digest), StandardCharsets.UTF_8), 1 << 16);
         return new Output(lines, digest);
@@ -63,8 +63,8 @@ public final class WorkUnits {
     }
 
     /**
-     * Reads and checks the catalog once. Unit identities must be {@code 1..count}, source events
-     * strictly increasing, and each unit must name a process and application.
+     * Reads and checks the catalog once. Unit identities must be {@code 1..count} and source events
+     * strictly increasing.
      */
     public static Catalog read(Path trace) throws IOException {
         MessageDigest digest = sha256();
@@ -76,8 +76,7 @@ public final class WorkUnits {
                                 new InputStreamReader(input, StandardCharsets.UTF_8), 1 << 16)) {
             for (String line; (line = reader.readLine()) != null; ) {
                 long id = 0, event = 0;
-                int pid = 0, fields = 0;
-                String application = "";
+                int fields = 0;
                 // Hash all original bytes, but avoid a JSON tree for fields the catalog never retains.
                 try (var unit = new JsonReader(new java.io.StringReader(line))) {
                     unit.beginObject();
@@ -85,8 +84,6 @@ public final class WorkUnits {
                         switch (unit.nextName()) {
                             case "work_unit_id" -> { id = unit.nextLong(); fields |= 1; }
                             case "source_event" -> { event = unit.nextLong(); fields |= 2; }
-                            case "pid" -> { pid = unit.nextInt(); fields |= 4; }
-                            case "application" -> { application = unit.nextString(); fields |= 8; }
                             default -> unit.skipValue();
                         }
                     }
@@ -97,7 +94,7 @@ public final class WorkUnits {
                 }
                 if (id != count + 1
                         || event <= lastEvent
-                        || fields != 15 || pid < 1 || application.isEmpty())
+                        || fields != 3)
                     throw new IOException("Invalid source work-unit catalog order/identity");
                 if (id > Integer.MAX_VALUE - 8)
                     throw new IOException("Source work-unit catalog exceeds the in-memory index range");

@@ -1,0 +1,23 @@
+[package]
+name = "sibench-slatedb-jni"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "slatedb_jni"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# foyer provides upstream's default in-memory block and metadata caches.
+slatedb = { path = "../../../../../index/slatedb/slatedb", default-features = false, features = ["aws", "foyer"] }
+slatedb-mirror = { path = "../../../../../index/slatedb/slatedb-mirror" }
+async-trait = "0.1.89"
+jni = "0.21.1"
+bytes = "1.7.1"
+futures = "0.3.30"
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "time"] }
+
+[profile.release]
+strip = "debuginfo"
+

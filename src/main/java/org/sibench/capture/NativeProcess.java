@@ -4,19 +4,15 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
-/** Starts upstream native clients as separate processes and waits for their sessions to drain. */
+/** Starts upstream native clients with bounded execution and retained diagnostics. */
 final class NativeProcess {
+    @FunctionalInterface interface Check {void run()throws Exception;}
     /** Assignments consumed by the shell entry points, including paths containing quotes. */
     static void assignment(String name, Object value) {
         System.out.println(name + "='" + value.toString().replace("'", "'\\''") + "'");
@@ -37,7 +33,12 @@ final class NativeProcess {
             Path directory,
             Path logs,
             Duration timeout)
-            throws IOException, InterruptedException {
+            throws Exception {
+        return run(name,command,environment,directory,logs,timeout,()->{});
+    }
+
+    static Result run(String name,List<String> command,Map<String,String> environment,Path directory,
+            Path logs,Duration timeout,Check check)throws Exception {
         Files.createDirectories(logs);
         Path out = logs.resolve(name + ".out"), err = logs.resolve(name + ".err");
         Files.writeString(
@@ -49,31 +50,22 @@ final class NativeProcess {
         builder.environment().putAll(environment);
         builder.redirectOutput(out.toFile()).redirectError(err.toFile());
         Process process = builder.start();
-        if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
-            process.destroyForcibly();
-            throw new IOException("Native client timed out: " + name);
-        }
-        return new Result(process.exitValue(), out, err);
-    }
-
-    /** Waits until no backend still carries a capture label, so its trace is complete. */
-    static void drain(String adminJdbc, String user) throws SQLException, InterruptedException {
-        long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
-        while (true) {
-            try (Connection connection =
-                            DriverManager.getConnection(
-                                    adminJdbc, user, System.getenv().getOrDefault("PGPASSWORD", ""));
-                    Statement statement = connection.createStatement();
-                    ResultSet rows =
-                            statement.executeQuery(
-                                    "SELECT count(*) FROM pg_stat_activity WHERE application_name"
-                                            + " LIKE 'sibench:%'")) {
-                rows.next();
-                if (rows.getLong(1) == 0) return;
+        long deadline = System.nanoTime() + timeout.toNanos();
+        try {
+            while (true) {
+                check.run();
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) throw new IOException("Native client timed out: " + name);
+                if (process.waitFor(Math.min(remaining, TimeUnit.SECONDS.toNanos(1)), TimeUnit.NANOSECONDS)) {
+                    check.run();
+                    return new Result(process.exitValue(), out, err);
+                }
             }
-            if (System.nanoTime() > deadline)
-                throw new SQLException("Capture sessions did not close within 60 seconds");
-            Thread.sleep(100);
+        } finally {
+            if (process.isAlive()) {
+                process.descendants().forEach(ProcessHandle::destroyForcibly);
+                process.destroyForcibly();
+            }
         }
     }
 
@@ -98,5 +90,11 @@ final class NativeProcess {
         } catch (java.net.URISyntaxException error) {
             throw new IOException(error);
         }
+    }
+
+    static String runtimeClasspath() {
+        return java.util.Arrays.stream(System.getProperty("java.class.path").split(java.io.File.pathSeparator))
+                .map(path -> Path.of(path).toAbsolutePath().normalize().toString())
+                .collect(java.util.stream.Collectors.joining(java.io.File.pathSeparator));
     }
 }

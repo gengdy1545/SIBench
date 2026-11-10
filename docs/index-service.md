@@ -1,83 +1,89 @@
 # Index Service contract
 
-The protocol namespace is `sibench.index`, defined in `src/main/proto/index_service.proto`. The driver and service are built together from the same commit. The service executes operations by transaction position and publishes complete commits as a contiguous sequence, using canonical Trace inputs.
+[index_service.proto](../proto/index_service.proto) defines the five data RPCs in namespace `sibench.index`. Shared logical types are in [index_types.proto](../proto/index_types.proto); stored operations and source facts belong to [index_trace.proto](../proto/index_trace.proto). Driver and service ship together with one supported API and Trace format.
 
-## Interfaces and acknowledgment boundaries
+## Data interfaces
 
-| Interface | Semantics |
+| RPC | Contract |
 | --- | --- |
-| `Describe` | Declares value types, versioned reads, overwrites at the same version, transaction-local reads, query groups, complete-commit publication, Baseline batch writes, and acknowledgment / Flush durability levels. The driver rejects services that lack complete-commit publication or capabilities required by the input. |
-| `Execute` | One bidirectional stream per client. Initial metadata `sibench-index-binding` must carry the binding for this Trace, value mode, and secondary-index configuration. The service checks it and binds the index before accepting requests. Request IDs are unique within a stream; responses match by ID and may complete out of order. Operations within a transaction execute according to `transaction_id` / `transaction_operation`; different transactions may run in parallel. Connection arrival order cannot determine version visibility. |
-| `Flush` | Waits for accepted requests to reach the declared durability level, records the complete publication watermark and Trace binding, and returns the index location. It defines load, workload, and recovery boundaries; the driver does not use it as a per-request barrier to repair query ordering. |
+| `Get` | Exact `(table,index,indexed_value,PK)` at `read_version`; one optional Result. Missing Result means absent; RowID/Locator zero is valid. A secondary lookup without an exact PK uses Scan. |
+| `Put` | One entry and logical version; success follows visible application through the same service instance. Version 0 uses the same write/ACK policy as every other version. |
+| `Delete` | Versioned logical deletion; the selected tombstone hides older values while historical reads remain valid. |
+| `Scan` | Ordered bounded query at `read_version`, with inclusive/exclusive endpoints, direction and limit. Chunks concatenate in order; only normal gRPC completion establishes success, including for an empty result. |
+| `BatchWrite` | Generic Put/Delete members; success follows completion of every member. Inputs are validated before application. Atomic visibility and rollback are not promised; execution failure may be partial. |
 
-`Describe` uses `replay.request_timeout_seconds`. Both the client deadline for `Flush` and the server's request-drain deadline are 3,600 seconds. Any failed accepted request makes Flush fail. The driver also checks the returned binding, exact publication watermark, and nonempty index location.
+Get/Put/Delete/BatchWrite are unary calls; Scan is server streaming. Requests reuse per-client channels and run concurrently. gRPC supplies call association, errors and stream completion; the data API carries no request IDs, transaction control, Describe or Flush RPCs.
 
-Writes with unknown outcomes are not retried automatically. `INVALID` means the request violates the contract; `UNAVAILABLE` means execution failed and a write may already have taken effect. The first error, subsequent drain, and process cleanup are recorded separately.
+The service consumes committed updates and committed-snapshot queries. Generation excludes aborted writes and transaction-local searches and retains the final write to each physical identity within one commit version. Source transaction boundaries remain in Trace for provenance and input validation; the service does not infer missing commits or wait for source transactions.
 
-For actual gRPC requests, `ClientStreamTracer.outboundMessageSent` confirms local send completion after serialization and handoff to the transport. A return from `StreamObserver.onNext` alone does not establish send completion. Send completion and service responses are awaited separately. Logical members awaiting batching or grouping are not counted as separate RPCs. Driver capacity diagnostics reuse a transaction-complete prefix of the original Trace and actual complete responses, applying the same per-query digest checks. A finite prefix does not establish sustained load or the index throughput limit.
+An entry is `(table,index,indexed_value,PK)`; primary index 0 has no indexed value. Components use the [Trace encoding](trace.md#identity-and-versions). Values are RowID or Locator `(file,position)`, retaining both full int64 fields. Get/Scan select the latest version at or below their explicit read point. Versions and limits must fit Java's nonnegative signed int64 range; read version 0 is valid. Repeated conflicting writes to the same physical identity/version and unknown-outcome retries are outside this contract. Current production sources do not emit relocation/GC workloads; RELOCATE is not a public data RPC.
 
-## Data, transactions, and reads
+A successful write ACK guarantees same-instance visibility, including another client's RPCs. It does not promise remote durability. INVALID_ARGUMENT rejects invalid input; UNAVAILABLE, cancellation and deadlines may leave a write outcome unknown. The driver never automatically retries such writes. Local transport handoff is measured separately and does not establish server receipt, execution or success.
 
-An index entry is `(table, index, indexed_value, PK)`; the primary index, `index=0`, has no indexed value. Key components use `IndexKey`'s order-preserving encoding. Values are either RowIDs or Locators `(file, position)` containing two full int64 values. Capabilities are checked separately for each mode.
+## Harness identity and deployment description
 
-| Operation | Constraints |
-| --- | --- |
-| Baseline `INSERT` | Version 0; bypasses WAL, with declared durability guaranteed only after Flush. `WriteBatch` is allowed. The entire batch is validated first, and an invalid member fails the batch. When a batch shares completion state, in-flight budgets, completion counts, and latency remain per member, using the earliest deadline in the batch. |
-| `UPSERT` / `LOGICAL_DELETE` | Writes at a new version. Operations on the same key and version overwrite according to transaction position. Deletion retains an invisible version and must not resurrect older values. |
-| `RELOCATE` | Must match an existing exact version. Changes its physical location without creating a logical version. This does not imply that the full Rewrite / GC protocol is implemented. |
-| `Search` | At read_version, selects the latest version at or below the read point, omitting entries whose selected version is deleted. Supports primary / secondary ranges, inclusive and exclusive bounds, direction, limit, and secondary lookups pinned to a PK. Results are ordered by indexed value and PK, reversed for descending queries. |
-| Transaction-local `Search` | read_version preserves the original statement snapshot; local_version identifies this transaction's exact version. Only writes from earlier transaction_operation positions in the same transaction are overlaid. Other intervening commits remain invisible. |
-| `SearchGroup` | The server intersects or unions members of the same source access by PK. Intersection follows the first member's order; union preserves first-occurrence order. Members must share the table, read point, and group identity. |
-| `Commit` | Declares the transaction version and actual sent write and operation counts. Operations include queries, groups, and writes. Transactions made empty by filtering still have commit markers. |
+SIBench attaches `sibench-index-binding` and `sibench-value-kind` metadata to its data calls. The server adapter checks both before applying the request and binds a fresh index to its first Trace; another Trace, value mode or secondary-index selection is refused. This is a harness guard around the data API. Ordinary callers may use the five RPCs without SIBench metadata; it is not an authentication mechanism.
 
-Publishing version V requires its commit marker, completion of all its operations, matching write counts, and publication of V−1. The maximum observed version cannot replace the contiguous complete watermark. Snapshot reads wait for publication of read_version; transaction-local reads also wait for earlier positions in the same transaction.
+The adapter returns a JSON IndexDescription in binary `sibench-service-bin` response metadata: backend name, value mode, acknowledgment level, durability description and storage location. Replay checks the selected mode, complete description and consistency across calls before accepting responses, including empty Scan completion. These are deployment/reporting facts rather than data messages. All five RPCs and versioned reads are required by this API; query groups are implemented by SIBench, so no optional service group capability remains.
 
-Late writes to published versions, version reuse across transactions, and duplicate pending / executing positions are rejected before reaching the backend. Requests must not change state after returning such a failure. Completed transaction lanes are released, retaining the identities needed to reject late requests in a bitmap. The bitmap still grows with the maximum transaction_id; prefix reclamation is not implemented.
+A replay report records the Trace/input/build/configuration identity and backend location. `last_source_version` comes from consumed Trace, not a durability or publication watermark. No additional lookup, polling read or independent DbReader is added to ordinary replay.
 
-## Results and validation
+## Baseline and incremental measurement
 
-Ordinary queries return chunks of 16,384 results. `more=true` indicates another chunk with the same ID; only the last chunk carries the final status. The service respects gRPC flow control, and the driver accumulates digests chunk by chunk without retaining the entire ordinary query result. Query groups are fully materialized, so their memory requirements grow with member results and require capacity validation for the intended workload.
+Baseline load uses BatchWrite, bounded by the in-flight budget. Only baseline operations are combined by replay; the public batch method itself is generic. Every incremental write or query member is a separate data RPC. Loading and workload throughput/latency are reported in separate phases. A source update can expand into multiple independent index writes, including Delete(old secondary key) and Put(new secondary key).
 
-Each query checks the native expected count and an ordered SHA-256 digest. The digest includes source query identity, range / pinned key, read point, transaction position, and complete `(PK, version, value)` results, including both int64 fields of a Locator. Wrong keys, versions, or values, changed order, results swapped between queries, missing chunks, and unchecked responses must all fail.
+Every basic operation is timed from entry to the Index Client API through completion of its own final business response, using the replay process's monotonic clock. Serialization and client buffering are included. Scan ends only after normal stream completion. Admission waits at the in-flight limit are separate backpressure. Background persistence and engine maintenance run during the experiment and contribute to its resource costs.
 
-Service replay requires an explicit reference report from `replay` or `validate-snapshots`, including its per-query digest sidecar. The sidecar header binds the Baseline / workload Trace, value mode, and secondary-index filtering configuration; its file SHA-256 must match the report. Missing reports or per-query digests are rejected before replay. Configuration matrices compare `query_digest_sha256` while retaining independent checks of final state, selected versions, and operation order.
+`target_calls` counts basic operations; `rpc_requests` counts actual calls, with `rpc_by_kind` distinguishing Get/Put/Delete/Scan/BatchWrite. Baseline batch members remain distinct basic operations. Trace source boundaries are not sent and do not enter throughput or latency. Warmup membership is assigned in input order before query deferral and follows each operation through its response; histograms exclude warmup. Failed or timed-out requests fail the run and are not successful latency samples.
 
-`request_bytes` sums `Request.getSerializedSize()`, including batch requests. `result_bytes` sums `Result.getSerializedSize()`, accounted after the final response arrives and its count is verified. These counters exclude response envelopes, repeated-field tags / lengths, empty responses, gRPC / HTTP2 / TCP overhead, and retransmissions; they do not measure network bytes.
+SearchGroup remains a source-access description in Trace. The client issues one Get/Scan per member, unions/intersects results by PK, and checks the combined native expected count. Intersection preserves the first member's order; union preserves first-occurrence order. Each member retains its own business-response timestamp. Combined validation gates completion/drain and can fail the run; it does not replace all members' latency with the group completion time. Group results are materialized in the client and can consume memory proportional to their member results.
 
-## Publication, execution, and recovery
+Snapshot queries wait for all pending write responses at/below their read point. Until then the single sender defers the query and continues with newer writes. Deferred queries leave in source order once their dependencies complete; later writes at/below a deferred read point wait for that query. `dependency_wait_seconds`, `search_deferral_seconds` and `deferred_search_operations` remain outside API latency and inside elapsed throughput time. The entire group must fit `max_in_flight` before its first member is admitted.
 
-`IndexServer` and the in-process adapter both use `PublishedIndex`. Requests that are not ready wait on transaction lanes or version-indexed wait tables without occupying workers. Ready writes / commits use a fixed worker pool; queries use a separate pool. Backend calls and response callbacks do not hold the ordering lock. Baseline needs no transaction ordering and may load in parallel.
+Latency mean/max retain measured nanoseconds; p50/p95/p99 are fixed-memory nearest-rank upper bounds, exact below 2048 ns and with less than 1/1024 relative quantization error thereafter. Measurements include the return path and client completion processing; they are not exact server-side visibility timestamps.
 
-`Flush` waits for requests accepted before the call began, then writes the publication watermark and Trace binding into the index and persists them with the data. An index rejects a binding for another Trace, value mode, or secondary-index configuration. A minimal index manifest beside the report records input identity, version coverage, key / value encoding, backend location, build identity, and digest provenance. Source snapshot is N/A until integrated.
+## Results and failure handling
 
-`reopen: true` opens an existing index and restores the last Flush watermark; versions above it remain invisible. `verify-service` checks all replayable snapshot queries at their original read points. Transaction-local queries are reported separately and excluded from this check because they depend on live transaction prefixes that cannot be reconstructed by replay after the transaction has ended.
+Scans respect gRPC flow control and chunk at 16,384 results or approximately 1 MiB, whichever comes first. An individually larger result is sent alone, up to the 32 MiB message bound; oversized requests/results fail. Ordinary scans are counted without retaining all results. Partial results followed by RPC failure never constitute a successful query.
 
-## RocksDB implementation
+Replay checks native expected result counts, RPC status/completion, complete input consumption, input/source integrity, selected value mode and the harness binding. Equal counts do not certify matching keys, versions, values or order; production replay does not create per-query answer artifacts or a reference index. Independent acceptance checks those properties separately.
 
-`RocksDbBackend` uses the key layout `table(u32) ++ index(u32) ++ [indexed_value] ++ PK ++ ~version(u64)`, placing an entry's versions next to each other from newest to oldest. Reads locate the latest version at or below the read point. Transaction-local reads first select the exact local_version, falling back to the snapshot only when it does not exist. Baseline bypasses WAL; other writes use the local WAL without fsync.
+`request_bytes` sums serialized data RPC payloads, including batch envelopes. `result_bytes` sums all returned Result payloads, including each group member's rows before deduplication. Neither measures network bytes: response envelopes, repeated-field framing, metadata and transport overhead are excluded. `checked_result_items` counts the validated ordinary/group answers, which can differ from the number of Result items received over RPC.
 
-Service and replay templates are [rocksdb.yaml](../config/index/rocksdb.yaml) and [sibench.yaml](../config/sibench.yaml), defaulting to row_id. In-process replay uses `target.service.adapter: rocksdb` and a fresh `target.service.path`. Locator is another value mode; both sides must agree on the configuration.
+## Internal persistence and reopening
+
+Persistence belongs to the service. The adapter checks for completed writes every five seconds and persists dirty state, including after input becomes idle; there is no client phase barrier. The check interval is not a per-write persistence deadline; scheduling, concurrent writes and storage latency can delay persistence. A background persistence failure is retained, rejects subsequent calls and fails controlled shutdown. Request failures and later cleanup failures preserve the original error separately. Normal replay success certifies checked request completion and visibility, not remote durability of every acknowledged write.
+
+Controlled shutdown cancels transports, waits up to 30 seconds at each transport/execution boundary, stops workers/maintenance and persists completed dirty writes. Native handles close only after workers and active persistence have exited; timeout/interruption keeps those handles valid until process exit. The underlying engine may also run its own WAL/flush/compaction maintenance.
+
+`reopen: true` opens persisted data and checks value kind and Trace binding. `verify-service` runs the Trace's snapshot queries at their original read points and rejects a Trace with no queries to verify. It does not force persistence. Use a completed internal persistence cycle or controlled service shutdown before an explicit cold-reopen acceptance. Clean reopen does not certify crash recovery, cross-instance visibility or autoscaling. See [service commands](../README.md#replay-and-service).
+
+## Local RocksDB fixture
+
+All writes, including baseline entries, use local WAL without fsync, so write acknowledgment does not promise power-loss durability. Logical deletions retain versioned tombstones; no physical undo or version GC is implemented.
+
+Local RocksDB remains a generation dependency and test fixture, outside the Index Service comparison. The comparison roster is RocksDB-Cloud and SlateDB.
 
 ## rocksdb-cloud backend
 
-The thin JNI layer forwards bytes and reuses the same Java key layout, version selection, and publication logic. See [README](../README.md#rocksdb-cloud-jni) for build and loading instructions.
+Build/loading instructions are in [README](../README.md#rocksdb-cloud-jni). The backend uses the same key, snapshot and ACK visibility semantics.
 
-Select `service.backend: rocksdb_cloud` and set `service.storage: config/index/storage.yaml`, `service.profile`, and an independent `service.object_path` under the profile prefix. Credentials come only from the environment. The cloud backend is accessed through the index service; the in-process adapter currently supports only local RocksDB. The COS bucket is a placeholder; replace the bucket, endpoint, and region before running. The service does not create buckets automatically. Validate local_s3 and COS separately.
-
-| Item | Semantics |
+| Boundary | Behavior |
 | --- | --- |
-| Write acknowledgment | memtable + local WAL, without fsync; Baseline bypasses WAL. |
-| Flush | Returns after SST / MANIFEST uploads are acknowledged, guaranteeing remote durability through the last Flush. Later writes may exist only locally. |
-| Cold start | `keep_local_sst_files=true`. After loss of the local directory, required SSTs are downloaded from the bucket. WAL that was not uploaded cannot be recovered. |
-| Deletion | No automatic bucket creation. `run_purger=false`; ordinary expired / invisible file deletion is delayed by 1 h by default. Bucket bytes may temporarily exceed local bytes. This is not logical version GC. |
-| Measurement | Each Flush writes `<index>.engine-stats.jsonl`. Object requests are N/A for the local backend. |
+| Write acknowledgment | Memtable + local WAL without fsync for baseline and incremental writes. |
+| Internal persistence | Uploads SST/MANIFEST; writes after the completed persistence cycle may exist only locally. |
+| Cold start | `keep_local_sst_files=true`; missing local SSTs are downloaded. Unuploaded WAL is unrecoverable. |
+| Deletion | No bucket creation; `run_purger=false`; ordinary expired/invisible file deletion defaults to a 1-hour delay. This is not logical version GC. |
+| Statistics | Each internal persistence cycle writes `<index>.engine-stats.jsonl`; object-request metrics are N/A for local RocksDB. Both cloud backends count remote requests, failures, bytes and latency below any local copy. |
 
-Object requests record counts, failures, bytes, cumulative microseconds, and a fixed 32-bucket histogram by request type. Upper bounds are 1, 2, 4…2^30 μs, with the final bucket handling overflow: `overflow_after=2^30`, with overflow upper bound `Long.MAX_VALUE`. p50 / p95 / p99 are the upper bounds of the buckets containing their nearest ranks. Both successes and failures contribute; percentiles are not interpreted when samples=0. Concurrent snapshots are not transactional, and percentiles use each histogram's own sample count. Callbacks do not separately report SDK-internal HTTP retries. Cumulative parallel time cannot be added to wall time.
+Object metrics include type, count, failures, bytes, cumulative microseconds and 32 histogram buckets with upper bounds 1, 2, 4…2^30 μs, then `Long.MAX_VALUE` (`overflow_after=2^30`). p50/p95/p99 are nearest-rank bucket upper bounds over successes and failures; no percentile is meaningful with zero samples. Concurrent snapshots are not transactional, so each histogram uses its own sample count. SDK-internal HTTP retries are not separately reported; parallel cumulative time is not wall time. Missing engine data is N/A; incompatible Java/JNI statistics formats fail at open.
 
-Java and JNI statistics formats must match. JNI builds without the required histograms are rejected at open. `summarize_index_run.py` separately summarizes verified service reports and flush / compaction observations from supplied `EVENT_LOG_v1` logs, recording file and script SHA digests. It cannot establish that a log belongs to the report's run: combined analysis with logs is marked `unverified_engine_provenance` and cannot establish performance acceptance without independent same-run records. Job time is not process CPU time, sequence numbers are not user-key ranges, and missing logs are N/A.
+Data-file Rewrite, physical version GC, unknown-outcome write retries and the complete source-snapshot lifecycle are unsupported. Reopening support does not by itself certify fault recovery or full-input capacity.
 
-## Validation boundaries
+## SlateDB backend
 
-See [README](../README.md#tests) for basic check entry points. Service acceptance requires loading, complete replay, per-query checking, and Flush on the same Trace, followed by checks of the original snapshot queries after reopening. Cloud backends additionally require bucket cold-start checks after local-directory loss and positive / negative failure cases around Flush. Resource and correctness reports must come from the same run. Short tests or storage-interface checks do not establish recovery behavior or capacity limits.
+[Build and loading](../README.md#slatedb-jni) use the pinned SlateDB source and a thin Rust JNI byte-store adapter. The shared Java implementation owns the same key layout and version selection as RocksDB-Cloud. All reads and writes use one `Db`, with memory-visible reads; no independent `DbReader` is opened.
 
-Data-file Rewrite, physical version GC, recovery retries for writes with unknown outcomes, and the complete source-snapshot lifecycle are not implemented. Target-scale crash recovery, query-group capacity, and backend performance comparisons require separate validation with matching input, configuration and build identities. Unit tests, short inputs, and storage-interface checks do not establish those guarantees.
+Native writes return after applying to that Db's memory read path (`ACK_MEMORY`). Internal persistence waits for object-store persistence. Write completion and remote durability are separate boundaries. The configured S3 bucket must exist, and creation refuses an existing object prefix; an owner marker uses conditional creation to reject concurrent creators when the store enforces that primitive. SlateDB's writer fencing and manifest publication rely on conditional object writes. Test them on the deployment in use; local S3 results do not certify COS. The tested COS deployment accepted but did not enforce `If-None-Match`/`If-Match` on PUT. Those observations do not certify other COS deployments, owner exclusivity or fencing. The pinned engine also uses conditional creation for successive manifest versions and conditional updates for its object boundary; writer and background maintenance share these protocols. A single application writer does not establish safe manifest publication on that endpoint. Retained COS runs are experimental observations, not certification of these required storage primitives.
+
+Ordered cursors hold a SlateDB snapshot and stream keys in either direction, without copying a complete scan into Java; their data blocks enter the block cache like point reads. The local path holds SlateDB's object mirror: compacted SSTs are written to both the object prefix and local disk and read locally, matching RocksDB-Cloud's local SST copies, while WAL objects and manifests stay remote. The database itself resides in the configured object prefix; reopening uses that prefix, downloads missing mirrored SSTs and reads the persisted Java metadata.

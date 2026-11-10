@@ -1,0 +1,64 @@
+// Logical index types and internal replay completion messages.
+syntax = "proto3";
+
+package sibench.index;
+
+option java_multiple_files = true;
+option java_package = "org.sibench.adapters.proto";
+
+enum Acknowledgement {
+  ACK_UNSPECIFIED = 0;
+  ACK_MEMORY = 1;  // acknowledged before durable state
+  ACK_WAL = 2;     // acknowledged in a write-ahead log, not necessarily fsynced
+  ACK_FSYNC = 3;   // acknowledged after fsync
+}
+
+enum ValueKind {
+  VALUE_KIND_UNSPECIFIED = 0;
+  LOCATOR = 1;  // (file id, row position) of the row version in a data file
+  ROW_ID = 2;   // logical row identity
+}
+
+message EntryKey {
+  uint32 table = 1;
+  uint32 index = 2;
+  bytes indexed_value = 3;  // empty for index 0
+  bytes primary_key = 4;
+}
+
+message Value {
+  // LOCATOR uses file and position; ROW_ID uses row_id.
+  int64 file = 1;
+  int64 position = 2;
+  int64 row_id = 3;
+}
+
+message Bound {
+  bytes key = 1;
+  bool inclusive = 2;
+}
+
+message Result {
+  bytes primary_key = 1;
+  uint64 version = 2;
+  Value value = 3;
+}
+
+message Response {
+  uint64 id = 1;
+  Status status = 2;
+  string message = 3;
+  // Searches and groups: the result entries, in result order (group: first member's order, then
+  // entries only later members added).
+  repeated Result results = 4;
+  // More responses with this id follow. A large result is sent in chunks whose results
+  // concatenate in order; only the last chunk (more = false) carries the final status.
+  bool more = 5;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  OK = 1;
+  INVALID = 2;      // the request breaks the protocol
+  UNAVAILABLE = 3;  // the service could not execute it; the outcome of a write is unknown
+}
