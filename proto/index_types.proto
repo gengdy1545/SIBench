@@ -59,6 +59,6 @@ message Response {
 enum Status {
   STATUS_UNSPECIFIED = 0;
   OK = 1;
-  INVALID = 2;      // the request breaks the protocol (no such version to relocate, ...)
+  INVALID = 2;      // the request breaks the protocol
   UNAVAILABLE = 3;  // the service could not execute it; the outcome of a write is unknown
 }

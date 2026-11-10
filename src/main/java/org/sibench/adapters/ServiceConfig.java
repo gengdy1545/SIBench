@@ -34,6 +34,7 @@ public record ServiceConfig(
         ObjectStore objects,
         boolean reopen) {
     public ServiceConfig {
+        require(port >= 0 && port <= 65535, "Invalid index service port");
         require(Set.of("grpc", "rocksdb", "rocksdb_cloud", "slatedb").contains(adapter), "Unknown service adapter: " + adapter);
         require(!adapter.equals("grpc") || endpoint != null, "A gRPC target needs an endpoint");
         require(adapter.equals("grpc") || path != null, "An index needs a path");

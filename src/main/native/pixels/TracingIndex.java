@@ -27,7 +27,7 @@ final class TracingIndex implements SinglePointIndex {
     @Override
     public long getUniqueRowId(IndexProto.IndexKey key) throws SinglePointIndexException {
         long rowId = delegate.getUniqueRowId(key);
-        record(IndexTraceChannel.LOOKUP, key, rowId, null, -1);
+        record(IndexTraceChannel.LOOKUP, key, rowId, null);
         return rowId;
     }
 
@@ -35,7 +35,7 @@ final class TracingIndex implements SinglePointIndex {
     public boolean putPrimaryEntries(List<IndexProto.PrimaryIndexEntry> entries) throws SinglePointIndexException {
         boolean success = delegate.putPrimaryEntries(entries);
         if (!success) return false;
-        for (var entry : entries) record(IndexTraceChannel.PUT, entry.getIndexKey(), entry.getRowId(), entry, -1);
+        for (var entry : entries) record(IndexTraceChannel.PUT, entry.getIndexKey(), entry.getRowId(), entry);
         return true;
     }
 
@@ -44,7 +44,7 @@ final class TracingIndex implements SinglePointIndex {
         List<Long> previous = delegate.updatePrimaryEntries(entries);
         if (previous.size() != entries.size()) unsupported("updatePrimaryEntries with absent keys");
         for (int i = 0; i < entries.size(); i++)
-            record(IndexTraceChannel.UPDATE, entries.get(i).getIndexKey(), entries.get(i).getRowId(), entries.get(i), previous.get(i));
+            record(IndexTraceChannel.UPDATE, entries.get(i).getIndexKey(), entries.get(i).getRowId(), entries.get(i));
         return previous;
     }
 
@@ -53,7 +53,7 @@ final class TracingIndex implements SinglePointIndex {
         List<Long> deleted = delegate.deleteEntries(keys);
         // Retina deletes only keys it has just resolved; a size mismatch would lose the key/row pairing.
         if (deleted.size() != keys.size()) unsupported("deleteEntries with absent keys");
-        for (int i = 0; i < keys.size(); i++) record(IndexTraceChannel.DELETE, keys.get(i), deleted.get(i), null, -1);
+        for (int i = 0; i < keys.size(); i++) record(IndexTraceChannel.DELETE, keys.get(i), deleted.get(i), null);
         return deleted;
     }
 
@@ -118,12 +118,12 @@ final class TracingIndex implements SinglePointIndex {
     @Override
     public boolean closeAndRemove() throws SinglePointIndexException { return delegate.closeAndRemove(); }
 
-    private void record(int kind, IndexProto.IndexKey key, long rowId, IndexProto.PrimaryIndexEntry entry, long previous)
+    private void record(int kind, IndexProto.IndexKey key, long rowId, IndexProto.PrimaryIndexEntry entry)
             throws SinglePointIndexException {
         var location = entry == null ? null : entry.getRowLocation();
         append(IndexTraceChannel.fact(kind, key.getTableId(), key.getIndexId(), key.getTimestamp(), key.getKey().toByteArray(),
                 rowId, location == null ? 0 : location.getFileId(), location == null ? 0 : location.getRgId(),
-                location == null ? 0 : location.getRgRowOffset(), previous));
+                location == null ? 0 : location.getRgRowOffset()));
     }
 
     private void unsupported(String method) throws SinglePointIndexException {

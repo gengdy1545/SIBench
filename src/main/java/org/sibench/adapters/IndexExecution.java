@@ -79,6 +79,13 @@ public final class IndexExecution {
         if (!key.getUnknownFields().asMap().isEmpty() || key.getTable() < 1 || key.getIndex() < 0
                 || (key.getIndex() == 0) != key.getIndexedValue().isEmpty() || key.getPrimaryKey().isEmpty())
             throw new IllegalArgumentException("Invalid entry key");
+        if (component(key.getPrimaryKey()).isNull()) throw new IllegalArgumentException("Primary key is NULL");
+        if (key.getIndex() != 0) component(key.getIndexedValue());
+    }
+
+    static org.sibench.trace.IndexKey component(ByteString bytes) {
+        try { return org.sibench.trace.IndexKey.decode(bytes.toByteArray()); }
+        catch (IOException invalid) { throw new IllegalArgumentException("Invalid index key component", invalid); }
     }
 
     static void validateWrite(org.sibench.adapters.proto.Write write, org.sibench.adapters.proto.ValueKind kind) {

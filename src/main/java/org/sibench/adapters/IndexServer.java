@@ -82,6 +82,19 @@ public final class IndexServer implements AutoCloseable {
         // The benchmark harness checks target identity before application, outside the data schema.
         var bound = ServerInterceptors.intercept(service, new ServerInterceptor() {
             @Override public <Q,S> ServerCall.Listener<Q> interceptCall(ServerCall<Q,S> call, Metadata headers, ServerCallHandler<Q,S> next) {
+                var described = new ForwardingServerCall.SimpleForwardingServerCall<Q,S>(call) {
+                    private boolean headersSent;
+                    @Override public void sendHeaders(Metadata responseHeaders) {
+                        responseHeaders.put(GrpcService.DESCRIPTION, metadata);
+                        headersSent = true;
+                        super.sendHeaders(responseHeaders);
+                    }
+                    @Override public void close(io.grpc.Status status, Metadata trailers) {
+                        // Empty streams and rejected calls may close without sending a message.
+                        if (!headersSent) sendHeaders(new Metadata());
+                        super.close(status, trailers);
+                    }
+                };
                 try {
                     executor.requireHealthy();
                     String binding = headers.get(GrpcService.INDEX_BINDING);
@@ -91,15 +104,9 @@ public final class IndexServer implements AutoCloseable {
                         backend.bind(binding);
                     }
                 } catch (IOException | RuntimeException error) {
-                    call.close(io.grpc.Status.FAILED_PRECONDITION.withDescription(error.getMessage()), new Metadata());
+                    described.close(io.grpc.Status.FAILED_PRECONDITION.withDescription(error.getMessage()), new Metadata());
                     return new ServerCall.Listener<>() {};
                 }
-                var described = new ForwardingServerCall.SimpleForwardingServerCall<Q,S>(call) {
-                    @Override public void sendHeaders(Metadata responseHeaders) {
-                        responseHeaders.put(GrpcService.DESCRIPTION, metadata);
-                        super.sendHeaders(responseHeaders);
-                    }
-                };
                 return next.startCall(described, headers);
             }
         });

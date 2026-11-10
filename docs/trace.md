@@ -55,7 +55,7 @@ Only exported operations count. A committed-snapshot search is retained even whe
 ```text
 PrimaryKey   = (Table, IndexID=0, PK, VersionDescending)
 SecondaryKey = (Table, IndexID, IndexedValue, PK, VersionDescending)
-LogicalValue = RowID
+LogicalValue = RowID or Locator(file, position), as declared by value_kinds
 ```
 
 TableIDs start at 1 in source-schema order; secondary IndexIDs follow each table's source index order. Nonunique secondary predicates search all matching primary keys.
@@ -64,11 +64,11 @@ TableIDs start at 1 in source-schema order; secondary IndexIDs follow each table
 
 Backend keys are `Table(uint32 BE) ++ IndexID(uint32 BE) ++ [IndexedValue] ++ PK ++ (~Version int64 BE)`. Component-prefix equality is `[value, prefixSuccessor(value))`; inclusive/exclusive bounds adjust that endpoint.
 
-Baseline version is 0. Native transaction outcomes receive canonical resolution slots in actual outcome order, including Commit, Abort and read-only transactions; `transactionId` is the resolution version. In `cdc` mode the slots follow Pixels transaction timestamps, which pixels-sink assigns at each source transaction's BEGIN in source commit order; only committed source transactions that changed rows reach Pixels, so there are no Abort or read-only slots. Native start IDs, wall time, log arrival and replay completion do not define visibility. The actual snapshot determines the committed read bound. At a read point, select the latest exported committed version at or below it; a selected tombstone means absent and cannot expose an older value.
+Baseline version is 0. Native transaction outcomes receive contiguous canonical resolution slots, including Commit, Abort and read-only transactions; `transactionId` is the resolution version. DuckDB follows its native resolution order. PostgreSQL orders by native completion counter, places XID-bearing outcomes before read-only ties, and uses source chunk order for remaining ties. These read-only ties add no committed writes; slots are logical time, not physical completion timestamps. In `cdc` mode the slots follow Pixels transaction timestamps, which pixels-sink assigns at each source transaction's BEGIN in source commit order; only committed source transactions that changed rows reach Pixels, so there are no Abort or read-only slots. Native start IDs, wall time, log arrival and replay completion do not define visibility. The actual snapshot determines the committed read bound. At a read point, select the latest exported committed version at or below it; a selected tombstone means absent and cannot expose an older value.
 
 Source operation order and `mutationOrdinal` identify original changes. Generation validates complete source transactions before filtering, then retains only the last action for each `(table, index, indexed_value, PK)` at that commit version. Intermediate values do not become separate same-version writes. A secondary key introduced and removed within one transaction may retain an absent-key tombstone; this is harmless and prevents older versions from resurfacing. Original source positions may therefore have gaps.
 
-Snapshot searches keep the actual committed read bound. Transaction-local searches, including an entire group with any local member, are excluded. Source Abort slots remain as metadata with no exported writes. See [service visibility rules](index-service.md#data-and-snapshot-reads). Primary-key assignments, including permutations and later-aborted attempts, are unsupported.
+Snapshot searches keep the actual committed read bound. Transaction-local searches, including an entire group with any local member, are excluded. Source Abort slots remain as metadata with no exported writes. See [service visibility rules](index-service.md#data-interfaces). Native capture rejects primary-key assignments, including permutations and later-aborted attempts. Pixels CDC rejects actual key changes; assignments of the same key value are allowed.
 
 ## Work units and routing
 
@@ -122,7 +122,7 @@ YCSB API Scan retains its explicit maximum result count and may exhaust the rang
 
 Supply counts effective requests after filtering, excluding baseline/source markers, aborted writes and transaction-local searches; each SearchGroup member counts once. Required supply is warmup operations + ceil(rate × measurement seconds × (1 + margin)). Insufficient supply fails before loading/sending. Dispatch warmup, measurement windows and operation rates use this same primitive-operation count. Source terminal markers have no service call or latency samples. Warmup responses remain excluded from measured latency and completion rates even when they arrive after the measured window starts. Supply does not establish achievable throughput; Trace is finite and has no segmented resume/checkpoints.
 
-Reports distinguish baseline/workload records, effective requests, transactions/outcomes, responses, in-flight work and backpressure. `last_resolved_version` includes Abort. RowID replay does not rewrite native rows. [Service checks](index-service.md#results-and-validation) validate counts/completion and harness target binding, not every result identity; independent full-data auditing is a separate explicit workflow.
+Reports distinguish baseline/workload records, effective requests, transactions/outcomes, responses, in-flight work and backpressure. `last_resolved_version` includes Abort. RowID replay does not rewrite native rows. [Service checks](index-service.md#results-and-failure-handling) validate counts/completion and harness target binding, not every result identity; small independent semantic counterexamples are separate from ordinary replay. Native row/history auditing is outside the delivered workflow.
 
 ## Source scope
 

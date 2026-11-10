@@ -47,7 +47,6 @@ final class PixelsGeneration {
         Files.createDirectory(output);
         String traceToken = UUID.randomUUID().toString(), reportToken = UUID.randomUUID().toString();
         Process sink = null;
-        Throwable primary = null;
         var sourceSettings = new LinkedHashMap<>(SibenchConfig.postgresSettings(object(object(settings, "source"), "settings")));
         sourceSettings.putAll(Map.of("wal_level", "logical", "max_wal_senders", "4", "max_replication_slots", "4"));
         String hostSetting = string(settings, "pixels_host");
@@ -157,14 +156,17 @@ final class PixelsGeneration {
                     evidence.put("pixels_host", Map.of("deployment", hostSetting, "address", pixels.get("address").getAsString(),
                             "build", host.identity(), "stop", new com.google.gson.Gson().fromJson(stopped.get("exits"), Map.class)));
                     var manifest = Generation.publishThenDiscard(() -> trace.publish(evidence), database.data(), timings);
-                    host.call(Map.of("op", "delete"));
+                    try {
+                        host.call(Map.of("op", "delete"));
+                    } catch (IOException failure) {
+                        throw new IOException("Trace published at " + output.resolve("trace")
+                                + "; Pixels cleanup failed at " + pixels.get("address").getAsString()
+                                + ":" + pixels.get("directory").getAsString(), failure);
+                    }
                     timings.put("total_seconds", seconds(started));
                     json(output.resolve("result.json"), Map.of("status", "complete", "trace", output.resolve("trace").toString(), "timings", timings));
                     return manifest;
                 }
-            } catch (Exception | Error failure) {
-                primary = failure;
-                throw failure;
             } finally {
                 try {
                     Runtime.getRuntime().removeShutdownHook(stopSource);
@@ -177,7 +179,6 @@ final class PixelsGeneration {
                 }
             }
         } catch (Exception | Error failure) {
-            if (primary == null) primary = failure;
             var stack = new java.io.StringWriter();
             failure.printStackTrace(new java.io.PrintWriter(stack));
             try {

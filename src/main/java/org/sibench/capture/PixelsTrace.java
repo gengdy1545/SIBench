@@ -36,7 +36,7 @@ final class PixelsTrace implements AutoCloseable {
 
     /** One raw fact from the Retina tracer. */
     record Fact(int kind, long table, long index, long timestamp, byte[] key, long rowId, long fileId, int rgId,
-            int rgRowOffset, long previousRowId) {}
+            int rgRowOffset) {}
 
     /** A Pixels table: its Trace table id (0 for the marker), primary index and key column type. */
     record Table(String name, int id, long primaryIndex, String keyType) {}

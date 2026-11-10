@@ -28,9 +28,9 @@ public class PixelsTraceTest {
                 MARKER, new PixelsTrace.Table("sibench_marker", 0, 10, "bigint")), budget);
     }
 
-    private static PixelsTrace.Fact fact(int kind, long timestamp, int key, long rowId, long previous) {
+    private static PixelsTrace.Fact fact(int kind, long timestamp, int key, long rowId) {
         return new PixelsTrace.Fact(kind, TABLE, INDEX, timestamp, ByteBuffer.allocate(4).putInt(key).array(), rowId,
-                kind == PixelsTrace.PUT || kind == PixelsTrace.UPDATE ? 40 + key : 0, 2, 5, previous);
+                kind == PixelsTrace.PUT || kind == PixelsTrace.UPDATE ? 40 + key : 0, 2, 5);
     }
 
     private static List<Operation> workload(Map<String, Object> manifest) throws IOException {
@@ -46,25 +46,25 @@ public class PixelsTraceTest {
         var trace = trace(null);
         Path directory = temporary.getRoot().toPath().resolve(temporary.getRoot().list()[0]).resolve("trace");
         // LOAD: two baseline rows at the LOAD timestamp; the count must match the source exactly.
-        trace.fact(fact(PixelsTrace.PUT, 3, 1, 100, -1));
-        trace.fact(fact(PixelsTrace.PUT, 3, 2, 101, -1));
+        trace.fact(fact(PixelsTrace.PUT, 3, 1, 100));
+        trace.fact(fact(PixelsTrace.PUT, 3, 2, 101));
         trace.finishBaseline(Map.of("sbtest1", 2L));
         trace.begin(10);
         trace.begin(11);
         trace.begin(12);
         trace.begin(13);
         // The later transaction's facts and commit arrive first, but it waits for its predecessor.
-        trace.fact(fact(PixelsTrace.PUT, 11, 5, 200, -1));
+        trace.fact(fact(PixelsTrace.PUT, 11, 5, 200));
         trace.commit(11);
         trace.covered(trace.committedSnapshot());
         assertEquals(0, trace.version());
-        trace.fact(fact(PixelsTrace.LOOKUP, 10, 1, 100, -1));
-        trace.fact(fact(PixelsTrace.UPDATE, 10, 1, 201, 100));
+        trace.fact(fact(PixelsTrace.LOOKUP, 10, 1, 100));
+        trace.fact(fact(PixelsTrace.UPDATE, 10, 1, 201));
         // Insert, read back and update of one key inside one transaction: the read saw its own write.
-        trace.fact(fact(PixelsTrace.PUT, 12, 7, 300, -1));
-        trace.fact(fact(PixelsTrace.LOOKUP, 12, 7, 300, -1));
-        trace.fact(fact(PixelsTrace.UPDATE, 12, 7, 301, 300));
-        trace.fact(new PixelsTrace.Fact(PixelsTrace.PUT, MARKER, 10, 13, ByteBuffer.allocate(8).putLong(4).array(), 1, 1, 0, 0, -1));
+        trace.fact(fact(PixelsTrace.PUT, 12, 7, 300));
+        trace.fact(fact(PixelsTrace.LOOKUP, 12, 7, 300));
+        trace.fact(fact(PixelsTrace.UPDATE, 12, 7, 301));
+        trace.fact(new PixelsTrace.Fact(PixelsTrace.PUT, MARKER, 10, 13, ByteBuffer.allocate(8).putLong(4).array(), 1, 1, 0, 0));
         for (long timestamp : List.of(10L, 12L, 13L)) trace.commit(timestamp);
         trace.covered(trace.committedSnapshot());
         assertEquals(3, trace.version());
@@ -101,11 +101,11 @@ public class PixelsTraceTest {
 
     @Test public void rejectsIncompleteBaselineUnsupportedCallsAndUnresolvedTransactions() throws Exception {
         var trace = trace(null);
-        trace.fact(fact(PixelsTrace.PUT, 3, 1, 100, -1));
+        trace.fact(fact(PixelsTrace.PUT, 3, 1, 100));
         assertThrows(IOException.class, () -> trace.finishBaseline(Map.of("sbtest1", 2L)));
-        assertThrows(IOException.class, () -> trace.fact(fact(PixelsTrace.LOOKUP, 3, 1, 100, -1)));
+        assertThrows(IOException.class, () -> trace.fact(fact(PixelsTrace.LOOKUP, 3, 1, 100)));
         assertThrows(IOException.class, () -> trace.fact(new PixelsTrace.Fact(PixelsTrace.UNSUPPORTED, 0, 0, 0,
-                "purgeEntries".getBytes(java.nio.charset.StandardCharsets.UTF_8), -1, 0, 0, 0, -1)));
+                "purgeEntries".getBytes(java.nio.charset.StandardCharsets.UTF_8), -1, 0, 0, 0)));
 
         var workload = trace(null);
         workload.finishBaseline(Map.of());
@@ -122,8 +122,8 @@ public class PixelsTraceTest {
         var trace = trace(null);
         trace.finishBaseline(Map.of());
         trace.begin(4);
-        trace.fact(fact(PixelsTrace.PUT, 4, 1, 10, -1));
-        trace.fact(new PixelsTrace.Fact(PixelsTrace.PUT, MARKER, 10, 4, ByteBuffer.allocate(8).putLong(1).array(), 1, 1, 0, 0, -1));
+        trace.fact(fact(PixelsTrace.PUT, 4, 1, 10));
+        trace.fact(new PixelsTrace.Fact(PixelsTrace.PUT, MARKER, 10, 4, ByteBuffer.allocate(8).putLong(1).array(), 1, 1, 0, 0));
         trace.commit(4);
         assertThrows(IOException.class, () -> trace.covered(trace.committedSnapshot()));
         trace.close();
@@ -131,15 +131,15 @@ public class PixelsTraceTest {
 
     @Test public void deleteAndReinsertKeepTheTombstoneAndNewRowIdentityInBothValueModes() throws Exception {
         var trace = trace(null);
-        trace.fact(fact(PixelsTrace.PUT, 3, 1, 0, -1));
+        trace.fact(fact(PixelsTrace.PUT, 3, 1, 0));
         trace.finishBaseline(Map.of("sbtest1", 1L));
         trace.begin(10);
-        trace.fact(fact(PixelsTrace.LOOKUP, 10, 1, 0, -1));
-        trace.fact(fact(PixelsTrace.DELETE, 10, 1, 0, -1));
+        trace.fact(fact(PixelsTrace.LOOKUP, 10, 1, 0));
+        trace.fact(fact(PixelsTrace.DELETE, 10, 1, 0));
         trace.commit(10); trace.covered(trace.committedSnapshot());
         trace.begin(11);
-        trace.fact(fact(PixelsTrace.LOOKUP, 11, 1, -1, -1));
-        trace.fact(fact(PixelsTrace.PUT, 11, 1, 7, -1));
+        trace.fact(fact(PixelsTrace.LOOKUP, 11, 1, -1));
+        trace.fact(fact(PixelsTrace.PUT, 11, 1, 7));
         trace.commit(11); trace.covered(trace.committedSnapshot());
         trace.finish();
         Path directory = temporary.getRoot().toPath().resolve(temporary.getRoot().list()[0]).resolve("trace");

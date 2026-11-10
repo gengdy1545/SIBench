@@ -294,3 +294,110 @@ diff --git a/src/main/java/io/pixelsdb/pixels/sink/util/concurrent/StreamOrdered
 +        }
          return completion;
      }
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java b/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java
+@@ -68,0 +69,2 @@
++    private final io.pixelsdb.pixels.sink.SibenchSourceTransactions sourceTransactions =
++            new io.pixelsdb.pixels.sink.SibenchSourceTransactions();
+@@ -129,0 +132,8 @@
++            try
++            {
++                sourceTransactions.accept(sourceRecord, recordType);
++            } catch (RuntimeException failure)
++            {
++                io.pixelsdb.pixels.sink.SibenchReport.fail("Invalid PostgreSQL CDC source event", failure);
++                throw failure;
++            }
+@@ -177,3 +187,2 @@
+-            LOGGER.warn("Skipping invalid Debezium ROW event from topic {}",
+-                    record.topic(), result.failure());
+-            return;
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Cannot decode Debezium ROW event", result.failure());
++            throw new IllegalStateException(result.failure());
+@@ -183 +192,2 @@
+-            return;
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Decoded CDC event is absent", null);
++            throw new IllegalStateException("Decoded CDC event is absent");
+@@ -195,3 +205,2 @@
+-            LOGGER.warn("Skipping invalid Debezium TRANSACTION event from topic {}",
+-                    record.topic(), result.failure());
+-            return;
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Cannot decode Debezium TRANSACTION event", result.failure());
++            throw new IllegalStateException(result.failure());
+@@ -201 +210,2 @@
+-            return;
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Decoded CDC event is absent", null);
++            throw new IllegalStateException("Decoded CDC event is absent");
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/SibenchSourceTransactions.java b/src/main/java/io/pixelsdb/pixels/sink/SibenchSourceTransactions.java
+new file mode 100644
+--- /dev/null
++++ b/src/main/java/io/pixelsdb/pixels/sink/SibenchSourceTransactions.java
+@@ -0,0 +1,67 @@
++/* SIBench source-completeness guard; distributed under the pixels-sink license. */
++package io.pixelsdb.pixels.sink;
++
++import io.pixelsdb.pixels.sink.source.engine.DebeziumRecordType;
++import io.pixelsdb.pixels.sink.conversion.debezium.dialect.PostgresSourceAdapter;
++import java.util.HashMap;
++import java.util.Map;
++import org.apache.kafka.connect.data.Struct;
++import org.apache.kafka.connect.source.SourceRecord;
++
++/** Checks the ordered PostgreSQL envelope before parallel decoding or offset acknowledgement. */
++public final class SibenchSourceTransactions
++{
++    private String transaction;
++    private long rows;
++    private final Map<String, Long> tables = new HashMap<>();
++
++    public void accept(SourceRecord record, DebeziumRecordType type)
++    {
++        if (type == DebeziumRecordType.TOMBSTONE) return;
++        if (!(record.value() instanceof Struct value)) throw invalid();
++        if (type == DebeziumRecordType.TRANSACTION)
++        {
++            String id = PostgresSourceAdapter.INSTANCE.normalizeTransactionId(value.getString("id"));
++            if (id == null || id.isBlank()) throw invalid();
++            if (value.getString("status").equals("BEGIN"))
++            {
++                if (transaction != null) throw invalid();
++                transaction = id;
++                rows = 0;
++                tables.clear();
++            }
++            else if (value.getString("status").equals("END"))
++            {
++                if (!id.equals(transaction) || value.getInt64("event_count") != rows) throw invalid();
++                var counts = new HashMap<String, Long>();
++                for (Object item : value.getArray("data_collections"))
++                {
++                    Struct collection = (Struct) item;
++                    if (counts.put(collection.getString("data_collection"), collection.getInt64("event_count")) != null)
++                        throw invalid();
++                }
++                if (!tables.equals(counts)) throw invalid();
++                transaction = null;
++                tables.clear();
++            }
++            else throw invalid();
++        }
++        else if (type == DebeziumRecordType.ROW)
++        {
++            Struct tx = value.getStruct("transaction"), source = value.getStruct("source");
++            if (tx == null || source == null || !PostgresSourceAdapter.INSTANCE.normalizeTransactionId(tx.getString("id")).equals(transaction)
++                    || tx.getInt64("total_order") != rows + 1) throw invalid();
++            String table = source.getString("schema") + "." + source.getString("table");
++            long count = tables.getOrDefault(table, 0L) + 1;
++            if (tx.getInt64("data_collection_order") != count) throw invalid();
++            tables.put(table, count);
++            rows++;
++        }
++        else throw invalid();
++    }
++
++    private static IllegalArgumentException invalid()
++    {
++        return new IllegalArgumentException("Incomplete or unordered PostgreSQL CDC transaction");
++    }
++}

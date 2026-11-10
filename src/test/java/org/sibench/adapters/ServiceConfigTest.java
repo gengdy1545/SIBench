@@ -12,6 +12,12 @@ import org.junit.rules.TemporaryFolder;
 public class ServiceConfigTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test public void serverPortMustFitTheNetworkPortRange() {
+        for (int port : new int[] {-1, 65536})
+            assertThrows(IllegalArgumentException.class, () -> new ServiceConfig("rocksdb", null,
+                    temporary.getRoot().toPath(), port, org.sibench.adapters.proto.ValueKind.ROW_ID, null, false));
+    }
+
     @Test
     public void serverRejectsUnknownServiceFields() throws Exception {
         Path config = temporary.getRoot().toPath().resolve("index.yaml");

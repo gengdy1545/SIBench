@@ -16,6 +16,15 @@ import org.yaml.snakeyaml.Yaml;
 public class SibenchConfigTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test public void remoteHostPortMustFitTheNetworkPortRange() throws Exception {
+        var root = Path.of("").toAbsolutePath();
+        var settings = new java.util.LinkedHashMap<>(ConfigValues.parse(Files.readString(root.resolve("config/engine/pixels/pixels.yaml"))));
+        settings.remove("schema_version"); settings.remove("purpose"); settings.remove("engine");
+        settings.put("pixels_host", "host:65536");
+        var failure = assertThrows(IllegalArgumentException.class, () -> PixelsConfig.read(root.resolve("config/engine/pixels"), settings));
+        assertEquals("Invalid Pixels host port", failure.getMessage());
+    }
+
     @Test
     public void replayServiceAndAnalysisUseTheSameConfiguration() throws Exception {
         Path root = Path.of("").toAbsolutePath();
@@ -65,6 +74,22 @@ public class SibenchConfigTest {
         Files.writeString(root.resolve("postgres.yaml"), "schema_version: 1\npurpose: engine\nengine: postgres\n"
                 + "build_directory: build/services/postgres\nsettings: {}\ndata_directory: data\n");
         assertThrows(IllegalArgumentException.class, () -> SibenchConfig.engine(root, runtime, Engine.POSTGRES));
+    }
+
+    @Test public void postgresSettingsCannotRedirectWorkingStateOrDisableSourceTriggers() {
+        var accepted=new java.util.ArrayList<String>();
+        for (String key:java.util.List.of("data_directory","hba_file","ident_file","external_pid_file","session_replication_role")) {
+            try { SibenchConfig.postgresSettings(Map.of(key,"external")); accepted.add(key); }
+            catch (IllegalArgumentException expected) { }
+        }
+        assertEquals(java.util.List.of(),accepted);
+    }
+
+    @Test public void cdcSecondaryExportFailsDuringSelectionBeforeAnyBuildOrRun() throws Exception {
+        var root=temporary.getRoot().toPath();
+        Files.writeString(root.resolve("hybench.yaml"),"benchmark: hybench\ntrace:\n  secondary_indexes: true\n");
+        assertThrows(IllegalArgumentException.class,()->BenchmarkSelection.read(root,Map.of("benchmarks",java.util.List.of(
+                Map.of("config","hybench.yaml","mode","cdc","engine","pixels")))));
     }
 
     @Test

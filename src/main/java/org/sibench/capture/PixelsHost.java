@@ -31,6 +31,7 @@ import org.sibench.config.PixelsConfig;
 public final class PixelsHost {
     private static final Gson GSON = new Gson();
     private static final Duration SETUP = Duration.ofMinutes(5), STOP = Duration.ofMinutes(2);
+    private static final long MAX_UPLOAD_BYTES = 4L << 30;
 
     private PixelsHost() {}
 
@@ -188,6 +189,8 @@ public final class PixelsHost {
         private Path run, config;
         private Map<String, String> environment;
         private Duration requestTimeout = SETUP;
+        private long requestDeadline;
+        private boolean stopped;
 
         Session(Path build, Path workRoot, String token, Socket socket) throws IOException {
             this.build = build;
@@ -216,11 +219,18 @@ public final class PixelsHost {
                     } catch (java.io.EOFException closed) {
                         return;
                     }
+                    long timeout = request.get("timeout_ms").getAsLong();
+                    if (timeout <= 0 || timeout > TimeUnit.HOURS.toMillis(24)) throw new IOException("Invalid host request timeout");
+                    var deadline = Client.DEADLINES.schedule(() -> {
+                        try { socket.close(); } catch (IOException ignored) { }
+                    }, timeout, TimeUnit.MILLISECONDS);
                     try {
                         reply(handle(request));
                     } catch (Exception failure) {
                         reply(Map.of("error", String.valueOf(failure)));
-                    }
+                        // Failed uploads leave an unread body; never parse it as another request.
+                        return;
+                    } finally { deadline.cancel(false); }
                 }
             } finally {
                 // An abandoned session must not leave daemons running; their state and logs stay.
@@ -237,6 +247,7 @@ public final class PixelsHost {
             long timeout = request.get("timeout_ms").getAsLong();
             if (timeout <= 0 || timeout > TimeUnit.HOURS.toMillis(24)) throw new IOException("Invalid host request timeout");
             requestTimeout = Duration.ofMillis(timeout);
+            requestDeadline = System.nanoTime() + requestTimeout.toNanos();
             return switch (request.get("op").getAsString()) {
                 case "start" -> start(request);
                 case "create" -> create(request);
@@ -259,10 +270,12 @@ public final class PixelsHost {
         private Map<String, ?> start(JsonObject request) throws Exception {
             if (run != null) throw new IOException("Pixels run already started in this session");
             String name = request.get("run").getAsString();
-            if (!name.matches("[A-Za-z0-9._-]+")) throw new IOException("Invalid run name");
-            run = workRoot.resolve(name);
+            if (!name.matches("[A-Za-z0-9._-]+") || name.equals(".") || name.equals("..")) throw new IOException("Invalid run name");
             Files.createDirectories(workRoot);
-            Files.createDirectory(run);
+            Path created = workRoot.toRealPath().resolve(name);
+            Files.createDirectory(created);
+            run = created;
+            stopped = false;
             String address = socket.getLocalAddress().getHostAddress();
             var ports = new LinkedHashMap<String, Integer>();
             for (String port : List.of("etcd", "etcd_peer", "metadata", "trans", "retina", "node", "query", "index", "scaling", "worker"))
@@ -324,7 +337,7 @@ public final class PixelsHost {
                     Map.of("LD_LIBRARY_PATH", run.resolve("home/lib") + ":" + Path.of(System.getProperty("java.home"), "lib") + ":"
                             + Path.of(System.getProperty("java.home"), "lib/server"), "LD_PRELOAD", run.resolve("home/lib/libjemalloc.so").toString()));
             for (String port : List.of("retina", "index", "trans")) await(address, ports.get(port));
-            return Map.of("properties", Files.readString(config), "address", address);
+            return Map.of("properties", Files.readString(config), "address", address, "directory", run.toString());
         }
 
         private List<String> daemon(String heap, String role, List<String> options, String classpath) throws IOException {
@@ -350,7 +363,7 @@ public final class PixelsHost {
             var process = builder.start();
             processes.put("setup", process);
             try {
-                if (!process.waitFor(requestTimeout.toMillis(), TimeUnit.MILLISECONDS))
+                if (!process.waitFor(remainingMillis(), TimeUnit.MILLISECONDS))
                     throw new IOException("Pixels setup timed out: " + arguments[0]);
                 if (process.exitValue() != 0) throw new IOException("Pixels setup failed: " + arguments[0] + "; see " + run);
             } finally {
@@ -362,10 +375,22 @@ public final class PixelsHost {
 
         private Map<String, ?> upload(JsonObject request) throws IOException {
             String table = request.get("table").getAsString(), name = request.get("name").getAsString();
-            if (!table.matches("[A-Za-z0-9_]+") || !name.matches("[A-Za-z0-9_.-]+")) throw new IOException("Invalid upload name");
-            Path file = Files.createDirectories(run.resolve("load").resolve(table)).resolve(name);
+            if (!table.matches("[A-Za-z0-9_]+") || !name.matches("[A-Za-z0-9_.-]+") || name.equals(".") || name.equals(".."))
+                throw new IOException("Invalid upload name");
+            if (run == null || stopped) throw new IOException("No active Pixels run");
             long remaining = request.get("bytes").getAsLong();
+            if (remaining < 0 || remaining > MAX_UPLOAD_BYTES) throw new IOException("Upload exceeds the 4 GiB file limit");
+            Path directory = run;
+            for (String part : List.of("load", table)) {
+                if (Files.isSymbolicLink(directory)) throw new IOException("Symbolic upload directory: " + directory);
+                directory = directory.resolve(part);
+                if (!Files.exists(directory, java.nio.file.LinkOption.NOFOLLOW_LINKS)) Files.createDirectory(directory);
+            }
+            if (Files.isSymbolicLink(directory)) throw new IOException("Symbolic upload directory: " + directory);
+            Path file = directory.resolve(name);
+            boolean created = false;
             try (var target = Files.newOutputStream(file, StandardOpenOption.CREATE_NEW)) {
+                created = true;
                 byte[] buffer = new byte[1 << 20];
                 while (remaining > 0) {
                     int read = input.read(buffer, 0, (int) Math.min(buffer.length, remaining));
@@ -373,6 +398,9 @@ public final class PixelsHost {
                     target.write(buffer, 0, read);
                     remaining -= read;
                 }
+            } catch (IOException | RuntimeException failure) {
+                if (created) try { Files.delete(file); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
+                throw failure;
             }
             return Map.of();
         }
@@ -406,7 +434,7 @@ public final class PixelsHost {
             for (String name : names) {
                 var process = processes.get(name);
                 process.destroy();
-                if (!process.waitFor(STOP.toSeconds(), TimeUnit.SECONDS)) {
+                if (!process.waitFor(Math.min(STOP.toMillis(), remainingMillis()), TimeUnit.MILLISECONDS)) {
                     process.destroyForcibly();
                     throw new IOException("Pixels " + name + " did not stop; see " + run);
                 }
@@ -415,12 +443,14 @@ public final class PixelsHost {
                     throw new IOException("Pixels " + name + " stopped with " + process.exitValue() + "; see " + run);
             }
             processes.clear();
+            stopped = true;
             return Map.of("exits", exits);
         }
 
         private Map<String, ?> delete() throws IOException {
-            if (!processes.isEmpty()) throw new IOException("Pixels processes are still running");
+            if (run == null || !stopped || !processes.isEmpty()) throw new IOException("Pixels run has not stopped normally");
             Generation.deleteTree(run);
+            run = null;
             return Map.of();
         }
 
@@ -429,22 +459,30 @@ public final class PixelsHost {
                     .redirectOutput(run.resolve(name + ".log").toFile());
             builder.environment().putAll(environment);
             builder.environment().putAll(extra);
-            Files.writeString(run.resolve(name + ".command"), String.join(" ", command) + "\n", StandardOpenOption.CREATE_NEW);
+            Files.writeString(run.resolve(name + ".command"), command.stream()
+                    .map(option -> option.replaceAll("(-Dsibench\\.[^=]*token=).*", "$1<redacted>"))
+                    .collect(java.util.stream.Collectors.joining(" ")) + "\n", StandardOpenOption.CREATE_NEW);
             processes.put(name, builder.start());
         }
 
         private void await(String address, int port) throws Exception {
-            long deadline = System.nanoTime() + SETUP.toNanos();
+            long deadline = Math.min(System.nanoTime() + SETUP.toNanos(), requestDeadline);
             while (true) {
                 check();
                 try (var probe = new Socket()) {
-                    probe.connect(new InetSocketAddress(address, port), 1000);
+                    probe.connect(new InetSocketAddress(address, port), (int) Math.min(1000, remainingMillis()));
                     return;
                 } catch (IOException notReady) {
                     if (System.nanoTime() > deadline) throw new IOException("Pixels port " + port + " not ready; see " + run);
                     Thread.sleep(200);
                 }
             }
+        }
+
+        private long remainingMillis() throws IOException {
+            long remaining = requestDeadline - System.nanoTime();
+            if (remaining <= 0) throw new IOException("Pixels host request deadline exceeded");
+            return Math.max(1, TimeUnit.NANOSECONDS.toMillis(remaining));
         }
 
         private Path write(String name, String text) throws IOException {

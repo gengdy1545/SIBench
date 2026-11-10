@@ -17,6 +17,16 @@ import org.sibench.config.SibenchConfig;
 public class PixelsGenerationTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test public void sinkOverridesCannotFilterOrRewriteSourceEventsOrHideTypos() {
+        var accepted=new java.util.ArrayList<String>();
+        for (String key:java.util.List.of("debezium.skipped.operations","debezium.column.exclude.list", "debezium.unknown",
+                "sink.unknown", "debezium.column.truncate.to.1.chars")) {
+            try { PixelsConfig.sinkProperties(Map.of(key,"x")); accepted.add(key); }
+            catch (IllegalArgumentException expected) { }
+        }
+        assertEquals(java.util.List.of(),accepted);
+    }
+
     @Test public void postgresTypesMapToPixelsTypesOrFail() throws Exception {
         assertEquals("int", PixelsSchema.type("integer"));
         assertEquals("float", PixelsSchema.type("real"));
@@ -46,6 +56,10 @@ public class PixelsGenerationTest {
                 "debezium.offset.storage.file.filename", "bootstrap.servers"})
             assertThrows(owned, IllegalArgumentException.class, () -> PixelsConfig.sinkProperties(Map.of(owned, "x")));
         assertEquals(Map.of("sink.retina.client", "8"), PixelsConfig.sinkProperties(Map.of("sink.retina.client", "8")));
+        assertThrows(IllegalArgumentException.class,
+                () -> PixelsConfig.sinkProperties(Map.of("sink.retina.client", "8\ndebezium.skipped.operations=u")));
+        assertThrows(IllegalArgumentException.class,
+                () -> PixelsConfig.pixelsProperties(Map.of("node.virtual.num", "1\nretina.storage.gc.enabled=true")));
     }
 
     @Test public void publicEngineConfigInlinesItsOverridesForTheRunSnapshot() throws Exception {

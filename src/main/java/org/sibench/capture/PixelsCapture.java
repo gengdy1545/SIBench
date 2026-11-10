@@ -84,12 +84,14 @@ final class PixelsCapture implements AutoCloseable {
                     return;
                 }
                 long table = input.readLong(), index = input.readLong(), timestamp = input.readLong();
-                byte[] key = input.readNBytes(input.readInt());
+                int length = input.readInt();
+                if (length < 0 || length > 32 * 1024 * 1024) throw new IOException("Invalid Pixels tracer key size");
+                byte[] key = new byte[length];
+                input.readFully(key);
                 long rowId = input.readLong(), fileId = input.readLong();
                 int rgId = input.readInt(), offset = input.readInt();
-                long previous = input.readLong();
                 put(kind == BARRIER ? new Ack(rowId)
-                        : new FactEvent(new PixelsTrace.Fact(kind, table, index, timestamp, key, rowId, fileId, rgId, offset, previous)));
+                        : new FactEvent(new PixelsTrace.Fact(kind, table, index, timestamp, key, rowId, fileId, rgId, offset)));
             }
         });
     }

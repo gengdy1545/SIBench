@@ -55,6 +55,8 @@ public record BenchmarkSelection(Path config, String benchmark, Mode mode,Engine
             };
             require(supported, "Unsupported benchmark/mode/engine combination: " + benchmark + "/"
                     + string(item, "mode") + "/" + string(item, "engine"));
+            if (mode == Mode.CDC && profile.containsKey("trace"))
+                require(!bool(object(profile,"trace"),"secondary_indexes"), "Pixels CDC supports primary indexes only");
             result.add(new BenchmarkSelection(path, benchmark, mode, engine));
         }
         return List.copyOf(result);

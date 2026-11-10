@@ -15,8 +15,9 @@ import java.util.concurrent.TimeUnit;
 import org.junit.Test;
 import org.junit.After;
 import org.sibench.adapters.IndexExecutor;
+import org.sibench.adapters.InProcessService;
+import org.sibench.adapters.TraceRequests;
 import org.sibench.adapters.VersionedIndexBackend;
-import org.sibench.adapters.proto.Status;
 import org.sibench.adapters.proto.TraceRecord;
 import org.sibench.adapters.proto.ValueKind;
 import org.sibench.generation.DuckDbDatabase;
@@ -43,12 +44,9 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             assertTrue(row.next());long value=row.getLong(1);assertFalse(row.next());return value;
         }
     }
-    private static String classpath(Path repository,Path build,Path parameters)throws Exception {
+    private static String classpath(Path build,Path parameters) {
         return String.join(java.io.File.pathSeparator,List.of(parameters.toString(),
-                repository.resolve("build/sibench/test-classes").toString(),repository.resolve("build/sibench/classes").toString(),
-                repository.resolve("build/sibench/sibench.jar").toString(),
-                Path.of(org.junit.Assert.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toString(),
-                Path.of(org.hamcrest.SelfDescribing.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toString(),
+                NativeProcess.runtimeClasspath(),
                 build.resolve("target/classes").toString(),build.resolve("lib/*").toString()));
     }
     @Test public void rejectsFailedNativePhaseAndClosesItsTransaction()throws Exception {
@@ -67,7 +65,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             sql(observer,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
                     +"'SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path='"+raw+"')");
             var command=List.of(Path.of(System.getProperty("java.home"),"bin/java").toString(),"-Xmx256m","-cp",
-                    classpath(repository,build,output),getClass().getName(),"failure",repository.toString(),build.toString(),socket.toString());
+                    classpath(build,output),getClass().getName(),"failure",repository.toString(),build.toString(),socket.toString());
             var result=NativeProcess.run("failure",command,Map.of("SIBENCH_BUDGET_STOP",output.resolve("stop").toString()),
                     output,output,Duration.ofSeconds(10));
             assertEquals(Files.readString(result.err())+result.stdout(),0,result.exit());
@@ -85,7 +83,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
         Path output=Files.createDirectory(retained==null?root.resolve("dialect"):Path.of(retained+"-dialect"));
         retainedOutput=output;
         var command=List.of(Path.of(System.getProperty("java.home"),"bin/java").toString(),"-Xmx256m","-cp",
-                classpath(repository,build,output),getClass().getName(),"dialect",repository.toString(),build.toString(),socket.toString());
+                classpath(build,output),getClass().getName(),"dialect",repository.toString(),build.toString(),socket.toString());
         var result=NativeProcess.run("dialect",command,Map.of(),output,output,Duration.ofSeconds(10));
         assertEquals(Files.readString(result.err())+result.stdout(),0,result.exit());
     }
@@ -93,7 +91,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
         Path repository=Path.of("").toRealPath(),build=Path.of(System.getProperty("sibench.hybench.build")).toRealPath();
         Path output=Files.createDirectory(root.resolve("conflict"));
         var command=List.of(Path.of(System.getProperty("java.home"),"bin/java").toString(),"-Xmx256m","-cp",
-                classpath(repository,build,output),getClass().getName(),"conflict",repository.toString(),build.toString(),socket.toString());
+                classpath(build,output),getClass().getName(),"conflict",repository.toString(),build.toString(),socket.toString());
         try(var observer=connect()) {
             Path raw=output.resolve("native.csv");
             sql(observer,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
@@ -114,7 +112,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
                         "checking_number",600,"loanapps_number",600,"loantrans_number",600)));
         Files.writeString(parameters.resolve("parameters.toml"),new com.moandjiezana.toml.TomlWriter().write(Map.of("1x",settings)));
         var base=new ArrayList<>(List.of(Path.of(System.getProperty("java.home"),"bin/java").toString(),"-Xmx256m","-cp",
-                classpath(repository,build,parameters),getClass().getName()));
+                classpath(build,parameters),getClass().getName()));
         String reused=System.getProperty("sibench.hybench.inputs");
         if(reused==null) {
             var generate=new ArrayList<>(base);generate.addAll(List.of("generate",repository.toString(),build.toString(),socket.toString()));
@@ -215,17 +213,38 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             try(writer){DuckDbProjection.write(observer,true,writer);}
             long[] ids={0},searches={0},matched={0};
             try(var backend=VersionedIndexBackend.create(output.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {
+                var answers=new ArrayList<java.util.concurrent.CompletableFuture<List<org.sibench.adapters.proto.Result>>>();
+                try(var client=InProcessService.factory((request,partial)->{
+                    assertFalse("Groups must not reach the service",request.hasGroup());
+                    var items=new ArrayList<org.sibench.adapters.proto.Result>();
+                    var response=index.submit(request,chunk->{items.addAll(chunk.getResultsList());partial.accept(chunk);});
+                    answers.add(response.thenApply(reply->{items.addAll(reply.getResultsList());return List.copyOf(items);}));
+                    return response;
+                },new TraceRequests(ValueKind.ROW_ID)).open(0)) {
                 var consumer=new IndexOperationTrace.Consumer(){
                     @Override public void accept(IndexOperationTrace.Operation operation){fail("Missing stored request");}
                     @Override public void accept(TraceRecord record,List<IndexOperationTrace.Operation> operations)throws java.io.IOException {
                         if(record.hasBegin())return;
                         if(record.hasEnd())return;
                         try {
-                            var request=record.getRequest().toBuilder().setId(++ids[0]).build();
-                            var response=index.submit(request).get(5,TimeUnit.SECONDS);assertEquals(response.getMessage(),Status.OK,response.getStatus());
+                            answers.clear();
+                            var request=record.getRequest();
+                            var completions=new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+                            for(var operation:operations)
+                                completions.add(client.send(++ids[0],operation,request).response().toCompletableFuture());
+                            java.util.concurrent.CompletableFuture.allOf(completions.toArray(java.util.concurrent.CompletableFuture[]::new))
+                                    .get(5,TimeUnit.SECONDS);
                             if(request.hasSearch()||request.hasGroup()) {
                                 var wanted=expected.get(operations.get(0).sourceEvent());assertNotNull(wanted);
-                                var actual=new HashSet<Long>();for(var row:response.getResultsList())assertTrue(actual.add(row.getValue().getRowId()));
+                                HashSet<Long> actual=null;
+                                for(var answer:answers) {
+                                    var member=new HashSet<Long>();
+                                    for(var row:answer.get(5,TimeUnit.SECONDS))assertTrue(member.add(row.getValue().getRowId()));
+                                    if(actual==null)actual=member;
+                                    else if(request.getGroup().getMode()==org.sibench.adapters.proto.SearchGroup.Mode.INTERSECTION)
+                                        actual.retainAll(member);
+                                    else actual.addAll(member);
+                                }
                                 assertEquals(wanted,actual);searches[0]++;matched[0]+=actual.size();
                             }
                         }catch(Exception failure){throw new java.io.IOException(failure);}
@@ -233,6 +252,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
                 };
                 ProtoTrace.read(baseline,baseWriter.sha256(),baseWriter.logicalSha256(),consumer);
                 ProtoTrace.read(trace,writer.sha256(),writer.logicalSha256(),consumer);
+                }
             }
             assertEquals(expected.size(),searches[0]);
             Files.writeString(output.resolve("summary.json"),new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(

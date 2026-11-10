@@ -9,6 +9,7 @@
   <properties>
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <sibench.build.directory>${project.basedir}/build/sibench</sibench.build.directory>
     <grpc.version>1.74.0</grpc.version>
     <protobuf.version>3.25.5</protobuf.version>
     <duckdb.build.directory>${project.basedir}/build/services/duckdb</duckdb.build.directory>
@@ -84,7 +85,7 @@
     </dependency>
   </dependencies>
   <build>
-    <directory>${project.basedir}/build/sibench</directory>
+    <directory>${sibench.build.directory}</directory>
     <finalName>sibench</finalName>
     <extensions>
       <extension>

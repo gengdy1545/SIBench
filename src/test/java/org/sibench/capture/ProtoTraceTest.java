@@ -16,6 +16,38 @@ import java.util.*;
 public class ProtoTraceTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test public void decodingRejectsMissingValuesAndUnknownNestedFieldsBeforeLosingTheirPresence() throws Exception {
+        var unknown=com.google.protobuf.UnknownFieldSet.newBuilder().addField(99,
+                com.google.protobuf.UnknownFieldSet.Field.newBuilder().addVarint(1).build()).build();
+        var key=EntryKey.newBuilder().setTable(1).setPrimaryKey(com.google.protobuf.ByteString.copyFrom(IndexKey.ofInt(1).bytes())).build();
+        var value=Value.newBuilder().setRowId(0).build();
+        var write=Write.newBuilder().setKind(Write.Kind.INSERT).setKey(key).setValue(value).build();
+        var position=TracePosition.newBuilder().setSourceEvent(1).setWorkUnitId(1).build();
+        var valid=TraceRecord.newBuilder().setRequest(Request.newBuilder().setWrite(write)).addPositions(position).build();
+        var cases=new LinkedHashMap<String,TraceRecord>();
+        cases.put("missing value",valid.toBuilder().setRequest(Request.newBuilder().setWrite(write.toBuilder().clearValue())).build());
+        cases.put("unknown write",valid.toBuilder().setRequest(Request.newBuilder().setWrite(write.toBuilder().setUnknownFields(unknown))).build());
+        cases.put("unknown key",valid.toBuilder().setRequest(Request.newBuilder().setWrite(write.toBuilder().setKey(key.toBuilder().setUnknownFields(unknown)))).build());
+        cases.put("unknown value",valid.toBuilder().setRequest(Request.newBuilder().setWrite(write.toBuilder().setValue(value.toBuilder().setUnknownFields(unknown)))).build());
+        cases.put("unknown position",valid.toBuilder().setPositions(0,position.toBuilder().setUnknownFields(unknown)).build());
+        var bound=Bound.newBuilder().setKey(key.getPrimaryKey()).setInclusive(true).build();
+        cases.put("unknown bound",TraceRecord.newBuilder().addPositions(position.toBuilder().setFlags(IndexOperationTrace.LOWER_INCLUSIVE))
+                .setRequest(Request.newBuilder().setSearch(Search.newBuilder().setTable(1).setLower(bound.toBuilder().setUnknownFields(unknown)))).build());
+        var accepted=new ArrayList<String>();
+        for (var entry:cases.entrySet()) {
+            var file=temporary.getRoot().toPath().resolve(entry.getKey()+".pb.zst");
+            unchecked(file,List.of(entry.getValue()));
+            try { ProtoTrace.read(file,null,null,ignored->{}); accepted.add(entry.getKey()); }
+            catch (IOException expected) { }
+        }
+        assertEquals("Malformed nested messages were silently projected",List.of(),accepted);
+        var zero=temporary.getRoot().toPath().resolve("valid-zero.pb.zst");
+        unchecked(zero,List.of(valid));
+        var decoded=new ArrayList<Operation>();
+        ProtoTrace.read(zero,null,null,decoded::add);
+        assertEquals(0,decoded.get(0).rowId());
+    }
+
     @Test public void logicalDigestMatchesHandSpecifiedMessageAndRejectsDifferentValidTrace() throws Exception {
         Path file = temporary.getRoot().toPath().resolve("identity.pb.zst");
         var operation = IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0,

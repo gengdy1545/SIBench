@@ -35,8 +35,30 @@ public class PixelsCaptureTest {
         out.writeLong(1);
         out.writeInt(0);
         out.writeInt(0);
-        out.writeLong(-1);
         out.flush();
+    }
+
+    @Test(timeout = 10000) public void invalidKeyLengthFailsBeforeAllocatingOrWaitingForItsPayload() throws Exception {
+        var source = SourceSchema.of("sysbench", Path.of("benchmark/sysbench"), Map.of("tables", 1L));
+        var loopback = InetAddress.getLoopbackAddress();
+        for (int length : new int[] {-1, 32 * 1024 * 1024 + 1}) {
+            var trace = new PixelsTrace(temporary.newFolder().toPath().resolve("trace"), source, Map.of(), null);
+            var listener = new ServerSocket(0, 1, loopback);
+            try (var capture = new PixelsCapture(trace, listener, "token", new ServerSocket(0, 1, loopback), "sink")) {
+                capture.acceptTracer(Duration.ofSeconds(2));
+                try (var socket = new Socket(loopback, listener.getLocalPort())) {
+                    var out = new DataOutputStream(socket.getOutputStream());
+                    out.writeInt(0x53495854); out.writeUTF("token");
+                    out.writeByte(PixelsTrace.PUT);
+                    out.writeLong(1); out.writeLong(1); out.writeLong(1); out.writeInt(length); out.flush();
+                    IOException failure = assertThrows(IOException.class,
+                            () -> capture.call(() -> {}, true, Duration.ofSeconds(2)));
+                    var causes = new java.io.StringWriter();
+                    failure.printStackTrace(new java.io.PrintWriter(causes));
+                    assertTrue(causes.toString(), causes.toString().contains("Invalid Pixels tracer key size"));
+                }
+            }
+        }
     }
 
     @Test public void barrierAcknowledgementRunsSyncedStepsAndExportsCommittedTransactions() throws Exception {
@@ -90,7 +112,6 @@ public class PixelsCaptureTest {
                         out.writeLong(1);
                         out.writeInt(0);
                         out.writeInt(0);
-                        out.writeLong(-1);
                         out.flush();
                     }
                     reports.write("C 6\nC 5\n".getBytes(StandardCharsets.UTF_8));

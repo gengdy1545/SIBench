@@ -22,7 +22,10 @@ class PixelsBuildTest(unittest.TestCase):
         self.git(self.root, "init", "-q")
         self.pins = {
             "third_party/pixels": {"pixels-common/src/main/resources/pixels.properties":
-                                   "retina.tile.visibility.capacity=256\nretina.enable=false\n"},
+                                   "retina.tile.visibility.capacity=256\nretina.enable=false\n",
+                                   "cpp/pixels-retina/CMakeLists.txt": "fixture\n",
+                                   "scripts/etc/coordinator-jvm.config": "-Xmx1g\n",
+                                   "scripts/etc/retina-jvm.config": "-Xmx1g\n"},
             "third_party/pixels-sink": {"src/main/resources/pixels-sink.properties": "sink.mode=none\n",
                                         "App.java": "original\n"},
             "third_party/postgresql": {"configure": "#!/bin/sh\necho \"$1\" > prefix\n"},
@@ -125,6 +128,27 @@ if [ "$1" = "install" ]; then p=$(sed 's/--prefix=//' prefix); mkdir -p "$p/bin"
         self.assertIn("etcd release checksum mismatch", result.stderr)
         self.assertFalse((self.build / "native-build.json").exists())
         self.assertFalse((self.build / "etcd/etcd").exists())
+
+    def test_native_phase_rejects_changed_source_and_capacity_before_compilation(self):
+        self.assertEqual(0, self.run_build("java").returncode)
+        source = self.build / "source/pixels/cpp/pixels-retina/CMakeLists.txt"
+        original = source.read_text()
+        source.write_text("changed\n")
+        self.assertIn("differs from its pin", self.run_build("native").stderr)
+        self.assertFalse((self.build / "native-retina.log").exists())
+        source.write_text(original)
+        (self.build / "defaults/pixels.properties").write_text("retina.tile.visibility.capacity=512\n")
+        self.assertIn("capacity/defaults differ", self.run_build("native").stderr)
+        self.assertFalse((self.build / "native-retina.log").exists())
+
+    def test_java_receipt_never_claims_inputs_changed_during_compilation(self):
+        tool = self.bin / "mvn"
+        tool.write_text(tool.read_text() + "\nfrom pathlib import Path\nPath(" + repr(str(self.root /
+            "src/main/native/pixels-sink/pixels-sink-0.2.0-SNAPSHOT.patch")) + ").write_text('changed during build')\n")
+        result = self.run_build("java")
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("inputs changed during compilation", result.stderr)
+        self.assertFalse((self.build / "java-build.json").exists())
 
 
 if __name__ == "__main__":

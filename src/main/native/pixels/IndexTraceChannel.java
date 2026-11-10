@@ -63,7 +63,7 @@ final class IndexTraceChannel {
     }
 
     static byte[] fact(int kind, long table, long index, long timestamp, byte[] key, long rowId, long fileId, int rgId,
-            int rgRowOffset, long previousRowId) {
+            int rgRowOffset) {
         var bytes = new ByteArrayOutputStream(64 + key.length);
         var data = new DataOutputStream(bytes);
         try {
@@ -77,7 +77,6 @@ final class IndexTraceChannel {
             data.writeLong(fileId);
             data.writeInt(rgId);
             data.writeInt(rgRowOffset);
-            data.writeLong(previousRowId);
         } catch (IOException impossible) {
             throw new IllegalStateException(impossible);
         }
@@ -86,7 +85,7 @@ final class IndexTraceChannel {
 
     static byte[] unsupported(String method) {
         byte[] name = method.getBytes(StandardCharsets.UTF_8);
-        return fact(UNSUPPORTED, 0, 0, 0, name, -1, 0, 0, 0, -1);
+        return fact(UNSUPPORTED, 0, 0, 0, name, -1, 0, 0, 0);
     }
 
     private void serveBarriers() {
@@ -94,7 +93,7 @@ final class IndexTraceChannel {
             while (true) {
                 long barrier = input.readLong();
                 synchronized (output) {
-                    output.write(fact(BARRIER, 0, 0, 0, new byte[0], barrier, 0, 0, 0, -1));
+                    output.write(fact(BARRIER, 0, 0, 0, new byte[0], barrier, 0, 0, 0));
                     output.flush();
                 }
             }

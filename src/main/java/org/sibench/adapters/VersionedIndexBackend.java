@@ -180,10 +180,13 @@ public final class VersionedIndexBackend implements IndexBackend {
 
     @Override
     public void search(Search search, ResultSink sink) throws IOException {
-        if (!search.getUnknownFields().asMap().isEmpty())
+        if (!search.getUnknownFields().asMap().isEmpty() || !search.getLower().getUnknownFields().asMap().isEmpty()
+                || !search.getUpper().getUnknownFields().asMap().isEmpty())
             throw new IllegalArgumentException("Unsupported search fields");
         if (search.getTable() < 1 || search.getIndex() < 0 || search.getReadVersion() < 0 || search.getLimit() < 0)
             throw new IllegalArgumentException("Invalid search table, index, version or limit");
+        if (search.hasLower()) IndexExecution.component(search.getLower().getKey());
+        if (search.hasUpper()) IndexExecution.component(search.getUpper().getKey());
         long found = 0;
         byte[] prefix = entry(search.getTable(), search.getIndex(), ByteString.EMPTY, ByteString.EMPTY);
         if (!search.getPinnedPrimaryKey().isEmpty()) {

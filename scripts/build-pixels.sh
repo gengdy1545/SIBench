@@ -32,6 +32,10 @@ pixels_patch="$root/src/main/native/pixels/pixels-0.2.0-SNAPSHOT.patch"
 
 if [[ "$phase" == java ]]; then
   [[ ! -e "$build" ]] || { echo "build already exists: $build; use a fresh build directory" >&2; exit 1; }
+  script_sha=$(sha "$0")
+  pixels_patch_sha=$(sha "$pixels_patch")
+  sink_patch_sha=$(sha "$patch_file")
+  tracer_sha=$(tree_sha "$root/src/main/native/pixels")
   mkdir -p "$build/source/pixels" "$build/source/pixels-sink" "$build/jars" "$build/defaults" "$build/home/etc" "$build/tracer"
   git -C "$root/third_party/pixels" archive "$pixels" | tar -x -C "$build/source/pixels"
   git -C "$root/third_party/pixels-sink" archive "$sink" | tar -x -C "$build/source/pixels-sink"
@@ -54,10 +58,13 @@ if [[ "$phase" == java ]]; then
   echo org.sibench.pixels.TracingIndexProvider \
     > "$build/tracer/classes/META-INF/services/io.pixelsdb.pixels.common.index.SinglePointIndexProvider"
   (cd "$build/tracer/classes" && jar cf "$build/jars/sibench-pixels.jar" .)
+  [[ $(sha "$0") == "$script_sha" && $(sha "$pixels_patch") == "$pixels_patch_sha" &&
+     $(sha "$patch_file") == "$sink_patch_sha" && $(tree_sha "$root/src/main/native/pixels") == "$tracer_sha" ]] || {
+    echo "Pixels Java build inputs changed during compilation" >&2; exit 1; }
   python3 - "$build/java-build.json" <<PY
 import json, sys
-json.dump({"pixels_commit": "$pixels", "pixels_patch_sha256": "$(sha "$pixels_patch")", "pixels_sink_commit": "$sink", "pixels_sink_patch_sha256": "$(sha "$patch_file")",
-           "tracer_sources_sha256": "$(tree_sha "$root/src/main/native/pixels")", "java": "$(java -version 2>&1 | head -1 | tr -d '"')",
+json.dump({"pixels_commit": "$pixels", "pixels_patch_sha256": "$pixels_patch_sha", "pixels_sink_commit": "$sink", "pixels_sink_patch_sha256": "$sink_patch_sha",
+           "build_script_sha256": "$script_sha", "tracer_sources_sha256": "$tracer_sha", "java": "$(java -version 2>&1 | head -1 | tr -d '"')",
            "jars": {name: sha for name, sha in [$(for jar in "$build"/jars/*.jar; do printf '("%s", "%s"),' "$(basename "$jar")" "$(sha "$jar")"; done)]}},
           open(sys.argv[1], "x"), indent=2)
 PY
@@ -74,6 +81,28 @@ identity = json.load(open(sys.argv[1]))
 if (identity["pixels_commit"], identity["pixels_sink_commit"]) != (sys.argv[2], sys.argv[3]):
     raise SystemExit("Java build was made from different Pixels sources")
 PY
+python3 - "$root/third_party/pixels" "$pixels" "$build" <<'PY'
+import hashlib, pathlib, subprocess, sys
+source, pin, build = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
+paths = ["cpp/pixels-retina", "scripts/etc/coordinator-jvm.config", "scripts/etc/retina-jvm.config",
+         "pixels-common/src/main/resources/pixels.properties"]
+entries = subprocess.check_output(["git", "-C", source, "ls-tree", "-rz", pin, "--", *paths]).split(b"\0")
+for entry in filter(None, entries):
+    metadata, name = entry.split(b"\t", 1)
+    name = name.decode()
+    expected = metadata.split()[2].decode()
+    data = (build / "source/pixels" / name).read_bytes()
+    if hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest() != expected:
+        raise SystemExit("Pixels native input differs from its pin: " + name)
+original = (build / "source/pixels/pixels-common/src/main/resources/pixels.properties").read_bytes()
+for name in ["defaults/pixels.properties", "home/etc/pixels.properties"]:
+    if (build / name).read_bytes() != original:
+        raise SystemExit("Pixels capacity/defaults differ from their pin: " + name)
+PY
+runtime_configs=(defaults/pixels.properties home/etc/pixels.properties source/pixels/scripts/etc/coordinator-jvm.config source/pixels/scripts/etc/retina-jvm.config)
+runtime_sha() { (cd "$build" && sha256sum "${runtime_configs[@]}") | sha256sum | cut -c1-64; }
+native_sources_sha=$(tree_sha "$build/source/pixels/cpp/pixels-retina")
+runtime_inputs_sha=$(runtime_sha)
 capacity=$(sed -n 's/^retina.tile.visibility.capacity=//p' "$build/defaults/pixels.properties")
 PIXELS_HOME="$build/home" cmake -B "$build/native/retina" -S "$build/source/pixels/cpp/pixels-retina" "-DRETINA_CAPACITY=$capacity" > "$build/native-retina.log" 2>&1
 PIXELS_HOME="$build/home" make -C "$build/native/retina" -j "$jobs" install >> "$build/native-retina.log" 2>&1
@@ -91,13 +120,23 @@ curl -sSLf --retry 5 -o "$archive" "https://github.com/etcd-io/etcd/releases/dow
 [[ $(sha "$archive") == "$etcd_sha256" ]] || { echo "etcd release checksum mismatch" >&2; exit 1; }
 mkdir -p "$build/etcd" && tar -xzf "$archive" -C "$build/etcd" --strip-components=1 && rm "$archive"
 
-python3 - "$build/native-build.json" <<PY
+[[ $(tree_sha "$build/source/pixels/cpp/pixels-retina") == "$native_sources_sha" && $(runtime_sha) == "$runtime_inputs_sha" ]] || {
+  echo "Pixels native inputs changed during compilation" >&2; exit 1; }
+python3 - "$build/native-build.json" "$build" "${runtime_configs[@]}" <<PY
 import json, sys
+import hashlib, pathlib
+root = pathlib.Path(sys.argv[2])
+configs = sys.argv[3:]
 json.dump({"pixels_commit": "$pixels", "postgresql_commit": "$postgres", "retina_capacity": int("$capacity"),
+           "native_sources_sha256": "$native_sources_sha",
+           "runtime_configs": {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in configs},
            "compiler": "$("$compiler" --version | head -1)", "cmake": "$(cmake --version | head -1)",
            "etcd_version": "$etcd_version", "etcd_sha256": "$etcd_sha256",
            "files": {name: sha for name, sha in [("libpixels-retina.so", "$(sha "$build/home/lib/libpixels-retina.so")"),
-                     ("postgres", "$(sha "$build/postgres/runtime/bin/postgres")"), ("etcd", "$(sha "$build/etcd/etcd")")]}},
+                     ("libjemalloc.so", "$(sha "$build/home/lib/libjemalloc.so")"),
+                     ("postgres", "$(sha "$build/postgres/runtime/bin/postgres")"),
+                     ("pg_ctl", "$(sha "$build/postgres/runtime/bin/pg_ctl")"), ("initdb", "$(sha "$build/postgres/runtime/bin/initdb")"),
+                     ("etcd", "$(sha "$build/etcd/etcd")")]}},
           open(sys.argv[1], "x"), indent=2)
 PY
 printf '\nPixels native build: %s\n' "$build"

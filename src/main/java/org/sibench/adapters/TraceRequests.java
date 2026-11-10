@@ -43,7 +43,7 @@ public final class TraceRequests {
     public Request request(long id, Operation operation) throws IOException {
         var request = Request.newBuilder().setId(id);
         if (operation.kind() == IndexOperationTrace.SEARCH) {
-            if (operation.grouped()) throw new IOException("Group members are sent as one group");
+            if (operation.grouped()) throw new IOException("Grouped searches require complete member metadata");
             return request.setSearch(search(operation)).build();
         }
         return request.setWrite(write(operation)).build();

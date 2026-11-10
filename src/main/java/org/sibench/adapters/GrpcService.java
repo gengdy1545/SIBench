@@ -39,7 +39,7 @@ public final class GrpcService implements AutoCloseable {
     @Override public void close() { clients.forEach(Client::close); clients.clear(); }
 
     private final class Client extends ServiceClient {
-        final ManagedChannel channel=ManagedChannelBuilder.forTarget(endpoint).usePlaintext()
+        final ManagedChannel channel=ManagedChannelBuilder.forTarget(endpoint).usePlaintext().disableRetry()
                 .maxInboundMessageSize(IndexExecution.MAX_MESSAGE_BYTES).build();
         final ConcurrentHashMap<CompletableFuture<Response>,ClientCall<?,?>> pending=new ConcurrentHashMap<>();
         private CompletableFuture<Void> lastSend=CompletableFuture.completedFuture(null);
@@ -92,6 +92,7 @@ public final class GrpcService implements AutoCloseable {
                 @Override public void start(Listener<S> listener,Metadata headers) {
                     headers.put(INDEX_BINDING,binding); headers.put(VALUE_KIND,requests.valueKind().name());
                     super.start(new ForwardingClientCallListener.SimpleForwardingClientCallListener<S>(listener) {
+                        private boolean described;
                         @Override public void onHeaders(Metadata headers) {
                             try {
                                 byte[] value=headers.get(DESCRIPTION);
@@ -103,8 +104,13 @@ public final class GrpcService implements AutoCloseable {
                                     if (description!=null && !description.equals(actual)) throw new IOException("Index service description changed during replay");
                                     description=actual;
                                 }
+                                described=true;
                                 super.onHeaders(headers);
                             } catch (IOException | RuntimeException error) { fail(error); }
+                        }
+                        @Override public void onClose(io.grpc.Status status, Metadata trailers) {
+                            if (status.isOk() && !described) fail(new IOException("Missing index service deployment description"));
+                            super.onClose(status,trailers);
                         }
                     },headers);
                 }

@@ -349,11 +349,17 @@ public final class ProtoTrace {
         long transaction, version, operations, writes, buffered;
 
         void accept(TraceRecord record, IndexOperationTrace.Consumer consumer) throws IOException {
-            if (!record.getUnknownFields().asMap().isEmpty() || record.getPositionsCount() == 0)
+            known(record);
+            if (record.getPositionsCount() == 0)
                 throw new IOException("Unsupported or missing proto Trace metadata");
+            for (var position : record.getPositionsList()) known(position);
             var first = record.getPositions(0);
+            if ((record.hasBegin() || record.hasEnd()) && (first.getWorkUnitId() != 0 || first.getMutationOrdinal() != 0
+                    || first.getFlags() != 0 || first.getExpansionPosition() != 0 || first.getExpansionSize() != 0
+                    || first.getDeletedRowId() != 0)) throw new IOException("Invalid proto control position");
             if (record.hasBegin()) {
                 var begin = record.getBegin();
+                known(begin);
                 if (transaction != 0 || begin.getTransactionId() <= 0 || begin.getVersion() <= 0
                         || record.getPositionsCount() != 1) throw new IOException("Invalid proto transaction begin");
                 transaction = begin.getTransactionId();
@@ -365,6 +371,7 @@ public final class ProtoTrace {
             }
             if (record.hasEnd()) {
                 var end = record.getEnd();
+                known(end);
                 if (transaction == 0 || end.getTransactionId() != transaction || end.getVersion() != version
                         || end.getOperations() != operations || end.getWrites() != writes
                         || end.getAborted() && writes != 0
@@ -377,8 +384,9 @@ public final class ProtoTrace {
             }
             if (!record.hasRequest()) throw new IOException("Missing proto service request");
             var request = record.getRequest();
+            known(request);
             if (request.getId() != 0) throw new IOException("Proto request IDs are assigned at replay");
-            if (!request.getUnknownFields().asMap().isEmpty()) throw new IOException("Unsupported proto service fields");
+            if (request.hasGroup()) known(request.getGroup());
             int members = request.hasGroup() ? request.getGroup().getMembersCount() : 1;
             if (transaction != 0) {
                 if (request.hasWrite()) writes++;
@@ -412,6 +420,11 @@ public final class ProtoTrace {
     }
 
     private static Operation write(Write write, long transaction, TracePosition p) throws IOException {
+        known(write);
+        known(write.getKey());
+        known(write.getValue());
+        if (!write.hasKey() || (write.getKind() == Write.Kind.LOGICAL_DELETE ? write.hasValue() : !write.hasValue()))
+            throw new IOException("Missing write key/value or value on a deletion");
         int kind = switch (write.getKind()) {
             case INSERT -> IndexOperationTrace.INSERT;
             case UPSERT -> IndexOperationTrace.UPSERT;
@@ -429,13 +442,15 @@ public final class ProtoTrace {
     }
 
     private static Operation search(Search search, long transaction, TracePosition p) throws IOException {
+        known(search);
+        known(search.getLower());
+        known(search.getUpper());
         int bounds = (search.hasLower() && search.getLower().getInclusive() ? IndexOperationTrace.LOWER_INCLUSIVE : 0)
                 | (search.hasUpper() && search.getUpper().getInclusive() ? IndexOperationTrace.UPPER_INCLUSIVE : 0)
                 | (search.getDescending() ? IndexOperationTrace.DESCENDING : 0);
         if ((p.getFlags() & (IndexOperationTrace.LOWER_INCLUSIVE | IndexOperationTrace.UPPER_INCLUSIVE
                 | IndexOperationTrace.DESCENDING)) != bounds
-                || (p.getFlags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0
-                || !search.getUnknownFields().asMap().isEmpty())
+                || (p.getFlags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0)
             throw new IOException("Proto search metadata mismatch");
         return new Operation(p.getSourceEvent(), IndexOperationTrace.SEARCH, search.getTable(), search.getIndex(),
                 p.getFlags(), search.getPinnedPrimaryKey().isEmpty() ? null : key(search.getPinnedPrimaryKey()), null,
@@ -447,5 +462,9 @@ public final class ProtoTrace {
 
     private static IndexKey key(ByteString bytes) throws IOException {
         return IndexKey.decode(bytes.toByteArray());
+    }
+
+    private static void known(com.google.protobuf.Message message) throws IOException {
+        if (!message.getUnknownFields().asMap().isEmpty()) throw new IOException("Unsupported proto fields: " + message.getDescriptorForType().getName());
     }
 }
