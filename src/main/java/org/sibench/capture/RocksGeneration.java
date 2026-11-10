@@ -18,12 +18,12 @@ final class RocksGeneration {
         var build = plan.engines().get(org.sibench.config.Engine.ROCKSDB);
         Path library = build.directory().resolve("libsibench_rocksdb.so");
         RocksDbTimestamps.load(library);
-        var config = object(plan.runtime(), "rocksdb");
+        var config = build.settings();
         var settings = new RocksDbRows.Settings(positive(config, "cache_bytes"), positive(config, "write_buffer_bytes"),
                 Math.toIntExact(positive(config, "background_jobs")));
         var n = input.nativeConfig(); int fields = Math.toIntExact(positive(n, "fieldcount"));
         Path out = input.output(); Files.createDirectories(out.getParent()); Files.createDirectory(out);
-        json(out.resolve("effective-config.json"), Map.of("runtime", plan.runtime(), "benchmark", input.document(), "engine", "rocksdb", "mode", "api"));
+        json(out.resolve("effective-config.json"), Generation.effectiveConfig(plan, input));
         json(out.resolve("engine-build.json"), build.identity()); json(out.resolve("client-build.json"), input.buildIdentity());
         var stages = new LinkedHashMap<String, Object>();
         var budget = new RequestBudget(Generation.requestTarget(input.document()),input.timeout());
@@ -63,13 +63,13 @@ final class RocksGeneration {
                 } finally { RocksYcsb.install(null); }
                 closeStarted = System.nanoTime();
             }
-            trace.close(); Generation.deleteTree(out.resolve("database"));
+            trace.close();
             timings.put("native_close_seconds", seconds(closeStarted));
-            long publication = System.nanoTime();
-            var manifest = trace.publish(Map.of("engine", build.identity(), "settings", config,
+            var evidence = Map.<String, Object>of("engine", build.identity(), "settings", config,
                     "client", input.buildIdentity(), "stages", stages, "request_budget", budget.finish(), "baseline_rows", input.baselineRows(),
-                    "effective_config_sha256", Digests.sha256(out.resolve("effective-config.json"))));
-            timings.put("publication_seconds", seconds(publication)); timings.put("total_seconds", seconds(start));
+                    "effective_config_sha256", Digests.sha256(out.resolve("effective-config.json")));
+            var manifest = Generation.publishThenDiscard(() -> trace.publish(evidence), out.resolve("database"), timings);
+            timings.put("total_seconds", seconds(start));
             json(out.resolve("result.json"), Map.of("status", "complete", "trace", out.resolve("trace").toString(), "timings", timings));
             return manifest;
         } catch (Exception | Error failure) {

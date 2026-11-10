@@ -24,7 +24,7 @@ public class PostgresAccessesCheck {
     @Test public void projectsIndexVisibleRowsBeforeFilterAggregationAndAbort()throws Exception {
         String runtime=System.getProperty("sibench.postgres.runtime");assertNotNull("Set sibench.postgres.runtime",runtime);
         Path root=temporary.getRoot().toPath().resolve("source");
-        try(var cluster=PostgresDatabase.create(Path.of(runtime),root)) {
+        try(var cluster=PostgresDatabase.create(Path.of(runtime),root,org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=cluster.connect("setup")) {
                 sql(setup,"CREATE TABLE sbtest1(id INTEGER PRIMARY KEY,k INTEGER,c CHAR(120),pad CHAR(60))");
                 sql(setup,"INSERT INTO sbtest1 SELECT i,i/4,'value','pad' FROM generate_series(1,20) i");
@@ -59,7 +59,7 @@ public class PostgresAccessesCheck {
     @Test public void statementSnapshotsAdvanceInReadCommittedAndRemainFixedInRepeatableRead()throws Exception {
         String runtime=System.getProperty("sibench.postgres.runtime");assertNotNull("Set sibench.postgres.runtime",runtime);
         Path root=temporary.getRoot().toPath().resolve("snapshots");
-        try(var cluster=PostgresDatabase.create(Path.of(runtime),root);
+        try(var cluster=PostgresDatabase.create(Path.of(runtime),root,org.sibench.generation.PostgresTestSettings.SETTINGS);
                 var writer=cluster.connect("setup");var rc=cluster.connect("sibench:rc");var rr=cluster.connect("sibench:rr")) {
             sql(writer,"CREATE TABLE sbtest1(id INTEGER PRIMARY KEY,k INTEGER)");sql(writer,"INSERT INTO sbtest1 VALUES(1,10)");
             sql(rc,"SET enable_seqscan=off");sql(rr,"SET enable_seqscan=off");
@@ -100,7 +100,7 @@ public class PostgresAccessesCheck {
         String query="SELECT cu.custid,sum(tr.amount) FROM company co,transfer tr,customer cu WHERE cu.custid=tr.targetid"
                 +" AND cu.companyid=co.companyid AND tr.sourceid=co.companyid AND co.companyid=$1 AND tr.type='salary'"
                 +" GROUP BY cu.custid";
-        try(var cluster=PostgresDatabase.create(Path.of(runtime),root)) {
+        try(var cluster=PostgresDatabase.create(Path.of(runtime),root,org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=cluster.connect("setup")) {
                 sql(setup,"CREATE TABLE company(companyid INT PRIMARY KEY)");sql(setup,"INSERT INTO company VALUES(301),(302)");
                 sql(setup,"CREATE TABLE customer(custid INT PRIMARY KEY,companyid INT)");
@@ -148,7 +148,7 @@ public class PostgresAccessesCheck {
         String query="SELECT co.name,t.amount FROM company co,transfer t WHERE t.sourceid=$1 AND t.type='invest'"
                 +" AND t.targetid=co.companyid";
         var settings=List.of("plan_cache_mode=force_generic_plan","enable_hashjoin=off","enable_mergejoin=off");
-        try(var cluster=PostgresDatabase.create(Path.of(runtime),root)) {
+        try(var cluster=PostgresDatabase.create(Path.of(runtime),root,org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=cluster.connect("setup")) {
                 sql(setup,"CREATE TABLE company(companyid INT PRIMARY KEY,name VARCHAR(20))");
                 sql(setup,"INSERT INTO company VALUES(301,'a'),(302,'b')");
@@ -197,7 +197,7 @@ public class PostgresAccessesCheck {
         // scan: the new rows' index entries point past the heap's size at scan start.
         String query="WITH ins AS (INSERT INTO transfer SELECT i,1,5,i,'invest' FROM generate_series(100001,104000) i RETURNING 1)"
                 +" SELECT count(*) FROM transfer WHERE sourceid=1 AND (SELECT count(*) FROM ins)>0";
-        try(var cluster=PostgresDatabase.create(Path.of(runtime),root)) {
+        try(var cluster=PostgresDatabase.create(Path.of(runtime),root,org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=cluster.connect("setup")) {
                 sql(setup,"CREATE TABLE transfer(id INT PRIMARY KEY,sourceid INT,targetid INT,amount REAL,type CHAR(10))");
                 sql(setup,"INSERT INTO transfer SELECT i,CASE WHEN i<=1200 THEN 1 ELSE 2+i%300 END,1+(i*7)%300,i,'invest'"

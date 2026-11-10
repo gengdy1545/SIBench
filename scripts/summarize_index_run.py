@@ -94,8 +94,7 @@ def summarize(report, logs, after_flush_millis=None):
                 "timed_out_operations")):
             raise ValueError("Service dispatch contains failed or timed-out requests")
         phases[name] = {key: phase[key] for key in (
-            "operations", "execute_requests", "seconds", "operations_per_second", "request_bytes", "result_bytes",
-            "flush_seconds")}
+            "operations", "rpc_requests", "rpc_by_kind", "seconds", "operations_per_second", "request_bytes", "result_bytes")}
         phases[name].update({key: dispatch[key] for key in (
             "source_operations", "filtered_secondary_operations", "transaction_control_records",
             "target_calls", "basic_operations", "completed_operations",

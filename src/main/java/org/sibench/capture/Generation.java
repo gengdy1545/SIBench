@@ -35,7 +35,7 @@ public final class Generation {
         Map<String,Object> nativeConfig(){return object(document,"native");}
         Duration timeout(){return Duration.ofMinutes(positive(nativeConfig(),"timeout_minutes"));}
     }
-    record NativeBuild(Path directory,Map<String,Object> identity) {}
+    record NativeBuild(Path directory,Map<String,Object> identity,Map<String,Object> settings) {}
     record Plan(Path root,Map<String,Object> runtime,Map<Engine,NativeBuild> engines,List<Input> inputs) {}
 
     /** Validate every selected input before creating any run output or launching a database. */
@@ -44,20 +44,18 @@ public final class Generation {
         var selections=BenchmarkSelection.read(root,runtime);
         var engines=new java.util.EnumMap<Engine,NativeBuild>(Engine.class);
         for(var selection:selections)if(!engines.containsKey(selection.engine())) {
-            if(selection.engine()==Engine.DUCKDB) {
-                var engine=object(runtime,"duckdb");keys(engine,Set.of("build_directory","memory_limit","threads"));
-                require(string(engine,"memory_limit").matches("[1-9][0-9]*(KiB|MiB|GiB)"),"Invalid DuckDB memory_limit");
-                require(positive(engine,"threads")<=256,"DuckDB threads exceeds 256");
-                Path build=NativeBuildCheck.engineDirectory(root,runtime).toRealPath();
-                require(Files.isExecutable(build.resolve("duckdb_host"))&&Files.isRegularFile(build.resolve("src/libduckdb.so")),"Missing DuckDB host/library build");
-                engines.put(Engine.DUCKDB,new NativeBuild(build,NativeBuildCheck.verifyEngine(root,build)));
-            }else if(selection.engine()==Engine.POSTGRES) {
-                Path build=NativeBuildCheck.engineDirectory(root,runtime,"postgres").toRealPath();
-                engines.put(Engine.POSTGRES,new NativeBuild(build,NativeBuildCheck.verifyPostgres(root,build)));
-            }else {
-                Path build=NativeBuildCheck.engineDirectory(root,runtime,"rocksdb").toRealPath();
-                engines.put(Engine.ROCKSDB,new NativeBuild(build,NativeBuildCheck.verifyRocks(root,build)));
-            }
+            Engine engine=selection.engine();var settings=SibenchConfig.engine(root,runtime,engine);
+            Path build=NativeBuildCheck.engineDirectory(root,settings,engine.configName()).toRealPath();
+            var identity=switch(engine) {
+                case DUCKDB -> {
+                    require(Files.isExecutable(build.resolve("duckdb_host"))&&Files.isRegularFile(build.resolve("src/libduckdb.so")),"Missing DuckDB host/library build");
+                    yield NativeBuildCheck.verifyEngine(root,build);
+                }
+                case POSTGRES -> NativeBuildCheck.verifyPostgres(root,build);
+                case ROCKSDB -> NativeBuildCheck.verifyRocks(root,build);
+                case PIXELS -> PixelsBuild.verify(root,build);
+            };
+            engines.put(engine,new NativeBuild(build,identity,settings));
         }
         var inputs=new ArrayList<Input>();
         for(var selection:selections) {
@@ -168,19 +166,20 @@ public final class Generation {
             case POSTGRES -> PostgresGeneration.generate(plan,input);
             case ROCKSDB -> RocksGeneration.generate(plan,input);
             case DUCKDB -> generate(plan,input);
+            case PIXELS -> PixelsGeneration.generate(plan,input);
         });
         return List.copyOf(reports);
     }
 
     private static Map<String,Object> generate(Plan plan,Input input)throws Exception {
         long started=System.nanoTime();var timings=new LinkedHashMap<String,Double>();
-        var nativeBuild=plan.engines().get(Engine.DUCKDB);var settings=object(plan.runtime(),"duckdb");
+        var nativeBuild=plan.engines().get(Engine.DUCKDB);var settings=nativeBuild.settings();
         String memory=string(settings,"memory_limit");int threads=Math.toIntExact(positive(settings,"threads"));
         Path out=input.output();Files.createDirectories(out.getParent());Files.createDirectory(out);
         Path scratch=Files.createTempDirectory("sibench-duckdb-");Path socket=scratch.resolve("host.sock");
         Process host=null;DuckDbTrace.Draft draft;Throwable primaryFailure=null;
         try {
-            json(out.resolve("effective-config.json"),Map.of("runtime",plan.runtime(),"benchmark",input.document(),"mode",input.selection().mode(),"engine",input.selection().engine()));
+            json(out.resolve("effective-config.json"),effectiveConfig(plan,input));
             var engine=new LinkedHashMap<String,Object>(nativeBuild.identity());
             engine.put("memory_limit",memory);engine.put("threads",threads);
             json(out.resolve("engine-build.json"),engine);json(out.resolve("client-build.json"),input.buildIdentity());
@@ -269,10 +268,10 @@ public final class Generation {
                 }
             }
             long closeStart=System.nanoTime();
-            stop(host);host=null;deleteTree(out.resolve("data"));
-            timings.put("native_close_seconds",seconds(closeStart));long publicationStart=System.nanoTime();
-            var manifest=draft.publish();
-            timings.put("publication_seconds",seconds(publicationStart));timings.put("total_seconds",seconds(started));
+            stop(host);host=null;
+            timings.put("native_close_seconds",seconds(closeStart));
+            var manifest=publishThenDiscard(draft::publish,out.resolve("data"),timings);
+            timings.put("total_seconds",seconds(started));
             json(out.resolve("result.json"),Map.of("status","complete","trace",out.resolve("trace").toString(),"timings",timings));
             return manifest;
         }catch(Exception|Error failure) {
@@ -287,7 +286,22 @@ public final class Generation {
         }
     }
 
+    /** The run's effective runtime, engine and benchmark settings, recorded before the engine starts. */
+    static Map<String,Object> effectiveConfig(Plan plan,Input input) {
+        return Map.of("runtime",plan.runtime(),"engine_settings",plan.engines().get(input.selection().engine()).settings(),
+                "benchmark",input.document(),"mode",input.selection().mode(),"engine",input.selection().engine());
+    }
+
     private static double seconds(long start){return (System.nanoTime()-start)/1e9;}
+    /** Publishes a closed run, then discards its database; a failed publication keeps the database for diagnosis. */
+    static <T> T publishThenDiscard(java.util.concurrent.Callable<T> publish,Path database,Map<String,Double> timings)throws Exception {
+        long start=System.nanoTime();T manifest=publish.call();
+        timings.put("publication_seconds",seconds(start));start=System.nanoTime();
+        try{deleteTree(database);}
+        catch(IOException failure){throw new IOException("Trace published; closed database remains at "+database,failure);}
+        timings.put("database_cleanup_seconds",seconds(start));
+        return manifest;
+    }
     /** Removes a disposable working tree, such as a closed engine's data directory. */
     static void deleteTree(Path root)throws IOException {
         try(var paths=Files.walk(root)){for(Path path:paths.sorted(java.util.Comparator.reverseOrder()).toList())Files.delete(path);}
@@ -328,8 +342,9 @@ public final class Generation {
             Files.createDirectory(parameters);Files.writeString(parameterFile,parameterText,StandardOpenOption.CREATE_NEW);
         }else require(Files.readString(parameterFile).equals(parameterText),"HyBench effective parameters changed after load");
         properties.setProperty("url",url);properties.setProperty("url_ap",url);
-        properties.setProperty("tpclient",Long.toString(positive(n,"clients")));properties.setProperty("apclient",Long.toString(positive(n,"ap_clients")));
-        properties.setProperty("xtpclient",Long.toString(positive(n,"xp_transaction_clients")));properties.setProperty("xapclient",Long.toString(positive(n,"xp_query_clients")));
+        boolean cdc=input.selection().mode()==Mode.CDC;
+        properties.setProperty("tpclient",Long.toString(positive(n,"clients")));properties.setProperty("apclient",cdc?"0":Long.toString(positive(n,"ap_clients")));
+        properties.setProperty("xtpclient",Long.toString(positive(n,"xp_transaction_clients")));properties.setProperty("xapclient",cdc?"0":Long.toString(positive(n,"xp_query_clients")));
         for(String phase:List.of("ap","tp","xp"))properties.setProperty(phase+"RunMins",Long.toString(n.containsKey("phase_duration_minutes")&&object(n,"phase_duration_minutes").containsKey(phase)?positive(object(n,"phase_duration_minutes"),phase):positive(n,"duration_minutes")));
         if(selectedPhase!=null)properties.setProperty("sibench.phase",selectedPhase);
         Path receipts=engine==Engine.DUCKDB?Files.createDirectory(stage.resolve("clients")):null;

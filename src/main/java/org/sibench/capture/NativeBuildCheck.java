@@ -232,14 +232,10 @@ public final class NativeBuildCheck {
         return verify(new Build(root, benchmark, source, directory, commit));
     }
 
-    static Path engineDirectory(Path root, java.util.Map<String, Object> runtime) throws IOException {
-        return engineDirectory(root,runtime,"duckdb");
-    }
-
-    static Path engineDirectory(Path root, java.util.Map<String, Object> runtime,String engine) throws IOException {
+    /** The build directory an engine configuration selects; it must stay under build/services. */
+    static Path engineDirectory(Path root, java.util.Map<String, Object> settings,String engine) throws IOException {
         root = root.toRealPath();
-        Path directory = root.resolve(org.sibench.config.ConfigValues.string(
-                org.sibench.config.ConfigValues.object(runtime, engine), "build_directory")).normalize();
+        Path directory = root.resolve(org.sibench.config.ConfigValues.string(settings, "build_directory")).normalize();
         Path parent = root.resolve("build/services");
         if (!directory.startsWith(parent) || directory.equals(parent))
             throw new IOException(engine+" builds must be under build/services");
@@ -373,7 +369,8 @@ public final class NativeBuildCheck {
         Path root = Path.of(args[1]).toRealPath();
         if(args[0].startsWith("postgres-")) {
             var runtime=org.sibench.config.SibenchConfig.read(root.resolve(args[2]));
-            postgresBuild(args[0],root,engineDirectory(root,runtime,"postgres"));return;
+            var settings=org.sibench.config.SibenchConfig.engine(root,runtime,org.sibench.config.Engine.POSTGRES);
+            postgresBuild(args[0],root,engineDirectory(root,settings,"postgres"));return;
         }
         Build build = build(root, Path.of(args[2]));
         switch (args[0]) {

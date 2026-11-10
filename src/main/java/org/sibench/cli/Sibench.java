@@ -24,11 +24,14 @@ public final class Sibench {
     private static void printServiceHelp(PrintStream out) {
         out.println("       java -jar build/sibench/sibench.jar generate [--root PATH] CONFIG");
         out.println(
+                "       java -jar build/sibench/sibench.jar pixels-host ADDRESS:PORT BUILD WORK_ROOT TOKEN_FILE"
+                        + "   (Pixels side of CDC generation for a remote pixels_host)");
+        out.println(
                 "       java -jar build/sibench/sibench.jar plan-operations PROFILE CALIBRATION_TRACE"
                         + " REPLAY_CONFIG   (native parameters for the replay configuration's operation budget)");
         out.println(
                 "       java -jar build/sibench/sibench.jar index-server SERVICE_CONFIG"
-                        + "   (serves a new or reopened RocksDB / rocksdb-cloud index over the SIBench index protocol)");
+                        + "   (serves a new or reopened RocksDB / rocksdb-cloud / SlateDB index)");
         out.println(
                 "       java -jar build/sibench/sibench.jar replay-service REPLAY_CONFIG"
                         + " TRACE_DIRECTORY REPORT"
@@ -58,6 +61,7 @@ public final class Sibench {
             if (!List.of(
                             "inspect-scale",
                             "generate",
+                            "pixels-host",
                             "check-replay",
                             "index-server",
                             "replay-service",
@@ -94,6 +98,13 @@ public final class Sibench {
                         org.sibench.capture.Generation.run(root,Path.of(profiles.get(0)))));
                 return 0;
             }
+            if (args[0].equals("pixels-host")) {
+                if (profiles.size() != 4)
+                    throw new IllegalArgumentException("pixels-host requires ADDRESS:PORT BUILD WORK_ROOT TOKEN_FILE");
+                org.sibench.capture.PixelsHost.serve(profiles.get(0), Path.of(profiles.get(1)).toAbsolutePath(),
+                        Path.of(profiles.get(2)).toAbsolutePath(), Path.of(profiles.get(3)));
+                return 0;
+            }
             root = root.toRealPath();
             if (args[0].equals("plan-operations")) {
                 if (profiles.size() != 3)
@@ -118,16 +129,25 @@ public final class Sibench {
                     throw failure;
                 }
                 Throwable failed = null;
+                var closing = new java.util.concurrent.atomic.AtomicBoolean();
+                var shutdown = new Thread(() -> {
+                    if (!closing.compareAndSet(false, true)) return;
+                    try { server.close(); backend.close(); }
+                    catch (Exception error) { err.println("Index service shutdown failed: " + error); }
+                }, "sibench-index-shutdown");
+                Runtime.getRuntime().addShutdownHook(shutdown);
                 try {
-                    out.println("index-server " + backend.describe().getName() + " on port " + server.port());
+                    out.println("index-server " + backend.describe().name() + " on port " + server.port());
                     out.flush();
                     server.awaitTermination();
                 } catch (Exception | Error error) {
                     failed = error;
                     throw error;
                 } finally {
+                    try { Runtime.getRuntime().removeShutdownHook(shutdown); }
+                    catch (IllegalStateException shuttingDown) { /* The shutdown hook owns cleanup. */ }
                     // A failed shutdown leaves native calls alive; keep their handles valid.
-                    try { server.close(); backend.close(); }
+                    try { if (closing.compareAndSet(false, true)) { server.close(); backend.close(); } }
                     catch (Exception close) {
                         if (failed == null) throw close;
                         failed.addSuppressed(close);

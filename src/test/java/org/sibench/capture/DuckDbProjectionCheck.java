@@ -77,7 +77,7 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
             }
             assertEquals(7,expected.size());
             var workload=root.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(workload);
-            try(writer){assertEquals(30,DuckDbProjection.write(db,writer));}
+            try(writer){assertEquals(30,DuckDbProjection.write(db,true,writer));}
             try(var backend=VersionedIndexBackend.create(root.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {
                 long[] requests={0},searches={0},aborts={0};
                 var consumer=new IndexOperationTrace.Consumer(){
@@ -133,7 +133,7 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
             assertEquals(1,number(db,"SELECT count(*) FROM sibench_source_mutations WHERE statement_outcome='failed' AND event='complete'"));
             assertEquals(2,number(db,"SELECT count(*) FROM items"));
             var trace=root.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(trace);
-            try(writer){assertEquals(5,DuckDbProjection.write(db,writer));}
+            try(writer){assertEquals(5,DuckDbProjection.write(db,true,writer));}
             try(var backend=VersionedIndexBackend.create(root.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {
                 long[] searches={0},aborts={0},ids={0};
                 ProtoTrace.read(trace,writer.sha256(),writer.logicalSha256(),new IndexOperationTrace.Consumer(){

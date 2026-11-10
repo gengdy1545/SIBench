@@ -11,16 +11,15 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * One benchmark client of an index service. Operations become protocol requests in send order;
- * the members of a search group (consecutive in the trace, one source access, always on one
- * client) are held until the last one arrives and travel as one group request, whose response
- * completes every member. Baseline INSERTs may likewise travel as write batches: a batch is sent
- * when full, when the source work unit changes, before any other request and on {@link #flush()}.
+ * One replay client. Group members use individual calls and retain their business completion
+ * times; client-side union/intersection gates their validation. Only baseline writes are buffered
+ * into batches, sent when full, at a work-unit change, before other calls and on flush().
  */
 abstract class ServiceClient implements ReplayTarget {
     private final TraceRequests requests;
     private final List<Operation> group = new ArrayList<>();
-    private final List<CompletableFuture<Void>> groupResponses = new ArrayList<>();
+    private final List<CompletableFuture<java.util.List<org.sibench.adapters.proto.Result>>> groupResults = new ArrayList<>();
+    private CompletableFuture<Void> groupResponse;
     private final List<Operation> batch = new ArrayList<>();
     private final List<org.sibench.adapters.proto.Write> batchWrites = new ArrayList<>();
     private Request groupRequest;
@@ -102,37 +101,46 @@ abstract class ServiceClient implements ReplayTarget {
         }
         sendBatch();
         if (operation.grouped()) {
-            if (group.isEmpty()) groupRequest = stored;
+            if (group.isEmpty()) { groupRequest = stored; groupResponse = new CompletableFuture<>(); }
             else if (groupRequest != stored) throw new IOException("Stored search group interrupted");
+            if (operation.expansionPosition() != group.size()) throw new IOException("Search group member out of order");
             group.add(operation);
-            var response = new CompletableFuture<Void>();
-            groupResponses.add(response);
-            // Held members are sent with the last one; nothing else can come between them.
-            if (group.size() < operation.expansionSize())
-                return new SendHandle(CompletableFuture.completedFuture(null), response);
-            var members = List.copyOf(group);
-            var responses = List.copyOf(groupResponses);
-            group.clear();
-            groupResponses.clear();
-            var request = groupRequest == null ? requests.group(dispatchSequence, members)
-                    : requests.forward(dispatchSequence, groupRequest, members);
-            groupRequest = null;
-            var received = requests.receive(operation, request.getId());
-            var answer = transmit(request, received.partial());
-            answer.whenComplete((result, error) -> {
-                Throwable failure = error;
-                if (failure == null) {
-                    try {
-                        received.finish(result);
-                    } catch (IOException mismatch) {
-                        failure = mismatch;
-                    }
-                }
-                for (var member : responses)
-                    if (failure == null) member.complete(null);
-                    else member.completeExceptionally(failure);
+            var checked = groupResponse;
+            var search = stored == null ? requests.search(operation) : stored.getGroup().getMembers(operation.expansionPosition());
+            var request = Request.newBuilder().setId(dispatchSequence).setSearch(search).build();
+            var items = new ArrayList<org.sibench.adapters.proto.Result>();
+            var answer = transmit(request, chunk -> {
+                if (chunk.getId() != dispatchSequence || !chunk.getMore()
+                        || chunk.getStatus() != org.sibench.adapters.proto.Status.OK)
+                    throw new IllegalArgumentException("Invalid group member result chunk");
+                items.addAll(chunk.getResultsList());
+            }).thenApply(result -> {
+                if (result.getId() != dispatchSequence || result.getMore()
+                        || result.getStatus() != org.sibench.adapters.proto.Status.OK)
+                    throw new java.util.concurrent.CompletionException(new IOException("Group member request failed"));
+                items.addAll(result.getResultsList());
+                return List.copyOf(items);
             });
-            return new SendHandle(localSend(), response);
+            answer.whenComplete((result,error) -> { if (error != null) checked.completeExceptionally(error); });
+            groupResults.add(answer);
+            var sent = localSend();
+            if (group.size() == operation.expansionSize()) {
+                var members = List.copyOf(group);
+                var answers = List.copyOf(groupResults);
+                var source = groupRequest == null ? requests.group(dispatchSequence, members)
+                        : requests.forward(dispatchSequence, groupRequest, members);
+                group.clear(); groupResults.clear(); groupRequest = null;
+                CompletableFuture.allOf(answers.toArray(CompletableFuture[]::new)).whenComplete((unused,error) -> {
+                    try {
+                        if (error != null) { checked.completeExceptionally(error); return; }
+                        var results = IndexExecution.group(source.getGroup(), answers.stream().map(CompletableFuture::join).toList());
+                        requests.check(operation, org.sibench.adapters.proto.Response.newBuilder().setId(dispatchSequence)
+                                .setStatus(org.sibench.adapters.proto.Status.OK).addAllResults(results).build());
+                        checked.complete(null);
+                    } catch (IOException | RuntimeException failure) { checked.completeExceptionally(failure); }
+                });
+            }
+            return new SendHandle(sent, checked, answer.thenApply(result -> null));
         }
         if (!group.isEmpty()) throw new IOException("Search group interrupted on its client");
         var request = stored == null ? requests.request(dispatchSequence, operation)

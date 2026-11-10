@@ -39,7 +39,9 @@ public class PostgresBuildTest {
         header = root.resolve("src/main/native/postgres/sibench_capture.c"); Files.createDirectories(header.getParent());
         Files.writeString(header,"instrumentation\n");
         Files.writeString(header.resolveSibling("row_capture.c"),"host source\n");
-        Files.writeString(root.resolve("runtime.yaml"),"schema_version: 1\npurpose: sibench\npostgres:\n  build_directory: build/services/postgres\n");
+        Files.writeString(root.resolve("postgres.yaml"),"schema_version: 1\npurpose: engine\nengine: postgres\n"
+                +"build_directory: build/services/postgres\nsettings: {}\n");
+        Files.writeString(root.resolve("runtime.yaml"),"schema_version: 1\npurpose: sibench\nengines:\n  postgres: postgres.yaml\n");
         action("postgres-inputs");
         Files.copy(source.resolve("upstream.cpp"),build.resolve("source/upstream.cpp"));
         Files.copy(header,build.resolve("source/capture.hpp"));

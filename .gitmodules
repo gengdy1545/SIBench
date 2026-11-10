@@ -38,3 +38,11 @@
 	path = index/slatedb
 	url = https://github.com/slatedb/slatedb.git
 	branch = main
+[submodule "third_party/pixels"]
+	path = third_party/pixels
+	url = https://github.com/pixelsdb/pixels.git
+	branch = master
+[submodule "third_party/pixels-sink"]
+	path = third_party/pixels-sink
+	url = https://github.com/pixelsdb/pixels-sink.git
+	branch = master

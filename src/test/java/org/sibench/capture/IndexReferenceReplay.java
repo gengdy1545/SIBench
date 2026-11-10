@@ -678,7 +678,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
             if ((operation.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0) snapshotQueries++;
             return;
         }
-        if (operation.key() == null || operation.version() < 0 || operation.rowId() < 1)
+        if (operation.key() == null || operation.version() < 0 || operation.rowId() < 0)
             throw new IOException("Invalid index key/version");
         Store store = store(operation.table(), operation.index());
         Composite entry =

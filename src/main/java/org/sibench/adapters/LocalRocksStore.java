@@ -62,7 +62,7 @@ final class LocalRocksStore implements OrderedStore {
     @Override
     public String durability() {
         return "acknowledged writes are in the memtable and WAL without fsync;"
-                + " baseline inserts skip the WAL until Flush";
+                + " persistence is maintained internally";
     }
 
     @Override

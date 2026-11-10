@@ -33,7 +33,7 @@ public class PostgresProjectionCheck {
         var failedPhysicalWrite=new java.util.concurrent.atomic.AtomicBoolean();
         var sourceClosed=new java.util.concurrent.CountDownLatch(1);
         try(var capture=new PostgresCapture(socketRoot.resolve("capture.sock"),root.resolve("pending"),16L<<20,1024);
-                var cluster=PostgresDatabase.create(Path.of(runtime),root.resolve("source"),socketRoot.resolve("capture.sock"))) {
+                var cluster=PostgresDatabase.create(Path.of(runtime),root.resolve("source"),socketRoot.resolve("capture.sock"),org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=cluster.connect("setup")) {
                 sql(setup,"CREATE TABLE sbtest1(id INTEGER PRIMARY KEY,k INTEGER,c CHAR(120),pad CHAR(60))");
                 sql(setup,"CREATE INDEX k_1 ON sbtest1(k)");sql(setup,"INSERT INTO sbtest1 VALUES(1,10,'a','a'),(2,20,'b','b')");
@@ -54,7 +54,7 @@ public class PostgresProjectionCheck {
                     control.setAutoCommit(false);
                     var units=WorkUnits.create(root);
                     try(var lines=units.lines();var versions=new PostgresVersions(control);
-                            var projection=new PostgresProjection(control,catalog,root,versions,units,operations::add)) {
+                            var projection=new PostgresProjection(control,catalog,root,versions,units,true,operations::add)) {
                         for(PostgresTransactions.Chunk next;(next=capture.transactions.next(()->capture.watermark(control)))!=null;)
                             try(var chunk=next){
                                 if(!chunk.committed)chunk.read(e->{
@@ -90,13 +90,26 @@ public class PostgresProjectionCheck {
                     sql(writer,"UPDATE sbtest1 SET k=61 WHERE id=1");
                     assertEquals(0,number(worker,"SELECT count(*) FROM sbtest1 WHERE k=60"));worker.commit();
                 }
+                // Both row changes precede the statement-level identity facts of this insert.
+                sql(worker,"INSERT INTO sbtest1 VALUES(5,70,'f','f'),(6,80,'g','g')");
+                assertEquals(70,number(worker,"SELECT k FROM sbtest1 WHERE id=5"));worker.commit();
             }
-            try(var control=cluster.connect("close")){capture.finishSources(control);}
+            var nativeIds=new java.util.HashMap<org.sibench.trace.IndexKey,Long>();
+            try(var control=cluster.connect("close")) {
+                capture.finishSources(control);
+                try(var q=control.createStatement();var rows=q.executeQuery("SELECT id,_sib_row_id FROM sibench_history.identities_1 WHERE _sib_tx<>0")) {
+                    while(rows.next())nativeIds.put(org.sibench.trace.IndexKey.ofInt(rows.getInt(1)),rows.getLong(2));
+                }
+            }
             sourceClosed.countDown();
             var operations=future.get(10,TimeUnit.SECONDS);
+            var inserted=new java.util.HashMap<org.sibench.trace.IndexKey,Long>();
+            for(var o:operations)if(IndexOperationTrace.isMutation(o)&&o.index()==0&&(o.flags()&IndexOperationTrace.BUSINESS_INSERT)!=0
+                    &&o.kind()!=IndexOperationTrace.LOGICAL_DELETE&&!o.key().equals(org.sibench.trace.IndexKey.ofInt(3)))inserted.put(o.key(),o.rowId());
+            assertEquals("Committed insertions use PG's own RowID allocations",nativeIds,inserted);
             assertTrue("The failed statement really emitted a row change before its error",failedPhysicalWrite.get());
             assertEquals(1,operations.stream().filter(o->o.kind()==IndexOperationTrace.TRANSACTION_ABORT).count());
-            assertEquals(7,operations.stream().filter(o->IndexOperationTrace.isMutation(o)&&o.index()==0).count());
+            assertEquals(9,operations.stream().filter(o->IndexOperationTrace.isMutation(o)&&o.index()==0).count());
             assertTrue(operations.stream().anyMatch(o->o.kind()==IndexOperationTrace.SEARCH&&o.mutationOrdinal()==2&&o.expectedCount()==1));
             assertFalse(operations.stream().anyMatch(o->IndexOperationTrace.isMutation(o)&&org.sibench.trace.IndexKey.ofInt(4).equals(o.key())));
             long original=baseline.stream().filter(o->o.index()==0&&o.key().equals(org.sibench.trace.IndexKey.ofInt(1))).findFirst().orElseThrow().rowId();
@@ -120,7 +133,7 @@ public class PostgresProjectionCheck {
             var committed=new ArrayList<IndexOperationTrace.Operation>();
             ProtoTrace.read(exported,writer.sha256(),writer.logicalSha256(),committed::add);
             // The aborted UPDATE/INSERT disappear; DELETE/INSERT/UPDATE of id=1 collapse to one.
-            assertEquals(3,committed.stream().filter(o->IndexOperationTrace.isMutation(o)&&o.index()==0).count());
+            assertEquals(5,committed.stream().filter(o->IndexOperationTrace.isMutation(o)&&o.index()==0).count());
             assertTrue(committed.stream().noneMatch(o->(o.flags()&IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)!=0));
             var config=new ReplayConfig(true,0,0,0,0,"operation");
             try(var reference=new IndexReferenceReplay(true,true);
@@ -133,6 +146,43 @@ public class PostgresProjectionCheck {
         }finally{executor.shutdownNow();Files.deleteIfExists(socketRoot.resolve("capture.sock"));Files.delete(socketRoot);}
     }
 
+    @Test public void insertionWithoutItsNativeIdentityFactIsRejected()throws Exception {
+        String runtime=System.getProperty("sibench.postgres.runtime");assertNotNull(runtime);
+        Path root=temporary.getRoot().toPath(),socketRoot=Files.createTempDirectory("pg-project-");
+        var executor=Executors.newSingleThreadExecutor();
+        var catalog=IndexCatalog.fromSchema(SourceSchema.of("sysbench",Path.of("benchmark/sysbench"),Map.of("tables",1L)));
+        try(var capture=new PostgresCapture(socketRoot.resolve("capture.sock"),root.resolve("pending"),16L<<20,1024);
+                var cluster=PostgresDatabase.create(Path.of(runtime),root.resolve("source"),socketRoot.resolve("capture.sock"),org.sibench.generation.PostgresTestSettings.SETTINGS)) {
+            try(var setup=cluster.connect("setup")) {
+                sql(setup,"CREATE TABLE sbtest1(id INTEGER PRIMARY KEY,k INTEGER,c CHAR(120),pad CHAR(60))");
+                sql(setup,"CREATE INDEX k_1 ON sbtest1(k)");sql(setup,"INSERT INTO sbtest1 VALUES(1,10,'a','a')");
+                setup.setAutoCommit(false);NativeHistory.initialize(setup,Engine.POSTGRES);
+                NativeHistory.install(setup,Engine.POSTGRES,1,"public","sbtest1","id");PostgresCapture.install(setup);setup.commit();
+                setup.setAutoCommit(true);
+                // The identity row is still written, so only the native identity fact is missing.
+                sql(setup,"ALTER TABLE sibench_history.identities_1 DISABLE TRIGGER sibench_row_identity");
+            }
+            var future=executor.submit(()->{
+                try(var control=cluster.connect("projection")) {
+                    control.setAutoCommit(false);var units=WorkUnits.create(root);
+                    try(var lines=units.lines();var versions=new PostgresVersions(control);
+                            var projection=new PostgresProjection(control,catalog,root,versions,units,true,ignored->{})) {
+                        for(PostgresTransactions.Chunk next;(next=capture.transactions.next(()->capture.watermark(control)))!=null;)
+                            try(var chunk=next){projection.accept(chunk);}
+                    }
+                }catch(Throwable failure){capture.fail(failure);throw failure;}
+                return null;
+            });
+            try(var worker=cluster.connect("sibench:projection")) {
+                sql(worker,"INSERT INTO sbtest1 VALUES(2,20,'b','b')");
+                assertEquals(1,number(worker,"SELECT count(*) FROM sibench_history.identities_1 WHERE id=2"));
+            }
+            try(var control=cluster.connect("close")){capture.finishSources(control);}catch(Exception ignored){}
+            var failure=assertThrows(java.util.concurrent.ExecutionException.class,()->future.get(10,TimeUnit.SECONDS));
+            assertTrue(String.valueOf(failure.getCause()),failure.getCause().getMessage().contains("lacks its native RowID"));
+        }finally{executor.shutdownNow();Files.deleteIfExists(socketRoot.resolve("capture.sock"));Files.delete(socketRoot);}
+    }
+
     @Test public void bitmapAndCyclesKeepOneSearchWhenTheirFirstInputIsReplaced()throws Exception {
         String runtime=System.getProperty("sibench.postgres.runtime");assertNotNull(runtime);
         Path root=temporary.getRoot().toPath(),socketRoot=Files.createTempDirectory("pg-project-");
@@ -140,7 +190,7 @@ public class PostgresProjectionCheck {
         var catalog=IndexCatalog.fromSchema(SourceSchema.hybench(Path.of("benchmark/HyBench-2024")));
         var sourceClosed=new java.util.concurrent.CountDownLatch(1);
         try(var capture=new PostgresCapture(socketRoot.resolve("capture.sock"),root.resolve("pending"),16L<<20,1024);
-                var cluster=PostgresDatabase.create(Path.of(runtime),root.resolve("source"),socketRoot.resolve("capture.sock"))) {
+                var cluster=PostgresDatabase.create(Path.of(runtime),root.resolve("source"),socketRoot.resolve("capture.sock"),org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=cluster.connect("setup")) {
                 sql(setup,"CREATE TABLE company(companyid INT PRIMARY KEY,name VARCHAR(20))");
                 sql(setup,"INSERT INTO company VALUES(301,'a'),(302,'b')");
@@ -163,7 +213,7 @@ public class PostgresProjectionCheck {
                     control.setAutoCommit(false);
                     var units=WorkUnits.create(root);
                     try(var lines=units.lines();var versions=new PostgresVersions(control);
-                            var projection=new PostgresProjection(control,catalog,root,versions,units,operations::add)) {
+                            var projection=new PostgresProjection(control,catalog,root,versions,units,true,operations::add)) {
                         for(PostgresTransactions.Chunk next;(next=capture.transactions.next(()->capture.watermark(control)))!=null;)
                             try(var chunk=next){projection.accept(chunk);}
                     }
@@ -203,7 +253,7 @@ public class PostgresProjectionCheck {
         var baseline=new ArrayList<IndexOperationTrace.Operation>();
         // The reader's events exceed this 1 MiB pending budget; prefixes beyond 2 KiB leave as pieces.
         try(var capture=new PostgresCapture(socketRoot.resolve("capture.sock"),root.resolve("pending"),1L<<20,1024);
-                var cluster=PostgresDatabase.create(Path.of(runtime),root.resolve("source"),socketRoot.resolve("capture.sock"))) {
+                var cluster=PostgresDatabase.create(Path.of(runtime),root.resolve("source"),socketRoot.resolve("capture.sock"),org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=cluster.connect("setup")) {
                 sql(setup,"CREATE TABLE sbtest1(id INTEGER PRIMARY KEY,k INTEGER,c CHAR(120),pad CHAR(60))");
                 sql(setup,"CREATE INDEX k_1 ON sbtest1(k)");sql(setup,"INSERT INTO sbtest1 VALUES(1,10,'a','a'),(2,20,'b','b')");
@@ -219,7 +269,7 @@ public class PostgresProjectionCheck {
                     control.setAutoCommit(false);
                     var units=WorkUnits.create(root);
                     try(var lines=units.lines();var versions=new PostgresVersions(control);
-                            var projection=new PostgresProjection(control,catalog,root,versions,units,operations::add)) {
+                            var projection=new PostgresProjection(control,catalog,root,versions,units,true,operations::add)) {
                         for(PostgresTransactions.Chunk next;(next=capture.transactions.next(()->capture.watermark(control)))!=null;)
                             try(var chunk=next){projection.accept(chunk);}
                     }
@@ -265,7 +315,7 @@ public class PostgresProjectionCheck {
         var sourceClosed=new java.util.concurrent.CountDownLatch(1);
         long budget=Long.getLong("sibench.test.queue_bytes",4L<<20);
         try(var capture=new PostgresCapture(socketRoot.resolve("capture.sock"),root.resolve("pending"),budget,4096);
-                var cluster=PostgresDatabase.create(Path.of(runtime),root.resolve("source"),socketRoot.resolve("capture.sock"))) {
+                var cluster=PostgresDatabase.create(Path.of(runtime),root.resolve("source"),socketRoot.resolve("capture.sock"),org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=cluster.connect("setup")) {
                 sql(setup,"CREATE TABLE sbtest1(id INTEGER PRIMARY KEY,k INTEGER,c CHAR(120),pad CHAR(60))");
                 sql(setup,"CREATE INDEX k_1 ON sbtest1(k)");
@@ -283,7 +333,7 @@ public class PostgresProjectionCheck {
                     control.setAutoCommit(false);
                     var units=WorkUnits.create(root);
                     try(var lines=units.lines();var versions=new PostgresVersions(control);
-                            var projection=new PostgresProjection(control,catalog,root,versions,units,operations::add)) {
+                            var projection=new PostgresProjection(control,catalog,root,versions,units,true,operations::add)) {
                         for(PostgresTransactions.Chunk next;(next=capture.transactions.next(()->capture.watermark(control)))!=null;)
                             try(var chunk=next){projection.accept(chunk);capture.updateHold(control);}
                     }

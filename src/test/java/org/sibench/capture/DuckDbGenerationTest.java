@@ -86,10 +86,10 @@ public class DuckDbGenerationTest {
         Path root=Files.createTempDirectory("sibench-engine-path-");
         try {
             assertEquals(root.resolve("build/services/duckdb"),NativeBuildCheck.engineDirectory(root,
-                    Map.of("duckdb",Map.of("build_directory","build/services/duckdb"))));
+                    Map.of("build_directory","build/services/duckdb"),"duckdb"));
             for(String path:new String[]{"build/services","../outside","build/services/../../source"})
                 assertThrows(java.io.IOException.class,()->NativeBuildCheck.engineDirectory(root,
-                        Map.of("duckdb",Map.of("build_directory",path))));
+                        Map.of("build_directory",path),"duckdb"));
         }finally{Files.delete(root);}
     }
     @Test public void rejectsMissingWorkloadsAndOverridesOfConnectionOrScale()throws Exception {

@@ -15,7 +15,7 @@ import java.util.function.LongSupplier;
  * writes keep flowing; deferred searches leave in arrival order once those writes complete.
  */
 public final class ReplayDispatcher implements AutoCloseable {
-    private record Deferred(Operation operation, org.sibench.adapters.proto.Request stored, long since) {}
+    private record Deferred(Operation operation, org.sibench.adapters.proto.Request stored, long since, boolean measured) {}
 
     private static final class Pending {
         private final long deadline, started;
@@ -26,6 +26,7 @@ public final class ReplayDispatcher implements AutoCloseable {
         private int warmupMembers;
         private long[] memberStarts;
         private boolean failed;
+        private long businessCompleted = -1;
 
         Pending(long deadline, CompletableFuture<Void> response,
                 int clientId, Operation operation, long started, boolean measured) {
@@ -123,6 +124,8 @@ public final class ReplayDispatcher implements AutoCloseable {
     /** Basic operations sent before the measured window starts. */
     private final long warmup;
     private long firstSend, measuredStart, lastSend, lastCompletion, measuredLastCompletion, measuredCompleted, drainNanos;
+    private long admitted, measuredLastSend;
+    private boolean measurementStarted;
     private final Map<Integer, ReplayTarget> clients = new LinkedHashMap<>();
     private final BitSet workUnits = new BitSet();
     private final Map<Integer, long[]> counts = new TreeMap<>();
@@ -164,11 +167,12 @@ public final class ReplayDispatcher implements AutoCloseable {
      * Before a call is handed to its client: the first send, and the measured window's start
      * before its first call, whose response may complete within the send itself.
      */
-    private void beginCall(long now) {
+    private void beginCall(long now, boolean measured) {
         if (operationsSent == 0) firstSend = now;
-        if (operationsSent == warmup)
+        if (measured && !measurementStarted)
             synchronized (inFlight) {
                 measuredStart = now;
+                measurementStarted = true;
             }
     }
 
@@ -229,29 +233,30 @@ public final class ReplayDispatcher implements AutoCloseable {
     public void send(Operation operation, org.sibench.adapters.proto.Request stored) throws IOException {
         checkSender();
         route(operation);
+        boolean measured = admitted++ >= warmup;
         boolean member = operation.grouped() && operation.expansionPosition() > 0;
         if (operation.kind() == IndexOperationTrace.SEARCH && member) {
-            if (deferringGroup > 0) defer(operation, stored, false);
+            if (deferringGroup > 0) defer(operation, stored, false, measured);
             else {
                 directGroup--;
-                dispatch(operation, stored);
+                dispatch(operation, stored, measured);
             }
             return;
         }
         if (directGroup != 0 || deferringGroup != 0) throw new IOException("Incomplete search group");
         releaseDeferred();
         if (operation.kind() == IndexOperationTrace.SEARCH) {
-            if (needsDeferral(operation)) defer(operation, stored, true);
+            if (needsDeferral(operation)) defer(operation, stored, true, measured);
             else {
                 directGroup = operation.grouped() ? operation.expansionSize() - 1 : 0;
-                dispatch(operation, stored);
+                dispatch(operation, stored, measured);
             }
             return;
         }
         // A deferred snapshot at or after this version precedes it in source order.
         if (operation.version() <= deferredReadLimit)
             awaitDeferred(() -> deferred.stream().noneMatch(d -> d.operation().readTimestamp() >= operation.version()));
-        dispatch(operation, stored);
+        dispatch(operation, stored, measured);
     }
 
     private boolean needsDeferral(Operation operation) {
@@ -260,7 +265,7 @@ public final class ReplayDispatcher implements AutoCloseable {
         }
     }
 
-    private void defer(Operation operation, org.sibench.adapters.proto.Request stored, boolean head)
+    private void defer(Operation operation, org.sibench.adapters.proto.Request stored, boolean head, boolean measured)
             throws IOException {
         if (head) {
             int size = operation.grouped() ? operation.expansionSize() : 1;
@@ -282,7 +287,7 @@ public final class ReplayDispatcher implements AutoCloseable {
             deferringGroup = size;
             deferredReadLimit = Math.max(deferredReadLimit, operation.readTimestamp());
         }
-        deferred.addLast(new Deferred(operation, stored, nanoTime.getAsLong()));
+        deferred.addLast(new Deferred(operation, stored, nanoTime.getAsLong(), measured));
         deferringGroup--;
         peakDeferred = Math.max(peakDeferred, deferred.size());
     }
@@ -298,7 +303,7 @@ public final class ReplayDispatcher implements AutoCloseable {
                 var item = deferred.pollFirst();
                 deferredNanos += now - item.since();
                 deferredOperations++;
-                dispatch(item.operation(), item.stored());
+                dispatch(item.operation(), item.stored(), item.measured());
             }
         }
         deferredReadLimit = -1;
@@ -324,7 +329,7 @@ public final class ReplayDispatcher implements AutoCloseable {
         }
     }
 
-    private void dispatch(Operation operation, org.sibench.adapters.proto.Request stored) throws IOException {
+    private void dispatch(Operation operation, org.sibench.adapters.proto.Request stored, boolean measured) throws IOException {
         int clientId = route(operation);
         synchronized (inFlight) {
             // A buffered search group cannot produce responses until its last member arrives.
@@ -352,8 +357,7 @@ public final class ReplayDispatcher implements AutoCloseable {
             long deadline =
                     nanoTime.getAsLong() + TimeUnit.SECONDS.toNanos(config.requestTimeoutSeconds());
             long started = nanoTime.getAsLong();
-            beginCall(started);
-            boolean measured = operationsSent >= warmup;
+            beginCall(started, measured);
             ReplayTarget.SendHandle handle =
                     Objects.requireNonNull(client.send(sequence, operation, stored));
             localSend = handle.sent().toCompletableFuture();
@@ -375,7 +379,15 @@ public final class ReplayDispatcher implements AutoCloseable {
                 peakCompletionGroups = Math.max(peakCompletionGroups, inFlight.size());
             }
             Pending pending = added;
-            if (pending != null) response.whenComplete(
+            CompletableFuture<Void> validated = response;
+            if (pending != null && handle.businessResponse() != handle.response()) {
+                var timed = handle.businessResponse().handle((unused, error) -> {
+                    synchronized (inFlight) { pending.businessCompleted = nanoTime.getAsLong(); }
+                    return null;
+                });
+                validated = response.thenCombine(timed, (unused, time) -> null);
+            }
+            if (pending != null) validated.whenComplete(
                     (unused, error) -> {
                         synchronized (inFlight) {
                             Pending removed = inFlight.remove(sequence);
@@ -393,6 +405,7 @@ public final class ReplayDispatcher implements AutoCloseable {
                                                 error));
                             }
                             else if (error == null && !closed) {
+                                if (pending.businessCompleted < 0) pending.businessCompleted = nanoTime.getAsLong();
                                 if (deadline <= nanoTime.getAsLong()) {
                                     recordResponseFailure(pending, true);
                                     fail(
@@ -409,7 +422,7 @@ public final class ReplayDispatcher implements AutoCloseable {
                                     lastCompletion = nanoTime.getAsLong();
                                     if (pending.members > pending.warmupMembers) measuredLastCompletion = lastCompletion;
                                     pending.recordLatency(latencyKind == 1 ? searchLatency : writeLatency,
-                                            lastCompletion);
+                                            pending.businessCompleted);
                                 }
                             }
                             inFlight.notifyAll();
@@ -422,6 +435,7 @@ public final class ReplayDispatcher implements AutoCloseable {
             sent++;
             operationsSent++;
             lastSend = nanoTime.getAsLong();
+            if (measured) measuredLastSend = lastSend;
             long[] clientCounts = counts.computeIfAbsent(clientId, key -> new long[4]);
             clientCounts[0]++;
             if (operation.kind() == IndexOperationTrace.SEARCH) clientCounts[1]++;
@@ -628,7 +642,7 @@ public final class ReplayDispatcher implements AutoCloseable {
         report.put("completed_operations", measuredCompleted);
         report.put("target_arrival_rate", "N/A");
         if (calls > 0) {
-            double sending = (lastSend - measuredStart) / 1e9;
+            double sending = (measuredLastSend - measuredStart) / 1e9;
             double completing = measuredLastCompletion == 0 ? 0 : (measuredLastCompletion - measuredStart) / 1e9;
             report.put("send_seconds", sending);
             report.put("send_rate", sending > 0 ? calls / sending : 0.0);

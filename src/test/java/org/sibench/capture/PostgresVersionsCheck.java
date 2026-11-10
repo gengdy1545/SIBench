@@ -15,7 +15,7 @@ public class PostgresVersionsCheck {
 
     @Test public void growingCommitMappingsKeepAnIndexedPreparedLookup()throws Exception {
         String runtime=System.getProperty("sibench.postgres.runtime");assertNotNull(runtime);
-        try(var cluster=PostgresDatabase.create(Path.of(runtime),temporary.getRoot().toPath().resolve("source"));
+        try(var cluster=PostgresDatabase.create(Path.of(runtime),temporary.getRoot().toPath().resolve("source"),org.sibench.generation.PostgresTestSettings.SETTINGS);
                 var database=cluster.connect("projection");var query=database.createStatement()) {
             database.setAutoCommit(false);NativeHistory.initialize(database,Engine.POSTGRES);database.commit();
             database.setAutoCommit(true);query.execute("VACUUM ANALYZE");database.setAutoCommit(false);

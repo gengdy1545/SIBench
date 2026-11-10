@@ -24,16 +24,17 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
     private final WorkUnits.Output units;
     private final PostgresVersions versions;
     private final Path scratch;
+    private final boolean secondaryIndexes;
     private final Map<Integer,PostgresAccessUnits.Detail> details=new HashMap<>();
     /** Backends with released read-only pieces whose transaction has not resolved yet. */
     private final java.util.Set<Integer> pieces=new java.util.HashSet<>();
-    private final Map<Integer,PreparedStatement> identities=new HashMap<>(),insertions=new HashMap<>();
+    private final Map<Integer,PreparedStatement> identities=new HashMap<>();
     private final Map<PostgresAccessUnits.Unit,Search> live=new IdentityHashMap<>();
     private final Map<PostgresAccessUnits.BitmapGroup,Search> groups=new IdentityHashMap<>();
     private final ArrayDeque<Object> pending=new ArrayDeque<>();
     private PostgresTransactions.Chunk chunk;
     private SpillingMap local,allocated;
-    private long version,event,workUnits,currentUnit,unitEvent,readVersion,writes,statementWrites;
+    private long version,event,workUnits,currentUnit,unitEvent,readVersion,writes,statementWrites,allocations,insertions;
     private long commits,aborts,searches,mutations;
 
     private static final class Search {
@@ -43,11 +44,12 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
             this.source=source;this.unit=unit;this.readVersion=readVersion;this.preceding=preceding;
         }
     }
-    private record Change(JsonObject row,long source,long unit,long ordinal) {}
+    /** An insert's allocation key names the native identity fact that must arrive before it is projected. */
+    private record Change(JsonObject row,long source,long unit,long ordinal,byte[] allocation) {}
 
     PostgresProjection(Connection database,IndexCatalog catalog,Path scratch,PostgresVersions versions,
-            WorkUnits.Output units,IndexOperationTrace.Consumer output)throws SQLException {
-        this.catalog=catalog;this.scratch=scratch;this.versions=versions;this.units=units;this.output=output;
+            WorkUnits.Output units,boolean secondaryIndexes,IndexOperationTrace.Consumer output)throws SQLException {
+        this.catalog=catalog;this.secondaryIndexes=secondaryIndexes;this.scratch=scratch;this.versions=versions;this.units=units;this.output=output;
         for(var primary:catalog.definitions())if(primary.indexId()==0) {
             String key=quote(primary.column()),cast=switch(primary.type()){case "int"->"bigint";case "timestamp"->"timestamp";default->"text";};
             String table="sibench_history.identities_"+primary.tableId();
@@ -56,14 +58,12 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
                     +"(SELECT c.commit_version FROM sibench_history.commits c WHERE c.transaction_id=i._sib_tx) END "
                     +"FROM "+table+" i WHERE i."+key+"=?::"+cast+" ORDER BY i._sib_row_id DESC");
             identity.setFetchSize(64);identities.put(primary.tableId(),identity);
-            insertions.put(primary.tableId(),database.prepareStatement("SELECT _sib_row_id FROM "+table
-                    +" WHERE "+key+"=?::"+cast+" AND _sib_tx=? AND _sib_query=?"));
         }
     }
 
     /** Projects one chunk; returns whether it resolved a source transaction with requests. */
     boolean accept(PostgresTransactions.Chunk source)throws IOException,SQLException {
-        chunk=source;writes=0;statementWrites=0;currentUnit=0;
+        chunk=source;writes=0;statementWrites=0;currentUnit=0;allocations=0;insertions=0;
         // A piece's searches are standalone snapshot reads; its transaction resolves with its outcome.
         if(source.piece)pieces.add(source.pid);
         boolean split=!source.piece&&pieces.remove(source.pid);
@@ -71,13 +71,6 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
         try(var rowIds=new SpillingMap(scratch.resolve("local-identities"),65536,4);
                 var abortIds=new SpillingMap(scratch.resolve("aborted-identities"),65536,4)) {
             local=rowIds;allocated=abortIds;
-            // Aborted allocations no longer exist in PG; only their identity facts need lookahead.
-            if(!source.committed)source.read(e->{
-                if(e.get("event").getAsString().equals("row_identity")&&e.get("req").getAsLong()<=source.lastCompletedRequest) {
-                    int table=e.get("table_id").getAsInt();
-                    allocated.put(identityKey(table,catalog.postgresKey(catalog.primary(table),text(e.get("primary_key"))),e.get("req").getAsLong()),e.get("row_id").getAsLong());
-                }
-            });
             var tracker=new PostgresAccessUnits(this);
             if(details.containsKey(source.pid))tracker.continueSession(details.get(source.pid));else tracker.beginSession();
             if(version>0)output.accept(IndexOperationTrace.transaction(0,IndexOperationTrace.TRANSACTION_BEGIN,version,version,0));
@@ -85,18 +78,25 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
                 event++;
                 if(e.get("event").getAsString().equals("executor_start")&&e.get("depth").getAsInt()==1)drain();
                 tracker.accept(e);
-                if(e.get("event").getAsString().equals("row_change")
+                String type=e.get("event").getAsString();
+                // Successful statements of an aborted transaction stay visible to its later reads.
+                if((type.equals("row_change")||type.equals("row_identity"))
                         &&(source.committed||e.get("req").getAsLong()<=source.lastCompletedRequest)) {
                     if(version==0||currentUnit==0||e.get("xid").getAsLong()!=source.transaction)
                         throw new IOException("PG mutation lacks its source transaction/request");
-                    pending.add(new Change(e,unitEvent,currentUnit,++writes));statementWrites++;
+                    if(type.equals("row_identity"))allocate(e);
+                    else {
+                        pending.add(new Change(e,unitEvent,currentUnit,++writes,allocation(e)));statementWrites++;
+                    }
                 }
                 drain();
                 if(pending.size()>ProtoTrace.MAX_TRANSACTION_OPERATIONS)
                     throw new IOException("Unsettled PG operation prefix exceeds the buffer limit");
             });
             details.put(source.pid,tracker.detail());tracker.endSession();drain();
+            if(pending.peekFirst() instanceof Change)throw new IOException("PG insertion lacks its native RowID");
             if(!pending.isEmpty()||!live.isEmpty()||!groups.isEmpty())throw new IOException("PG transaction has unsettled accesses");
+            if(allocations!=insertions)throw new IOException("PG native RowID allocations do not match insertions");
             if(version>0) {
                 output.accept(IndexOperationTrace.transaction(0,source.committed?IndexOperationTrace.TRANSACTION_COMMIT:
                         IndexOperationTrace.TRANSACTION_ABORT,version,version,writes));
@@ -158,6 +158,8 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
         while(!pending.isEmpty()) {
             Object item=pending.peekFirst();
             if(item instanceof Search search&&search.decision==null)return;
+            // The statement-level identity trigger reports an insert's RowID after its row change.
+            if(item instanceof Change change&&change.allocation()!=null&&allocated.get(change.allocation())==SpillingMap.ABSENT)return;
             pending.removeFirst();
             if(item instanceof Search search)search(search);else change((Change)item);
         }
@@ -188,17 +190,8 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
             throw new IOException("PG row change has a missing or changed primary key");
         byte[] identity=identityKey(table,key,0);long rowId;
         try {
-            if(action.equals("insert")) {
-                long request=row.get("req").getAsLong();
-                if(chunk.committed) {
-                    var statement=insertions.get(table);statement.setString(1,text(after.get(primary.column())));
-                    statement.setLong(2,chunk.transaction);statement.setLong(3,request);
-                    try(var rows=statement.executeQuery()) {
-                        if(!rows.next())throw new IOException("PG insertion lacks its native RowID");rowId=rows.getLong(1);
-                        if(rows.next())throw new IOException("PG insertion has ambiguous native RowIDs");
-                    }
-                }else rowId=allocated.get(identityKey(table,key,request));
-            }else {
+            if(action.equals("insert")){rowId=allocated.get(change.allocation());insertions++;}
+            else {
                 rowId=local.get(identity);
                 if(rowId==SpillingMap.ABSENT) {
                     var statement=identities.get(table);statement.setString(1,text(before.get(primary.column())));
@@ -220,11 +213,23 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
                 .withTransaction(version,change.ordinal()).withWorkUnitId(change.unit()),keys(table,before),keys(table,after),output);
         mutations++;
     }
+    private void allocate(JsonObject event)throws IOException {
+        int table=event.get("table_id").getAsInt();
+        byte[] key=identityKey(table,catalog.postgresKey(catalog.primary(table),text(event.get("primary_key"))),event.get("req").getAsLong());
+        if(allocated.get(key)!=SpillingMap.ABSENT)throw new IOException("PG insertion has ambiguous native RowIDs");
+        allocated.put(key,event.get("row_id").getAsLong());allocations++;
+    }
+    private byte[] allocation(JsonObject row)throws IOException {
+        if(!row.get("operation").getAsString().equals("insert")||row.get("new").isJsonNull())return null;
+        int table=catalog.tableId(row.get("relation").getAsString());var primary=catalog.primary(table);
+        return identityKey(table,catalog.postgresKey(primary,text(row.getAsJsonObject("new").get(primary.column()))),row.get("req").getAsLong());
+    }
+    /** Every native index column must be captured; only exported secondary keys are built. */
     private Map<Integer,IndexKey> keys(int table,JsonObject row)throws IOException {
         if(row==null)return Map.of();var keys=new LinkedHashMap<Integer,IndexKey>();
         for(var index:catalog.secondary(table)) {
             if(!row.has(index.column()))throw new IOException("Missing indexed source column");
-            keys.put(index.indexId(),catalog.postgresKey(index,text(row.get(index.column()))));
+            if(secondaryIndexes)keys.put(index.indexId(),catalog.postgresKey(index,text(row.get(index.column()))));
         }
         return keys;
     }
@@ -236,6 +241,6 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
     Map<String,Object> counts(){return Map.of("source_work_units",workUnits,"committed_transactions",commits,
             "aborted_transactions",aborts,"searched_accesses",searches,"logical_row_changes",mutations);}
     @Override public void close()throws SQLException {
-        for(var statement:identities.values())statement.close();for(var statement:insertions.values())statement.close();
+        for(var statement:identities.values())statement.close();
     }
 }

@@ -19,9 +19,11 @@ public final class IndexVersionCheck {
 
     static void check(IndexBackend backend) throws Exception {
         for(int version=0;version<=3;version++) {
-            backend.write(Write.newBuilder().setKey(EntryKey.newBuilder().setTable(1).setPrimaryKey(KEY))
+            var write=Write.newBuilder().setKey(EntryKey.newBuilder().setTable(1).setPrimaryKey(KEY))
                     .setKind(version==0?Write.Kind.INSERT:version==2?Write.Kind.LOGICAL_DELETE:Write.Kind.UPSERT)
-                    .setVersion(version).setValue(Value.newBuilder().setRowId(70+version)).build());
+                    .setVersion(version);
+            if(version!=2) write.setValue(Value.newBuilder().setRowId(70+version));
+            backend.write(write.build());
         }
         for(int pass=0;pass<2;pass++) {
             for(int timestamp=0;timestamp<=5;timestamp++) {

@@ -115,9 +115,10 @@ public class VersionedIndexBackendTest {
         var key = EntryKey.newBuilder().setTable(TABLE).setIndex(index)
                 .setPrimaryKey(ByteString.copyFrom(IndexKey.ofInt(pk).bytes()));
         if (index != 0) key.setIndexedValue(ByteString.copyFrom(IndexKey.ofInt(value).bytes()));
-        backend.write(Write.newBuilder().setKey(key).setVersion(version)
-                .setKind(deleted ? Write.Kind.LOGICAL_DELETE : version == 0 ? Write.Kind.INSERT : Write.Kind.UPSERT)
-                .setValue(Value.newBuilder().setRowId(rowId)).build());
+        var write = Write.newBuilder().setKey(key).setVersion(version)
+                .setKind(deleted ? Write.Kind.LOGICAL_DELETE : version == 0 ? Write.Kind.INSERT : Write.Kind.UPSERT);
+        if (!deleted) write.setValue(Value.newBuilder().setRowId(rowId));
+        backend.write(write.build());
     }
 
     private static LookupResult row(int pk, long version, long rowId) {
@@ -195,12 +196,11 @@ public class VersionedIndexBackendTest {
                     var group = SearchGroup.newBuilder().setMode(SearchGroup.Mode.INTERSECTION)
                             .addMembers(search(1, Range.equal(IndexKey.ofInt(a)), last))
                             .addMembers(search(2, Range.equal(IndexKey.ofInt(b)), last)).build();
-                    var response = IndexExecution.execute(backend, Request.newBuilder().setId(1).setGroup(group).build());
-                    assertEquals(Status.OK, response.getStatus());
-                    assertEquals(intersection, response.getResultsCount());
-                    var union = IndexExecution.execute(backend, Request.newBuilder().setId(2).setGroup(
-                            group.toBuilder().setMode(SearchGroup.Mode.UNION).build()).build());
-                    assertEquals(first.size() + second.size() - intersection, union.getResultsCount());
+                    var results = List.of(backend.search(group.getMembers(0)),backend.search(group.getMembers(1)));
+                    var response = IndexExecution.group(group,results);
+                    assertEquals(intersection, response.size());
+                    var union = IndexExecution.group(group.toBuilder().setMode(SearchGroup.Mode.UNION).build(),results);
+                    assertEquals(first.size() + second.size() - intersection, union.size());
                 }
         }
     }

@@ -31,21 +31,40 @@ public class SibenchConfigTest {
 
     @Test
     public void publicGenerationSelectsThreeNativeModesAndOwnsEngineBuildLocations() throws Exception {
-        var document = SibenchConfig.read(Path.of("config/sibench.yaml"));
-        var selected = BenchmarkSelection.read(Path.of(""), document);
+        Path root = Path.of("").toAbsolutePath();
+        var document = SibenchConfig.read(root.resolve("config/sibench.yaml"));
+        var selected = BenchmarkSelection.read(root, document);
         assertEquals(java.util.List.of("ycsb", "sysbench", "hybench"),
                 selected.stream().map(BenchmarkSelection::benchmark).toList());
         assertEquals(java.util.List.of(BenchmarkSelection.Mode.API, BenchmarkSelection.Mode.CAPTURE,
-                BenchmarkSelection.Mode.CAPTURE), selected.stream().map(BenchmarkSelection::mode).toList());
-        assertEquals("build/services/postgres",ConfigValues.string(ConfigValues.object(document,"postgres"),"build_directory"));
-        assertEquals(java.util.List.of(Engine.ROCKSDB, Engine.POSTGRES, Engine.POSTGRES),
+                BenchmarkSelection.Mode.CDC), selected.stream().map(BenchmarkSelection::mode).toList());
+        assertEquals(java.util.List.of(Engine.ROCKSDB, Engine.POSTGRES, Engine.PIXELS),
                 selected.stream().map(BenchmarkSelection::engine).toList());
-        assertEquals("build/services/rocksdb", ConfigValues.string(ConfigValues.object(document,"rocksdb"),"build_directory"));
+        var postgres = SibenchConfig.engine(root, document, Engine.POSTGRES);
+        assertEquals("build/services/postgres", ConfigValues.string(postgres, "build_directory"));
+        assertEquals("off", SibenchConfig.postgresSettings(ConfigValues.object(postgres, "settings")).get("fsync"));
+        assertEquals("build/services/rocksdb", ConfigValues.string(SibenchConfig.engine(root, document, Engine.ROCKSDB), "build_directory"));
+        assertEquals("16GiB", ConfigValues.string(SibenchConfig.engine(root, document, Engine.DUCKDB), "memory_limit"));
         assertFalse(document.containsKey("generation"));
+        // Engine settings live in their own files; the runtime only selects them.
         assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(
-                Map.of("schema_version", 1, "purpose", "sibench", "postgres", Map.of())));
+                Map.of("schema_version", 1, "purpose", "sibench", "postgres", Map.of("build_directory", "build/services/postgres"))));
         assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(
-                Map.of("schema_version",1,"purpose","sibench","postgres",Map.of("build_directory","build/services/postgres","data_directory","data"))));
+                Map.of("schema_version", 1, "purpose", "sibench", "engines", Map.of("mysql", "config/engine/mysql.yaml"))));
+    }
+
+    @Test
+    public void engineConfigsRejectUnknownOptionsAndGeneratorOwnedPostgresSettings() throws Exception {
+        Path root = temporary.getRoot().toPath();
+        Files.writeString(root.resolve("postgres.yaml"), "schema_version: 1\npurpose: engine\nengine: postgres\n"
+                + "build_directory: build/services/postgres\nsettings:\n  port: 5432\n");
+        var runtime = Map.<String, Object>of("engines", Map.of("postgres", "postgres.yaml", "duckdb", "postgres.yaml"));
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.engine(root, runtime, Engine.POSTGRES));
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.engine(root, runtime, Engine.DUCKDB));
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.engine(root, runtime, Engine.ROCKSDB));
+        Files.writeString(root.resolve("postgres.yaml"), "schema_version: 1\npurpose: engine\nengine: postgres\n"
+                + "build_directory: build/services/postgres\nsettings: {}\ndata_directory: data\n");
+        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.engine(root, runtime, Engine.POSTGRES));
     }
 
     @Test

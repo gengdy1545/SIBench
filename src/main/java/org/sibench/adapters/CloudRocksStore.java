@@ -87,13 +87,12 @@ final class CloudRocksStore implements OrderedStore {
 
     @Override
     public String durability() {
-        return "acknowledged writes are in the memtable and the local WAL without fsync; baseline"
-                + " inserts skip the WAL; Flush returns once the SST files and MANIFEST are in"
+        return "acknowledged writes are in the memtable and the local WAL without fsync; internal persistence uploads SST files and MANIFEST to"
                 + " bucket "
                 + bucket
                 + " at "
                 + objectPath
-                + "; the WAL is not uploaded, so writes after the last Flush are only local";
+                + "; the WAL is not uploaded, so writes after the last persistence cycle are only local";
     }
 
     @Override

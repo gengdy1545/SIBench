@@ -13,7 +13,7 @@ import java.util.Set;
 
 /** Resolves exactly the selected benchmark profiles, without generating data or opening a database. */
 public record BenchmarkSelection(Path config, String benchmark, Mode mode,Engine engine) {
-    public enum Mode { API, CAPTURE }
+    public enum Mode { API, CAPTURE, CDC }
 
     public static void validate(Object value) {
         require(value instanceof List<?> && !((List<?>) value).isEmpty(),
@@ -46,11 +46,16 @@ public record BenchmarkSelection(Path config, String benchmark, Mode mode,Engine
                     "Unsupported benchmark: " + benchmark);
             require(names.add(benchmark), "Duplicate benchmark: " + benchmark);
             Mode mode = mode(item);
-            require(mode == (benchmark.equals("ycsb") ? Mode.API : Mode.CAPTURE),
-                    "Unsupported benchmark/mode combination: " + benchmark + "/" + string(item, "mode"));
-            require((benchmark.equals("ycsb")) == (engine(item) == Engine.ROCKSDB),
-                    "YCSB requires RocksDB; RocksDB supports only YCSB API generation");
-            result.add(new BenchmarkSelection(path, benchmark, mode,engine(item)));
+            Engine engine = engine(item);
+            // Each supported combination names one operation source and its native engine.
+            boolean supported = switch (mode) {
+                case API -> benchmark.equals("ycsb") && engine == Engine.ROCKSDB;
+                case CAPTURE -> !benchmark.equals("ycsb") && (engine == Engine.DUCKDB || engine == Engine.POSTGRES);
+                case CDC -> benchmark.equals("hybench") && engine == Engine.PIXELS;
+            };
+            require(supported, "Unsupported benchmark/mode/engine combination: " + benchmark + "/"
+                    + string(item, "mode") + "/" + string(item, "engine"));
+            result.add(new BenchmarkSelection(path, benchmark, mode, engine));
         }
         return List.copyOf(result);
     }
@@ -66,16 +71,12 @@ public record BenchmarkSelection(Path config, String benchmark, Mode mode,Engine
         return switch (string(item, "mode")) {
             case "api" -> Mode.API;
             case "capture" -> Mode.CAPTURE;
+            case "cdc" -> Mode.CDC;
             default -> throw new IllegalArgumentException("Unknown benchmark mode: " + string(item, "mode"));
         };
     }
 
     private static Engine engine(Map<String,Object> item) {
-        return switch(string(item,"engine")) {
-            case "duckdb"->Engine.DUCKDB;
-            case "postgres"->Engine.POSTGRES;
-            case "rocksdb"->Engine.ROCKSDB;
-            default->throw new IllegalArgumentException("Unknown benchmark engine: "+string(item,"engine"));
-        };
+        return Engine.of(string(item, "engine"));
     }
 }

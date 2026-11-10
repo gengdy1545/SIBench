@@ -1,0 +1,8 @@
+# Native RocksDB generation engine for YCSB API generation.
+schema_version: 1
+purpose: engine
+engine: rocksdb
+build_directory: build/services/rocksdb
+cache_bytes: 1073741824
+write_buffer_bytes: 4294967296
+background_jobs: 16

@@ -122,6 +122,47 @@ public class ReplayDispatcherTest {
     }
 
     @Test
+    public void groupValidationWaitDoesNotReplaceIndividualBusinessResponseTimes() throws Exception {
+        var now=new AtomicLong(1_000_000);
+        var validated=new CompletableFuture<Void>();
+        var replies=List.of(new CompletableFuture<Void>(),new CompletableFuture<Void>());
+        try(var dispatcher=new ReplayDispatcher(config(1,4),client -> (sequence,operation) ->
+                new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null),validated,replies.get((int)sequence-1)),0,now::get)) {
+            dispatcher.send(groupMember(0,2)); dispatcher.send(groupMember(1,2));
+            now.set(1_050_000); replies.get(0).complete(null);
+            now.set(1_150_000); replies.get(1).complete(null);
+            assertEquals(0L,dispatcher.describe().get("completed_operations"));
+            now.set(2_000_000); validated.complete(null); dispatcher.drain();
+            var latency=(Map<?,?>)dispatcher.describe().get("search_latency");
+            assertEquals(2L,latency.get("count"));
+            assertEquals(0.1,(double)latency.get("mean_ms"),1e-12);
+            assertEquals(0.15,(double)latency.get("max_ms"),1e-12);
+        }
+    }
+
+    @Test
+    public void deferredQueriesKeepTheirOriginalWarmupMembership() throws Exception {
+        var now=new AtomicLong(1_000_000);
+        var writes=List.of(new CompletableFuture<Void>(),new CompletableFuture<Void>());
+        var order=new ArrayList<Long>();
+        try(var dispatcher=new ReplayDispatcher(config(1,4),client -> (sequence,operation) -> {
+            order.add(operation.sourceEvent());
+            return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null),operation.kind()==IndexOperationTrace.SEARCH
+                    ?CompletableFuture.completedFuture(null):writes.get((int)operation.version()-1));
+        },2,now::get)) {
+            dispatcher.send(IndexOperationTrace.write(1,IndexOperationTrace.UPSERT,3,0,IndexKey.ofInt(1),1,0,0,1).withWorkUnitId(1));
+            dispatcher.send(IndexOperationTrace.search(2,3,0,Range.equal(IndexKey.ofInt(1)),1,1,0).withWorkUnitId(2));
+            dispatcher.send(IndexOperationTrace.write(3,IndexOperationTrace.UPSERT,3,0,IndexKey.ofInt(1),2,0,0,2).withWorkUnitId(3));
+            dispatcher.send(IndexOperationTrace.search(4,3,0,Range.equal(IndexKey.ofInt(1)),2,1,0).withWorkUnitId(4));
+            now.set(1_050_000); writes.forEach(reply -> reply.complete(null)); dispatcher.drain();
+            assertEquals(List.of(1L,3L,2L,4L),order);
+            assertEquals(1L,((Map<?,?>)dispatcher.describe().get("write_latency")).get("count"));
+            assertEquals(1L,((Map<?,?>)dispatcher.describe().get("search_latency")).get("count"));
+            assertEquals(2L,((Map<?,?>)dispatcher.describe().get("measurement")).get("completed_operations"));
+        }
+    }
+
+    @Test
     public void bufferedSearchGroupWaitsForRoomBeforeItsFirstMember() throws Exception {
         var now = new AtomicLong(1_000_000);
         var ordinary = List.of(new CompletableFuture<Void>(), new CompletableFuture<Void>());

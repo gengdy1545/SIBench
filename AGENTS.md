@@ -19,8 +19,9 @@
 - Keep one public configuration per benchmark under `config/benchmark/`, named
   for the source without a scale suffix. Defaults use 87,060,000 baseline rows
   (HyBench SF10); exact scale stays in the file and each run's effective snapshot.
-  Keep index/backend configuration under `config/index/`, and tool runtime
-  settings, including DuckDB engine settings, in `config/sibench.yaml`.
+  Keep index/backend configuration under `config/index/`, generation engine
+  settings under `config/engine/` (one file or folder per engine), and tool
+  runtime settings and engine selection in `config/sibench.yaml`.
   Do not add scale, client-count or mode variants to the public directory.
   Keep experiment variants in `develop/configs/`
   and required test inputs in test resources or temporary directories.
@@ -35,8 +36,8 @@
   system for published dependencies and gitlinks for upstream source dependencies.
   Keep build dependencies with the component that consumes them; runtime
   configuration is not a dependency inventory. Preserve effective run snapshots.
-- Build PostgreSQL, DuckDB and RocksDB generation engines from their pinned
-  `third_party/` sources. Keep project patches under `src/main/native/` and apply
+- Build PostgreSQL, DuckDB, RocksDB and Pixels (with pixels-sink) generation
+  engines from their pinned `third_party/` sources. Keep project patches under `src/main/native/` and apply
   them to build copies, leaving upstream checkouts clean. Use matching source and
   build inputs for headers, native libraries and JNI; bind artifacts to their
   build identities. Maven consumes and packages the resulting Java/JNI artifacts

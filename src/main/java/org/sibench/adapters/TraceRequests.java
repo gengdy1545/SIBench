@@ -26,7 +26,9 @@ public final class TraceRequests {
     private final ValueKind valueKind;
     private final AtomicLong results = new AtomicLong(), queries = new AtomicLong();
     private final AtomicLong requestBytes = new AtomicLong(), resultBytes = new AtomicLong();
-    private final AtomicLong executeRequests = new AtomicLong();
+    private final AtomicLong returnedResults = new AtomicLong();
+    private final AtomicLong rpcRequests = new AtomicLong();
+    private final java.util.concurrent.ConcurrentHashMap<String, AtomicLong> rpcKinds = new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicLong maxResults = new AtomicLong(), maxGroupMembers = new AtomicLong();
     private volatile int baselineBatch = 1;
     public TraceRequests(ValueKind valueKind) {
@@ -42,9 +44,9 @@ public final class TraceRequests {
         var request = Request.newBuilder().setId(id);
         if (operation.kind() == IndexOperationTrace.SEARCH) {
             if (operation.grouped()) throw new IOException("Group members are sent as one group");
-            return countRequest(request.setSearch(search(operation)).build());
+            return request.setSearch(search(operation)).build();
         }
-        return countRequest(request.setWrite(write(operation)).build());
+        return request.setWrite(write(operation)).build();
     }
 
     /** Reuses a validated Trace payload; only replay IDs and value representation change. */
@@ -61,7 +63,7 @@ public final class TraceRequests {
         var request = stored.toBuilder().setId(id);
         if (stored.hasWrite() && stored.getWrite().getKind() != Write.Kind.LOGICAL_DELETE)
             request.setWrite(forwardWrite(stored.getWrite(), first));
-        return countRequest(request.build());
+        return request.build();
     }
 
     /** Baseline INSERTs sent as one request; a batch takes one send position. */
@@ -79,7 +81,7 @@ public final class TraceRequests {
             if (stored.isEmpty()) batch.addWrites(write(insert));
             else batch.addWrites(forwardWrite(stored.get(i), insert));
         }
-        return countRequest(Request.newBuilder().setId(id).setBatch(batch).build());
+        return Request.newBuilder().setId(id).setBatch(batch).build();
     }
 
     private Write forwardWrite(Write stored, Operation operation) {
@@ -144,10 +146,10 @@ public final class TraceRequests {
         for (Operation member : members) group.addMembers(search(member));
         var request = Request.newBuilder().setId(id);
         maxGroupMembers.accumulateAndGet(members.size(), Math::max);
-        return countRequest(request.setGroup(group).build());
+        return request.setGroup(group).build();
     }
 
-    private Search search(Operation operation) throws IOException {
+    Search search(Operation operation) throws IOException {
         if ((operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0)
             throw new IOException("Only committed-snapshot searches may reach the service");
         var search = Search.newBuilder()
@@ -191,7 +193,7 @@ public final class TraceRequests {
     public final class Received {
         private final Operation operation;
         private final long id;
-        private long count, bytes;
+        private long count;
         private IOException failure;
 
         private Received(Operation operation, long id) {
@@ -225,9 +227,6 @@ public final class TraceRequests {
             if (count > operation.expectedCount())
                 throw new IOException("Search count mismatch at source event " + operation.sourceEvent()
                         + ": expected " + operation.expectedCount() + ", found more");
-            for (Result result : chunk.getResultsList()) {
-                bytes += result.getSerializedSize();
-            }
         }
 
         /** The final response (more = false): status, the remaining results and every check. */
@@ -248,7 +247,6 @@ public final class TraceRequests {
                         + ": expected " + operation.expectedCount() + ", found " + count);
             results.addAndGet(count);
             queries.incrementAndGet();
-            resultBytes.addAndGet(bytes);
             maxResults.accumulateAndGet(count, Math::max);
         }
     }
@@ -277,14 +275,29 @@ public final class TraceRequests {
         return maxGroupMembers.get();
     }
 
-    private Request countRequest(Request request) {
-        executeRequests.incrementAndGet();
+
+
+    void rpcRequest(com.google.protobuf.MessageLite request, String kind) {
+        rpcRequests.incrementAndGet();
         requestBytes.addAndGet(request.getSerializedSize());
-        return request;
+        rpcKinds.computeIfAbsent(kind, key -> new AtomicLong()).incrementAndGet();
     }
 
-    /** Execute request messages; a stream contains many messages. */
-    public long executeRequests() {
-        return executeRequests.get();
+    void rpcResults(List<Result> items) {
+        returnedResults.addAndGet(items.size());
+        for (var item : items) resultBytes.addAndGet(item.getSerializedSize());
+    }
+
+    public long returnedResults() { return returnedResults.get(); }
+
+    public java.util.Map<String, Long> rpcKinds() {
+        var result = new java.util.TreeMap<String, Long>();
+        rpcKinds.forEach((kind, count) -> result.put(kind, count.get()));
+        return result;
+    }
+
+    /** Actual data RPC calls, including one call per batch or search-group member. */
+    public long rpcRequests() {
+        return rpcRequests.get();
     }
 }

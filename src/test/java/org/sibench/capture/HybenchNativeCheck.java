@@ -212,7 +212,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
                         row.read(),row.local(),row.query())));
             }
             var trace=output.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(trace);
-            try(writer){DuckDbProjection.write(observer,writer);}
+            try(writer){DuckDbProjection.write(observer,true,writer);}
             long[] ids={0},searches={0},matched={0};
             try(var backend=VersionedIndexBackend.create(output.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {
                 var consumer=new IndexOperationTrace.Consumer(){

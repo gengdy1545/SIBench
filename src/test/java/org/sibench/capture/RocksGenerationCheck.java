@@ -24,9 +24,11 @@ public class RocksGenerationCheck {
         document.put("artifacts", Map.of("directory", root.relativize(run.resolve("generated")).toString()));
         var json = new GsonBuilder().setPrettyPrinting().create();
         Path profile = run.resolve("profile.json"); Files.writeString(profile, json.toJson(document));
+        Path engine = run.resolve("rocksdb.json"); Files.writeString(engine, json.toJson(Map.of("schema_version", 1, "purpose", "engine",
+                "engine", "rocksdb", "build_directory", runtime, "cache_bytes", 32L << 20, "write_buffer_bytes", 4L << 20, "background_jobs", 2)));
         Path config = run.resolve("runtime.json"); Files.writeString(config, json.toJson(Map.of(
                 "schema_version", 1, "purpose", "sibench", "benchmarks", List.of(Map.of("config", profile.toString(), "mode", "api", "engine", "rocksdb")),
-                "rocksdb", Map.of("build_directory", runtime, "cache_bytes", 32L << 20, "write_buffer_bytes", 4L << 20, "background_jobs", 2))));
+                "engines", Map.of("rocksdb", engine.toString()))));
         var result = Generation.run(root, config).get(0);
         assertEquals(1000L, result.get("baseline_rows")); assertEquals(1000L, result.get("baseline_operations"));
         assertEquals(0L, result.get("aborted_transactions"));

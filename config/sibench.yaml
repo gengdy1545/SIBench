@@ -21,19 +21,13 @@ benchmarks:
     mode: capture
     engine: postgres
   - config: config/benchmark/hybench.yaml
-    mode: capture
-    engine: postgres
-duckdb:
-  build_directory: build/services/duckdb
-  memory_limit: 16GiB
-  threads: 8
-postgres:
-  build_directory: build/services/postgres
-rocksdb:
-  build_directory: build/services/rocksdb
-  cache_bytes: 1073741824
-  write_buffer_bytes: 4294967296
-  background_jobs: 16
+    mode: cdc
+    engine: pixels
+engines:
+  duckdb: config/engine/duckdb.yaml
+  postgres: config/engine/postgres.yaml
+  rocksdb: config/engine/rocksdb.yaml
+  pixels: config/engine/pixels/pixels.yaml
 analysis:
   layout:
     entries_per_block: 256

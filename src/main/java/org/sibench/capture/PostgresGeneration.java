@@ -25,10 +25,10 @@ final class PostgresGeneration {
         var executor=Executors.newSingleThreadExecutor();Throwable primary=null;
         var timings=new LinkedHashMap<String,Double>();
         try(var capture=new PostgresCapture(endpoint,output.resolve("pending"),4L<<30,262144);
-                var database=PostgresDatabase.create(runtime,output.resolve("database"),endpoint)) {
+                var database=PostgresDatabase.create(runtime,output.resolve("database"),endpoint,
+                        org.sibench.config.SibenchConfig.postgresSettings(object(build.settings(),"settings")))) {
             try {
-                json(output.resolve("effective-config.json"),Map.of("runtime",plan.runtime(),"benchmark",input.document(),
-                        "engine",input.selection().engine(),"mode",input.selection().mode()));
+                json(output.resolve("effective-config.json"),Generation.effectiveConfig(plan,input));
                 json(output.resolve("engine-build.json"),build.identity());json(output.resolve("client-build.json"),input.buildIdentity());
                 long loadStart=System.nanoTime();
                 boolean hybench=input.selection().benchmark().equals("hybench");
@@ -83,13 +83,13 @@ final class PostgresGeneration {
                 try(var control=database.connect("source-drain")){capture.finishSources(control);}
                 projected.get(input.timeout().toMillis(),TimeUnit.MILLISECONDS);
                 timings.put("workload_and_export_seconds",seconds(workloadStart));
-                // The Trace is complete without native rows: stop the cluster normally, then discard its data.
-                long closeStart=System.nanoTime();database.close();Generation.deleteTree(database.data());
-                timings.put("native_close_seconds",seconds(closeStart));long publicationStart=System.nanoTime();
+                // The Trace is complete without native rows: stop the cluster normally, publish, then discard its data.
+                long closeStart=System.nanoTime();database.close();
+                timings.put("native_close_seconds",seconds(closeStart));
                 var evidence=Map.<String,Object>of("engine",build.identity(),"client",input.buildIdentity(),"stages",stages,
                         "request_budget",budget.finish(),"effective_config_sha256",Digests.sha256(output.resolve("effective-config.json")),"baseline_rows",input.baselineRows());
-                var manifest=trace.publish(evidence);
-                timings.put("publication_seconds",seconds(publicationStart));timings.put("total_seconds",seconds(started));
+                var manifest=Generation.publishThenDiscard(()->trace.publish(evidence),database.data(),timings);
+                timings.put("total_seconds",seconds(started));
                 json(output.resolve("result.json"),Map.of("status","complete","trace",output.resolve("trace").toString(),"timings",timings));
                 return manifest;
             }catch(Exception|Error failure){capture.fail(failure);throw failure;}

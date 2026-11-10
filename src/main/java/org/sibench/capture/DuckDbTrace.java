@@ -61,7 +61,7 @@ public final class DuckDbTrace implements AutoCloseable {
         }
     }
 
-    /** The caller closes the host and discards its native data before publishing. */
+    /** The caller closes the host and publishes; native data is discarded only after publication. */
     public record Draft(Path directory,Map<String,Object> manifest) {
         public Draft {manifest=Map.copyOf(manifest);}
         public Map<String,Object> publish()throws IOException,SQLException {
@@ -95,7 +95,7 @@ public final class DuckDbTrace implements AutoCloseable {
                 shapes.merge((operation.flags()&IndexOperationTrace.INTERSECT_GROUP)!=0?"intersection":"union",1L,Long::sum);
             workload.accept(operation);
         };
-        DuckDbProjection.write(database,output);
+        DuckDbProjection.write(database,secondaryIndexes,output);
         if(lastVersion()-before!=number(database,"SELECT count(*) FROM temp.main.sibench_transactions"))
             throw new IOException("Incomplete native transaction projection");
         statements+=number(database,"SELECT count(*) FROM temp.main.sibench_statements");

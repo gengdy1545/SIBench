@@ -27,7 +27,7 @@ public class PostgresCaptureCheck {
         Path sockets=Files.createTempDirectory("pg-credit-"),endpoint=sockets.resolve("capture.sock");
         var executor=Executors.newSingleThreadExecutor();
         try(var capture=new PostgresCapture(endpoint,temporary.getRoot().toPath().resolve("pending"),16L<<20,256);
-                var cluster=PostgresDatabase.create(Path.of(runtime),temporary.getRoot().toPath().resolve("source"),endpoint)) {
+                var cluster=PostgresDatabase.create(Path.of(runtime),temporary.getRoot().toPath().resolve("source"),endpoint,org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=cluster.connect("setup")) {
                 setup.setAutoCommit(false);NativeHistory.initialize(setup,Engine.POSTGRES);PostgresCapture.install(setup);setup.commit();
             }
@@ -58,7 +58,7 @@ public class PostgresCaptureCheck {
         var executor=Executors.newSingleThreadExecutor();
         Path source=temporary.getRoot().toPath().resolve("source");
         try(var capture=new PostgresCapture(endpoint,temporary.getRoot().toPath().resolve("pending"),16L<<20,1024);
-                var cluster=PostgresDatabase.create(Path.of(runtime),source,endpoint)) {
+                var cluster=PostgresDatabase.create(Path.of(runtime),source,endpoint,org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=cluster.connect("setup")) {
                 sql(setup,"CREATE TABLE items(id BIGINT PRIMARY KEY,value BIGINT)");sql(setup,"INSERT INTO items VALUES(1,10),(2,20)");
                 setup.setAutoCommit(false);NativeHistory.initialize(setup,Engine.POSTGRES);

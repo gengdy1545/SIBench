@@ -28,6 +28,35 @@ public class PostgresGenerationCheck {
     @Test public void sharedOutputBudgetControlsRealSourceAdmission() throws Exception {
         Path root=Path.of("").toRealPath();
         Path output=Files.createTempDirectory(root.resolve("results/capture"),"postgres-budget-");
+        var result=Generation.run(root,settings(root,output)).get(0);
+        assertEquals(1024L,result.get("baseline_operations"));
+        assertFalse(Files.exists(output.resolve("generated/database/data")));
+        var budget=object(object(result,"source_evidence"),"request_budget");
+        assertTrue(((Number)budget.get("effective_requests")).longValue()>=600);
+        assertEquals(6,object(budget,"stages").size());
+        assertTrue(Files.exists(output.resolve("generated/oltp_read_write/budget.stop")));
+        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
+                new org.sibench.replay.ReplayConfig(false,0,0,0,0,"operation"),output.resolve("reference.json")).get("status"));
+    }
+    @Test public void failedPublicationRetainsTheClosedDatabase() throws Exception {
+        Path root=Path.of("").toRealPath();
+        Path output=Files.createTempDirectory(root.resolve("results/capture"),"postgres-publication-");
+        Path trace=output.resolve("generated/trace"),settings=settings(root,output);
+        var executor=Executors.newSingleThreadExecutor();
+        try {
+            // An occupied partial-manifest path makes publication fail after normal shutdown.
+            var occupied=executor.submit(()->{
+                while(!Files.isDirectory(trace))Thread.sleep(5);
+                return Files.createDirectory(trace.resolve("manifest.json.partial"));
+            });
+            var failure=assertThrows(java.nio.file.FileAlreadyExistsException.class,()->Generation.run(root,settings));
+            assertTrue(occupied.isDone());assertTrue(failure.getMessage().contains("manifest.json.partial"));
+        }finally{executor.shutdownNow();}
+        assertTrue(Files.exists(trace.resolve("INCOMPLETE")));assertFalse(Files.exists(trace.resolve("manifest.json")));
+        assertTrue(Files.isRegularFile(output.resolve("generated/database/data/PG_VERSION")));
+        assertTrue(Files.isRegularFile(output.resolve("generated/failure.txt")));
+    }
+    private static Path settings(Path root,Path output) throws Exception {
         String runtime=System.getProperty("sibench.postgres.runtime"),client=System.getProperty("sibench.sysbench.build");
         assertNotNull(runtime);assertNotNull(client);
         var document=DuckDbGenerationTest.profile("sysbench");var config=object(document,"native");
@@ -40,17 +69,13 @@ public class PostgresGenerationCheck {
         document.put("artifacts",Map.of("directory",root.relativize(output.resolve("generated")).toString()));
         var yaml=new org.yaml.snakeyaml.Yaml();Path profile=output.resolve("profile.yaml"),settings=output.resolve("runtime.yaml");
         Files.writeString(profile,yaml.dump(document));
+        Path engine=output.resolve("postgres.yaml");
+        Files.writeString(engine,yaml.dump(Map.of("schema_version",1,"purpose","engine","engine","postgres",
+                "build_directory",Path.of(runtime).getParent().toString(),"settings",org.sibench.generation.PostgresTestSettings.SETTINGS)));
         Files.writeString(settings,yaml.dump(Map.of("schema_version",1,"purpose","sibench",
                 "benchmarks",java.util.List.of(Map.of("config",profile.toString(),"mode","capture","engine","postgres")),
-                "postgres",Map.of("build_directory",Path.of(runtime).getParent().toString()))));
-        var result=Generation.run(root,settings).get(0);
-        assertEquals(1024L,result.get("baseline_operations"));
-        var budget=object(object(result,"source_evidence"),"request_budget");
-        assertTrue(((Number)budget.get("effective_requests")).longValue()>=600);
-        assertEquals(6,object(budget,"stages").size());
-        assertTrue(Files.exists(output.resolve("generated/oltp_read_write/budget.stop")));
-        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
-                new org.sibench.replay.ReplayConfig(false,0,0,0,0,"operation"),output.resolve("reference.json")).get("status"));
+                "engines",Map.of("postgres",engine.toString()))));
+        return settings;
     }
     private void run(boolean secondaryIndexes) throws Exception {
         String runtime=System.getProperty("sibench.postgres.runtime"),client=System.getProperty("sibench.sysbench.build");
@@ -64,7 +89,7 @@ public class PostgresGenerationCheck {
         config.put("workloads",workloads);document.put("native",config);
         var source=SourceSchema.read(root,document);var executor=Executors.newSingleThreadExecutor();
         try(var capture=new PostgresCapture(sockets.resolve("capture.sock"),output.resolve("pending"),64L<<20,4096);
-                var database=PostgresDatabase.create(Path.of(runtime),output.resolve("source"),sockets.resolve("capture.sock"))) {
+                var database=PostgresDatabase.create(Path.of(runtime),output.resolve("source"),sockets.resolve("capture.sock"),org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=database.connect("load-schema")){PostgresDatabase.unloggedTables(setup);}
             PostgresSysbench.run(root,root.resolve(client),config,database,output.resolve("load"),"oltp_read_write",null);
             var trace=new PostgresTrace(output.resolve("trace"),source,secondaryIndexes);

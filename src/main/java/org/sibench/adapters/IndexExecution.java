@@ -31,6 +31,7 @@ public final class IndexExecution {
      * 1 MB, so a chunk fits gRPC's default 4 MiB inbound message limit.
      */
     static final int CHUNK_RESULTS = 16_384;
+    static final int MAX_MESSAGE_BYTES = 32 * 1024 * 1024;
 
     private IndexExecution() {}
 
@@ -51,7 +52,7 @@ public final class IndexExecution {
                 case WRITE -> backend.write(request.getWrite());
                 case BATCH -> batch(backend, request.getBatch());
                 case SEARCH -> response = search(backend, request, partial);
-                case GROUP -> response.addAllResults(group(backend, request.getGroup()));
+                case GROUP -> throw new IllegalArgumentException("Search groups execute on the client");
                 default -> throw new IllegalArgumentException("Request without an operation");
             }
             return response.setStatus(Status.OK).build();
@@ -62,20 +63,43 @@ public final class IndexExecution {
         }
     }
 
-    /** A batch of Baseline INSERTs; any other write refuses the whole batch before applying it. */
+    /** Validate every member before applying a batch; execution failures may be partial. */
     static void batch(IndexBackend backend, org.sibench.adapters.proto.WriteBatch batch) throws IOException {
+        if (batch.getWritesCount() == 0) throw new IllegalArgumentException("Empty write batch");
+        var kind = backend.describe().valueKind();
         for (var write : batch.getWritesList()) {
-            if (write.getKind() != org.sibench.adapters.proto.Write.Kind.INSERT || write.getVersion() != 0)
-                throw new IllegalArgumentException("A write batch holds Baseline INSERTs only");
-            validateKey(write.getKey());
+            validateWrite(write, kind);
+            if (write.getKind() == org.sibench.adapters.proto.Write.Kind.RELOCATE)
+                throw new IllegalArgumentException("Relocate is not a batch mutation");
         }
-        backend.writeBaseline(batch.getWritesList());
+        backend.writeBatch(batch.getWritesList());
     }
 
     static void validateKey(org.sibench.adapters.proto.EntryKey key) {
-        if (key.getTable() < 1 || (key.getIndex() == 0) != key.getIndexedValue().isEmpty()
-                || key.getPrimaryKey().isEmpty())
+        if (!key.getUnknownFields().asMap().isEmpty() || key.getTable() < 1 || key.getIndex() < 0
+                || (key.getIndex() == 0) != key.getIndexedValue().isEmpty() || key.getPrimaryKey().isEmpty())
             throw new IllegalArgumentException("Invalid entry key");
+    }
+
+    static void validateWrite(org.sibench.adapters.proto.Write write, org.sibench.adapters.proto.ValueKind kind) {
+        validateKey(write.getKey());
+        if (!write.getUnknownFields().asMap().isEmpty() || write.getVersion() < 0)
+            throw new IllegalArgumentException("Unsupported write fields or version");
+        switch (write.getKind()) {
+            case INSERT -> { if (write.getVersion() != 0) throw new IllegalArgumentException("Insert outside the baseline"); }
+            case UPSERT, LOGICAL_DELETE, RELOCATE -> { }
+            default -> throw new IllegalArgumentException("Unknown write kind");
+        }
+        if (write.getKind() == org.sibench.adapters.proto.Write.Kind.LOGICAL_DELETE) {
+            if (write.hasValue()) throw new IllegalArgumentException("Delete carries no value");
+        } else {
+            if (!write.hasValue() || !write.getValue().getUnknownFields().asMap().isEmpty())
+                throw new IllegalArgumentException("Missing or unsupported write value");
+            var value = write.getValue();
+            if (kind == org.sibench.adapters.proto.ValueKind.ROW_ID && (value.getFile() != 0 || value.getPosition() != 0)
+                    || kind == org.sibench.adapters.proto.ValueKind.LOCATOR && value.getRowId() != 0)
+                throw new IllegalArgumentException("Write value differs from the service value mode");
+        }
     }
 
     /**
@@ -86,13 +110,23 @@ public final class IndexExecution {
             IndexBackend backend, Request request, java.util.function.Consumer<Response> partial)
             throws IOException {
         var chunk = new Response.Builder[] {Response.newBuilder().setId(request.getId())};
+        int[] bytes = {0};
         backend.search(
                 request.getSearch(),
                 result -> {
+                    int size = result.getSerializedSize() + 10;
+                    if (size > MAX_MESSAGE_BYTES - 64) throw new IOException("One index result exceeds the RPC message limit");
+                    if (chunk[0].getResultsCount() > 0 && bytes[0] + size > 1024 * 1024) {
+                        partial.accept(chunk[0].setStatus(Status.OK).setMore(true).build());
+                        chunk[0] = Response.newBuilder().setId(request.getId());
+                        bytes[0] = 0;
+                    }
                     chunk[0].addResults(result);
+                    bytes[0] += size;
                     if (chunk[0].getResultsCount() == CHUNK_RESULTS) {
                         partial.accept(chunk[0].setStatus(Status.OK).setMore(true).build());
                         chunk[0] = Response.newBuilder().setId(request.getId());
+                        bytes[0] = 0;
                     }
                 });
         return chunk[0];
@@ -102,7 +136,7 @@ public final class IndexExecution {
      * The members' results combined by primary key: an intersection keeps the first member's
      * entries every other member also found, a union adds the entries later members found.
      */
-    static List<Result> group(IndexBackend backend, SearchGroup group) throws IOException {
+    static List<Result> group(SearchGroup group, List<List<Result>> results) {
         if (group.getMembersCount() < 2) throw new IllegalArgumentException("A group has at least two members");
         boolean intersect = switch (group.getMode()) {
             case INTERSECTION -> true;
@@ -111,14 +145,14 @@ public final class IndexExecution {
         };
         Search first = group.getMembers(0);
         var combined = new LinkedHashMap<ByteString, Result>();
-        for (Result result : backend.search(first)) combined.put(result.getPrimaryKey(), result);
+        for (Result result : results.get(0)) combined.put(result.getPrimaryKey(), result);
         for (int i = 1; i < group.getMembersCount(); i++) {
             Search member = group.getMembers(i);
             if (member.getTable() != first.getTable()
                     || member.getReadVersion() != first.getReadVersion())
                 throw new IllegalArgumentException("Group members span tables or read versions");
             var keys = new HashSet<ByteString>();
-            for (Result result : backend.search(member)) {
+            for (Result result : results.get(i)) {
                 keys.add(result.getPrimaryKey());
                 if (!intersect) combined.putIfAbsent(result.getPrimaryKey(), result);
             }

@@ -29,10 +29,16 @@ public interface ReplayTarget extends AutoCloseable {
     /** Sends whatever the client still holds back, such as a partial batch, before a drain. */
     default void flush() throws IOException {}
 
-    record SendHandle(CompletionStage<Void> sent, CompletionStage<Void> response) {
+    /** response includes source-group validation; businessResponse ends this operation's latency. */
+    record SendHandle(CompletionStage<Void> sent, CompletionStage<Void> response,
+                      CompletionStage<Void> businessResponse) {
+        public SendHandle(CompletionStage<Void> sent, CompletionStage<Void> response) {
+            this(sent, response, response);
+        }
         public SendHandle {
             Objects.requireNonNull(sent);
             Objects.requireNonNull(response);
+            Objects.requireNonNull(businessResponse);
         }
 
         public static SendHandle completed() {

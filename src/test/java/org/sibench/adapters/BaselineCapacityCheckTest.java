@@ -50,7 +50,6 @@ public class BaselineCapacityCheckTest {
                 var a=client.send(1,first);var b=client.send(2,second);
                 a.response().toCompletableFuture().get(5,TimeUnit.SECONDS);
                 b.response().toCompletableFuture().get(5,TimeUnit.SECONDS);
-                remote.flush("independent baseline test");
                 var delta=BaselineCapacityCheck.difference(sink.received.summary(),before);
                 if(drop&&round==0)assertThrows(java.io.IOException.class,()->BaselineCapacityCheck.verify(expected,delta));
                 else BaselineCapacityCheck.verify(expected,delta);

@@ -16,6 +16,25 @@ import org.sibench.trace.IndexKey;
 public class IndexExecutorTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test(timeout=10000)
+    public void persistenceRunsWithoutAClientFlushAndItsFailureRejectsFurtherCalls() throws Exception {
+        var flushed=new java.util.concurrent.CountDownLatch(1);
+        try(var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("maintenance"),ValueKind.ROW_ID)) {
+            var failing=(IndexBackend)java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{IndexBackend.class},(proxy,method,args)->{
+                if(method.getName().equals("flush")) { flushed.countDown(); throw new IOException("storage unavailable"); }
+                try { return method.invoke(backend,args); } catch(java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
+            });
+            var executor=new IndexExecutor(failing,20);
+            var write=Request.newBuilder().setWrite(IndexRpc.write(IndexServerTest.put(7,1,70))).build();
+            assertEquals(Status.OK,executor.submit(write).get(2,TimeUnit.SECONDS).getStatus());
+            assertTrue(flushed.await(2,TimeUnit.SECONDS));
+            var error=assertThrows(IOException.class,executor::close);
+            assertTrue(error.getMessage().contains("Background persistence"));
+            assertEquals("storage unavailable",error.getCause().getMessage());
+            assertEquals(Status.UNAVAILABLE,executor.submit(write).get(2,TimeUnit.SECONDS).getStatus());
+        }
+    }
+
     @Test(timeout = 10000)
     public void flushCannotCertifyAnAcceptedFailedRequest() throws Exception {
         try (var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("failed"), ValueKind.ROW_ID);
@@ -72,7 +91,7 @@ public class IndexExecutorTest {
         int rows = IndexExecution.CHUNK_RESULTS + 5;
         var fail = new java.util.concurrent.atomic.AtomicBoolean();
         var backend = new IndexBackend() {
-            public DescribeResponse describe() { return DescribeResponse.getDefaultInstance(); }
+            public IndexDescription describe() { return new IndexDescription("fixture",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,"test",location()); }
             public void write(Write write) { throw new UnsupportedOperationException(); }
             public void search(Search search, ResultSink sink) throws IOException {
                 for (int key = 1; key <= rows; key++) {

@@ -6,7 +6,7 @@ SIBench runs upstream benchmarks on native databases, exports a unified index Tr
 | --- | --- | --- |
 | YCSB | `api` / RocksDB | A/B/C/F/D/E; Read-modify-write remains two API calls. |
 | sysbench | `capture` / PostgreSQL or DuckDB | Six configured OLTP workloads. |
-| HyBench | `capture` / DuckDB or PostgreSQL | AP → TP → concurrent XP. |
+| HyBench | `capture` / DuckDB or PostgreSQL; `cdc` / Pixels | AP → TP → concurrent XP. `cdc` runs HyBench on an uninstrumented PostgreSQL and exports the primary-index calls Pixels makes while applying its change stream. |
 
 ## Build
 
@@ -18,6 +18,7 @@ Use JDK 17, Maven and Git; set `JAVA_HOME`. Run from the repository root. Upstre
 | DuckDB | Linux/glibc x86-64, Python 3.9+, C++17, CMake 3.16+, make and patch. |
 | PostgreSQL | C compiler, make, patch, Perl, Bison, Flex and libzstd development headers; run PostgreSQL as an unprivileged user. |
 | Benchmark clients | HyBench/YCSB use Maven; sysbench also needs autotools, pkg-config, libtool, libaio and libpq development libraries. |
+| Pixels | Java phase: Maven with network access to Maven Central, and CMake/C++ for the Retina library built by Pixels' Maven build. Native phase, on the operating system that runs Pixels: CMake, C/C++, make, the PostgreSQL build tools above, curl and network access to GitHub (jemalloc, googletest and the pinned etcd release). |
 
 Build the embedded native runtimes before the Java application:
 
@@ -40,7 +41,14 @@ scripts/build-benchmarks.sh config/benchmark/sysbench.yaml
 scripts/build-benchmarks.sh config/benchmark/hybench.yaml
 ```
 
-Runtime engine paths come from `ENGINE.build_directory`; clients build under `build/benchmarks/`. Builds require clean pinned sources and fresh destinations, retain diagnostics on failure, and record input/artifact identities checked by generation. `JOBS` controls parallel compilation. Upstream licenses remain in [RocksDB](third_party/rocksdb/COPYING), [DuckDB](third_party/duckdb/LICENSE), [DuckDB Java](third_party/duckdb-java/LICENSE) and [PostgreSQL](third_party/postgresql/COPYRIGHT); both embedded runtime JARs include their license texts.
+Build the Pixels CDC engine in two phases; the native phase may run on another host after copying the directory:
+
+```bash
+scripts/build-pixels.sh java build/services/pixels
+scripts/build-pixels.sh native build/services/pixels
+```
+
+Runtime engine paths come from each engine configuration's `build_directory`; clients build under `build/benchmarks/`. Builds require clean pinned sources and fresh destinations, retain diagnostics on failure, and record input/artifact identities checked by generation. `JOBS` controls parallel compilation. Upstream licenses remain in [RocksDB](third_party/rocksdb/COPYING), [DuckDB](third_party/duckdb/LICENSE), [DuckDB Java](third_party/duckdb-java/LICENSE), [PostgreSQL](third_party/postgresql/COPYRIGHT), [Pixels](third_party/pixels/LICENSE) and [pixels-sink](third_party/pixels-sink/LICENSE); both embedded runtime JARs include their license texts.
 
 ### rocksdb-cloud JNI
 
@@ -68,7 +76,8 @@ The destination must be fresh. It retains source/build identities, native test r
 
 | Configuration | Responsibility |
 | --- | --- |
-| [sibench.yaml](config/sibench.yaml) | Explicit benchmark/mode/engine selection, native engine resources, replay and analysis. |
+| [sibench.yaml](config/sibench.yaml) | Explicit benchmark/mode/engine selection, the engine configuration files, replay and analysis. |
+| [postgres.yaml](config/engine/postgres.yaml), [duckdb.yaml](config/engine/duckdb.yaml), [rocksdb.yaml](config/engine/rocksdb.yaml), [pixels/](config/engine/pixels/pixels.yaml) | Engine build directory and resources. PostgreSQL server settings and Pixels/pixels-sink property overrides of the pinned upstream defaults live here; the generator assigns endpoints, run directories and settings that define Trace semantics, and rejects them in these files. |
 | [ycsb.yaml](config/benchmark/ycsb.yaml), [sysbench.yaml](config/benchmark/sysbench.yaml), [hybench.yaml](config/benchmark/hybench.yaml) | Source, schema, scale, workloads, concurrency, timeout, build/output paths and Trace export. |
 | [rocksdb_cloud.yaml](config/index/rocksdb_cloud.yaml), [slatedb.yaml](config/index/slatedb.yaml), [storage.yaml](config/index/storage.yaml) | Index Service and object storage. |
 
@@ -81,11 +90,21 @@ java -jar build/sibench/sibench.jar generate config/sibench.yaml
 
 `generate` validates every selected input before starting a host, ignores unselected profiles, runs selections in order and stops at the first failure. Each source uses one fresh database for loading, RowID identities and workload execution, and deletes it after publication. Existing/overlapping outputs, changed build/source inputs and unsupported configurations are rejected. Successful publication requires normal shutdown; failures retain diagnostics and cannot resume.
 
-`trace.workload_requests` counts each exported write and SearchGroup member (or standalone Search) after committed-state coalescing and index filtering; baseline and source transaction markers are excluded. Generation repeats finite source batches on the same database, distributes remaining requests across remaining workloads, and drains admitted events/transactions. HyBench runs AP once before allocating the remainder to TP/XP. Actual output may exceed the target by source activity already captured but not yet exported when the target is reached, especially by a whole DuckDB window or a PostgreSQL capture backlog; no-progress batches fail. Omitting the target runs each configured batch once. `request-budget.json` records actual counts and overshoot.
+`trace.workload_requests` counts each exported write and SearchGroup member (or standalone Search) after committed-state coalescing and index filtering; baseline and source transaction markers are excluded. Generation repeats finite source batches on the same database, distributes remaining requests across remaining workloads, and drains admitted events/transactions. HyBench native capture runs AP once before allocating the remainder to TP/XP; Pixels CDC shares the budget between TP and AT, with AP/IQ disabled. Actual output may exceed the target by source activity already captured but not yet exported when the target is reached, especially by a whole DuckDB window or a PostgreSQL capture backlog; no-progress batches fail. Omitting the target runs each configured batch once. `request-budget.json` records actual counts and overshoot.
 
 `trace.secondary_indexes` defaults to false: only primary-index requests are exported, while source secondary indexes remain in use. Set true for all source indexes. Consumption has a separate `target.secondary_indexes.enabled` switch and cannot request indexes absent from the Trace. [Filtering and expansion rules](docs/trace.md#operations-and-index-expansion) preserve whole query groups and transaction outcomes.
 
-Published artifacts contain separate baseline/workload streams, work units and a manifest with identities and statistics; they contain no native database or row contents. An `INCOMPLETE` marker prevents consumption. See [publication](docs/trace.md#native-publication). Current native output supports RowID values only.
+Published artifacts contain separate baseline/workload streams, work units and a manifest with identities and statistics; they contain no native database or row contents. An `INCOMPLETE` marker prevents consumption. See [publication](docs/trace.md#native-publication). SQL and RocksDB generation export RowID values; Pixels CDC exports both RowID and Locator values.
+
+The public runtime generates HyBench with `cdc` / Pixels, using a [TP/AT transaction subset](docs/trace.md#native-publication) rather than full HyBench HTAP; select `capture` with `postgres` or `duckdb` in a runtime copy for the native-capture Trace. Pixels CDC runs Pixels next to the generator when `pixels_host` is `local`. To run Pixels on another host, start the agent there with the same build and a token file, set `pixels_host: HOST:PORT` in an experiment copy of the engine configuration, and export `SIBENCH_PIXELS_HOST_TOKEN` for `generate`; the source PostgreSQL, HyBench and pixels-sink stay with the generator:
+
+```bash
+java -jar build/sibench/sibench.jar pixels-host ADDRESS:PORT build/services/pixels WORK_ROOT TOKEN_FILE
+```
+
+The generator checks the agent's Java build and native source/capacity identity before loading, and records the agent's actual build in the Trace. Host requests have deadlines covering uploads and responses. PostgreSQL and Pixels load independently from the same generated CSVs. The generator converts Pixels inputs into bounded text shards, using `load.rows_per_file` for the shard size and `load.threads` for parallel file consumers. Workloads start after both baselines and per-table counts pass. `source-load.json`, `baseline-load.json`, `pixels-schema.tsv` and `progress.jsonl` record the effective schema, overlapping phases and capture progress.
+
+Optional resource sampling: `scripts/sample-pixels-resources.sh OUT STOP_FILE [INTERVAL_SECONDS]`, with `WAL_DIR` set to the source WAL directory. Create `STOP_FILE` to stop. `pod_anon_metric` distinguishes cgroup v2 `anon` from v1 `total_rss`; unavailable readings are `null`. Per-process RSS sums count shared pages repeatedly and are not exclusive memory usage.
 
 Engine memory settings are not total process-memory caps; client `timeout_minutes` and separate setup/shutdown bounds are not whole-run resource quotas. Generation provides no crash recovery or reusable initial-state cache. Large-input capacity and performance require separate validation.
 
@@ -104,7 +123,7 @@ java -jar build/sibench/sibench.jar replay-service config/sibench.yaml \
 
 The runtime template selects gRPC, RowID values and explicit client/in-flight limits. Both ends must agree on value mode and secondary-index filtering. The comparison backends are RocksDB-Cloud and SlateDB; select their configuration under `config/index/`. Replace storage placeholders and supply credentials through the environment. Each run needs a fresh local path and object prefix; buckets must already exist. Local RocksDB remains an in-process test fixture and the YCSB generation engine, outside the Index Service comparison.
 
-Replay checks input integrity, service capabilities, response completion, native result counts and Flush completion and binding. Equal counts do not certify matching keys, versions, values or order. The same immutable Trace can be reused across backends and client settings.
+The data API is Get/Put/Delete/Scan/BatchWrite. Replay batches baseline loading and sends each incremental operation as a separate concurrent RPC. Services own asynchronous persistence and expose no Flush RPC. Replay checks input integrity, deployment/value mode and binding, response completion and native result counts. Equal counts do not certify matching keys, versions, values or order. The same immutable Trace can be reused across backends and client settings.
 
 `check-replay CONFIG TRACE` is an optional preflight-only diagnostic; replay already performs these checks. `plan-operations PROFILE TRACE REPLAY_CONFIG` estimates source batch parameters from a calibration Trace, not achievable throughput. Request supply, dispatch warmup and operation rates count the same basic operations; see [replay preflight](docs/trace.md#replay-preflight). To check persisted snapshots explicitly, use `service.reopen: true` and `verify-service`; [only committed-snapshot queries are exported](docs/index-service.md#persistence-and-reopening).
 
@@ -134,15 +153,19 @@ Native `*Check` and `*IT` classes are explicit opt-ins, not part of the default 
 | `PostgresHistoryCheck,PostgresAccessesCheck,PostgresCaptureCheck,PostgresVersionsCheck,PostgresProjectionCheck,PostgresGenerationCheck` | `sibench.postgres.runtime=build/services/postgres/runtime`; generation also needs `sibench.sysbench.build=build/benchmarks/sysbench`. |
 | `RocksDbHistoryCheck,RocksYcsbCheck,RocksGenerationCheck` | `sibench.rocksdb.library=$PWD/build/services/rocksdb/libsibench_rocksdb.so`; generation also needs `sibench.rocksdb.build=build/services/rocksdb` and `sibench.ycsb.build=build/benchmarks/YCSB`. |
 | `DuckDbTraceCheck,DuckDbAccessesCheck,DuckDbGenerationCheck,HybenchNativeCheck` | `sibench.duckdb.host=build/services/duckdb/duckdb_host`; source integration also needs `sibench.sysbench.build` and/or `sibench.hybench.build`. `HybenchSamplingCheck` needs only the HyBench build. |
+| `PixelsGenerationCheck` | `sibench.pixels.build=build/services/pixels` (both build phases) and `sibench.hybench.build=build/benchmarks/HyBench-2024`; runs Pixels locally with small HyBench parameters and replays both value kinds. |
+| `PixelsCdcCheck` | `sibench.pixels.build=build/services/pixels`; eight hand-written baseline rows, real PostgreSQL → sink → Pixels update/delete/reinsert/rollback, historical RowID/Locator checks and an injected LOAD visibility-publication failure. |
+| `PixelsSourceCheck` | `sibench.postgres.runtime=build/services/pixels/postgres/runtime`; source-only PostgreSQL checks for key-change rejection, unchanged-key updates without guard function calls, rollback, preceding triggers and preservation of the original indexes. |
 | `SlateDbStoreCheck` | Source-built `sibench.slatedb.library`; `sibench.slatedb.storage=PATH`, `sibench.slatedb.profile=NAME`, `sibench.slatedb.object_path=FRESH_PREFIX`, and that profile's environment credentials. Uses one Db against the configured S3 store; no independent reader. |
 
-Native component checks require Python 3 or C++17 and the built DuckDB engine:
+Native component checks require the indicated built engine and Python 3, C++17 or JDK 17:
 
 | Entry point in [src/test/native](src/test/native) | Invocation / compile inputs |
 | --- | --- |
 | `duckdb_index_attempts.py`, `duckdb_mutations.py` | `python3 SCRIPT build/services/duckdb/duckdb`. |
 | `sysbench_errors.cc` | Compile with `-I src/main/native/sysbench -I third_party/duckdb/src/include`, then run the binary. |
 | `duckdb_snapshot_attempts.cc` | Compile with `-pthread -I build/services/duckdb/source/src/include -L build/services/duckdb/src -lduckdb`; make that library directory available at runtime. |
+| `pixels/DecoderChainProbe.java` | Compile with `javac --release 17 -cp BUILD/jars/pixels-sink.jar -d TEST_CLASSES src/test/native/pixels/DecoderChainProbe.java`, then run `java -cp TEST_CLASSES:BUILD/jars/pixels-sink.jar org.sibench.pixels.DecoderChainProbe`. Checks FIFO completion of 8,192 same-stream events without starting services. |
 
 Cloud JNI checks use `make -C src/main/native/index/rocksdb_cloud test` after that backend's build.
 
@@ -153,10 +176,10 @@ After `mvn package`, explicit validation tools run with `java -cp build/sibench/
 | `replay.ReplayMatrixValidation` | `TRACE FRESH_OUTPUT`: dispatch/index-selection matrix against the in-memory reference index. |
 | `adapters.IndexVersionCheck` | `SERVICE_CONFIG REPORT`: bounded hand-derived version/delete/reinsert checks on a fresh local or cloud backend. |
 | `adapters.IndexServerAcceptance` | `SERVICE_CONFIG`: starts a service; stdin `close` shuts it down. |
-| `adapters.StreamingLatencyCheck` | `ENDPOINT REPORT`: 64 baseline entries and 600 ordinary workload operations on a fresh service; verifies streaming completion, count/latency accounting and phase Flush. This is a small integration check, not a full-input or performance certification. |
+| `adapters.StreamingLatencyCheck` | `ENDPOINT REPORT`: 64 baseline entries and 600 ordinary workload operations on a fresh service; verifies individual RPC completion and count/latency accounting with batched baseline loading. This is a small integration check, not a full-input or performance certification. |
 | [ProtoTraceBenchmark](src/test/java/org/sibench/capture/ProtoTraceBenchmark.java), [DispatcherCapacityCheck](src/test/java/org/sibench/replay/DispatcherCapacityCheck.java), [DriverCapacityCheck](src/test/java/org/sibench/adapters/DriverCapacityCheck.java), [BaselineCapacityCheck](src/test/java/org/sibench/adapters/BaselineCapacityCheck.java) | Explicit parser/driver diagnostics; invocation forms are in each class's usage checks. Bound input, duration, heap and output before running. |
 
-Production generation, backend evaluation and independent acceptance are separate workflows. Native checks cover small inputs; they do not certify full-scale capacity. Full backend acceptance requires complete local and real-cloud replay of the same Trace with response/count checks and Flush. Fault recovery and performance studies require separate runs and budgets.
+Production generation, backend evaluation and independent acceptance are separate workflows. Native checks cover small inputs; they do not certify full-scale capacity. Full backend acceptance requires complete local and real-cloud replay of the same Trace with response/count checks and an independent check of internal persistence/reopening. Fault recovery and performance studies require separate runs and budgets.
 
 ## Supported scope
 

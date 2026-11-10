@@ -53,8 +53,11 @@ public class DuckDbGenerationCheck {
         }
         Files.writeString(output.resolve("unselected.yaml"),"invalid unselected profile: [");
         String host=System.getProperty("sibench.duckdb.host");assertNotNull("Set sibench.duckdb.host",host);
+        Path engine=output.resolve("duckdb.yaml");
+        Files.writeString(engine,new Yaml().dump(Map.of("schema_version",1,"purpose","engine","engine","duckdb",
+                "build_directory",Path.of(host).getParent().toString(),"memory_limit","1GiB","threads",2)));
         var runtime=new LinkedHashMap<String,Object>(Map.of("schema_version",1,"purpose","sibench","benchmarks",selections,
-                "duckdb",Map.of("build_directory",Path.of(host).getParent().toString(),"memory_limit","1GiB","threads",2)));
+                "engines",Map.of("duckdb",engine.toString())));
         Path config=output.resolve("runtime.yaml");
         var invalid=new LinkedHashMap<>(runtime);invalid.put("benchmarks",List.of(selections.get(0),Map.of("config",selections.get(1).get("config"),"engine","duckdb","mode","api")));
         Files.writeString(config,new Yaml().dump(invalid));

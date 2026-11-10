@@ -1,0 +1,85 @@
+--- a/pixels-cli/src/main/java/io/pixelsdb/pixels/cli/executor/LoadExecutor.java
++++ b/pixels-cli/src/main/java/io/pixelsdb/pixels/cli/executor/LoadExecutor.java
+@@ -123,7 +123,7 @@
+ 
+                 } catch (RetinaException e)
+                 {
+-                    System.out.println("add visibility for ordered file '" + file + "' failed");
++                    throw new IllegalStateException("Cannot publish LOAD visibility for " + file.getName(), e);
+                 }
+             }
+ 
+--- a/pixels-cli/src/main/java/io/pixelsdb/pixels/cli/load/AbstractPixelsConsumer.java
++++ b/pixels-cli/src/main/java/io/pixelsdb/pixels/cli/load/AbstractPixelsConsumer.java
+@@ -45,7 +45,6 @@
+ import java.util.List;
+ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.ConcurrentLinkedQueue;
+-import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.regex.Pattern;
+ 
+@@ -67,6 +66,7 @@
+     protected TypeDescription schema;
+     protected int maxRowNum;
+     protected String regex;
++    protected Pattern delimiterPattern;
+     protected EncodingLevel encodingLevel;
+     protected boolean nullsPadding;
+     protected SinglePointIndex index;
+@@ -97,6 +97,7 @@
+         this.schema = TypeDescription.fromString(parameters.getSchema());
+         this.maxRowNum = parameters.getMaxRowNum();
+         this.regex = parameters.getRegex().equals("\\s") ? " " : parameters.getRegex();
++        this.delimiterPattern = Pattern.compile(Pattern.quote(this.regex));
+         this.encodingLevel = parameters.getEncodingLevel();
+         this.nullsPadding = parameters.isNullsPadding();
+         this.orderMapping = parameters.getOrderMapping();
+@@ -124,14 +125,14 @@
+         {
+             while (isRunning)
+             {
+-                String originalFilePath = inputFiles.poll(2, TimeUnit.SECONDS);
++                String originalFilePath = inputFiles.poll();
+                 if (originalFilePath != null)
+                 {
+                     count++;
+                     processSourceFile(originalFilePath);
+                 } else
+                 {
+-                    // No source file can be consumed within 2 seconds, loading is considered finished.
++                    // LoadExecutor fills the complete queue before starting consumers.
+                     isRunning = false;
+                 }
+             }
+@@ -139,10 +140,6 @@
+             // Flush any remaining data from writers
+             flushRemainingData();
+ 
+-        } catch (InterruptedException e)
+-        {
+-            Thread.currentThread().interrupt();
+-            throw new RuntimeException(this.getClass().getSimpleName() + " interrupted", e);
+         } catch (RuntimeException e)
+         {
+             throw e;
+@@ -246,7 +243,7 @@
+     protected void writeRowToBatch(VectorizedRowBatch rowBatch, String line, long timestamp)
+     {
+         // limit=-1 keeps trailing empty fields; String.split(regex) drops them by default.
+-        String[] colsInLine = Pattern.compile(Pattern.quote(regex)).split(line, -1);
++        String[] colsInLine = delimiterPattern.split(line, -1);
+         writeRowToBatch(rowBatch, colsInLine, timestamp);
+     }
+ 
+--- a/pixels-cli/src/main/java/io/pixelsdb/pixels/cli/load/IndexedPixelsConsumer.java
++++ b/pixels-cli/src/main/java/io/pixelsdb/pixels/cli/load/IndexedPixelsConsumer.java
+@@ -94,7 +94,7 @@
+                  lineNumber++;
+ 
+                  // limit=-1 keeps trailing empty fields; String.split(regex) drops them by default.
+-                 String[] colsInLine = Pattern.compile(Pattern.quote(regex)).split(line, -1);
++                 String[] colsInLine = delimiterPattern.split(line, -1);
+ 
+                  // 1. Calculate Primary Key and Bucket ID
+                  ByteString pkByteString;

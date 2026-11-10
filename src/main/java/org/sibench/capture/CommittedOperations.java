@@ -20,7 +20,7 @@ final class CommittedOperations {
         Entry(Operation operation) { this(operation.table(), operation.index(), operation.indexedValue(), operation.key()); }
     }
     private final Map<Entry, Integer> lastWrites = new HashMap<>();
-    private long transaction, version, lastVersion, lastTransaction, ordinal, lastSource;
+    private long transaction, version, lastVersion, lastTransaction, ordinal, lastSource, sourceOperations, superseded;
     private Operation mutation, previousExpansion, searchGroup;
     private int expansionMembers, searchMembers;
     private long abortedWrites, localSearches, coalescedWrites, peakBuffered;
@@ -34,8 +34,6 @@ final class CommittedOperations {
             return;
         }
         if (transaction != 0) {
-            if (pending.size() >= MAX_TRANSACTION_OPERATIONS)
-                throw new IOException("Source transaction exceeds operation buffer limit");
             if (operation.sourceEvent() < lastSource)
                 throw new IOException("Source operation order moved backwards");
             lastSource = operation.sourceEvent();
@@ -49,8 +47,19 @@ final class CommittedOperations {
         // emitting them now keeps the output order: a read-only transaction is never buffered.
         if (transaction == 0 || pending.isEmpty() && operation.kind() == SEARCH
                 && (operation.flags() & TRANSACTION_LOCAL_SEARCH) == 0) output.accept(operation);
+        // Operations held for the outcome count against the limit, even when dropped or superseded early.
+        else if (sourceOperations++ >= MAX_TRANSACTION_OPERATIONS)
+            throw new IOException("Source transaction exceeds operation buffer limit");
+        else if (operation.kind() == SEARCH && (operation.flags() & TRANSACTION_LOCAL_SEARCH) != 0) localSearches++;
         else {
-            if (isMutation(operation)) lastWrites.put(new Entry(operation), pending.size());
+            // A superseded write is never exported; its slot keeps the survivors' source order.
+            if (isMutation(operation)) {
+                Integer previous = lastWrites.put(new Entry(operation), pending.size());
+                if (previous != null) {
+                    pending.set(previous, null);
+                    superseded++;
+                }
+            }
             pending.add(operation);
             peakBuffered = Math.max(peakBuffered, pending.size());
         }
@@ -65,7 +74,7 @@ final class CommittedOperations {
                 throw new IOException("Invalid source group begin/order");
             transaction = operation.transactionId();
             version = operation.version();
-            ordinal = lastSource = 0;
+            ordinal = lastSource = sourceOperations = superseded = 0;
             mutation = previousExpansion = null;
             expansionMembers = 0;
             output.accept(operation);
@@ -76,13 +85,12 @@ final class CommittedOperations {
             throw new IOException("Source outcome or mutation count mismatch");
         requireCompleteExpansion();
         boolean aborted = operation.kind() == TRANSACTION_ABORT;
-        for (int i = 0; i < pending.size(); i++) {
-            Operation member = pending.get(i);
-            if (member.kind() == SEARCH) {
-                if ((member.flags() & TRANSACTION_LOCAL_SEARCH) != 0) localSearches++;
-                else output.accept(member);
-            } else if (aborted) abortedWrites++;
-            else if (lastWrites.get(new Entry(member)) != i) coalescedWrites++;
+        if (aborted) abortedWrites += superseded;
+        else coalescedWrites += superseded;
+        for (Operation member : pending) {
+            if (member == null) continue;
+            if (member.kind() == SEARCH) output.accept(member);
+            else if (aborted) abortedWrites++;
             else output.accept(member.withExpansion(0, 1));
         }
         output.accept(operation);

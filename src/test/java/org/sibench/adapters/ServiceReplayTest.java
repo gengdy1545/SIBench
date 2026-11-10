@@ -15,17 +15,13 @@ import org.sibench.replay.ReplayConfig;
 public class ServiceReplayTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
-    @Test public void capabilitiesFollowRetainedQueryGroups() throws Exception {
-        var limited = org.sibench.adapters.proto.DescribeResponse.newBuilder()
-                .setValueKind(ValueKind.ROW_ID).setVersionedReads(true)
-                .setWriteAck(org.sibench.adapters.proto.Acknowledgement.ACK_WAL)
-                .setFlushMakesDurable(true).build();
-        ServiceReplay.require(limited, ValueKind.ROW_ID, Map.of("search_groups", 0L));
-        assertTrue(assertThrows(IOException.class, () -> ServiceReplay.require(
-                limited, ValueKind.ROW_ID, Map.of("search_groups", 1L)))
-                .getMessage().contains("search groups"));
-        ServiceReplay.require(limited.toBuilder().setSearchGroups(true).build(),
-                ValueKind.ROW_ID, Map.of("search_groups", 1L));
+    @Test public void deploymentDescriptionRejectsWrongValueModeAndMissingEvidence() throws Exception {
+        var description = new IndexDescription("fixture",ValueKind.ROW_ID,
+                org.sibench.adapters.proto.Acknowledgement.ACK_MEMORY,"async persistence","fixture");
+        description.require(ValueKind.ROW_ID);
+        assertThrows(IOException.class, () -> description.require(ValueKind.LOCATOR));
+        assertThrows(IOException.class, () -> new IndexDescription("fixture",ValueKind.ROW_ID,
+                org.sibench.adapters.proto.Acknowledgement.ACK_UNSPECIFIED,"async persistence","").require(ValueKind.ROW_ID));
     }
 
     @Test

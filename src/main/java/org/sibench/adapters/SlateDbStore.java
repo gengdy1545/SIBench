@@ -66,8 +66,8 @@ final class SlateDbStore implements OrderedStore {
         // SlateDB uses its in-memory WAL for both baseline and workload writes.
         nativePut(handle, key, value);
     }
-    /** One SlateDB write batch per baseline request instead of one write per entry. */
-    @Override public void putBaseline(java.util.List<byte[]> keys, java.util.List<byte[]> values) throws IOException {
+    /** One SlateDB write batch per public batch request. */
+    @Override public void putAll(java.util.List<byte[]> keys, java.util.List<byte[]> values) throws IOException {
         requireOpen();
         nativePutAll(handle, keys.toArray(byte[][]::new), values.toArray(byte[][]::new));
     }

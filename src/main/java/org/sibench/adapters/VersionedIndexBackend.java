@@ -3,7 +3,6 @@ package org.sibench.adapters;
 import com.google.protobuf.ByteString;
 
 import org.sibench.adapters.proto.Bound;
-import org.sibench.adapters.proto.DescribeResponse;
 import org.sibench.adapters.proto.Result;
 import org.sibench.adapters.proto.Search;
 import org.sibench.adapters.proto.Value;
@@ -26,7 +25,7 @@ import java.util.List;
  * {@code present(1) ++ indexed value length(u32) ++ file(i64) ++ position(i64) ++ row id(i64)}; a
  * logical delete is a version that is not present.
  *
- * <p>Baseline inserts become durable at {@link #flush()}; incremental write durability is
+ * <p>All writes have the same acknowledgment contract; persistence is asynchronous and its level is
  * declared by the store. Table 0, which no entry uses, holds the index's value kind and its
  * Trace binding, so a reopened index is checked before reuse.
  */
@@ -36,7 +35,7 @@ public final class VersionedIndexBackend implements IndexBackend {
             TRACE_BINDING = metadata("trace_binding");
     private final OrderedStore store;
     private final ValueKind valueKind;
-    /** One JSON line per Flush: the engine's state and object-storage requests so far. */
+    /** One JSON line per internal persistence cycle: the engine's state and object-storage requests so far. */
     private final Path engineStats;
     private long flushes;
 
@@ -132,30 +131,20 @@ public final class VersionedIndexBackend implements IndexBackend {
     }
 
     @Override
-    public DescribeResponse describe() {
-        return DescribeResponse.newBuilder()
-                .setName(store.name())
-                .setValueKind(valueKind)
-                .setVersionedReads(true)
-                .setSearchGroups(true)
-                .setDurability(store.durability())
-                .setWriteAck(store.writeAck())
-                .setBaselineDurableOnlyAtFlush(true)
-                .setFlushMakesDurable(true)
-                .setBaselineWriteBatches(true)
-                .build();
+    public IndexDescription describe() {
+        return new IndexDescription(store.name(), valueKind, store.writeAck(), store.durability(), store.location());
     }
 
     @Override
     public void write(Write write) throws IOException {
         var key = write.getKey();
-        IndexExecution.validateKey(key);
+        IndexExecution.validateWrite(write, valueKind);
         byte[] entry = entry(key.getTable(), key.getIndex(), key.getIndexedValue(), key.getPrimaryKey());
         byte[] versioned = versioned(entry, write.getVersion());
         switch (write.getKind()) {
             case INSERT -> {
                 if (write.getVersion() != 0) throw new IllegalArgumentException("Insert outside the baseline");
-                store.put(versioned, value(true, key.getIndexedValue().size(), write.getValue()), false);
+                store.put(versioned, value(true, key.getIndexedValue().size(), write.getValue()), true);
             }
             case UPSERT -> store.put(versioned, value(true, key.getIndexedValue().size(), write.getValue()), true);
             case LOGICAL_DELETE ->
@@ -174,25 +163,27 @@ public final class VersionedIndexBackend implements IndexBackend {
     }
 
     @Override
-    public void writeBaseline(java.util.List<Write> inserts) throws IOException {
-        var keys = new java.util.ArrayList<byte[]>(inserts.size());
-        var values = new java.util.ArrayList<byte[]>(inserts.size());
-        for (var insert : inserts) {
-            var key = insert.getKey();
-            IndexExecution.validateKey(key);
-            if (insert.getKind() != Write.Kind.INSERT || insert.getVersion() != 0)
-                throw new IllegalArgumentException("Insert outside the baseline");
-            keys.add(versioned(entry(key.getTable(), key.getIndex(), key.getIndexedValue(), key.getPrimaryKey()), 0));
-            values.add(value(true, key.getIndexedValue().size(), insert.getValue()));
+    public void writeBatch(java.util.List<Write> writes) throws IOException {
+        var keys = new java.util.ArrayList<byte[]>(writes.size());
+        var values = new java.util.ArrayList<byte[]>(writes.size());
+        for (var write : writes) {
+            IndexExecution.validateWrite(write, valueKind);
+            if (write.getKind() == Write.Kind.RELOCATE)
+                throw new IllegalArgumentException("Relocate is not a batch mutation");
+            var key = write.getKey();
+            keys.add(versioned(entry(key.getTable(), key.getIndex(), key.getIndexedValue(), key.getPrimaryKey()), write.getVersion()));
+            boolean present = write.getKind() != Write.Kind.LOGICAL_DELETE;
+            values.add(value(present, key.getIndexedValue().size(), present ? write.getValue() : Value.getDefaultInstance()));
         }
-        store.putBaseline(keys, values);
+        store.putAll(keys, values);
     }
 
     @Override
     public void search(Search search, ResultSink sink) throws IOException {
         if (!search.getUnknownFields().asMap().isEmpty())
             throw new IllegalArgumentException("Unsupported search fields");
-        if (search.getTable() < 1) throw new IllegalArgumentException("Invalid search table");
+        if (search.getTable() < 1 || search.getIndex() < 0 || search.getReadVersion() < 0 || search.getLimit() < 0)
+            throw new IllegalArgumentException("Invalid search table, index, version or limit");
         long found = 0;
         byte[] prefix = entry(search.getTable(), search.getIndex(), ByteString.EMPTY, ByteString.EMPTY);
         if (!search.getPinnedPrimaryKey().isEmpty()) {
@@ -413,7 +404,7 @@ public final class VersionedIndexBackend implements IndexBackend {
     @Override
     public synchronized void bind(String binding) throws IOException {
         if (binding == null || binding.isEmpty())
-            throw new IllegalArgumentException("A Flush must name the trace the index holds");
+            throw new IllegalArgumentException("An index must name the trace it holds");
         byte[] stored = store.get(TRACE_BINDING);
         if (stored == null)
             store.put(TRACE_BINDING, binding.getBytes(java.nio.charset.StandardCharsets.UTF_8), true);

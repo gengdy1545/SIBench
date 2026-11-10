@@ -51,7 +51,7 @@ final class PostgresTrace {
         var units=WorkUnits.create(directory);
         var writer=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,budget);
         try(var lines=units.lines();writer;var versions=new PostgresVersions(database);
-                var projection=new PostgresProjection(database,catalog,directory,versions,units,writer::accept)) {
+                var projection=new PostgresProjection(database,catalog,directory,versions,units,secondaryIndexes,writer::accept)) {
             for(PostgresTransactions.Chunk next;(next=capture.transactions.next(()->capture.watermark(database)))!=null;)
                 try(var chunk=next){
                     if (projection.accept(chunk)) projectedTransactions++;

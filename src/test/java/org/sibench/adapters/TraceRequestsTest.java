@@ -97,7 +97,7 @@ public class TraceRequestsTest {
     }
 
     @Test
-    public void baselineBatchIsOneExecuteMessageForMultipleOperations() throws Exception {
+    public void baselineBatchMapsToOneGenericBatchWrite() throws Exception {
         var requests = new TraceRequests(ValueKind.ROW_ID);
         var first = IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0,
                 IndexKey.ofInt(1), 0, 0, 0, 1);
@@ -105,7 +105,9 @@ public class TraceRequestsTest {
                 IndexKey.ofInt(2), 0, 0, 0, 2);
         var message = requests.batch(1, List.of(first, second), List.of());
         assertEquals(2, message.getBatch().getWritesCount());
-        assertEquals(1, requests.executeRequests());
-        assertEquals(message.getSerializedSize(), requests.requestBytes());
+        var batch = IndexRpc.batch(message.getBatch());
+        assertEquals(2, batch.getMutationsCount());
+        assertEquals(0, batch.getMutations(0).getPut().getVersion());
+        assertEquals(message.getBatch().getWrites(1).getKey(), batch.getMutations(1).getPut().getKey());
     }
 }

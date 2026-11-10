@@ -23,7 +23,7 @@ public class PostgresHistoryCheck {
     @Test public void loadedKeysNeedNoHeapFetchesAfterVacuum()throws Exception {
         String configured=System.getProperty("sibench.postgres.runtime");
         assertNotNull("Set sibench.postgres.runtime",configured);
-        try(var cluster=PostgresDatabase.create(Path.of(configured),temporary.getRoot().toPath().resolve("visibility"));
+        try(var cluster=PostgresDatabase.create(Path.of(configured),temporary.getRoot().toPath().resolve("visibility"),org.sibench.generation.PostgresTestSettings.SETTINGS);
                 var setup=cluster.connect("visibility")) {
             sql(setup,"CREATE UNLOGGED TABLE wide_rows(id BIGINT PRIMARY KEY,payload TEXT)");
             sql(setup,"INSERT INTO wide_rows SELECT i,repeat('x',1000) FROM generate_series(1,10000) i");
@@ -47,7 +47,7 @@ public class PostgresHistoryCheck {
         String configured=System.getProperty("sibench.postgres.runtime");
         assertNotNull("Set sibench.postgres.runtime to a freshly built instrumented runtime",configured);
         Path root=temporary.getRoot().toPath().resolve("source");long aborted,original,replacement;
-        try(var cluster=PostgresDatabase.create(Path.of(configured),root)) {
+        try(var cluster=PostgresDatabase.create(Path.of(configured),root,org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=cluster.connect("setup")) {
                 assertEquals(1,number(setup,"SELECT (current_setting('wal_level')='minimal' "
                         +"AND current_setting('max_wal_senders')='0' AND current_setting('max_parallel_maintenance_workers')='0' "
@@ -111,6 +111,6 @@ public class PostgresHistoryCheck {
                 &&e.get("depth").getAsInt()==1&&e.get("req").getAsLong()==failedRequest));
         assertFalse(events.stream().anyMatch(e->"scan_summary".equals(e.get("event").getAsString())&&e.get("relation").getAsString().startsWith("identity_")));
         assertFalse(Files.exists(root.resolve("data/postmaster.pid")));
-        assertThrows(java.io.IOException.class,()->PostgresDatabase.create(Path.of(configured),root));
+        assertThrows(java.io.IOException.class,()->PostgresDatabase.create(Path.of(configured),root,org.sibench.generation.PostgresTestSettings.SETTINGS));
     }
 }

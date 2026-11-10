@@ -1,6 +1,5 @@
 package org.sibench.adapters;
 
-import org.sibench.adapters.proto.DescribeResponse;
 import org.sibench.adapters.proto.Result;
 import org.sibench.adapters.proto.Search;
 import org.sibench.adapters.proto.Write;
@@ -15,14 +14,14 @@ import java.util.List;
  * dependencies before dispatch.
  */
 public interface IndexBackend extends AutoCloseable {
-    DescribeResponse describe();
+    IndexDescription describe();
 
     /** Applies one write; later normal reads at applicable versions see its effect once this returns. */
     void write(Write write) throws IOException;
 
-    /** Applies validated Baseline INSERTs; all are visible once this returns. */
-    default void writeBaseline(List<Write> inserts) throws IOException {
-        for (var insert : inserts) write(insert);
+    /** Applies validated writes; all are visible once this returns, without an atomicity promise. */
+    default void writeBatch(List<Write> writes) throws IOException {
+        for (var write : writes) write(write);
     }
 
     /** Receives search results one at a time, in result order. */

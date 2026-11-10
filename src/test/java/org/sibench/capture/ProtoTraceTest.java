@@ -269,6 +269,36 @@ public class ProtoTraceTest {
     }
 
     @Test
+    public void interleavedSupersededWritesLeaveFinalWritesInTheirLastSourceOrder() throws Exception {
+        // Keys 1,2,1,3,2: the survivors are ordinals 3, 4 and 5, in that order.
+        int[] keys = {1, 2, 1, 3, 2};
+        for (boolean aborted : List.of(false, true)) {
+            Path file = temporary.getRoot().toPath().resolve("superseded-" + aborted + ".pb.zst");
+            var writer = new ProtoTrace.Writer(file);
+            try (writer) {
+                writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 91, 1, 0));
+                for (int i = 0; i < keys.length; i++)
+                    writer.append(IndexOperationTrace.write(10 + i, IndexOperationTrace.UPSERT, 1, 0,
+                            IndexKey.ofInt(keys[i]), 1, 7, i, 100 + i).withTransaction(91, i + 1)
+                            .withWorkUnitId(1).withExpansion(0, 1));
+                writer.append(IndexOperationTrace.transaction(0, aborted ? IndexOperationTrace.TRANSACTION_ABORT
+                        : IndexOperationTrace.TRANSACTION_COMMIT, 91, 1, keys.length));
+            }
+            var decoded = new ArrayList<Operation>();
+            ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add);
+            var writes = decoded.stream().filter(IndexOperationTrace::isMutation).toList();
+            assertEquals(aborted ? List.of() : List.of(102L, 103L, 104L), writes.stream().map(Operation::rowId).toList());
+            assertEquals(aborted ? List.of() : List.of(3L, 4L, 5L), writes.stream().map(Operation::mutationOrdinal).toList());
+            assertEquals(aborted ? List.of() : List.of(IndexKey.ofInt(1), IndexKey.ofInt(3), IndexKey.ofInt(2)),
+                    writes.stream().map(Operation::key).toList());
+            var filtered = (Map<?, ?>) writer.statistics().get("source_projection");
+            assertEquals(aborted ? 5L : 0L, filtered.get("excluded_aborted_writes"));
+            assertEquals(aborted ? 0L : 2L, filtered.get("coalesced_writes"));
+            assertEquals(5L, filtered.get("peak_buffered_operations"));
+        }
+    }
+
+    @Test
     public void sourceSnapshotValidationPrecedesScopeAndOutcomeFiltering() throws Exception {
         var file = temporary.getRoot().toPath().resolve("future-snapshot.pb.zst");
         try (var writer = new ProtoTrace.Writer(file, false)) {

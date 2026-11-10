@@ -40,7 +40,6 @@ public final class StreamingLatencyCheck {
         var requests = new TraceRequests(ValueKind.ROW_ID);
         requests.baselineBatch(16);
         try (var grpc = new GrpcService(args[0], requests, BINDING, 5)) {
-            report.put("service_description", grpc.describe().toString());
             try (var baseline = new ReplayDispatcher(config, grpc.factory())) {
                 for (int key = 0; key < BASELINE_ROWS; key++) {
                     baseline.send(IndexOperationTrace.write(key + 1L, IndexOperationTrace.INSERT,
@@ -51,10 +50,10 @@ public final class StreamingLatencyCheck {
                 baseline.requireClientCoverage();
                 var counts = baseline.describe();
                 verify(counts, 64, 64, 0, 64);
-                equal(requests.executeRequests(), 4, "baseline Execute requests");
+                equal(requests.rpcRequests(), 4, "baseline RPC requests");
                 report.put("baseline", counts);
             }
-            report.put("baseline_flush", flush(grpc));
+            report.put("service_description", grpc.description());
             try (var replay = new ReplayDispatcher(config, grpc.factory(), WARMUP)) {
                 long event = BASELINE_ROWS, version = 0;
                 for (int cycle = 0; cycle < CYCLES; cycle++) {
@@ -77,11 +76,10 @@ public final class StreamingLatencyCheck {
                 verify(counts, 600, 584, 292, 292);
                 report.put("workload_dispatch", counts);
             }
-            report.put("workload_flush", flush(grpc));
-            equal(requests.executeRequests(), 604, "total Execute requests");
+            equal(requests.rpcRequests(), 604, "total RPC requests");
             equal(requests.queries(), 300, "ordinary queries");
             equal(requests.checkedResults(), 200, "returned rows");
-            report.put("execute_requests", requests.executeRequests());
+            report.put("rpc_requests", requests.rpcRequests());
             report.put("checked_queries", requests.queries());
             report.put("checked_results", requests.checkedResults());
             rejectWrongCount();
@@ -95,15 +93,6 @@ public final class StreamingLatencyCheck {
             Files.writeString(output, new GsonBuilder().setPrettyPrinting().create().toJson(report) + "\n",
                     StandardOpenOption.CREATE_NEW);
         }
-    }
-
-    private static Map<String, Object> flush(GrpcService grpc) throws IOException {
-        long start = System.nanoTime();
-        var response = grpc.flush(BINDING);
-        double seconds = (System.nanoTime() - start) / 1e9;
-        ServiceReplay.requireFlush(response, BINDING);
-        return Map.of("seconds", seconds,
-                "response", response.toString(), "timing_scope", "outside operation latency and measurement");
     }
 
     private static void verify(Map<String, Object> report, long operations,

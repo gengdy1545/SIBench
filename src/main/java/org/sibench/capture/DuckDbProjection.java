@@ -14,8 +14,11 @@ import org.sibench.trace.IndexKey;
 public final class DuckDbProjection {
     private DuckDbProjection() {}
 
-    /** Access and mutation binding must have completed. The consumer must not query this connection. */
-    public static long write(Connection database,IndexOperationTrace.Consumer consumer) throws SQLException,IOException {
+    /**
+     * Access and mutation binding must have completed. The consumer must not query this connection.
+     * Mutation binding has checked every indexed column; only exported secondary keys are parsed.
+     */
+    public static long write(Connection database,boolean secondaryIndexes,IndexOperationTrace.Consumer consumer) throws SQLException,IOException {
         if(!database.getAutoCommit())throw new SQLException("Capture projection requires an idle connection");
         database.setAutoCommit(false);
         long[] count={0};IndexOperationTrace.Consumer output=operation->{consumer.accept(operation);count[0]++;};
@@ -35,7 +38,7 @@ public final class DuckDbProjection {
                     +"m.after_values[list_position(list_transform(m.columns,lambda x: x.name),c.column_name)] AS after_token,"
                     +"0 AS probe_position,c.index_id AS detail_position,'' AS origin,'' AS comparison,'' AS predicate_type,'' AS predicate_value "
                     +"FROM temp.main.sibench_work_units u JOIN temp.main.sibench_changes m ON u.tag='write' AND u.identity=m.change_id "
-                    +"JOIN temp.main.sibench_index_catalog c ON c.table_id=m.table_id UNION ALL "
+                    +"JOIN temp.main.sibench_index_catalog c ON c.table_id=m.table_id"+(secondaryIndexes?"":" AND c.index_id=0")+" UNION ALL "
                     +"SELECT u.unit_id,a.index_id,NULL,NULL,NULL,p.ordinality,d.ordinality,p.probe.origin,"
                     +"d.predicate.comparison,d.predicate.value_type,d.predicate.value_sql FROM temp.main.sibench_work_units u "
                     +"JOIN temp.main.sibench_accesses a ON u.tag='search' AND u.identity=a.access_id,"

@@ -134,7 +134,7 @@ public final class DriverCapacityCheck {
         var recorded = new ConcurrentHashMap<Request, List<Response>>();
         var bytes = new AtomicLong();
         var requests = new TraceRequests(ValueKind.ROW_ID);
-        DescribeResponse description;
+        IndexDescription description;
         try (var backend = VersionedIndexBackend.create(output.resolve("index"), ValueKind.ROW_ID);
                 var executor = new IndexExecutor(backend)) {
             description = backend.describe();
@@ -172,7 +172,7 @@ public final class DriverCapacityCheck {
         Path binary = output.resolve("responses.bin");
         try (var data = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(binary)))) {
             data.writeInt(MAGIC);
-            description.writeDelimitedTo(data);
+            data.writeUTF(new com.google.gson.Gson().toJson(description));
             data.writeInt(recorded.size());
             // Stable order makes the diagnostic fixture reproducible for the same requests/results.
             for (var request : recorded.keySet().stream().sorted(Comparator.comparingLong(Request::getId)).toList()) {
@@ -209,10 +209,10 @@ public final class DriverCapacityCheck {
     private static void serve(Path fixture, int port, boolean corrupt) throws Exception {
         manifest(fixture);
         var recorded = new HashMap<Request, List<Response>>();
-        DescribeResponse description;
+        IndexDescription description;
         try (var data = new DataInputStream(new BufferedInputStream(Files.newInputStream(fixture.resolve("responses.bin"))))) {
             if (data.readInt() != MAGIC) throw new IOException("Invalid fixture");
-            description = DescribeResponse.parseDelimitedFrom(data);
+            description = new com.google.gson.Gson().fromJson(data.readUTF(), IndexDescription.class);
             int count = data.readInt();
             for (int i = 0; i < count; i++) {
                 Request request = Request.parseDelimitedFrom(data);
@@ -231,40 +231,44 @@ public final class DriverCapacityCheck {
             }
             if (data.read() != -1) throw new IOException("Extra fixture records");
         }
-        var workers = Executors.newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors()));
-        var service = new IndexServiceGrpc.IndexServiceImplBase() {
-            @Override public void describe(DescribeRequest request, StreamObserver<DescribeResponse> out) {
-                out.onNext(description); out.onCompleted();
+        var normalized = new HashMap<Request,List<Response>>();
+        recorded.forEach((request,responses) -> normalized.put(normalize(request),responses));
+        IndexBackend backend = new IndexBackend() {
+            public IndexDescription describe() {
+                return new IndexDescription("recorded-response-fixture",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,
+                        "diagnostic responses; no persistent index",fixture.toString());
             }
-            @Override public StreamObserver<Request> execute(StreamObserver<Response> responses) {
-                var call = (ServerCallStreamObserver<Response>) responses;
-                var ready = new Object();
-                call.setOnReadyHandler(() -> { synchronized (ready) { ready.notifyAll(); } });
-                return new StreamObserver<>() {
-                    public void onNext(Request request) {
-                        var chunks = recorded.get(request);
-                        if (chunks == null) { responses.onError(io.grpc.Status.INVALID_ARGUMENT.withDescription("Request differs from recorded prefix").asRuntimeException()); return; }
-                        workers.execute(() -> {
-                            try {
-                                for (var chunk : chunks) {
-                                    synchronized (ready) {
-                                        while (!call.isReady() && !call.isCancelled()) ready.wait(10);
-                                    }
-                                    if (call.isCancelled()) return;
-                                    synchronized (responses) { responses.onNext(chunk); }
-                                }
-                            } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
-                        });
-                    }
-                    public void onError(Throwable error) {}
-                    public void onCompleted() {}
-                };
+            private List<Response> find(Request request) throws IOException {
+                var found=normalized.get(normalize(request));
+                if(found==null) throw new IOException("Request differs from recorded prefix");
+                for(var response:found) if(response.getStatus()!=org.sibench.adapters.proto.Status.OK) throw new IOException(response.getMessage());
+                return found;
             }
+            public void write(Write write) throws IOException { find(Request.newBuilder().setWrite(write).build()); }
+            public void search(Search search,ResultSink output) throws IOException {
+                for(var response:find(Request.newBuilder().setSearch(search).build()))
+                    for(var result:response.getResultsList()) output.accept(result);
+            }
+            public void flush() {}
+            public void bind(String value) throws IOException {
+                if(!manifest(fixture).get("binding").getAsString().equals(value)) throw new IOException("Fixture binding differs");
+            }
+            public String location() { return fixture.toString(); }
+            public void close() {}
         };
-        var server = ServerBuilder.forPort(port).addService(service).maxInboundMessageSize(Integer.MAX_VALUE).build().start();
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> { server.shutdownNow(); workers.shutdownNow(); }));
-        System.out.println("READY port=" + server.getPort());
+        var server = IndexServer.start(port,backend);
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> { try { server.close(); } catch(IOException ignored) {} }));
+        System.out.println("READY port=" + server.port());
         server.awaitTermination();
+    }
+
+    private static Request normalize(Request request) {
+        var normalized=request.toBuilder().clearId();
+        if(request.hasSearch()) {
+            var get=IndexRpc.get(request.getSearch());
+            if(get!=null) normalized.setSearch(IndexRpc.search(get));
+        }
+        return normalized.build();
     }
 
     private static void run(Path fixture, String endpoint, int clients, Path report) throws Exception {

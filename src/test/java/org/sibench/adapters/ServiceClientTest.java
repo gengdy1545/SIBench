@@ -15,7 +15,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
-/** The members of one search group travel as one request, and its count is checked once. */
+/** Each group member travels independently, and the combined native count is checked once. */
 public class ServiceClientTest {
     @Test
     public void sendWaitsForTheTransportSignalEvenWhenTheResponseIsImmediate() throws Exception {
@@ -55,7 +55,8 @@ public class ServiceClientTest {
                     .setId(request.getId())
                     .setStatus(org.sibench.adapters.proto.Status.OK);
             for (int i = 0; i < results; i++)
-                response.addResults(org.sibench.adapters.proto.Result.newBuilder().setVersion(1));
+                response.addResults(org.sibench.adapters.proto.Result.newBuilder().setVersion(1)
+                        .setPrimaryKey(com.google.protobuf.ByteString.copyFrom(IndexKey.ofInt(i).bytes())));
             return java.util.concurrent.CompletableFuture.completedFuture(response.build());
         }
     }
@@ -66,18 +67,18 @@ public class ServiceClientTest {
     }
 
     @Test
-    public void groupMembersTravelAsOneRequest() throws IOException {
+    public void groupMembersTravelAsIndividualRequests() throws IOException {
         var requests = new TraceRequests(ValueKind.ROW_ID);
         var client = new Recorder(requests);
         client.results = 2;
         var first = client.send(1, member(0, 3, 2, IndexOperationTrace.INTERSECT_GROUP));
         var middle = client.send(2, member(1, 3, 2, IndexOperationTrace.INTERSECT_GROUP));
-        // Held members are not sent on their own.
-        assertEquals(List.of(), client.sent);
+        assertEquals(2, client.sent.size());
+        assertFalse(first.response().toCompletableFuture().isDone());
+        assertTrue(first.businessResponse().toCompletableFuture().isDone());
         var last = client.send(3, member(2, 3, 2, IndexOperationTrace.INTERSECT_GROUP));
-        assertEquals(1, client.sent.size());
-        assertEquals(3, client.sent.get(0).getGroup().getMembersCount());
-        assertEquals(SearchGroup.Mode.INTERSECTION, client.sent.get(0).getGroup().getMode());
+        assertEquals(3, client.sent.size());
+        assertTrue(client.sent.stream().allMatch(Request::hasSearch));
         // Every member completes with the group's response; a group is one native query.
         for (var handle : List.of(first, middle, last)) {
             handle.response().toCompletableFuture().join();
@@ -167,8 +168,10 @@ public class ServiceClientTest {
         var storedGroup = encoded.group(0, members);
         client.send(4, members.get(0), storedGroup);
         client.send(5, members.get(1), storedGroup).response().toCompletableFuture().join();
-        assertSame(storedGroup.getGroup(), client.sent.get(2).getGroup());
-        assertEquals(5, client.sent.get(2).getId());
+        assertSame(storedGroup.getGroup().getMembers(0), client.sent.get(2).getSearch());
+        assertSame(storedGroup.getGroup().getMembers(1), client.sent.get(3).getSearch());
+        assertEquals(4, client.sent.get(2).getId());
+        assertEquals(5, client.sent.get(3).getId());
         var snapshots = new TraceRequests(ValueKind.ROW_ID);
         var search = IndexOperationTrace.search(12, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 0, 0);
         var storedSearch = encoded.request(0, search);

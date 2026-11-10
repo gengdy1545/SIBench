@@ -34,7 +34,7 @@ public final class BaselineCapacityCheck {
             h=bytes(h,op.key());h=op.index()==0?mix(h):bytes(h,op.indexedValue());add(h);
         }
         void write(Write write) throws IOException {
-            if (write.getKind()!=Write.Kind.INSERT || write.getVersion()!=0 || write.getValue().getFile()!=0 || write.getValue().getPosition()!=0)
+            if ((write.getKind()!=Write.Kind.INSERT && write.getKind()!=Write.Kind.UPSERT) || write.getVersion()!=0 || write.getValue().getFile()!=0 || write.getValue().getPosition()!=0)
                 throw new IOException("Not a RowID baseline INSERT");
             var key=write.getKey();long h=mix(((long)key.getTable()<<32)^key.getIndex())^mix(write.getValue().getRowId());
             h=bytes(h,key.getPrimaryKey());h=bytes(h,key.getIndexedValue());add(h);
@@ -44,8 +44,8 @@ public final class BaselineCapacityCheck {
     static final class Sink implements IndexBackend {
         final Fingerprint received=new Fingerprint();final Path report;final boolean dropFirst;final AtomicBoolean dropped=new AtomicBoolean();String binding="";
         Sink(Path report,boolean dropFirst) { this.report=report;this.dropFirst=dropFirst; }
-        public DescribeResponse describe() { return DescribeResponse.newBuilder().setName("baseline-transport-field-check-sink").setValueKind(ValueKind.ROW_ID).setBaselineWriteBatches(true).setWriteAck(Acknowledgement.ACK_MEMORY).setDurability("diagnostic field receiver; no index storage").build(); }
-        public void write(Write write) throws IOException { if (dropFirst && dropped.compareAndSet(false,true)) return;received.write(write); }
+        public IndexDescription describe() { return new IndexDescription("baseline-transport-field-check-sink",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,"diagnostic field receiver; no index storage",location()); }
+        public void write(Write write) throws IOException { if (dropFirst && dropped.compareAndSet(false,true)) return;received.write(write); flush(); }
         public void search(Search search,ResultSink output) throws IOException { throw new IOException("Baseline-only diagnostic receiver"); }
         public void flush() throws IOException { Files.writeString(report,JSON.toJson(received.summary())+"\n"); }
         public void bind(String value) throws IOException { if (!binding.isEmpty()&&!binding.equals(value)) throw new IOException("Different binding");binding=value; }
@@ -86,11 +86,11 @@ public final class BaselineCapacityCheck {
                 }
             }); } catch(EndWindow stop) { complete=false; }
             Files.writeString(report.resolveSibling(report.getFileName()+".submission-stopped"),Long.toString(System.currentTimeMillis()));
-            projection.finish();dispatch=projection.describe();remote.flush("baseline-capacity "+trace.toAbsolutePath());
+            projection.finish();dispatch=projection.describe();
         }
         double seconds=(System.nanoTime()-started)/1e9;
         verify(expected,difference(received(receiver),before));
-        var out=new LinkedHashMap<String,Object>();out.put("status","passed");out.put("clients",clients);out.put("complete_baseline",complete);out.put("setup_seconds",setupSeconds);out.put("seconds_including_flush",seconds);out.put("field_fingerprint",expected.summary());out.put("request_bytes",requests.requestBytes());out.put("dispatch",dispatch);out.put("preflight",input.preflight());out.put("scope","same verified input; actual batch conversion/RPC/ACK path plus independent commutative field fingerprint; receiver has no index storage; full canonical SHA checked only if complete_baseline=true, otherwise prior full reference/oracle proof reused for immutable input; finite window, not backend throughput");
+        var out=new LinkedHashMap<String,Object>();out.put("status","passed");out.put("clients",clients);out.put("complete_baseline",complete);out.put("setup_seconds",setupSeconds);out.put("seconds",seconds);out.put("field_fingerprint",expected.summary());out.put("request_bytes",requests.requestBytes());out.put("dispatch",dispatch);out.put("preflight",input.preflight());out.put("scope","same verified input; actual batch conversion/RPC/ACK path plus independent commutative field fingerprint; receiver has no index storage; full canonical SHA checked only if complete_baseline=true, otherwise prior full reference/oracle proof reused for immutable input; finite window, not backend throughput");
         Files.writeString(report,JSON.toJson(out)+"\n",StandardOpenOption.CREATE_NEW);return out;
     }
     public static void main(String[] args) throws Exception {

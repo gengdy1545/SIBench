@@ -28,8 +28,8 @@ class IndexRunSummaryTest(unittest.TestCase):
             dispatch[kind + "_latency"] = {"count": 0, "mean_ms": 0.0, "p99_ms": 0.0,
                 "percentile_bound": "upper", "percentile_relative_error_bound": 1 / 1024,
                 "exact_below_ns": 2048, "mean_and_max": "unquantized"}
-        return {**dict.fromkeys(("operations", "execute_requests", "seconds", "operations_per_second",
-            "request_bytes", "result_bytes", "flush_seconds"), 0), "dispatch": dispatch}
+        return {**dict.fromkeys(("operations", "rpc_requests", "seconds", "operations_per_second",
+            "request_bytes", "result_bytes"), 0), "rpc_by_kind": {}, "dispatch": dispatch}
 
     def test_missing_logs_mean_unmeasured_not_zero_engine_work(self):
         result = summary.engine_events([])
@@ -79,26 +79,31 @@ class IndexRunSummaryTest(unittest.TestCase):
             self.assertEqual("unverified", result["engine"]["same_run_provenance"])
             self.assertEqual("passed", result["correctness_status"])
 
-    def test_basic_operations_and_execute_messages_remain_distinct(self):
+    def test_baseline_batches_and_individual_workload_rpcs_remain_distinct(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "service.json"
             phase = self.phase()
-            phase.update(operations=4, execute_requests=3)
+            phase.update(operations=4, rpc_requests=4, rpc_by_kind={"Get": 3, "Put": 1})
             phase["dispatch"].update(target_calls=4, completed_responses=4,
                 basic_operations=4, completed_operations=4, dependency_wait_seconds=0.02,
                 deferred_search_operations=1, search_deferral_seconds=0.5)
             phase["dispatch"]["measurement"].update(warmup_operations=1, measured_operations=3,
                                                    completed_operations=3)
             phase["dispatch"]["search_latency"].update(count=3, p99_ms=0.125)
+            baseline = self.phase()
+            baseline.update(operations=4, rpc_requests=2, rpc_by_kind={"BatchWrite": 2})
+            baseline["dispatch"].update(target_calls=4, completed_responses=4, basic_operations=4, completed_operations=4)
             path.write_text(json.dumps({"status": "passed", "result": {
-                "service": "test", "baseline": self.phase(), "workload": phase,
+                "service": "test", "baseline": baseline, "workload": phase,
                 "queries": 1, "checked_result_items": 1}}))
             workload = summary.summarize(path, [])["phases"]["workload"]
             self.assertEqual(4, workload["basic_operations"])
             self.assertEqual(0.02, workload["dependency_wait_seconds"])
             self.assertEqual(1, workload["deferred_search_operations"])
             self.assertEqual(0.5, workload["search_deferral_seconds"])
-            self.assertEqual(3, workload["execute_requests"])
+            self.assertEqual(4, workload["rpc_requests"])
+            self.assertEqual({"Get": 3, "Put": 1}, workload["rpc_by_kind"])
+            self.assertEqual(2, summary.summarize(path, [])["phases"]["baseline"]["rpc_requests"])
             self.assertEqual(3, workload["measurement"]["measured_operations"])
             self.assertEqual(0.125, workload["search_latency"]["p99_ms"])
             self.assertEqual("upper", workload["search_latency"]["percentile_bound"])

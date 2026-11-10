@@ -8,13 +8,13 @@ import java.util.List;
  * stores bytes; the index layout, versions and visibility are {@link VersionedIndexBackend}'s.
  */
 interface OrderedStore extends AutoCloseable {
-    /** Engine and version, as Describe reports it. */
+    /** Engine and version, recorded in deployment metadata. */
     String name();
 
     /** Where the database lives: a local directory or an object-storage location. */
     String location();
 
-    /** Where a write and a Flush are durable, as Describe reports it. */
+    /** Write acknowledgment and internal persistence levels. */
     String durability();
 
     /** Durability reached by a successful incremental write, separate from query visibility. */
@@ -24,9 +24,9 @@ interface OrderedStore extends AutoCloseable {
 
     void put(byte[] key, byte[] value, boolean wal) throws IOException;
 
-    /** Baseline entries, without the WAL where the store has one; {@code keys} and {@code values} pair up. */
-    default void putBaseline(List<byte[]> keys, List<byte[]> values) throws IOException {
-        for (int i = 0; i < keys.size(); i++) put(keys.get(i), values.get(i), false);
+    /** Ordinary writes; keys and values pair up, with the same WAL policy as individual writes. */
+    default void putAll(List<byte[]> keys, List<byte[]> values) throws IOException {
+        for (int i = 0; i < keys.size(); i++) put(keys.get(i), values.get(i), true);
     }
 
     /** The value of the exact key, or null. */
