@@ -41,10 +41,10 @@ public class ReferenceReplayTest {
                 writer.append(search(0, 1, 1));
                 writer.append(search(1, 10, 1));
                 writer.append(search(2, 20, 1));
-                writer.append(IndexOperationTrace.transaction(3, 6, 3, 7, 0));
+                writer.append(IndexOperationTrace.transaction(0, 6, 7, 7, 0));
                 org.sibench.capture.TransferIndexFixtures.appendRow(
-                        writer, TestOps.op(3, 5, 5, 0, 0, 1, 7, 0, 0, 50, 10, 20, 0, 3, 1));
-                writer.append(IndexOperationTrace.transaction(3, 7, 3, 7, 1));
+                        writer, TestOps.op(3, 5, 5, 0, 0, 1, 7, 0, 0, 50, 10, 20, 0, 7, 1));
+                writer.append(IndexOperationTrace.transaction(0, 7, 7, 7, 1));
             }
             assertThrows(
                     IOException.class,
@@ -95,16 +95,16 @@ public class ReferenceReplayTest {
                 org.sibench.capture.TransferIndexFixtures.appendRow(writer, row(1, 0, 5, 50));
             }
             try (var writer = new ProtoTrace.Writer(workload)) {
-                writer.append(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
+                writer.append(IndexOperationTrace.transaction(0, 6, 1, 1, 0));
                 org.sibench.capture.TransferIndexFixtures.appendRow(
-                        writer, TestOps.op(1, 3, 5, 0, 2, 1, 1, 9, 0, 50, 10, 20, 0, 10, 1));
+                        writer, TestOps.op(1, 3, 5, 0, 2, 1, 1, 9, 0, 50, 10, 20, 0, 1, 1));
                 org.sibench.capture.TransferIndexFixtures.appendRow(
-                        writer, TestOps.op(2, 3, 5, 0, 2, 1, 1, 9, 1, 50, 10, 20, 0, 10, 2));
+                        writer, TestOps.op(2, 3, 5, 0, 2, 1, 1, 9, 1, 50, 10, 20, 0, 1, 2));
                 org.sibench.capture.TransferIndexFixtures.appendRow(
-                        writer, TestOps.op(3, 3, 5, 0, 1, 2, 1, 9, 2, 51, 10, 20, 0, 10, 3));
+                        writer, TestOps.op(3, 3, 5, 0, 1, 2, 1, 9, 2, 51, 10, 20, 0, 1, 3));
                 org.sibench.capture.TransferIndexFixtures.appendRow(
-                        writer, TestOps.op(4, 5, 5, 0, 0, 2, 1, 0, 0, 51, 10, 20, 0, 10, 4));
-                writer.append(IndexOperationTrace.transaction(10, 7, 10, 1, 4));
+                        writer, TestOps.op(4, 5, 5, 0, 0, 2, 1, 0, 0, 51, 10, 20, 0, 1, 4));
+                writer.append(IndexOperationTrace.transaction(0, 7, 1, 1, 4));
                 writer.append(TestOps.op(11, 2, 5, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1));
                 writer.append(TestOps.op(12, 2, 5, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0));
             }

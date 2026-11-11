@@ -2,17 +2,8 @@ package org.sibench.adapters;
 
 import com.google.protobuf.ByteString;
 
-import org.sibench.adapters.proto.Bound;
-import org.sibench.adapters.proto.EntryKey;
-import org.sibench.adapters.proto.Request;
-import org.sibench.adapters.proto.Response;
-import org.sibench.adapters.proto.Result;
-import org.sibench.adapters.proto.Search;
-import org.sibench.adapters.proto.SearchGroup;
-import org.sibench.adapters.proto.Status;
-import org.sibench.adapters.proto.Value;
-import org.sibench.adapters.proto.ValueKind;
-import org.sibench.adapters.proto.Write;
+import org.sibench.adapters.proto.*;
+import org.sibench.trace.IndexEntry;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.trace.IndexKey;
@@ -39,149 +30,130 @@ public final class TraceRequests {
         return valueKind;
     }
 
-    /** A write or a search that is not part of a group. */
-    public Request request(long id, Operation operation) throws IOException {
-        var request = Request.newBuilder().setId(id);
-        if (operation.kind() == IndexOperationTrace.SEARCH) {
-            if (operation.grouped()) throw new IOException("Grouped searches require complete member metadata");
-            return request.setSearch(search(operation)).build();
-        }
-        return request.setWrite(write(operation)).build();
+    public Request request(Operation operation) throws IOException {
+        if (operation.grouped()) throw new IOException("Grouped queries require member metadata");
+        if (operation.kind() == IndexOperationTrace.SEARCH) return query(operation);
+        var key = new IndexEntry(operation.table(), operation.index(), operation.indexedValue(), operation.key()).bytes();
+        if (operation.kind() == IndexOperationTrace.LOGICAL_DELETE)
+            return Request.newBuilder().setDelete(DeleteRequest.newBuilder().setKey(key).setTs(operation.version())).build();
+        if (operation.kind() != IndexOperationTrace.INSERT && operation.kind() != IndexOperationTrace.UPSERT)
+            throw new IOException("Not a data operation");
+        return Request.newBuilder().setPut(PutRequest.newBuilder().setKey(key).setTs(operation.version())
+                .setValue(value(operation))).build();
     }
 
-    /** Reuses a validated Trace payload; only replay IDs and value representation change. */
-    public Request forward(long id, Request stored, List<Operation> members) throws IOException {
+    /** Stored operations already contain the data RPC payload; only the selected value encoding changes. */
+    public Request forward(Request stored, List<Operation> members) throws IOException {
         Operation first = members.get(0);
         if (first.grouped()) {
-            if (!stored.hasGroup() || stored.getGroup().getMembersCount() != members.size()
-                    || members.size() != first.expansionSize()) throw new IOException("Incomplete stored search group");
+            if (!stored.hasGroup() || stored.getGroup().getMembersCount() != members.size())
+                throw new IOException("Incomplete stored query group");
             maxGroupMembers.accumulateAndGet(members.size(), Math::max);
         } else if (members.size() != 1 || (first.kind() == IndexOperationTrace.SEARCH
-                ? !stored.hasSearch() : !stored.hasWrite())) {
-            throw new IOException("Stored service payload disagrees with operation view");
-        }
-        var request = stored.toBuilder().setId(id);
-        if (stored.hasWrite() && stored.getWrite().getKind() != Write.Kind.LOGICAL_DELETE)
-            request.setWrite(forwardWrite(stored.getWrite(), first));
-        return request.build();
+                ? !(stored.hasGet() || stored.hasScan()) : first.kind() == IndexOperationTrace.LOGICAL_DELETE
+                ? !stored.hasDelete() : !stored.hasPut())) throw new IOException("Stored operation shape mismatch");
+        if (stored.hasPut() && valueKind == ValueKind.LOCATOR)
+            return stored.toBuilder().setPut(stored.getPut().toBuilder().setValue(value(first))).build();
+        return stored;
     }
 
-    /** Baseline INSERTs sent as one request; a batch takes one send position. */
-    public Request batch(long id, List<Operation> inserts) throws IOException {
-        return batch(id, inserts, List.of());
-    }
-
-    Request batch(long id, List<Operation> inserts, List<Write> stored) throws IOException {
-        if (!stored.isEmpty() && stored.size() != inserts.size())
-            throw new IOException("Invalid stored Baseline batch");
-        var batch = org.sibench.adapters.proto.WriteBatch.newBuilder();
+    public Request batch(List<Operation> inserts) throws IOException { return batch(inserts, List.of()); }
+    Request batch(List<Operation> inserts, List<PutRequest> stored) throws IOException {
+        if (!stored.isEmpty() && stored.size() != inserts.size()) throw new IOException("Invalid stored baseline batch");
+        var batch = BatchWriteRequest.newBuilder();
         for (int i = 0; i < inserts.size(); i++) {
-            Operation insert = inserts.get(i);
-            if (!baselineInsert(insert)) throw new IOException("Only Baseline INSERTs travel in a batch");
-            if (stored.isEmpty()) batch.addWrites(write(insert));
-            else batch.addWrites(forwardWrite(stored.get(i), insert));
+            var insert = inserts.get(i);
+            if (!baselineInsert(insert)) throw new IOException("Only baseline puts are batched by replay");
+            PutRequest put = stored.isEmpty() ? request(insert).getPut() : stored.get(i);
+            if (valueKind == ValueKind.LOCATOR) put = put.toBuilder().setValue(value(insert)).build();
+            batch.addMutations(Mutation.newBuilder().setPut(put));
         }
-        return Request.newBuilder().setId(id).setBatch(batch).build();
+        return Request.newBuilder().setBatch(batch).build();
     }
-
-    private Write forwardWrite(Write stored, Operation operation) {
-        if (valueKind == ValueKind.ROW_ID && stored.getValue().getFile() == 0
-                && stored.getValue().getPosition() == 0) return stored;
-        return stored.toBuilder().setValue(value(operation)).build();
-    }
-
     static boolean baselineInsert(Operation operation) {
-        return operation.kind() == IndexOperationTrace.INSERT
-                && operation.version() == 0
-                && operation.transactionId() == 0;
+        return operation.kind() == IndexOperationTrace.INSERT && operation.version() == 0 && operation.transactionId() == 0;
     }
-
-    /** A write batch response carries no results. */
-    public void checkBatch(Response response, long id) throws IOException {
-        if (response.getId() != id || response.getMore())
-            throw new IOException("Invalid final response for write batch " + id);
-        if (response.getStatus() != Status.OK)
-            throw new IOException("Service " + response.getStatus() + " for a write batch: " + response.getMessage());
-        if (response.getResultsCount() != 0) throw new IOException("Write batch returned results");
+    public void checkBatch(Response response) throws IOException {
+        if (response.getMore() || response.getStatus() != Status.OK || response.getResultsCount() != 0)
+            throw new IOException("Invalid write batch response: " + response.getMessage());
     }
-
-    /** Baseline INSERTs per batch request; 1 sends each on its own. */
     public void baselineBatch(int writes) {
         if (writes < 1) throw new IllegalArgumentException("A batch holds at least one write");
         baselineBatch = writes;
     }
+    int baselineBatch() { return baselineBatch; }
 
-    int baselineBatch() {
-        return baselineBatch;
-    }
-
-    private Write.Builder write(Operation operation) throws IOException {
-        Write.Kind kind = switch (operation.kind()) {
-            case IndexOperationTrace.INSERT -> Write.Kind.INSERT;
-            case IndexOperationTrace.UPSERT -> Write.Kind.UPSERT;
-            case IndexOperationTrace.LOGICAL_DELETE -> Write.Kind.LOGICAL_DELETE;
-            case IndexOperationTrace.RELOCATE -> Write.Kind.RELOCATE;
-            default -> throw new IOException("Not an index operation: " + IndexOperationTrace.kindName(operation.kind()));
-        };
-        var write = Write.newBuilder()
-                .setKind(kind)
-                .setKey(EntryKey.newBuilder()
-                        .setTable(operation.table())
-                        .setIndex(operation.index())
-                        .setIndexedValue(operation.index() == 0 ? ByteString.EMPTY : bytes(operation.indexedValue()))
-                        .setPrimaryKey(bytes(operation.key())))
-                .setVersion(operation.version());
-        if (kind != Write.Kind.LOGICAL_DELETE) write.setValue(value(operation));
-        return write;
-    }
-
-    /** The members of one search group, in trace order. */
-    public Request group(long id, List<Operation> members) throws IOException {
+    public Request group(List<Operation> members) throws IOException {
         Operation first = members.get(0);
-        if (members.size() != first.expansionSize()) throw new IOException("Incomplete search group");
-        var group = SearchGroup.newBuilder()
-                .setMode((first.flags() & IndexOperationTrace.INTERSECT_GROUP) != 0
-                        ? SearchGroup.Mode.INTERSECTION
-                        : SearchGroup.Mode.UNION);
-        for (Operation member : members) group.addMembers(search(member));
-        var request = Request.newBuilder().setId(id);
+        if (members.size() != first.expansionSize()) throw new IOException("Incomplete query group");
+        var group = SearchGroup.newBuilder().setMode((first.flags() & IndexOperationTrace.INTERSECT_GROUP) != 0
+                ? SearchGroup.Mode.INTERSECTION : SearchGroup.Mode.UNION);
+        for (var member : members) {
+            var request = query(member);
+            var read = ReadRequest.newBuilder();
+            if (request.hasGet()) read.setGet(request.getGet()); else read.setScan(request.getScan());
+            group.addMembers(read);
+        }
         maxGroupMembers.accumulateAndGet(members.size(), Math::max);
-        return request.setGroup(group).build();
+        return Request.newBuilder().setGroup(group).build();
     }
-
-    Search search(Operation operation) throws IOException {
+    static Request read(ReadRequest read) throws IOException {
+        if (read.hasGet()) return Request.newBuilder().setGet(read.getGet()).build();
+        if (read.hasScan()) return Request.newBuilder().setScan(read.getScan()).build();
+        throw new IOException("Missing query member");
+    }
+    Request query(Operation operation) throws IOException {
         if ((operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0)
-            throw new IOException("Only committed-snapshot searches may reach the service");
-        var search = Search.newBuilder()
-                .setTable(operation.table())
-                .setIndex(operation.index())
-                .setDescending((operation.flags() & IndexOperationTrace.DESCENDING) != 0)
-                .setLimit(operation.limit())
-                .setReadVersion(operation.readTimestamp());
-        if (operation.lower() != null)
-            search.setLower(Bound.newBuilder().setKey(bytes(operation.lower()))
-                    .setInclusive((operation.flags() & IndexOperationTrace.LOWER_INCLUSIVE) != 0));
-        if (operation.upper() != null)
-            search.setUpper(Bound.newBuilder().setKey(bytes(operation.upper()))
-                    .setInclusive((operation.flags() & IndexOperationTrace.UPPER_INCLUSIVE) != 0));
-        // A secondary search that names a primary key is pinned to that one entry.
-        if (operation.key() != null) search.setPinnedPrimaryKey(bytes(operation.key()));
-        return search.build();
+            throw new IOException("Transaction-local read cannot reach the service");
+        boolean exact = operation.range().point() && (operation.index() == 0 || operation.key() != null);
+        if (exact) {
+            var key = new IndexEntry(operation.table(), operation.index(), operation.index() == 0 ? null : operation.lower(),
+                    operation.index() == 0 ? operation.lower() : operation.key()).bytes();
+            return Request.newBuilder().setGet(GetRequest.newBuilder().setKey(key).setReadTs(operation.readTimestamp())).build();
+        }
+        var scan = ScanRequest.newBuilder().setReadTs(operation.readTimestamp()).setLimit(operation.limit())
+                .setReverse((operation.flags() & IndexOperationTrace.DESCENDING) != 0)
+                .setStartKey(IndexEntry.bound(operation.table(), operation.index(), operation.lower(),
+                        operation.lower() != null && !operation.range().lowerInclusive()))
+                .setEndKey(IndexEntry.bound(operation.table(), operation.index(), operation.upper(),
+                        operation.upper() == null || operation.range().upperInclusive()));
+        return Request.newBuilder().setScan(scan).build();
+    }
+    private ByteString value(Operation operation) {
+        return valueKind == ValueKind.ROW_ID ? IndexEntry.rowId(operation.rowId())
+                : IndexEntry.locator(operation.file(), operation.position());
     }
 
-    private Value value(Operation operation) {
-        return valueKind == ValueKind.ROW_ID
-                ? Value.newBuilder().setRowId(operation.rowId()).build()
-                : Value.newBuilder().setFile(operation.file()).setPosition(operation.position()).build();
-    }
-
-    private static ByteString bytes(IndexKey key) {
-        return ByteString.copyFrom(key.bytes());
+    /** Groups are a replay concern; full index keys differ between indexes, so combine by table/PK. */
+    public static List<Result> combine(SearchGroup group, List<List<Result>> answers) throws IOException {
+        if (group.getMembersCount() < 2 || answers.size() != group.getMembersCount()) throw new IOException("Invalid query group");
+        boolean intersect = group.getMode() == SearchGroup.Mode.INTERSECTION;
+        if (!intersect && group.getMode() != SearchGroup.Mode.UNION) throw new IOException("Unknown group mode");
+        var combined = new java.util.LinkedHashMap<IndexKey, Result>();
+        int table = -1; long ts = -1;
+        for (int i = 0; i < answers.size(); i++) {
+            var member = group.getMembers(i);
+            ByteString key = member.hasGet() ? member.getGet().getKey() : member.getScan().getStartKey();
+            if (key.size() < 8) throw new IOException("Missing group namespace");
+            int current = key.asReadOnlyByteBuffer().getInt();
+            long readTs = member.hasGet() ? member.getGet().getReadTs() : member.getScan().getReadTs();
+            if (i > 0 && (table != current || ts != readTs)) throw new IOException("Group spans tables or read points");
+            table = current; ts = readTs;
+            var keys = new java.util.HashSet<IndexKey>();
+            for (Result result : answers.get(i)) {
+                var entry = IndexEntry.decode(result.getKey());
+                if (entry.table() != table) throw new IOException("Result outside query table");
+                keys.add(entry.primaryKey());
+                if (i == 0 || !intersect) combined.putIfAbsent(entry.primaryKey(), result);
+            }
+            if (i > 0 && intersect) combined.keySet().retainAll(keys);
+        }
+        return List.copyOf(combined.values());
     }
 
     /** Checks one complete response against its Trace operation. */
     public void check(Operation operation, Response response) throws IOException {
-        receive(operation, response.getId()).finish(response);
+        receive(operation, operation.sourceEvent()).finish(response);
     }
 
     /** The response to request {@code id}, received as one or more chunks. */
@@ -215,7 +187,7 @@ public final class TraceRequests {
 
         /** A chunk with {@code more = true}: results only. */
         public void add(Response chunk) throws IOException {
-            if (chunk.getId() != id || !chunk.getMore() || chunk.getStatus() != Status.OK)
+            if (!chunk.getMore() || chunk.getStatus() != Status.OK)
                 throw new IOException("Invalid partial response for request " + id);
             if (operation.kind() != IndexOperationTrace.SEARCH)
                 throw new IOException("Partial response to a write");
@@ -232,7 +204,6 @@ public final class TraceRequests {
         /** The final response (more = false): status, the remaining results and every check. */
         public void finish(Response response) throws IOException {
             if (failure != null) throw failure;
-            if (response.getId() != id) throw new IOException("Response ID differs from request " + id);
             if (response.getMore()) throw new IOException("Final response marked partial");
             if (response.getStatus() != Status.OK)
                 throw new IOException("Service " + response.getStatus() + " at source event "
@@ -274,8 +245,6 @@ public final class TraceRequests {
     public long maxGroupMembers() {
         return maxGroupMembers.get();
     }
-
-
 
     void rpcRequest(com.google.protobuf.MessageLite request, String kind) {
         rpcRequests.incrementAndGet();

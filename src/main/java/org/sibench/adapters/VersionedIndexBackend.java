@@ -4,12 +4,8 @@ import org.sibench.config.ObjectStore;
 
 import com.google.protobuf.ByteString;
 
-import org.sibench.adapters.proto.Bound;
-import org.sibench.adapters.proto.Result;
-import org.sibench.adapters.proto.Search;
-import org.sibench.adapters.proto.Value;
-import org.sibench.adapters.proto.ValueKind;
-import org.sibench.adapters.proto.Write;
+import org.sibench.adapters.proto.*;
+import org.sibench.state.ByteKeys;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -19,20 +15,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
-/**
- * A versioned index on one ordered byte store, in the trace contract's KV
- * layout:
- * {@code table(u32) ++ index(u32) ++ [indexed value] ++ primary key ++ ~version(u64)}, all big
- * endian, so the versions of one entry sort newest first right after each other. The value is
- * {@code present(1) ++ indexed value length(u32) ++ file(i64) ++ position(i64) ++ row id(i64)}; a
- * logical delete is a version that is not present.
- *
- * <p>All writes have the same acknowledgment contract; persistence is asynchronous and its level is
- * declared by the store. Table 0, which no entry uses, holds the index's value kind and its
- * Trace binding, so a reopened index is checked before reuse.
- */
+/** Versioned opaque KV over an ordered store. Escaped keys delimit histories, including key prefixes. */
 public final class VersionedIndexBackend implements IndexBackend {
-    private static final int HEADER = 8, VERSION = 8, VALUE = 1 + 4 + 8 + 8 + 8;
+    private static final int VERSION = 8;
     private static final byte[] VALUE_KIND = metadata("value_kind"),
             TRACE_BINDING = metadata("trace_binding");
     private final OrderedStore store;
@@ -112,8 +97,8 @@ public final class VersionedIndexBackend implements IndexBackend {
             throw new IOException("Reopened index does not hold " + valueKind + " values");
         }
         var backend = new VersionedIndexBackend(store, valueKind, path);
-        byte[] prefix = new byte[HEADER];
-        try (var entries = store.cursor(prefix, successor(prefix))) {
+        byte[] prefix = new byte[] {0};
+        try (var entries = store.cursor(prefix, ByteKeys.successor(prefix))) {
             entries.seek(prefix);
             while (entries.valid()) {
                 if (!Arrays.equals(entries.key(), VALUE_KIND) && !Arrays.equals(entries.key(), TRACE_BINDING))
@@ -129,7 +114,7 @@ public final class VersionedIndexBackend implements IndexBackend {
 
     private static byte[] metadata(String name) {
         byte[] text = name.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
-        return ByteBuffer.allocate(HEADER + text.length).putInt(0).putInt(0).put(text).array();
+        return ByteBuffer.allocate(1 + text.length).put((byte) 0).put(text).array();
     }
 
     @Override
@@ -138,208 +123,108 @@ public final class VersionedIndexBackend implements IndexBackend {
     }
 
     @Override
-    public void write(Write write) throws IOException {
-        var key = write.getKey();
-        IndexExecution.validateWrite(write, valueKind);
-        byte[] entry = entry(key.getTable(), key.getIndex(), key.getIndexedValue(), key.getPrimaryKey());
-        byte[] versioned = versioned(entry, write.getVersion());
-        switch (write.getKind()) {
-            case INSERT -> {
-                if (write.getVersion() != 0) throw new IllegalArgumentException("Insert outside the baseline");
-                store.put(versioned, value(true, key.getIndexedValue().size(), write.getValue()), true);
-            }
-            case UPSERT -> store.put(versioned, value(true, key.getIndexedValue().size(), write.getValue()), true);
-            case LOGICAL_DELETE ->
-                    store.put(versioned, value(false, key.getIndexedValue().size(), Value.getDefaultInstance()), true);
-            case RELOCATE -> {
-                byte[] current = store.get(versioned);
-                if (current == null || current[0] == 0)
-                    throw new IllegalArgumentException("Relocation requires an existing exact version");
-                if (valueKind == ValueKind.ROW_ID
-                        && ByteBuffer.wrap(current).getLong(1 + 4 + 16) != write.getValue().getRowId())
-                    throw new IllegalArgumentException("Relocation changed the row id");
-                store.put(versioned, value(true, key.getIndexedValue().size(), write.getValue()), true);
-            }
-            default -> throw new IllegalArgumentException("Unknown write kind");
-        }
+    public void write(Mutation mutation) throws IOException {
+        IndexExecution.validateMutation(mutation);
+        boolean put = mutation.hasPut();
+        ByteString key = put ? mutation.getPut().getKey() : mutation.getDelete().getKey();
+        long ts = put ? mutation.getPut().getTs() : mutation.getDelete().getTs();
+        store.put(versioned(entry(key), ts), value(put, mutation.getPut().getValue()), true);
     }
 
     @Override
-    public void writeBatch(java.util.List<Write> writes) throws IOException {
-        var keys = new java.util.ArrayList<byte[]>(writes.size());
-        var values = new java.util.ArrayList<byte[]>(writes.size());
-        for (var write : writes) {
-            IndexExecution.validateWrite(write, valueKind);
-            if (write.getKind() == Write.Kind.RELOCATE)
-                throw new IllegalArgumentException("Relocate is not a batch mutation");
-            var key = write.getKey();
-            keys.add(versioned(entry(key.getTable(), key.getIndex(), key.getIndexedValue(), key.getPrimaryKey()), write.getVersion()));
-            boolean present = write.getKind() != Write.Kind.LOGICAL_DELETE;
-            values.add(value(present, key.getIndexedValue().size(), present ? write.getValue() : Value.getDefaultInstance()));
+    public void writeBatch(List<Mutation> mutations) throws IOException {
+        var keys = new ArrayList<byte[]>(mutations.size());
+        var values = new ArrayList<byte[]>(mutations.size());
+        for (var mutation : mutations) {
+            IndexExecution.validateMutation(mutation);
+            boolean put = mutation.hasPut();
+            keys.add(versioned(entry(put ? mutation.getPut().getKey() : mutation.getDelete().getKey()),
+                    put ? mutation.getPut().getTs() : mutation.getDelete().getTs()));
+            values.add(value(put, mutation.getPut().getValue()));
         }
         store.putAll(keys, values);
     }
 
     @Override
-    public void search(Search search, ResultSink sink) throws IOException {
-        if (!search.getUnknownFields().asMap().isEmpty() || !search.getLower().getUnknownFields().asMap().isEmpty()
-                || !search.getUpper().getUnknownFields().asMap().isEmpty())
-            throw new IllegalArgumentException("Unsupported search fields");
-        if (search.getTable() < 1 || search.getIndex() < 0 || search.getReadVersion() < 0 || search.getLimit() < 0)
-            throw new IllegalArgumentException("Invalid search table, index, version or limit");
-        if (search.hasLower()) IndexExecution.component(search.getLower().getKey());
-        if (search.hasUpper()) IndexExecution.component(search.getUpper().getKey());
-        long found = 0;
-        byte[] prefix = entry(search.getTable(), search.getIndex(), ByteString.EMPTY, ByteString.EMPTY);
-        if (!search.getPinnedPrimaryKey().isEmpty()) {
-            if (search.getIndex() == 0 || !search.hasLower() || !search.getLower().equals(search.getUpper()))
-                throw new IllegalArgumentException("A pinned search names one secondary entry");
-            byte[] entry = entry(search.getTable(), search.getIndex(), search.getLower().getKey(), search.getPinnedPrimaryKey());
-            try (var iterator = store.cursor(null, null)) {
-                Result result = visible(iterator, entry, search.getReadVersion());
-                if (result != null) sink.accept(result);
-            }
-            return;
+    public Result get(GetRequest get) throws IOException {
+        IndexExecution.validateGet(get);
+        try (var cursor = store.cursor(null, null)) {
+            return visible(cursor, entry(get.getKey()), get.getReadTs());
         }
-        byte[] start = search.hasLower() ? concat(prefix, lower(search.getLower())) : prefix;
-        // A bound without a successor is past every entry of the index.
-        if (start == null) return;
-        byte[] end = search.hasUpper() ? concat(prefix, upper(search.getUpper())) : null;
-        if (end == null) end = successor(prefix);
-        if (end != null && Arrays.compareUnsigned(start, end) >= 0) return;
-        long limit = search.getLimit();
-        try (var iterator = store.cursor(start, end)) {
-            if (!search.getDescending()) {
-                iterator.seek(start);
-                while (iterator.valid() && (limit == 0 || found < limit)) {
-                    byte[] key = iterator.key();
-                    byte[] entry = logical(key);
-                    long version = ~ByteBuffer.wrap(key, entry.length, VERSION).getLong();
-                    long selected = search.getReadVersion();
-                    if (version > selected) iterator.seek(versioned(entry, selected));
-                    Result result = visibleAt(iterator, entry, search.getReadVersion());
-                    if (result != null) {
-                        sink.accept(result);
-                        found++;
-                    }
-                    // Most entries have one version. Keep long histories bounded by one skip seek.
-                    if (iterator.valid() && sameEntry(iterator.key(), entry)) {
-                        iterator.next();
-                        if (iterator.valid() && sameEntry(iterator.key(), entry)) {
-                            iterator.seek(versioned(entry, 0));
-                            if (iterator.valid() && sameEntry(iterator.key(), entry)) iterator.next();
+    }
+
+    @Override
+    public void scan(ScanRequest scan, ResultSink sink) throws IOException {
+        IndexExecution.validateScan(scan);
+        byte[] start = scan.hasStartKey() ? entry(scan.getStartKey()) : new byte[] {1};
+        byte[] end = scan.hasEndKey() ? entry(scan.getEndKey()) : new byte[] {2};
+        if (Arrays.compareUnsigned(start, end) >= 0) return;
+        long found = 0, limit = scan.getLimit();
+        try (var cursor = store.cursor(start, end)) {
+            if (!scan.getReverse()) {
+                cursor.seek(start);
+                while (cursor.valid() && (limit == 0 || found < limit)) {
+                    byte[] key = cursor.key(), entry = logical(key);
+                    long ts = ~ByteBuffer.wrap(key, entry.length, VERSION).getLong();
+                    if (ts > scan.getReadTs()) cursor.seek(versioned(entry, scan.getReadTs()));
+                    Result result = visibleAt(cursor, entry);
+                    if (result != null) { sink.accept(result); found++; }
+                    if (cursor.valid() && sameEntry(cursor.key(), entry)) {
+                        cursor.next();
+                        if (cursor.valid() && sameEntry(cursor.key(), entry)) {
+                            cursor.seek(versioned(entry, 0));
+                            if (cursor.valid() && sameEntry(cursor.key(), entry)) cursor.next();
                         }
                     }
                 }
             } else try (var versions = store.cursor(null, null)) {
-                if (end == null) iterator.seekToLast();
-                else iterator.seekForPrev(end);
-                while (iterator.valid() && end != null && Arrays.compareUnsigned(iterator.key(), end) >= 0)
-                    iterator.prev();
-                while (iterator.valid() && (limit == 0 || found < limit)) {
-                    byte[] entry = logical(iterator.key());
-                    Result result = visible(versions, entry, search.getReadVersion());
-                    if (result != null) {
-                        sink.accept(result);
-                        found++;
-                    }
-                    // Every version of the entry sorts after the entry itself.
-                    iterator.seekForPrev(entry);
+                cursor.seekForPrev(end);
+                while (cursor.valid() && Arrays.compareUnsigned(cursor.key(), end) >= 0) cursor.prev();
+                while (cursor.valid() && (limit == 0 || found < limit)) {
+                    byte[] entry = logical(cursor.key());
+                    Result result = visible(versions, entry, scan.getReadTs());
+                    if (result != null) { sink.accept(result); found++; }
+                    cursor.seekForPrev(entry);
                 }
             }
         }
     }
 
-    /**
-     * The newest committed version of {@code entry} at or below the read version.
-     */
-    private Result visible(
-            OrderedStore.Cursor versions, byte[] entry, long readVersion)
-            throws IOException {
-        byte[] selected = versioned(entry, readVersion);
-        versions.seek(selected);
-        return visibleAt(versions, entry, readVersion);
+    private Result visible(OrderedStore.Cursor cursor, byte[] entry, long readTs) throws IOException {
+        cursor.seek(versioned(entry, readTs));
+        return visibleAt(cursor, entry);
     }
 
     private static boolean sameEntry(byte[] key, byte[] entry) {
-        return key.length == entry.length + VERSION
-                && Arrays.equals(key, 0, entry.length, entry, 0, entry.length);
+        return key.length == entry.length + VERSION && Arrays.equals(key, 0, entry.length, entry, 0, entry.length);
     }
 
-    private Result visibleAt(
-            OrderedStore.Cursor versions, byte[] entry, long readVersion)
-            throws IOException {
-        if (!versions.valid()) return null;
-        byte[] key = versions.key();
-        if (!sameEntry(key, entry)) return null;
-        ByteBuffer value = ByteBuffer.wrap(versions.value());
-        if (value.get(0) == 0) return null;
-        int indexedValue = value.getInt(1);
-        return Result.newBuilder()
-                .setPrimaryKey(ByteString.copyFrom(key, HEADER + indexedValue, entry.length - HEADER - indexedValue))
-                .setVersion(~ByteBuffer.wrap(key, entry.length, VERSION).getLong())
-                .setValue(Value.newBuilder()
-                        .setFile(value.getLong(5))
-                        .setPosition(value.getLong(13))
-                        .setRowId(value.getLong(21)))
-                .build();
+    private Result visibleAt(OrderedStore.Cursor cursor, byte[] entry) throws IOException {
+        if (!cursor.valid() || !sameEntry(cursor.key(), entry)) return null;
+        byte[] value = cursor.value();
+        if (value.length == 0 || (value[0] != 0 && value[0] != 1) || value[0] == 0 && value.length != 1)
+            throw new IOException("Invalid stored KV value");
+        if (value[0] == 0) return null;
+        ByteBuffer input = ByteBuffer.wrap(entry, 1, entry.length - 1);
+        byte[] key = ByteKeys.decode(input);
+        if (input.hasRemaining()) throw new IOException("Invalid stored KV key");
+        return Result.newBuilder().setKey(ByteString.copyFrom(key))
+                .setTs(~ByteBuffer.wrap(cursor.key(), entry.length, VERSION).getLong())
+                .setValue(ByteString.copyFrom(value, 1, value.length - 1)).build();
     }
 
-    private static byte[] entry(int table, int index, ByteString indexedValue, ByteString primaryKey) {
-        return ByteBuffer.allocate(HEADER + indexedValue.size() + primaryKey.size())
-                .putInt(table)
-                .putInt(index)
-                .put(indexedValue.asReadOnlyByteBuffer())
-                .put(primaryKey.asReadOnlyByteBuffer())
-                .array();
+    private static byte[] entry(ByteString key) {
+        return ByteKeys.concat(new byte[] {1}, ByteKeys.encode(key.toByteArray()));
     }
-
-    private static byte[] versioned(byte[] entry, long version) {
-        return ByteBuffer.allocate(entry.length + VERSION).put(entry).putLong(~version).array();
+    private static byte[] versioned(byte[] entry, long ts) {
+        return ByteBuffer.allocate(entry.length + VERSION).put(entry).putLong(~ts).array();
     }
-
-    private static byte[] logical(byte[] key) {
+    private static byte[] logical(byte[] key) throws IOException {
+        if (key.length < 3 + VERSION || key[0] != 1) throw new IOException("Invalid stored versioned key");
         return Arrays.copyOf(key, key.length - VERSION);
     }
-
-    private static byte[] value(boolean present, int indexedValue, Value value) {
-        return ByteBuffer.allocate(VALUE)
-                .put((byte) (present ? 1 : 0))
-                .putInt(indexedValue)
-                .putLong(value.getFile())
-                .putLong(value.getPosition())
-                .putLong(value.getRowId())
-                .array();
-    }
-
-    /** Components delimit themselves, so the successor of a component bounds everything after it. */
-    private static byte[] lower(Bound bound) {
-        byte[] key = bound.getKey().toByteArray();
-        return bound.getInclusive() ? key : successor(key);
-    }
-
-    private static byte[] upper(Bound bound) {
-        byte[] key = bound.getKey().toByteArray();
-        return bound.getInclusive() ? successor(key) : key;
-    }
-
-    /** The smallest byte string greater than every string starting with {@code bytes}. */
-    static byte[] successor(byte[] bytes) {
-        byte[] result = bytes.clone();
-        for (int i = result.length - 1; i >= 0; i--) {
-            if (result[i] != (byte) 0xff) {
-                result[i]++;
-                return Arrays.copyOf(result, i + 1);
-            }
-        }
-        return null;
-    }
-
-    private static byte[] concat(byte[] a, byte[] b) {
-        if (b == null) return null;
-        byte[] result = Arrays.copyOf(a, a.length + b.length);
-        System.arraycopy(b, 0, result, a.length, b.length);
-        return result;
+    private static byte[] value(boolean present, ByteString value) {
+        return present ? ByteKeys.concat(new byte[] {1}, value.toByteArray()) : new byte[] {0};
     }
 
     @Override

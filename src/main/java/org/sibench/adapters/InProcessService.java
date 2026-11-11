@@ -17,16 +17,13 @@ public final class InProcessService {
             @Override
             CompletableFuture<Response> transmit(
                     Request request, java.util.function.Consumer<Response> partial) {
-                if (request.hasBatch()) requests.rpcRequest(IndexRpc.batch(request.getBatch()), "BatchWrite");
-                else if (request.hasWrite()) {
-                    var write = request.getWrite();
-                    if (write.getKind() == org.sibench.adapters.proto.Write.Kind.LOGICAL_DELETE)
-                        requests.rpcRequest(IndexRpc.delete(write), "Delete");
-                    else requests.rpcRequest(IndexRpc.put(write), "Put");
-                } else {
-                    var get = IndexRpc.get(request.getSearch());
-                    if (get != null) requests.rpcRequest(get, "Get");
-                    else requests.rpcRequest(IndexRpc.scan(request.getSearch()), "Scan");
+                switch (request.getOperationCase()) {
+                    case PUT -> requests.rpcRequest(request.getPut(), "Put");
+                    case DELETE -> requests.rpcRequest(request.getDelete(), "Delete");
+                    case GET -> requests.rpcRequest(request.getGet(), "Get");
+                    case SCAN -> requests.rpcRequest(request.getScan(), "Scan");
+                    case BATCH -> requests.rpcRequest(request.getBatch(), "BatchWrite");
+                    default -> throw new IllegalArgumentException("Expected a data operation");
                 }
                 return executor.submit(request, chunk -> { requests.rpcResults(chunk.getResultsList()); partial.accept(chunk); })
                         .thenApply(response -> { requests.rpcResults(response.getResultsList()); return response; });

@@ -57,22 +57,19 @@ public final class GrpcService implements AutoCloseable {
         @Override synchronized CompletableFuture<Response> transmit(Request request, Consumer<Response> partial) throws IOException {
             if (failure!=null) throw new IOException("Index client failed",failure);
             try {
-                if (request.hasBatch()) return call(IndexServiceGrpc.getBatchWriteMethod(),IndexRpc.batch(request.getBatch()),request,partial,false);
-                if (request.hasWrite()) {
-                    var write=request.getWrite();
-                    if (write.getKind()==Write.Kind.LOGICAL_DELETE)
-                        return call(IndexServiceGrpc.getDeleteMethod(),IndexRpc.delete(write),request,partial,false);
-                    return call(IndexServiceGrpc.getPutMethod(),IndexRpc.put(write),request,partial,false);
-                }
-                if (!request.hasSearch()) throw new IOException("Only individual searches reach the transport");
-                var get=IndexRpc.get(request.getSearch());
-                return get!=null ? call(IndexServiceGrpc.getGetMethod(),get,request,partial,false)
-                        : call(IndexServiceGrpc.getScanMethod(),IndexRpc.scan(request.getSearch()),request,partial,true);
+                return switch (request.getOperationCase()) {
+                    case PUT -> call(IndexServiceGrpc.getPutMethod(), request.getPut(), partial, false);
+                    case DELETE -> call(IndexServiceGrpc.getDeleteMethod(), request.getDelete(), partial, false);
+                    case GET -> call(IndexServiceGrpc.getGetMethod(), request.getGet(), partial, false);
+                    case SCAN -> call(IndexServiceGrpc.getScanMethod(), request.getScan(), partial, true);
+                    case BATCH -> call(IndexServiceGrpc.getBatchWriteMethod(), request.getBatch(), partial, false);
+                    default -> throw new IOException("Only data operations reach the transport");
+                };
             } catch (IllegalArgumentException error) { throw new IOException("Unsupported index operation",error); }
         }
 
         private <Q extends MessageLite,S> CompletableFuture<Response> call(MethodDescriptor<Q,S> method,Q input,
-                Request request,Consumer<Response> partial,boolean scan) throws IOException {
+                Consumer<Response> partial,boolean scan) throws IOException {
             if (input.getSerializedSize()>IndexExecution.MAX_MESSAGE_BYTES) throw new IOException("Index request exceeds the RPC message limit");
             var done=new CompletableFuture<Response>();
             var sent=new CompletableFuture<Void>(); lastSend=sent;
@@ -117,7 +114,7 @@ public final class GrpcService implements AutoCloseable {
             };
             pending.put(done,call);
             requests.rpcRequest(input,method.getBareMethodName());
-            var answer=Response.newBuilder().setId(request.getId()).setStatus(org.sibench.adapters.proto.Status.OK);
+            var answer=Response.newBuilder().setStatus(org.sibench.adapters.proto.Status.OK);
             StreamObserver<S> observer=new StreamObserver<>() {
                 int messages;
                 @Override public void onNext(S value) {
@@ -127,7 +124,7 @@ public final class GrpcService implements AutoCloseable {
                             answer.addResults(get.getResult()); requests.rpcResults(java.util.List.of(get.getResult()));
                         } else if (value instanceof ScanResponse chunk) {
                             requests.rpcResults(chunk.getResultsList());
-                            partial.accept(Response.newBuilder().setId(request.getId()).setStatus(org.sibench.adapters.proto.Status.OK)
+                            partial.accept(Response.newBuilder().setStatus(org.sibench.adapters.proto.Status.OK)
                                     .setMore(true).addAllResults(chunk.getResultsList()).build());
                         }
                     } catch (IOException | RuntimeException error) { fail(error); }

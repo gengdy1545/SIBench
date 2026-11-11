@@ -1,22 +1,24 @@
 # Index Service contract
 
-[index_service.proto](../proto/index_service.proto) defines the five data RPCs in namespace `sibench.index`. Shared logical types are in [index_types.proto](../proto/index_types.proto); stored operations and source facts belong to [index_trace.proto](../proto/index_trace.proto). Driver and service ship together with one supported API and Trace format.
+[index_service.proto](../proto/index_service.proto) defines the five data RPCs and their request/response types in namespace `sibench.index`. It also groups the harness deployment enums and internal completion messages separately from the data API. [index_trace.proto](../proto/index_trace.proto) imports these service types and owns stored operation envelopes and source facts. Driver and service ship together with one supported API and Trace format.
 
 ## Data interfaces
 
 | RPC | Contract |
 | --- | --- |
-| `Get` | Exact `(table,index,indexed_value,PK)` at `read_version`; one optional Result. Missing Result means absent; RowID/Locator zero is valid. A secondary lookup without an exact PK uses Scan. |
-| `Put` | One entry and logical version; success follows visible application through the same service instance. Version 0 uses the same write/ACK policy as every other version. |
-| `Delete` | Versioned logical deletion; the selected tombstone hides older values while historical reads remain valid. |
-| `Scan` | Ordered bounded query at `read_version`, with inclusive/exclusive endpoints, direction and limit. Chunks concatenate in order; only normal gRPC completion establishes success, including for an empty result. |
+| `Get` | Exact opaque `key` at `read_ts`; one optional Result containing `key`, selected `ts` and `value`. Missing Result means absent; an empty byte value is a present value. |
+| `Put` | Opaque `key`, caller-assigned `ts` and opaque `value`; success follows visible application through the same instance. Timestamp 0 uses the same write/ACK policy as every other timestamp. |
+| `Delete` | Opaque `key` and caller-assigned `ts`; the selected tombstone hides older values while historical reads remain valid. |
+| `Scan` | Unsigned byte range `[start_key,end_key)` at `read_ts`; missing endpoints are unbounded. `reverse` defaults to false and `limit=0` means unlimited visible entries. Each key contributes at most one visible result. Chunks concatenate in order; only normal gRPC completion establishes success. |
 | `BatchWrite` | Generic Put/Delete members; success follows completion of every member. Inputs are validated before application. Atomic visibility and rollback are not promised; execution failure may be partial. |
 
 Get/Put/Delete/BatchWrite are unary calls; Scan is server streaming. Requests reuse per-client channels and run concurrently. gRPC supplies call association, errors and stream completion; the data API carries no request IDs, transaction control, Describe or Flush RPCs.
 
 The service consumes committed updates and committed-snapshot queries. Generation excludes aborted writes and transaction-local searches and retains the final write to each physical identity within one commit version. Source transaction boundaries remain in Trace for provenance and input validation; the service does not infer missing commits or wait for source transactions.
 
-An entry is `(table,index,indexed_value,PK)`; primary index 0 has no indexed value. Components use the [Trace encoding](trace.md#identity-and-versions). Values are RowID or Locator `(file,position)`, retaining both full int64 fields. Get/Scan select the latest version at or below their explicit read point. Versions and limits must fit Java's nonnegative signed int64 range; read version 0 is valid. Repeated conflicting writes to the same physical identity/version and unknown-outcome retries are outside this contract. Current production sources do not emit relocation/GC workloads; RELOCATE is not a public data RPC.
+The service treats every key and value as bytes, including empty strings and keys that are prefixes of other keys. SIBench owns table/index/primary-key encoding and RowID/Locator conversion; see the [Trace encoding](trace.md#identity-and-versions). A nonunique secondary equality becomes a prefix-range Scan, while an exact secondary entry uses Get. Get and Scan select the newest version at or below `read_ts`; a selected tombstone hides every older value. Timestamps and limits must fit Java's nonnegative signed int64 range. The service allocates no revision or transaction identity. Repeated conflicting writes to the same key/timestamp and unknown-outcome retries are outside this contract.
+
+The protocol and persisted engine layout have one supported representation. Changes require coordinated clients and fresh indexes; there is no legacy decoder or protocol negotiation.
 
 A successful write ACK guarantees same-instance visibility, including another client's RPCs. It does not promise remote durability. INVALID_ARGUMENT rejects invalid input; UNAVAILABLE, cancellation and deadlines may leave a write outcome unknown. The driver never automatically retries such writes. Local transport handoff is measured separately and does not establish server receipt, execution or success.
 
@@ -36,7 +38,7 @@ Every basic operation is timed from entry to the Index Client API through comple
 
 `target_calls` counts basic operations; `rpc_requests` counts actual calls, with `rpc_by_kind` distinguishing Get/Put/Delete/Scan/BatchWrite. Baseline batch members remain distinct basic operations. Trace source boundaries are not sent and do not enter throughput or latency. Warmup membership is assigned in input order before query deferral and follows each operation through its response; histograms exclude warmup. Failed or timed-out requests fail the run and are not successful latency samples.
 
-SearchGroup remains a source-access description in Trace. The client issues one Get/Scan per member, unions/intersects results by PK, and checks the combined native expected count. Intersection preserves the first member's order; union preserves first-occurrence order. Each member retains its own business-response timestamp. Combined validation gates completion/drain and can fail the run; it does not replace all members' latency with the group completion time. Group results are materialized in the client and can consume memory proportional to their member results.
+SearchGroup remains a source-access description in Trace. The client issues one Get/Scan per member at the same read point, decodes the table/PK from returned keys, unions/intersects results by PK, and checks the combined native expected count. Intersection preserves the first member's order; union preserves first-occurrence order. Each member retains its own business-response timestamp. Combined validation gates completion/drain and can fail the run; it does not replace all members' latency with the group completion time. Group results are materialized in the client and can consume memory proportional to their member results.
 
 Snapshot queries wait for all pending write responses at/below their read point. Until then the single sender defers the query and continues with newer writes. Deferred queries leave in source order once their dependencies complete; later writes at/below a deferred read point wait for that query. `dependency_wait_seconds`, `search_deferral_seconds` and `deferred_search_operations` remain outside API latency and inside elapsed throughput time. The entire group must fit `max_in_flight` before its first member is admitted.
 
@@ -59,6 +61,8 @@ Controlled shutdown cancels transports, waits up to 30 seconds at each transport
 `reopen: true` opens persisted data and checks value kind and Trace binding. `verify-service` runs the Trace's snapshot queries at their original read points and rejects a Trace with no queries to verify. It does not force persistence. Use a completed internal persistence cycle or controlled service shutdown before an explicit cold-reopen acceptance. Clean reopen does not certify crash recovery, cross-instance visibility or autoscaling. See [service commands](../README.md#replay-and-service).
 
 ## Local RocksDB fixture
+
+The shared Java backend stores `0x01 ++ escaped(key) ++ ~ts` in unsigned byte order. Escaping maps zero to `00 ff` and terminates with `00 00`, so empty and prefix-related keys have separate histories. Values use a presence byte followed by the opaque payload; a tombstone is a zero presence byte. Harness metadata occupies the separate `0x00` prefix.
 
 All writes, including baseline entries, use local WAL without fsync, so write acknowledgment does not promise power-loss durability. Logical deletions retain versioned tombstones; no physical undo or version GC is implemented.
 

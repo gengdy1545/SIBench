@@ -9,6 +9,7 @@ import org.junit.rules.TemporaryFolder;
 import org.sibench.adapters.proto.*;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.trace.IndexKey;
+import org.sibench.trace.IndexEntry;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
@@ -16,9 +17,9 @@ import java.util.concurrent.*;
 /** Independent cases for the data API, completion, target identity and streamed failures. */
 public class IndexServerTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
-    static EntryKey key(int pk) { return EntryKey.newBuilder().setTable(1).setPrimaryKey(ByteString.copyFrom(IndexKey.ofInt(pk).bytes())).build(); }
-    static PutRequest put(int pk,long version,long row) { return PutRequest.newBuilder().setKey(key(pk)).setVersion(version).setValue(Value.newBuilder().setRowId(row)).build(); }
-    static GetRequest get(int pk,long version) { return GetRequest.newBuilder().setKey(key(pk)).setReadVersion(version).build(); }
+    static ByteString key(int pk) { return new IndexEntry(1, 0, null, IndexKey.ofInt(pk)).bytes(); }
+    static PutRequest put(int pk,long ts,long row) { return PutRequest.newBuilder().setKey(key(pk)).setTs(ts).setValue(IndexEntry.rowId(row)).build(); }
+    static GetRequest get(int pk,long ts) { return GetRequest.newBuilder().setKey(key(pk)).setReadTs(ts).build(); }
     static ManagedChannel channel(int port) { return ManagedChannelBuilder.forAddress("127.0.0.1",port).usePlaintext().build(); }
     static IndexServiceGrpc.IndexServiceBlockingStub stub(ManagedChannel channel) { return IndexServiceGrpc.newBlockingStub(channel).withDeadlineAfter(5,TimeUnit.SECONDS); }
 
@@ -53,7 +54,7 @@ public class IndexServerTest {
         var entered=new CountDownLatch(1); var release=new CountDownLatch(1);
         try(var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("visible"),ValueKind.ROW_ID)) {
             var blocked=(IndexBackend)java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{IndexBackend.class},(proxy,method,args)->{
-                if(method.getName().equals("write") && ((Write)args[0]).getVersion()==1) {
+                if(method.getName().equals("write") && ((Mutation)args[0]).getPut().getTs()==1) {
                     entered.countDown(); if(!release.await(5,TimeUnit.SECONDS)) throw new IOException("release timeout");
                 }
                 try { return method.invoke(backend,args); } catch(java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
@@ -68,13 +69,13 @@ public class IndexServerTest {
                 var reader=channel(server.port());
                 try {
                     var api=stub(reader);
-                    assertEquals(71,api.get(get(7,1)).getResult().getValue().getRowId());
-                    api.delete(DeleteRequest.newBuilder().setKey(key(7)).setVersion(2).build());
+                    assertEquals(71,api.get(get(7,1)).getResult().getValue().asReadOnlyByteBuffer().getLong());
+                    api.delete(DeleteRequest.newBuilder().setKey(key(7)).setTs(2).build());
                     assertFalse(api.get(get(7,2)).hasResult());
-                    assertEquals(71,api.get(get(7,1)).getResult().getValue().getRowId());
+                    assertEquals(71,api.get(get(7,1)).getResult().getValue().asReadOnlyByteBuffer().getLong());
                     api.put(put(7,3,73));
-                    assertEquals(73,api.get(get(7,3)).getResult().getValue().getRowId());
-                    assertEquals(70,api.get(get(7,0)).getResult().getValue().getRowId());
+                    assertEquals(73,api.get(get(7,3)).getResult().getValue().asReadOnlyByteBuffer().getLong());
+                    assertEquals(70,api.get(get(7,0)).getResult().getValue().asReadOnlyByteBuffer().getLong());
                     assertFalse(api.get(get(7,2)).hasResult());
                 } finally { reader.shutdownNow(); }
             }
@@ -91,7 +92,7 @@ public class IndexServerTest {
                     assertThrows(ExecutionException.class,()->response.get(3,TimeUnit.SECONDS));
                 }
             }
-            assertTrue(backend.search(Search.newBuilder().setTable(1).build()).isEmpty());
+            assertTrue(backend.scan(ScanRequest.getDefaultInstance()).isEmpty());
         }
     }
 
@@ -186,23 +187,22 @@ public class IndexServerTest {
                     if(batch.getMutationsCount()==256) { api.batchWrite(batch.build()); batch.clear(); }
                 }
                 if(batch.getMutationsCount()!=0) api.batchWrite(batch.build());
-                var chunks=api.scan(ScanRequest.newBuilder().setTable(1).build());
+                var chunks=api.scan(ScanRequest.newBuilder().build());
                 int next=0,count=0;
                 var operation=IndexOperationTrace.search(1,1,0,new IndexOperationTrace.Range(null,false,null,false,false,0),0,rows,0);
                 var received=new TraceRequests(ValueKind.ROW_ID).receive(operation,1);
                 var truncated=new TraceRequests(ValueKind.ROW_ID).receive(operation,1);
                 while(chunks.hasNext()) {
                     var chunk=chunks.next(); count++;
-                    for(var result:chunk.getResultsList()) { assertEquals(key(next).getPrimaryKey(),result.getPrimaryKey()); assertEquals(next++,result.getValue().getRowId()); }
-                    received.add(Response.newBuilder().setId(1).setMore(true).setStatus(org.sibench.adapters.proto.Status.OK).addAllResults(chunk.getResultsList()).build());
+                    for(var result:chunk.getResultsList()) { assertEquals(key(next),result.getKey()); assertEquals(next++,result.getValue().asReadOnlyByteBuffer().getLong()); }
+                    received.add(Response.newBuilder().setMore(true).setStatus(org.sibench.adapters.proto.Status.OK).addAllResults(chunk.getResultsList()).build());
                 }
                 assertEquals(rows,next); assertTrue(count>=2);
-                var end=Response.newBuilder().setId(1).setStatus(org.sibench.adapters.proto.Status.OK).build();
+                var end=Response.newBuilder().setStatus(org.sibench.adapters.proto.Status.OK).build();
                 received.finish(end);
                 assertThrows(IOException.class,()->truncated.finish(end));
-                var bound=Bound.newBuilder().setKey(key(9).getPrimaryKey()).setInclusive(true);
-                var scan=api.scan(ScanRequest.newBuilder().setTable(1).setUpper(bound).setDescending(true).setLimit(3).build());
-                var values=new ArrayList<Long>(); while(scan.hasNext()) for(var row:scan.next().getResultsList()) values.add(row.getValue().getRowId());
+                var scan=api.scan(ScanRequest.newBuilder().setEndKey(key(10)).setReverse(true).setLimit(3).build());
+                var values=new ArrayList<Long>(); while(scan.hasNext()) for(var row:scan.next().getResultsList()) values.add(row.getValue().asReadOnlyByteBuffer().getLong());
                 assertEquals(List.of(9L,8L,7L),values);
             } finally { channel.shutdownNow(); }
         }
@@ -216,11 +216,11 @@ public class IndexServerTest {
                 var api=stub(channel);
                 api.batchWrite(BatchWriteRequest.newBuilder().addMutations(Mutation.newBuilder().setPut(put(1,0,11)))
                         .addMutations(Mutation.newBuilder().setPut(put(1,3,13)))
-                        .addMutations(Mutation.newBuilder().setDelete(DeleteRequest.newBuilder().setKey(key(1)).setVersion(4))).build());
-                assertEquals(11,api.get(get(1,0)).getResult().getValue().getRowId());
-                assertEquals(13,api.get(get(1,3)).getResult().getValue().getRowId());
+                        .addMutations(Mutation.newBuilder().setDelete(DeleteRequest.newBuilder().setKey(key(1)).setTs(4))).build());
+                assertEquals(11,api.get(get(1,0)).getResult().getValue().asReadOnlyByteBuffer().getLong());
+                assertEquals(13,api.get(get(1,3)).getResult().getValue().asReadOnlyByteBuffer().getLong());
                 assertFalse(api.get(get(1,4)).hasResult());
-                for(var invalid:List.of(PutRequest.getDefaultInstance(),put(3,1,3).toBuilder().clearValue().build(),put(3,-1,3))) {
+                for(var invalid:List.of(put(3,-1,3),put(3,1,3).toBuilder().setUnknownFields(unknown()).build())) {
                     var bad=BatchWriteRequest.newBuilder().addMutations(Mutation.newBuilder().setPut(put(9,0,9)))
                             .addMutations(Mutation.newBuilder().setPut(invalid)).build();
                     var error=assertThrows(StatusRuntimeException.class,()->api.batchWrite(bad));
@@ -231,27 +231,31 @@ public class IndexServerTest {
         }
     }
 
-    @Test(timeout=10000) public void malformedKeyComponentsAndBoundsAreInvalidBeforeApplication() throws Exception {
-        try (var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("invalid-components"),ValueKind.ROW_ID);
+    private static com.google.protobuf.UnknownFieldSet unknown() {
+        return com.google.protobuf.UnknownFieldSet.newBuilder().addField(99,
+                com.google.protobuf.UnknownFieldSet.Field.newBuilder().addVarint(1).build()).build();
+    }
+
+    @Test(timeout=10000) public void opaqueKeysAndEmptyValuesRoundTripAndUnknownFieldsAreRejected() throws Exception {
+        try (var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("opaque"),ValueKind.ROW_ID);
              var server=IndexServer.start(0,backend)) {
             var channel=channel(server.port());
             try {
                 var api=stub(channel);
-                for (var invalid:List.of(key(1).toBuilder().setPrimaryKey(ByteString.copyFromUtf8("unterminated")).build(),
-                        key(1).toBuilder().setPrimaryKey(ByteString.copyFrom(IndexKey.NULL.bytes())).build(),
-                        key(1).toBuilder().setIndex(1).setIndexedValue(ByteString.copyFromUtf8("raw")).build())) {
-                    var bad=BatchWriteRequest.newBuilder().addMutations(Mutation.newBuilder().setPut(put(9,0,9)))
-                            .addMutations(Mutation.newBuilder().setPut(put(1,1,1).toBuilder().setKey(invalid))).build();
-                    assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT,assertThrows(StatusRuntimeException.class,()->api.batchWrite(bad)).getStatus().getCode());
-                    assertFalse(api.get(get(9,0)).hasResult());
-                    assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT,assertThrows(StatusRuntimeException.class,
-                            ()->api.get(GetRequest.newBuilder().setKey(invalid).build())).getStatus().getCode());
+                for (var key:List.of(ByteString.EMPTY, ByteString.copyFromUtf8("a"), ByteString.copyFromUtf8("ab"),
+                        ByteString.copyFrom(new byte[]{0, (byte)255}))) {
+                    api.put(PutRequest.newBuilder().setKey(key).setTs(3).build());
+                    var result=api.get(GetRequest.newBuilder().setKey(key).setReadTs(3).build());
+                    assertTrue(result.hasResult()); assertEquals(key,result.getResult().getKey());
+                    assertEquals(ByteString.EMPTY,result.getResult().getValue());
+                    assertFalse(api.get(GetRequest.newBuilder().setKey(key).setReadTs(2).build()).hasResult());
                 }
-                var unknown=com.google.protobuf.UnknownFieldSet.newBuilder().addField(99,
-                        com.google.protobuf.UnknownFieldSet.Field.newBuilder().addVarint(1).build()).build();
-                for (var bound:List.of(Bound.getDefaultInstance(),Bound.newBuilder().setKey(key(1).getPrimaryKey()).setUnknownFields(unknown).build()))
+                assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT,assertThrows(StatusRuntimeException.class,
+                        ()->api.get(get(1,0).toBuilder().setUnknownFields(unknown()).build())).getStatus().getCode());
+                for (var scan:List.of(ScanRequest.newBuilder().setUnknownFields(unknown()).build(),
+                        ScanRequest.newBuilder().setLimit(-1).build()))
                     assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT,assertThrows(StatusRuntimeException.class,
-                            ()->api.scan(ScanRequest.newBuilder().setTable(1).setLower(bound).build()).hasNext()).getStatus().getCode());
+                            ()->api.scan(scan).hasNext()).getStatus().getCode());
             } finally { channel.shutdownNow(); }
         }
     }
@@ -263,7 +267,7 @@ public class IndexServerTest {
                 if(method.getName().equals("writeBatch")) sizes.add(((List<?>)args[0]).size());
                 try { return method.invoke(backend,args); } catch(java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
             });
-            var batch=WriteBatch.newBuilder(); for(int k=1;k<=3;k++) batch.addWrites(IndexRpc.write(put(k,0,k)));
+            var batch=BatchWriteRequest.newBuilder(); for(int k=1;k<=3;k++) batch.addMutations(Mutation.newBuilder().setPut(put(k,0,k)));
             assertEquals(org.sibench.adapters.proto.Status.OK,IndexExecution.execute(wrapped,Request.newBuilder().setBatch(batch).build()).getStatus());
             assertEquals(List.of(3),sizes);
         }
@@ -274,11 +278,11 @@ public class IndexServerTest {
         int rows=IndexExecution.CHUNK_RESULTS+5;
         try(var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("partial"),ValueKind.ROW_ID)) {
             var synthetic=(IndexBackend)java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{IndexBackend.class},(proxy,method,args)->{
-                if(method.getName().equals("search") && args.length==2) {
+                if(method.getName().equals("scan") && args.length==2) {
                     var sink=(IndexBackend.ResultSink)args[1];
                     for(int k=0;k<rows;k++) {
                         if(fail.get() && k==IndexExecution.CHUNK_RESULTS+1) throw new IOException("failed after a chunk");
-                        sink.accept(Result.newBuilder().setPrimaryKey(key(k).getPrimaryKey()).setValue(Value.newBuilder().setRowId(k)).build());
+                        sink.accept(Result.newBuilder().setKey(key(k)).setValue(IndexEntry.rowId(k)).build());
                     }
                     return null;
                 }
@@ -302,8 +306,8 @@ public class IndexServerTest {
         var large=ByteString.copyFrom(new byte[600_000]);
         try(var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("bytes"),ValueKind.ROW_ID)) {
             var synthetic=(IndexBackend)java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{IndexBackend.class},(proxy,method,args)->{
-                if(method.getName().equals("search") && args.length==2) {
-                    for(int k=0;k<3;k++) ((IndexBackend.ResultSink)args[1]).accept(Result.newBuilder().setPrimaryKey(large).build());
+                if(method.getName().equals("scan") && args.length==2) {
+                    for(int k=0;k<3;k++) ((IndexBackend.ResultSink)args[1]).accept(Result.newBuilder().setKey(large).build());
                     return null;
                 }
                 try { return method.invoke(backend,args); } catch(java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
@@ -311,7 +315,7 @@ public class IndexServerTest {
             try(var server=IndexServer.start(0,synthetic)) {
                 var channel=channel(server.port());
                 try {
-                    var chunks=stub(channel).scan(ScanRequest.newBuilder().setTable(1).build());
+                    var chunks=stub(channel).scan(ScanRequest.newBuilder().build());
                     int count=0; while(chunks.hasNext()) { assertEquals(1,chunks.next().getResultsCount()); count++; }
                     assertEquals(3,count);
                 } finally { channel.shutdownNow(); }

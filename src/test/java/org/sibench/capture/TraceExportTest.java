@@ -103,10 +103,12 @@ public class TraceExportTest {
     }
 
     @Test public void baselineCannotIntroduceAnUnresolvedVersion() throws Exception {
-        Path directory = trace(false, 1, false, 1);
-        assertTrue(assertThrows(IOException.class,
-                () -> ReplayInput.check(directory, new ReplayConfig(false, 0, 0, 0, 0)))
-                .getMessage().contains("Baseline"));
+        Path file = temporary.getRoot().toPath().resolve("invalid-baseline.pb.zst");
+        try (var writer = new ProtoTrace.Writer(file)) {
+            assertTrue(assertThrows(IOException.class,
+                    () -> writer.append(write(0, INSERT, 1, 0, IndexKey.ofInt(1), 1, 0, 0, 1)))
+                    .getMessage().contains("Baseline"));
+        }
     }
 
     @Test public void rejectsIncorrectResolutionWatermark() throws Exception {

@@ -1,6 +1,5 @@
 package org.sibench.capture;
 
-
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexOperationTrace.Range;
 import org.sibench.state.ExternalSort;
@@ -583,7 +582,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
     /** Where entries were last written, kept for the transaction being applied only. */
     private final Map<EntryId, WritePosition> writePositions = new HashMap<>();
     private long positionsTransaction;
-    private long relocationWrites, queries, checkedResults;
+    private long queries, checkedResults;
     private long selectedVersionChecksum, snapshotQueries, retainedVersions, lastAppliedVersion;
     private long skippedHistories;
 
@@ -697,10 +696,6 @@ public final class IndexReferenceReplay implements AutoCloseable {
             return;
         }
         store.seal();
-        if (operation.kind() == IndexOperationTrace.RELOCATE) {
-            relocate(operation, store, entry, value, position);
-            return;
-        }
         if (!IndexOperationTrace.isMutation(operation) || operation.version() == 0
                 || isAborted(aborted, operation.version()))
             throw new IOException("Unsupported index write");
@@ -1191,29 +1186,6 @@ public final class IndexReferenceReplay implements AutoCloseable {
                         ^ ((long) operation.index() << 40);
     }
 
-    private void relocate(
-            Operation operation, Store store, Composite entry, long value, long position)
-            throws IOException {
-        StoredVersion selected = store.visible(entry, operation.version());
-        if (selected == null || !selected.present() || selected.version() != operation.version())
-            throw new IOException("Relocation requires an existing exact version");
-        if (rowIds) {
-            if (selected.value() != value) throw new IOException("Relocation changed RowID");
-            return;
-        }
-        // Baseline entries are immutable; the moved location becomes their version-0 history.
-        store.overlay.put(
-                entry,
-                new StoredVersion(
-                        operation.version(),
-                        operation.transactionId(),
-                        operation.mutationOrdinal(),
-                        value,
-                        position,
-                        true));
-        relocationWrites++;
-    }
-
     /** The current RowID (or Locator FileID) of a primary key, or 0 when it has none. */
     public long value(int table, IndexKey key) throws IOException {
         StoredVersion selected = currentPrimary(table, key);
@@ -1281,10 +1253,6 @@ public final class IndexReferenceReplay implements AutoCloseable {
                 ^ version.version()
                 ^ ((long) table << 48)
                 ^ (version.present() ? 1 : 0);
-    }
-
-    public long relocationWrites() {
-        return relocationWrites;
     }
 
     public long queries() {

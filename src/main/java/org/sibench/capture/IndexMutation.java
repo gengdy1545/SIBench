@@ -20,18 +20,16 @@ public final class IndexMutation {
                 || !Set.of(
                                 IndexOperationTrace.INSERT,
                                 IndexOperationTrace.UPSERT,
-                                IndexOperationTrace.LOGICAL_DELETE,
-                                IndexOperationTrace.RELOCATE)
+                                IndexOperationTrace.LOGICAL_DELETE)
                         .contains(primary.kind())
                 || primary.indexedValue() != null
                 || before.keySet().stream().anyMatch(index -> index < 1)
                 || after.keySet().stream().anyMatch(index -> index < 1))
             throw new IOException("Index maintenance requires a primary row write");
-        if ((primary.kind() == IndexOperationTrace.INSERT
-                                || primary.kind() == IndexOperationTrace.RELOCATE)
+        if ((primary.kind() == IndexOperationTrace.INSERT)
                         && !before.isEmpty()
                 || primary.kind() == IndexOperationTrace.LOGICAL_DELETE && !after.isEmpty())
-            throw new IOException("Invalid baseline/delete/relocation index values");
+            throw new IOException("Invalid baseline/delete index values");
         var operations = new ArrayList<Operation>();
         operations.add(primary);
         var indexes = new TreeSet<Integer>();

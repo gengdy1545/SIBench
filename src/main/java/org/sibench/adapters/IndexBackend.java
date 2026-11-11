@@ -1,8 +1,9 @@
 package org.sibench.adapters;
 
 import org.sibench.adapters.proto.Result;
-import org.sibench.adapters.proto.Search;
-import org.sibench.adapters.proto.Write;
+import org.sibench.adapters.proto.GetRequest;
+import org.sibench.adapters.proto.ScanRequest;
+import org.sibench.adapters.proto.Mutation;
 
 import java.io.IOException;
 import java.util.List;
@@ -17,10 +18,10 @@ public interface IndexBackend extends AutoCloseable {
     IndexDescription describe();
 
     /** Applies one write; later normal reads at applicable versions see its effect once this returns. */
-    void write(Write write) throws IOException;
+    void write(Mutation write) throws IOException;
 
     /** Applies validated writes; all are visible once this returns, without an atomicity promise. */
-    default void writeBatch(List<Write> writes) throws IOException {
+    default void writeBatch(List<Mutation> writes) throws IOException {
         for (var write : writes) write(write);
     }
 
@@ -30,13 +31,16 @@ public interface IndexBackend extends AutoCloseable {
         void accept(Result result) throws IOException;
     }
 
-    /** The visible entries of one search, in result order, at most its limit. */
-    void search(Search search, ResultSink sink) throws IOException;
+    /** One visible value, or null when absent. */
+    Result get(GetRequest get) throws IOException;
+
+    /** The visible entries of a half-open byte range, at most its limit. */
+    void scan(ScanRequest scan, ResultSink sink) throws IOException;
 
     /** The visible entries of one search, collected; for searches known to be small. */
-    default List<Result> search(Search search) throws IOException {
+    default List<Result> scan(ScanRequest scan) throws IOException {
         var results = new java.util.ArrayList<Result>();
-        search(search, results::add);
+        scan(scan, results::add);
         return results;
     }
 

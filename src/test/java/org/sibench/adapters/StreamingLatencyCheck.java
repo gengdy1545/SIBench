@@ -115,7 +115,7 @@ public final class StreamingLatencyCheck {
         var lookup = IndexOperationTrace.search(1, 1, 0,
                 IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 0, 1, 0);
         try {
-            check.check(lookup, Response.newBuilder().setId(1).setStatus(Status.OK).build());
+            check.check(lookup, Response.newBuilder().setStatus(Status.OK).build());
         } catch (IOException expected) {
             if (expected.getMessage().contains("Search count mismatch")) return;
             throw expected;

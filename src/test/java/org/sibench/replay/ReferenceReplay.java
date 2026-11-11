@@ -105,7 +105,6 @@ public final class ReferenceReplay {
                 result.put("workload_dispatch", runtime.describe());
                 result.put("queries", index.queries());
                 result.put("checked_result_items", index.checkedResults());
-                result.put("relocation_writes", index.relocationWrites());
                 if (auditState) result.put("primary_state_checksum", index.stateChecksum());
                 result.put("selected_version_checksum", index.selectedVersionChecksum());
                 result.put("snapshot_queries", index.snapshotQueries());

@@ -10,6 +10,7 @@ import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexOperationTrace.Range;
 import org.sibench.trace.IndexKey;
+import org.sibench.trace.IndexEntry;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -24,7 +25,7 @@ public class ServiceClientTest {
             @Override java.util.concurrent.CompletableFuture<org.sibench.adapters.proto.Response> transmit(
                     Request request, java.util.function.Consumer<org.sibench.adapters.proto.Response> partial) {
                 return java.util.concurrent.CompletableFuture.completedFuture(
-                        org.sibench.adapters.proto.Response.newBuilder().setId(request.getId())
+                        org.sibench.adapters.proto.Response.newBuilder()
                                 .setStatus(org.sibench.adapters.proto.Status.OK).build());
             }
             @Override java.util.concurrent.CompletableFuture<Void> localSend() { return sent; }
@@ -52,11 +53,10 @@ public class ServiceClientTest {
                 Request request, java.util.function.Consumer<org.sibench.adapters.proto.Response> partial) {
             sent.add(request);
             var response = org.sibench.adapters.proto.Response.newBuilder()
-                    .setId(request.getId())
                     .setStatus(org.sibench.adapters.proto.Status.OK);
             for (int i = 0; i < results; i++)
-                response.addResults(org.sibench.adapters.proto.Result.newBuilder().setVersion(1)
-                        .setPrimaryKey(com.google.protobuf.ByteString.copyFrom(IndexKey.ofInt(i).bytes())));
+                response.addResults(org.sibench.adapters.proto.Result.newBuilder().setTs(1)
+                        .setKey(new IndexEntry(3,1,IndexKey.ofInt(7),IndexKey.ofInt(i)).bytes()));
             return java.util.concurrent.CompletableFuture.completedFuture(response.build());
         }
     }
@@ -78,7 +78,7 @@ public class ServiceClientTest {
         assertTrue(first.businessResponse().toCompletableFuture().isDone());
         var last = client.send(3, member(2, 3, 2, IndexOperationTrace.INTERSECT_GROUP));
         assertEquals(3, client.sent.size());
-        assertTrue(client.sent.stream().allMatch(Request::hasSearch));
+        assertTrue(client.sent.stream().allMatch(Request::hasScan));
         // Every member completes with the group's response; a group is one native query.
         for (var handle : List.of(first, middle, last)) {
             handle.response().toCompletableFuture().join();
@@ -125,23 +125,23 @@ public class ServiceClientTest {
         for (long key = 1; key <= 3; key++)
             responses.add(client.send(key, insert(key, key, 1)).response().toCompletableFuture());
         assertEquals(1, client.sent.size());
-        assertEquals(3, client.sent.get(0).getBatch().getWritesCount());
+        assertEquals(3, client.sent.get(0).getBatch().getMutationsCount());
         assertTrue(responses.stream().allMatch(java.util.concurrent.CompletableFuture::isDone));
         // A new work unit sends the held part of the previous one first.
         client.send(4, insert(4, 4, 1));
         client.send(5, insert(5, 5, 2));
         assertEquals(2, client.sent.size());
-        assertEquals(1, client.sent.get(1).getBatch().getWritesCount());
+        assertEquals(1, client.sent.get(1).getBatch().getMutationsCount());
         // Any other request sends the held inserts before it.
         client.send(6, IndexOperationTrace.write(6, IndexOperationTrace.UPSERT, 3, 0, IndexKey.ofInt(6), 1, 1, 6, 6));
         assertEquals(4, client.sent.size());
-        assertEquals(1, client.sent.get(2).getBatch().getWritesCount());
-        assertTrue(client.sent.get(3).hasWrite());
+        assertEquals(1, client.sent.get(2).getBatch().getMutationsCount());
+        assertTrue(client.sent.get(3).hasPut());
         client.send(7, insert(7, 7, 3));
         assertEquals(4, client.sent.size());
         client.flush();
         assertEquals(5, client.sent.size());
-        assertEquals(1, client.sent.get(4).getBatch().getWritesCount());
+        assertEquals(1, client.sent.get(4).getBatch().getMutationsCount());
     }
 
     @Test
@@ -152,32 +152,30 @@ public class ServiceClientTest {
         var client = new Recorder(requests);
         var first = insert(1, 1, 1);
         var second = insert(2, 2, 1);
-        var a = encoded.request(0, first);
-        var b = encoded.request(0, second);
+        var a = encoded.request(first);
+        var b = encoded.request(second);
         client.send(1, first, a);
         client.send(2, second, b).response().toCompletableFuture().join();
-        assertSame(a.getWrite(), client.sent.get(0).getBatch().getWrites(0));
-        assertSame(b.getWrite(), client.sent.get(0).getBatch().getWrites(1));
+        assertSame(a.getPut(), client.sent.get(0).getBatch().getMutations(0).getPut());
+        assertSame(b.getPut(), client.sent.get(0).getBatch().getMutations(1).getPut());
         var update = IndexOperationTrace.write(3, IndexOperationTrace.UPSERT, 3, 0, IndexKey.ofInt(1),
                 1, 0, 0, 3).withWorkUnitId(2);
-        var storedWrite = encoded.request(0, update);
+        var storedWrite = encoded.request(update);
         client.send(3, update, storedWrite).response().toCompletableFuture().join();
-        assertSame(storedWrite.getWrite(), client.sent.get(1).getWrite());
+        assertSame(storedWrite.getPut(), client.sent.get(1).getPut());
         var members = List.of(member(0, 2, 0, IndexOperationTrace.UNION_GROUP),
                 member(1, 2, 0, IndexOperationTrace.UNION_GROUP));
-        var storedGroup = encoded.group(0, members);
+        var storedGroup = encoded.group(members);
         client.send(4, members.get(0), storedGroup);
         client.send(5, members.get(1), storedGroup).response().toCompletableFuture().join();
-        assertSame(storedGroup.getGroup().getMembers(0), client.sent.get(2).getSearch());
-        assertSame(storedGroup.getGroup().getMembers(1), client.sent.get(3).getSearch());
-        assertEquals(4, client.sent.get(2).getId());
-        assertEquals(5, client.sent.get(3).getId());
+        assertSame(storedGroup.getGroup().getMembers(0).getScan(), client.sent.get(2).getScan());
+        assertSame(storedGroup.getGroup().getMembers(1).getScan(), client.sent.get(3).getScan());
         var snapshots = new TraceRequests(ValueKind.ROW_ID);
         var search = IndexOperationTrace.search(12, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 0, 0);
-        var storedSearch = encoded.request(0, search);
+        var storedSearch = encoded.request(search);
         var snapshotClient = new Recorder(snapshots);
         snapshotClient.send(1, search, storedSearch).response().toCompletableFuture().join();
-        assertSame(storedSearch.getSearch(), snapshotClient.sent.get(0).getSearch());
+        assertSame(storedSearch.getGet(), snapshotClient.sent.get(0).getGet());
         snapshotClient.results = 1;
         var wrong = snapshotClient.send(2, search, storedSearch).response().toCompletableFuture();
         assertTrue(assertThrows(java.util.concurrent.CompletionException.class, wrong::join)
@@ -194,7 +192,6 @@ public class ServiceClientTest {
                     Request request, java.util.function.Consumer<org.sibench.adapters.proto.Response> partial) {
                 return java.util.concurrent.CompletableFuture.completedFuture(
                         org.sibench.adapters.proto.Response.newBuilder()
-                                .setId(request.getId())
                                 .setStatus(org.sibench.adapters.proto.Status.UNAVAILABLE)
                                 .build());
             }

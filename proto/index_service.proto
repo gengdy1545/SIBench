@@ -7,8 +7,6 @@ package sibench.index;
 option java_multiple_files = true;
 option java_package = "org.sibench.adapters.proto";
 
-import "index_types.proto";
-
 service IndexService {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Put(PutRequest) returns (WriteResponse);
@@ -17,28 +15,87 @@ service IndexService {
   rpc BatchWrite(BatchWriteRequest) returns (WriteResponse);
 }
 
-// Exact index identity, including the PK for a secondary entry. Version zero is valid.
-message GetRequest { EntryKey key = 1; uint64 read_version = 2; }
-// A missing result means not found; RowID/Locator zero remains a valid value.
-message GetResponse { Result result = 1; }
-message PutRequest { EntryKey key = 1; uint64 version = 2; Value value = 3; }
-message DeleteRequest { EntryKey key = 1; uint64 version = 2; }
-message Mutation { oneof operation { PutRequest put = 1; DeleteRequest delete = 2; } }
-// Success covers all members. No atomic visibility or rollback is promised.
-// Invalid input is refused before application; execution failure may be partial.
-message BatchWriteRequest { repeated Mutation mutations = 1; }
-message WriteResponse {}
-
-// Bounds use the primary key for index 0 and the indexed value otherwise.
-// Results select the latest version <= read_version, excluding selected deletions.
-message ScanRequest {
-  uint32 table = 1;
-  uint32 index = 2;
-  Bound lower = 3;
-  Bound upper = 4;
-  bool descending = 5;
-  uint64 limit = 6; // 0: unbounded
-  uint64 read_version = 7;
+// Data requests and responses. Keys and values are opaque bytes.
+// Timestamps are caller-assigned, nonnegative int64 values.
+message GetRequest {
+  bytes key = 1;
+  uint64 read_ts = 2;
 }
-// Concatenate chunks in order. Only normal gRPC completion establishes success.
-message ScanResponse { repeated Result results = 1; }
+
+message GetResponse {
+  Result result = 1;
+}
+
+message PutRequest {
+  bytes key = 1;
+  uint64 ts = 2;
+  bytes value = 3;
+}
+
+message DeleteRequest {
+  bytes key = 1;
+  uint64 ts = 2;
+}
+
+// Unsigned byte order over [start_key, end_key). Missing bounds are unbounded.
+message ScanRequest {
+  optional bytes start_key = 1;
+  optional bytes end_key = 2;
+  uint64 read_ts = 3;
+  uint64 limit = 4; // 0: unlimited visible entries
+  bool reverse = 5;
+}
+
+message ScanResponse {
+  repeated Result results = 1;
+}
+
+message Mutation {
+  oneof operation {
+    PutRequest put = 1;
+    DeleteRequest delete = 2;
+  }
+}
+
+// Validation precedes application; execution failure may be partial. No transaction atomicity.
+message BatchWriteRequest {
+  repeated Mutation mutations = 1;
+}
+
+message WriteResponse {
+}
+
+message Result {
+  bytes key = 1;
+  uint64 ts = 2;
+  bytes value = 3;
+}
+
+// Harness deployment metadata, not data RPC fields.
+enum Acknowledgement {
+  ACK_UNSPECIFIED = 0;
+  ACK_MEMORY = 1; // acknowledged before durable state
+  ACK_WAL = 2; // acknowledged in a write-ahead log, not necessarily fsynced
+  ACK_FSYNC = 3; // acknowledged after fsync
+}
+
+enum ValueKind {
+  VALUE_KIND_UNSPECIFIED = 0;
+  LOCATOR = 1; // (file id, row position) of the row version in a data file
+  ROW_ID = 2; // logical row identity
+}
+
+// Completion chunks within the replay process, not additional data RPCs.
+message Response {
+  Status status = 1;
+  string message = 2;
+  repeated Result results = 3;
+  bool more = 4;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  OK = 1;
+  INVALID = 2;
+  UNAVAILABLE = 3;
+}

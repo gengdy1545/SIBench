@@ -29,6 +29,8 @@ final class CommittedOperations {
 
     void accept(Operation operation) throws IOException {
         validate(operation);
+        if (operation.kind() == INSERT && operation.version() != 0)
+            throw new IOException("Baseline requires timestamp zero");
         if (isControl(operation)) {
             control(operation);
             return;

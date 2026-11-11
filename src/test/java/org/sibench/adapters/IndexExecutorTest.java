@@ -11,6 +11,7 @@ import org.junit.rules.TemporaryFolder;
 import org.sibench.adapters.proto.*;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.trace.IndexKey;
+import org.sibench.trace.IndexEntry;
 
 /** Failure and shutdown boundaries remain required without transaction publication. */
 public class IndexExecutorTest {
@@ -25,7 +26,7 @@ public class IndexExecutorTest {
                 try { return method.invoke(backend,args); } catch(java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
             });
             var executor=new IndexExecutor(failing,20);
-            var write=Request.newBuilder().setWrite(IndexRpc.write(IndexServerTest.put(7,1,70))).build();
+            var write=Request.newBuilder().setPut(IndexServerTest.put(7,1,70)).build();
             assertEquals(Status.OK,executor.submit(write).get(2,TimeUnit.SECONDS).getStatus());
             assertTrue(flushed.await(2,TimeUnit.SECONDS));
             var error=assertThrows(IOException.class,executor::close);
@@ -39,8 +40,7 @@ public class IndexExecutorTest {
     public void flushCannotCertifyAnAcceptedFailedRequest() throws Exception {
         try (var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("failed"), ValueKind.ROW_ID);
                 var executor = new IndexExecutor(backend)) {
-            var invalid = Request.newBuilder().setId(1).setWrite(Write.newBuilder()
-                    .setKind(Write.Kind.INSERT).setKey(EntryKey.getDefaultInstance())).build();
+            var invalid = Request.newBuilder().setPut(PutRequest.newBuilder().setTs(-1)).build();
             assertEquals(Status.INVALID, executor.submit(invalid).get(3, TimeUnit.SECONDS).getStatus());
             assertThrows(IOException.class, executor::flush);
         }
@@ -71,17 +71,14 @@ public class IndexExecutorTest {
                         catch (java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
                     });
             try (var executor = new IndexExecutor(blocked)) {
-                var written = executor.submit(Request.newBuilder().setId(1).setWrite(Write.newBuilder()
-                        .setKind(Write.Kind.INSERT).setKey(EntryKey.newBuilder().setTable(1)
-                                .setPrimaryKey(ByteString.copyFrom(IndexKey.ofInt(7).bytes())))
-                        .setValue(Value.newBuilder().setRowId(70))).build());
+                var written = executor.submit(Request.newBuilder().setPut(IndexServerTest.put(7,0,70)).build());
                 assertTrue(entered.await(2, TimeUnit.SECONDS));
                 var closed = pool.submit(() -> { executor.close(); return null; });
                 assertThrows(java.util.concurrent.TimeoutException.class, () -> closed.get(100, TimeUnit.MILLISECONDS));
                 release.countDown();
                 assertEquals(Status.UNAVAILABLE, written.get(3, TimeUnit.SECONDS).getStatus());
                 closed.get(3, TimeUnit.SECONDS);
-                assertEquals(70, backend.search(Search.newBuilder().setTable(1).build()).get(0).getValue().getRowId());
+                assertEquals(70, backend.scan(ScanRequest.getDefaultInstance()).get(0).getValue().asReadOnlyByteBuffer().getLong());
             }
         } finally { release.countDown(); pool.shutdownNow(); }
     }
@@ -92,12 +89,12 @@ public class IndexExecutorTest {
         var fail = new java.util.concurrent.atomic.AtomicBoolean();
         var backend = new IndexBackend() {
             public IndexDescription describe() { return new IndexDescription("fixture",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,"test",location()); }
-            public void write(Write write) { throw new UnsupportedOperationException(); }
-            public void search(Search search, ResultSink sink) throws IOException {
+            public void write(Mutation write) { throw new UnsupportedOperationException(); }
+            public Result get(GetRequest get) { throw new UnsupportedOperationException(); }
+            public void scan(ScanRequest scan, ResultSink sink) throws IOException {
                 for (int key = 1; key <= rows; key++) {
                     if (fail.get() && key == IndexExecution.CHUNK_RESULTS + 2) throw new IOException("failed after chunk");
-                    sink.accept(Result.newBuilder().setPrimaryKey(ByteString.copyFrom(IndexKey.ofInt(key).bytes()))
-                            .setValue(Value.newBuilder().setRowId(key)).build());
+                    sink.accept(Result.newBuilder().setKey(IndexServerTest.key(key)).setValue(IndexEntry.rowId(key)).build());
                 }
             }
             public void flush() {}
@@ -106,7 +103,7 @@ public class IndexExecutorTest {
             public void close() {}
         };
         try (var executor = new IndexExecutor(backend)) {
-            var request = Request.newBuilder().setId(1).setSearch(Search.newBuilder().setTable(1)).build();
+            var request = Request.newBuilder().setScan(ScanRequest.newBuilder()).build();
             var operation = IndexOperationTrace.search(1, 1, 0,
                     new IndexOperationTrace.Range(null, false, null, false, false, 0), 0, rows, 0);
             var chunks = new java.util.concurrent.CopyOnWriteArrayList<Response>();
@@ -119,7 +116,7 @@ public class IndexExecutorTest {
             received.finish(last);
             fail.set(true);
             chunks.clear();
-            var failed = executor.submit(request.toBuilder().setId(2).build(), chunks::add).get(3, TimeUnit.SECONDS);
+            var failed = executor.submit(request.toBuilder().build(), chunks::add).get(3, TimeUnit.SECONDS);
             assertEquals(1, chunks.size());
             assertEquals(Status.UNAVAILABLE, failed.getStatus());
             var rejected = new TraceRequests(ValueKind.ROW_ID).receive(operation, 2);

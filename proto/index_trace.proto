@@ -1,9 +1,9 @@
-// Compressed Trace files carry logical index operations and source facts for replay.
+// Compressed Trace files reuse the data requests and retain source evidence for replay.
 syntax = "proto3";
 
 package sibench.index;
 
-import "index_types.proto";
+import "index_service.proto";
 
 option java_multiple_files = true;
 option java_package = "org.sibench.adapters.proto";
@@ -12,81 +12,39 @@ message TracePosition {
   uint64 source_event = 1;
   uint64 work_unit_id = 2;
   uint64 mutation_ordinal = 3;
-  uint32 flags = 4;
-  uint64 expected_count = 5;
-  uint32 expansion_position = 6;
-  uint32 expansion_size = 7;
-  // Deletes have no service value, but their source maintenance unit still names its RowID.
-  int64 deleted_row_id = 8;
+  uint32 write_origin = 4;
+  uint64 expected_count = 5; // query/group result count only
+  uint32 baseline_position = 6;
+  uint32 baseline_size = 7;
+  bytes locator = 8; // optional alternative value for Locator replay; Put carries RowID
 }
 
 message TraceBegin {
-  uint64 transaction_id = 1;
-  uint64 version = 2;
+  uint64 ts = 1;
 }
 
-// Source resolution only: never sent to the Index Service. Counts describe exported members.
 message TraceEnd {
-  uint64 transaction_id = 1;
-  uint64 version = 2;
-  bool aborted = 3;
-  uint64 operations = 4;
-  uint64 writes = 5;
+  uint64 ts = 1;
+  bool aborted = 2;
+  uint64 operations = 3;
+  uint64 writes = 4;
+  uint64 source_mutations = 5;
 }
 
 message TraceRecord {
   oneof operation {
     Request request = 1;
     TraceBegin begin = 2;
-    TraceEnd end = 4;
+    TraceEnd end = 3;
   }
-  // One position per logical member; a SearchGroup is one source access.
-  repeated TracePosition positions = 3;
+  TracePosition position = 4; // shared by the members of a query group; absent on controls
 }
 
-// Stored operation messages retain their field layout independently of the data RPCs.
-message Request {
-  uint64 id = 1;  // unique per stream
-  reserved 5, 6, 7, 8, 10;
+message ReadRequest {
   oneof operation {
-    Write write = 2;
-    Search search = 3;
-    SearchGroup group = 4;
-    WriteBatch batch = 9;
+    GetRequest get = 1;
+    ScanRequest scan = 2;
   }
-}
-
-message Write {
-  enum Kind {
-    KIND_UNSPECIFIED = 0;
-    INSERT = 1;          // baseline load at version 0
-    UPSERT = 2;          // a new version of the entry
-    LOGICAL_DELETE = 3;  // the entry does not exist from this version on; no value
-    RELOCATE = 4;        // replace the value of this exact, existing version
-  }
-  Kind kind = 1;
-  EntryKey key = 2;
-  uint64 version = 3;
-  Value value = 4;
-}
-
-message WriteBatch {
-  repeated Write writes = 1;
-}
-
-message Search {
-  uint32 table = 1;
-  uint32 index = 2;
-  Bound lower = 3;  // absent: unbounded
-  Bound upper = 4;  // absent: unbounded
-  bool descending = 5;
-  uint64 limit = 6;  // 0: no limit
-  uint64 read_version = 7;
-  // A pinned search names exactly one secondary entry: lower == upper == the indexed value, and
-  // this primary key.
-  bytes pinned_primary_key = 8;
-  reserved 9;
-
 }
 
 message SearchGroup {
@@ -96,5 +54,17 @@ message SearchGroup {
     UNION = 2;
   }
   Mode mode = 1;
-  repeated Search members = 2;  // all of one table, at one read_version
+  repeated ReadRequest members = 2;
+}
+
+// Batch is constructed by replay; persisted records contain individual operations or a query group.
+message Request {
+  oneof operation {
+    PutRequest put = 1;
+    DeleteRequest delete = 2;
+    GetRequest get = 3;
+    ScanRequest scan = 4;
+    SearchGroup group = 5;
+    BatchWriteRequest batch = 6;
+  }
 }

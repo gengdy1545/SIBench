@@ -24,29 +24,21 @@ public final class IndexServer implements AutoCloseable {
                 executor.submit(request).thenAccept(response -> finish(response, out, result));
             }
             @Override public void put(PutRequest put, StreamObserver<WriteResponse> out) {
-                try { submit(Request.newBuilder().setWrite(IndexRpc.write(put)).build(), out, r -> WriteResponse.getDefaultInstance()); }
+                try { submit(Request.newBuilder().setPut(put).build(), out, r -> WriteResponse.getDefaultInstance()); }
                 catch (IllegalArgumentException error) { invalid(out, error); }
             }
             @Override public void delete(DeleteRequest delete, StreamObserver<WriteResponse> out) {
-                try { submit(Request.newBuilder().setWrite(IndexRpc.write(delete)).build(), out, r -> WriteResponse.getDefaultInstance()); }
+                try { submit(Request.newBuilder().setDelete(delete).build(), out, r -> WriteResponse.getDefaultInstance()); }
                 catch (IllegalArgumentException error) { invalid(out, error); }
             }
             @Override public void batchWrite(BatchWriteRequest batch, StreamObserver<WriteResponse> out) {
                 try {
-                    if (!batch.getUnknownFields().asMap().isEmpty()) throw new IllegalArgumentException("Unsupported batch fields");
-                    var writes = WriteBatch.newBuilder();
-                    for (var mutation : batch.getMutationsList()) {
-                        if (!mutation.getUnknownFields().asMap().isEmpty()) throw new IllegalArgumentException("Unsupported mutation fields");
-                        if (mutation.hasPut()) writes.addWrites(IndexRpc.write(mutation.getPut()));
-                        else if (mutation.hasDelete()) writes.addWrites(IndexRpc.write(mutation.getDelete()));
-                        else throw new IllegalArgumentException("Missing mutation");
-                    }
-                    submit(Request.newBuilder().setBatch(writes).build(), out, r -> WriteResponse.getDefaultInstance());
+                    submit(Request.newBuilder().setBatch(batch).build(), out, r -> WriteResponse.getDefaultInstance());
                 } catch (IllegalArgumentException error) { invalid(out, error); }
             }
             @Override public void get(GetRequest get, StreamObserver<GetResponse> out) {
                 try {
-                    submit(Request.newBuilder().setSearch(IndexRpc.search(get)).build(), out, response -> {
+                    submit(Request.newBuilder().setGet(get).build(), out, response -> {
                         if (response.getResultsCount() > 1) throw new IllegalArgumentException("Get returned multiple entries");
                         var result = GetResponse.newBuilder();
                         if (response.getResultsCount() == 1) result.setResult(response.getResults(0));
@@ -71,7 +63,7 @@ public final class IndexServer implements AutoCloseable {
                         if (call.isCancelled()) throw new IllegalStateException("Scan cancelled");
                         out.onNext(ScanResponse.newBuilder().addAllResults(response.getResultsList()).build());
                     };
-                    executor.submit(Request.newBuilder().setSearch(IndexRpc.search(scan)).build(), send).thenAccept(response -> {
+                    executor.submit(Request.newBuilder().setScan(scan).build(), send).thenAccept(response -> {
                         if (response.getStatus() != org.sibench.adapters.proto.Status.OK) { failed(out, response); return; }
                         try { if (response.getResultsCount() > 0) send.accept(response); out.onCompleted(); }
                         catch (RuntimeException error) { out.onError(io.grpc.Status.UNAVAILABLE.withDescription(error.toString()).asRuntimeException()); }

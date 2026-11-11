@@ -7,6 +7,8 @@ import org.sibench.adapters.TraceRequests;
 import org.sibench.adapters.proto.*;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.trace.IndexKey;
+import org.sibench.trace.IndexEntry;
+import org.sibench.adapters.IndexExecution;
 
 import java.io.*;
 import java.nio.file.Files;
@@ -153,8 +155,8 @@ public final class ProtoTrace {
                 group.add(operation);
                 if (group.size() == operation.expansionSize()) {
                     if (secondaryIndexes || group.stream().allMatch(member -> member.index() == 0)) {
-                        var record = TraceRecord.newBuilder().setRequest(requests.group(0, group));
-                        for (Operation member : group) record.addPositions(position(member));
+                        var record = TraceRecord.newBuilder().setRequest(requests.group(group));
+                        record.setPosition(position(group.get(0)));
                         write(record.build());
                     }
                     group.clear();
@@ -166,28 +168,22 @@ public final class ProtoTrace {
             if (!secondaryIndexes && !IndexOperationTrace.isControl(operation)
                     && operation.kind() != IndexOperationTrace.SEARCH)
                 operation = operation.withExpansion(0, 1);
-            var record = TraceRecord.newBuilder().addPositions(position(operation));
+            var record = TraceRecord.newBuilder();
             if (operation.kind() == IndexOperationTrace.TRANSACTION_BEGIN) {
                 if (transaction != 0) throw new IOException("Nested proto transaction");
-                transaction = operation.transactionId();
+                if (operation.transactionId() != operation.version()) throw new IOException("Source identity must equal its timestamp");
+                transaction = operation.version();
                 transactionOperations = transactionWrites = 0;
-                record.setBegin(TraceBegin.newBuilder().setTransactionId(transaction).setVersion(operation.version()));
+                record.setBegin(TraceBegin.newBuilder().setTs(operation.version()));
             } else if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT
                     || operation.kind() == IndexOperationTrace.TRANSACTION_ABORT) {
                 if (transaction != operation.transactionId()) throw new IOException("Unmatched proto commit");
-                record.setEnd(TraceEnd.newBuilder().setTransactionId(transaction).setVersion(operation.version())
+                record.setEnd(TraceEnd.newBuilder().setTs(operation.version()).setSourceMutations(operation.expectedCount())
                         .setAborted(operation.kind() == IndexOperationTrace.TRANSACTION_ABORT)
                         .setOperations(transactionOperations).setWrites(transactionWrites));
                 transaction = 0;
             } else {
-                var request = requests.request(0, operation);
-                if (request.hasWrite() && operation.kind() != IndexOperationTrace.LOGICAL_DELETE) {
-                    // Persist both value representations for replay from the same physical data layout.
-                    request = request.toBuilder().setWrite(request.getWrite().toBuilder().setValue(
-                            request.getWrite().getValue().toBuilder()
-                                    .setFile(operation.file()).setPosition(operation.position()))).build();
-                }
-                record.setRequest(request);
+                record.setRequest(requests.request(operation)).setPosition(position(operation));
             }
             write(record.build());
         }
@@ -198,37 +194,36 @@ public final class ProtoTrace {
                     || block.size() + record.getSerializedSize() + 5 > BLOCK_BYTES)) flush();
             record.writeDelimitedTo(messages);
             records++;
-            count += record.getPositionsCount();
+            count += members(record);
             var request = record.getRequest();
             if (record.hasBegin() || record.hasEnd()) {
                 controls.merge(record.hasBegin() ? "begin" : record.getEnd().getAborted() ? "abort" : "commit", 1L, Long::sum);
                 return;
             }
-            int operations = record.getPositionsCount();
+            int operations = members(record);
             if (transaction != 0) {
                 transactionOperations += operations;
-                if (request.hasWrite()) transactionWrites++;
+                if ((request.hasPut() || request.hasDelete())) transactionWrites++;
             }
             effectiveRequests = Math.addExact(effectiveRequests, operations);
             if (budget != null) budget.record(operations);
-            indexEntries += record.getPositionsCount();
+            indexEntries += members(record);
             String type;
-            if (request.hasWrite()) {
-                var write = request.getWrite();
-                if (write.getKey().getIndex() == 0) primaryEntries++;
-                type = write.getKind().name().toLowerCase(Locale.ROOT);
-                int flags = record.getPositions(0).getFlags();
+            if (request.hasPut() || request.hasDelete()) {
+                ByteString key = request.hasPut() ? request.getPut().getKey() : request.getDelete().getKey();
+                if (IndexEntry.decode(key).index() == 0) primaryEntries++;
+                type = request.hasPut() ? "put" : "delete";
+                int flags = record.getPosition().getWriteOrigin();
                 if ((flags & IndexOperationTrace.BUSINESS_INSERT) != 0) writeOrigins.merge("business_insert", 1L, Long::sum);
                 if ((flags & IndexOperationTrace.BUSINESS_UPDATE) != 0) writeOrigins.merge("business_update", 1L, Long::sum);
             } else if (request.hasGroup()) {
-                for (Search member : request.getGroup().getMembersList()) if (member.getIndex() == 0) primaryEntries++;
-                type = request.getGroup().getMode().name().toLowerCase(Locale.ROOT) + "_search";
+                for (ReadRequest member : request.getGroup().getMembersList())
+                    if (queryKey(member).asReadOnlyByteBuffer().getInt(4) == 0) primaryEntries++;
+                type = request.getGroup().getMode().name().toLowerCase(Locale.ROOT) + "_query";
             } else {
-                var search = request.getSearch();
-                if (search.getIndex() == 0) primaryEntries++;
-                type = search.hasLower() && search.hasUpper() && search.getLower().getInclusive()
-                        && search.getUpper().getInclusive() && search.getLower().getKey().equals(search.getUpper().getKey())
-                        ? "point_search" : "range_search";
+                ByteString key = request.hasGet() ? request.getGet().getKey() : request.getScan().getStartKey();
+                if (key.asReadOnlyByteBuffer().getInt(4) == 0) primaryEntries++;
+                type = request.hasGet() ? "get" : "scan";
             }
             requestTypes.merge(type, 1L, Long::sum);
         }
@@ -286,13 +281,21 @@ public final class ProtoTrace {
     }
 
     private static TracePosition position(Operation operation) {
-        var position = TracePosition.newBuilder()
-                .setSourceEvent(operation.sourceEvent()).setWorkUnitId(operation.workUnitId())
-                .setMutationOrdinal(operation.mutationOrdinal()).setFlags(operation.flags())
-                .setExpectedCount(operation.expectedCount()).setExpansionPosition(operation.expansionPosition())
-                .setExpansionSize(operation.expansionSize());
-        if (operation.kind() == IndexOperationTrace.LOGICAL_DELETE) position.setDeletedRowId(operation.rowId());
+        var position = TracePosition.newBuilder().setSourceEvent(operation.sourceEvent())
+                .setWorkUnitId(operation.workUnitId()).setMutationOrdinal(operation.mutationOrdinal());
+        if (operation.kind() == IndexOperationTrace.SEARCH) position.setExpectedCount(operation.expectedCount());
+        else {
+            position.setWriteOrigin(operation.flags());
+            if (operation.kind() == IndexOperationTrace.INSERT)
+                position.setBaselinePosition(operation.expansionPosition()).setBaselineSize(operation.expansionSize());
+            if (operation.kind() != IndexOperationTrace.LOGICAL_DELETE && (operation.file() != 0 || operation.position() != 0))
+                position.setLocator(IndexEntry.locator(operation.file(), operation.position()));
+        }
         return position.build();
+    }
+
+    private static int members(TraceRecord record) {
+        return record.hasRequest() && record.getRequest().hasGroup() ? record.getRequest().getGroup().getMembersCount() : 1;
     }
 
     public static long read(Path file, String expectedPhysical, String expectedLogical,
@@ -328,7 +331,7 @@ public final class ProtoTrace {
                     if (messages.isAtEnd()) throw new EOFException("Missing proto Trace request");
                     var record = messages.readMessage(TraceRecord.parser(),
                             com.google.protobuf.ExtensionRegistryLite.getEmptyRegistry());
-                    var views = new ArrayList<Operation>(record.getPositionsCount());
+                    var views = new ArrayList<Operation>(members(record));
                     decoder.accept(record, views::add);
                     for (Operation operation : views) IndexOperationTrace.validate(operation);
                     consumer.accept(record, List.copyOf(views));
@@ -345,123 +348,125 @@ public final class ProtoTrace {
         return count;
     }
 
+    private static ByteString queryKey(ReadRequest read) {
+        return read.hasGet() ? read.getGet().getKey() : read.getScan().getStartKey();
+    }
+
     private static final class Decoder {
-        long transaction, version, operations, writes, buffered;
+        long transaction, operations, writes, buffered;
 
         void accept(TraceRecord record, IndexOperationTrace.Consumer consumer) throws IOException {
             known(record);
-            if (record.getPositionsCount() == 0)
-                throw new IOException("Unsupported or missing proto Trace metadata");
-            for (var position : record.getPositionsList()) known(position);
-            var first = record.getPositions(0);
-            if ((record.hasBegin() || record.hasEnd()) && (first.getWorkUnitId() != 0 || first.getMutationOrdinal() != 0
-                    || first.getFlags() != 0 || first.getExpansionPosition() != 0 || first.getExpansionSize() != 0
-                    || first.getDeletedRowId() != 0)) throw new IOException("Invalid proto control position");
-            if (record.hasBegin()) {
-                var begin = record.getBegin();
-                known(begin);
-                if (transaction != 0 || begin.getTransactionId() <= 0 || begin.getVersion() <= 0
-                        || record.getPositionsCount() != 1) throw new IOException("Invalid proto transaction begin");
-                transaction = begin.getTransactionId();
-                version = begin.getVersion();
-                operations = writes = buffered = 0;
-                consumer.accept(IndexOperationTrace.transaction(first.getSourceEvent(),
-                        IndexOperationTrace.TRANSACTION_BEGIN, transaction, version, first.getExpectedCount()));
+            if (record.hasBegin() || record.hasEnd()) {
+                if (record.hasPosition()) throw new IOException("Source controls cannot carry operation metadata");
+                if (record.hasBegin()) {
+                    var begin = record.getBegin(); known(begin);
+                    if (transaction != 0 || begin.getTs() <= 0) throw new IOException("Invalid source begin");
+                    transaction = begin.getTs(); operations = writes = buffered = 0;
+                    consumer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, transaction, transaction, 0));
+                } else {
+                    var end = record.getEnd(); known(end);
+                    if (transaction == 0 || end.getTs() != transaction || end.getOperations() != operations
+                            || end.getWrites() != writes || end.getAborted() && writes != 0 || end.getSourceMutations() < 0)
+                        throw new IOException("Invalid source terminal counts or timestamp");
+                    consumer.accept(IndexOperationTrace.transaction(0, end.getAborted() ? IndexOperationTrace.TRANSACTION_ABORT
+                            : IndexOperationTrace.TRANSACTION_COMMIT, transaction, transaction, end.getSourceMutations()));
+                    transaction = 0;
+                }
                 return;
             }
-            if (record.hasEnd()) {
-                var end = record.getEnd();
-                known(end);
-                if (transaction == 0 || end.getTransactionId() != transaction || end.getVersion() != version
-                        || end.getOperations() != operations || end.getWrites() != writes
-                        || end.getAborted() && writes != 0
-                        || record.getPositionsCount() != 1) throw new IOException("Invalid proto terminal counts or identity");
-                consumer.accept(IndexOperationTrace.transaction(first.getSourceEvent(),
-                        end.getAborted() ? IndexOperationTrace.TRANSACTION_ABORT : IndexOperationTrace.TRANSACTION_COMMIT,
-                        transaction, version, first.getExpectedCount()));
-                transaction = 0;
-                return;
-            }
-            if (!record.hasRequest()) throw new IOException("Missing proto service request");
-            var request = record.getRequest();
-            known(request);
-            if (request.getId() != 0) throw new IOException("Proto request IDs are assigned at replay");
-            if (request.hasGroup()) known(request.getGroup());
-            int members = request.hasGroup() ? request.getGroup().getMembersCount() : 1;
+            if (!record.hasRequest() || !record.hasPosition()) throw new IOException("Missing operation or source metadata");
+            var request = record.getRequest(); known(request);
+            var p = record.getPosition(); known(p);
+            if (p.getSourceEvent() < 0 || p.getWorkUnitId() < 0 || p.getMutationOrdinal() < 0 || p.getExpectedCount() < 0
+                    || (p.getWriteOrigin() & ~3) != 0) throw new IOException("Invalid source position");
+            int count = members(record);
             if (transaction != 0) {
-                if (request.hasWrite()) writes++;
-                operations += members;
-                // Generation buffers a source group only from its first write; earlier searches stream.
-                if (writes > 0) buffered += members;
-                if (buffered > MAX_TRANSACTION_OPERATIONS) throw new IOException("Proto source group exceeds operation buffer limit");
+                if (request.hasPut() || request.hasDelete()) writes++;
+                operations += count;
+                if (writes > 0) buffered += count;
+                if (buffered > MAX_TRANSACTION_OPERATIONS) throw new IOException("Source group exceeds operation buffer limit");
             }
-            if (record.getPositionsCount() != members) throw new IOException("Proto source-member count mismatch");
-            if (request.hasGroup() && (members < 2 || request.getGroup().getMode() == SearchGroup.Mode.MODE_UNSPECIFIED
-                    || request.getGroup().getMode() == SearchGroup.Mode.UNRECOGNIZED))
-                throw new IOException("Invalid proto search group");
-            for (int i = 0; i < members; i++) {
-                var metadata = record.getPositions(i);
-                Operation operation;
-                if (request.hasWrite()) operation = write(request.getWrite(), transaction, metadata);
-                else if (request.hasSearch() || request.hasGroup()) {
-                    var search = request.hasSearch() ? request.getSearch() : request.getGroup().getMembers(i);
-                    if (request.hasGroup()) {
-                        int flag = request.getGroup().getMode() == SearchGroup.Mode.INTERSECTION
-                                ? IndexOperationTrace.INTERSECT_GROUP : IndexOperationTrace.UNION_GROUP;
-                        if ((metadata.getFlags() & flag) == 0 || metadata.getExpansionPosition() != i
-                                || metadata.getExpansionSize() != members)
-                            throw new IOException("Proto search group metadata mismatch");
-                    }
-                    operation = search(search, transaction, metadata);
-                } else throw new IOException("Unsupported proto service request");
-                consumer.accept(operation);
-            }
+            if (request.hasGroup()) {
+                var group = request.getGroup(); known(group);
+                if (count < 2 || group.getMode() != SearchGroup.Mode.INTERSECTION && group.getMode() != SearchGroup.Mode.UNION)
+                    throw new IOException("Invalid query group");
+                int flag = group.getMode() == SearchGroup.Mode.INTERSECTION ? IndexOperationTrace.INTERSECT_GROUP : IndexOperationTrace.UNION_GROUP;
+                int table = 0; long readTs = -1;
+                for (int i = 0; i < count; i++) {
+                    var member = group.getMembers(i); known(member);
+                    var operation = query(member, transaction, p, flag, i, count);
+                    if (i > 0 && (table != operation.table() || readTs != operation.readTimestamp()))
+                        throw new IOException("Query group spans tables or read points");
+                    table = operation.table(); readTs = operation.readTimestamp();
+                    consumer.accept(operation);
+                }
+            } else if (request.hasGet() || request.hasScan()) {
+                var read = ReadRequest.newBuilder();
+                if (request.hasGet()) read.setGet(request.getGet()); else read.setScan(request.getScan());
+                consumer.accept(query(read.build(), transaction, p, 0, 0, 0));
+            } else if (request.hasPut() || request.hasDelete()) consumer.accept(write(request, transaction, p));
+            else throw new IOException("Unsupported persisted operation");
         }
     }
 
-    private static Operation write(Write write, long transaction, TracePosition p) throws IOException {
-        known(write);
-        known(write.getKey());
-        known(write.getValue());
-        if (!write.hasKey() || (write.getKind() == Write.Kind.LOGICAL_DELETE ? write.hasValue() : !write.hasValue()))
-            throw new IOException("Missing write key/value or value on a deletion");
-        int kind = switch (write.getKind()) {
-            case INSERT -> IndexOperationTrace.INSERT;
-            case UPSERT -> IndexOperationTrace.UPSERT;
-            case LOGICAL_DELETE -> IndexOperationTrace.LOGICAL_DELETE;
-            case RELOCATE -> IndexOperationTrace.RELOCATE;
-            default -> throw new IOException("Unsupported proto write kind");
-        };
-        var key = write.getKey();
-        return new Operation(p.getSourceEvent(), kind, key.getTable(), key.getIndex(), p.getFlags(),
-                key(key.getPrimaryKey()), key.getIndexedValue().isEmpty() ? null : key(key.getIndexedValue()),
-                write.getVersion(), write.getValue().getFile(), write.getValue().getPosition(),
-                kind == IndexOperationTrace.LOGICAL_DELETE ? p.getDeletedRowId() : write.getValue().getRowId(),
-                p.getExpectedCount(), transaction, p.getMutationOrdinal(), -1, p.getWorkUnitId(),
-                p.getExpansionPosition(), p.getExpansionSize(), null, null, 0);
+    private static Operation write(Request request, long transaction, TracePosition p) throws IOException {
+        boolean put = request.hasPut();
+        var mutation = Mutation.newBuilder();
+        if (put) mutation.setPut(request.getPut()); else mutation.setDelete(request.getDelete());
+        try { IndexExecution.validateMutation(mutation.build()); }
+        catch (IllegalArgumentException error) { throw new IOException(error); }
+        var key = IndexEntry.decode(put ? request.getPut().getKey() : request.getDelete().getKey());
+        long ts = put ? request.getPut().getTs() : request.getDelete().getTs();
+        boolean baseline = transaction == 0 && ts == 0 && put;
+        if (p.getExpectedCount() != 0 || !put && !p.getLocator().isEmpty()
+                || !baseline && (p.getBaselinePosition() != 0 || p.getBaselineSize() != 0))
+            throw new IOException("Invalid write metadata");
+        long rowId = 0, file = 0, position = 0;
+        if (put) {
+            if (request.getPut().getValue().size() != 8) throw new IOException("Trace Put must carry an encoded RowID");
+            rowId = request.getPut().getValue().asReadOnlyByteBuffer().getLong();
+            if (rowId < 0) throw new IOException("Negative source RowID");
+            if (!p.getLocator().isEmpty()) {
+                if (p.getLocator().size() != 16) throw new IOException("Invalid source locator");
+                var bytes = p.getLocator().asReadOnlyByteBuffer(); file = bytes.getLong(); position = bytes.getLong();
+            }
+        }
+        return new Operation(p.getSourceEvent(), baseline ? IndexOperationTrace.INSERT : put ? IndexOperationTrace.UPSERT
+                : IndexOperationTrace.LOGICAL_DELETE, key.table(), key.index(), p.getWriteOrigin(), key.primaryKey(),
+                key.indexedValue(), ts, file, position, rowId, 0, transaction, p.getMutationOrdinal(), -1, p.getWorkUnitId(),
+                baseline ? p.getBaselinePosition() : 0, baseline ? p.getBaselineSize() : 1, null, null, 0);
     }
 
-    private static Operation search(Search search, long transaction, TracePosition p) throws IOException {
-        known(search);
-        known(search.getLower());
-        known(search.getUpper());
-        int bounds = (search.hasLower() && search.getLower().getInclusive() ? IndexOperationTrace.LOWER_INCLUSIVE : 0)
-                | (search.hasUpper() && search.getUpper().getInclusive() ? IndexOperationTrace.UPPER_INCLUSIVE : 0)
-                | (search.getDescending() ? IndexOperationTrace.DESCENDING : 0);
-        if ((p.getFlags() & (IndexOperationTrace.LOWER_INCLUSIVE | IndexOperationTrace.UPPER_INCLUSIVE
-                | IndexOperationTrace.DESCENDING)) != bounds
-                || (p.getFlags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0)
-            throw new IOException("Proto search metadata mismatch");
-        return new Operation(p.getSourceEvent(), IndexOperationTrace.SEARCH, search.getTable(), search.getIndex(),
-                p.getFlags(), search.getPinnedPrimaryKey().isEmpty() ? null : key(search.getPinnedPrimaryKey()), null,
-                0, 0, 0, 0, p.getExpectedCount(), transaction, p.getMutationOrdinal(),
-                search.getReadVersion(), p.getWorkUnitId(), p.getExpansionPosition(), p.getExpansionSize(),
-                search.hasLower() ? key(search.getLower().getKey()) : null,
-                search.hasUpper() ? key(search.getUpper().getKey()) : null, search.getLimit());
-    }
-
-    private static IndexKey key(ByteString bytes) throws IOException {
-        return IndexKey.decode(bytes.toByteArray());
+    private static Operation query(ReadRequest read, long transaction, TracePosition p, int group, int member, int count) throws IOException {
+        if (p.getWriteOrigin() != 0 || p.getBaselinePosition() != 0 || p.getBaselineSize() != 0 || !p.getLocator().isEmpty())
+            throw new IOException("Query carries write metadata");
+        int table, index, flags = IndexOperationTrace.SNAPSHOT_SEARCH | group;
+        long ts, limit = 0;
+        IndexKey lower, upper, pinned = null;
+        try {
+            if (read.hasGet()) {
+                var get = read.getGet(); IndexExecution.validateGet(get);
+                var key = IndexEntry.decode(get.getKey()); table = key.table(); index = key.index(); ts = get.getReadTs();
+                lower = upper = index == 0 ? key.primaryKey() : key.indexedValue();
+                if (index != 0) pinned = key.primaryKey();
+                flags |= IndexOperationTrace.LOWER_INCLUSIVE | IndexOperationTrace.UPPER_INCLUSIVE;
+            } else if (read.hasScan()) {
+                var scan = read.getScan(); IndexExecution.validateScan(scan);
+                if (!scan.hasStartKey() || !scan.hasEndKey() || scan.getStartKey().size() < 8)
+                    throw new IOException("Trace Scan must be bounded by its index namespace");
+                var bytes = scan.getStartKey().asReadOnlyByteBuffer(); table = bytes.getInt(); index = bytes.getInt();
+                var start = IndexEntry.boundary(scan.getStartKey(), table, index, false);
+                var end = IndexEntry.boundary(scan.getEndKey(), table, index, true);
+                lower = start.key(); upper = end.key(); ts = scan.getReadTs(); limit = scan.getLimit();
+                if (lower != null && !start.after()) flags |= IndexOperationTrace.LOWER_INCLUSIVE;
+                if (upper != null && end.after()) flags |= IndexOperationTrace.UPPER_INCLUSIVE;
+                if (scan.getReverse()) flags |= IndexOperationTrace.DESCENDING;
+            } else throw new IOException("Missing read operation");
+        } catch (IllegalArgumentException error) { throw new IOException(error); }
+        return new Operation(p.getSourceEvent(), IndexOperationTrace.SEARCH, table, index, flags, pinned, null,
+                0, 0, 0, 0, p.getExpectedCount(), transaction, p.getMutationOrdinal(), ts, p.getWorkUnitId(), member, count,
+                lower, upper, limit);
     }
 
     private static void known(com.google.protobuf.Message message) throws IOException {

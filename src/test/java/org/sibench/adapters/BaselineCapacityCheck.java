@@ -12,6 +12,7 @@ import org.sibench.adapters.proto.*;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.replay.*;
 import org.sibench.trace.IndexKey;
+import org.sibench.trace.IndexEntry;
 
 /** Diagnostic receiver consumes every baseline field and emits the normal empty write ACK. */
 public final class BaselineCapacityCheck {
@@ -33,11 +34,12 @@ public final class BaselineCapacityCheck {
             long h=mix(((long)op.table()<<32)^op.index())^mix(op.rowId());
             h=bytes(h,op.key());h=op.index()==0?mix(h):bytes(h,op.indexedValue());add(h);
         }
-        void write(Write write) throws IOException {
-            if ((write.getKind()!=Write.Kind.INSERT && write.getKind()!=Write.Kind.UPSERT) || write.getVersion()!=0 || write.getValue().getFile()!=0 || write.getValue().getPosition()!=0)
-                throw new IOException("Not a RowID baseline INSERT");
-            var key=write.getKey();long h=mix(((long)key.getTable()<<32)^key.getIndex())^mix(write.getValue().getRowId());
-            h=bytes(h,key.getPrimaryKey());h=bytes(h,key.getIndexedValue());add(h);
+        void write(Mutation mutation) throws IOException {
+            if (!mutation.hasPut() || mutation.getPut().getTs()!=0 || mutation.getPut().getValue().size()!=8)
+                throw new IOException("Not a RowID baseline Put");
+            var write=mutation.getPut(); var key=IndexEntry.decode(write.getKey());
+            long h=mix(((long)key.table()<<32)^key.index())^mix(write.getValue().asReadOnlyByteBuffer().getLong());
+            h=bytes(h,key.primaryKey());h=key.index()==0?mix(h):bytes(h,key.indexedValue());add(h);
         }
         Map<String,Long> summary() { return Map.of("members",count.sum(),"sum64",sum.sum(),"xor64",xor.get()); }
     }
@@ -45,8 +47,9 @@ public final class BaselineCapacityCheck {
         final Fingerprint received=new Fingerprint();final Path report;final boolean dropFirst;final AtomicBoolean dropped=new AtomicBoolean();String binding="";
         Sink(Path report,boolean dropFirst) { this.report=report;this.dropFirst=dropFirst; }
         public IndexDescription describe() { return new IndexDescription("baseline-transport-field-check-sink",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,"diagnostic field receiver; no index storage",location()); }
-        public void write(Write write) throws IOException { if (dropFirst && dropped.compareAndSet(false,true)) return;received.write(write); flush(); }
-        public void search(Search search,ResultSink output) throws IOException { throw new IOException("Baseline-only diagnostic receiver"); }
+        public void write(Mutation write) throws IOException { if (dropFirst && dropped.compareAndSet(false,true)) return;received.write(write); flush(); }
+        public Result get(GetRequest get) throws IOException { throw new IOException("Baseline-only diagnostic receiver"); }
+        public void scan(ScanRequest scan,ResultSink output) throws IOException { throw new IOException("Baseline-only diagnostic receiver"); }
         public void flush() throws IOException { Files.writeString(report,JSON.toJson(received.summary())+"\n"); }
         public void bind(String value) throws IOException { if (!binding.isEmpty()&&!binding.equals(value)) throw new IOException("Different binding");binding=value; }
         public String location() { return "diagnostic-baseline-sink"; }

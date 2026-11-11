@@ -63,14 +63,14 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
             if (closed) return CompletableFuture.completedFuture(unavailable(request, "Index executor is closed"));
             if (maintenanceFailure != null) return CompletableFuture.completedFuture(unavailable(request, maintenanceFailure.toString()));
             pending.put(response, request);
-            var pool = request.hasWrite() || request.hasBatch() ? writers : readers;
+            var pool = (request.hasPut() || request.hasDelete()) || request.hasBatch() ? writers : readers;
             // Submission and shutdown share this monitor, so an accepted task cannot be lost.
             pool.execute(() -> {
                 Response result = IndexExecution.execute(backend, request, partial);
                 synchronized (IndexExecutor.this) {
                     if (result.getStatus() != Status.OK && failure == null)
                         failure = new IOException("Accepted request failed: " + result.getMessage());
-                    if (result.getStatus() == Status.OK && (request.hasWrite() || request.hasBatch())) changes++;
+                    if (result.getStatus() == Status.OK && ((request.hasPut() || request.hasDelete()) || request.hasBatch())) changes++;
                 }
                 response.complete(result);
                 synchronized (IndexExecutor.this) { pending.remove(response); }
@@ -162,7 +162,7 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
     }
 
     private static Response unavailable(Request request, String message) {
-        return Response.newBuilder().setId(request.getId()).setStatus(Status.UNAVAILABLE)
+        return Response.newBuilder().setStatus(Status.UNAVAILABLE)
                 .setMessage(message).build();
     }
 }

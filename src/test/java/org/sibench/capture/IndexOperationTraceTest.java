@@ -34,7 +34,7 @@ public class IndexOperationTraceTest {
             for (String value : new String[] {"", "ordinary", "中文"})
                 written.add(
                         IndexOperationTrace.search(
-                                2, 5, 3, Range.equal(IndexKey.ofText(value)), 0, 0, 0));
+                                2, 5, 3, Range.equal(IndexKey.ofText(value)), 0, 0, IndexOperationTrace.SNAPSHOT_SEARCH));
             written.add(
                     IndexOperationTrace.search(
                             3,
@@ -43,10 +43,10 @@ public class IndexOperationTraceTest {
                             new Range(IndexKey.ofInt(-5), false, null, false, true, 2),
                             0,
                             2,
-                            0));
+                            IndexOperationTrace.SNAPSHOT_SEARCH));
             written.add(
                     IndexOperationTrace.search(
-                            4, 5, 0, new Range(null, false, null, false, false, 0), 0, 9, 0));
+                            4, 5, 0, new Range(null, false, null, false, false, 0), 0, 9, IndexOperationTrace.SNAPSHOT_SEARCH));
             try (var writer = new ProtoTrace.Writer(file)) {
                 for (Operation operation : written) writer.append(operation);
             }
@@ -77,6 +77,7 @@ public class IndexOperationTraceTest {
             for (Operation invalid :
                     List.of(
                             IndexOperationTrace.search(1, 3, 0, point, 0, 0, 0).withWorkUnitId(-1),
+                            IndexOperationTrace.search(1, 3, 0, point, 0, 2, 0),
                             IndexOperationTrace.transaction(1, 6, 1, 1, 0).withWorkUnitId(1),
                             // A limited search cannot return more than its limit.
                             IndexOperationTrace.search(
@@ -148,11 +149,12 @@ public class IndexOperationTraceTest {
         Files.delete(file);
         Range point = Range.equal(IndexKey.ofInt(6));
         Range interval = new Range(IndexKey.ofInt(1), true, IndexKey.ofInt(4), false, false, 0);
-        int intersect = IndexOperationTrace.INTERSECT_GROUP, union = IndexOperationTrace.UNION_GROUP;
+        int snapshot = IndexOperationTrace.SNAPSHOT_SEARCH;
+        int intersect = IndexOperationTrace.INTERSECT_GROUP | snapshot, union = IndexOperationTrace.UNION_GROUP | snapshot;
         try {
             var written =
                     List.of(
-                            IndexOperationTrace.search(1, 5, 1, point, IndexKey.ofInt(9), 0, 1, 0, 0, 0),
+                            IndexOperationTrace.search(1, 5, 1, point, IndexKey.ofInt(9), 0, 1, snapshot, 0, 0),
                             IndexOperationTrace.search(2, 5, 1, interval, null, 0, 4, intersect, 0, 2),
                             IndexOperationTrace.search(2, 5, 2, point, null, 0, 4, intersect, 1, 2),
                             IndexOperationTrace.search(3, 5, 1, point, null, 0, 2, union, 0, 2),
@@ -171,9 +173,9 @@ public class IndexOperationTraceTest {
         for (Operation invalid :
                 List.of(
                         // A pinned search names one secondary entry: a point, count 1, no PK index.
-                        IndexOperationTrace.search(1, 5, 1, interval, IndexKey.ofInt(9), 0, 1, 0, 0, 0),
+                        IndexOperationTrace.search(1, 5, 1, interval, IndexKey.ofInt(9), 0, 1, snapshot, 0, 0),
                         IndexOperationTrace.search(1, 5, 1, point, IndexKey.ofInt(9), 0, 2, 0, 0, 0),
-                        IndexOperationTrace.search(1, 5, 0, point, IndexKey.ofInt(9), 0, 1, 0, 0, 0),
+                        IndexOperationTrace.search(1, 5, 0, point, IndexKey.ofInt(9), 0, 1, snapshot, 0, 0),
                         // A group has at least two members, a valid position, no limit or pin.
                         IndexOperationTrace.search(2, 5, 1, interval, null, 0, 4, intersect, 0, 1),
                         IndexOperationTrace.search(2, 5, 1, interval, null, 0, 4, intersect, 2, 2),

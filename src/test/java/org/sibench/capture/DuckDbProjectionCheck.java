@@ -8,6 +8,7 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.junit.Test;
 import org.sibench.adapters.IndexExecutor;
+import org.sibench.adapters.TraceRequests;
 import org.sibench.adapters.VersionedIndexBackend;
 import org.sibench.adapters.proto.Status;
 import org.sibench.adapters.proto.TraceRecord;
@@ -86,14 +87,27 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
                         if(record.hasBegin())return;
                         if(record.hasEnd()){if(record.getEnd().getAborted())aborts[0]++;return;}
                         try {
-                            var request=record.getRequest().toBuilder().setId(++requests[0]).build();
-                            var response=index.submit(request).get(5,TimeUnit.SECONDS);assertEquals(response.getMessage(),Status.OK,response.getStatus());
-                            if(request.hasSearch()||request.hasGroup()) {
+                            requests[0]++; var request=record.getRequest();
+                            org.sibench.adapters.proto.Response response;
+                            if (request.hasGroup()) {
+                                var answers = new java.util.ArrayList<List<org.sibench.adapters.proto.Result>>();
+                                for (var member : request.getGroup().getMembersList()) {
+                                    var call = org.sibench.adapters.proto.Request.newBuilder();
+                                    if (member.hasGet()) call.setGet(member.getGet()); else call.setScan(member.getScan());
+                                    var answer = index.submit(call.build()).get(5, TimeUnit.SECONDS);
+                                    assertEquals(answer.getMessage(), Status.OK, answer.getStatus());
+                                    answers.add(answer.getResultsList());
+                                }
+                                response = org.sibench.adapters.proto.Response.newBuilder().setStatus(Status.OK)
+                                        .addAllResults(TraceRequests.combine(request.getGroup(), answers)).build();
+                            } else response = index.submit(request).get(5, TimeUnit.SECONDS);
+                            assertEquals(response.getMessage(), Status.OK, response.getStatus());
+                            if(request.hasGet() || request.hasScan() || request.hasGroup()) {
                                 var wanted=expected.get(operations.get(0).sourceEvent());assertNotNull(wanted);assertEquals(wanted.size(),response.getResultsCount());
                                 for(int i=0;i<wanted.size();i++) {
                                     var actual=response.getResults(i);var e=wanted.get(i);
-                                    assertArrayEquals(IndexKey.ofInt(e.key()).bytes(),actual.getPrimaryKey().toByteArray());
-                                    assertEquals(e.row(),actual.getValue().getRowId());assertEquals(e.version(),actual.getVersion());
+                                    assertArrayEquals(IndexKey.ofInt(e.key()).bytes(),org.sibench.trace.IndexEntry.decode(actual.getKey()).primaryKey().bytes());
+                                    assertEquals(e.row(),actual.getValue().asReadOnlyByteBuffer().getLong());assertEquals(e.version(),actual.getTs());
                                 }
                                 searches[0]++;
                             }
@@ -142,9 +156,9 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
                         if(record.hasBegin())return;
                         if(record.hasEnd()){if(record.getEnd().getAborted())aborts[0]++;return;}
                         try {
-                            var request=record.getRequest().toBuilder().setId(++ids[0]).build();
+                            ids[0]++; var request=record.getRequest();
                             var response=index.submit(request).get(5,TimeUnit.SECONDS);assertEquals(response.getMessage(),Status.OK,response.getStatus());
-                            if(request.hasSearch()) {assertEquals(1,response.getResultsCount());assertEquals(rowId,response.getResults(0).getValue().getRowId());assertEquals(1,response.getResults(0).getVersion());searches[0]++;}
+                            if((request.hasGet() || request.hasScan())) {assertEquals(1,response.getResultsCount());assertEquals(rowId,response.getResults(0).getValue().asReadOnlyByteBuffer().getLong());assertEquals(1,response.getResults(0).getTs());searches[0]++;}
                         }catch(Exception error){throw new java.io.IOException(error);}
                     }
                 });

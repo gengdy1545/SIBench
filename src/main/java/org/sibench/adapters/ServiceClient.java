@@ -21,10 +21,9 @@ abstract class ServiceClient implements ReplayTarget {
     private final List<CompletableFuture<java.util.List<org.sibench.adapters.proto.Result>>> groupResults = new ArrayList<>();
     private CompletableFuture<Void> groupResponse;
     private final List<Operation> batch = new ArrayList<>();
-    private final List<org.sibench.adapters.proto.Write> batchWrites = new ArrayList<>();
+    private final List<org.sibench.adapters.proto.PutRequest> batchWrites = new ArrayList<>();
     private Request groupRequest;
     private CompletableFuture<Void> batchResponse;
-    private long batchId;
 
     ServiceClient(TraceRequests requests) {
         this.requests = requests;
@@ -57,7 +56,7 @@ abstract class ServiceClient implements ReplayTarget {
         if (batch.isEmpty()) return;
         var inserts = List.copyOf(batch);
         var response = batchResponse;
-        var request = requests.batch(batchId, inserts, batchWrites);
+        var request = requests.batch(inserts, batchWrites);
         batch.clear();
         batchWrites.clear();
         batchResponse = null;
@@ -67,7 +66,7 @@ abstract class ServiceClient implements ReplayTarget {
                             Throwable failure = error;
                             if (failure == null) {
                                 try {
-                                    requests.checkBatch(result, request.getId());
+                                    requests.checkBatch(result);
                                 } catch (IOException mismatch) {
                                     failure = mismatch;
                                 }
@@ -91,11 +90,9 @@ abstract class ServiceClient implements ReplayTarget {
             var response = batchResponse;
             batch.add(operation);
             if (stored != null) {
-                if (!stored.hasWrite()) throw new IOException("Missing stored Baseline write");
-                batchWrites.add(stored.getWrite());
+                if (!stored.hasPut()) throw new IOException("Missing stored Baseline write");
+                batchWrites.add(stored.getPut());
             }
-            // The request takes the dispatch id of its last insert, unique on this stream.
-            batchId = dispatchSequence;
             if (batch.size() == limit) sendBatch();
             return new SendHandle(localSend(), response);
         }
@@ -106,16 +103,16 @@ abstract class ServiceClient implements ReplayTarget {
             if (operation.expansionPosition() != group.size()) throw new IOException("Search group member out of order");
             group.add(operation);
             var checked = groupResponse;
-            var search = stored == null ? requests.search(operation) : stored.getGroup().getMembers(operation.expansionPosition());
-            var request = Request.newBuilder().setId(dispatchSequence).setSearch(search).build();
+            var request = stored == null ? requests.query(operation)
+                    : TraceRequests.read(stored.getGroup().getMembers(operation.expansionPosition()));
             var items = new ArrayList<org.sibench.adapters.proto.Result>();
             var answer = transmit(request, chunk -> {
-                if (chunk.getId() != dispatchSequence || !chunk.getMore()
+                if (!chunk.getMore()
                         || chunk.getStatus() != org.sibench.adapters.proto.Status.OK)
                     throw new IllegalArgumentException("Invalid group member result chunk");
                 items.addAll(chunk.getResultsList());
             }).thenApply(result -> {
-                if (result.getId() != dispatchSequence || result.getMore()
+                if (result.getMore()
                         || result.getStatus() != org.sibench.adapters.proto.Status.OK)
                     throw new java.util.concurrent.CompletionException(new IOException("Group member request failed"));
                 items.addAll(result.getResultsList());
@@ -127,14 +124,14 @@ abstract class ServiceClient implements ReplayTarget {
             if (group.size() == operation.expansionSize()) {
                 var members = List.copyOf(group);
                 var answers = List.copyOf(groupResults);
-                var source = groupRequest == null ? requests.group(dispatchSequence, members)
-                        : requests.forward(dispatchSequence, groupRequest, members);
+                var source = groupRequest == null ? requests.group(members)
+                        : requests.forward(groupRequest, members);
                 group.clear(); groupResults.clear(); groupRequest = null;
                 CompletableFuture.allOf(answers.toArray(CompletableFuture[]::new)).whenComplete((unused,error) -> {
                     try {
                         if (error != null) { checked.completeExceptionally(error); return; }
-                        var results = IndexExecution.group(source.getGroup(), answers.stream().map(CompletableFuture::join).toList());
-                        requests.check(operation, org.sibench.adapters.proto.Response.newBuilder().setId(dispatchSequence)
+                        var results = TraceRequests.combine(source.getGroup(), answers.stream().map(CompletableFuture::join).toList());
+                        requests.check(operation, org.sibench.adapters.proto.Response.newBuilder()
                                 .setStatus(org.sibench.adapters.proto.Status.OK).addAllResults(results).build());
                         checked.complete(null);
                     } catch (IOException | RuntimeException failure) { checked.completeExceptionally(failure); }
@@ -143,9 +140,9 @@ abstract class ServiceClient implements ReplayTarget {
             return new SendHandle(sent, checked, answer.thenApply(result -> null));
         }
         if (!group.isEmpty()) throw new IOException("Search group interrupted on its client");
-        var request = stored == null ? requests.request(dispatchSequence, operation)
-                : requests.forward(dispatchSequence, stored, List.of(operation));
-        var received = requests.receive(operation, request.getId());
+        var request = stored == null ? requests.request(operation)
+                : requests.forward(stored, List.of(operation));
+        var received = requests.receive(operation, dispatchSequence);
         var answer = transmit(request, received.partial());
         CompletableFuture<Void> response = answer.thenApply(result -> {
             try {

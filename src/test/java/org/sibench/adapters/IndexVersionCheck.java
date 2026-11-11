@@ -6,6 +6,7 @@ import java.nio.file.*;
 import java.util.List;
 import org.sibench.adapters.proto.*;
 import org.sibench.trace.IndexKey;
+import org.sibench.trace.IndexEntry;
 
 /** Explicit backend acceptance with hand-derived historical results; outside timed Trace replay. */
 public final class IndexVersionCheck {
@@ -19,15 +20,14 @@ public final class IndexVersionCheck {
 
     static void check(IndexBackend backend) throws Exception {
         for(int version=0;version<=3;version++) {
-            var write=Write.newBuilder().setKey(EntryKey.newBuilder().setTable(1).setPrimaryKey(KEY))
-                    .setKind(version==0?Write.Kind.INSERT:version==2?Write.Kind.LOGICAL_DELETE:Write.Kind.UPSERT)
-                    .setVersion(version);
-            if(version!=2) write.setValue(Value.newBuilder().setRowId(70+version));
+            var write=Mutation.newBuilder();
+            if(version==2) write.setDelete(DeleteRequest.newBuilder().setKey(KEY).setTs(version));
+            else write.setPut(PutRequest.newBuilder().setKey(KEY).setTs(version).setValue(IndexEntry.rowId(70+version)));
             backend.write(write.build());
         }
         for(int pass=0;pass<2;pass++) {
             for(int timestamp=0;timestamp<=5;timestamp++) {
-                var actual=backend.search(Search.newBuilder().setTable(1).setReadVersion(timestamp).build());
+                var actual=backend.scan(ScanRequest.newBuilder().setReadTs(timestamp).build());
                 if(timestamp==2) { if(!actual.isEmpty())throw new IOException("Deletion resurrected an older value"); }
                 else require(actual,timestamp<2?timestamp:3,timestamp<2?70+timestamp:73);
             }
@@ -36,8 +36,8 @@ public final class IndexVersionCheck {
     }
 
     static void require(List<Result> actual,long version,long row) throws IOException {
-        if(actual.size()!=1 || !actual.get(0).getPrimaryKey().equals(KEY)
-                || actual.get(0).getVersion()!=version || actual.get(0).getValue().getRowId()!=row)
+        if(actual.size()!=1 || !actual.get(0).getKey().equals(KEY)
+                || actual.get(0).getTs()!=version || actual.get(0).getValue().asReadOnlyByteBuffer().getLong()!=row)
             throw new IOException("Historical key/version/RowID mismatch");
     }
 }

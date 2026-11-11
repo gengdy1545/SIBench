@@ -234,12 +234,12 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
                                 completions.add(client.send(++ids[0],operation,request).response().toCompletableFuture());
                             java.util.concurrent.CompletableFuture.allOf(completions.toArray(java.util.concurrent.CompletableFuture[]::new))
                                     .get(5,TimeUnit.SECONDS);
-                            if(request.hasSearch()||request.hasGroup()) {
+                            if((request.hasGet() || request.hasScan())||request.hasGroup()) {
                                 var wanted=expected.get(operations.get(0).sourceEvent());assertNotNull(wanted);
                                 HashSet<Long> actual=null;
                                 for(var answer:answers) {
                                     var member=new HashSet<Long>();
-                                    for(var row:answer.get(5,TimeUnit.SECONDS))assertTrue(member.add(row.getValue().getRowId()));
+                                    for(var row:answer.get(5,TimeUnit.SECONDS))assertTrue(member.add(row.getValue().asReadOnlyByteBuffer().getLong()));
                                     if(actual==null)actual=member;
                                     else if(request.getGroup().getMode()==org.sibench.adapters.proto.SearchGroup.Mode.INTERSECTION)
                                         actual.retainAll(member);

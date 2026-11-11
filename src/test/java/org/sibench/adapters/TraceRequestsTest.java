@@ -2,13 +2,11 @@ package org.sibench.adapters;
 
 import static org.junit.Assert.*;
 
-import com.google.protobuf.ByteString;
-
 import org.junit.Test;
 import org.sibench.adapters.proto.Response;
 import org.sibench.adapters.proto.Result;
 import org.sibench.adapters.proto.Status;
-import org.sibench.adapters.proto.Value;
+import org.sibench.trace.IndexEntry;
 import org.sibench.adapters.proto.ValueKind;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
@@ -34,66 +32,80 @@ public class TraceRequestsTest {
 
     private static Result responseResult(long key, long version, long rowId) {
         return Result.newBuilder()
-                .setPrimaryKey(ByteString.copyFrom(IndexKey.ofInt(key).bytes()))
-                .setVersion(version)
-                .setValue(Value.newBuilder().setRowId(rowId))
+                .setKey(new IndexEntry(1,0,null,IndexKey.ofInt(key)).bytes())
+                .setTs(version)
+                .setValue(IndexEntry.rowId(rowId))
                 .build();
     }
 
-    private static Response response(long id, Result... results) {
+    private static Response response(Result... results) {
         return Response.newBuilder()
-                .setId(id)
                 .setStatus(Status.OK)
                 .addAllResults(List.of(results))
                 .build();
     }
 
     @Test
-    public void finalResponsesRequireMatchingIdentityAndCompletion() throws Exception {
+    public void exactKeysUseGetAndNonuniqueSecondaryValuesUseScan() throws Exception {
+        var requests = new TraceRequests(ValueKind.ROW_ID);
+        var primary = requests.request(query(1, 7, 1));
+        assertTrue(primary.hasGet());
+        assertEquals(10, primary.getGet().getReadTs());
+        var point = Range.equal(IndexKey.ofInt(7));
+        var secondary = requests.request(IndexOperationTrace.search(2, 1, 1, point, 10, 2, 0));
+        assertTrue(secondary.hasScan());
+        assertEquals(10, secondary.getScan().getReadTs());
+        assertEquals(0, secondary.getScan().getLimit());
+        var pinned = requests.request(IndexOperationTrace.search(3, 1, 1, point,
+                IndexKey.ofInt(9), 10, 1, 0, 0, 0));
+        assertTrue(pinned.hasGet());
+        assertEquals(new IndexEntry(1, 1, IndexKey.ofInt(7), IndexKey.ofInt(9)).bytes(), pinned.getGet().getKey());
+    }
+
+    @Test
+    public void finalResponsesRequireSuccessfulCompletion() throws Exception {
         var requests = new TraceRequests(ValueKind.LOCATOR);
         var search = query(1, 1, 0);
-        assertThrows(IOException.class, () -> requests.receive(search, 7).finish(response(8)));
         assertThrows(IOException.class, () -> requests.receive(search, 7)
-                .finish(response(7).toBuilder().setMore(true).build()));
-        requests.receive(search, 7).finish(response(7));
-        for (Response invalid : List.of(response(8), response(7).toBuilder().setMore(true).build()))
-            assertThrows(IOException.class, () -> requests.checkBatch(invalid, 7));
-        requests.checkBatch(response(7), 7);
+                .finish(response().toBuilder().setMore(true).build()));
+        requests.receive(search, 7).finish(response());
+        for (Response invalid : List.of(response().toBuilder().setStatus(Status.INVALID).build(), response().toBuilder().setMore(true).build()))
+            assertThrows(IOException.class, () -> requests.checkBatch(invalid));
+        requests.checkBatch(response());
     }
 
     @Test
     public void storedFullWritesRespectTheSelectedValueMode() throws Exception {
         var operation = IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0,
                 IndexKey.ofInt(7), 0, 3, 9, 17);
-        var stored = new TraceRequests(ValueKind.ROW_ID).request(0, operation);
-        stored = stored.toBuilder().setWrite(stored.getWrite().toBuilder().setValue(
-                stored.getWrite().getValue().toBuilder().setFile(3).setPosition(9))).build();
+        var stored = new TraceRequests(ValueKind.ROW_ID).request(operation);
         for (var kind : List.of(ValueKind.ROW_ID, ValueKind.LOCATOR)) {
             var requests = new TraceRequests(kind);
-            var expected = kind == ValueKind.ROW_ID ? Value.newBuilder().setRowId(17).build()
-                    : Value.newBuilder().setFile(3).setPosition(9).build();
-            assertEquals(expected, requests.forward(1, stored, List.of(operation)).getWrite().getValue());
-            assertEquals(expected, requests.batch(2, List.of(operation), List.of(stored.getWrite()))
-                    .getBatch().getWrites(0).getValue());
+            var expected = kind == ValueKind.ROW_ID ? IndexEntry.rowId(17)
+                    : IndexEntry.locator(3,9);
+            assertEquals(expected, requests.forward(stored, List.of(operation)).getPut().getValue());
+            assertEquals(expected, requests.batch(List.of(operation), List.of(stored.getPut()))
+                    .getBatch().getMutations(0).getPut().getValue());
         }
     }
 
     @Test
     public void streamedResponsesCheckNativeCountsWithoutAnswerFiles() throws Exception {
-        var operation = query(3, 1, 2);
+        var operation = IndexOperationTrace.search(3, 1, 0,
+                new Range(null, false, null, false, false, 0), 10, 2, 0);
         var requests = new TraceRequests(ValueKind.ROW_ID);
-        var stored = requests.request(11, operation);
-        assertTrue(requests.forward(12, stored, List.of(operation)).hasSearch());
+        var stored = requests.request(operation);
+        assertTrue(requests.forward(stored, List.of(operation)).hasScan());
         var received = requests.receive(operation, 12);
-        received.add(response(12, responseResult(8, 4, 9)).toBuilder().setMore(true).build());
-        received.finish(response(12, responseResult(7, 2, 3)));
+        received.add(response(responseResult(8, 4, 9)).toBuilder().setMore(true).build());
+        received.finish(response(responseResult(7, 2, 3)));
         assertEquals(1, requests.queries());
         assertEquals(2, requests.checkedResults());
-        assertThrows(IOException.class, () -> requests.check(operation, response(13, responseResult(1, 1, 1))));
-        assertThrows(IOException.class, () -> requests.check(operation, response(14,
+        assertThrows(IOException.class, () -> requests.check(operation, response(responseResult(1, 1, 1))));
+        assertThrows(IOException.class, () -> requests.check(operation, response(
                 responseResult(1, 1, 1), responseResult(2, 1, 2), responseResult(3, 1, 3))));
         assertThrows(IOException.class, () -> requests.check(operation,
-                response(15).toBuilder().setStatus(Status.INVALID).build()));
+                response().toBuilder().setStatus(Status.INVALID).build()));
     }
 
     @Test
@@ -103,11 +115,10 @@ public class TraceRequestsTest {
                 IndexKey.ofInt(1), 0, 0, 0, 1);
         var second = IndexOperationTrace.write(2, IndexOperationTrace.INSERT, 1, 0,
                 IndexKey.ofInt(2), 0, 0, 0, 2);
-        var message = requests.batch(1, List.of(first, second), List.of());
-        assertEquals(2, message.getBatch().getWritesCount());
-        var batch = IndexRpc.batch(message.getBatch());
+        var message = requests.batch(List.of(first, second), List.of());
+        var batch = message.getBatch();
         assertEquals(2, batch.getMutationsCount());
-        assertEquals(0, batch.getMutations(0).getPut().getVersion());
-        assertEquals(message.getBatch().getWrites(1).getKey(), batch.getMutations(1).getPut().getKey());
+        assertEquals(0, batch.getMutations(0).getPut().getTs());
+        assertEquals(new IndexEntry(1, 0, null, IndexKey.ofInt(2)).bytes(), batch.getMutations(1).getPut().getKey());
     }
 }

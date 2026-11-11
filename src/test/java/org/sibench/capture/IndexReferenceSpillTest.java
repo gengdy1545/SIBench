@@ -174,33 +174,6 @@ public class IndexReferenceSpillTest {
     }
 
     @Test
-    public void relocatedLocatorsAndDeletesSurviveSpilling() throws Exception {
-        var operations = stream(false, 8);
-        Path directory = temporary.newFolder().toPath().resolve("spill");
-        try (var memory = new IndexReferenceReplay(false, true);
-                var spilled = new IndexReferenceReplay(false, true, tiny(directory))) {
-            apply(memory, operations);
-            apply(spilled, operations);
-            long last = operations.stream().mapToLong(Operation::version).max().orElse(0);
-            // Relocate a baseline entry at version 0 and a written one at its exact version.
-            for (var model : List.of(memory, spilled)) {
-                var primary =
-                        IndexOperationTrace.write(
-                                9_000, IndexOperationTrace.RELOCATE, TABLE, 0, IndexKey.ofInt(2),
-                                0, 31, 4_000_000_000L, 2);
-                model.accept(primary);
-                IndexMutation.emit(primary, java.util.Map.of(), java.util.Map.of(), x -> {});
-            }
-            assertEquals(
-                    memory.lookupPrimary(TABLE, IndexKey.ofInt(2), 0),
-                    spilled.lookupPrimary(TABLE, IndexKey.ofInt(2), 0));
-            assertEquals(31, spilled.lookupPrimary(TABLE, IndexKey.ofInt(2), 0).value());
-            assertEquals(4_000_000_000L, spilled.lookupPrimary(TABLE, IndexKey.ofInt(2), 0).position());
-            compareEverywhere(memory, spilled, last, 5);
-        }
-    }
-
-    @Test
     public void modelsSharingAConfiguredDirectoryNeverMeetEachOthersFiles() throws Exception {
         Path directory = temporary.newFolder().toPath().resolve("shared");
         var operations = stream(false, 2);

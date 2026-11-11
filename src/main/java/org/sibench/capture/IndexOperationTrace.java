@@ -6,7 +6,7 @@ import java.io.IOException;
 
 /** Normalized operation views shared by generation, Trace validation and replay. */
 public final class IndexOperationTrace {
-    public static final int INSERT = 1, SEARCH = 2, UPSERT = 3, RELOCATE = 4, LOGICAL_DELETE = 5;
+    public static final int INSERT = 1, SEARCH = 2, UPSERT = 3, LOGICAL_DELETE = 5;
     public static final int TRANSACTION_BEGIN = 6, TRANSACTION_COMMIT = 7, TRANSACTION_ABORT = 8;
     public static final int BUSINESS_INSERT = 1, BUSINESS_UPDATE = 2;
     public static final int SNAPSHOT_SEARCH = 1;
@@ -36,7 +36,6 @@ public final class IndexOperationTrace {
             case INSERT -> "insert";
             case SEARCH -> "search";
             case UPSERT -> "upsert";
-            case RELOCATE -> "relocate";
             case LOGICAL_DELETE -> "logical_delete";
             case TRANSACTION_BEGIN -> "transaction_begin";
             case TRANSACTION_COMMIT -> "transaction_commit";
@@ -341,8 +340,7 @@ public final class IndexOperationTrace {
     static void validate(Operation o) throws IOException {
         boolean control = isControl(o), search = o.kind() == SEARCH;
         boolean valid =
-                o.kind() >= INSERT
-                        && o.kind() <= TRANSACTION_ABORT
+                (o.kind() == INSERT || o.kind() == SEARCH || isMutation(o) || control)
                         && (control ? o.table() == 0 : o.table() >= 1 && o.table() <= MAX_TABLE)
                         && o.index() >= 0
                         && o.index() <= MAX_INDEX
@@ -379,6 +377,7 @@ public final class IndexOperationTrace {
                 && (o.upper() != null || (o.flags() & UPPER_INCLUSIVE) == 0)
                 && o.limit() >= 0
                 && o.expectedCount() >= 0
+                && (group != 0 || o.index() != 0 || !o.range().point() || o.expectedCount() <= 1)
                 && (o.limit() == 0 || o.expectedCount() <= o.limit())
                 && group != (INTERSECT_GROUP | UNION_GROUP)
                 && (group == 0

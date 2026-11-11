@@ -136,13 +136,6 @@ public class VersionedLookupTest {
         assertEquals(Long.MAX_VALUE, model.value(3, TestOps.key(1)));
         assertEquals(Long.MAX_VALUE, model.position(3, TestOps.key(1)));
 
-        // Relocating the exact version changes the position and keeps the version.
-        model.accept(TestOps.op(2, 4, 3, 0, 0, 1, 7, Long.MAX_VALUE - 1, 3, 50, 0, 0, 0));
-        var relocated = model.lookupPrimary(3, TestOps.key(1), 7);
-        assertEquals(Long.MAX_VALUE - 1, relocated.value());
-        assertEquals(3, relocated.position());
-        assertEquals(7, relocated.commitVersion());
-
         // A Locator needs a positive FileID and a non-negative position.
         assertThrows(
                 IOException.class,
@@ -154,7 +147,7 @@ public class VersionedLookupTest {
 
     @Test
     public void
-            secondaryHistoryIncludesDeletedEntriesExcludesFutureInsertsAndRelocatesExactVersion()
+            secondaryHistoryIncludesDeletedEntriesAndExcludesFutureInserts()
                     throws Exception {
         for (boolean rowIds : new boolean[] {false, true}) {
             var model = new IndexReferenceReplay(rowIds, true);
@@ -173,36 +166,12 @@ public class VersionedLookupTest {
                             .toList());
             replay.accept(snapshot(5, 1, 10, 105, 2));
             replay.accept(snapshot(5, 2, 20, 0, 1));
-            org.sibench.capture.TransferIndexFixtures.expandRow(
-                    TestOps.op(200, 4, 5, 0, 0, 1, 100, 11, 7, 50, 10, 20, 0), model::accept);
-            assertEquals(rowIds ? 0 : 3, model.relocationWrites());
-            assertEquals(rowIds ? 50 : 11, model.lookupPrimary(5, TestOps.key(1), 105).value());
-            assertEquals(rowIds ? 0 : 7, model.lookupPrimary(5, TestOps.key(1), 105).position());
-            var relocated =
-                    model.lookupSecondary(5, 1, TestOps.key(10), 105).stream()
-                            .filter(o -> o.key().equals(TestOps.key(1)))
-                            .findFirst()
-                            .orElseThrow();
-            assertEquals(rowIds ? 50 : 11, relocated.value());
-            assertEquals(rowIds ? 0 : 7, relocated.position());
+            var retained = model.lookupSecondary(5, 1, TestOps.key(10), 105).stream()
+                    .filter(o -> o.key().equals(TestOps.key(1))).findFirst().orElseThrow();
+            assertEquals(rowIds ? 50 : 9, retained.value());
+            assertEquals(rowIds ? 0 : 1, retained.position());
             assertNull(model.lookupPrimary(5, TestOps.key(1), 130));
-            assertThrows(
-                    IOException.class,
-                    () ->
-                            model.accept(
-                                    TestOps.op(201, 4, 5, 0, 0, 1, 110, 11, 8, 50, 10, 20, 0)));
-            assertThrows(
-                    IOException.class,
-                    () ->
-                            model.accept(
-                                    TestOps.op(201, 4, 5, 0, 0, 1, 99, 11, 8, 50, 10, 20, 0)));
-            if (rowIds)
-                assertThrows(
-                        IOException.class,
-                        () ->
-                                model.accept(
-                                        TestOps.op(
-                                                201, 4, 5, 0, 0, 1, 100, 11, 8, 99, 10, 20, 0)));
+            replay.finish();
         }
     }
 
