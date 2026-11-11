@@ -74,6 +74,20 @@ java -Dsibench.slatedb.library=build/index/slatedb-build/libslatedb_jni.so \
 
 The destination must be fresh. It retains source/build identities, native test results through the build exit status, and the JNI library. License: [SlateDB](index/slatedb/LICENSE).
 
+### Relive prototype
+
+The [Relive submodule](index/relive/README.md) requires JDK 17, Maven and a Linux
+filesystem with file locking, atomic rename and file/directory fsync. Build and
+run its local protocol tests separately:
+
+```bash
+mvn -f index/relive/pom.xml -Drelive.build.directory="$PWD/build/index/relive" package
+```
+
+Its local HTTP versioned-KV protocol is separate from SIBench's gRPC service.
+Source registration does not enroll Relive in backend comparisons; this branch
+has no Relive replay adapter. See its README for the bounded standalone POC.
+
 ## Native generation
 
 | Configuration | Responsibility |

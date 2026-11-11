@@ -1,3 +1,4 @@
+# Benchmark sources
 [submodule "HyBench-2024"]
 	path = benchmark/HyBench-2024
 	url = https://github.com/gengdy1545/HyBench-2024.git
@@ -10,14 +11,26 @@
 	path = benchmark/YCSB
 	url = https://github.com/gengdy1545/YCSB.git
 	branch = master
-[submodule "third_party/aws-sdk-cpp"]
-	path = third_party/aws-sdk-cpp
-	url = https://github.com/aws/aws-sdk-cpp.git
-	branch = main
+
+# Index backends
+[submodule "index/relive"]
+	path = index/relive
+	url = https://github.com/gengdy1545/relive.git
+	branch = master
 [submodule "index/rocksdb-cloud"]
 	path = index/rocksdb-cloud
 	url = https://github.com/rockset/rocksdb-cloud.git
 	branch = master
+[submodule "index/slatedb"]
+	path = index/slatedb
+	url = https://github.com/slatedb/slatedb.git
+	branch = main
+
+# Generation engines and build dependencies
+[submodule "third_party/aws-sdk-cpp"]
+	path = third_party/aws-sdk-cpp
+	url = https://github.com/aws/aws-sdk-cpp.git
+	branch = main
 [submodule "third_party/duckdb"]
 	path = third_party/duckdb
 	url = https://github.com/duckdb/duckdb.git
@@ -25,18 +38,6 @@
 [submodule "third_party/duckdb-java"]
 	path = third_party/duckdb-java
 	url = https://github.com/duckdb/duckdb-java.git
-	branch = main
-[submodule "third_party/postgresql"]
-	path = third_party/postgresql
-	url = https://github.com/postgres/postgres.git
-	branch = master
-[submodule "third_party/rocksdb"]
-	path = third_party/rocksdb
-	url = https://github.com/facebook/rocksdb.git
-	branch = main
-[submodule "index/slatedb"]
-	path = index/slatedb
-	url = https://github.com/slatedb/slatedb.git
 	branch = main
 [submodule "third_party/pixels"]
 	path = third_party/pixels
@@ -50,3 +51,11 @@
 	path = third_party/pixels-trino
 	url = https://github.com/pixelsdb/pixels-trino.git
 	branch = master
+[submodule "third_party/postgresql"]
+	path = third_party/postgresql
+	url = https://github.com/postgres/postgres.git
+	branch = master
+[submodule "third_party/rocksdb"]
+	path = third_party/rocksdb
+	url = https://github.com/facebook/rocksdb.git
+	branch = main
