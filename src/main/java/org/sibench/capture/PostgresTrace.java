@@ -69,7 +69,7 @@ final class PostgresTrace {
                     ||aborts!=((Number)counts.get("aborted_transactions")).longValue()
                     ||versions.version()!=commits+aborts)throw new IOException("Incomplete PG source projection");
             manifest.putAll(counts);manifest.put("source_statements",requests);
-            manifest.put("last_resolved_version",versions.version());
+            manifest.put("last_resolved_version",writer.lastCommittedVersion());
             manifest.put("capture_queue",capture.transactions.metrics());
         }
         database.commit();

@@ -34,21 +34,17 @@ public class ReplayProjectionTest {
     }
 
     @Test
-    public void abortedSourceRetainsSnapshotQueriesButRejectsExportedWrites() throws Exception {
+    public void rejectsAbortBoundariesEvenWithoutWrites() throws Exception {
         var query = IndexOperationTrace.search(1, 3, 0, Range.equal(IndexKey.ofInt(1)), 0, 0, 0)
                 .withTransaction(10, 0);
         var operations = List.of(
                 IndexOperationTrace.transaction(1, IndexOperationTrace.TRANSACTION_BEGIN, 10, 1, 0),
                 query,
                 IndexOperationTrace.transaction(2, IndexOperationTrace.TRANSACTION_ABORT, 10, 1, 2));
-        var report = ReplayInput.checkStream(consumer -> {
+        assertThrows(IOException.class, () -> ReplayInput.checkStream(consumer -> {
             for (var operation : operations) consumer.accept(operation);
             return operations.size();
-        }, new ReplayConfig(true, 0, 0, 0, 0), true);
-        assertEquals(1L, report.get("dispatched_operations"));
-        assertEquals(1L, report.get("aborted_transactions"));
-        assertEquals(0L, report.get("committed_transactions"));
-        assertEquals(1L, report.get("last_resolved_version"));
+        }, new ReplayConfig(true, 0, 0, 0, 0), true));
         try (var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0), true, op -> fail())) {
             replay.accept(operations.get(0));
             replay.accept(mutation(3, 1, 1, 10, 1, IndexOperationTrace.UPSERT));
@@ -173,7 +169,7 @@ public class ReplayProjectionTest {
             Thread owner = Thread.currentThread();
             ReplayTarget.Factory target =
                     clientId ->
-                            (sequence, o) -> {
+                            (sequence, o, stored) -> {
                                 assertSame(owner, Thread.currentThread());
                                 received.add(o);
                                 return ReplayTarget.SendHandle.completed();
@@ -297,7 +293,7 @@ public class ReplayProjectionTest {
                 List.of(
                         IndexOperationTrace.transaction(10, 7, 11, 1, 1),
                         IndexOperationTrace.transaction(10, 7, 10, 2, 1),
-                        IndexOperationTrace.transaction(10, 7, 10, 1, 0),
+                        IndexOperationTrace.transaction(10, IndexOperationTrace.TRANSACTION_ABORT, 10, 1, 0),
                         IndexOperationTrace.transaction(11, 6, 11, 2, 0))) {
             var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0), true, operation -> fail());
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));

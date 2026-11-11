@@ -54,8 +54,8 @@ public final class ReferenceReplay {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
         var manifest = TraceManifest.read(directory);
         for (boolean rowIds : rowIdModes)
-            TraceManifest.requireValue(directory, rowIds ? org.sibench.adapters.proto.ValueKind.ROW_ID
-                    : org.sibench.adapters.proto.ValueKind.LOCATOR);
+            TraceManifest.requireValue(directory, rowIds ? org.sibench.adapters.ValueKind.ROW_ID
+                    : org.sibench.adapters.ValueKind.LOCATOR);
         var input = prepare(directory, config);
         return runChecked(
                 input.baseline(),
@@ -125,7 +125,7 @@ public final class ReferenceReplay {
                     + " implementation; resolved-source version history and timestamp lookup,"
                     + " ordered point/range/limited scans, pinned entries and intersection/union"
                     + " search groups over order-preserving keys of the complete declared source"
-                    + " indexes, including reads before Abort and exclusion of aborted writes;"
+                    + " indexes from successful transactions, excluding transaction-local reads;"
                     + " no RPC, persistence, concurrent MVCC, physical GC, rate scheduling or sustained-duration proof");
         Files.writeString(
                 report,

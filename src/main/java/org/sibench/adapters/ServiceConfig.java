@@ -4,7 +4,6 @@ import org.sibench.config.ObjectStore;
 
 import static org.sibench.config.ConfigValues.*;
 
-import org.sibench.adapters.proto.ValueKind;
 
 import java.nio.file.Files;
 import java.nio.file.Path;

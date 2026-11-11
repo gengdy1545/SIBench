@@ -10,9 +10,9 @@ import org.junit.Test;
 import org.sibench.adapters.IndexExecutor;
 import org.sibench.adapters.TraceRequests;
 import org.sibench.adapters.VersionedIndexBackend;
-import org.sibench.adapters.proto.Status;
+import org.sibench.adapters.IndexStatus;
 import org.sibench.adapters.proto.TraceRecord;
-import org.sibench.adapters.proto.ValueKind;
+import org.sibench.adapters.ValueKind;
 import org.sibench.generation.NativeHistory;
 import org.sibench.generation.DuckDbHostFixture;
 import org.sibench.trace.IndexKey;
@@ -21,7 +21,6 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
     private static final List<IndexCatalog.Definition> CATALOG=List.of(
             new IndexCatalog.Definition(1,"items",0,"canonical_primary","id","int"),
             new IndexCatalog.Definition(1,"items",1,"items_k","k","int"));
-    private record Expected(long key,long row,long version) {}
     private static void sql(Connection db,String text)throws Exception {try(var q=db.createStatement()){q.execute(text);}}
     private static long number(Connection db,String text)throws Exception {
         try(var q=db.createStatement();var r=q.executeQuery(text)){assertTrue(r.next());long value=r.getLong(1);assertFalse(r.next());return value;}
@@ -60,18 +59,18 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
             DuckDbTransactions.bind(db,"data");DuckDbIdentities.bind(db);DuckDbAccesses.bind(db,CATALOG);DuckDbMutations.bind(db);
             assertEquals(5,number(db,"SELECT count(*) FROM sibench_changes"));
             assertEquals(2,number(db,"SELECT count(*) FROM sibench_changes WHERE version=1"));
-            var expected=new HashMap<Long,List<Expected>>();
+            var expected=new HashMap<Long,List<Long>>();
             try(var q=db.createStatement();var r=q.executeQuery("SELECT a.raw_record,a.version,s.sql_text,a.query_id FROM sibench_accesses a "
                     +"JOIN sibench_statements s USING(connection_id,transaction_id,query_id) ORDER BY a.query_id")) {
                 int aggregate=0;
                 while(r.next()) {
-                    String text=r.getString(3);List<Expected> wanted;
-                    if(text.contains(" IN "))wanted=List.of(new Expected(10,id10,0),new Expected(30,id30,0));
-                    else if(text.startsWith("SELECT sum")) wanted=aggregate++==0?List.of(new Expected(10,id10,0),new Expected(20,id20,0)):
-                            List.of(new Expected(10,id10,0),new Expected(20,id20,0),new Expected(30,id30,1),new Expected(40,id40,1));
-                    else if(text.contains("id=30"))wanted=List.of(new Expected(30,id30,0));
-                    else if(text.contains("id=10"))wanted=List.of(new Expected(10,id10,0));
-                    else if(text.contains("id=20"))wanted=List.of(new Expected(20,id20,0));
+                    String text=r.getString(3);List<Long> wanted;
+                    if(text.contains(" IN "))wanted=List.of(id10,id30);
+                    else if(text.startsWith("SELECT sum")) wanted=aggregate++==0?List.of(id10,id20):
+                            List.of(id10,id20,id30,id40);
+                    else if(text.contains("id=30"))wanted=List.of(id30);
+                    else if(text.contains("id=10"))wanted=List.of(id10);
+                    else if(text.contains("id=20"))wanted=List.of(id20);
                     else {assertTrue(text,text.startsWith("SELECT count"));wanted=List.of();}
                     expected.put(r.getLong(1),wanted);
                 }
@@ -80,34 +79,30 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
             var workload=root.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(workload);
             try(writer){assertEquals(30,DuckDbProjection.write(db,true,writer));}
             try(var backend=VersionedIndexBackend.create(root.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {
-                long[] requests={0},searches={0},aborts={0};
+                long[] requests={0},searches={0};
                 var consumer=new IndexOperationTrace.Consumer(){
                     @Override public void accept(IndexOperationTrace.Operation operation){fail("Missing stored service request");}
                     @Override public void accept(TraceRecord record,List<IndexOperationTrace.Operation> operations)throws java.io.IOException {
-                        if(record.hasBegin())return;
-                        if(record.hasEnd()){if(record.getEnd().getAborted())aborts[0]++;return;}
+                        if(record.hasTransactionBegin())return;
+                        if(record.hasTransactionCommit())return;
                         try {
-                            requests[0]++; var request=record.getRequest();
-                            org.sibench.adapters.proto.Response response;
-                            if (request.hasGroup()) {
-                                var answers = new java.util.ArrayList<List<org.sibench.adapters.proto.Result>>();
-                                for (var member : request.getGroup().getMembersList()) {
-                                    var call = org.sibench.adapters.proto.Request.newBuilder();
-                                    if (member.hasGet()) call.setGet(member.getGet()); else call.setScan(member.getScan());
-                                    var answer = index.submit(call.build()).get(5, TimeUnit.SECONDS);
-                                    assertEquals(answer.getMessage(), Status.OK, answer.getStatus());
-                                    answers.add(answer.getResultsList());
+                            requests[0]++; var request=record.getOperation();
+                            org.sibench.adapters.IndexResponse response;
+                            if (request.hasReadGroup()) {
+                                var answers = new java.util.ArrayList<List<com.google.protobuf.ByteString>>();
+                                for (var member : request.getReadGroup().getRequestsList()) {
+                                    var answer = index.submit(TraceRequests.read(member)).get(5, TimeUnit.SECONDS);
+                                    assertEquals(answer.message(), IndexStatus.OK, answer.status());
+                                    answers.add(answer.values());
                                 }
-                                response = org.sibench.adapters.proto.Response.newBuilder().setStatus(Status.OK)
-                                        .addAllResults(TraceRequests.combine(request.getGroup(), answers)).build();
-                            } else response = index.submit(request).get(5, TimeUnit.SECONDS);
-                            assertEquals(response.getMessage(), Status.OK, response.getStatus());
-                            if(request.hasGet() || request.hasScan() || request.hasGroup()) {
-                                var wanted=expected.get(operations.get(0).sourceEvent());assertNotNull(wanted);assertEquals(wanted.size(),response.getResultsCount());
+                                response = org.sibench.adapters.IndexResponse.ok(TraceRequests.combine(request.getReadGroup(), answers));
+                            } else response = index.submit(new TraceRequests(ValueKind.ROW_ID).forward(request, operations.get(0))).get(5, TimeUnit.SECONDS);
+                            assertEquals(response.message(), IndexStatus.OK, response.status());
+                            if(request.hasGet() || request.hasScan() || request.hasReadGroup()) {
+                                var wanted=expected.get(operations.get(0).sourceEvent());assertNotNull(wanted);assertEquals(wanted.size(),response.values().size());
                                 for(int i=0;i<wanted.size();i++) {
-                                    var actual=response.getResults(i);var e=wanted.get(i);
-                                    assertArrayEquals(IndexKey.ofInt(e.key()).bytes(),org.sibench.trace.IndexEntry.decode(actual.getKey()).primaryKey().bytes());
-                                    assertEquals(e.row(),actual.getValue().asReadOnlyByteBuffer().getLong());assertEquals(e.version(),actual.getTs());
+                                    var actual=response.values().get(i);var e=wanted.get(i);
+                                    assertEquals(e.longValue(),actual.asReadOnlyByteBuffer().getLong());
                                 }
                                 searches[0]++;
                             }
@@ -116,12 +111,13 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
                 };
                 ProtoTrace.read(baseline,baseWriter.sha256(),baseWriter.logicalSha256(),consumer);
                 ProtoTrace.read(workload,writer.sha256(),writer.logicalSha256(),consumer);
-                assertEquals(6,searches[0]);assertEquals(1,aborts[0]);assertEquals(19,requests[0]);
+                // Only the committed update lookup, delete lookup and final count survive.
+                assertEquals(3,searches[0]);assertEquals(16,requests[0]);
             }
         }
     }
 
-    @Test public void retainsNativeFailedStatementFactsButExportsNoAbortedWritesOrLocalReads()throws Exception {
+    @Test public void retainsNativeFailedStatementFactsButExportsNoAbortedTransaction()throws Exception {
         try(var db=connect()) {
             sql(db,"CREATE TABLE items(id BIGINT PRIMARY KEY,k BIGINT)");sql(db,"CREATE INDEX items_k ON items(k)");
             sql(db,"INSERT INTO items VALUES(10,100),(20,200)");
@@ -148,22 +144,7 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
             assertEquals(2,number(db,"SELECT count(*) FROM items"));
             var trace=root.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(trace);
             try(writer){assertEquals(5,DuckDbProjection.write(db,true,writer));}
-            try(var backend=VersionedIndexBackend.create(root.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {
-                long[] searches={0},aborts={0},ids={0};
-                ProtoTrace.read(trace,writer.sha256(),writer.logicalSha256(),new IndexOperationTrace.Consumer(){
-                    @Override public void accept(IndexOperationTrace.Operation operation){fail("Missing stored request");}
-                    @Override public void accept(TraceRecord record,List<IndexOperationTrace.Operation> operations)throws java.io.IOException {
-                        if(record.hasBegin())return;
-                        if(record.hasEnd()){if(record.getEnd().getAborted())aborts[0]++;return;}
-                        try {
-                            ids[0]++; var request=record.getRequest();
-                            var response=index.submit(request).get(5,TimeUnit.SECONDS);assertEquals(response.getMessage(),Status.OK,response.getStatus());
-                            if((request.hasGet() || request.hasScan())) {assertEquals(1,response.getResultsCount());assertEquals(rowId,response.getResults(0).getValue().asReadOnlyByteBuffer().getLong());assertEquals(1,response.getResults(0).getTs());searches[0]++;}
-                        }catch(Exception error){throw new java.io.IOException(error);}
-                    }
-                });
-                assertEquals(0,searches[0]);assertEquals(1,aborts[0]);assertEquals(0,ids[0]);
-            }
+            assertEquals(0, ProtoTrace.read(trace,writer.sha256(),writer.logicalSha256(), ignored -> fail("Aborted transaction leaked")));
         }
     }
 }

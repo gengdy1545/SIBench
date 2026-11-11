@@ -15,7 +15,7 @@ public class ServiceConfigTest {
     @Test public void serverPortMustFitTheNetworkPortRange() {
         for (int port : new int[] {-1, 65536})
             assertThrows(IllegalArgumentException.class, () -> new ServiceConfig("rocksdb", null,
-                    temporary.getRoot().toPath(), port, org.sibench.adapters.proto.ValueKind.ROW_ID, null, false));
+                    temporary.getRoot().toPath(), port, ValueKind.ROW_ID, null, false));
     }
 
     @Test

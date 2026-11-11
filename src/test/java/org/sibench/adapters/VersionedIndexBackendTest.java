@@ -32,7 +32,7 @@ public class VersionedIndexBackendTest {
         var requests = new TraceRequests(kind);
         for (Operation operation : operations) {
             var response = IndexExecution.execute(backend, requests.request(operation));
-            assertEquals(response.getMessage(), Status.OK, response.getStatus());
+            assertEquals(response.message(), IndexStatus.OK, response.status());
         }
         return backend;
     }
@@ -43,18 +43,13 @@ public class VersionedIndexBackendTest {
                 .setEndKey(IndexEntry.bound(TABLE,index,range.upper(),range.upper()==null || range.upperInclusive())).build();
     }
 
-    private static void same(String what, List<LookupResult> expected, List<Result> actual, boolean rowIds) throws Exception {
+    private static void same(String what, List<LookupResult> expected, List<ByteString> actual, boolean rowIds) throws Exception {
         assertEquals(what + " size", expected.size(), actual.size());
         for (int i = 0; i < expected.size(); i++) {
             LookupResult e = expected.get(i);
-            Result a = actual.get(i);
-            assertArrayEquals(what + " key " + i, e.key().bytes(), IndexEntry.decode(a.getKey()).primaryKey().bytes());
-            assertEquals(what + " version " + i, e.commitVersion(), a.getTs());
-            if (rowIds) assertEquals(what + " row id " + i, e.value(), a.getValue().asReadOnlyByteBuffer().getLong());
-            else {
-                assertEquals(what + " file " + i, e.value(), a.getValue().asReadOnlyByteBuffer().getLong());
-                assertEquals(what + " position " + i, e.position(), a.getValue().asReadOnlyByteBuffer().getLong(8));
-            }
+            ByteString a = actual.get(i);
+            ByteString wanted = rowIds ? IndexEntry.rowId(e.value()) : IndexEntry.locator(e.value(), e.position());
+            assertEquals(what + " value " + i, wanted, a);
         }
     }
 
@@ -128,24 +123,24 @@ public class VersionedIndexBackendTest {
             backend.write(Mutation.newBuilder().setDelete(DeleteRequest.newBuilder().setKey(a).setTs(3)).build());
             backend.write(Mutation.newBuilder().setDelete(DeleteRequest.newBuilder().setKey(ab).setTs(5)).build());
             for (long ts : new long[] {0, 1, 3, 4, 5, Long.MAX_VALUE}) {
-                var expected = new ArrayList<Result>();
+                var expected = new java.util.LinkedHashMap<ByteString, ByteString>();
                 for (var key : keys) {
-                    Result result = ts == 0 || key.equals(a) && ts == 3 || key.equals(ab) && ts >= 5 ? null
-                            : Result.newBuilder().setKey(key).setTs(key.equals(a) && ts >= 4 ? 4 : 1)
-                                    .setValue(key.equals(a) && ts >= 4 ? updated : key).build();
+                    ByteString result = ts == 0 || key.equals(a) && ts == 3 || key.equals(ab) && ts >= 5 ? null
+                            : (key.equals(a) && ts >= 4 ? updated : key);
                     assertEquals(result, backend.get(GetRequest.newBuilder().setKey(key).setReadTs(ts).build()));
-                    if (result != null) expected.add(result);
+                    if (result != null) expected.put(key, result);
                 }
                 for (boolean reverse : new boolean[] {false, true}) {
-                    var wanted = new ArrayList<>(expected);
+                    var wanted = new ArrayList<>(expected.values());
                     if (reverse) java.util.Collections.reverse(wanted);
                     var scan = ScanRequest.newBuilder().setReadTs(ts).setReverse(reverse);
                     assertEquals(wanted, backend.scan(scan.build()));
                     assertEquals(wanted.subList(0, Math.min(2, wanted.size())),
                             backend.scan(scan.clone().setLimit(2).build()));
                     var end = ByteString.copyFromUtf8("b");
-                    var bounded = wanted.stream().filter(r -> order.compare(r.getKey(), a) >= 0
-                            && order.compare(r.getKey(), end) < 0).toList();
+                    var bounded = new ArrayList<>(expected.entrySet().stream().filter(r -> order.compare(r.getKey(), a) >= 0
+                            && order.compare(r.getKey(), end) < 0).map(java.util.Map.Entry::getValue).toList());
+                    if (reverse) java.util.Collections.reverse(bounded);
                     assertEquals(bounded, backend.scan(scan.clone().setStartKey(a).setEndKey(end).build()));
                     assertTrue(backend.scan(scan.clone().setEndKey(ByteString.EMPTY).build()).isEmpty());
                     assertEquals(wanted, backend.scan(scan.clone().setStartKey(ByteString.EMPTY).build()));
@@ -222,13 +217,13 @@ public class VersionedIndexBackendTest {
                     var keys = new ArrayList<IndexKey>();
                     for (var r : second) keys.add(r.key());
                     long intersection = first.stream().filter(r -> keys.contains(r.key())).count();
-                    var group = SearchGroup.newBuilder().setMode(SearchGroup.Mode.INTERSECTION)
-                            .addMembers(ReadRequest.newBuilder().setScan(search(1, Range.equal(IndexKey.ofInt(a)), last)))
-                            .addMembers(ReadRequest.newBuilder().setScan(search(2, Range.equal(IndexKey.ofInt(b)), last))).build();
-                    var results = List.of(backend.scan(group.getMembers(0).getScan()),backend.scan(group.getMembers(1).getScan()));
+                    var group = ReadGroup.newBuilder().setCombineMode(ReadGroup.CombineMode.INTERSECTION)
+                            .addRequests(ReadRequest.newBuilder().setScan(search(1, Range.equal(IndexKey.ofInt(a)), last)))
+                            .addRequests(ReadRequest.newBuilder().setScan(search(2, Range.equal(IndexKey.ofInt(b)), last))).build();
+                    var results = List.of(backend.scan(group.getRequests(0).getScan()),backend.scan(group.getRequests(1).getScan()));
                     var response = TraceRequests.combine(group,results);
                     assertEquals(intersection, response.size());
-                    var union = TraceRequests.combine(group.toBuilder().setMode(SearchGroup.Mode.UNION).build(),results);
+                    var union = TraceRequests.combine(group.toBuilder().setCombineMode(ReadGroup.CombineMode.UNION).build(),results);
                     assertEquals(first.size() + second.size() - intersection, union.size());
                 }
         }
@@ -237,10 +232,12 @@ public class VersionedIndexBackendTest {
     @Test
     public void rejectsWhatTheProtocolForbids() throws Exception {
         try (var backend = load(List.of(), ValueKind.ROW_ID)) {
-            assertEquals(Status.INVALID, IndexExecution.execute(backend, Request.newBuilder()
-                    .setPut(PutRequest.newBuilder().setTs(-1)).build()).getStatus());
-            assertEquals(Status.INVALID, IndexExecution.execute(backend, Request.newBuilder()
-                    .setGet(GetRequest.newBuilder().setReadTs(-1)).build()).getStatus());
+            assertEquals(IndexStatus.INVALID, IndexExecution.execute(backend, PutRequest.newBuilder().setTs(-1).build()).status());
+            assertEquals(IndexStatus.INVALID, IndexExecution.execute(backend, GetRequest.newBuilder().setReadTs(-1).build()).status());
+        }
+        try (var backend = load(List.of(), ValueKind.ROW_ID)) {
+            for (var trace : List.of(ReadGroup.getDefaultInstance(), TraceOperation.getDefaultInstance(), TraceRecord.getDefaultInstance()))
+                assertEquals(IndexStatus.INVALID, IndexExecution.execute(backend, trace).status());
         }
         // An index directory is never reused.
         var path = temporary.getRoot().toPath().resolve("once");
@@ -260,6 +257,21 @@ public class VersionedIndexBackendTest {
         }
         var error = assertThrows(java.io.IOException.class, () -> VersionedIndexBackend.open(path, ValueKind.ROW_ID));
         assertTrue(error.getMessage(), error.getMessage().contains("Unsupported index metadata"));
+    }
+
+    @Test
+    public void valueModeStorageTagsStayIndependentOfJavaEnumOrder() throws Exception {
+        for (var mode : java.util.Map.of(ValueKind.LOCATOR, (byte) 1, ValueKind.ROW_ID, (byte) 2).entrySet()) {
+            var path = temporary.getRoot().toPath().resolve(mode.getKey().name());
+            VersionedIndexBackend.create(path, mode.getKey()).close();
+            try (var store = LocalRocksStore.open(path)) {
+                assertArrayEquals(new byte[] {mode.getValue()}, store.get(new byte[] {
+                        0, 'v', 'a', 'l', 'u', 'e', '_', 'k', 'i', 'n', 'd'}));
+            }
+            try (var backend = VersionedIndexBackend.open(path, mode.getKey())) {
+                assertEquals(mode.getKey(), backend.describe().valueKind());
+            }
+        }
     }
 
     @Test

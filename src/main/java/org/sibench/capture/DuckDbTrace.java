@@ -121,7 +121,7 @@ public final class DuckDbTrace implements AutoCloseable {
         var gson=new Gson();
         manifest.put("baseline_trace_sha256",ProtoTrace.identity(gson.toJsonTree(baselineFiles).getAsJsonArray()));
         manifest.put("workload_trace_sha256",ProtoTrace.identity(gson.toJsonTree(workloadFiles).getAsJsonArray()));
-        manifest.put("source_statements",statements);manifest.put("last_resolved_version",lastVersion());
+        manifest.put("source_statements",statements);manifest.put("last_resolved_version",workload.lastCommittedVersion());
         manifest.put("source_evidence",Map.copyOf(evidence));
         finished=true;
         return new Draft(directory,manifest);

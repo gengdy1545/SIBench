@@ -1,5 +1,6 @@
 package org.sibench.adapters;
 
+import com.google.protobuf.Message;
 import com.google.protobuf.MessageLite;
 import io.grpc.*;
 import io.grpc.stub.*;
@@ -41,7 +42,7 @@ public final class GrpcService implements AutoCloseable {
     private final class Client extends ServiceClient {
         final ManagedChannel channel=ManagedChannelBuilder.forTarget(endpoint).usePlaintext().disableRetry()
                 .maxInboundMessageSize(IndexExecution.MAX_MESSAGE_BYTES).build();
-        final ConcurrentHashMap<CompletableFuture<Response>,ClientCall<?,?>> pending=new ConcurrentHashMap<>();
+        final ConcurrentHashMap<CompletableFuture<IndexResponse>,ClientCall<?,?>> pending=new ConcurrentHashMap<>();
         private CompletableFuture<Void> lastSend=CompletableFuture.completedFuture(null);
         private volatile Throwable failure;
 
@@ -54,24 +55,22 @@ public final class GrpcService implements AutoCloseable {
             pending.clear();
         }
 
-        @Override synchronized CompletableFuture<Response> transmit(Request request, Consumer<Response> partial) throws IOException {
+        @Override synchronized CompletableFuture<IndexResponse> transmit(Message request, Consumer<IndexResponse> partial) throws IOException {
             if (failure!=null) throw new IOException("Index client failed",failure);
             try {
-                return switch (request.getOperationCase()) {
-                    case PUT -> call(IndexServiceGrpc.getPutMethod(), request.getPut(), partial, false);
-                    case DELETE -> call(IndexServiceGrpc.getDeleteMethod(), request.getDelete(), partial, false);
-                    case GET -> call(IndexServiceGrpc.getGetMethod(), request.getGet(), partial, false);
-                    case SCAN -> call(IndexServiceGrpc.getScanMethod(), request.getScan(), partial, true);
-                    case BATCH -> call(IndexServiceGrpc.getBatchWriteMethod(), request.getBatch(), partial, false);
-                    default -> throw new IOException("Only data operations reach the transport");
-                };
+                if (request instanceof PutRequest put) return call(IndexServiceGrpc.getPutMethod(), put, partial, false);
+                if (request instanceof DeleteRequest delete) return call(IndexServiceGrpc.getDeleteMethod(), delete, partial, false);
+                if (request instanceof GetRequest get) return call(IndexServiceGrpc.getGetMethod(), get, partial, false);
+                if (request instanceof ScanRequest scan) return call(IndexServiceGrpc.getScanMethod(), scan, partial, true);
+                if (request instanceof WriteBatchRequest batch) return call(IndexServiceGrpc.getWriteBatchMethod(), batch, partial, false);
+                throw new IOException("Only data operations reach the transport");
             } catch (IllegalArgumentException error) { throw new IOException("Unsupported index operation",error); }
         }
 
-        private <Q extends MessageLite,S> CompletableFuture<Response> call(MethodDescriptor<Q,S> method,Q input,
-                Consumer<Response> partial,boolean scan) throws IOException {
+        private <Q extends MessageLite,S> CompletableFuture<IndexResponse> call(MethodDescriptor<Q,S> method,Q input,
+                Consumer<IndexResponse> partial,boolean scan) throws IOException {
             if (input.getSerializedSize()>IndexExecution.MAX_MESSAGE_BYTES) throw new IOException("Index request exceeds the RPC message limit");
-            var done=new CompletableFuture<Response>();
+            var done=new CompletableFuture<IndexResponse>();
             var sent=new CompletableFuture<Void>(); lastSend=sent;
             var options=CallOptions.DEFAULT.withDeadlineAfter(timeoutSeconds,TimeUnit.SECONDS)
                     .withStreamTracerFactory(new ClientStreamTracer.Factory() {
@@ -114,25 +113,24 @@ public final class GrpcService implements AutoCloseable {
             };
             pending.put(done,call);
             requests.rpcRequest(input,method.getBareMethodName());
-            var answer=Response.newBuilder().setStatus(org.sibench.adapters.proto.Status.OK);
+            var answer=new java.util.ArrayList<com.google.protobuf.ByteString>();
             StreamObserver<S> observer=new StreamObserver<>() {
                 int messages;
                 @Override public void onNext(S value) {
                     try {
                         if (!scan && messages++!=0) throw new IOException("Multiple responses to a unary index call");
-                        if (value instanceof GetResponse get && get.hasResult()) {
-                            answer.addResults(get.getResult()); requests.rpcResults(java.util.List.of(get.getResult()));
+                        if (value instanceof GetResponse get && get.hasValue()) {
+                            answer.add(get.getValue()); requests.rpcResults(java.util.List.of(get.getValue()));
                         } else if (value instanceof ScanResponse chunk) {
-                            requests.rpcResults(chunk.getResultsList());
-                            partial.accept(Response.newBuilder().setStatus(org.sibench.adapters.proto.Status.OK)
-                                    .setMore(true).addAllResults(chunk.getResultsList()).build());
+                            requests.rpcResults(chunk.getValuesList());
+                            partial.accept(new IndexResponse(IndexStatus.OK, "", chunk.getValuesList(), true));
                         }
                     } catch (IOException | RuntimeException error) { fail(error); }
                 }
                 @Override public void onError(Throwable error) { fail(error); }
                 @Override public void onCompleted() {
                     if (!scan && messages!=1) { fail(new IOException("Missing unary index response")); return; }
-                    pending.remove(done); done.complete(answer.build());
+                    pending.remove(done); done.complete(IndexResponse.ok(answer));
                 }
             };
             try {

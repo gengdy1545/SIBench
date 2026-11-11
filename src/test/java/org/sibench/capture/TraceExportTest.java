@@ -88,11 +88,10 @@ public class TraceExportTest {
         }
     }
 
-    @Test public void rejectsMissingResolutionSlotsWithValidFileIdentities() throws Exception {
+    @Test public void acceptsGapsLeftByExcludedAbortedTransactions() throws Exception {
         Path directory = trace(false, 2, false);
-        assertTrue(assertThrows(IOException.class,
-                () -> ReplayInput.prepare(directory, new ReplayConfig(false, 0, 0, 0, 0)))
-                .getMessage().contains("resolution sequence"));
+        assertEquals("trace_integrity_and_supply_valid",
+                ReplayInput.check(directory, new ReplayConfig(false, 0, 0, 0, 0)).get("status"));
     }
 
     @Test public void baselineContainsOnlyInserts() throws Exception {

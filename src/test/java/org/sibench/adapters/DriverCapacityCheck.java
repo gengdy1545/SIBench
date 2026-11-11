@@ -1,5 +1,9 @@
 package org.sibench.adapters;
 
+import com.google.protobuf.Message;
+import com.google.protobuf.Any;
+
+import com.google.protobuf.ByteString;
 import org.sibench.replay.ReplayInput;
 import com.google.gson.*;
 import io.grpc.*;
@@ -89,7 +93,7 @@ public final class DriverCapacityCheck {
                     items[0] = Math.addExact(items[0], operation.expectedCount());
                     largest[0] = Math.max(largest[0], operation.expectedCount());
                 }
-                if ((operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT || operation.kind() == IndexOperationTrace.TRANSACTION_ABORT) && records[0] >= next[0]) {
+                if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT && records[0] >= next[0]) {
                     candidates.add(Map.of("records", records[0], "queries", queries[0], "expected_result_items", items[0],
                             "largest_query_items", largest[0], "used_clients_128", clients.cardinality()));
                     next[0] = Math.max(next[0] * 2, records[0] + 1);
@@ -126,12 +130,12 @@ public final class DriverCapacityCheck {
                 records[0]++;
                 if (operation.kind() == IndexOperationTrace.SEARCH
                         && (!operation.grouped() || operation.expansionPosition() + 1 == operation.expansionSize())) queries[0]++;
-                if (records[0] >= wanted && (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT || operation.kind() == IndexOperationTrace.TRANSACTION_ABORT)) throw new EndPrefix();
+                if (records[0] >= wanted && operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) throw new EndPrefix();
             });
         } catch (EndPrefix expected) {}
         String binding = ReplayInput.binding(trace, config(trace, 128)) + " mode=rowid";
         // The serialized-byte cap is not an object-heap bound; setup also needs its external heap/deadline limits.
-        var recorded = new ConcurrentHashMap<Request, List<Response>>();
+        var recorded = new ConcurrentHashMap<Message, List<IndexResponse>>();
         var bytes = new AtomicLong();
         var requests = new TraceRequests(ValueKind.ROW_ID);
         IndexDescription description;
@@ -149,14 +153,15 @@ public final class DriverCapacityCheck {
             executor.flush();
             System.out.println("phase=record records=" + records[0] + " queries=" + queries[0]);
             ReplayTarget.Factory factory = client -> new ServiceClient(requests) {
-                @Override CompletableFuture<Response> transmit(Request request, java.util.function.Consumer<Response> partial) throws IOException {
-                    var chunks = new ArrayList<Response>();
-                    java.util.function.Consumer<Response> keep = response -> {
-                        long size = bytes.addAndGet(response.getSerializedSize());
+                @Override CompletableFuture<IndexResponse> transmit(Message request, java.util.function.Consumer<IndexResponse> partial) throws IOException {
+                    var chunks = new ArrayList<IndexResponse>();
+                    java.util.function.Consumer<IndexResponse> keep = response -> {
+                        if (response.status() != IndexStatus.OK) throw new IllegalStateException(response.message());
+                        long size = bytes.addAndGet(1L + ScanResponse.newBuilder().addAllValues(response.values()).build().getSerializedSize());
                         if (size > MAX_BYTES) throw new IllegalStateException("Response fixture exceeds 1 GiB budget");
                         chunks.add(response);
                     };
-                    if (bytes.addAndGet(request.getSerializedSize()) > MAX_BYTES) throw new IOException("Fixture budget exceeded");
+                    if (bytes.addAndGet(Any.pack(request).getSerializedSize()) > MAX_BYTES) throw new IOException("Fixture budget exceeded");
                     return executor.submit(request, chunk -> { keep.accept(chunk); partial.accept(chunk); })
                             .thenApply(response -> {
                                 keep.accept(response);
@@ -179,11 +184,12 @@ public final class DriverCapacityCheck {
             data.writeUTF(new com.google.gson.Gson().toJson(description));
             data.writeInt(recorded.size());
             // Stable order makes the diagnostic fixture reproducible for the same requests/results.
-            for (var request : recorded.keySet().stream().sorted((a,b) -> Arrays.compareUnsigned(a.toByteArray(),b.toByteArray())).toList()) {
-                request.writeDelimitedTo(data);
+            for (var request : recorded.keySet().stream().sorted(Comparator.comparing((Message m) -> m.getDescriptorForType().getFullName())
+                    .thenComparing(Message::toByteArray, Arrays::compareUnsigned)).toList()) {
+                Any.pack(request).writeDelimitedTo(data);
                 var chunks = recorded.get(request);
                 data.writeInt(chunks.size());
-                for (var response : chunks) response.writeDelimitedTo(data);
+                for (var response : chunks) writeResponse(data, response);
             }
         }
         var manifest = new LinkedHashMap<String, Object>();
@@ -212,22 +218,23 @@ public final class DriverCapacityCheck {
 
     private static void serve(Path fixture, int port, boolean corrupt) throws Exception {
         manifest(fixture);
-        var recorded = new HashMap<Request, List<Response>>();
+        var recorded = new HashMap<Message, List<IndexResponse>>();
         IndexDescription description;
         try (var data = new DataInputStream(new BufferedInputStream(Files.newInputStream(fixture.resolve("responses.bin"))))) {
             if (data.readInt() != MAGIC) throw new IOException("Invalid fixture");
             description = new com.google.gson.Gson().fromJson(data.readUTF(), IndexDescription.class);
             int count = data.readInt();
             for (int i = 0; i < count; i++) {
-                Request request = Request.parseDelimitedFrom(data);
+                Message request = readRequest(data);
                 int chunks = data.readInt();
-                var responses = new ArrayList<Response>();
+                var responses = new ArrayList<IndexResponse>();
                 for (int c = 0; c < chunks; c++) {
-                    var response = Response.parseDelimitedFrom(data);
-                    if (corrupt && response.getResultsCount() != 0) {
-                        var result = response.getResults(0);
-                        response = response.toBuilder().setResults(0, result.toBuilder()
-                                .setValue(org.sibench.trace.IndexEntry.rowId(result.getValue().asReadOnlyByteBuffer().getLong() + 1))).build();
+                    var response = readResponse(data);
+                    if (corrupt && response.values().size() != 0) {
+                        var result = response.values().get(0);
+                        var values = new ArrayList<>(response.values());
+                        values.set(0, org.sibench.trace.IndexEntry.rowId(result.asReadOnlyByteBuffer().getLong() + 1));
+                        response = new IndexResponse(response.status(), response.message(), values, response.more());
                     }
                     responses.add(response);
                 }
@@ -240,26 +247,23 @@ public final class DriverCapacityCheck {
                 return new IndexDescription("recorded-response-fixture",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,
                         "diagnostic responses; no persistent index",fixture.toString());
             }
-            private List<Response> find(Request request) throws IOException {
+            private List<IndexResponse> find(Message request) throws IOException {
                 var found=recorded.get(request);
                 if(found==null) throw new IOException("Request differs from recorded prefix");
-                for(var response:found) if(response.getStatus()!=org.sibench.adapters.proto.Status.OK) throw new IOException(response.getMessage());
                 return found;
             }
             public void write(Mutation mutation) throws IOException {
-                var request=Request.newBuilder();
-                if(mutation.hasPut())request.setPut(mutation.getPut());else request.setDelete(mutation.getDelete());
-                find(request.build());
+                find(mutation.hasPut() ? mutation.getPut() : mutation.getDelete());
             }
-            public Result get(GetRequest get) throws IOException {
-                var results=new ArrayList<Result>();
-                for(var response:find(Request.newBuilder().setGet(get).build()))results.addAll(response.getResultsList());
+            public ByteString get(GetRequest get) throws IOException {
+                var results=new ArrayList<ByteString>();
+                for(var response:find(get))results.addAll(response.values());
                 if(results.size()>1)throw new IOException("Get fixture has multiple results");
                 return results.isEmpty()?null:results.get(0);
             }
-            public void scan(ScanRequest scan,ResultSink output) throws IOException {
-                for(var response:find(Request.newBuilder().setScan(scan).build()))
-                    for(var result:response.getResultsList()) output.accept(result);
+            public void scan(ScanRequest scan,ValueSink output) throws IOException {
+                for(var response:find(scan))
+                    for(var result:response.values()) output.accept(result);
             }
             public void flush() {}
             public void bind(String value) throws IOException {
@@ -272,6 +276,33 @@ public final class DriverCapacityCheck {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> { try { server.close(); } catch(IOException ignored) {} }));
         System.out.println("READY port=" + server.port());
         server.awaitTermination();
+    }
+
+    static Message readRequest(DataInputStream data) throws IOException {
+        var request = Any.parseDelimitedFrom(data);
+        if (request == null) throw new EOFException("Missing fixture request");
+        if (!request.getUnknownFields().asMap().isEmpty()) throw new IOException("Unsupported fixture request fields");
+        if (request.is(GetRequest.class)) return request.unpack(GetRequest.class);
+        if (request.is(PutRequest.class)) return request.unpack(PutRequest.class);
+        if (request.is(DeleteRequest.class)) return request.unpack(DeleteRequest.class);
+        if (request.is(ScanRequest.class)) return request.unpack(ScanRequest.class);
+        if (request.is(WriteBatchRequest.class)) return request.unpack(WriteBatchRequest.class);
+        throw new IOException("Unsupported fixture request type");
+    }
+
+    // A published fixture contains only successful completions; reuse the RPC value payload.
+    static void writeResponse(DataOutputStream data, IndexResponse response) throws IOException {
+        if (response.status() != IndexStatus.OK) throw new IOException("Cannot record a failed response");
+        data.writeBoolean(response.more());
+        ScanResponse.newBuilder().addAllValues(response.values()).build().writeDelimitedTo(data);
+    }
+
+    static IndexResponse readResponse(DataInputStream data) throws IOException {
+        boolean more = data.readBoolean();
+        var response = ScanResponse.parseDelimitedFrom(data);
+        if (response == null) throw new EOFException("Missing fixture response");
+        if (!response.getUnknownFields().asMap().isEmpty()) throw new IOException("Unsupported fixture response fields");
+        return new IndexResponse(IndexStatus.OK, "", response.getValuesList(), more);
     }
 
     private static void run(Path fixture, String endpoint, int clients, Path report) throws Exception {

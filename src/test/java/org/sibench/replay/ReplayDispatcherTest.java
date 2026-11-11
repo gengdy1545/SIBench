@@ -61,7 +61,7 @@ public class ReplayDispatcherTest {
     public void onlyTheFinalBusinessResponseCompletesLatency() throws Exception {
         var now = new AtomicLong(1_000_000);
         var response = new CompletableFuture<Void>();
-        try (var dispatcher = new ReplayDispatcher(config(1, 10), client -> (seq, op) -> {
+        try (var dispatcher = new ReplayDispatcher(config(1, 10), client -> (seq, op, stored) -> {
             now.addAndGet(10_000); // Client serialization and local buffering belong in latency.
             return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response);
         }, 0, now::get)) {
@@ -84,7 +84,7 @@ public class ReplayDispatcherTest {
         var firstSent = new CountDownLatch(1);
         var secondSent = new CountDownLatch(1);
         var error = new AtomicReference<Throwable>();
-        try (var dispatcher = new ReplayDispatcher(config(1, 1), client -> (seq, op) -> {
+        try (var dispatcher = new ReplayDispatcher(config(1, 1), client -> (seq, op, stored) -> {
             if (seq == 2) secondSent.countDown();
             return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), responses.get((int) seq - 1));
         }, 0, now::get)) {
@@ -126,7 +126,7 @@ public class ReplayDispatcherTest {
         var now=new AtomicLong(1_000_000);
         var validated=new CompletableFuture<Void>();
         var replies=List.of(new CompletableFuture<Void>(),new CompletableFuture<Void>());
-        try(var dispatcher=new ReplayDispatcher(config(1,4),client -> (sequence,operation) ->
+        try(var dispatcher=new ReplayDispatcher(config(1,4),client -> (sequence, operation, stored) ->
                 new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null),validated,replies.get((int)sequence-1)),0,now::get)) {
             dispatcher.send(groupMember(0,2)); dispatcher.send(groupMember(1,2));
             now.set(1_050_000); replies.get(0).complete(null);
@@ -145,7 +145,7 @@ public class ReplayDispatcherTest {
         var now=new AtomicLong(1_000_000);
         var writes=List.of(new CompletableFuture<Void>(),new CompletableFuture<Void>());
         var order=new ArrayList<Long>();
-        try(var dispatcher=new ReplayDispatcher(config(1,4),client -> (sequence,operation) -> {
+        try(var dispatcher=new ReplayDispatcher(config(1,4),client -> (sequence, operation, stored) -> {
             order.add(operation.sourceEvent());
             return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null),operation.kind()==IndexOperationTrace.SEARCH
                     ?CompletableFuture.completedFuture(null):writes.get((int)operation.version()-1));
@@ -163,7 +163,7 @@ public class ReplayDispatcherTest {
     }
 
     @Test
-    public void bufferedSearchGroupWaitsForRoomBeforeItsFirstMember() throws Exception {
+    public void bufferedReadGroupWaitsForRoomBeforeItsFirstMember() throws Exception {
         var now = new AtomicLong(1_000_000);
         var ordinary = List.of(new CompletableFuture<Void>(), new CompletableFuture<Void>());
         var grouped = List.of(new CompletableFuture<Void>(), new CompletableFuture<Void>(),
@@ -172,7 +172,7 @@ public class ReplayDispatcherTest {
         var groupSent = new CountDownLatch(1);
         var groupCalls = new AtomicLong();
         var error = new AtomicReference<Throwable>();
-        try (var dispatcher = new ReplayDispatcher(config(1, 4), client -> (seq, op) -> {
+        try (var dispatcher = new ReplayDispatcher(config(1, 4), client -> (seq, op, stored) -> {
             CompletableFuture<Void> response;
             if (op.grouped()) {
                 response = grouped.get(op.expansionPosition());
@@ -220,7 +220,7 @@ public class ReplayDispatcherTest {
     }
 
     @Test
-    public void oversizedSearchGroupFailsBeforeOpeningAClient() throws Exception {
+    public void oversizedReadGroupFailsBeforeOpeningAClient() throws Exception {
         try (var dispatcher = new ReplayDispatcher(config(1, 2), client -> {
             fail("An oversized group must be rejected before opening a client");
             return null;
@@ -241,7 +241,7 @@ public class ReplayDispatcherTest {
         var independentReadSent = new CountDownLatch(1);
         var dependentReadSent = new CountDownLatch(1);
         var error = new AtomicReference<Throwable>();
-        try (var dispatcher = new ReplayDispatcher(config(2, 8), client -> (seq, op) -> {
+        try (var dispatcher = new ReplayDispatcher(config(2, 8), client -> (seq, op, stored) -> {
             CompletableFuture<Void> response;
             if (op.kind() != IndexOperationTrace.SEARCH)
                 response = op.version() == 1 ? oldWrite : newWrite;
@@ -312,7 +312,7 @@ public class ReplayDispatcherTest {
 
     /** Records the global send order; writes at the given versions stay pending until completed. */
     private static ReplayTarget.Factory recording(List<String> order, Map<Long, CompletableFuture<Void>> pending) {
-        return client -> (seq, op) -> {
+        return client -> (seq, op, stored) -> {
             synchronized (order) {
                 order.add(op.kind() == IndexOperationTrace.SEARCH
                         ? "S" + op.readTimestamp() + (op.grouped() ? "." + op.expansionPosition() : "") : "W" + op.version());
@@ -392,7 +392,7 @@ public class ReplayDispatcherTest {
             var response = new CompletableFuture<Void>();
             var readCalls = new AtomicLong();
             ReplayTarget.Factory factory = client -> new ReplayTarget() {
-                public SendHandle send(long seq, Operation op) {
+                public SendHandle send(long seq, Operation op, org.sibench.adapters.proto.TraceOperation stored) {
                     if (op.kind() == IndexOperationTrace.SEARCH) {
                         readCalls.incrementAndGet();
                         return SendHandle.completed();
@@ -424,7 +424,7 @@ public class ReplayDispatcherTest {
     public void sharedBatchKeepsEachMembersClientEntryTime() throws Exception {
         var now = new AtomicLong(1_000_000);
         var response = new CompletableFuture<Void>();
-        try (var dispatcher = new ReplayDispatcher(config(1, 10), client -> (seq, op) ->
+        try (var dispatcher = new ReplayDispatcher(config(1, 10), client -> (seq, op, stored) ->
                 new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response), 0, now::get)) {
             dispatcher.send(baseline(1));
             now.addAndGet(4_000);
@@ -446,7 +446,7 @@ public class ReplayDispatcherTest {
         var twoReturned = new CountDownLatch(1);
         var thirdCalled = new CountDownLatch(1);
         var error = new AtomicReference<Throwable>();
-        try (var dispatcher = new ReplayDispatcher(config(1, 2), client -> (sequence, operation) -> {
+        try (var dispatcher = new ReplayDispatcher(config(1, 2), client -> (sequence, operation, stored) -> {
             if (sequence == 3) thirdCalled.countDown();
             return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null),
                     sequence <= 2 ? batch : next);
@@ -487,7 +487,7 @@ public class ReplayDispatcherTest {
     @Test
     public void aBatchMayCompleteInsideItsLastSendBeforeRegistration() throws Exception {
         var response = new CompletableFuture<Void>();
-        try (var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation) -> {
+        try (var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation, stored) -> {
             if (sequence == 2) response.complete(null);
             return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response);
         })) {
@@ -505,7 +505,7 @@ public class ReplayDispatcherTest {
     @Test
     public void sharedBaselineFailureDoesNotCountAnyMemberAsSuccessful() throws Exception {
         var response = new CompletableFuture<Void>();
-        try (var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation) ->
+        try (var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation, stored) ->
                 new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response))) {
             dispatcher.send(baseline(1));
             dispatcher.send(baseline(2));
@@ -523,7 +523,7 @@ public class ReplayDispatcherTest {
     @Test
     public void closingSharedBaselineCompletionCancelsAndClearsAllMembers() throws Exception {
         var response = new CompletableFuture<Void>();
-        var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation) ->
+        var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation, stored) ->
                 new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response));
         dispatcher.send(baseline(1));
         dispatcher.send(baseline(2));
@@ -537,7 +537,7 @@ public class ReplayDispatcherTest {
     public void delayedWarmupResponsesStayOutsideTheMeasuredWindow() throws Exception {
         for (boolean batch : new boolean[] {false, true}) {
             var response = new CompletableFuture<Void>();
-            try (var dispatcher = new ReplayDispatcher(config(1, 10), client -> (sequence, operation) ->
+            try (var dispatcher = new ReplayDispatcher(config(1, 10), client -> (sequence, operation, stored) ->
                     new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response), 1)) {
                 dispatcher.send(batch ? baseline(1) : search(1));
                 dispatcher.send(batch ? baseline(2) : search(2));
@@ -557,7 +557,7 @@ public class ReplayDispatcherTest {
         try (var dispatcher =
                 new ReplayDispatcher(
                         config(1, 10),
-                        client -> (sequence, operation) -> ReplayTarget.SendHandle.completed(),
+                        client -> (sequence, operation, stored) -> ReplayTarget.SendHandle.completed(),
                         2)) {
             for (long unit = 1; unit <= 5; unit++) dispatcher.send(search(unit));
             dispatcher.drain();
@@ -583,7 +583,7 @@ public class ReplayDispatcherTest {
                 new ReplayDispatcher(
                         config(3, 10),
                         client ->
-                                (sequence, operation) -> {
+                                (sequence, operation, stored) -> {
                                     synchronized (sends) {
                                         sends.add(sequence);
                                         clients.add(client);
@@ -643,7 +643,7 @@ public class ReplayDispatcherTest {
                 new ReplayDispatcher(
                         config(2, 1),
                         client ->
-                                (seq, op) -> {
+                                (seq, op, stored) -> {
                                     CompletableFuture<Void> response = new CompletableFuture<>();
                                     responses.add(response);
                                     if (seq == 1) first.countDown();
@@ -689,7 +689,7 @@ public class ReplayDispatcherTest {
                         client ->
                                 new ReplayTarget() {
                                     @Override
-                                    public SendHandle send(long seq, Operation op) {
+                                    public SendHandle send(long seq, Operation op, org.sibench.adapters.proto.TraceOperation stored) {
                                         return new SendHandle(
                                                 CompletableFuture.completedFuture(null), response);
                                     }
@@ -710,7 +710,7 @@ public class ReplayDispatcherTest {
                 new ReplayDispatcher(
                         config(1, 10),
                         client ->
-                                (seq, op) ->
+                                (seq, op, stored) ->
                                         new ReplayTarget.SendHandle(
                                                 CompletableFuture.failedFuture(
                                                         new IOException("send")),
@@ -753,7 +753,7 @@ public class ReplayDispatcherTest {
             var dispatcher =
                     new ReplayDispatcher(
                             new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 1, 1),
-                            client -> (seq, op) -> new ReplayTarget.SendHandle(sent, response));
+                            client -> (seq, op, stored) -> new ReplayTarget.SendHandle(sent, response));
             try {
                 if (localTimeout) assertThrows(IOException.class, () -> dispatcher.send(search(1)));
                 else {
@@ -786,7 +786,7 @@ public class ReplayDispatcherTest {
                             config,
                             false,
                             client ->
-                                    (seq, op) -> {
+                                    (seq, op, stored) -> {
                                         routes.add(client);
                                         return ReplayTarget.SendHandle.completed();
                                     })) {
@@ -810,7 +810,7 @@ public class ReplayDispatcherTest {
                 new ReplayDispatcher(
                         config(1, 10),
                         client ->
-                                (seq, op) -> {
+                                (seq, op, stored) -> {
                                     sent.countDown();
                                     return new ReplayTarget.SendHandle(
                                             CompletableFuture.completedFuture(null), response);
@@ -853,7 +853,7 @@ public class ReplayDispatcherTest {
                 new ReplayDispatcher(
                         new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 10, 1),
                         client ->
-                                (seq, op) ->
+                                (seq, op, stored) ->
                                         new ReplayTarget.SendHandle(
                                                 CompletableFuture.completedFuture(null),
                                                 response))) {
@@ -869,7 +869,7 @@ public class ReplayDispatcherTest {
                 new ReplayDispatcher(
                         new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 10, 1),
                         client ->
-                                (seq, op) ->
+                                (seq, op, stored) ->
                                         new ReplayTarget.SendHandle(
                                                 localSend,
                                                 CompletableFuture.completedFuture(null)));

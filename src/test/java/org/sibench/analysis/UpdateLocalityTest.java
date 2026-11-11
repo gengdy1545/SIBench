@@ -28,7 +28,7 @@ import java.util.zip.GZIPInputStream;
 public class UpdateLocalityTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
-    @Test public void exportedAbortedSourceKeepsSnapshotQueriesWithoutMaintenance() throws Exception {
+    @Test public void exportedAbortedSourceContributesNeitherQueriesNorMaintenance() throws Exception {
         var operations = new ArrayList<Operation>();
         for (long version = 1; version <= 2; version++) {
             operations.add(IndexOperationTrace.transaction(version, IndexOperationTrace.TRANSACTION_BEGIN, version, version, 0));
@@ -45,9 +45,9 @@ public class UpdateLocalityTest {
         }
         var selected = new ArrayList<Operation>();
         IndexOperationTrace.Source source = export(operations);
-        assertEquals(8, UpdateLocality.committed(source).read(selected::add));
-        assertEquals(4, selected.stream().filter(IndexOperationTrace::isControl).count());
-        assertEquals(2, selected.stream().filter(operation -> operation.kind() == IndexOperationTrace.SEARCH).count());
+        assertEquals(5, UpdateLocality.committed(source).read(selected::add));
+        assertEquals(2, selected.stream().filter(IndexOperationTrace::isControl).count());
+        assertEquals(1, selected.stream().filter(operation -> operation.kind() == IndexOperationTrace.SEARCH).count());
         var writes = selected.stream().filter(IndexOperationTrace::isMutation).toList();
         assertEquals(2, writes.size());
         assertTrue(writes.stream().allMatch(write -> write.version() == 2));

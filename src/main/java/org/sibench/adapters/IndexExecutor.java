@@ -1,13 +1,12 @@
 package org.sibench.adapters;
 
-import org.sibench.adapters.proto.Request;
-import org.sibench.adapters.proto.Response;
-import org.sibench.adapters.proto.Status;
+import com.google.protobuf.Message;
+import org.sibench.adapters.proto.*;
 
 import java.io.IOException;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
+import java.util.Set;
+import java.util.HashSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -23,7 +22,7 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
     private final java.util.concurrent.ScheduledExecutorService maintenance;
     private long changes, persisted;
     private IOException maintenanceFailure;
-    private final Map<CompletableFuture<Response>, Request> pending = new HashMap<>();
+    private final Set<CompletableFuture<IndexResponse>> pending = new HashSet<>();
     private final ReentrantLock flushLock = new ReentrantLock();
     private boolean closed;
     private IOException failure;
@@ -52,25 +51,26 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
         });
     }
 
-    public CompletableFuture<Response> submit(Request request) {
+    public CompletableFuture<IndexResponse> submit(Message request) {
         return submit(request, chunk -> { throw new IllegalStateException("Unexpected partial response"); });
     }
 
     @Override
-    public CompletableFuture<Response> submit(Request request, Consumer<Response> partial) {
-        var response = new CompletableFuture<Response>();
+    public CompletableFuture<IndexResponse> submit(Message request, Consumer<IndexResponse> partial) {
+        var response = new CompletableFuture<IndexResponse>();
         synchronized (this) {
-            if (closed) return CompletableFuture.completedFuture(unavailable(request, "Index executor is closed"));
-            if (maintenanceFailure != null) return CompletableFuture.completedFuture(unavailable(request, maintenanceFailure.toString()));
-            pending.put(response, request);
-            var pool = (request.hasPut() || request.hasDelete()) || request.hasBatch() ? writers : readers;
+            if (closed) return CompletableFuture.completedFuture(unavailable("Index executor is closed"));
+            if (maintenanceFailure != null) return CompletableFuture.completedFuture(unavailable(maintenanceFailure.toString()));
+            pending.add(response);
+            boolean write = request instanceof PutRequest || request instanceof DeleteRequest || request instanceof WriteBatchRequest;
+            var pool = write ? writers : readers;
             // Submission and shutdown share this monitor, so an accepted task cannot be lost.
             pool.execute(() -> {
-                Response result = IndexExecution.execute(backend, request, partial);
+                IndexResponse result = IndexExecution.execute(backend, request, partial);
                 synchronized (IndexExecutor.this) {
-                    if (result.getStatus() != Status.OK && failure == null)
-                        failure = new IOException("Accepted request failed: " + result.getMessage());
-                    if (result.getStatus() == Status.OK && ((request.hasPut() || request.hasDelete()) || request.hasBatch())) changes++;
+                    if (result.status() != IndexStatus.OK && failure == null)
+                        failure = new IOException("Accepted request failed: " + result.message());
+                    if (result.status() == IndexStatus.OK && write) changes++;
                 }
                 response.complete(result);
                 synchronized (IndexExecutor.this) { pending.remove(response); }
@@ -104,10 +104,10 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
     public void flush() throws IOException {
         flushLock.lock();
         try {
-            List<CompletableFuture<Response>> accepted;
+            List<CompletableFuture<IndexResponse>> accepted;
             synchronized (this) {
                 if (closed) throw new IOException("Index executor is closed");
-                accepted = List.copyOf(pending.keySet());
+                accepted = List.copyOf(pending);
             }
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(FLUSH_TIMEOUT_SECONDS);
             for (var response : accepted) {
@@ -132,15 +132,15 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
     /** Backend handles may be closed only after workers and an active Flush have exited. */
     @Override
     public void close() throws IOException {
-        Map<CompletableFuture<Response>, Request> accepted;
+        Set<CompletableFuture<IndexResponse>> accepted;
         synchronized (this) {
             closed = true;
-            accepted = Map.copyOf(pending);
+            accepted = Set.copyOf(pending);
             pending.clear();
             writers.shutdownNow();
             readers.shutdownNow();
         }
-        accepted.forEach((response, request) -> response.complete(unavailable(request, "Index executor closed")));
+        accepted.forEach(response -> response.complete(unavailable("Index executor closed")));
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
         try {
             for (var pool : List.of(writers, readers))
@@ -161,8 +161,7 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
         }
     }
 
-    private static Response unavailable(Request request, String message) {
-        return Response.newBuilder().setStatus(Status.UNAVAILABLE)
-                .setMessage(message).build();
+    private static IndexResponse unavailable(String message) {
+        return IndexResponse.error(IndexStatus.UNAVAILABLE, message);
     }
 }

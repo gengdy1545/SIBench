@@ -91,7 +91,7 @@ class IndexRunSummaryTest(unittest.TestCase):
                                                    completed_operations=3)
             phase["dispatch"]["search_latency"].update(count=3, p99_ms=0.125)
             baseline = self.phase()
-            baseline.update(operations=4, rpc_requests=2, rpc_by_kind={"BatchWrite": 2})
+            baseline.update(operations=4, rpc_requests=2, rpc_by_kind={"WriteBatch": 2})
             baseline["dispatch"].update(target_calls=4, completed_responses=4, basic_operations=4, completed_operations=4)
             path.write_text(json.dumps({"status": "passed", "result": {
                 "service": "test", "baseline": baseline, "workload": phase,

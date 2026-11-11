@@ -309,8 +309,7 @@ public final class UpdateLocality {
                                 for (var write : row) if (write.index() != 0) consumer.accept(write);
                             }
                         }
-                        if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT
-                                || operation.kind() == IndexOperationTrace.TRANSACTION_ABORT) pending.clear();
+                        if (operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) pending.clear();
                         consumer.accept(operation);
                     }
                 });

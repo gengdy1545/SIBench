@@ -18,33 +18,90 @@ import java.util.*;
 public class ProtoTraceTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test public void operationRecordOwnsMetadataAndReusesRpcPayload() throws Exception {
+        var get = GetRequest.newBuilder().setKey(ByteString.copyFrom(HexFormat.of().parseHex(
+                "00000001000000000180" + "00ff".repeat(6) + "2a0000"))).build();
+        var metadata = TraceMetadata.newBuilder().setSourceEvent(7).setWorkUnitId(3).setExpectedCount(1).build();
+        var operation = new java.io.ByteArrayOutputStream();
+        var fields = com.google.protobuf.CodedOutputStream.newInstance(operation);
+        fields.writeMessage(1, get);
+        fields.writeMessage(6, metadata);
+        fields.flush();
+        var record = new java.io.ByteArrayOutputStream();
+        var envelope = com.google.protobuf.CodedOutputStream.newInstance(record);
+        envelope.writeByteArray(2, operation.toByteArray());
+        envelope.flush();
+        var bytes = new java.io.ByteArrayOutputStream();
+        var framedMessage = com.google.protobuf.CodedOutputStream.newInstance(bytes);
+        framedMessage.writeUInt32NoTag(record.size());
+        framedMessage.writeRawBytes(record.toByteArray());
+        framedMessage.flush();
+        Path file = temporary.newFile().toPath();
+        framed(file, bytes.toByteArray(), 1);
+        var decoded = new ArrayList<Operation>();
+        ProtoTrace.read(file, null, null, decoded::add);
+        var expected = IndexOperationTrace.search(7, 1, 0,
+                IndexOperationTrace.Range.equal(IndexKey.ofInt(42)), 0, 1, IndexOperationTrace.SNAPSHOT_SEARCH).withWorkUnitId(3);
+        assertEquals(List.of(expected), decoded);
+        var writer = new ProtoTrace.Writer(temporary.getRoot().toPath().resolve("operation-get.pb.zst"));
+        try (writer) { writer.append(expected); }
+        assertEquals(HexFormat.of().formatHex(org.sibench.config.Digests.digest().digest(bytes.toByteArray())),
+                writer.logicalSha256());
+    }
+
+    @Test public void transactionBoundariesUseInlineVersionsAndRejectInvalidControls() throws Exception {
+        // Length-prefixed records: field 1 = begin version 7, field 3 = commit version 7.
+        byte[] plain = HexFormat.of().parseHex("020807021807");
+        Path file = temporary.newFile().toPath();
+        framed(file, plain, 2);
+        var expected = List.of(
+                IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 7, 7, 0),
+                IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 7, 7, 0));
+        var decoded = new ArrayList<Operation>();
+        ProtoTrace.read(file, null, null, decoded::add);
+        assertEquals(expected, decoded);
+        var writer = new ProtoTrace.Writer(temporary.getRoot().toPath().resolve("transaction-boundaries.pb.zst"));
+        try (writer) { for (var operation : expected) writer.append(operation); }
+        assertEquals(HexFormat.of().formatHex(org.sibench.config.Digests.digest().digest(plain)), writer.logicalSha256());
+
+        // Missing event, zero, a version above int64, and a message in place of the scalar.
+        for (String invalid : List.of("00", "020800", "0b08ffffffffffffffffff01", "040a020807")) {
+            framed(file, HexFormat.of().parseHex(invalid), 1);
+            assertThrows(IOException.class, () -> ProtoTrace.read(file, null, null, ignored -> fail()));
+        }
+    }
+
     @Test public void decodingRejectsMissingValuesAndUnknownNestedFieldsBeforeLosingTheirPresence() throws Exception {
         var unknown=com.google.protobuf.UnknownFieldSet.newBuilder().addField(99,
                 com.google.protobuf.UnknownFieldSet.Field.newBuilder().addVarint(1).build()).build();
         var key=new IndexEntry(1,0,null,IndexKey.ofInt(1)).bytes();
         var write=PutRequest.newBuilder().setKey(key).setValue(IndexEntry.rowId(0)).build();
-        var position=TracePosition.newBuilder().setSourceEvent(1).setWorkUnitId(1).build();
-        var valid=TraceRecord.newBuilder().setRequest(Request.newBuilder().setPut(write)).setPosition(position).build();
-        var cases=new LinkedHashMap<String,TraceRecord>();
-        cases.put("missing RowID",valid.toBuilder().setRequest(Request.newBuilder().setPut(write.toBuilder().clearValue())).build());
-        cases.put("unknown put",valid.toBuilder().setRequest(Request.newBuilder().setPut(write.toBuilder().setUnknownFields(unknown))).build());
-        cases.put("invalid key",valid.toBuilder().setRequest(Request.newBuilder().setPut(write.toBuilder().setKey(ByteString.EMPTY))).build());
-        cases.put("invalid RowID",valid.toBuilder().setRequest(Request.newBuilder().setPut(write.toBuilder().setValue(ByteString.copyFromUtf8("x")))).build());
-        cases.put("unknown position",valid.toBuilder().setPosition(position.toBuilder().setUnknownFields(unknown)).build());
-        cases.put("unknown scan",TraceRecord.newBuilder().setPosition(position)
-                .setRequest(Request.newBuilder().setScan(ScanRequest.newBuilder().setUnknownFields(unknown))).build());
-        cases.put("unknown get",TraceRecord.newBuilder().setPosition(position)
-                .setRequest(Request.newBuilder().setGet(GetRequest.newBuilder().setKey(key).setUnknownFields(unknown))).build());
+        var metadata=TraceMetadata.newBuilder().setSourceEvent(1).setWorkUnitId(1).build();
+        var valid=TraceOperation.newBuilder().setPut(write).setMetadata(metadata).build();
+        var cases=new LinkedHashMap<String,TraceOperation>();
+        cases.put("empty operation",TraceOperation.getDefaultInstance());
+        cases.put("missing request",TraceOperation.newBuilder().setMetadata(metadata).build());
+        cases.put("missing metadata",valid.toBuilder().clearMetadata().build());
+        cases.put("unknown operation",valid.toBuilder().setUnknownFields(unknown).build());
+        cases.put("missing RowID",valid.toBuilder().setPut(write.toBuilder().clearValue()).build());
+        cases.put("unknown put",valid.toBuilder().setPut(write.toBuilder().setUnknownFields(unknown)).build());
+        cases.put("invalid key",valid.toBuilder().setPut(write.toBuilder().setKey(ByteString.EMPTY)).build());
+        cases.put("invalid RowID",valid.toBuilder().setPut(write.toBuilder().setValue(ByteString.copyFromUtf8("x"))).build());
+        cases.put("unknown metadata",valid.toBuilder().setMetadata(metadata.toBuilder().setUnknownFields(unknown)).build());
+        cases.put("unknown scan",TraceOperation.newBuilder().setMetadata(metadata)
+                .setScan(ScanRequest.newBuilder().setUnknownFields(unknown)).build());
+        cases.put("unknown get",TraceOperation.newBuilder().setMetadata(metadata)
+                .setGet(GetRequest.newBuilder().setKey(key).setUnknownFields(unknown)).build());
         var accepted=new ArrayList<String>();
         for (var entry:cases.entrySet()) {
             var file=temporary.getRoot().toPath().resolve(entry.getKey()+".pb.zst");
-            unchecked(file,List.of(entry.getValue()));
+            unchecked(file,List.of(TraceRecord.newBuilder().setOperation(entry.getValue()).build()));
             try { ProtoTrace.read(file,null,null,ignored->{}); accepted.add(entry.getKey()); }
             catch (IOException expected) { }
         }
         assertEquals("Malformed nested messages were silently projected",List.of(),accepted);
         var zero=temporary.getRoot().toPath().resolve("valid-zero.pb.zst");
-        unchecked(zero,List.of(valid));
+        unchecked(zero,List.of(TraceRecord.newBuilder().setOperation(valid).build()));
         var decoded=new ArrayList<Operation>();
         ProtoTrace.read(zero,null,null,decoded::add);
         assertEquals(0,decoded.get(0).rowId());
@@ -54,12 +111,13 @@ public class ProtoTraceTest {
         Path file = temporary.getRoot().toPath().resolve("identity.pb.zst");
         var operation = IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0,
                 IndexKey.ofInt(42), 0, 7, 0, 11).withWorkUnitId(1);
-        var expected = TraceRecord.newBuilder()
-                .setPosition(TracePosition.newBuilder().setSourceEvent(1).setWorkUnitId(1)
+        var data = TraceOperation.newBuilder()
+                .setMetadata(TraceMetadata.newBuilder().setSourceEvent(1).setWorkUnitId(1)
                         .setLocator(ByteString.copyFrom(HexFormat.of().parseHex("00000000000000070000000000000000"))))
-                .setRequest(Request.newBuilder().setPut(PutRequest.newBuilder()
+                .setPut(PutRequest.newBuilder()
                         .setKey(ByteString.copyFrom(HexFormat.of().parseHex("00000001000000000180"+"00ff".repeat(6)+"2a0000")))
-                        .setValue(ByteString.copyFrom(HexFormat.of().parseHex("000000000000000b"))))).build();
+                        .setValue(ByteString.copyFrom(HexFormat.of().parseHex("000000000000000b")))).build();
+        var expected = TraceRecord.newBuilder().setOperation(data).build();
         var plain = new java.io.ByteArrayOutputStream();
         expected.writeDelimitedTo(plain);
         String digest = HexFormat.of().formatHex(org.sibench.config.Digests.digest().digest(plain.toByteArray()));
@@ -81,20 +139,26 @@ public class ProtoTraceTest {
                 .withTransaction(version == 0 ? 0 : 1, ordinal).withWorkUnitId(1);
     }
 
-    @Test public void readOnlySourceTransactionsStreamSearchesButWritesBoundTheBuffer() throws Exception {
+    @Test public void allSourceTransactionsWaitForCommitAndBoundTheirBuffer() throws Exception {
         Path file = temporary.getRoot().toPath().resolve("read-only.pb.zst");
         var search = IndexOperationTrace.search(2, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 0, 0, 0)
                 .withTransaction(1, 0).withWorkUnitId(1);
-        int searches = ProtoTrace.MAX_TRANSACTION_OPERATIONS + 1;
+        int searches = ProtoTrace.MAX_TRANSACTION_OPERATIONS;
         var writer = new ProtoTrace.Writer(file);
         try (writer) {
             writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
             for (int i = 0; i < searches; i++) writer.accept(search);
+            assertEquals(0, writer.count());
             writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 1, 1, 0));
         }
         long[] read = {0};
         ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), operation -> read[0]++);
         assertEquals(searches + 2, read[0]);
+        var readOnly = new ProtoTrace.Writer(file.resolveSibling("read-only-overflow.pb.zst"));
+        readOnly.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
+        for (int i = 0; i < searches; i++) readOnly.accept(search);
+        assertThrows(IOException.class, () -> readOnly.accept(search));
+        assertThrows(IOException.class, readOnly::close);
         var buffered = new ProtoTrace.Writer(file.resolveSibling("buffered.pb.zst"));
         buffered.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
         buffered.accept(write(IndexOperationTrace.UPSERT, 1, 1, 1).withExpansion(0, 1));
@@ -103,6 +167,7 @@ public class ProtoTraceTest {
         assertTrue(assertThrows(IOException.class, () -> {
             for (int i = 0; i < ProtoTrace.MAX_TRANSACTION_OPERATIONS; i++) buffered.accept(after);
         }).getMessage().contains("operation buffer limit"));
+        assertThrows(IOException.class, buffered::close);
     }
 
     @Test public void countsEachSearchMemberWithoutSplittingItsRequestOrBudgetBoundary() throws Exception {
@@ -169,27 +234,27 @@ public class ProtoTraceTest {
                 writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 3, 3, 0));
             }
             assertTrue(Files.isRegularFile(stop));
-            assertEquals(secondary ? 8 : 3, budget.count());
+            assertEquals(secondary ? 7 : 3, budget.count());
             budget.end();
-            assertEquals(secondary ? 6L : 1L, budget.finish().get("overshoot_requests"));
+            assertEquals(secondary ? 5L : 1L, budget.finish().get("overshoot_requests"));
             var decoded = new ArrayList<Operation>();
-            assertEquals(secondary ? 14 : 9, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
-            assertEquals(secondary ? 14 : 9, writer.count());
+            assertEquals(secondary ? 11 : 7, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
+            assertEquals(secondary ? 11 : 7, writer.count());
             assertEquals(Files.size(file), writer.bytesWritten());
             var stats = writer.statistics();
-            assertEquals(secondary ? 8L : 3L, stats.get("index_entries"));
-            assertEquals(secondary ? 8L : 3L, stats.get("effective_requests"));
+            assertEquals(secondary ? 7L : 3L, stats.get("index_entries"));
+            assertEquals(secondary ? 7L : 3L, stats.get("effective_requests"));
             assertEquals(secondary ? 4L : 3L, stats.get("primary_entries"));
-            assertEquals(secondary ? 4L : 0L, stats.get("secondary_entries"));
-            assertEquals(Map.of("begin", 3L, "commit", 2L, "abort", 1L), stats.get("transaction_markers"));
+            assertEquals(secondary ? 3L : 0L, stats.get("secondary_entries"));
+            assertEquals(Map.of("begin", 2L, "commit", 2L), stats.get("transaction_markers"));
             assertEquals(secondary
-                    ? Map.of("put", 2L, "delete", 1L, "scan", 1L, "union_query", 2L)
+                    ? Map.of("put", 2L, "delete", 1L, "union_query", 2L)
                     : Map.of("put", 1L, "union_query", 1L), stats.get("request_types"));
             if (!secondary) {
                 assertTrue(decoded.stream().allMatch(o -> o.index() == 0));
                 assertEquals(1, decoded.get(1).expansionSize());
                 assertTrue(decoded.stream().noneMatch(o -> (o.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0));
-                assertEquals(IndexOperationTrace.TRANSACTION_ABORT, decoded.get(4).kind());
+                assertTrue(decoded.stream().noneMatch(o -> o.kind() == IndexOperationTrace.TRANSACTION_ABORT));
             }
         }
     }
@@ -225,7 +290,7 @@ public class ProtoTraceTest {
         try (writer) { for (var operation : original) writer.append(operation); }
         var decoded = new ArrayList<Operation>();
         ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add);
-        assertEquals(List.of(original.get(0), original.get(3)), decoded);
+        assertEquals(List.of(), decoded);
         assertEquals(0L, writer.statistics().get("effective_requests"));
         var filtered = (Map<?, ?>) writer.statistics().get("source_projection");
         assertEquals(1L, filtered.get("excluded_aborted_writes"));
@@ -251,7 +316,8 @@ public class ProtoTraceTest {
         try (writer) { for (Operation operation : original) writer.append(operation); }
         var decoded = new ArrayList<Operation>();
         assertEquals(6, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
-        assertEquals(List.of(original.get(0), original.get(1), original.get(3), original.get(5),
+        assertEquals(List.of(original.get(0), original.get(1), original.get(3),
+                IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 1, 1, 0),
                 original.get(6), original.get(7)), decoded);
         try (var model = new IndexReferenceReplay(true, true, new IndexReferenceReplay.Settings(null, 1, 1, 1024))) {
             for (Operation operation : decoded) if (!IndexOperationTrace.isControl(operation)) model.accept(operation);
@@ -286,7 +352,7 @@ public class ProtoTraceTest {
         assertTrue(writes.stream().allMatch(o -> o.expansionPosition() == 0 && o.expansionSize() == 1));
         assertEquals(4L, writer.statistics().get("effective_requests"));
         assertEquals(2L, ((Map<?, ?>) writer.statistics().get("source_projection")).get("coalesced_writes"));
-        assertEquals(2, decoded.get(decoded.size() - 1).expectedCount());
+        assertEquals(0, decoded.get(decoded.size() - 1).expectedCount());
         try (var raw = new IndexReferenceReplay(true, true);
                 var committed = new IndexReferenceReplay(true, true)) {
             var baseline = write(IndexOperationTrace.INSERT, 1, 0, 0);
@@ -348,9 +414,9 @@ public class ProtoTraceTest {
     }
 
     @Test
-    public void abortedSourceRetainsItsSnapshotButDropsItsWholeLocalGroup() throws Exception {
+    public void abortedSourceDropsItsSnapshotAndWholeLocalGroup() throws Exception {
         var file = temporary.getRoot().toPath().resolve("aborted-snapshots.pb.zst");
-        var budget = new RequestBudget(1, java.time.Duration.ofSeconds(10));
+        var budget = new RequestBudget(0, java.time.Duration.ofSeconds(10));
         budget.begin("snapshot", 1, file.resolveSibling("stop"));
         var writer = new ProtoTrace.Writer(file, true, budget);
         try (writer) {
@@ -363,16 +429,12 @@ public class ProtoTraceTest {
                         IndexOperationTrace.Range.equal(IndexKey.ofInt(member + 1)), null, 0, 1,
                         IndexOperationTrace.UNION_GROUP | IndexOperationTrace.TRANSACTION_LOCAL_SEARCH, member, 2)
                         .withTransaction(1, 1).withVersion(1).withWorkUnitId(1));
-            // The search before the first write is already exported; the local group waits for the outcome.
-            assertEquals(1, budget.count());
+            assertEquals(0, budget.count());
             writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_ABORT, 1, 1, 1));
         }
         var decoded = new ArrayList<Operation>();
-        assertEquals(3, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
-        assertEquals(IndexOperationTrace.SEARCH, decoded.get(1).kind());
-        assertEquals(0, decoded.get(1).readTimestamp());
-        assertEquals(1, decoded.get(1).expectedCount());
-        assertEquals(1, budget.count());
+        assertEquals(0, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
+        assertEquals(0, budget.count());
         budget.end();
         assertEquals(2L, ((Map<?, ?>) writer.statistics().get("source_projection")).get("excluded_local_search_members"));
     }
@@ -417,29 +479,55 @@ public class ProtoTraceTest {
 
     @Test
     public void decodedDataAndControlsAreValidatedBeforeTheyReachTheConsumer() throws Exception {
-        var position = TracePosition.newBuilder().setSourceEvent(12).setWorkUnitId(1).build();
-        var write = TraceRecord.newBuilder().setPosition(position).setRequest(Request.newBuilder()
-                .setPut(PutRequest.newBuilder().setKey(ByteString.copyFrom(new byte[8])).setValue(IndexEntry.rowId(1)))).build();
-        var badSearch = TraceRecord.newBuilder().setPosition(position)
-                .setRequest(Request.newBuilder().setScan(ScanRequest.newBuilder())).build();
-        var group = TraceRecord.newBuilder().setPosition(position)
-                .setRequest(Request.newBuilder().setGroup(SearchGroup.newBuilder()
-                        .addMembers(ReadRequest.newBuilder()).addMembers(ReadRequest.newBuilder()))).build();
-        var begin = TraceRecord.newBuilder().setBegin(TraceBegin.newBuilder().setTs(1)).build();
-        var end = TraceRecord.newBuilder().setEnd(TraceEnd.newBuilder().setTs(1)).build();
-        var cases = List.of(List.of(write), List.of(badSearch), List.of(group),
-                List.of(write.toBuilder().setRequest(Request.newBuilder().setPut(write.getRequest().getPut().toBuilder()
+        var metadata = TraceMetadata.newBuilder().setSourceEvent(12).setWorkUnitId(1).build();
+        var write = TraceOperation.newBuilder().setMetadata(metadata).setPut(PutRequest.newBuilder().setKey(ByteString.copyFrom(new byte[8])).setValue(IndexEntry.rowId(1))).build();
+        var badSearch = TraceRecord.newBuilder().setOperation(TraceOperation.newBuilder().setMetadata(metadata)
+                .setScan(ScanRequest.newBuilder())).build();
+        var group = TraceRecord.newBuilder().setOperation(TraceOperation.newBuilder().setMetadata(metadata)
+                .setReadGroup(ReadGroup.newBuilder()
+                        .addRequests(ReadRequest.newBuilder()).addRequests(ReadRequest.newBuilder()))).build();
+        var begin = TraceRecord.newBuilder().setTransactionBegin(1).build();
+        var commit = TraceRecord.newBuilder().setTransactionCommit(1).build();
+        var misplacedMetadata = com.google.protobuf.UnknownFieldSet.newBuilder().addField(8,
+                com.google.protobuf.UnknownFieldSet.Field.newBuilder().addLengthDelimited(metadata.toByteString()).build()).build();
+        var cases = List.of(List.of(TraceRecord.newBuilder().setOperation(write).build()), List.of(badSearch), List.of(group),
+                List.of(TraceRecord.newBuilder().setOperation(write.toBuilder().setPut(write.getPut().toBuilder()
                         .setKey(ByteString.copyFrom(HexFormat.of().parseHex("00000001000000000178"))))).build()),
-                List.of(begin.toBuilder().setBegin(TraceBegin.newBuilder()).build()),
-                List.of(begin, end.toBuilder().setEnd(end.getEnd().toBuilder().setOperations(1)).build()),
-                List.of(begin.toBuilder().setPosition(position).build()));
+                List.of(begin.toBuilder().setTransactionBegin(0).build()),
+                List.of(begin), List.of(commit), List.of(begin, begin), List.of(begin, commit, commit),
+                List.of(begin, commit.toBuilder().setTransactionCommit(0).build()),
+                List.of(begin, commit.toBuilder().setTransactionCommit(2).build()),
+                List.of(begin, commit.toBuilder().setTransactionCommit(Long.MIN_VALUE).build()),
+                List.of(begin.toBuilder().setUnknownFields(misplacedMetadata).build()),
+                List.of(begin, commit.toBuilder().setUnknownFields(misplacedMetadata).build()));
         for (var records : cases) {
             Path file = temporary.newFile().toPath();
             unchecked(file, records);
             var seen = new ArrayList<Operation>();
             assertThrows(IOException.class, () -> ProtoTrace.read(file, null, null, seen::add));
-            assertTrue(seen.stream().allMatch(o -> o.kind() == IndexOperationTrace.TRANSACTION_BEGIN && o.sourceEvent() == 0));
+            var expectedControls = records.equals(List.of(begin, commit, commit))
+                    ? List.of(IndexOperationTrace.TRANSACTION_BEGIN, IndexOperationTrace.TRANSACTION_COMMIT)
+                    : records.get(0).equals(begin) ? List.of(IndexOperationTrace.TRANSACTION_BEGIN) : List.<Integer>of();
+            assertEquals(expectedControls, seen.stream().map(Operation::kind).toList());
+            assertTrue(seen.stream().allMatch(o -> o.sourceEvent() == 0));
         }
+    }
+
+    @Test public void transactionBoundariesRejectUnsupportedFields() throws Exception {
+        var unknown = com.google.protobuf.UnknownFieldSet.newBuilder().addField(99,
+                com.google.protobuf.UnknownFieldSet.Field.newBuilder().addVarint(1).build()).build();
+        var begin = TraceRecord.newBuilder().setTransactionBegin(1).build();
+        var commit = TraceRecord.newBuilder().setTransactionCommit(1).build();
+        for (var records : List.of(List.of(begin.toBuilder().setUnknownFields(unknown).build()),
+                List.of(begin, commit.toBuilder().setUnknownFields(unknown).build()))) {
+            Path file = temporary.newFile().toPath();
+            unchecked(file, records);
+            assertThrows(IOException.class, () -> ProtoTrace.read(file, null, null, ignored -> {}));
+        }
+        // Both boundaries require scalar versions, so length-delimited messages are invalid.
+        Path file = temporary.newFile().toPath();
+        framed(file, HexFormat.of().parseHex("020807041a020807"), 2);
+        assertThrows(IOException.class, () -> ProtoTrace.read(file, null, null, ignored -> {}));
     }
 
     /** Frame deliberately invalid messages independently of the production writer's checks. */

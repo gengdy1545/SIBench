@@ -17,7 +17,7 @@ final class PostgresTransactions implements AutoCloseable {
     private static final long SEGMENT_BYTES = 8L << 20;
     private static final int DIAGNOSTIC_TRANSACTIONS = 65_536;
     private final Path directory;
-    private final long limit, pieceBytes;
+    private final long limit;
     private final int transactionLimit;
     private final PriorityQueue<Chunk> ready = new PriorityQueue<>(Comparator
             .comparingLong((Chunk c) -> c.csn).thenComparing(c -> !c.writer)
@@ -26,7 +26,7 @@ final class PostgresTransactions implements AutoCloseable {
     private final Map<Integer, Segment> tails = new HashMap<>();
     private final Map<Integer,Long> consumed=new HashMap<>();
     private long segmentSequence;
-    private long bytes, memoryBytes, peakBytes, peakMemoryBytes, sequence, pieces, holds, sealedBytes, safe = -1;
+    private long bytes, memoryBytes, peakBytes, peakMemoryBytes, sequence, holds, sealedBytes, safe = -1;
     private int peakTransactions;
     private Throwable failure;
     private boolean finished;
@@ -36,7 +36,6 @@ final class PostgresTransactions implements AutoCloseable {
         this.directory = Files.createDirectory(directory);
         this.limit = limit;
         this.transactionLimit = transactionLimit;
-        pieceBytes = Math.max(1, limit / 512);
     }
 
     synchronized Chunk begin(int pid) throws IOException {
@@ -72,11 +71,11 @@ final class PostgresTransactions implements AutoCloseable {
     synchronized Map<String, Object> metrics() {
         return Map.ofEntries(Map.entry("encoded_byte_limit", limit), Map.entry("transaction_limit", transactionLimit),
                 Map.entry("memory_encoded_byte_limit", PENDING_MEMORY_BYTES),
-                Map.entry("spool_segment_target_bytes", SEGMENT_BYTES), Map.entry("read_only_piece_bytes", pieceBytes),
+                Map.entry("spool_segment_target_bytes", SEGMENT_BYTES),
                 Map.entry("peak_encoded_bytes", peakBytes), Map.entry("peak_memory_encoded_bytes", peakMemoryBytes),
                 Map.entry("peak_transactions", peakTransactions), Map.entry("pending_encoded_bytes", bytes),
                 Map.entry("pending_memory_encoded_bytes", memoryBytes), Map.entry("pending_transactions", pending.size()),
-                Map.entry("read_only_pieces", pieces), Map.entry("full_queue_checks", holds));
+                Map.entry("full_queue_checks", holds));
     }
     synchronized long consumed(int pid){return consumed.getOrDefault(pid,0L);}
 
@@ -96,15 +95,6 @@ final class PostgresTransactions implements AutoCloseable {
     }
 
     /**
-     * Statements of a transaction that has not written read committed snapshots only, so their outcome
-     * does not depend on the transaction's. Once they outgrow a share of the budget, they leave as a piece
-     * at a statement boundary, ordered at their latest snapshot: after every commit any of them saw.
-     */
-    boolean splits(Chunk chunk) {
-        return chunk.hasRequests && !chunk.wrote && chunk.snapshotCsn > 0 && chunk.bytes >= pieceBytes;
-    }
-
-    /**
      * Native flow control acts at transaction completion; transactions that never write are held
      * natively at their next statement while completed transactions fill half the budget. Only
      * completed ones count: they drain once the watermark passes them, which no held source can stop.
@@ -113,12 +103,6 @@ final class PostgresTransactions implements AutoCloseable {
         boolean full = sealedBytes >= limit / 2;
         if (full) holds++;
         return full;
-    }
-
-    void completePiece(Chunk chunk) throws IOException {
-        chunk.piece = true;
-        synchronized (this) { pieces++; }
-        complete(chunk, chunk.snapshotCsn, false, true);
     }
 
     /** A watermark is read only after source completion facts have reached this process. */
@@ -260,9 +244,7 @@ final class PostgresTransactions implements AutoCloseable {
         final int pid;
         final long sequence;
         long csn, bytes, memoryBytes, lines, transaction, firstRequest,lastRequest,lastCompletedRequest,captureSequence;
-        /** The latest statement snapshot; whether any write event arrived; a read-only prefix, not an outcome. */
-        long snapshotCsn;
-        boolean hasRequests, wrote, piece;
+        boolean hasRequests;
         boolean writer, committed;
         private List<JsonObject> events = new ArrayList<>();
         private Segment segment;
@@ -278,9 +260,7 @@ final class PostgresTransactions implements AutoCloseable {
             String type=event.get("event").getAsString();
             if(type.equals("executor_start")&&event.get("depth").getAsInt()==1) {
                 hasRequests=true;lastRequest=event.get("req").getAsLong();if(firstRequest==0)firstRequest=lastRequest;
-                snapshotCsn=Math.max(snapshotCsn,event.get("snapshot_csn").getAsLong());
             }
-            if(type.equals("row_change")||type.equals("row_identity")||type.equals("index_insert_attempt"))wrote=true;
             if(type.equals("executor_end")&&event.get("depth").getAsInt()==1)
                 lastCompletedRequest=event.get("req").getAsLong();
             if(type.equals("transaction_commit")||type.equals("transaction_abort"))transaction=event.get("xid").getAsLong();

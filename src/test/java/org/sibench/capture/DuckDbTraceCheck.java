@@ -11,7 +11,7 @@ import org.junit.After;
 import org.junit.Test;
 import org.sibench.adapters.ServiceConfig;
 import org.sibench.adapters.ServiceReplay;
-import org.sibench.adapters.proto.ValueKind;
+import org.sibench.adapters.ValueKind;
 import org.sibench.config.BenchmarkSelection.Mode;
 import org.sibench.generation.DuckDbDatabase;
 import org.sibench.generation.NativeHistory;

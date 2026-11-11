@@ -87,7 +87,7 @@ final class RocksTrace implements AutoCloseable {
         manifest.put("source_work_units", version); manifest.put("source_statements", version);
         manifest.put("committed_transactions", commits); manifest.put("aborted_transactions", aborts);
         manifest.put("searched_accesses", searches); manifest.put("logical_row_changes", changes);
-        manifest.put("last_resolved_version", version);
+        manifest.put("last_resolved_version", workload.lastCommittedVersion());
         manifest.put("work_units_sha256", HexFormat.of().formatHex(units.digest().digest()));
         manifest.put("work_unit_rule", "one YCSB API call; numbered in native publication order");
         manifest.put("source_evidence", evidence); manifest.put("status", "complete_for_declared_projection");

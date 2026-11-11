@@ -9,7 +9,6 @@ import java.util.Map;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.sibench.adapters.proto.ValueKind;
 import org.sibench.replay.ReplayConfig;
 
 public class ServiceReplayTest {
@@ -17,11 +16,21 @@ public class ServiceReplayTest {
 
     @Test public void deploymentDescriptionRejectsWrongValueModeAndMissingEvidence() throws Exception {
         var description = new IndexDescription("fixture",ValueKind.ROW_ID,
-                org.sibench.adapters.proto.Acknowledgement.ACK_MEMORY,"async persistence","fixture");
+                Acknowledgement.ACK_MEMORY,"async persistence","fixture");
         description.require(ValueKind.ROW_ID);
         assertThrows(IOException.class, () -> description.require(ValueKind.LOCATOR));
         assertThrows(IOException.class, () -> new IndexDescription("fixture",ValueKind.ROW_ID,
-                org.sibench.adapters.proto.Acknowledgement.ACK_UNSPECIFIED,"async persistence","").require(ValueKind.ROW_ID));
+                null,"async persistence","fixture").require(ValueKind.ROW_ID));
+        assertThrows(IOException.class, () -> description.require(null));
+        var json = new com.google.gson.Gson();
+        assertEquals(description, json.fromJson(json.toJson(description), IndexDescription.class));
+        for (String field : java.util.List.of("valueKind", "writeAck")) {
+            var metadata = json.toJsonTree(description).getAsJsonObject();
+            metadata.addProperty(field, "UNKNOWN");
+            assertThrows(IOException.class, () -> json.fromJson(metadata, IndexDescription.class).require(ValueKind.ROW_ID));
+            metadata.remove(field);
+            assertThrows(IOException.class, () -> json.fromJson(metadata, IndexDescription.class).require(ValueKind.ROW_ID));
+        }
     }
 
     @Test

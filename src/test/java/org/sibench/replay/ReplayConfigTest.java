@@ -22,9 +22,9 @@ public class ReplayConfigTest {
         target.put("secondary_indexes", Map.of("enabled", true));
         withSecondary.put("target", target);
         assertTrue(ReplayConfig.from(withSecondary).secondaryIndexes());
-        assertEquals(org.sibench.adapters.proto.ValueKind.ROW_ID,
+        assertEquals(org.sibench.adapters.ValueKind.ROW_ID,
                 org.sibench.adapters.ServiceConfig.ofReplay(root, parse(template)).value());
-        assertEquals(org.sibench.adapters.proto.ValueKind.LOCATOR,
+        assertEquals(org.sibench.adapters.ValueKind.LOCATOR,
                 org.sibench.adapters.ServiceConfig.ofReplay(root, parse(template.replace("value: row_id", "value: locator"))).value());
         assertEquals(64, simple.clientCount());
         assertEquals(4096, simple.maxInFlight());

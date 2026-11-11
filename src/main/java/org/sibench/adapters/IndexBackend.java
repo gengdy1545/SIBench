@@ -1,6 +1,6 @@
 package org.sibench.adapters;
 
-import org.sibench.adapters.proto.Result;
+import com.google.protobuf.ByteString;
 import org.sibench.adapters.proto.GetRequest;
 import org.sibench.adapters.proto.ScanRequest;
 import org.sibench.adapters.proto.Mutation;
@@ -27,19 +27,19 @@ public interface IndexBackend extends AutoCloseable {
 
     /** Receives search results one at a time, in result order. */
     @FunctionalInterface
-    interface ResultSink {
-        void accept(Result result) throws IOException;
+    interface ValueSink {
+        void accept(ByteString result) throws IOException;
     }
 
     /** One visible value, or null when absent. */
-    Result get(GetRequest get) throws IOException;
+    ByteString get(GetRequest get) throws IOException;
 
     /** The visible entries of a half-open byte range, at most its limit. */
-    void scan(ScanRequest scan, ResultSink sink) throws IOException;
+    void scan(ScanRequest scan, ValueSink sink) throws IOException;
 
     /** The visible entries of one search, collected; for searches known to be small. */
-    default List<Result> scan(ScanRequest scan) throws IOException {
-        var results = new java.util.ArrayList<Result>();
+    default List<ByteString> scan(ScanRequest scan) throws IOException {
+        var results = new java.util.ArrayList<ByteString>();
         scan(scan, results::add);
         return results;
     }

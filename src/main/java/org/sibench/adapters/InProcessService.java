@@ -1,7 +1,7 @@
 package org.sibench.adapters;
 
-import org.sibench.adapters.proto.Request;
-import org.sibench.adapters.proto.Response;
+import com.google.protobuf.Message;
+import org.sibench.adapters.proto.*;
 import org.sibench.replay.ReplayTarget;
 
 import java.util.concurrent.CompletableFuture;
@@ -15,18 +15,18 @@ public final class InProcessService {
             IndexExecution.Executor executor, TraceRequests requests) {
         return clientId -> new ServiceClient(requests) {
             @Override
-            CompletableFuture<Response> transmit(
-                    Request request, java.util.function.Consumer<Response> partial) {
-                switch (request.getOperationCase()) {
-                    case PUT -> requests.rpcRequest(request.getPut(), "Put");
-                    case DELETE -> requests.rpcRequest(request.getDelete(), "Delete");
-                    case GET -> requests.rpcRequest(request.getGet(), "Get");
-                    case SCAN -> requests.rpcRequest(request.getScan(), "Scan");
-                    case BATCH -> requests.rpcRequest(request.getBatch(), "BatchWrite");
-                    default -> throw new IllegalArgumentException("Expected a data operation");
-                }
-                return executor.submit(request, chunk -> { requests.rpcResults(chunk.getResultsList()); partial.accept(chunk); })
-                        .thenApply(response -> { requests.rpcResults(response.getResultsList()); return response; });
+            CompletableFuture<IndexResponse> transmit(
+                    Message request, java.util.function.Consumer<IndexResponse> partial) {
+                String method;
+                if (request instanceof PutRequest) method = "Put";
+                else if (request instanceof DeleteRequest) method = "Delete";
+                else if (request instanceof GetRequest) method = "Get";
+                else if (request instanceof ScanRequest) method = "Scan";
+                else if (request instanceof WriteBatchRequest) method = "WriteBatch";
+                else throw new IllegalArgumentException("Expected a data operation");
+                requests.rpcRequest(request, method);
+                return executor.submit(request, chunk -> { requests.rpcResults(chunk.values()); partial.accept(chunk); })
+                        .thenApply(response -> { requests.rpcResults(response.values()); return response; });
             }
         };
     }

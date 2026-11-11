@@ -74,7 +74,7 @@ public class CapturePlanTest {
         manifest.put("baseline_operations", 200);
         manifest.put("baseline_trace_sha256", "0".repeat(64));
         manifest.put("source_work_units", 2);
-        manifest.put("last_resolved_version", 2);
+        manifest.put("last_resolved_version", writer.lastCommittedVersion());
         manifest.put("workload_operations", writer.count());
         var files = new com.google.gson.JsonArray();
         files.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("workload.pb.zst", writer)));

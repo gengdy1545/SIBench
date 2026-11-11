@@ -7,7 +7,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import org.sibench.adapters.proto.ValueKind;
+import org.sibench.adapters.ValueKind;
 
 /** Required identities and coverage counts shared by Trace consumers. */
 public final class TraceManifest {

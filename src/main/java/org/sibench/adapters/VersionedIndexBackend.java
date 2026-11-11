@@ -81,7 +81,7 @@ public final class VersionedIndexBackend implements IndexBackend {
     private static VersionedIndexBackend created(OrderedStore store, ValueKind valueKind, Path path)
             throws IOException {
         try {
-            store.put(VALUE_KIND, new byte[] {(byte) valueKind.getNumber()}, true);
+            store.put(VALUE_KIND, new byte[] {valueKindByte(valueKind)}, true);
         } catch (IOException | RuntimeException error) {
             store.close();
             throw error;
@@ -92,7 +92,7 @@ public final class VersionedIndexBackend implements IndexBackend {
     private static VersionedIndexBackend reopened(OrderedStore store, ValueKind valueKind, Path path)
             throws IOException {
         byte[] stored = store.get(VALUE_KIND);
-        if (stored == null || stored.length != 1 || stored[0] != valueKind.getNumber()) {
+        if (stored == null || stored.length != 1 || stored[0] != valueKindByte(valueKind)) {
             store.close();
             throw new IOException("Reopened index does not hold " + valueKind + " values");
         }
@@ -110,6 +110,10 @@ public final class VersionedIndexBackend implements IndexBackend {
             throw error;
         }
         return backend;
+    }
+
+    private static byte valueKindByte(ValueKind kind) {
+        return switch (kind) { case LOCATOR -> 1; case ROW_ID -> 2; };
     }
 
     private static byte[] metadata(String name) {
@@ -146,7 +150,7 @@ public final class VersionedIndexBackend implements IndexBackend {
     }
 
     @Override
-    public Result get(GetRequest get) throws IOException {
+    public ByteString get(GetRequest get) throws IOException {
         IndexExecution.validateGet(get);
         try (var cursor = store.cursor(null, null)) {
             return visible(cursor, entry(get.getKey()), get.getReadTs());
@@ -154,7 +158,7 @@ public final class VersionedIndexBackend implements IndexBackend {
     }
 
     @Override
-    public void scan(ScanRequest scan, ResultSink sink) throws IOException {
+    public void scan(ScanRequest scan, ValueSink sink) throws IOException {
         IndexExecution.validateScan(scan);
         byte[] start = scan.hasStartKey() ? entry(scan.getStartKey()) : new byte[] {1};
         byte[] end = scan.hasEndKey() ? entry(scan.getEndKey()) : new byte[] {2};
@@ -167,7 +171,7 @@ public final class VersionedIndexBackend implements IndexBackend {
                     byte[] key = cursor.key(), entry = logical(key);
                     long ts = ~ByteBuffer.wrap(key, entry.length, VERSION).getLong();
                     if (ts > scan.getReadTs()) cursor.seek(versioned(entry, scan.getReadTs()));
-                    Result result = visibleAt(cursor, entry);
+                    ByteString result = visibleAt(cursor, entry);
                     if (result != null) { sink.accept(result); found++; }
                     if (cursor.valid() && sameEntry(cursor.key(), entry)) {
                         cursor.next();
@@ -182,7 +186,7 @@ public final class VersionedIndexBackend implements IndexBackend {
                 while (cursor.valid() && Arrays.compareUnsigned(cursor.key(), end) >= 0) cursor.prev();
                 while (cursor.valid() && (limit == 0 || found < limit)) {
                     byte[] entry = logical(cursor.key());
-                    Result result = visible(versions, entry, scan.getReadTs());
+                    ByteString result = visible(versions, entry, scan.getReadTs());
                     if (result != null) { sink.accept(result); found++; }
                     cursor.seekForPrev(entry);
                 }
@@ -190,7 +194,7 @@ public final class VersionedIndexBackend implements IndexBackend {
         }
     }
 
-    private Result visible(OrderedStore.Cursor cursor, byte[] entry, long readTs) throws IOException {
+    private ByteString visible(OrderedStore.Cursor cursor, byte[] entry, long readTs) throws IOException {
         cursor.seek(versioned(entry, readTs));
         return visibleAt(cursor, entry);
     }
@@ -199,18 +203,16 @@ public final class VersionedIndexBackend implements IndexBackend {
         return key.length == entry.length + VERSION && Arrays.equals(key, 0, entry.length, entry, 0, entry.length);
     }
 
-    private Result visibleAt(OrderedStore.Cursor cursor, byte[] entry) throws IOException {
+    private ByteString visibleAt(OrderedStore.Cursor cursor, byte[] entry) throws IOException {
         if (!cursor.valid() || !sameEntry(cursor.key(), entry)) return null;
         byte[] value = cursor.value();
         if (value.length == 0 || (value[0] != 0 && value[0] != 1) || value[0] == 0 && value.length != 1)
             throw new IOException("Invalid stored KV value");
         if (value[0] == 0) return null;
         ByteBuffer input = ByteBuffer.wrap(entry, 1, entry.length - 1);
-        byte[] key = ByteKeys.decode(input);
+        ByteKeys.decode(input);
         if (input.hasRemaining()) throw new IOException("Invalid stored KV key");
-        return Result.newBuilder().setKey(ByteString.copyFrom(key))
-                .setTs(~ByteBuffer.wrap(cursor.key(), entry.length, VERSION).getLong())
-                .setValue(ByteString.copyFrom(value, 1, value.length - 1)).build();
+        return ByteString.copyFrom(value, 1, value.length - 1);
     }
 
     private static byte[] entry(ByteString key) {

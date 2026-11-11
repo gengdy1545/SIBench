@@ -29,15 +29,14 @@ public final class IndexVersionCheck {
             for(int timestamp=0;timestamp<=5;timestamp++) {
                 var actual=backend.scan(ScanRequest.newBuilder().setReadTs(timestamp).build());
                 if(timestamp==2) { if(!actual.isEmpty())throw new IOException("Deletion resurrected an older value"); }
-                else require(actual,timestamp<2?timestamp:3,timestamp<2?70+timestamp:73);
+                else require(actual,timestamp<2?70+timestamp:73);
             }
             backend.flush();
         }
     }
 
-    static void require(List<Result> actual,long version,long row) throws IOException {
-        if(actual.size()!=1 || !actual.get(0).getKey().equals(KEY)
-                || actual.get(0).getTs()!=version || actual.get(0).getValue().asReadOnlyByteBuffer().getLong()!=row)
-            throw new IOException("Historical key/version/RowID mismatch");
+    static void require(List<ByteString> actual,long row) throws IOException {
+        if(actual.size()!=1 || !actual.get(0).equals(IndexEntry.rowId(row)))
+            throw new IOException("Historical value mismatch");
     }
 }

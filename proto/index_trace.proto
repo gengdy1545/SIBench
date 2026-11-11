@@ -1,4 +1,3 @@
-// Compressed Trace files reuse the data requests and retain source evidence for replay.
 syntax = "proto3";
 
 package sibench.index;
@@ -8,38 +7,6 @@ import "index_service.proto";
 option java_multiple_files = true;
 option java_package = "org.sibench.adapters.proto";
 
-message TracePosition {
-  uint64 source_event = 1;
-  uint64 work_unit_id = 2;
-  uint64 mutation_ordinal = 3;
-  uint32 write_origin = 4;
-  uint64 expected_count = 5; // query/group result count only
-  uint32 baseline_position = 6;
-  uint32 baseline_size = 7;
-  bytes locator = 8; // optional alternative value for Locator replay; Put carries RowID
-}
-
-message TraceBegin {
-  uint64 ts = 1;
-}
-
-message TraceEnd {
-  uint64 ts = 1;
-  bool aborted = 2;
-  uint64 operations = 3;
-  uint64 writes = 4;
-  uint64 source_mutations = 5;
-}
-
-message TraceRecord {
-  oneof operation {
-    Request request = 1;
-    TraceBegin begin = 2;
-    TraceEnd end = 3;
-  }
-  TracePosition position = 4; // shared by the members of a query group; absent on controls
-}
-
 message ReadRequest {
   oneof operation {
     GetRequest get = 1;
@@ -47,24 +14,48 @@ message ReadRequest {
   }
 }
 
-message SearchGroup {
-  enum Mode {
-    MODE_UNSPECIFIED = 0;
+// One source query; the replay client combines the individual RPC results.
+message ReadGroup {
+  enum CombineMode {
+    COMBINE_MODE_UNSPECIFIED = 0;
     INTERSECTION = 1;
     UNION = 2;
   }
-  Mode mode = 1;
-  repeated ReadRequest members = 2;
+  CombineMode combine_mode = 1;
+  repeated ReadRequest requests = 2;
 }
 
-// Batch is constructed by replay; persisted records contain individual operations or a query group.
-message Request {
-  oneof operation {
-    PutRequest put = 1;
-    DeleteRequest delete = 2;
-    GetRequest get = 3;
+message TraceMetadata {
+  uint64 source_event = 1;
+  uint64 work_unit_id = 2;
+  uint64 mutation_ordinal = 3;
+  uint32 write_origin = 4;
+  // Expected result count for a query or query group.
+  uint64 expected_count = 5;
+  uint32 baseline_position = 6;
+  uint32 baseline_size = 7;
+  // Alternative value for Locator replay; Put carries RowID.
+  bytes locator = 8;
+}
+
+// One data request or read group with its source metadata.
+message TraceOperation {
+  oneof request {
+    GetRequest get = 1;
+    PutRequest put = 2;
+    DeleteRequest delete = 3;
     ScanRequest scan = 4;
-    SearchGroup group = 5;
-    BatchWriteRequest batch = 6;
+    ReadGroup read_group = 5;
+  }
+  // Shared by all requests in a read group.
+  TraceMetadata metadata = 6;
+}
+
+message TraceRecord {
+  oneof event {
+    // Both boundaries carry the same positive source transaction version.
+    uint64 transaction_begin = 1;
+    TraceOperation operation = 2;
+    uint64 transaction_commit = 3;
   }
 }

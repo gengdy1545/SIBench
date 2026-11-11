@@ -4,7 +4,6 @@ import org.sibench.replay.ReplayInput;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParser;
 
-import org.sibench.adapters.proto.ValueKind;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.RunTiming;
 

@@ -13,7 +13,7 @@ import org.junit.Test;
 import org.junit.rules.Timeout;
 import org.sibench.adapters.ServiceConfig;
 import org.sibench.adapters.ServiceReplay;
-import org.sibench.adapters.proto.ValueKind;
+import org.sibench.adapters.ValueKind;
 import org.sibench.replay.ReplayConfig;
 import org.sibench.trace.TraceManifest;
 import org.yaml.snakeyaml.Yaml;

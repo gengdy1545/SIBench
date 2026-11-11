@@ -19,7 +19,7 @@ import org.sibench.adapters.InProcessService;
 import org.sibench.adapters.TraceRequests;
 import org.sibench.adapters.VersionedIndexBackend;
 import org.sibench.adapters.proto.TraceRecord;
-import org.sibench.adapters.proto.ValueKind;
+import org.sibench.adapters.ValueKind;
 import org.sibench.generation.DuckDbDatabase;
 import org.sibench.generation.NativeHistory;
 import org.sibench.generation.DuckDbHostDriver;
@@ -213,35 +213,35 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             try(writer){DuckDbProjection.write(observer,true,writer);}
             long[] ids={0},searches={0},matched={0};
             try(var backend=VersionedIndexBackend.create(output.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {
-                var answers=new ArrayList<java.util.concurrent.CompletableFuture<List<org.sibench.adapters.proto.Result>>>();
+                var answers=new ArrayList<java.util.concurrent.CompletableFuture<List<com.google.protobuf.ByteString>>>();
                 try(var client=InProcessService.factory((request,partial)->{
-                    assertFalse("Groups must not reach the service",request.hasGroup());
-                    var items=new ArrayList<org.sibench.adapters.proto.Result>();
-                    var response=index.submit(request,chunk->{items.addAll(chunk.getResultsList());partial.accept(chunk);});
-                    answers.add(response.thenApply(reply->{items.addAll(reply.getResultsList());return List.copyOf(items);}));
+                    assertFalse("Groups must not reach the service",request instanceof org.sibench.adapters.proto.ReadGroup);
+                    var items=new ArrayList<com.google.protobuf.ByteString>();
+                    var response=index.submit(request,chunk->{items.addAll(chunk.values());partial.accept(chunk);});
+                    answers.add(response.thenApply(reply->{items.addAll(reply.values());return List.copyOf(items);}));
                     return response;
                 },new TraceRequests(ValueKind.ROW_ID)).open(0)) {
                 var consumer=new IndexOperationTrace.Consumer(){
                     @Override public void accept(IndexOperationTrace.Operation operation){fail("Missing stored request");}
                     @Override public void accept(TraceRecord record,List<IndexOperationTrace.Operation> operations)throws java.io.IOException {
-                        if(record.hasBegin())return;
-                        if(record.hasEnd())return;
+                        if(record.hasTransactionBegin())return;
+                        if(record.hasTransactionCommit())return;
                         try {
                             answers.clear();
-                            var request=record.getRequest();
+                            var request=record.getOperation();
                             var completions=new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
                             for(var operation:operations)
                                 completions.add(client.send(++ids[0],operation,request).response().toCompletableFuture());
                             java.util.concurrent.CompletableFuture.allOf(completions.toArray(java.util.concurrent.CompletableFuture[]::new))
                                     .get(5,TimeUnit.SECONDS);
-                            if((request.hasGet() || request.hasScan())||request.hasGroup()) {
+                            if((request.hasGet() || request.hasScan())||request.hasReadGroup()) {
                                 var wanted=expected.get(operations.get(0).sourceEvent());assertNotNull(wanted);
                                 HashSet<Long> actual=null;
                                 for(var answer:answers) {
                                     var member=new HashSet<Long>();
-                                    for(var row:answer.get(5,TimeUnit.SECONDS))assertTrue(member.add(row.getValue().asReadOnlyByteBuffer().getLong()));
+                                    for(var row:answer.get(5,TimeUnit.SECONDS))assertTrue(member.add(row.asReadOnlyByteBuffer().getLong()));
                                     if(actual==null)actual=member;
-                                    else if(request.getGroup().getMode()==org.sibench.adapters.proto.SearchGroup.Mode.INTERSECTION)
+                                    else if(request.getReadGroup().getCombineMode()==org.sibench.adapters.proto.ReadGroup.CombineMode.INTERSECTION)
                                         actual.retainAll(member);
                                     else actual.addAll(member);
                                 }

@@ -245,14 +245,14 @@ public class PostgresProjectionCheck {
         }finally{executor.shutdownNow();Files.deleteIfExists(socketRoot.resolve("capture.sock"));Files.delete(socketRoot);}
     }
 
-    @Test public void longReadOnlyTransactionsLeaveAsPiecesAtTheirSnapshots()throws Exception {
+    @Test public void readOnlyTransactionsWaitForTheirOutcomeBeforeExport()throws Exception {
         String runtime=System.getProperty("sibench.postgres.runtime");assertNotNull(runtime);
         Path root=temporary.getRoot().toPath(),socketRoot=Files.createTempDirectory("pg-project-");
         var executor=Executors.newSingleThreadExecutor();
         var catalog=IndexCatalog.fromSchema(SourceSchema.of("sysbench",Path.of("benchmark/sysbench"),Map.of("tables",1L)));
         var baseline=new ArrayList<IndexOperationTrace.Operation>();
-        // The reader's events exceed this 1 MiB pending budget; prefixes beyond 2 KiB leave as pieces.
-        try(var capture=new PostgresCapture(socketRoot.resolve("capture.sock"),root.resolve("pending"),1L<<20,1024);
+        // The reader crosses the former prefix-release threshold but stays within the transaction budget.
+        try(var capture=new PostgresCapture(socketRoot.resolve("capture.sock"),root.resolve("pending"),16L<<20,1024);
                 var cluster=PostgresDatabase.create(Path.of(runtime),root.resolve("source"),socketRoot.resolve("capture.sock"),org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=cluster.connect("setup")) {
                 sql(setup,"CREATE TABLE sbtest1(id INTEGER PRIMARY KEY,k INTEGER,c CHAR(120),pad CHAR(60))");
@@ -262,7 +262,7 @@ public class PostgresProjectionCheck {
                 NativeBaseline.write(setup,Engine.POSTGRES,catalog.definitions(),baseline::add);setup.commit();
                 setup.setAutoCommit(true);sql(setup,"VACUUM ANALYZE");
             }
-            // Projection runs concurrently with the sources and releases pieces once the watermark passes them.
+            // Other committed transactions can drain while the reader remains unresolved.
             var future=executor.submit(()->{
                 var operations=new ArrayList<IndexOperationTrace.Operation>();
                 try(var control=cluster.connect("projection")) {
@@ -286,22 +286,37 @@ public class PostgresProjectionCheck {
                     seen.add(number(reader,"SELECT count(*) FROM sbtest1 WHERE k BETWEEN 10 AND 20"));
                 }
                 reader.rollback();
+                assertEquals(12,number(reader,"SELECT count(*) FROM sbtest1 WHERE k BETWEEN 10 AND 20"));
+                reader.commit();
             }
             try(var control=cluster.connect("close")){capture.finishSources(control);}
             var operations=future.get(30,TimeUnit.SECONDS);
-            assertTrue(((Number)capture.transactions.metrics().get("read_only_pieces")).longValue()>1);
             assertEquals(12L,(long)seen.get(seen.size()-1));
             var counts=operations.stream().filter(o->o.kind()==IndexOperationTrace.SEARCH&&o.index()==1)
                     .map(IndexOperationTrace.Operation::expectedCount).toList();
-            assertEquals(seen,counts);
-            // Every snapshot count matches an independent index at its read point; the reader resolves once, as an abort.
+            var allSeen=new ArrayList<>(seen);allSeen.add(12L);
+            assertEquals(allSeen,counts);
+            assertTrue(operations.stream().filter(o->o.kind()==IndexOperationTrace.SEARCH).allMatch(o->o.transactionId()>0));
+            // Raw source validation still sees the abort and all of its reads.
             assertEquals(1,operations.stream().filter(o->o.kind()==IndexOperationTrace.TRANSACTION_ABORT).count());
             try(var reference=new IndexReferenceReplay(true,true)) {
                 for(var operation:baseline)reference.accept(operation);
                 for(var operation:operations)
                     if(!IndexOperationTrace.isControl(operation)||operation.kind()==IndexOperationTrace.TRANSACTION_ABORT)
                         reference.accept(operation);
-                assertEquals(1000,reference.queries());
+                assertEquals(1001,reference.queries());
+            }
+            var file=root.resolve("committed.pb.zst");var trace=new ProtoTrace.Writer(file);
+            try(trace){for(var operation:operations)trace.accept(operation);}
+            var exported=new ArrayList<IndexOperationTrace.Operation>();
+            ProtoTrace.read(file,trace.sha256(),trace.logicalSha256(),exported::add);
+            assertFalse(exported.stream().anyMatch(o->o.kind()==IndexOperationTrace.TRANSACTION_ABORT));
+            var queries=exported.stream().filter(o->o.kind()==IndexOperationTrace.SEARCH).toList();
+            assertEquals(1,queries.size());assertEquals(12,queries.get(0).expectedCount());
+            try(var reference=new IndexReferenceReplay(true,true)) {
+                for(var operation:baseline)reference.accept(operation);
+                for(var operation:exported)if(!IndexOperationTrace.isControl(operation))reference.acceptCommitted(operation);
+                assertEquals(1,reference.queries());
             }
         }finally{executor.shutdownNow();Files.deleteIfExists(socketRoot.resolve("capture.sock"));Files.delete(socketRoot);}
     }

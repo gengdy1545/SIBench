@@ -48,8 +48,8 @@ public final class BaselineCapacityCheck {
         Sink(Path report,boolean dropFirst) { this.report=report;this.dropFirst=dropFirst; }
         public IndexDescription describe() { return new IndexDescription("baseline-transport-field-check-sink",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,"diagnostic field receiver; no index storage",location()); }
         public void write(Mutation write) throws IOException { if (dropFirst && dropped.compareAndSet(false,true)) return;received.write(write); flush(); }
-        public Result get(GetRequest get) throws IOException { throw new IOException("Baseline-only diagnostic receiver"); }
-        public void scan(ScanRequest scan,ResultSink output) throws IOException { throw new IOException("Baseline-only diagnostic receiver"); }
+        public ByteString get(GetRequest get) throws IOException { throw new IOException("Baseline-only diagnostic receiver"); }
+        public void scan(ScanRequest scan,ValueSink output) throws IOException { throw new IOException("Baseline-only diagnostic receiver"); }
         public void flush() throws IOException { Files.writeString(report,JSON.toJson(received.summary())+"\n"); }
         public void bind(String value) throws IOException { if (!binding.isEmpty()&&!binding.equals(value)) throw new IOException("Different binding");binding=value; }
         public String location() { return "diagnostic-baseline-sink"; }

@@ -1,6 +1,7 @@
 package org.sibench.adapters;
 
 import static org.junit.Assert.*;
+import static org.sibench.adapters.TraceRequestsTest.send;
 import java.nio.file.*;
 import java.util.concurrent.TimeUnit;
 import org.junit.Rule;
@@ -47,7 +48,7 @@ public class BaselineCapacityCheckTest {
               var before=sink.received.summary();
               for(int round=0;round<2;round++) {
                 var client=remote.factory().open(0);
-                var a=client.send(1,first);var b=client.send(2,second);
+                var a=send(client, 1,first);var b=send(client, 2,second);
                 a.response().toCompletableFuture().get(5,TimeUnit.SECONDS);
                 b.response().toCompletableFuture().get(5,TimeUnit.SECONDS);
                 var delta=BaselineCapacityCheck.difference(sink.received.summary(),before);

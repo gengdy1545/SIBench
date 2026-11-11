@@ -1,5 +1,3 @@
-// Versioned index data API. ACK means visible through the same service instance.
-// Persistence and storage maintenance are internal service responsibilities.
 syntax = "proto3";
 
 package sibench.index;
@@ -7,23 +5,26 @@ package sibench.index;
 option java_multiple_files = true;
 option java_package = "org.sibench.adapters.proto";
 
+// Versioned KV operations over opaque byte keys and values.
+// Timestamps are caller-assigned, nonnegative int64 values.
+// Write success guarantees same-instance visibility.
+// Persistence and storage maintenance are service responsibilities.
 service IndexService {
   rpc Get(GetRequest) returns (GetResponse);
-  rpc Put(PutRequest) returns (WriteResponse);
-  rpc Delete(DeleteRequest) returns (WriteResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc Scan(ScanRequest) returns (stream ScanResponse);
-  rpc BatchWrite(BatchWriteRequest) returns (WriteResponse);
+  rpc WriteBatch(WriteBatchRequest) returns (WriteBatchResponse);
 }
 
-// Data requests and responses. Keys and values are opaque bytes.
-// Timestamps are caller-assigned, nonnegative int64 values.
 message GetRequest {
   bytes key = 1;
   uint64 read_ts = 2;
 }
 
 message GetResponse {
-  Result result = 1;
+  // Absent means no visible entry; a present empty value is valid.
+  optional bytes value = 1;
 }
 
 message PutRequest {
@@ -32,22 +33,30 @@ message PutRequest {
   bytes value = 3;
 }
 
+message PutResponse {
+}
+
 message DeleteRequest {
   bytes key = 1;
   uint64 ts = 2;
 }
 
-// Unsigned byte order over [start_key, end_key). Missing bounds are unbounded.
+message DeleteResponse {
+}
+
+// Unsigned byte range [start_key, end_key). Absent bounds are unbounded.
 message ScanRequest {
   optional bytes start_key = 1;
   optional bytes end_key = 2;
   uint64 read_ts = 3;
-  uint64 limit = 4; // 0: unlimited visible entries
+  // Zero means no limit on visible entries.
+  uint64 limit = 4;
   bool reverse = 5;
 }
 
 message ScanResponse {
-  repeated Result results = 1;
+  // Values follow the requested key order and preserve duplicates.
+  repeated bytes values = 1;
 }
 
 message Mutation {
@@ -57,45 +66,11 @@ message Mutation {
   }
 }
 
-// Validation precedes application; execution failure may be partial. No transaction atomicity.
-message BatchWriteRequest {
+// All mutations are validated before application.
+// Execution may be partial; atomicity and rollback are not guaranteed.
+message WriteBatchRequest {
   repeated Mutation mutations = 1;
 }
 
-message WriteResponse {
-}
-
-message Result {
-  bytes key = 1;
-  uint64 ts = 2;
-  bytes value = 3;
-}
-
-// Harness deployment metadata, not data RPC fields.
-enum Acknowledgement {
-  ACK_UNSPECIFIED = 0;
-  ACK_MEMORY = 1; // acknowledged before durable state
-  ACK_WAL = 2; // acknowledged in a write-ahead log, not necessarily fsynced
-  ACK_FSYNC = 3; // acknowledged after fsync
-}
-
-enum ValueKind {
-  VALUE_KIND_UNSPECIFIED = 0;
-  LOCATOR = 1; // (file id, row position) of the row version in a data file
-  ROW_ID = 2; // logical row identity
-}
-
-// Completion chunks within the replay process, not additional data RPCs.
-message Response {
-  Status status = 1;
-  string message = 2;
-  repeated Result results = 3;
-  bool more = 4;
-}
-
-enum Status {
-  STATUS_UNSPECIFIED = 0;
-  OK = 1;
-  INVALID = 2;
-  UNAVAILABLE = 3;
+message WriteBatchResponse {
 }

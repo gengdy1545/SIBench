@@ -16,7 +16,7 @@ public final class DispatcherCapacityCheck {
         long[] received = {0};
         long start = System.nanoTime();
         Map<String, Object> result;
-        try (var dispatcher = new ReplayDispatcher(config, client -> (sequence, operation) -> {
+        try (var dispatcher = new ReplayDispatcher(config, client -> (sequence, operation, stored) -> {
             if (sequence != ++received[0] || operation.sourceEvent() != sequence
                     || operation.rowId() != sequence || operation.key().intValue() != sequence)
                 throw new IOException("Generated operation was lost, reordered or changed");

@@ -26,8 +26,6 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
     private final Path scratch;
     private final boolean secondaryIndexes;
     private final Map<Integer,PostgresAccessUnits.Detail> details=new HashMap<>();
-    /** Backends with released read-only pieces whose transaction has not resolved yet. */
-    private final java.util.Set<Integer> pieces=new java.util.HashSet<>();
     private final Map<Integer,PreparedStatement> identities=new HashMap<>();
     private final Map<PostgresAccessUnits.Unit,Search> live=new IdentityHashMap<>();
     private final Map<PostgresAccessUnits.BitmapGroup,Search> groups=new IdentityHashMap<>();
@@ -64,10 +62,7 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
     /** Projects one chunk; returns whether it resolved a source transaction with requests. */
     boolean accept(PostgresTransactions.Chunk source)throws IOException,SQLException {
         chunk=source;writes=0;statementWrites=0;currentUnit=0;allocations=0;insertions=0;
-        // A piece's searches are standalone snapshot reads; its transaction resolves with its outcome.
-        if(source.piece)pieces.add(source.pid);
-        boolean split=!source.piece&&pieces.remove(source.pid);
-        version=split||!source.piece&&source.hasRequests?versions.begin(source):0;
+        version=source.hasRequests?versions.begin(source):0;
         try(var rowIds=new SpillingMap(scratch.resolve("local-identities"),65536,4);
                 var abortIds=new SpillingMap(scratch.resolve("aborted-identities"),65536,4)) {
             local=rowIds;allocated=abortIds;
@@ -110,11 +105,11 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
         startRequest(event);
     }
     private void startRequest(JsonObject event)throws IOException {
-        if(version==0&&!chunk.piece)throw new IOException("PG request lacks a canonical transaction");
+        if(version==0)throw new IOException("PG request lacks a canonical transaction");
         currentUnit=++workUnits;unitEvent=this.event;statementWrites=0;
         try {
             readVersion=versions.readVersion(event.get("snapshot_csn").getAsLong());
-            if(!chunk.piece&&readVersion>=version)throw new IOException("PG statement sees its own or a future Trace resolution");
+            if(readVersion>=version)throw new IOException("PG statement sees its own or a future Trace resolution");
         }catch(SQLException failure){throw new IOException("Cannot bind PG statement snapshot",failure);}
         units.lines().write("{\"work_unit_id\":"+currentUnit+",\"source_event\":"+unitEvent+"}\n");
     }

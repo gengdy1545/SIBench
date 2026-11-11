@@ -1,9 +1,8 @@
 package org.sibench.adapters;
 
+import static org.sibench.adapters.TraceRequestsTest.stored;
+
 import com.google.gson.GsonBuilder;
-import org.sibench.adapters.proto.Response;
-import org.sibench.adapters.proto.Status;
-import org.sibench.adapters.proto.ValueKind;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.replay.ReplayConfig;
 import org.sibench.replay.ReplayDispatcher;
@@ -32,8 +31,8 @@ public final class StreamingLatencyCheck {
         report.put("endpoint", args[0]);
         report.put("workload", "64 baseline inserts in four batches; 100 cycles of upsert/read-one, "
                 + "delete/read-zero, reinsert/read-one; first 16 basic operations warmup");
-        report.put("expected", Map.of("baseline_operations", 64, "baseline_execute_requests", 4,
-                "workload_operations", 600, "workload_execute_requests", 600,
+        report.put("expected", Map.of("baseline_operations", 64, "baseline_rpc_requests", 4,
+                "workload_operations", 600, "workload_rpc_requests", 600,
                 "measured_operations", 584, "measured_writes", 292, "measured_searches", 292,
                 "checked_results", 200));
         var config = new ReplayConfig(false, 0, 0, WARMUP, 0, "operation", 2, 64, 5);
@@ -42,9 +41,10 @@ public final class StreamingLatencyCheck {
         try (var grpc = new GrpcService(args[0], requests, BINDING, 5)) {
             try (var baseline = new ReplayDispatcher(config, grpc.factory())) {
                 for (int key = 0; key < BASELINE_ROWS; key++) {
-                    baseline.send(IndexOperationTrace.write(key + 1L, IndexOperationTrace.INSERT,
+                    var operation = IndexOperationTrace.write(key + 1L, IndexOperationTrace.INSERT,
                             1, 0, IndexKey.ofInt(key), 0, 0, 0, key + 1L)
-                            .withWorkUnitId(key / 32 + 1L));
+                            .withWorkUnitId(key / 32 + 1L);
+                    baseline.send(operation, stored(operation));
                 }
                 baseline.drain();
                 baseline.requireClientCoverage();
@@ -62,12 +62,14 @@ public final class StreamingLatencyCheck {
                         version++;
                         long workUnit = version + 2;
                         int kind = step == 1 ? IndexOperationTrace.LOGICAL_DELETE : IndexOperationTrace.UPSERT;
-                        replay.send(IndexOperationTrace.write(++event, kind, 1, 0, key,
+                        var write = IndexOperationTrace.write(++event, kind, 1, 0, key,
                                 version, 0, 0, 1000 + version)
-                                .withWorkUnitId(workUnit));
-                        replay.send(IndexOperationTrace.search(++event, 1, 0,
+                                .withWorkUnitId(workUnit);
+                        replay.send(write, stored(write));
+                        var read = IndexOperationTrace.search(++event, 1, 0,
                                 IndexOperationTrace.Range.equal(key), version, step == 1 ? 0 : 1, 0)
-                                .withWorkUnitId(workUnit));
+                                .withWorkUnitId(workUnit);
+                        replay.send(read, stored(read));
                     }
                 }
                 replay.drain();
@@ -115,7 +117,7 @@ public final class StreamingLatencyCheck {
         var lookup = IndexOperationTrace.search(1, 1, 0,
                 IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 0, 1, 0);
         try {
-            check.check(lookup, Response.newBuilder().setStatus(Status.OK).build());
+            check.check(lookup, IndexResponse.ok(java.util.List.of()));
         } catch (IOException expected) {
             if (expected.getMessage().contains("Search count mismatch")) return;
             throw expected;

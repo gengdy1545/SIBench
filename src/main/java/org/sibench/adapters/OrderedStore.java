@@ -18,8 +18,8 @@ interface OrderedStore extends AutoCloseable {
     String durability();
 
     /** Durability reached by a successful incremental write, separate from query visibility. */
-    default org.sibench.adapters.proto.Acknowledgement writeAck() {
-        return org.sibench.adapters.proto.Acknowledgement.ACK_WAL;
+    default Acknowledgement writeAck() {
+        return Acknowledgement.ACK_WAL;
     }
 
     void put(byte[] key, byte[] value, boolean wal) throws IOException;

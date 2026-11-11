@@ -193,7 +193,7 @@ final class PixelsTrace implements AutoCloseable {
         manifest.put("aborted_transactions", 0L);
         manifest.put("searched_accesses", searches);
         manifest.put("logical_row_changes", changes);
-        manifest.put("last_resolved_version", version);
+        manifest.put("last_resolved_version", workload.lastCommittedVersion());
         manifest.put("window_markers", markers.size());
         manifest.put("work_units_sha256", HexFormat.of().formatHex(units.digest().digest()));
         manifest.put("work_unit_rule", "one source transaction applied by Pixels; numbered in Pixels timestamp order");

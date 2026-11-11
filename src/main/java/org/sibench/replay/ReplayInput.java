@@ -82,7 +82,7 @@ public final class ReplayInput {
         private final java.util.Set<Integer> loadedTables = new java.util.HashSet<>();
         private IndexOperationTrace.Operation primary, previous;
         private int position, group;
-        private long rows, groupEvent, resolution;
+        private long rows, groupEvent;
 
         Coverage(
                 String name,
@@ -97,9 +97,6 @@ public final class ReplayInput {
         public void accept(IndexOperationTrace.Operation operation) throws IOException {
                 if (name.equals("baseline") && (operation.kind() != IndexOperationTrace.INSERT || operation.version() != 0))
                     throw new IOException("Baseline requires version-zero Inserts");
-                if (operation.kind() == IndexOperationTrace.TRANSACTION_BEGIN
-                        && operation.version() != ++resolution)
-                    throw new IOException("Incomplete Trace resolution sequence");
                 if (!IndexOperationTrace.isControl(operation) && name.equals("workload")) {
                     long start = units.firstEvent(operation.workUnitId());
                     long next = units.firstEvent(operation.workUnitId() + 1);

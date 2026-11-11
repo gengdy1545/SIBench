@@ -11,7 +11,7 @@ import java.util.Objects;
 
 import static org.sibench.capture.IndexOperationTrace.*;
 
-/** Validates native source operations before projecting committed state and snapshot queries. */
+/** Validates native source operations before exporting only successful transactions. */
 final class CommittedOperations {
     static final int MAX_TRANSACTION_OPERATIONS = 1_000_000;
     private final Consumer output;
@@ -20,10 +20,10 @@ final class CommittedOperations {
         Entry(Operation operation) { this(operation.table(), operation.index(), operation.indexedValue(), operation.key()); }
     }
     private final Map<Entry, Integer> lastWrites = new HashMap<>();
-    private long transaction, version, lastVersion, lastTransaction, ordinal, lastSource, sourceOperations, superseded;
-    private Operation mutation, previousExpansion, searchGroup;
+    private long transaction, lastVersion, lastCommittedVersion, ordinal, lastSource, sourceOperations, superseded;
+    private Operation begin, mutation, previousExpansion, searchGroup;
     private int expansionMembers, searchMembers;
-    private long abortedWrites, localSearches, coalescedWrites, peakBuffered;
+    private long abortedTransactions, abortedWrites, abortedSearches, localSearches, coalescedWrites, peakBuffered;
 
     CommittedOperations(Consumer output) { this.output = output; }
 
@@ -45,10 +45,14 @@ final class CommittedOperations {
         else if (isMutation(operation)) mutation(operation);
         else if (transaction != 0 || operation.transactionId() != 0 || operation.mutationOrdinal() != 0)
             throw new IOException("Unexpected source transaction metadata");
-        // Until a transaction writes, its snapshot searches cannot depend on its outcome, and
-        // emitting them now keeps the output order: a read-only transaction is never buffered.
-        if (transaction == 0 || pending.isEmpty() && operation.kind() == SEARCH
-                && (operation.flags() & TRANSACTION_LOCAL_SEARCH) == 0) output.accept(operation);
+        // Removed Abort slots contain no state; use the equivalent preceding committed read bound.
+        if (operation.kind() == SEARCH && (operation.flags() & TRANSACTION_LOCAL_SEARCH) == 0
+                && operation.readTimestamp() > lastCommittedVersion)
+            operation = IndexOperationTrace.search(operation.sourceEvent(), operation.table(), operation.index(),
+                    operation.range(), operation.key(), lastCommittedVersion, operation.expectedCount(), operation.flags(),
+                    operation.expansionPosition(), operation.expansionSize())
+                    .withTransaction(operation.transactionId(), operation.mutationOrdinal()).withWorkUnitId(operation.workUnitId());
+        if (transaction == 0) output.accept(operation);
         // Operations held for the outcome count against the limit, even when dropped or superseded early.
         else if (sourceOperations++ >= MAX_TRANSACTION_OPERATIONS)
             throw new IOException("Source transaction exceeds operation buffer limit");
@@ -68,43 +72,51 @@ final class CommittedOperations {
     }
 
     private void control(Operation operation) throws IOException {
-        if (operation.transactionId() <= 0 || operation.version() <= 0 || operation.mutationOrdinal() != 0)
+        if (operation.transactionId() <= 0 || operation.transactionId() != operation.version() || operation.mutationOrdinal() != 0)
             throw new IOException("Invalid source transaction control");
         if (operation.kind() == TRANSACTION_BEGIN) {
             if (transaction != 0 || searchGroup != null || operation.version() <= lastVersion
-                    || operation.transactionId() <= lastTransaction || operation.expectedCount() != 0)
+                    || operation.expectedCount() != 0)
                 throw new IOException("Invalid source group begin/order");
             transaction = operation.transactionId();
-            version = operation.version();
             ordinal = lastSource = sourceOperations = superseded = 0;
             mutation = previousExpansion = null;
             expansionMembers = 0;
-            output.accept(operation);
+            begin = operation;
             return;
         }
-        if (transaction == 0 || operation.transactionId() != transaction || operation.version() != version
+        if (transaction == 0 || operation.transactionId() != transaction || operation.version() != transaction
                 || operation.expectedCount() != ordinal || searchGroup != null)
             throw new IOException("Source outcome or mutation count mismatch");
         requireCompleteExpansion();
         boolean aborted = operation.kind() == TRANSACTION_ABORT;
-        if (aborted) abortedWrites += superseded;
-        else coalescedWrites += superseded;
+        if (aborted) {
+            abortedTransactions++;
+            abortedWrites += superseded;
+        } else {
+            coalescedWrites += superseded;
+            output.accept(begin);
+        }
         for (Operation member : pending) {
             if (member == null) continue;
-            if (member.kind() == SEARCH) output.accept(member);
-            else if (aborted) abortedWrites++;
-            else output.accept(member.withExpansion(0, 1));
+            if (aborted) {
+                if (member.kind() == SEARCH) abortedSearches++;
+                else abortedWrites++;
+            } else output.accept(member.kind() == SEARCH ? member : member.withExpansion(0, 1));
         }
-        output.accept(operation);
+        if (!aborted) {
+            output.accept(operation);
+            lastCommittedVersion = transaction;
+        }
+        begin = null;
         pending.clear();
         lastWrites.clear();
-        lastVersion = version;
-        lastTransaction = transaction;
+        lastVersion = transaction;
         transaction = 0;
     }
 
     private void mutation(Operation operation) throws IOException {
-        if (transaction == 0 || operation.transactionId() != transaction || operation.version() != version
+        if (transaction == 0 || operation.transactionId() != transaction || operation.version() != transaction
                 || operation.mutationOrdinal() < 1)
             throw new IOException("Mutation missing matching source group/version");
         if (operation.expansionSize() < 1 || operation.expansionSize() > MAX_TRANSACTION_OPERATIONS
@@ -143,7 +155,7 @@ final class CommittedOperations {
             requireCompleteExpansion();
             if (operation.transactionId() != transaction || operation.mutationOrdinal() != ordinal)
                 throw new IOException("Search source transaction position mismatch");
-            if (local && (ordinal == 0 || operation.version() != version || operation.readTimestamp() >= version))
+            if (local && (ordinal == 0 || operation.version() != transaction || operation.readTimestamp() >= transaction))
                 throw new IOException("Invalid source snapshot read point");
         } else if (operation.transactionId() != 0 || operation.mutationOrdinal() != 0 || local)
             throw new IOException("Transaction-local search outside source group");
@@ -179,8 +191,12 @@ final class CommittedOperations {
         if (transaction != 0 || searchGroup != null) throw new IOException("Incomplete source transaction or search group");
     }
 
+    long lastCommittedVersion() { return lastCommittedVersion; }
+
     Map<String, Long> statistics() {
-        return Map.of("excluded_aborted_writes", abortedWrites, "excluded_local_search_members", localSearches,
+        return Map.of("excluded_aborted_transactions", abortedTransactions,
+                "excluded_aborted_writes", abortedWrites, "excluded_aborted_search_members", abortedSearches,
+                "excluded_local_search_members", localSearches,
                 "coalesced_writes", coalescedWrites, "peak_buffered_operations", peakBuffered);
     }
 }

@@ -1,11 +1,11 @@
 package org.sibench.adapters;
 
 import static org.junit.Assert.*;
+import static org.sibench.adapters.TraceRequestsTest.send;
 
 import org.junit.Test;
-import org.sibench.adapters.proto.Request;
-import org.sibench.adapters.proto.SearchGroup;
-import org.sibench.adapters.proto.ValueKind;
+import com.google.protobuf.Message;
+import org.sibench.adapters.proto.*;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.capture.IndexOperationTrace.Range;
@@ -21,27 +21,33 @@ public class ServiceClientTest {
     @Test
     public void sendWaitsForTheTransportSignalEvenWhenTheResponseIsImmediate() throws Exception {
         var sent = new java.util.concurrent.CompletableFuture<Void>();
-        var client = new ServiceClient(new TraceRequests(org.sibench.adapters.proto.ValueKind.ROW_ID)) {
-            @Override java.util.concurrent.CompletableFuture<org.sibench.adapters.proto.Response> transmit(
-                    Request request, java.util.function.Consumer<org.sibench.adapters.proto.Response> partial) {
+        var client = new ServiceClient(new TraceRequests(ValueKind.ROW_ID)) {
+            @Override java.util.concurrent.CompletableFuture<IndexResponse> transmit(
+                    Message request, java.util.function.Consumer<IndexResponse> partial) {
                 return java.util.concurrent.CompletableFuture.completedFuture(
-                        org.sibench.adapters.proto.Response.newBuilder()
-                                .setStatus(org.sibench.adapters.proto.Status.OK).build());
+                        IndexResponse.ok(java.util.List.of()));
             }
             @Override java.util.concurrent.CompletableFuture<Void> localSend() { return sent; }
         };
         var operation = IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0,
                 IndexKey.ofInt(7), 0, 1, 0, 70);
-        var handle = client.send(1, operation);
+        var handle = send(client, 1, operation);
         assertTrue(handle.response().toCompletableFuture().isDone());
         assertFalse(handle.sent().toCompletableFuture().isDone());
         sent.complete(null);
         handle.sent().toCompletableFuture().get();
     }
 
+    @Test
+    public void missingStoredPayloadIsRejectedBeforeTransmission() throws IOException {
+        var client = new Recorder(new TraceRequests(ValueKind.ROW_ID));
+        assertThrows(IOException.class, () -> client.send(1, insert(1, 1, 1), null));
+        assertTrue(client.sent.isEmpty());
+    }
+
     /** Records what reaches the transport; the backend answers with fixed counts. */
     private static final class Recorder extends ServiceClient {
-        final List<Request> sent = new ArrayList<>();
+        final List<Message> sent = new ArrayList<>();
         long results;
 
         Recorder(TraceRequests requests) {
@@ -49,15 +55,13 @@ public class ServiceClientTest {
         }
 
         @Override
-        java.util.concurrent.CompletableFuture<org.sibench.adapters.proto.Response> transmit(
-                Request request, java.util.function.Consumer<org.sibench.adapters.proto.Response> partial) {
+        java.util.concurrent.CompletableFuture<IndexResponse> transmit(
+                Message request, java.util.function.Consumer<IndexResponse> partial) {
             sent.add(request);
-            var response = org.sibench.adapters.proto.Response.newBuilder()
-                    .setStatus(org.sibench.adapters.proto.Status.OK);
+            var values = new ArrayList<com.google.protobuf.ByteString>();
             for (int i = 0; i < results; i++)
-                response.addResults(org.sibench.adapters.proto.Result.newBuilder().setTs(1)
-                        .setKey(new IndexEntry(3,1,IndexKey.ofInt(7),IndexKey.ofInt(i)).bytes()));
-            return java.util.concurrent.CompletableFuture.completedFuture(response.build());
+                values.add(IndexEntry.rowId(i));
+            return java.util.concurrent.CompletableFuture.completedFuture(IndexResponse.ok(values));
         }
     }
 
@@ -71,14 +75,18 @@ public class ServiceClientTest {
         var requests = new TraceRequests(ValueKind.ROW_ID);
         var client = new Recorder(requests);
         client.results = 2;
-        var first = client.send(1, member(0, 3, 2, IndexOperationTrace.INTERSECT_GROUP));
-        var middle = client.send(2, member(1, 3, 2, IndexOperationTrace.INTERSECT_GROUP));
+        var members = List.of(member(0, 3, 2, IndexOperationTrace.INTERSECT_GROUP),
+                member(1, 3, 2, IndexOperationTrace.INTERSECT_GROUP),
+                member(2, 3, 2, IndexOperationTrace.INTERSECT_GROUP));
+        var stored = TraceOperation.newBuilder().setReadGroup(requests.group(members)).build();
+        var first = client.send(1, members.get(0), stored);
+        var middle = client.send(2, members.get(1), stored);
         assertEquals(2, client.sent.size());
         assertFalse(first.response().toCompletableFuture().isDone());
         assertTrue(first.businessResponse().toCompletableFuture().isDone());
-        var last = client.send(3, member(2, 3, 2, IndexOperationTrace.INTERSECT_GROUP));
+        var last = client.send(3, members.get(2), stored);
         assertEquals(3, client.sent.size());
-        assertTrue(client.sent.stream().allMatch(Request::hasScan));
+        assertTrue(client.sent.stream().allMatch(ScanRequest.class::isInstance));
         // Every member completes with the group's response; a group is one native query.
         for (var handle : List.of(first, middle, last)) {
             handle.response().toCompletableFuture().join();
@@ -93,8 +101,11 @@ public class ServiceClientTest {
         var requests = new TraceRequests(ValueKind.ROW_ID);
         var client = new Recorder(requests);
         client.results = 1;
-        client.send(1, member(0, 2, 4, IndexOperationTrace.UNION_GROUP));
-        var last = client.send(2, member(1, 2, 4, IndexOperationTrace.UNION_GROUP));
+        var members = List.of(member(0, 2, 4, IndexOperationTrace.UNION_GROUP),
+                member(1, 2, 4, IndexOperationTrace.UNION_GROUP));
+        var stored = TraceOperation.newBuilder().setReadGroup(requests.group(members)).build();
+        client.send(1, members.get(0), stored);
+        var last = client.send(2, members.get(1), stored);
         var failure = assertThrows(
                 java.util.concurrent.CompletionException.class,
                 () -> last.response().toCompletableFuture().join());
@@ -104,11 +115,32 @@ public class ServiceClientTest {
     @Test
     public void anInterruptedGroupIsRefused() throws IOException {
         var requests = new TraceRequests(ValueKind.ROW_ID);
+        requests.baselineBatch(2);
         var client = new Recorder(requests);
-        client.send(1, member(0, 2, 1, IndexOperationTrace.UNION_GROUP));
+        var members = List.of(member(0, 2, 1, IndexOperationTrace.UNION_GROUP),
+                member(1, 2, 1, IndexOperationTrace.UNION_GROUP));
+        var stored = TraceOperation.newBuilder().setReadGroup(requests.group(members)).build();
+        client.send(1, members.get(0), stored);
         var alone = IndexOperationTrace.search(11, 3, 1, Range.equal(IndexKey.ofInt(7)), 5, 1, 0);
-        assertTrue(assertThrows(IOException.class, () -> client.send(2, alone))
-                .getMessage().contains("Search group interrupted"));
+        assertTrue(assertThrows(IOException.class, () -> send(client, 2, alone))
+                .getMessage().contains("Read group interrupted"));
+        assertThrows(IOException.class, () -> send(client, 3, insert(12, 1, 1)));
+        assertEquals(1, client.sent.size());
+    }
+
+    @Test
+    public void malformedStoredReadGroupsFailBeforeTransmission() throws IOException {
+        var requests = new TraceRequests(ValueKind.ROW_ID);
+        var client = new Recorder(requests);
+        var members = List.of(member(0, 2, 0, IndexOperationTrace.UNION_GROUP),
+                member(1, 2, 0, IndexOperationTrace.UNION_GROUP));
+        var stored = TraceOperation.newBuilder().setReadGroup(requests.group(members)).build();
+        for (var invalid : List.of(TraceOperation.getDefaultInstance(), stored.toBuilder()
+                .setReadGroup(stored.getReadGroup().toBuilder().removeRequests(1)).build())) {
+            assertThrows(IOException.class, () -> client.send(1, members.get(0), invalid));
+        }
+        assertThrows(IOException.class, () -> client.send(1, members.get(1), stored));
+        assertTrue(client.sent.isEmpty());
     }
 
     private static Operation insert(long event, long key, long unit) {
@@ -123,25 +155,25 @@ public class ServiceClientTest {
         var client = new Recorder(requests);
         var responses = new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
         for (long key = 1; key <= 3; key++)
-            responses.add(client.send(key, insert(key, key, 1)).response().toCompletableFuture());
+            responses.add(send(client, key, insert(key, key, 1)).response().toCompletableFuture());
         assertEquals(1, client.sent.size());
-        assertEquals(3, client.sent.get(0).getBatch().getMutationsCount());
+        assertEquals(3, ((WriteBatchRequest) client.sent.get(0)).getMutationsCount());
         assertTrue(responses.stream().allMatch(java.util.concurrent.CompletableFuture::isDone));
         // A new work unit sends the held part of the previous one first.
-        client.send(4, insert(4, 4, 1));
-        client.send(5, insert(5, 5, 2));
+        send(client, 4, insert(4, 4, 1));
+        send(client, 5, insert(5, 5, 2));
         assertEquals(2, client.sent.size());
-        assertEquals(1, client.sent.get(1).getBatch().getMutationsCount());
+        assertEquals(1, ((WriteBatchRequest) client.sent.get(1)).getMutationsCount());
         // Any other request sends the held inserts before it.
-        client.send(6, IndexOperationTrace.write(6, IndexOperationTrace.UPSERT, 3, 0, IndexKey.ofInt(6), 1, 1, 6, 6));
+        send(client, 6, IndexOperationTrace.write(6, IndexOperationTrace.UPSERT, 3, 0, IndexKey.ofInt(6), 1, 1, 6, 6));
         assertEquals(4, client.sent.size());
-        assertEquals(1, client.sent.get(2).getBatch().getMutationsCount());
-        assertTrue(client.sent.get(3).hasPut());
-        client.send(7, insert(7, 7, 3));
+        assertEquals(1, ((WriteBatchRequest) client.sent.get(2)).getMutationsCount());
+        assertTrue(client.sent.get(3) instanceof PutRequest);
+        send(client, 7, insert(7, 7, 3));
         assertEquals(4, client.sent.size());
         client.flush();
         assertEquals(5, client.sent.size());
-        assertEquals(1, client.sent.get(4).getBatch().getMutationsCount());
+        assertEquals(1, ((WriteBatchRequest) client.sent.get(4)).getMutationsCount());
     }
 
     @Test
@@ -152,34 +184,55 @@ public class ServiceClientTest {
         var client = new Recorder(requests);
         var first = insert(1, 1, 1);
         var second = insert(2, 2, 1);
-        var a = encoded.request(first);
-        var b = encoded.request(second);
+        var a = TraceOperation.newBuilder().setPut((PutRequest) encoded.request(first)).build();
+        var b = TraceOperation.newBuilder().setPut((PutRequest) encoded.request(second)).build();
         client.send(1, first, a);
         client.send(2, second, b).response().toCompletableFuture().join();
-        assertSame(a.getPut(), client.sent.get(0).getBatch().getMutations(0).getPut());
-        assertSame(b.getPut(), client.sent.get(0).getBatch().getMutations(1).getPut());
+        assertSame(a.getPut(), ((WriteBatchRequest) client.sent.get(0)).getMutations(0).getPut());
+        assertSame(b.getPut(), ((WriteBatchRequest) client.sent.get(0)).getMutations(1).getPut());
         var update = IndexOperationTrace.write(3, IndexOperationTrace.UPSERT, 3, 0, IndexKey.ofInt(1),
                 1, 0, 0, 3).withWorkUnitId(2);
-        var storedWrite = encoded.request(update);
+        var storedWrite = TraceOperation.newBuilder().setPut((PutRequest) encoded.request(update)).build();
         client.send(3, update, storedWrite).response().toCompletableFuture().join();
-        assertSame(storedWrite.getPut(), client.sent.get(1).getPut());
+        assertSame(storedWrite.getPut(), client.sent.get(1));
         var members = List.of(member(0, 2, 0, IndexOperationTrace.UNION_GROUP),
                 member(1, 2, 0, IndexOperationTrace.UNION_GROUP));
-        var storedGroup = encoded.group(members);
+        var storedGroup = TraceOperation.newBuilder().setReadGroup(encoded.group(members)).build();
         client.send(4, members.get(0), storedGroup);
         client.send(5, members.get(1), storedGroup).response().toCompletableFuture().join();
-        assertSame(storedGroup.getGroup().getMembers(0).getScan(), client.sent.get(2).getScan());
-        assertSame(storedGroup.getGroup().getMembers(1).getScan(), client.sent.get(3).getScan());
+        assertEquals(2, requests.maxGroupMembers());
+        assertSame(storedGroup.getReadGroup().getRequests(0).getScan(), client.sent.get(2));
+        assertSame(storedGroup.getReadGroup().getRequests(1).getScan(), client.sent.get(3));
         var snapshots = new TraceRequests(ValueKind.ROW_ID);
         var search = IndexOperationTrace.search(12, 3, 0, Range.equal(IndexKey.ofInt(1)), 1, 0, 0);
-        var storedSearch = encoded.request(search);
+        var storedSearch = TraceOperation.newBuilder().setGet((GetRequest) encoded.request(search)).build();
         var snapshotClient = new Recorder(snapshots);
         snapshotClient.send(1, search, storedSearch).response().toCompletableFuture().join();
-        assertSame(storedSearch.getGet(), snapshotClient.sent.get(0).getGet());
+        assertSame(storedSearch.getGet(), snapshotClient.sent.get(0));
         snapshotClient.results = 1;
         var wrong = snapshotClient.send(2, search, storedSearch).response().toCompletableFuture();
         assertTrue(assertThrows(java.util.concurrent.CompletionException.class, wrong::join)
                 .getCause().getMessage().contains("Search count mismatch"));
+    }
+
+    @Test
+    public void baselineBatchesPreserveKeysVersionsAndSelectedValues() throws IOException {
+        for (var kind : List.of(ValueKind.ROW_ID, ValueKind.LOCATOR)) {
+            var requests = new TraceRequests(kind);
+            requests.baselineBatch(2);
+            var client = new Recorder(requests);
+            send(client, 1, insert(1, 7, 1));
+            send(client, 2, insert(2, 8, 1)).response().toCompletableFuture().join();
+            var batch = (WriteBatchRequest) client.sent.get(0);
+            assertEquals(2, batch.getMutationsCount());
+            for (int i = 0; i < 2; i++) {
+                var put = batch.getMutations(i).getPut();
+                assertEquals(new IndexEntry(3, 0, null, IndexKey.ofInt(7 + i)).bytes(), put.getKey());
+                assertEquals(0, put.getTs());
+                assertEquals(kind == ValueKind.ROW_ID ? IndexEntry.rowId(7 + i)
+                        : IndexEntry.locator(1, 7 + i), put.getValue());
+            }
+        }
     }
 
     @Test
@@ -188,16 +241,14 @@ public class ServiceClientTest {
         requests.baselineBatch(2);
         var client = new ServiceClient(requests) {
             @Override
-            java.util.concurrent.CompletableFuture<org.sibench.adapters.proto.Response> transmit(
-                    Request request, java.util.function.Consumer<org.sibench.adapters.proto.Response> partial) {
+            java.util.concurrent.CompletableFuture<IndexResponse> transmit(
+                    Message request, java.util.function.Consumer<IndexResponse> partial) {
                 return java.util.concurrent.CompletableFuture.completedFuture(
-                        org.sibench.adapters.proto.Response.newBuilder()
-                                .setStatus(org.sibench.adapters.proto.Status.UNAVAILABLE)
-                                .build());
+                        IndexResponse.error(IndexStatus.UNAVAILABLE, ""));
             }
         };
-        var first = client.send(1, insert(1, 1, 1)).response().toCompletableFuture();
-        var second = client.send(2, insert(2, 2, 1)).response().toCompletableFuture();
+        var first = send(client, 1, insert(1, 1, 1)).response().toCompletableFuture();
+        var second = send(client, 2, insert(2, 2, 1)).response().toCompletableFuture();
         assertTrue(first.isCompletedExceptionally());
         assertTrue(second.isCompletedExceptionally());
     }

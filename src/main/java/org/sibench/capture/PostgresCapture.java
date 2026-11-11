@@ -96,10 +96,6 @@ final class PostgresCapture implements AutoCloseable {
                     var ack=ByteBuffer.wrap(new byte[]{'E'});while(ack.hasRemaining())socket.write(ack);
                     session.ended.complete(null);return;
                 }
-                // A statement starts at its top-level executor; the previous one's end events precede it.
-                if(chunk!=null&&type.equals("executor_start")&&event.get("depth").getAsInt()==1&&transactions.splits(chunk)) {
-                    transactions.completePiece(chunk);chunk=null;
-                }
                 if(chunk==null)chunk=transactions.begin(pid);
                 chunk.append(line,event,encoded.length);
                 if(type.equals("transaction_commit")||type.equals("transaction_abort")) {

@@ -1,5 +1,6 @@
 package org.sibench.adapters;
 
+import com.google.protobuf.Message;
 import io.grpc.*;
 import io.grpc.stub.*;
 import org.sibench.adapters.proto.*;
@@ -20,28 +21,28 @@ public final class IndexServer implements AutoCloseable {
         byte[] metadata = new com.google.gson.Gson().toJson(description).getBytes(java.nio.charset.StandardCharsets.UTF_8);
         var executor = new IndexExecutor(backend);
         var service = new IndexServiceGrpc.IndexServiceImplBase() {
-            private <T> void submit(Request request, StreamObserver<T> out, Function<Response,T> result) {
+            private <T> void submit(Message request, StreamObserver<T> out, Function<IndexResponse,T> result) {
                 executor.submit(request).thenAccept(response -> finish(response, out, result));
             }
-            @Override public void put(PutRequest put, StreamObserver<WriteResponse> out) {
-                try { submit(Request.newBuilder().setPut(put).build(), out, r -> WriteResponse.getDefaultInstance()); }
+            @Override public void put(PutRequest put, StreamObserver<PutResponse> out) {
+                try { submit(put, out, r -> PutResponse.getDefaultInstance()); }
                 catch (IllegalArgumentException error) { invalid(out, error); }
             }
-            @Override public void delete(DeleteRequest delete, StreamObserver<WriteResponse> out) {
-                try { submit(Request.newBuilder().setDelete(delete).build(), out, r -> WriteResponse.getDefaultInstance()); }
+            @Override public void delete(DeleteRequest delete, StreamObserver<DeleteResponse> out) {
+                try { submit(delete, out, r -> DeleteResponse.getDefaultInstance()); }
                 catch (IllegalArgumentException error) { invalid(out, error); }
             }
-            @Override public void batchWrite(BatchWriteRequest batch, StreamObserver<WriteResponse> out) {
+            @Override public void writeBatch(WriteBatchRequest batch, StreamObserver<WriteBatchResponse> out) {
                 try {
-                    submit(Request.newBuilder().setBatch(batch).build(), out, r -> WriteResponse.getDefaultInstance());
+                    submit(batch, out, r -> WriteBatchResponse.getDefaultInstance());
                 } catch (IllegalArgumentException error) { invalid(out, error); }
             }
             @Override public void get(GetRequest get, StreamObserver<GetResponse> out) {
                 try {
-                    submit(Request.newBuilder().setGet(get).build(), out, response -> {
-                        if (response.getResultsCount() > 1) throw new IllegalArgumentException("Get returned multiple entries");
+                    submit(get, out, response -> {
+                        if (response.values().size() > 1) throw new IllegalArgumentException("Get returned multiple entries");
                         var result = GetResponse.newBuilder();
-                        if (response.getResultsCount() == 1) result.setResult(response.getResults(0));
+                        if (response.values().size() == 1) result.setValue(response.values().get(0));
                         return result.build();
                     });
                 } catch (IllegalArgumentException error) { invalid(out, error); }
@@ -51,7 +52,7 @@ public final class IndexServer implements AutoCloseable {
                     var call = (ServerCallStreamObserver<ScanResponse>) out;
                     var ready = new Object();
                     call.setOnReadyHandler(() -> { synchronized (ready) { ready.notifyAll(); } });
-                    java.util.function.Consumer<Response> send = response -> {
+                    java.util.function.Consumer<IndexResponse> send = response -> {
                         synchronized (ready) {
                             while (!call.isReady() && !call.isCancelled()) {
                                 try { ready.wait(10); }
@@ -61,11 +62,11 @@ public final class IndexServer implements AutoCloseable {
                             }
                         }
                         if (call.isCancelled()) throw new IllegalStateException("Scan cancelled");
-                        out.onNext(ScanResponse.newBuilder().addAllResults(response.getResultsList()).build());
+                        out.onNext(ScanResponse.newBuilder().addAllValues(response.values()).build());
                     };
-                    executor.submit(Request.newBuilder().setScan(scan).build(), send).thenAccept(response -> {
-                        if (response.getStatus() != org.sibench.adapters.proto.Status.OK) { failed(out, response); return; }
-                        try { if (response.getResultsCount() > 0) send.accept(response); out.onCompleted(); }
+                    executor.submit(scan, send).thenAccept(response -> {
+                        if (response.status() != IndexStatus.OK) { failed(out, response); return; }
+                        try { if (!response.values().isEmpty()) send.accept(response); out.onCompleted(); }
                         catch (RuntimeException error) { out.onError(io.grpc.Status.UNAVAILABLE.withDescription(error.toString()).asRuntimeException()); }
                     });
                 } catch (IllegalArgumentException error) { invalid(out, error); }
@@ -111,15 +112,15 @@ public final class IndexServer implements AutoCloseable {
         }
     }
 
-    private static <T> void finish(Response response, StreamObserver<T> out, Function<Response,T> result) {
-        if (response.getStatus() != org.sibench.adapters.proto.Status.OK) { failed(out, response); return; }
+    private static <T> void finish(IndexResponse response, StreamObserver<T> out, Function<IndexResponse,T> result) {
+        if (response.status() != IndexStatus.OK) { failed(out, response); return; }
         try { out.onNext(result.apply(response)); out.onCompleted(); }
         catch (RuntimeException error) { out.onError(io.grpc.Status.UNAVAILABLE.withDescription(error.toString()).asRuntimeException()); }
     }
-    private static void failed(StreamObserver<?> out, Response response) {
-        var status = response.getStatus() == org.sibench.adapters.proto.Status.INVALID
+    private static void failed(StreamObserver<?> out, IndexResponse response) {
+        var status = response.status() == IndexStatus.INVALID
                 ? io.grpc.Status.INVALID_ARGUMENT : io.grpc.Status.UNAVAILABLE;
-        out.onError(status.withDescription(response.getMessage()).asRuntimeException());
+        out.onError(status.withDescription(response.message()).asRuntimeException());
     }
     private static void invalid(StreamObserver<?> out, IllegalArgumentException error) {
         out.onError(io.grpc.Status.INVALID_ARGUMENT.withDescription(error.getMessage()).asRuntimeException());

@@ -6,7 +6,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
-import org.sibench.adapters.proto.Acknowledgement;
 
 /** Same-instance SlateDB byte storage; Java owns the shared versioned index layout. */
 final class SlateDbStore implements OrderedStore {

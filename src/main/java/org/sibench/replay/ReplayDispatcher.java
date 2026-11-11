@@ -1,5 +1,7 @@
 package org.sibench.replay;
 
+import org.sibench.adapters.proto.TraceOperation;
+
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
 
@@ -15,7 +17,7 @@ import java.util.function.LongSupplier;
  * writes keep flowing; deferred searches leave in arrival order once those writes complete.
  */
 public final class ReplayDispatcher implements AutoCloseable {
-    private record Deferred(Operation operation, org.sibench.adapters.proto.Request stored, long since, boolean measured) {}
+    private record Deferred(Operation operation, TraceOperation stored, long since, boolean measured) {}
 
     private static final class Pending {
         private final long deadline, started;
@@ -230,7 +232,7 @@ public final class ReplayDispatcher implements AutoCloseable {
         send(operation, null);
     }
 
-    public void send(Operation operation, org.sibench.adapters.proto.Request stored) throws IOException {
+    public void send(Operation operation, TraceOperation stored) throws IOException {
         checkSender();
         route(operation);
         boolean measured = admitted++ >= warmup;
@@ -265,7 +267,7 @@ public final class ReplayDispatcher implements AutoCloseable {
         }
     }
 
-    private void defer(Operation operation, org.sibench.adapters.proto.Request stored, boolean head, boolean measured)
+    private void defer(Operation operation, TraceOperation stored, boolean head, boolean measured)
             throws IOException {
         if (head) {
             int size = operation.grouped() ? operation.expansionSize() : 1;
@@ -329,7 +331,7 @@ public final class ReplayDispatcher implements AutoCloseable {
         }
     }
 
-    private void dispatch(Operation operation, org.sibench.adapters.proto.Request stored, boolean measured) throws IOException {
+    private void dispatch(Operation operation, TraceOperation stored, boolean measured) throws IOException {
         int clientId = route(operation);
         synchronized (inFlight) {
             // A buffered search group cannot produce responses until its last member arrives.

@@ -1,5 +1,8 @@
 package org.sibench.replay;
 
+import org.sibench.adapters.proto.TraceOperation;
+import org.sibench.adapters.proto.TraceRecord;
+
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
 
@@ -14,15 +17,15 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     private final boolean secondaryIndexes, sourceTransactions, snapshotOnly;
     private final String dispatchMode;
     private final ReplayDispatcher dispatcher;
-    private record Pending(Operation operation, org.sibench.adapters.proto.Request request) {}
+    private record Pending(Operation operation, TraceOperation request) {}
     private final List<Pending> pending = new ArrayList<>();
-    private org.sibench.adapters.proto.Request storedRequest;
+    private TraceOperation storedRequest;
     private final Map<String, Long> kinds = new LinkedHashMap<>();
-    private long source, dispatched, effectiveRequests, primary, secondary, filtered, transactions, abortedTransactions, controls, groups;
+    private long source, dispatched, effectiveRequests, primary, secondary, filtered, transactions, controls, groups;
     private long searchGroups;
     private long peakPending, peakSearchGroup;
     private long activeTransaction, activeVersion, lastVersion, lastTransactionId;
-    private long lastSourceEvent, maxSourceOrdinal;
+    private long lastSourceEvent;
     private record WriteIdentity(int table, int index, org.sibench.trace.IndexKey key,
             org.sibench.trace.IndexKey indexedValue) {}
     private final java.util.Set<WriteIdentity> writes = new java.util.HashSet<>();
@@ -89,8 +92,8 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     }
 
     @Override
-    public void accept(org.sibench.adapters.proto.TraceRecord record, List<Operation> views) throws IOException {
-        storedRequest = record.hasRequest() ? record.getRequest() : null;
+    public void accept(TraceRecord record, List<Operation> views) throws IOException {
+        storedRequest = record.hasOperation() ? record.getOperation() : null;
         try {
             for (Operation operation : views) accept(operation);
         } finally {
@@ -111,7 +114,6 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
             if (operation.sourceEvent() < lastSourceEvent)
                 throw new IOException("Source operation order moved backwards");
             lastSourceEvent = operation.sourceEvent();
-            maxSourceOrdinal = Math.max(maxSourceOrdinal, operation.mutationOrdinal());
         }
         if (activeTransaction != 0
                 && !IndexOperationTrace.isMutation(operation)
@@ -144,7 +146,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
             else sendOperation(operation);
             return;
         }
-        // Searches before a transaction's first write do not wait for its outcome, as in generation.
+        // Trace contains only committed transactions; prefix reads can be dispatched immediately.
         if (activeTransaction != 0 && (!pending.isEmpty() || operation.kind() != IndexOperationTrace.SEARCH)) {
             if (pending.size() >= org.sibench.capture.ProtoTrace.MAX_TRANSACTION_OPERATIONS)
                 throw new IOException("Source transaction exceeds operation buffer limit");
@@ -250,14 +252,12 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
             activeTransaction = o.transactionId();
             activeVersion = o.version();
             writes.clear();
-            lastSourceEvent = maxSourceOrdinal = 0;
+            lastSourceEvent = 0;
         } else {
-            boolean aborted = o.kind() == IndexOperationTrace.TRANSACTION_ABORT;
-            if (activeTransaction == 0
+            if (o.kind() != IndexOperationTrace.TRANSACTION_COMMIT || activeTransaction == 0
                     || o.transactionId() != activeTransaction
-                    || o.version() != activeVersion || maxSourceOrdinal > o.expectedCount())
-                throw new IOException("Source boundary identity or ordinal bound mismatch");
-            if (aborted && !writes.isEmpty()) throw new IOException("Aborted source contains exported writes");
+                    || o.version() != activeVersion)
+                throw new IOException("Invalid committed source boundary");
             if (!searchGroup.isEmpty()) throw new IOException("Search group crosses its commit");
             if (dispatchMode.equals("transaction") && !pending.isEmpty()) groups++;
             for (Pending item : pending) {
@@ -268,8 +268,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
             lastVersion = activeVersion;
             lastTransactionId = activeTransaction;
             activeTransaction = 0;
-            if (aborted) abortedTransactions++;
-            else transactions++;
+            transactions++;
         }
     }
 
@@ -308,9 +307,8 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         report.put("search_groups", searchGroups);
         report.put("filtered_secondary_operations", filtered);
         report.put("committed_transactions", transactions);
-        report.put("aborted_transactions", abortedTransactions);
         report.put("last_resolved_version", lastVersion);
-        report.put("change_delivery", sourceTransactions ? "committed_updates_and_snapshot_searches" : "baseline");
+        report.put("change_delivery", sourceTransactions ? "committed_transactions" : "baseline");
         report.put("transaction_control_records", controls);
         report.put("dispatch_mode", dispatchMode);
         report.put("source_dispatch_groups", groups);

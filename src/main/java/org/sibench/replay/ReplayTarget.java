@@ -1,5 +1,6 @@
 package org.sibench.replay;
 
+import org.sibench.adapters.proto.TraceOperation;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
 
@@ -16,15 +17,10 @@ public interface ReplayTarget extends AutoCloseable {
      * send API return. This is not a peer acknowledgement. response completes after
      * matching and validating the response against this operation; mismatches complete
      * exceptionally. The adapter owns transport cancellation on close and must not reorder local
-     * sends.
+     * sends. Service clients require the stored Trace payload; logical reference targets may
+     * consume the operation view alone.
      */
-    SendHandle send(long dispatchSequence, Operation operation) throws IOException;
-
-    /** Logical reference targets consume views; service clients forward the stored payload. */
-    default SendHandle send(long dispatchSequence, Operation operation,
-            org.sibench.adapters.proto.Request stored) throws IOException {
-        return send(dispatchSequence, operation);
-    }
+    SendHandle send(long dispatchSequence, Operation operation, TraceOperation stored) throws IOException;
 
     /** Sends whatever the client still holds back, such as a partial batch, before a drain. */
     default void flush() throws IOException {}
@@ -55,14 +51,10 @@ public interface ReplayTarget extends AutoCloseable {
 
     /** In-process references execute immediately; they do not claim network send semantics. */
     static Factory immediate(IndexOperationTrace.Consumer consumer) {
-        return clientId -> new ReplayTarget() {
-                @Override
-                public SendHandle send(long sequence, Operation operation) throws IOException {
-                    consumer.accept(operation);
-                    return SendHandle.completed();
-                }
-
-            };
+        return clientId -> (sequence, operation, stored) -> {
+            consumer.accept(operation);
+            return SendHandle.completed();
+        };
     }
 
     @Override
