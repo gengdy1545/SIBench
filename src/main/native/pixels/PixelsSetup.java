@@ -23,7 +23,7 @@ import net.sourceforge.argparse4j.inf.Namespace;
  * <pre>
  * init-meta
  * create SCHEMA BASE_DIRECTORY SPEC OUTPUT   SPEC lines: table TAB primary-key TAB name:type;...
- * load SCHEMA TABLES DIRECTORY ROWS_PER_FILE THREADS
+ * load SCHEMA TABLES DIRECTORY ROWS_PER_FILE THREADS COUNTS
  * </pre>
  */
 public final class PixelsSetup {
@@ -40,7 +40,8 @@ public final class PixelsSetup {
                 create(args[1], Path.of(args[2]), Path.of(args[3]), Path.of(args[4]));
             }
             case "load" -> {
-                if (args.length != 6) usage();
+                if (args.length != 7) usage();
+                var counts = new StringBuilder();
                 for (String table : args[2].split(",")) {
                     long started = System.nanoTime();
                     System.out.println("SIBench LOAD begin " + table + " " + java.time.Instant.now());
@@ -54,8 +55,24 @@ public final class PixelsSetup {
                     options.put("encoding_level", "2");
                     options.put("nulls_padding", "false");
                     new LoadExecutor().execute(new Namespace(options), "LOAD");
+                    long rows = 0;
+                    var metadata = MetadataService.Instance();
+                    var layout = metadata.getLatestLayout(args[1], table);
+                    var paths = new ArrayList<>(layout.getOrderedPaths());
+                    paths.addAll(layout.getCompactPaths());
+                    for (var path : paths) for (var file : metadata.getRegularFiles(path.getId())) {
+                        String uri = io.pixelsdb.pixels.common.metadata.domain.File.getFilePath(path, file);
+                        try (var reader = io.pixelsdb.pixels.core.PixelsReaderImpl.newBuilder().setPath(uri)
+                                .setStorage(io.pixelsdb.pixels.common.physical.StorageFactory.Instance().getStorage(uri))
+                                .setEnableCache(false).setCacheOrder(List.of()).setPixelsCacheReader(null)
+                                .setPixelsFooterCache(new io.pixelsdb.pixels.core.PixelsFooterCache()).build()) {
+                            rows = Math.addExact(rows, reader.getNumberOfRows());
+                        }
+                    }
+                    counts.append(table).append('\t').append(rows).append('\n');
                     System.out.println("SIBench LOAD complete " + table + " seconds=" + (System.nanoTime() - started) / 1e9);
                 }
+                Files.writeString(Path.of(args[6]), counts, java.nio.file.StandardOpenOption.CREATE_NEW);
             }
             default -> usage();
         }
@@ -103,6 +120,6 @@ public final class PixelsSetup {
     }
 
     private static void usage() {
-        throw new IllegalArgumentException("PixelsSetup init-meta | create SCHEMA BASE SPEC OUTPUT | load SCHEMA TABLE DIR ROWS THREADS");
+        throw new IllegalArgumentException("PixelsSetup init-meta | create SCHEMA BASE SPEC OUTPUT | load SCHEMA TABLE DIR ROWS THREADS COUNTS");
     }
 }

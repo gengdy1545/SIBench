@@ -28,6 +28,35 @@ engines:
   postgres: config/engine/postgres.yaml
   rocksdb: config/engine/rocksdb.yaml
   pixels: config/engine/pixels/pixels.yaml
+# pixels-experiment CONFIG INPUT_DIRECTORY OUTPUT_DIRECTORY; independent of prepare-cdc.
+pixels_experiment:
+  trace: false
+  updates: true
+  max_transactions: 0 # Complete source transaction prefix; zero consumes all files once.
+  timeout_seconds: 600
+  queries:
+    enabled: false
+    timing: after # after the selected updates, or during their application
+    directory: "" # Ready-to-run Trino .sql files, sorted by filename.
+    rounds: 1
+  freshness:
+    enabled: false
+    table: savingaccount
+    column: fresh_ts
+    sample_seconds: 5
+  trino:
+    # Empty uses an existing cluster. A verified build on pixels_host starts a run-scoped node.
+    deployment_directory: ""
+    server: http://127.0.0.1:8080
+    user: sibench
+    catalog: pixels
+    schema: postgres
+    timeout_seconds: 120
+    heap: 40G
+    query_memory: 24GB
+    query_total_memory: 28GB
+    heap_headroom: 12GB
+    threads: 32
 analysis:
   layout:
     entries_per_block: 256

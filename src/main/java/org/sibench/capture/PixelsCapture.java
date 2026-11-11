@@ -138,6 +138,9 @@ final class PixelsCapture implements AutoCloseable {
     /** The generator stops the sink after its last marker; the report connection may then close. */
     void sinkStopping() { sinkStopping = true; }
 
+    void begin(long timestamp) throws Exception { put(new Begin(timestamp)); }
+    void commit(long timestamp) throws Exception { put(new Commit(timestamp)); }
+
     void check() throws IOException {
         if (failure != null) throw new IOException("Pixels capture failed", failure);
     }

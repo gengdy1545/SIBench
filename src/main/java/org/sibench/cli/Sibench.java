@@ -23,6 +23,9 @@ public final class Sibench {
 
     private static void printServiceHelp(PrintStream out) {
         out.println("       java -jar build/sibench/sibench.jar generate [--root PATH] CONFIG");
+        out.println("       java -jar build/sibench/sibench.jar prepare-cdc [--root PATH] CONFIG");
+        out.println("       java -jar build/sibench/sibench.jar check-cdc-input INPUT_DIRECTORY");
+        out.println("       java -jar build/sibench/sibench.jar pixels-experiment CONFIG INPUT_DIRECTORY OUTPUT_DIRECTORY");
         out.println(
                 "       java -jar build/sibench/sibench.jar pixels-host ADDRESS:PORT BUILD WORK_ROOT TOKEN_FILE"
                         + "   (Pixels side of CDC generation for a remote pixels_host)");
@@ -61,6 +64,9 @@ public final class Sibench {
             if (!List.of(
                             "inspect-scale",
                             "generate",
+                            "prepare-cdc",
+                            "check-cdc-input",
+                            "pixels-experiment",
                             "pixels-host",
                             "check-replay",
                             "index-server",
@@ -91,6 +97,24 @@ public final class Sibench {
                 } else {
                     profiles.add(args[i]);
                 }
+            }
+            if (args[0].equals("pixels-experiment")) {
+                if (profiles.size() != 3) throw new IllegalArgumentException("pixels-experiment requires CONFIG INPUT_DIRECTORY OUTPUT_DIRECTORY");
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(org.sibench.capture.PixelsExperiment.run(
+                        root, Path.of(profiles.get(0)), Path.of(profiles.get(1)), Path.of(profiles.get(2)))));
+                return 0;
+            }
+            if (args[0].equals("prepare-cdc")) {
+                if (profiles.size() != 1) throw new IllegalArgumentException("prepare-cdc requires one runtime CONFIG");
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(
+                        org.sibench.capture.CdcPreparation.run(root, Path.of(profiles.get(0)))));
+                return 0;
+            }
+            if (args[0].equals("check-cdc-input")) {
+                if (profiles.size() != 1) throw new IllegalArgumentException("check-cdc-input requires INPUT_DIRECTORY");
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(
+                        org.sibench.capture.CdcInput.check(root.resolve(profiles.get(0)))));
+                return 0;
             }
             if (args[0].equals("generate")) {
                 if (profiles.size() != 1) throw new IllegalArgumentException("generate requires one runtime CONFIG");

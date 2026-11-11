@@ -82,7 +82,7 @@ final class PixelsGeneration {
                 var budget = new RequestBudget(Generation.requestTarget(input.document()), input.timeout());
                 var overlay = object(settings, "properties");
                 var pixels = host.call(Map.of("op", "start", "run", hostSetting.equals("local") ? "pixels" : output.getFileName().toString(), "overlay", overlay,
-                        "memory", object(settings, "memory"), "trace_endpoint", address.getHostAddress() + ":" + traceListener.getLocalPort(),
+                        "memory", object(settings, "memory"), "trace", true, "trace_endpoint", address.getHostAddress() + ":" + traceListener.getLocalPort(),
                         "trace_token", traceToken));
                 Path sinkRoot = Files.createDirectory(output.resolve("sink"));
                 Path pixelsConfig = Files.writeString(sinkRoot.resolve("pixels.properties"), pixels.get("properties").getAsString());
@@ -193,21 +193,11 @@ final class PixelsGeneration {
     static Process replicate(PostgresDatabase database, PixelsCapture capture, SourceSchema source,
             Path build, Map<String, Object> settings, Path sinkRoot, Path pixelsConfig, int reportPort, String reportToken,
             Duration timeout) throws Exception {
-        try (var setup = database.connect("replication")) {
-            var names = new ArrayList<String>();
-            for (var table : source.tables()) names.add(quote(table.name()));
-            names.add(MARKER);
-            execute(setup, "CREATE PUBLICATION " + SLOT + " FOR TABLE " + String.join(",", names));
-            execute(setup, "SELECT pg_create_logical_replication_slot('" + SLOT + "','pgoutput')");
-        }
+        createSlot(database, source);
         Path sinkConfig = sinkRoot.resolve("sink.properties");
-        Files.writeString(sinkConfig, sinkProperties(object(settings, "sink_properties"), sinkRoot, database.port()),
+        Files.writeString(sinkConfig, sinkProperties(object(settings, "sink_properties"), sinkRoot, database.port(), "retina"),
                 StandardOpenOption.CREATE_NEW);
-        // The bundled logging records every change event at DEBUG, twice; generation keeps INFO on stdout.
-        Path logging = Files.writeString(sinkRoot.resolve("log4j2.properties"), "status=warn\n"
-                + "appender.console.type=Console\nappender.console.name=STDOUT\n"
-                + "appender.console.layout.type=PatternLayout\nappender.console.layout.pattern=%d [%c]-[%p] %m%n\n"
-                + "rootLogger.level=info\nrootLogger.appenderRef.stdout.ref=STDOUT\n", StandardOpenOption.CREATE_NEW);
+        Path logging = sinkLogging(sinkRoot);
         var command = new ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
                 "-Xmx" + string(object(settings, "memory"), "sink_heap"), "-Dlog4j2.configurationFile=" + logging,
                 "-Dsibench.report.endpoint=127.0.0.1:" + reportPort, "-Dsibench.report.token=" + reportToken,
@@ -220,12 +210,30 @@ final class PixelsGeneration {
         Runtime.getRuntime().addShutdownHook(new Thread(sink::destroyForcibly, "sibench-pixels-sink-cleanup"));
         capture.acceptSink(timeout);
         try {
-            awaitSlot(database, sink, capture);
+            awaitSlot(database, sink, capture::check);
             return sink;
         } catch (Exception | Error failure) {
             sink.destroyForcibly();
             throw failure;
         }
+    }
+
+    static void createSlot(PostgresDatabase database, SourceSchema source) throws Exception {
+        try (var setup = database.connect("replication")) {
+            var names = new ArrayList<String>();
+            for (var table : source.tables()) names.add(quote(table.name()));
+            names.add(MARKER);
+            execute(setup, "CREATE PUBLICATION " + SLOT + " FOR TABLE " + String.join(",", names));
+            execute(setup, "SELECT pg_create_logical_replication_slot('" + SLOT + "','pgoutput')");
+        }
+    }
+
+    static Path sinkLogging(Path sinkRoot) throws IOException {
+        // The bundled logging records every change event at DEBUG, twice; generation keeps INFO on stdout.
+        return Files.writeString(sinkRoot.resolve("log4j2.properties"), "status=warn\n"
+                + "appender.console.type=Console\nappender.console.name=STDOUT\n"
+                + "appender.console.layout.type=PatternLayout\nappender.console.layout.pattern=%d [%c]-[%p] %m%n\n"
+                + "rootLogger.level=info\nrootLogger.appenderRef.stdout.ref=STDOUT\n", StandardOpenOption.CREATE_NEW);
     }
 
     /** PostgreSQL and Pixels independently load the same bound CSVs; neither reads the other's database. */
@@ -337,12 +345,12 @@ final class PixelsGeneration {
         execute(database, "ALTER TABLE " + MARKER + " REPLICA IDENTITY FULL");
     }
 
-    private static String sinkProperties(Map<String, Object> overrides, Path root, int port) {
+    static String sinkProperties(Map<String, Object> overrides, Path root, int port, String mode) {
         var generated = new LinkedHashMap<String, String>();
         generated.put("sink.datasource", "engine");
         generated.put("sink.datasource.engine.format", "connect");
         generated.put("sink.debezium.dialect", "postgresql");
-        generated.put("sink.mode", "retina");
+        generated.put("sink.mode", mode);
         generated.put("sink.retina.mode", "stream");
         generated.put("sink.trans.mode", "batch");
         generated.put("sink.storage.loop", "false");
@@ -380,11 +388,11 @@ final class PixelsGeneration {
     }
 
     /** Debezium streams from the pre-created slot once it is active; the workload starts only then. */
-    private static void awaitSlot(PostgresDatabase database, Process sink, PixelsCapture capture) throws Exception {
+    static void awaitSlot(PostgresDatabase database, Process sink, NativeProcess.Check check) throws Exception {
         long deadline = System.nanoTime() + CONNECT.toNanos();
         try (var control = database.connect("slot")) {
             while (true) {
-                capture.check();
+                check.run();
                 if (!sink.isAlive()) throw new IOException("pixels-sink exited with " + sink.exitValue());
                 try (var query = control.createStatement();
                      var rows = query.executeQuery("SELECT active FROM pg_replication_slots WHERE slot_name = '" + SLOT + "'")) {

@@ -24,6 +24,6 @@ public final class TracingIndexProvider implements SinglePointIndexProvider {
 
     @Override
     public boolean compatibleWith(@Nonnull SinglePointIndex.Scheme scheme) {
-        return rocksdb.compatibleWith(scheme);
+        return System.getProperty("sibench.trace.endpoint") != null && rocksdb.compatibleWith(scheme);
     }
 }

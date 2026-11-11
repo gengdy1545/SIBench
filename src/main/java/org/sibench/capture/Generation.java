@@ -40,8 +40,20 @@ public final class Generation {
 
     /** Validate every selected input before creating any run output or launching a database. */
     static Plan plan(Path root,Path configuration)throws Exception {
+        return plan(root,configuration,false);
+    }
+
+    static Plan cdcPlan(Path root,Path configuration)throws Exception {
+        return plan(root,configuration,true);
+    }
+
+    private static Plan plan(Path root,Path configuration,boolean prepareCdc)throws Exception {
         root=root.toRealPath();var runtime=SibenchConfig.read(root.resolve(configuration));
         var selections=BenchmarkSelection.read(root,runtime);
+        if(prepareCdc) {
+            selections=selections.stream().filter(s->s.benchmark().equals("hybench")&&s.mode()==Mode.CDC).toList();
+            require(selections.size()==1,"prepare-cdc requires one HyBench/cdc/Pixels selection");
+        }
         var engines=new java.util.EnumMap<Engine,NativeBuild>(Engine.class);
         for(var selection:selections)if(!engines.containsKey(selection.engine())) {
             Engine engine=selection.engine();var settings=SibenchConfig.engine(root,runtime,engine);
@@ -298,7 +310,7 @@ public final class Generation {
         long start=System.nanoTime();T manifest=publish.call();
         timings.put("publication_seconds",seconds(start));start=System.nanoTime();
         try{deleteTree(database);}
-        catch(IOException failure){throw new IOException("Trace published; closed database remains at "+database,failure);}
+        catch(IOException failure){throw new IOException("Artifact published; closed database remains at "+database,failure);}
         timings.put("database_cleanup_seconds",seconds(start));
         return manifest;
     }

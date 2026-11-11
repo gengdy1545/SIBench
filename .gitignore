@@ -1,6 +1,8 @@
-# OS and editor files
+# Operating system files
 .DS_Store
 Thumbs.db
+
+# Editor files
 .idea/
 .vscode/
 *.swp
@@ -23,26 +25,22 @@ __pycache__/
 .ruff_cache/
 .ipynb_checkpoints/
 
-# Root-level build and temporary directories
+# Root build outputs
 /build/
 /dist/
 /target/
+
+# Root temporary directories
 /tmp/
 /temp/
 
-# Local benchmark output (keep shared fixtures and reports elsewhere)
+# Local benchmark and service output
 /results/
 /logs/
 *.log
 *.pid
 
-# Submodules are tracked; manage their generated files in their own .gitignore.
-
-# Local codegraph state
-/.codegraph/
-
-# Local development context; excluded from the source deliverable.
+# Local development and tool state
 /develop/
-
-# AI
+/.codegraph/
 /.claude/

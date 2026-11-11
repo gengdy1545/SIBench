@@ -13,6 +13,18 @@ import java.nio.file.*;
 import java.util.*;
 
 public class SourceSchemaTest {
+    @Test public void capturedDdlUsesBoundBytesAndRecordedSourceIdentity() throws Exception {
+        Path directory = Files.createTempDirectory("sibench-captured-ddl-");
+        Path ddl = Files.writeString(directory.resolve("schema.sql"), "CREATE TABLE a(id int PRIMARY KEY);\n");
+        try {
+            String digest = org.sibench.config.Digests.sha256(ddl);
+            var source = SourceSchema.captured(ddl, "captured-source", digest);
+            assertEquals("captured-source", source.sourceCommit());
+            assertEquals("a", source.tables().get(0).name());
+            Files.writeString(ddl, "CREATE TABLE b(id int PRIMARY KEY);\n");
+            assertThrows(IOException.class, () -> SourceSchema.captured(ddl, "captured-source", digest));
+        } finally { Files.delete(ddl);Files.delete(directory); }
+    }
     static Map<String, Object> config(String path) throws IOException {
         return ConfigValues.parse(Files.readString(Path.of(path)));
     }

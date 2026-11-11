@@ -28,7 +28,7 @@ public final class PixelsConfig {
             "sink.monitor.freshness.level", "sink.retina.log.queue", "sink.datasource.rate.limit", "sink.retina.client",
             "sink.retina.trans.limit", "sink.datasource.decode.threads", "sink.timeout.ms", "sink.flush.batch.size",
             "sink.flush.interval.ms", "sink.commit.method", "sink.commit.batch.size", "sink.commit.batch.worker",
-            "sink.commit.batch.delay", "sink.trans.batch.size", "debezium.tombstones.on.delete", "debezium.max.batch.size",
+            "sink.commit.batch.delay", "sink.trans.batch.size", "sink.proto.maxRecords", "debezium.tombstones.on.delete", "debezium.max.batch.size",
             "debezium.max.queue.size", "debezium.max.queue.size.in.bytes", "debezium.poll.interval.ms");
 
     static Map<String, Object> read(Path directory, Map<String, Object> settings) throws IOException {
@@ -73,6 +73,8 @@ public final class PixelsConfig {
             require(SINK_OVERRIDES.contains(key), "Unsupported or generator-owned pixels-sink property: " + key);
             require(!key.equals("sink.monitor.freshness.level") || overrides.get(key).equals("none"),
                     "Pixels CDC generation disables freshness query workloads");
+            require(!key.equals("sink.proto.maxRecords") || Integer.parseInt(overrides.get(key)) > 0,
+                    "sink.proto.maxRecords must be a positive transaction count");
             require(overrides.get(key).indexOf('\n') < 0 && overrides.get(key).indexOf('\r') < 0,
                     "Multiline pixels-sink property: " + key);
         }

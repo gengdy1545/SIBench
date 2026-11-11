@@ -14,12 +14,14 @@ import org.sibench.schema.SourceSchema;
 
 /** Converts the same HyBench CSVs PostgreSQL reads into bounded, parallel Pixels LOAD inputs. */
 final class PixelsInputs {
-    record Prepared(PixelsSchema.Spec schema, Map<String, Long> rows) {}
+    record Prepared(PixelsSchema.Spec schema, Map<String, Long> rows, Map<String, String> sha256) {}
     private PixelsInputs() {}
 
+    static Prepared inspect(SourceSchema source, Path data) throws IOException {
+        return prepare(source, data, null, Long.MAX_VALUE);
+    }
+
     static Prepared prepare(SourceSchema source, Path data, Path output, long shardRows) throws IOException {
-        if (shardRows < 1) throw new IllegalArgumentException("Invalid LOAD shard size");
-        Files.createDirectory(output);
         var files = new LinkedHashMap<String, Path>();
         for (String line : Files.readAllLines(source.source().resolve("conf/load_data_pg.sql"))) {
             if (line.isBlank()) continue;
@@ -27,19 +29,29 @@ final class PixelsInputs {
             if (copy == null || files.put(copy[0].toLowerCase(java.util.Locale.ROOT), data.resolve(copy[1])) != null)
                 throw new IOException("Invalid HyBench load statement: " + line);
         }
+        return prepare(source, files, output, shardRows);
+    }
+
+    static Prepared prepare(SourceSchema source, Map<String, Path> baseline, Path output, long shardRows) throws IOException {
+        if (shardRows < 1) throw new IllegalArgumentException("Invalid LOAD shard size");
+        if (output != null) Files.createDirectory(output);
+        var files = new LinkedHashMap<>(baseline);
         var counts = new LinkedHashMap<String, Long>();
+        var hashes = new LinkedHashMap<String, String>();
         var keyTypes = new LinkedHashMap<String, String>();
         var spec = new StringBuilder();
         for (var table : source.tables()) {
             Path input = files.remove(table.name());
             if (input == null) throw new IOException("Missing CSV for " + table.name());
-            Path directory = Files.createDirectory(output.resolve(table.name()));
+            Path directory = output == null ? null : Files.createDirectory(output.resolve(table.name()));
             var types = new ArrayList<String>();
             for (var column : table.columns()) types.add(PixelsSchema.type(column.type()));
             long[] maximum = new long[types.size()];
             long rows = 0;
             BufferedWriter writer = null;
-            try (var reader = new BufferedReader(Files.newBufferedReader(input, StandardCharsets.UTF_8), 1 << 20)) {
+            var digest = org.sibench.config.Digests.digest();
+            try (var reader = new BufferedReader(new java.io.InputStreamReader(new java.security.DigestInputStream(
+                    Files.newInputStream(input), digest), StandardCharsets.UTF_8), 1 << 20)) {
                 for (String line; (line = reader.readLine()) != null;) {
                     List<String> fields = csv(line);
                     if (fields.size() != types.size()) throw new IOException("CSV column count differs: " + table.name() + " row " + (rows + 1));
@@ -71,17 +83,18 @@ final class PixelsInputs {
                         if (type.equals("varchar")) maximum[i] = Math.max(maximum[i], value.getBytes(StandardCharsets.UTF_8).length);
                         text.append(value);
                     }
-                    if (rows % shardRows == 0) {
+                    if (directory != null && rows % shardRows == 0) {
                         if (writer != null) writer.close();
                         writer = new BufferedWriter(Files.newBufferedWriter(directory.resolve(String.format("part-%06d.tbl", rows / shardRows)),
                                 StandardCharsets.UTF_8), 1 << 20);
                     }
-                    writer.append(text).append('\n');
+                    if (writer != null) writer.append(text).append('\n');
                     rows++;
                     if (Thread.currentThread().isInterrupted()) throw new IOException("Pixels input preparation interrupted");
                 }
             } finally { if (writer != null) writer.close(); }
             counts.put(table.name(), rows);
+            hashes.put(table.name(), java.util.HexFormat.of().formatHex(digest.digest()));
             String key = table.indexes().stream().filter(SourceSchema.Index::primary).findFirst().orElseThrow().column();
             var columns = new ArrayList<String>();
             for (int i = 0; i < types.size(); i++) {
@@ -95,7 +108,7 @@ final class PixelsInputs {
         if (!files.isEmpty()) throw new IOException("Unexpected HyBench CSV tables: " + files.keySet());
         spec.append("sibench_marker\tid\tid:bigint\n");
         keyTypes.put("sibench_marker", "bigint");
-        return new Prepared(new PixelsSchema.Spec(spec.toString(), keyTypes), Map.copyOf(counts));
+        return new Prepared(new PixelsSchema.Spec(spec.toString(), keyTypes), Map.copyOf(counts), Map.copyOf(hashes));
     }
 
     /** PostgreSQL COPY CSV: unquoted empty is NULL, quoted empty is an empty string. */

@@ -41,6 +41,6 @@ public class GenerationTest {
     @Test public void cleanupFailureReportsTheRemainingDatabaseAfterPublication()throws Exception {
         var missing=temporary.getRoot().toPath().resolve("absent");
         var failure=assertThrows(IOException.class,()->Generation.publishThenDiscard(()->"published",missing,new LinkedHashMap<>()));
-        assertTrue(failure.getMessage().startsWith("Trace published; closed database remains at "+missing));
+        assertTrue(failure.getMessage().startsWith("Artifact published; closed database remains at "+missing));
     }
 }

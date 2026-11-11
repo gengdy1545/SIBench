@@ -51,7 +51,7 @@ public class PixelsCdcCheck {
              var capture = new PixelsCapture(trace, traceSocket, "trace-test", reportSocket, "sink-test")) {
             var pixels = host.call(Map.of("op", "start", "run", "pixels", "overlay", object(settings, "properties"),
                     "memory", Map.of("coordinator_heap", "1g", "retina_heap", "4g"),
-                    "trace_endpoint", "127.0.0.1:" + traceSocket.getLocalPort(), "trace_token", "trace-test"));
+                    "trace", true, "trace_endpoint", "127.0.0.1:" + traceSocket.getLocalPort(), "trace_token", "trace-test"));
             capture.acceptTracer(timeout);
             PixelsGeneration.loadBaseline(database, host, capture, trace, source, data, output, expected, object(settings, "load"), timeout);
             if (loadFailure) {

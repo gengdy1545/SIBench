@@ -1,0 +1,7 @@
+diff --git a/connector/src/main/java/io/pixelsdb/pixels/trino/PixelsTypeParser.java b/connector/src/main/java/io/pixelsdb/pixels/trino/PixelsTypeParser.java
+--- a/connector/src/main/java/io/pixelsdb/pixels/trino/PixelsTypeParser.java
++++ b/connector/src/main/java/io/pixelsdb/pixels/trino/PixelsTypeParser.java
+@@ -61,1 +61,2 @@
+-            return this.baseRegistry.fromSqlType(signature);
++            // Pixels float is a 32-bit IEEE value; Trino names that type real.
++            return this.baseRegistry.fromSqlType(signature.equalsIgnoreCase("float") ? "real" : signature);

@@ -108,6 +108,15 @@
         </configuration>
         <executions>
           <execution>
+            <id>pixels-cdc-protobuf</id>
+            <goals><goal>compile</goal></goals>
+            <configuration>
+              <protoSourceRoot>${project.basedir}/third_party/pixels/proto</protoSourceRoot>
+              <includes><include>sink.proto</include></includes>
+              <outputDirectory>${project.build.directory}/generated-sources/pixels-cdc</outputDirectory>
+            </configuration>
+          </execution>
+          <execution>
             <goals>
               <goal>compile</goal>
               <goal>compile-custom</goal>

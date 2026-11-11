@@ -30,6 +30,7 @@ public class PixelsInputsTest {
         var source = SourceSchema.hybench(HybenchTest.source());
         Path output = temporary.getRoot().toPath().resolve("pixels");
         var prepared = PixelsInputs.prepare(source, csv, output, 2);
+        assertEquals(prepared, PixelsInputs.inspect(source, csv));
         assertEquals(3L, prepared.rows().get("transfer").longValue());
         try (var files = Files.list(output.resolve("transfer"))) { assertEquals(2, files.count()); }
         assertEquals(List.of("10|2|1|50|salary    |2023-01-01 00:00:00|\\N", "11|2|1|60|salary    |2023-01-01 00:00:00|\\N"),

@@ -17,7 +17,11 @@ public class ReplayConfigTest {
         String template = Files.readString(root.resolve("config/sibench.yaml"));
         var simple = ReplayConfig.read(root, Path.of("config/sibench.yaml"));
         assertFalse(simple.secondaryIndexes());
-        assertTrue(ReplayConfig.from(parse(template.replace("enabled: false", "enabled: true"))).secondaryIndexes());
+        var withSecondary = parse(template);
+        var target = object(withSecondary, "target");
+        target.put("secondary_indexes", Map.of("enabled", true));
+        withSecondary.put("target", target);
+        assertTrue(ReplayConfig.from(withSecondary).secondaryIndexes());
         assertEquals(org.sibench.adapters.proto.ValueKind.ROW_ID,
                 org.sibench.adapters.ServiceConfig.ofReplay(root, parse(template)).value());
         assertEquals(org.sibench.adapters.proto.ValueKind.LOCATOR,

@@ -53,7 +53,7 @@ if [[ "$phase" == java ]]; then
   cp "$build/source/pixels/pixels-cli/target/pixels-cli-0.2.0-SNAPSHOT-full.jar" "$build/jars/pixels-cli.jar"
   cp "$build/source/pixels-sink/target/pixels-sink-0.2.0-SNAPSHOT-full.jar" "$build/jars/pixels-sink.jar"
   mkdir -p "$build/tracer/classes/META-INF/services"
-  javac --release 17 -nowarn -d "$build/tracer/classes" -cp "$build/jars/pixels-daemon.jar:$build/jars/pixels-cli.jar" \
+  javac --release 17 -nowarn -d "$build/tracer/classes" -cp "$build/jars/pixels-sink.jar:$build/jars/pixels-daemon.jar:$build/jars/pixels-cli.jar" \
     "$root"/src/main/native/pixels/*.java
   echo org.sibench.pixels.TracingIndexProvider \
     > "$build/tracer/classes/META-INF/services/io.pixelsdb.pixels.common.index.SinglePointIndexProvider"

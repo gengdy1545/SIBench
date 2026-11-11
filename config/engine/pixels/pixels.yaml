@@ -1,5 +1,7 @@
 # Pixels CDC generation engine. HyBench runs on an uninstrumented source PostgreSQL; pixels-sink
 # applies its committed changes to Pixels Retina, whose primary-index calls form the Trace.
+# prepare-cdc uses the same build's source PostgreSQL and sink, retaining baseline/row-CDC input
+# without starting Pixels or contacting pixels_host. See docs/cdc-input.md.
 # Endpoints, run directories and semantic switches are assigned by the generator; the property
 # files below hold only overrides of the upstream defaults pinned by third_party/.
 schema_version: 1

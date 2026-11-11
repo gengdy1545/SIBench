@@ -56,6 +56,8 @@ public final class SourceTransactionsProbe {
         valid.accept(control("tx","END",3,List.of(collection("a",2),collection("b",1))),DebeziumRecordType.TRANSACTION);
         valid.accept(control("empty","BEGIN",0,List.of()),DebeziumRecordType.TRANSACTION);
         valid.accept(control("empty","END",0,List.of()),DebeziumRecordType.TRANSACTION);
+        valid.finish();
+        reject(()->begin().finish());
         reject(()->new SibenchSourceTransactions().accept(row("tx","a",1,1),DebeziumRecordType.ROW));
         reject(()->begin().accept(row("foreign","a",1,1),DebeziumRecordType.ROW));
         reject(()->begin().accept(row("tx","a",2,1),DebeziumRecordType.ROW));

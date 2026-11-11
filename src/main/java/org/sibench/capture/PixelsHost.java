@@ -227,6 +227,7 @@ public final class PixelsHost {
                     try {
                         reply(handle(request));
                     } catch (Exception failure) {
+                        failure.printStackTrace(System.err);
                         reply(Map.of("error", String.valueOf(failure)));
                         // Failed uploads leave an unread body; never parse it as another request.
                         return;
@@ -253,6 +254,7 @@ public final class PixelsHost {
                 case "create" -> create(request);
                 case "upload" -> upload(request);
                 case "load" -> load(request);
+                case "start-query" -> startQuery(request);
                 case "check" -> check();
                 case "stop" -> stop();
                 case "delete" -> delete();
@@ -329,8 +331,9 @@ public final class PixelsHost {
             launch("coordinator", daemon(memory.get("coordinator_heap").getAsString(), "coordinator", List.of(), build.resolve("jars/pixels-daemon.jar").toString()),
                     Map.of());
             await(address, ports.get("metadata"));
-            var trace = List.of("-Dsibench.trace.endpoint=" + request.get("trace_endpoint").getAsString(),
-                    "-Dsibench.trace.token=" + request.get("trace_token").getAsString());
+            var trace = request.get("trace").getAsBoolean()
+                    ? List.of("-Dsibench.trace.endpoint=" + request.get("trace_endpoint").getAsString(),
+                            "-Dsibench.trace.token=" + request.get("trace_token").getAsString()) : List.<String>of();
             launch("retina", daemon(memory.get("retina_heap").getAsString(), "retina", trace,
                     build.resolve("jars/sibench-pixels.jar") + ":" + build.resolve("jars/pixels-daemon.jar")),
                     // As upstream run-class.sh: the Retina library may link the JDK's libjawt.so.
@@ -348,6 +351,27 @@ public final class PixelsHost {
             command.addAll(List.of("-Dio.netty.leakDetection.level=advanced", "-Doperation=start", "-Drole=" + role, "-cp", classpath,
                     "io.pixelsdb.pixels.daemon.Pixels" + Character.toUpperCase(role.charAt(0)) + role.substring(1)));
             return command;
+        }
+
+        private Map<String, ?> startQuery(JsonObject request) throws Exception {
+            if (run == null || stopped || processes.containsKey("trino")) throw new IOException("No fresh Pixels query session");
+            var settings = org.sibench.config.ConfigValues.parse(request.get("settings").toString());
+            Path deployment = Path.of(org.sibench.config.ConfigValues.string(settings, "deployment_directory")).toRealPath();
+            var pixelsIdentity = PixelsBuild.identity(build).getAsJsonObject("java");
+            var identity = TrinoHost.verify(deployment, pixelsIdentity.get("pixels_commit").getAsString());
+            if (!identity.get("pixels_patch_sha256").equals(pixelsIdentity.get("pixels_patch_sha256")))
+                throw new IOException("Trino connector and Pixels patches differ");
+            String address = socket.getLocalAddress().getHostAddress();
+            int port = freePort(address);
+            Path query = Files.createDirectory(run.resolve("trino"));
+            String javaHome = deployment.resolve(identity.get("java_home").getAsString()).toString();
+            launch("trino", TrinoHost.command(deployment, query, address, port, settings, identity),
+                    Map.of("JAVA_HOME", javaHome, "PATH", javaHome + "/bin:" + System.getenv("PATH")));
+            String server = "http://" + address + ":" + port;
+            var readiness = TrinoHost.await(server, processes.get("trino"), requestTimeout);
+            return Map.of("server", server, "deployment", identity, "settings", settings, "readiness", readiness,
+                    "jvm_options", Files.readAllLines(query.resolve("etc/jvm.config")),
+                    "server_properties", Files.readString(query.resolve("etc/config.properties")));
         }
 
         private String setup(String... arguments) throws Exception {
@@ -413,9 +437,15 @@ public final class PixelsHost {
                 tables.add(table);
             }
             setup("load", request.get("schema").getAsString(), String.join(",", tables), run.resolve("load").toString(),
-                    request.get("rows_per_file").getAsString(), request.get("threads").getAsString());
+                    request.get("rows_per_file").getAsString(), request.get("threads").getAsString(), run.resolve("loaded-rows.tsv").toString());
+            var rows = new LinkedHashMap<String, Long>();
+            for (String line : Files.readAllLines(run.resolve("loaded-rows.tsv"))) {
+                String[] fields = line.split("\t");
+                if (fields.length != 2 || rows.put(fields[0], Long.parseLong(fields[1])) != null)
+                    throw new IOException("Invalid native LOAD row counts");
+            }
             Generation.deleteTree(run.resolve("load"));
-            return Map.of();
+            return Map.of("rows", rows);
         }
 
         private Map<String, ?> check() throws IOException {

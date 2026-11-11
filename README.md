@@ -1,6 +1,6 @@
 # SIBench
 
-SIBench runs upstream benchmarks on native databases, exports a unified index Trace, and replays it against an Index Service. It measures index workloads, not end-to-end SQL performance or original client arrival timing. See the [Trace contract](docs/trace.md) and [Index Service contract](docs/index-service.md).
+SIBench captures native benchmark workloads for isolated Index Service replay and runs Pixels experiments from reusable CDC files. Pixels experiments independently select Index Trace export, Trino queries and sink freshness. See the [Trace](docs/trace.md), [Index Service](docs/index-service.md) and [Pixels experiment](docs/pixels-experiment.md) contracts.
 
 | Source | Mode / engine | Workload |
 | --- | --- | --- |
@@ -48,7 +48,7 @@ scripts/build-pixels.sh java build/services/pixels
 scripts/build-pixels.sh native build/services/pixels
 ```
 
-The [Pixels Trino connector and event listener](third_party/pixels-trino/README.md) are registered as pinned upstream sources only. Their upstream build requires Maven, JDK 23 and locally installed Pixels modules; use the upstream build/deployment instructions with its declared Trino version. They are not built by the root JDK 17 project or `build-pixels.sh`, and SIBench has no Trino experiment entry point yet. License: [pixels-trino](third_party/pixels-trino/LICENSE).
+For optional queries, build the pinned [Pixels Trino connector](third_party/pixels-trino/README.md) with `TRINO_JAVA_HOME=/path/to/jdk23 bash scripts/build-trino.sh build/services/pixels-trino`. Pixels dependencies build with JDK 17; the connector uses JDK 23 and its POM selects the Trino release. [Install a checked distribution and configure its resources](docs/pixels-experiment.md#trino-deployment) separately. License: [pixels-trino](third_party/pixels-trino/LICENSE).
 
 Runtime engine paths come from each engine configuration's `build_directory`; clients build under `build/benchmarks/`. Builds use pinned inputs and fresh destinations, leave upstream checkouts untouched, retain diagnostics on failure, and record input/artifact identities checked by generation. `JOBS` controls parallel compilation. Upstream licenses remain in [RocksDB](third_party/rocksdb/COPYING), [DuckDB](third_party/duckdb/LICENSE), [DuckDB Java](third_party/duckdb-java/LICENSE), [PostgreSQL](third_party/postgresql/COPYRIGHT), [Pixels](third_party/pixels/LICENSE) and [pixels-sink](third_party/pixels-sink/LICENSE); both embedded runtime JARs include their license texts.
 
@@ -92,23 +92,26 @@ java -jar build/sibench/sibench.jar generate config/sibench.yaml
 
 `generate` validates every selected input before starting a host, ignores unselected profiles, runs selections in order and stops at the first failure. Native API/capture uses one fresh database per source. Pixels CDC uses a fresh source PostgreSQL and a fresh Pixels database loaded independently from the same inputs. Working databases are deleted after publication. Existing/overlapping outputs, changed build/source inputs and unsupported configurations are rejected. Successful publication requires normal shutdown; failures retain diagnostics and cannot resume.
 
-`trace.workload_requests` counts each exported write and SearchGroup member (or standalone Search) after committed-state coalescing and index filtering; baseline and source transaction markers are excluded. Generation repeats finite source batches on the same database, distributes remaining requests across remaining workloads, and drains admitted events/transactions. HyBench native capture runs AP once before allocating the remainder to TP/XP; Pixels CDC shares the budget between TP and AT, with AP/IQ disabled. Actual output may exceed the target by source activity already captured but not yet exported when the target is reached, especially by a whole DuckDB window or a PostgreSQL capture backlog; no-progress batches fail. Omitting the target runs each configured batch once. `request-budget.json` records actual counts and overshoot.
+`trace.workload_requests` limits exported workload operations; it excludes the baseline and may be exceeded by already admitted source work. `trace.secondary_indexes` defaults to false. See [generation and publication](docs/trace.md#native-publication) for source phases, request accounting, index selection and failure behavior.
 
-`trace.secondary_indexes` defaults to false: only primary-index requests are exported, while source secondary indexes remain in use. Set true for all source indexes in native capture; Pixels CDC rejects secondary-index export. Consumption has a separate `target.secondary_indexes.enabled` switch and cannot request indexes absent from the Trace. [Filtering and expansion rules](docs/trace.md#operations-and-index-expansion) preserve whole query groups and transaction outcomes.
+For repeated Pixels runs, prepare a [reusable CDC input](docs/cdc-input.md), then consume it in a [Pixels experiment](docs/pixels-experiment.md):
 
-Published artifacts contain separate baseline/workload streams, work units and a manifest with identities and statistics; they contain no native database or row contents. An `INCOMPLETE` marker prevents consumption. See [publication](docs/trace.md#native-publication). SQL and RocksDB generation export RowID values; Pixels CDC exports both RowID and Locator values.
+```bash
+java -jar build/sibench/sibench.jar prepare-cdc config/sibench.yaml
+java -jar build/sibench/sibench.jar check-cdc-input results/capture/hybench
+java -jar build/sibench/sibench.jar pixels-experiment config/sibench.yaml \
+  results/capture/hybench results/pixels/run
+```
 
-The public runtime generates HyBench with `cdc` / Pixels, using a [TP/AT transaction subset](docs/trace.md#native-publication) rather than full HyBench HTAP; select `capture` with `postgres` or `duckdb` in a runtime copy for the native-capture Trace. Pixels CDC runs Pixels next to the generator when `pixels_host` is `local`. To run Pixels on another host, start the agent there with the same build and a token file, set `pixels_host: HOST:PORT` in an experiment copy of the engine configuration, and export `SIBENCH_PIXELS_HOST_TOKEN` for `generate`; the source PostgreSQL, HyBench and pixels-sink stay with the generator:
+Preparation runs the configured HyBench TP/AT phases once and retains the baseline and committed row changes. File experiments load a fresh Pixels baseline and consume the input once or a complete transaction prefix, without PostgreSQL. Updates default on; Index Trace export, Trino queries and freshness default off. All output directories must be fresh. Isolated Index Service replay consumes an exported Trace without Pixels or the original database.
+
+Pixels runs locally by default. For a remote Pixels host, start the agent there with the matching build and a token file, set `pixels_host: HOST:PORT` in the engine configuration, and supply `SIBENCH_PIXELS_HOST_TOKEN` to the client:
 
 ```bash
 java -jar build/sibench/sibench.jar pixels-host ADDRESS:PORT build/services/pixels WORK_ROOT TOKEN_FILE
 ```
 
-The generator checks the agent's Java build and native source/capacity identity before loading, and records the agent's actual build in the Trace. Host requests have deadlines covering uploads and responses. Each uploaded shard is limited to 4 GiB; failed uploads remove only their own partial file and terminate the session. Commands redact tracer tokens. Deletion requires a run directory created and stopped by that session. PostgreSQL and Pixels load independently from the same generated CSVs. The generator converts Pixels inputs into bounded text shards, using `load.rows_per_file` for the shard size and `load.threads` for parallel file consumers. Workloads start after both baselines and per-table counts pass. `source-load.json`, `baseline-load.json`, `pixels-schema.tsv` and `progress.jsonl` record the effective schema, overlapping phases and capture progress.
-
-Optional resource sampling: `scripts/sample-pixels-resources.sh OUT STOP_FILE [INTERVAL_SECONDS]`, with `WAL_DIR` set to the source WAL directory. Create `STOP_FILE` to stop. `pod_anon_metric` distinguishes cgroup v2 `anon` from v1 `total_rss`; unavailable readings are `null`. CLI `--timing` also records unavailable process/directory measurements as `null`; sampled disk peaks include only successful observations. Per-process RSS sums count shared pages repeatedly and are not exclusive memory usage.
-
-Engine memory settings are not total process-memory caps; client `timeout_minutes` and separate setup/shutdown bounds are not whole-run resource quotas. Generation provides no crash recovery or reusable initial-state cache. Large-input capacity and performance require separate validation.
+The source PostgreSQL and sink remain on the generator during live `generate` runs. See [host lifecycle and limits](docs/trace.md#pixels-host) for identity checks, uploads and cleanup. Engine memory and phase timeouts are separate resource controls, not whole-run quotas.
 
 ## Replay and service
 
@@ -156,34 +159,17 @@ Use `-Dsibench.build.directory=ABSOLUTE_PATH` for an isolated Maven build/test/p
 | `RocksDbHistoryCheck,RocksYcsbCheck,RocksGenerationCheck` | `sibench.rocksdb.library=$PWD/build/services/rocksdb/libsibench_rocksdb.so`; generation also needs `sibench.rocksdb.build=build/services/rocksdb` and `sibench.ycsb.build=build/benchmarks/YCSB`. |
 | `DuckDbTraceCheck,DuckDbAccessesCheck,DuckDbGenerationCheck,HybenchNativeCheck` | `sibench.duckdb.host=build/services/duckdb/duckdb_host`; source integration also needs `sibench.sysbench.build` and/or `sibench.hybench.build`. `HybenchSamplingCheck` needs only the HyBench build. |
 | `PixelsGenerationCheck` | `sibench.pixels.build=build/services/pixels` (both build phases) and `sibench.hybench.build=build/benchmarks/HyBench-2024`; runs Pixels locally with small HyBench parameters and replays both value kinds. |
-| `PixelsCdcCheck` | `sibench.pixels.build=build/services/pixels`; eight hand-written baseline rows, real PostgreSQL → sink → Pixels update/delete/reinsert/rollback, historical RowID/Locator checks and an injected LOAD visibility-publication failure. |
+| `PixelsCdcCheck` | `sibench.pixels.build=build/services/pixels`; real PostgreSQL → sink → Pixels application and RowID/Locator validation. |
 | `PixelsSourceCheck` | `sibench.postgres.runtime=build/services/pixels/postgres/runtime`; source-only PostgreSQL checks for key-change rejection, unchanged-key updates without guard function calls, rollback, preceding triggers and preservation of the original indexes. |
+| `CdcPreparationCheck` | `sibench.pixels.build=build/services/pixels`; real PostgreSQL CDC preparation without target services. The HyBench command check also requires `sibench.hybench.build` and runs two one-minute phases. |
+| `PixelsExperimentCheck` | `sibench.pixels.build`; file application, Trace export and static queries. `sibench.cdc.input` can reuse the matching test input; otherwise the test prepares it. The Trino method additionally requires `sibench.trino.deployment` on the Pixels host; `sibench.pixels.host` and `SIBENCH_PIXELS_HOST_TOKEN` select a remote host. Queries require an ABI-compatible host build and matching Java artifacts. |
 | `SlateDbStoreCheck` | Source-built `sibench.slatedb.library`; `sibench.slatedb.storage=PATH`, `sibench.slatedb.profile=NAME`, `sibench.slatedb.object_path=FRESH_PREFIX`, and that profile's environment credentials. Uses one Db against the configured S3 store; no independent reader. |
 
-Native component checks require the indicated built engine and Python 3, C++17 or JDK 17:
+Native component checks live under [src/test/native](src/test/native). DuckDB Python checks accept the instrumented DuckDB executable; C++ checks require C++17 and the matching build's headers/libraries. Compile Pixels Java probes with JDK 17 and `BUILD/jars/pixels-sink.jar`, then run with that JAR and the probe classes on the classpath. Cloud JNI checks use `make -C src/main/native/index/rocksdb_cloud test` after that backend's build. The sink's `RetinaPayloadBuilderTest` runs through its patched build POM.
 
-| Entry point in [src/test/native](src/test/native) | Invocation / compile inputs |
-| --- | --- |
-| `duckdb_index_attempts.py`, `duckdb_mutations.py` | `python3 SCRIPT build/services/duckdb/duckdb`. |
-| `sysbench_errors.cc` | Compile with `-I src/main/native/sysbench -I third_party/duckdb/src/include`, then run the binary. |
-| `duckdb_snapshot_attempts.cc` | Compile with `-pthread -I build/services/duckdb/source/src/include -L build/services/duckdb/src -lduckdb`; make that library directory available at runtime. |
-| `pixels/DecoderChainProbe.java` | Compile with `javac --release 17 -cp BUILD/jars/pixels-sink.jar -d TEST_CLASSES src/test/native/pixels/DecoderChainProbe.java`, then run `java -cp TEST_CLASSES:BUILD/jars/pixels-sink.jar org.sibench.pixels.DecoderChainProbe`. Checks FIFO completion of 8,192 same-stream events without starting services. |
-| `pixels/SourceTransactionsProbe.java` | Compile and run with the same sink classpath as DecoderChainProbe. Hand-built BEGIN/ROW/END records check transaction identity, global/table order, exact totals and malformed-control rejection without starting services. |
-| `pixels/SourceFailureProbe.java` | Run in a separate JVM with the sink classpath, a sink properties file and `sibench.report.endpoint`/`sibench.report.token`. A malformed update must report failure and exit 70 before offset acknowledgement; Optional `row-failure`, `row-null`, `transaction-failure` and `transaction-null` arguments inject invalid decoded results and require a failure report/exit 70; no database is started. |
+After `mvn package`, explicit Java validation tools use `java -cp build/sibench/test-classes:build/sibench/sibench.jar CLASS ARGS`; their usage checks describe arguments. [ReplayMatrixValidation](src/test/java/org/sibench/replay/ReplayMatrixValidation.java) checks a Trace against the reference index; [IndexVersionCheck](src/test/java/org/sibench/adapters/IndexVersionCheck.java) checks a fresh backend. Capacity diagnostics are opt-in and need bounded inputs, resources and duration.
 
-Cloud JNI checks use `make -C src/main/native/index/rocksdb_cloud test` after that backend's build.
-
-After `mvn package`, explicit validation tools run with `java -cp build/sibench/test-classes:build/sibench/sibench.jar CLASS ARGS`:
-
-| Tool under `org.sibench.` | Entry point / cost boundary |
-| --- | --- |
-| `replay.ReplayMatrixValidation` | `TRACE FRESH_OUTPUT`: dispatch/index-selection matrix against the in-memory reference index. |
-| `adapters.IndexVersionCheck` | `SERVICE_CONFIG REPORT`: bounded hand-derived version/delete/reinsert checks on a fresh local or cloud backend. |
-| `adapters.IndexServerAcceptance` | `SERVICE_CONFIG`: starts a service; stdin `close` shuts it down. |
-| `adapters.StreamingLatencyCheck` | `ENDPOINT REPORT`: 64 baseline entries and 600 ordinary workload operations on a fresh service; verifies individual RPC completion and count/latency accounting with batched baseline loading. This is a small integration check, not a full-input or performance certification. |
-| [ProtoTraceBenchmark](src/test/java/org/sibench/capture/ProtoTraceBenchmark.java), [DispatcherCapacityCheck](src/test/java/org/sibench/replay/DispatcherCapacityCheck.java), [DriverCapacityCheck](src/test/java/org/sibench/adapters/DriverCapacityCheck.java), [BaselineCapacityCheck](src/test/java/org/sibench/adapters/BaselineCapacityCheck.java) | Explicit parser/driver diagnostics; invocation forms are in each class's usage checks. Bound input, duration, heap and output before running. |
-
-Production generation, backend evaluation and independent acceptance are separate workflows. Native checks cover small inputs; they do not certify full-scale capacity. Full backend acceptance requires complete local and real-cloud replay of the same Trace with response/count checks and an independent check of internal persistence/reopening. Fault recovery and performance studies require separate runs and budgets.
+Generation, backend evaluation and independent acceptance are separate workflows. The default suite and small native checks do not certify full-scale performance, remote durability or fault recovery.
 
 ## Supported scope
 

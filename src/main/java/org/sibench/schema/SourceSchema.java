@@ -65,9 +65,14 @@ public final class SourceSchema {
             Map<String, String> fingerprints,
             List<Index> secondaryOrder,
             Map<String, Object> nativeConfig) throws IOException {
+        this(benchmark, source, tables, fingerprints, secondaryOrder, nativeConfig, null);
+    }
+
+    private SourceSchema(String benchmark, Path source, List<Table> tables, Map<String, String> fingerprints,
+            List<Index> secondaryOrder, Map<String, Object> nativeConfig, String capturedCommit) throws IOException {
         this.benchmark = benchmark;
         try {
-            this.sourceCommit = Files.exists(source.resolve(".git"))
+            this.sourceCommit = capturedCommit != null ? capturedCommit : Files.exists(source.resolve(".git"))
                     ? git(source, "rev-parse", "HEAD") : "unverified";
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
@@ -82,6 +87,17 @@ public final class SourceSchema {
                 nativeConfig == null
                         ? null
                         : Collections.unmodifiableMap(new LinkedHashMap<>(nativeConfig));
+    }
+
+    /** Layout and provenance bound by a published CDC artifact, independent of a source checkout. */
+    public static SourceSchema captured(Path ddl, String sourceCommit, String expectedDigest) throws IOException {
+        byte[] bytes;
+        try (var input = Files.newInputStream(ddl)) { bytes = input.readNBytes((16 << 20) + 1); }
+        String digest = HexFormat.of().formatHex(org.sibench.config.Digests.digest().digest(bytes));
+        if (bytes.length > 16 << 20 || !digest.equals(expectedDigest)) throw new IOException("Captured source DDL changed");
+        var layout = SimpleDdl.read(new String(bytes, StandardCharsets.UTF_8), "");
+        return new SourceSchema("hybench", ddl.getParent(), layout.tables(),
+                Map.of("schema.sql", digest), List.of(), null, sourceCommit);
     }
 
     public static SourceSchema read(Path root, Map<String, Object> config)

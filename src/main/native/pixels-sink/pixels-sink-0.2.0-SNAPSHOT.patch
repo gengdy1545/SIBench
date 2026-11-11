@@ -1,22 +1,14 @@
 diff --git a/src/main/java/io/pixelsdb/pixels/sink/PixelsSinkApp.java b/src/main/java/io/pixelsdb/pixels/sink/PixelsSinkApp.java
-index a55afb4..6bf4701 100644
 --- a/src/main/java/io/pixelsdb/pixels/sink/PixelsSinkApp.java
 +++ b/src/main/java/io/pixelsdb/pixels/sink/PixelsSinkApp.java
-@@ -74,6 +74,8 @@ public class PixelsSinkApp
- 
-         }));
- 
+@@ -76,0 +77,2 @@
 +        Thread.setDefaultUncaughtExceptionHandler((thread, error) ->
 +                io.pixelsdb.pixels.sink.SibenchReport.fail("Uncaught exception in " + thread.getName(), error));
-         init(args);
-         PixelsSinkConfig config = PixelsSinkConfigFactory.getInstance();
-         sinkSource = SinkSourceFactory.createSinkSource();
 diff --git a/src/main/java/io/pixelsdb/pixels/sink/SibenchReport.java b/src/main/java/io/pixelsdb/pixels/sink/SibenchReport.java
 new file mode 100644
-index 0000000..bbe1b71
 --- /dev/null
 +++ b/src/main/java/io/pixelsdb/pixels/sink/SibenchReport.java
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,98 @@
 +/*
 + * SIBench CDC generation support for pixels-sink; distributed under the pixels-sink license.
 + */
@@ -67,6 +59,15 @@ index 0000000..bbe1b71
 +        line("B " + timestamp);
 +    }
 +
++    public static void captured(String id, long rows)
++    {
++        line("P " + id + " " + rows);
++    }
++
++    public static void ready() { line("R"); }
++
++    public static void closed() { line("E"); }
++
 +    public static void commit(long timestamp)
 +    {
 +        line("C " + timestamp);
@@ -106,234 +107,11 @@ index 0000000..bbe1b71
 +        }
 +    }
 +}
-diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaWriter.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaWriter.java
-index 8e20f91..0dfe9dd 100644
---- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaWriter.java
-+++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaWriter.java
-@@ -68,7 +68,7 @@ public class RetinaWriter implements PixelsSinkWriter
-             }
-         } catch (SinkException e)
-         {
--            LOGGER.error(e.getMessage(), e);
-+            io.pixelsdb.pixels.sink.SibenchReport.fail("Sink transaction handling failed", e);
-             return false;
-         }
-         return true;
-@@ -111,7 +111,7 @@ public class RetinaWriter implements PixelsSinkWriter
-             }
-         } catch (SinkException e)
-         {
--            LOGGER.error(e.getMessage(), e);
-+            io.pixelsdb.pixels.sink.SibenchReport.fail("Sink transaction handling failed", e);
-             return false;
-         }
- 
-@@ -144,6 +144,7 @@ public class RetinaWriter implements PixelsSinkWriter
- 
-     private void handleNonTxEvent(RowChangeEvent event) throws SinkException
-     {
-+        io.pixelsdb.pixels.sink.SibenchReport.fail("Row change without source transaction metadata", null);
-         // virtual tx
-         String randomId = Long.toString(System.currentTimeMillis()) + RandomUtils.nextLong();
-         writeTrans(buildBeginTransactionMetadata(randomId));
-diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/SinkContextManager.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/SinkContextManager.java
-index 5389cc2..005ed4b 100644
---- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/SinkContextManager.java
-+++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/SinkContextManager.java
-@@ -115,6 +115,11 @@ public class SinkContextManager
-     {
-         LOGGER.trace("Start trans {}", sourceTxId);
-         TransContext pixelsTransContext = transactionProxy.getNewTransContext(sourceTxId);
-+        if (pixelsTransContext == null)
-+        {
-+            io.pixelsdb.pixels.sink.SibenchReport.fail("Cannot begin Pixels transaction for " + sourceTxId, null);
-+        }
-+        io.pixelsdb.pixels.sink.SibenchReport.begin(pixelsTransContext.getTimestamp());
-         activeTxContexts.compute(
-                 sourceTxId,
-                 (k, oldCtx) ->
-@@ -204,6 +209,7 @@ public class SinkContextManager
-             }
-         } else
-         {
-+            io.pixelsdb.pixels.sink.SibenchReport.fail("Source transaction failed in Pixels: " + txId, null);
-             LOGGER.info("Abort transaction: {}", txId);
-             CompletableFuture.runAsync(() ->
-             {
-diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableCrossTxWriter.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableCrossTxWriter.java
-index 1c90b06..4ef8604 100644
---- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableCrossTxWriter.java
-+++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableCrossTxWriter.java
-@@ -158,6 +158,7 @@ public class TableCrossTxWriter extends TableWriter
- 
-     private void failCtxs(List<String> txIds)
-     {
-+        io.pixelsdb.pixels.sink.SibenchReport.fail("Retina write failed for source transactions " + txIds, null);
-         for (String writeTxId : txIds)
-         {
-             SinkContext sinkContext = SinkContextManager.getInstance().getSinkContext(writeTxId);
-diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TransactionProxy.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TransactionProxy.java
-index 5c8713d..d4c3248 100644
---- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TransactionProxy.java
-+++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TransactionProxy.java
-@@ -165,6 +165,7 @@ public class TransactionProxy
-     public void commitTransSync(SinkContext transContext)
-     {
-         commitTrans(transContext.getPixelsTransCtx());
-+        io.pixelsdb.pixels.sink.SibenchReport.commit(transContext.getPixelsTransCtx().getTimestamp());
-         metricsFacade.recordTransaction();
-         long txEndTime = System.currentTimeMillis();
- 
-@@ -179,10 +180,13 @@ public class TransactionProxy
-         commitCount.incrementAndGet();
-         try
-         {
--            transService.commitTrans(ctx.getTransId(), false);
-+            if (!transService.commitTrans(ctx.getTransId(), false))
-+            {
-+                io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels commit rejected " + ctx.getTransId(), null);
-+            }
-         } catch (TransException e)
-         {
--            LOGGER.error("Batch commit failed: {}", e.getMessage(), e);
-+            io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels commit failed " + ctx.getTransId(), e);
-         }
-     }
- 
-@@ -195,6 +199,7 @@ public class TransactionProxy
-         {
-             LOGGER.error("Rollback transaction failed: {}", e.getMessage(), e);
-         }
-+        io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels transaction rolled back " + ctx.getTransId(), null);
-     }
- 
-     private void batchCommitWorker()
-@@ -237,7 +242,15 @@ public class TransactionProxy
-                     txStartTimes.add(ctx.getStartTime());
-                 }
- 
--                transService.commitTransBatch(batchTransIds, false);
-+                List<Boolean> committed = transService.commitTransBatch(batchTransIds, false);
-+                if (committed.size() != batchContexts.size() || committed.contains(false))
-+                {
-+                    io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels batch commit rejected " + batchTransIds, null);
-+                }
-+                for (TransContext committedContext : batchContexts)
-+                {
-+                    io.pixelsdb.pixels.sink.SibenchReport.commit(committedContext.getTimestamp());
-+                }
-                 metricsFacade.recordTransaction(batchTransIds.size());
-                 long txEndTime = System.currentTimeMillis();
- 
-@@ -264,10 +277,10 @@ public class TransactionProxy
-                 break;
-             } catch (TransException e)
-             {
--                LOGGER.error("Batch commit failed: {}", e.getMessage(), e);
-+                io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels batch commit failed", e);
-             } catch (Exception e)
-             {
--                LOGGER.error("Unexpected error in batch commit worker", e);
-+                io.pixelsdb.pixels.sink.SibenchReport.fail("Unexpected error in batch commit worker", e);
-             }
-         }
-     }
-diff --git a/src/main/java/io/pixelsdb/pixels/sink/util/concurrent/StreamOrderedDecoder.java b/src/main/java/io/pixelsdb/pixels/sink/util/concurrent/StreamOrderedDecoder.java
---- a/src/main/java/io/pixelsdb/pixels/sink/util/concurrent/StreamOrderedDecoder.java
-+++ b/src/main/java/io/pixelsdb/pixels/sink/util/concurrent/StreamOrderedDecoder.java
-@@ -98,35 +98,28 @@
-             Consumer<DecodeResult<O>> afterDecode)
-     {
--        CompletableFuture<Void> previous;
--        CompletableFuture<Void> completion = new CompletableFuture<>();
-+        CompletableFuture<DecodeResult<O>> decoded = new CompletableFuture<>();
-+        CompletableFuture<Void> completion;
-         synchronized (lifecycleLock)
-         {
-             ensureAccepting();
--            previous = streamTails.getOrDefault(
-+            CompletableFuture<Void> previous = streamTails.getOrDefault(
-                     streamKey, CompletableFuture.completedFuture(null));
-+            // Direct chaining lets CompletableFuture drain long streams without recursive complete calls.
-+            completion = previous.thenCombine(decoded, (ignored, result) ->
-+            {
-+                publish(result, afterDecode);
-+                return null;
-+            });
-             streamTails.put(streamKey, completion);
-             activeCompletions.add(completion);
-         }
--
--        CompletableFuture<DecodeResult<O>> decoded = CompletableFuture.supplyAsync(
--                () -> decode(input, decoder), decodeExecutor);
--
--        previous.thenCombine(decoded, (ignored, result) ->
--                {
--                    publish(result, afterDecode);
--                    return null;
--                })
--                .whenComplete((ignored, failure) ->
--                {
--                    if (failure != null)
--                    {
--                        completion.completeExceptionally(failure);
--                    }
--                    else
--                    {
--                        completion.complete(null);
--                    }
--                    removeCompletion(streamKey, completion);
--                });
-+        completion.whenComplete((ignored, failure) -> removeCompletion(streamKey, completion));
-+        try
-+        {
-+            decoded.completeAsync(() -> decode(input, decoder), decodeExecutor);
-+        } catch (RuntimeException failure)
-+        {
-+            decoded.completeExceptionally(failure);
-+        }
-         return completion;
-     }
-diff --git a/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java b/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java
---- a/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java
-+++ b/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java
-@@ -68,0 +69,2 @@
-+    private final io.pixelsdb.pixels.sink.SibenchSourceTransactions sourceTransactions =
-+            new io.pixelsdb.pixels.sink.SibenchSourceTransactions();
-@@ -129,0 +132,8 @@
-+            try
-+            {
-+                sourceTransactions.accept(sourceRecord, recordType);
-+            } catch (RuntimeException failure)
-+            {
-+                io.pixelsdb.pixels.sink.SibenchReport.fail("Invalid PostgreSQL CDC source event", failure);
-+                throw failure;
-+            }
-@@ -177,3 +187,2 @@
--            LOGGER.warn("Skipping invalid Debezium ROW event from topic {}",
--                    record.topic(), result.failure());
--            return;
-+            io.pixelsdb.pixels.sink.SibenchReport.fail("Cannot decode Debezium ROW event", result.failure());
-+            throw new IllegalStateException(result.failure());
-@@ -183 +192,2 @@
--            return;
-+            io.pixelsdb.pixels.sink.SibenchReport.fail("Decoded CDC event is absent", null);
-+            throw new IllegalStateException("Decoded CDC event is absent");
-@@ -195,3 +205,2 @@
--            LOGGER.warn("Skipping invalid Debezium TRANSACTION event from topic {}",
--                    record.topic(), result.failure());
--            return;
-+            io.pixelsdb.pixels.sink.SibenchReport.fail("Cannot decode Debezium TRANSACTION event", result.failure());
-+            throw new IllegalStateException(result.failure());
-@@ -201 +210,2 @@
--            return;
-+            io.pixelsdb.pixels.sink.SibenchReport.fail("Decoded CDC event is absent", null);
-+            throw new IllegalStateException("Decoded CDC event is absent");
 diff --git a/src/main/java/io/pixelsdb/pixels/sink/SibenchSourceTransactions.java b/src/main/java/io/pixelsdb/pixels/sink/SibenchSourceTransactions.java
 new file mode 100644
 --- /dev/null
 +++ b/src/main/java/io/pixelsdb/pixels/sink/SibenchSourceTransactions.java
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,72 @@
 +/* SIBench source-completeness guard; distributed under the pixels-sink license. */
 +package io.pixelsdb.pixels.sink;
 +
@@ -400,4 +178,1152 @@ new file mode 100644
 +    {
 +        return new IllegalArgumentException("Incomplete or unordered PostgreSQL CDC transaction");
 +    }
++
++    public void finish()
++    {
++        if (transaction != null) throw invalid();
++    }
 +}
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/metadata/TableMetadataRegistry.java b/src/main/java/io/pixelsdb/pixels/sink/metadata/TableMetadataRegistry.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/metadata/TableMetadataRegistry.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/metadata/TableMetadataRegistry.java
+@@ -38 +37,0 @@
+-    private static final MetadataService metadataService = MetadataService.Instance();
+@@ -73,0 +73,11 @@
++    }
++
++    /** Registers the input-bound schema for file preparation without a running metadata service. */
++    public void register(String schema, TableMetadata metadata)
++    {
++        SchemaTableName key = new SchemaTableName(schema, metadata.getTable().getName());
++        if (registry.putIfAbsent(key, metadata) != null
++                || tableId2SchemaTableName.putIfAbsent(metadata.getTableId(), key) != null)
++        {
++            throw new IllegalArgumentException("Duplicate capture table metadata: " + key);
++        }
+@@ -111,0 +122 @@
++        MetadataService metadataService = MetadataService.Instance();
+@@ -138,0 +150 @@
++        MetadataService metadataService = MetadataService.Instance();
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java b/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/source/engine/PixelsDebeziumConsumer.java
+@@ -68,0 +69,2 @@
++    private final io.pixelsdb.pixels.sink.SibenchSourceTransactions sourceTransactions =
++            new io.pixelsdb.pixels.sink.SibenchSourceTransactions();
+@@ -129,0 +132,8 @@
++            try
++            {
++                sourceTransactions.accept(sourceRecord, recordType);
++            } catch (RuntimeException failure)
++            {
++                io.pixelsdb.pixels.sink.SibenchReport.fail("Invalid PostgreSQL CDC source event", failure);
++                throw failure;
++            }
+@@ -177,3 +187,2 @@
+-            LOGGER.warn("Skipping invalid Debezium ROW event from topic {}",
+-                    record.topic(), result.failure());
+-            return;
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Cannot decode Debezium ROW event", result.failure());
++            throw new IllegalStateException(result.failure());
+@@ -183 +192,2 @@
+-            return;
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Decoded CDC event is absent", null);
++            throw new IllegalStateException("Decoded CDC event is absent");
+@@ -195,3 +205,2 @@
+-            LOGGER.warn("Skipping invalid Debezium TRANSACTION event from topic {}",
+-                    record.topic(), result.failure());
+-            return;
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Cannot decode Debezium TRANSACTION event", result.failure());
++            throw new IllegalStateException(result.failure());
+@@ -201 +210,2 @@
+-            return;
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Decoded CDC event is absent", null);
++            throw new IllegalStateException("Decoded CDC event is absent");
+@@ -265,0 +276 @@
++        sourceTransactions.finish();
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/source/engine/SinkEngineSource.java b/src/main/java/io/pixelsdb/pixels/sink/source/engine/SinkEngineSource.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/source/engine/SinkEngineSource.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/source/engine/SinkEngineSource.java
+@@ -40,0 +41 @@
++    private volatile boolean closing;
+@@ -45,0 +47,6 @@
++    }
++
++    public SinkEngineSource(io.pixelsdb.pixels.sink.writer.PixelsSinkWriter writer)
++    {
++        this.pixelsSinkConfig = PixelsSinkConfigFactory.getInstance();
++        this.consumer = new PixelsDebeziumConsumer(java.util.Objects.requireNonNull(writer));
+@@ -56,0 +64,5 @@
++                .using((boolean success, String message, Throwable error) ->
++                {
++                    if (!success || !closing)
++                        io.pixelsdb.pixels.sink.SibenchReport.fail("Debezium engine stopped: " + message, error);
++                })
+@@ -66,0 +79 @@
++        closing = true;
+@@ -81 +94 @@
+-                    return;
++                    throw new IllegalStateException("Debezium shutdown deadline exceeded");
+@@ -92,0 +106 @@
++            throw new IllegalStateException("Debezium shutdown interrupted", e);
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/util/concurrent/StreamOrderedDecoder.java b/src/main/java/io/pixelsdb/pixels/sink/util/concurrent/StreamOrderedDecoder.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/util/concurrent/StreamOrderedDecoder.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/util/concurrent/StreamOrderedDecoder.java
+@@ -100,2 +100,2 @@
+-        CompletableFuture<Void> previous;
+-        CompletableFuture<Void> completion = new CompletableFuture<>();
++        CompletableFuture<DecodeResult<O>> decoded = new CompletableFuture<>();
++        CompletableFuture<Void> completion;
+@@ -105 +105 @@
+-            previous = streamTails.getOrDefault(
++            CompletableFuture<Void> previous = streamTails.getOrDefault(
+@@ -106,0 +107,6 @@
++            // Direct chaining lets CompletableFuture drain long streams without recursive complete calls.
++            completion = previous.thenCombine(decoded, (ignored, result) ->
++            {
++                publish(result, afterDecode);
++                return null;
++            });
+@@ -110,21 +116,8 @@
+-
+-        CompletableFuture<DecodeResult<O>> decoded = CompletableFuture.supplyAsync(
+-                () -> decode(input, decoder), decodeExecutor);
+-
+-        previous.thenCombine(decoded, (ignored, result) ->
+-                {
+-                    publish(result, afterDecode);
+-                    return null;
+-                })
+-                .whenComplete((ignored, failure) ->
+-                {
+-                    if (failure != null)
+-                    {
+-                        completion.completeExceptionally(failure);
+-                    }
+-                    else
+-                    {
+-                        completion.complete(null);
+-                    }
+-                    removeCompletion(streamKey, completion);
+-                });
++        completion.whenComplete((ignored, failure) -> removeCompletion(streamKey, completion));
++        try
++        {
++            decoded.completeAsync(() -> decode(input, decoder), decodeExecutor);
++        } catch (RuntimeException failure)
++        {
++            decoded.completeExceptionally(failure);
++        }
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/proto/ProtoWriter.java b/src/main/java/io/pixelsdb/pixels/sink/writer/proto/ProtoWriter.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/writer/proto/ProtoWriter.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/writer/proto/ProtoWriter.java
+@@ -18,3 +18 @@
+-
+-import com.google.protobuf.InvalidProtocolBufferException;
+-import io.pixelsdb.pixels.common.physical.PhysicalWriter;
++import com.google.protobuf.MessageLite;
+@@ -22,2 +19,0 @@
+-import io.pixelsdb.pixels.sink.config.PixelsSinkConfig;
+-import io.pixelsdb.pixels.sink.config.factory.PixelsSinkConfigFactory;
+@@ -25,3 +20,0 @@
+-import io.pixelsdb.pixels.sink.exception.SinkException;
+-import io.pixelsdb.pixels.sink.metadata.TableMetadataRegistry;
+-import io.pixelsdb.pixels.sink.util.TableCounters;
+@@ -29,4 +21,0 @@
+-import lombok.Getter;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
+@@ -34 +23 @@
+-import java.nio.BufferOverflowException;
++import java.io.UncheckedIOException;
+@@ -36,2 +25,2 @@
+-import java.nio.ByteOrder;
+-import java.util.List;
++import java.util.ArrayDeque;
++import java.util.HashMap;
+@@ -39,11 +28,3 @@
+-import java.util.concurrent.ConcurrentHashMap;
+-import java.util.concurrent.CopyOnWriteArrayList;
+-import java.util.concurrent.atomic.AtomicInteger;
+-import java.util.concurrent.locks.ReentrantLock;
+-
+-/**
+- * @package: io.pixelsdb.pixels.sink.writer
+- * @className: ProtoWriter
+- * @author: AntiO2
+- * @date: 2025/10/5 07:10
+- */
++import java.util.TreeMap;
++
++/** Writes complete source transactions in BEGIN order despite parallel table decoding. */
+@@ -52,34 +33,145 @@
+-    private final Logger LOGGER = LoggerFactory.getLogger(ProtoWriter.class);
+-    private final RotatingWriterManager writerManager;
+-    private final TableMetadataRegistry instance;
+-    private final ReentrantLock lock = new ReentrantLock();
+-    private final Boolean debug = true;
+-    /**
+-     * Data structure to track transaction progress:
+-     * Map<TransId, TransactionContext>
+-     */
+-    private final Map<String, TransactionContext> transTracker = new ConcurrentHashMap<>();
+-
+-
+-    public ProtoWriter() throws IOException
+-    {
+-        PixelsSinkConfig sinkConfig = PixelsSinkConfigFactory.getInstance();
+-
+-        String dataPath = sinkConfig.getSinkProtoData();
+-        this.writerManager = new RotatingWriterManager(dataPath);
+-        this.instance = TableMetadataRegistry.Instance();
+-    }
+-
+-    /**
+-     * Checks if all tables within a transaction have reached their expected row count.
+-     * If complete, the transaction is removed from the tracker and final metrics are recorded.
+-     *
+-     * @param transId The ID of the transaction to check.
+-     */
+-    private void checkAndCleanupTransaction(String transId)
+-    {
+-        TransactionContext context = transTracker.get(transId);
+-
+-        if (context == null || !context.isEndReceived())
+-        {
+-            // Transaction has not received TX END or has been cleaned up already.
++    public interface Output
++    {
++        void append(ByteBuffer buffer, SinkProto.TransactionMetadata transaction) throws IOException;
++        void close(boolean complete) throws IOException;
++    }
++
++    private final Output output;
++    private final Map<String, Transaction> pending = new HashMap<>();
++    private final ArrayDeque<String> order = new ArrayDeque<>();
++    private IOException failure;
++    private boolean closed;
++
++    public ProtoWriter(Output output)
++    {
++        this.output = java.util.Objects.requireNonNull(output);
++    }
++
++    @Override
++    public synchronized boolean writeTrans(SinkProto.TransactionMetadata metadata)
++    {
++        try
++        {
++            requireOpen();
++            String id = metadata.getId();
++            require(!id.isBlank(), "Missing transaction ID");
++            Transaction transaction = pending.computeIfAbsent(id, ignored -> new Transaction());
++            switch (metadata.getStatus())
++            {
++                case BEGIN:
++                    require(transaction.begin == null, "Duplicate BEGIN: " + id);
++                    transaction.begin = metadata;
++                    order.addLast(id);
++                    break;
++                case END:
++                    require(transaction.begin != null && transaction.end == null, "Missing BEGIN or duplicate END: " + id);
++                    require(metadata.getEventCount() >= 0, "Negative transaction row count");
++                    long total = 0;
++                    for (var table : metadata.getDataCollectionsList())
++                    {
++                        require(!table.getDataCollection().isBlank() && table.getEventCount() > 0,
++                                "Invalid transaction table count");
++                        require(transaction.expected.putIfAbsent(table.getDataCollection(), table.getEventCount()) == null,
++                                "Duplicate transaction table");
++                        total = Math.addExact(total, table.getEventCount());
++                    }
++                    require(total == metadata.getEventCount(), "Transaction/table count mismatch");
++                    transaction.end = metadata;
++                    validateCounts(transaction);
++                    break;
++                default:
++                    throw new IOException("Unknown transaction status");
++            }
++            drain();
++            return true;
++        }
++        catch (IOException | RuntimeException error)
++        {
++            throw failed(error);
++        }
++    }
++
++    @Override
++    public synchronized boolean writeRow(RowChangeEvent event)
++    {
++        try
++        {
++            requireOpen();
++            var row = event.getRowRecord();
++            require(row.hasTransaction() && !row.getTransaction().getId().isBlank(), "Missing row transaction");
++            var tx = row.getTransaction();
++            require(tx.getTotalOrder() > 0 && tx.getDataCollectionOrder() > 0, "Invalid row order");
++            int tableId = Math.toIntExact(event.getTableId());
++            require(tableId >= 0, "Invalid table ID");
++            var transaction = pending.computeIfAbsent(tx.getId(), ignored -> new Transaction());
++            require(transaction.rows.putIfAbsent(tx.getTotalOrder(), new Row(row, tableId)) == null,
++                    "Duplicate transaction row order");
++            transaction.actual.merge(event.getFullTableName(), 1L, Math::addExact);
++            if (transaction.end != null) validateCounts(transaction);
++            drain();
++            return true;
++        }
++        catch (IOException | RuntimeException error)
++        {
++            throw failed(error);
++        }
++    }
++
++    private static void validateCounts(Transaction transaction) throws IOException
++    {
++        require(transaction.rows.size() <= transaction.end.getEventCount(), "Excess transaction rows");
++        for (var table : transaction.actual.entrySet())
++            require(table.getValue() <= transaction.expected.getOrDefault(table.getKey(), 0L),
++                    "Unexpected table or excess transaction table rows");
++    }
++
++    private void drain() throws IOException
++    {
++        while (!order.isEmpty())
++        {
++            String id = order.getFirst();
++            Transaction transaction = pending.get(id);
++            if (transaction.end == null || transaction.rows.size() != transaction.end.getEventCount()) return;
++            require(transaction.actual.equals(transaction.expected), "Incomplete transaction table counts");
++            long next = 1;
++            var tableOrders = new HashMap<String, Long>();
++            int size = Math.addExact(16, Math.addExact(transaction.begin.getSerializedSize(), transaction.end.getSerializedSize()));
++            for (var entry : transaction.rows.entrySet())
++            {
++                require(entry.getKey() == next++, "Noncontiguous transaction row order");
++                var row = entry.getValue().record();
++                var source = row.getSource();
++                String table = (source.getSchema().isBlank() ? source.getDb() : source.getSchema()) + "." + source.getTable();
++                long tableOrder = tableOrders.merge(table, 1L, Math::addExact);
++                require(row.getTransaction().getDataCollectionOrder() == tableOrder, "Noncontiguous table row order");
++                size = Math.addExact(size, Math.addExact(8, row.getSerializedSize()));
++            }
++            var buffer = ByteBuffer.allocate(size);
++            frame(buffer, -1, transaction.begin);
++            for (Row row : transaction.rows.values()) frame(buffer, row.tableId(), row.record());
++            frame(buffer, -1, transaction.end);
++            buffer.flip();
++            output.append(buffer, transaction.end);
++            pending.remove(id);
++            order.removeFirst();
++        }
++    }
++
++    private static void frame(ByteBuffer target, int tableId, MessageLite record)
++    {
++        target.putInt(tableId).putInt(record.getSerializedSize()).put(record.toByteArray());
++    }
++
++    @Override
++    public synchronized void flush()
++    {
++        try { requireOpen(); }
++        catch (IOException error) { throw failed(error); }
++    }
++
++    @Override
++    public synchronized void close() throws IOException
++    {
++        if (closed)
++        {
++            if (failure != null) throw failure;
+@@ -88,35 +180,3 @@
+-
+-        Map<String, TableCounters> tableMap = context.tableCounters;
+-        if (tableMap == null || tableMap.isEmpty())
+-        {
+-            // Empty transaction with no tables. Clean up immediately.
+-            transTracker.remove(transId);
+-            LOGGER.info("Transaction {} (empty) successfully completed and removed from tracker.", transId);
+-            return;
+-        }
+-
+-        boolean allComplete = true;
+-        int actualProcessedRows = 0;
+-
+-        // Iterate through all tables to check completion status
+-        for (Map.Entry<String, TableCounters> entry : tableMap.entrySet())
+-        {
+-            TableCounters counters = entry.getValue();
+-            if (!counters.isComplete())
+-            {
+-                allComplete = false;
+-            }
+-        }
+-
+-        if (allComplete)
+-        {
+-            transTracker.remove(transId);
+-            ByteBuffer transInfo = getTransBuffer(context);
+-            transInfo.rewind();
+-            writeBuffer(transInfo);
+-        }
+-    }
+-
+-    @Override
+-    public boolean writeTrans(SinkProto.TransactionMetadata transactionMetadata)
+-    {
++        closed = true;
++        IOException primary = failure;
++        if (primary == null && !pending.isEmpty()) primary = new IOException("Incomplete transactions at ProtoWriter close: " + pending.size());
+@@ -125,343 +185,38 @@
+-            lock.lock();
+-            String transId = transactionMetadata.getId();
+-            if (transactionMetadata.getStatus() == SinkProto.TransactionStatus.BEGIN)
+-            {
+-                // 1. BEGIN: Create context if not exists (in case ROWChange arrived first).
+-                TransactionContext transactionContext = transTracker.computeIfAbsent(transId, k -> new TransactionContext());
+-                LOGGER.debug("Transaction {} BEGIN received.", transId);
+-                transactionContext.txBegin = transactionMetadata;
+-            } else if (transactionMetadata.getStatus() == SinkProto.TransactionStatus.END)
+-            {
+-                // 2. END: Finalize tracker state, merge pre-counts, and trigger cleanup.
+-
+-                // Get existing context or create a new one (in case BEGIN was missed).
+-                TransactionContext context = transTracker.computeIfAbsent(transId, k -> new TransactionContext());
+-
+-                // --- Initialization Step: Set Total Counts ---
+-                Map<String, TableCounters> newTableCounters = new ConcurrentHashMap<>();
+-                for (SinkProto.DataCollection dataCollection : transactionMetadata.getDataCollectionsList())
+-                {
+-                    String fullTable = dataCollection.getDataCollection();
+-                    // Create official counter with total count
+-                    newTableCounters.put(fullTable, new TableCounters((int) dataCollection.getEventCount()));
+-                }
+-
+-                // Set the final state (must be volatile write)
+-                context.setEndReceived(newTableCounters);
+-
+-                // --- Merge Step: Apply pre-received rows ---
+-                for (Map.Entry<String, AtomicInteger> preEntry : context.preEndCounts.entrySet())
+-                {
+-                    String table = preEntry.getKey();
+-                    int accumulatedCount = preEntry.getValue().get();
+-                    TableCounters finalCounter = newTableCounters.get(table);
+-
+-                    if (finalCounter != null)
+-                    {
+-                        // Apply the accumulated count to the official counter
+-                        for (int i = 0; i < accumulatedCount; i++)
+-                        {
+-                            finalCounter.increment();
+-                        }
+-                    } else
+-                    {
+-                        LOGGER.warn("Pre-received rows for table {} (count: {}) but table was not in TX END metadata. Discarding accumulated count.", table, accumulatedCount);
+-                    }
+-                }
+-                context.txEnd = transactionMetadata;
+-
+-                // --- Cleanup/Validation Step ---
+-                // Trigger cleanup. This will validate if all rows (pre and post END) have satisfied the total counts.
+-                checkAndCleanupTransaction(transId);
+-            }
+-            return true;
+-        } finally
+-        {
+-            lock.unlock();
+-        }
+-    }
+-
+-    private ByteBuffer getTransBuffer(TransactionContext transactionContext)
+-    {
+-        int total = 0;
+-        byte[] transDataBegin = transactionContext.txBegin.toByteArray();
+-        ByteBuffer beginByteBuffer = writeData(-1, transDataBegin);
+-        total += beginByteBuffer.remaining();
+-
+-        byte[] transDataEnd = transactionContext.txEnd.toByteArray();
+-        ByteBuffer endByteBuffer = writeData(-1, transDataEnd);
+-        total += endByteBuffer.remaining();
+-
+-        if (debug)
+-        {
+-            validMetaInfo(transDataBegin);
+-            validMetaInfo(transDataEnd);
+-        }
+-
+-        List<ByteBuffer> rowEvents = new CopyOnWriteArrayList<>();
+-        for (RowChangeEvent rowChangeEvent : transactionContext.rowChangeEventList)
+-        {
+-            ByteBuffer byteBuffer = write(rowChangeEvent.getRowRecord());
+-            if (byteBuffer == null)
+-            {
+-                return null;
+-            }
+-            rowEvents.add(byteBuffer);
+-            total += byteBuffer.remaining();
+-        }
+-        ByteBuffer buffer = ByteBuffer.allocate(total).order(ByteOrder.BIG_ENDIAN);
+-        beginByteBuffer.rewind();
+-        try
+-        {
+-            buffer.put(beginByteBuffer);
+-        } catch (BufferOverflowException e)
+-        {
+-            throw new RuntimeException(e);
+-        }
+-
+-        for (ByteBuffer rowEvent : rowEvents)
+-        {
+-            rowEvent.rewind();
+-            buffer.put(rowEvent);
+-        }
+-        endByteBuffer.rewind();
+-        buffer.put(endByteBuffer);
+-        buffer.flip();
+-        return buffer;
+-    }
+-
+-    private boolean validMetaInfo(byte[] data)
+-    {
+-        try
+-        {
+-            SinkProto.TransactionMetadata.parseFrom(data);
+-        } catch (InvalidProtocolBufferException e)
+-        {
+-            throw new RuntimeException(e);
+-        }
+-        return true;
+-    }
+-
+-    public ByteBuffer write(SinkProto.RowRecord rowRecord)
+-    {
+-        byte[] rowData = rowRecord.toByteArray();
+-        String tableName = rowRecord.getSource().getTable();
+-        String schemaName = rowRecord.getSource().getDb();
+-
+-        if (debug)
+-        {
+-            try
+-            {
+-                SinkProto.RowRecord.parseFrom(rowData);
+-            } catch (InvalidProtocolBufferException e)
+-            {
+-                throw new RuntimeException(e);
+-            }
+-        }
+-
+-
+-        long tableId;
+-        try
+-        {
+-            tableId = instance.getTableId(schemaName, tableName);
+-        } catch (SinkException e)
+-        {
+-            LOGGER.error("Error while getting schema table id.", e);
+-            return null;
+-        }
+-        {
+-            return writeData((int) tableId, rowData);
+-        }
+-    }
+-
+-    // key: -1 means transaction, else means table id
+-    private ByteBuffer writeData(int key, byte[] data)
+-    {
+-        ByteBuffer buf = ByteBuffer.allocate(Integer.BYTES + Integer.BYTES + data.length).order(ByteOrder.BIG_ENDIAN); // key + value len + data
+-        buf.putInt(key).putInt(data.length).put(data);
+-        buf.flip();
+-        return buf;
+-    }
+-
+-    private synchronized boolean writeBuffer(ByteBuffer buf)
+-    {
+-        if (debug)
+-        {
+-            // Perform deep check before writing to physical storage
+-            try
+-            {
+-                debugVerifyBuffer(buf);
+-            } catch (Exception e)
+-            {
+-                LOGGER.error("CRITICAL: Data corruption detected in memory buffer!", e);
+-                // Block the write to prevent disk pollution
+-                return false;
+-            }
+-        }
+-        PhysicalWriter writer;
+-        try
+-        {
+-            writer = writerManager.current();
+-            int size = buf.remaining();
+-            writer.prepare(size);
+-
+-            byte[] effectiveData = new byte[size];
+-            buf.get(effectiveData);
+-            writer.append(effectiveData);
+-            writer.flush();
+-        } catch (IOException e)
+-        {
+-            LOGGER.error("Error while writing row record.", e);
+-            return false;
+-        }
+-        return true;
+-    }
+-
+-    @Override
+-    public boolean writeRow(RowChangeEvent rowChangeEvent)
+-    {
+-        try
+-        {
+-            lock.lock();
+-            String transId = rowChangeEvent.getTransaction().getId();
+-            String fullTable = rowChangeEvent.getFullTableName();
+-
+-            // 1. Get or create the transaction context
+-            TransactionContext context = transTracker.computeIfAbsent(transId, k -> new TransactionContext());
+-            context.rowChangeEventList.add(rowChangeEvent);
+-            // 2. Check if TX END has arrived
+-            if (context.isEndReceived())
+-            {
+-                // TX END arrived: Use official TableCounters
+-                TableCounters counters = context.tableCounters.get(fullTable);
+-                if (counters != null)
+-                {
+-                    // Increment the processed row count for this table
+-                    counters.increment();
+-
+-                    // If this table completed, check if the entire transaction is complete.
+-                    if (counters.isComplete())
+-                    {
+-                        checkAndCleanupTransaction(transId);
+-                    }
+-                } else
+-                {
+-                    LOGGER.warn("Row received for TransId {} / Table {} but was not included in TX END metadata.", transId, fullTable);
+-                }
+-            } else
+-            {
+-                context.incrementPreEndCount(fullTable);
+-                LOGGER.debug("Row received for TransId {} / Table {} before TX END. Accumulating count.", transId, fullTable);
+-            }
+-            return true;
+-        } finally
+-        {
+-            lock.unlock();
+-        }
+-    }
+-
+-    @Override
+-    public void flush()
+-    {
+-
+-    }
+-
+-    @Override
+-    public void close() throws IOException
+-    {
+-        this.writerManager.close();
+-    }
+-
+-    /**
+-     * Verifies the structure and content of the ByteBuffer before physical write.
+-     * It checks [Key(4B)][Len(4B)][Data(nB)] framing and validates Protobuf integrity.
+-     * * @param buf The ByteBuffer prepared for writing.
+-     */
+-    private void debugVerifyBuffer(ByteBuffer buf)
+-    {
+-        // Create a snapshot to avoid modifying the original buffer's position
+-        ByteBuffer temp = buf.duplicate();
+-        temp.order(ByteOrder.BIG_ENDIAN);
+-        temp.rewind();
+-
+-        int recordCount = 0;
+-//        LOGGER.info("--- [Debug Verify] Starting deep verification (Size: {} bytes) ---", temp.remaining());
+-
+-        while (temp.hasRemaining())
+-        {
+-            int startPos = temp.position();
+-
+-            // 1. Ensure enough bytes for the Header (Key + Len = 8 bytes)
+-            if (temp.remaining() < 8)
+-            {
+-                throw new RuntimeException(String.format(
+-                        "Header truncated at pos %d. Only %d bytes remaining.", startPos, temp.remaining()));
+-            }
+-
+-            int key = temp.getInt();
+-            int len = temp.getInt();
+-
+-            // 2. Boundary Check: Ensure the buffer contains the full data payload
+-            if (len < 0 || temp.remaining() < len)
+-            {
+-                throw new RuntimeException(String.format(
+-                        "Data mismatch at pos %d. Key: %d, Declared Len: %d, Available: %d",
+-                        startPos, key, len, temp.remaining()));
+-            }
+-
+-            // 3. Extract payload for Protobuf parsing
+-            byte[] payload = new byte[len];
+-            temp.get(payload);
+-
+-            try
+-            {
+-                if (key == -1)
+-                {
+-                    // Key -1: Must be valid TransactionMetadata
+-                    SinkProto.TransactionMetadata.parseFrom(payload);
+-                    if (debug) LOGGER.debug("Record {}: Verified Metadata at pos {}", recordCount, startPos);
+-                } else
+-                {
+-                    // Key >= 0: Must be valid RowRecord
+-                    SinkProto.RowRecord.parseFrom(payload);
+-                    if (debug)
+-                        LOGGER.debug("Record {}: Verified RowRecord (TableId: {}) at pos {}", recordCount, key, startPos);
+-                }
+-            } catch (InvalidProtocolBufferException e)
+-            {
+-                // This is where "invalid tag (zero)" or "invalid UTF-8" would be caught
+-                LOGGER.error("[Debug Verify] Protobuf corruption detected!");
+-                LOGGER.error("Record: {}, Key: {}, Offset: {}, Error: {}", recordCount, key, startPos, e.getMessage());
+-                throw new RuntimeException("Pre-write Protobuf validation failed", e);
+-            }
+-            recordCount++;
+-        }
+-    }
+-
+-    private static class TransactionContext
+-    {
+-        // Key: Full Table Name, Value: Row Count
+-        private final Map<String, AtomicInteger> preEndCounts = new ConcurrentHashMap<>();
+-        public List<RowChangeEvent> rowChangeEventList = new CopyOnWriteArrayList<>();
+-        public SinkProto.TransactionMetadata txBegin;
+-        public SinkProto.TransactionMetadata txEnd;
+-        @Getter
+-        private volatile boolean endReceived = false;
+-        // Key: Full Table Name
+-        private Map<String, TableCounters> tableCounters = null;
+-
+-        public void setEndReceived(Map<String, TableCounters> counters)
+-        {
+-            this.tableCounters = counters;
+-            this.endReceived = true;
+-        }
+-
+-        /**
+-         * @param table Full table name
+-         */
+-        public void incrementPreEndCount(String table)
+-        {
+-            preEndCounts.computeIfAbsent(table, k -> new AtomicInteger(0)).incrementAndGet();
+-        }
+-    }
+-}
+\ No newline at end of file
++            output.close(primary == null);
++        }
++        catch (IOException | RuntimeException error)
++        {
++            IOException cleanup = error instanceof IOException ? (IOException) error : new IOException(error);
++            if (primary == null) primary = cleanup;
++            else if (primary != cleanup) primary.addSuppressed(cleanup);
++        }
++        failure = primary;
++        if (failure != null) throw failure;
++    }
++
++    private void requireOpen() throws IOException
++    {
++        if (failure != null) throw failure;
++        require(!closed, "ProtoWriter is closed");
++    }
++
++    private UncheckedIOException failed(Exception error)
++    {
++        if (failure == null) failure = error instanceof IOException ? (IOException) error : new IOException("Invalid Proto transaction", error);
++        return new UncheckedIOException(failure);
++    }
++
++    private static void require(boolean condition, String message) throws IOException
++    {
++        if (!condition) throw new IOException(message);
++    }
++
++    private record Row(SinkProto.RowRecord record, int tableId) {}
++
++    private static final class Transaction
++    {
++        SinkProto.TransactionMetadata begin, end;
++        final TreeMap<Long, Row> rows = new TreeMap<>();
++        final Map<String, Long> expected = new HashMap<>(), actual = new HashMap<>();
++    }
++}
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/proto/RotatingWriterManager.java b/src/main/java/io/pixelsdb/pixels/sink/writer/proto/RotatingWriterManager.java
+deleted file mode 100644
+--- a/src/main/java/io/pixelsdb/pixels/sink/writer/proto/RotatingWriterManager.java
++++ /dev/null
+@@ -1,88 +0,0 @@
+-/*
+- * Copyright 2025 PixelsDB.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package io.pixelsdb.pixels.sink.writer.proto;
+-
+-
+-import io.pixelsdb.pixels.common.physical.PhysicalWriter;
+-import io.pixelsdb.pixels.common.physical.PhysicalWriterUtil;
+-import io.pixelsdb.pixels.common.physical.Storage;
+-import io.pixelsdb.pixels.sink.config.PixelsSinkConfig;
+-import io.pixelsdb.pixels.sink.config.factory.PixelsSinkConfigFactory;
+-import io.pixelsdb.pixels.sink.util.EtcdFileRegistry;
+-
+-import java.io.IOException;
+-
+-/**
+- * @package: io.pixelsdb.pixels.sink.writer
+- * @className: RotatingWriterManager
+- * @author: AntiO2
+- * @date: 2025/10/5 07:34
+- */
+-public class RotatingWriterManager
+-{
+-    private final String baseDir;
+-    private final String topic;
+-    private final int maxRecordsPerFile;
+-    private final Storage.Scheme scheme;
+-    private final EtcdFileRegistry registry;
+-    private int currentCount = 0;
+-    private PhysicalWriter currentWriter;
+-    private String currentFileName;
+-
+-    public RotatingWriterManager(String topic) throws IOException
+-    {
+-        PixelsSinkConfig sinkConfig = PixelsSinkConfigFactory.getInstance();
+-        this.baseDir = sinkConfig.getSinkProtoDir();
+-        this.topic = topic;
+-        this.maxRecordsPerFile = sinkConfig.getMaxRecordsPerFile();
+-        this.registry = new EtcdFileRegistry(topic, baseDir);
+-        this.scheme = Storage.Scheme.fromPath(this.baseDir);
+-        rotate();
+-    }
+-
+-    private void rotate() throws IOException
+-    {
+-        if (currentWriter != null)
+-        {
+-            currentWriter.close();
+-            registry.markFileCompleted(registry.getCurrentFileKey());
+-        }
+-
+-        currentFileName = registry.createNewFile();
+-        currentWriter = PhysicalWriterUtil.newPhysicalWriter(scheme, currentFileName);
+-
+-        currentCount = 0;
+-    }
+-
+-    public PhysicalWriter current() throws IOException
+-    {
+-        if (currentCount >= maxRecordsPerFile)
+-        {
+-            rotate();
+-        }
+-        currentCount++;
+-        return currentWriter;
+-    }
+-
+-    public void close() throws IOException
+-    {
+-        if (currentWriter != null)
+-        {
+-            currentWriter.close();
+-            registry.markFileCompleted(registry.getCurrentFileKey());
+-        }
+-    }
+-}
+\ No newline at end of file
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaWriter.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaWriter.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaWriter.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaWriter.java
+@@ -71 +71 @@
+-            LOGGER.error(e.getMessage(), e);
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Sink transaction handling failed", e);
+@@ -114 +114 @@
+-            LOGGER.error(e.getMessage(), e);
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Sink transaction handling failed", e);
+@@ -146,0 +147 @@
++        io.pixelsdb.pixels.sink.SibenchReport.fail("Row change without source transaction metadata", null);
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/SinkContextManager.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/SinkContextManager.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/SinkContextManager.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/SinkContextManager.java
+@@ -117,0 +118,5 @@
++        if (pixelsTransContext == null)
++        {
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Cannot begin Pixels transaction for " + sourceTxId, null);
++        }
++        io.pixelsdb.pixels.sink.SibenchReport.begin(pixelsTransContext.getTimestamp());
+@@ -206,0 +212 @@
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Source transaction failed in Pixels: " + txId, null);
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableCrossTxWriter.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableCrossTxWriter.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableCrossTxWriter.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableCrossTxWriter.java
+@@ -160,0 +161 @@
++        io.pixelsdb.pixels.sink.SibenchReport.fail("Retina write failed for source transactions " + txIds, null);
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TransactionProxy.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TransactionProxy.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TransactionProxy.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TransactionProxy.java
+@@ -167,0 +168 @@
++        io.pixelsdb.pixels.sink.SibenchReport.commit(transContext.getPixelsTransCtx().getTimestamp());
+@@ -182 +183,4 @@
+-            transService.commitTrans(ctx.getTransId(), false);
++            if (!transService.commitTrans(ctx.getTransId(), false))
++            {
++                io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels commit rejected " + ctx.getTransId(), null);
++            }
+@@ -185 +189 @@
+-            LOGGER.error("Batch commit failed: {}", e.getMessage(), e);
++            io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels commit failed " + ctx.getTransId(), e);
+@@ -197,0 +202 @@
++        io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels transaction rolled back " + ctx.getTransId(), null);
+@@ -240 +245,9 @@
+-                transService.commitTransBatch(batchTransIds, false);
++                List<Boolean> committed = transService.commitTransBatch(batchTransIds, false);
++                if (committed.size() != batchContexts.size() || committed.contains(false))
++                {
++                    io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels batch commit rejected " + batchTransIds, null);
++                }
++                for (TransContext committedContext : batchContexts)
++                {
++                    io.pixelsdb.pixels.sink.SibenchReport.commit(committedContext.getTimestamp());
++                }
+@@ -267 +280 @@
+-                LOGGER.error("Batch commit failed: {}", e.getMessage(), e);
++                io.pixelsdb.pixels.sink.SibenchReport.fail("Pixels batch commit failed", e);
+@@ -270 +283 @@
+-                LOGGER.error("Unexpected error in batch commit worker", e);
++                io.pixelsdb.pixels.sink.SibenchReport.fail("Unexpected error in batch commit worker", e);
+diff --git a/src/test/java/io/pixelsdb/pixels/sink/writer/proto/ProtoWriterTest.java b/src/test/java/io/pixelsdb/pixels/sink/writer/proto/ProtoWriterTest.java
+index 9609268..08debf1 100644
+--- a/src/test/java/io/pixelsdb/pixels/sink/writer/proto/ProtoWriterTest.java
++++ b/src/test/java/io/pixelsdb/pixels/sink/writer/proto/ProtoWriterTest.java
+@@ -19 +18,0 @@ package io.pixelsdb.pixels.sink.writer.proto;
+-import com.google.protobuf.ByteString;
+@@ -21,2 +19,0 @@ import io.pixelsdb.pixels.common.physical.*;
+-import io.pixelsdb.pixels.sink.SinkProto;
+-import io.pixelsdb.pixels.sink.TestConfig;
+@@ -24 +20,0 @@ import io.pixelsdb.pixels.storage.localfs.PhysicalLocalReader;
+-import org.junit.jupiter.api.Tag;
+@@ -31 +26,0 @@ import java.nio.ByteOrder;
+-import java.nio.charset.StandardCharsets;
+@@ -40,57 +34,0 @@ class ProtoWriterTest
+-    private static final String SCHEMA_NAME = "test";
+-    private static final String TABLE_NAME = "ray";
+-
+-    private static SinkProto.RowRecord getRowRecord(int i)
+-    {
+-        byte[][] cols = new byte[3][];
+-
+-        cols[0] = Integer.toString(i).getBytes(StandardCharsets.UTF_8);
+-        cols[1] = Long.toString(i * 1000L).getBytes(StandardCharsets.UTF_8);
+-        cols[2] = ("row_" + i).getBytes(StandardCharsets.UTF_8);
+-        SinkProto.RowValue.Builder afterValueBuilder = SinkProto.RowValue.newBuilder();
+-        afterValueBuilder
+-                .addValues(
+-                        SinkProto.ColumnValue.newBuilder().setValue(ByteString.copyFrom((cols[0]))).build())
+-                .addValues(
+-                        SinkProto.ColumnValue.newBuilder().setValue(ByteString.copyFrom((cols[1]))).build())
+-                .addValues(
+-                        SinkProto.ColumnValue.newBuilder().setValue(ByteString.copyFrom((cols[2]))).build());
+-
+-
+-        SinkProto.RowRecord.Builder builder = SinkProto.RowRecord.newBuilder();
+-        builder.setOp(SinkProto.OperationType.INSERT)
+-                .setAfter(afterValueBuilder)
+-                .setSource(
+-                        SinkProto.SourceInfo.newBuilder()
+-                                .setDb(SCHEMA_NAME)
+-                                .setTable(TABLE_NAME)
+-                                .build()
+-                );
+-        return builder.build();
+-    }
+-
+-    private static SinkProto.TransactionMetadata getTrans(int i, SinkProto.TransactionStatus status)
+-    {
+-        SinkProto.TransactionMetadata.Builder builder = SinkProto.TransactionMetadata.newBuilder();
+-        builder.setId(Integer.toString(i));
+-        builder.setStatus(status);
+-        builder.setTimestamp(System.currentTimeMillis());
+-        return builder.build();
+-    }
+-
+-    @Tag("integration")
+-    @Test
+-    void testWriteTransInfo() throws Exception
+-    {
+-        TestConfig.initializeIntegrationConfig();
+-        int maxTx = Integer.getInteger("pixels.sink.test.transactions", 10);
+-        try (ProtoWriter transWriter = new ProtoWriter())
+-        {
+-            for (int i = 0; i < maxTx; i++)
+-            {
+-                transWriter.writeTrans(getTrans(i, SinkProto.TransactionStatus.BEGIN));
+-                transWriter.writeTrans(getTrans(i, SinkProto.TransactionStatus.END));
+-            }
+-        }
+-    }
+-
+@@ -152,21 +89,0 @@ class ProtoWriterTest
+-    @Tag("integration")
+-    @Test
+-    void testWriteRowInfo() throws Exception
+-    {
+-        TestConfig.initializeIntegrationConfig();
+-        int maxTx = Integer.getInteger("pixels.sink.test.transactions", 10);
+-        int rowCnt = 0;
+-        try (ProtoWriter transWriter = new ProtoWriter())
+-        {
+-            for (int i = 0; i < maxTx; i++)
+-            {
+-                transWriter.writeTrans(getTrans(i, SinkProto.TransactionStatus.BEGIN));
+-                for (int j = 0; j < 3; j++)
+-                {
+-                    transWriter.write(getRowRecord(rowCnt++));
+-                }
+-                transWriter.writeTrans(getTrans(i, SinkProto.TransactionStatus.END));
+-            }
+-        }
+-        assertEquals(maxTx * 3, rowCnt);
+-    }
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/freshness/FreshnessClient.java b/src/main/java/io/pixelsdb/pixels/sink/freshness/FreshnessClient.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/freshness/FreshnessClient.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/freshness/FreshnessClient.java
+@@ -55,0 +56,10 @@
++    private final String measuredColumn = System.getProperty("sibench.freshness.column", "freshness_ts");
++    private final String measuredTable = System.getProperty("sibench.freshness.table");
++    private final java.util.concurrent.atomic.AtomicLong samples = new java.util.concurrent.atomic.AtomicLong();
++    private volatile Throwable sampleFailure;
++
++    public void checkSamples() throws java.io.IOException
++    {
++        if (sampleFailure != null) throw new java.io.IOException("Freshness sampling failed", sampleFailure);
++        if (samples.get() == 0) throw new java.io.IOException("Freshness produced no non-null samples");
++    }
+@@ -216 +226 @@
+-        monitoredTables.add(tableName);
++        if (measuredTable == null || measuredTable.equals(tableName)) monitoredTables.add(tableName);
+@@ -259 +269,10 @@
+-        connectionExecutor.shutdownNow();
++        connectionExecutor.shutdown();
++        try
++        {
++            if (!connectionExecutor.awaitTermination(35, TimeUnit.SECONDS))
++                throw new IllegalStateException("Freshness query did not stop");
++        } catch (InterruptedException interrupted)
++        {
++            Thread.currentThread().interrupt();
++            throw new IllegalStateException("Interrupted stopping freshness queries", interrupted);
++        }
+@@ -326,0 +346 @@
++            if (!measuredColumn.matches("[a-z][a-z0-9_]*")) throw new IllegalArgumentException("Invalid freshness column");
+@@ -328,9 +348,8 @@
+-                    "SELECT max(freshness_ts) FROM \"%s\" WHERE freshness_ts < TIMESTAMP '%s'",
+-                    tableName,
+-                    tSendMillisStr
+-            );
+-
+-            try (Statement statement = conn.createStatement();
+-                 ResultSet rs = statement.executeQuery(query))
+-            {
+-
++                    "SELECT max(%s) FROM \"%s\" WHERE %s < TIMESTAMP '%s'",
++                    measuredColumn, tableName, measuredColumn, tSendMillisStr);
++
++            try (Statement statement = conn.createStatement())
++            {
++
++                statement.setQueryTimeout(30);
++                try (ResultSet rs = statement.executeQuery(query)) {
+@@ -351,0 +371 @@
++                    samples.incrementAndGet();
+@@ -356,0 +377 @@
++                }
+@@ -360,0 +382 @@
++                sampleFailure = e;
+@@ -364,0 +387 @@
++                sampleFailure = e;
+@@ -368,0 +392 @@
++                sampleFailure = e;
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaPayloadBuilder.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaPayloadBuilder.java
+--- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaPayloadBuilder.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/RetinaPayloadBuilder.java
+@@ -53,0 +54,6 @@
++        var updateKeys = new java.util.HashSet<com.google.protobuf.ByteString>();
++        if (events.get(0).isUpdate())
++        {
++            events.get(0).initRoutingKey();
++            updateKeys.add(events.get(0).getAfterRoutingKey());
++        }
+@@ -56 +62,8 @@
+-            if (i == events.size() || events.get(i).getOp() != events.get(groupStart).getOp())
++            boolean split = i == events.size() || events.get(i).getOp() != events.get(groupStart).getOp();
++            if (!split && events.get(i).isUpdate())
++            {
++                events.get(i).initRoutingKey();
++                // Retina resolves a whole update group before switching any primary entry.
++                split = !updateKeys.add(events.get(i).getAfterRoutingKey());
++            }
++            if (split)
+@@ -60,0 +74,6 @@
++                updateKeys.clear();
++                if (i < events.size() && events.get(i).isUpdate())
++                {
++                    events.get(i).initRoutingKey();
++                    updateKeys.add(events.get(i).getAfterRoutingKey());
++                }
+diff --git a/src/test/java/io/pixelsdb/pixels/sink/writer/retina/RetinaPayloadBuilderTest.java b/src/test/java/io/pixelsdb/pixels/sink/writer/retina/RetinaPayloadBuilderTest.java
+--- a/src/test/java/io/pixelsdb/pixels/sink/writer/retina/RetinaPayloadBuilderTest.java
++++ b/src/test/java/io/pixelsdb/pixels/sink/writer/retina/RetinaPayloadBuilderTest.java
+@@ -40,0 +41,20 @@
++
++    @Test
++    void shouldSplitRepeatedUpdatesAndPreserveEveryAfterImage() throws Exception
++    {
++        TableMetadata metadata = tableMetadata();
++        RowChangeEvent first = event(SinkProto.OperationType.UPDATE, row("1", "2000"), row("1", "2100"), metadata);
++        RowChangeEvent other = event(SinkProto.OperationType.UPDATE, row("2", "3000"), row("2", "3100"), metadata);
++        RowChangeEvent second = event(SinkProto.OperationType.UPDATE, row("1", "2100"), row("1", "2200"), metadata);
++        for (List<RowChangeEvent> events : List.of(List.of(first, second), List.of(first, other, second)))
++        {
++            var updates = RetinaPayloadBuilder.buildTableUpdateDataList(TABLE_NAME, TIMESTAMP, events);
++            assertEquals(2, updates.size());
++            assertEquals(events.size() - 1, updates.get(0).getUpdateDataCount());
++            assertEquals(1, updates.get(1).getUpdateDataCount());
++            assertEquals(bytes("2100"), updates.get(0).getUpdateData(0).getColValues(1));
++            assertEquals(bytes("2200"), updates.get(1).getUpdateData(0).getColValues(1));
++            assertEquals(TIMESTAMP, updates.get(0).getTimestamp());
++            assertEquals(TIMESTAMP, updates.get(1).getTimestamp());
++        }
++    }
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/PixelsSinkWriterFactory.java b/src/main/java/io/pixelsdb/pixels/sink/writer/PixelsSinkWriterFactory.java
+index cc901d2..65698f0 100644
+--- a/src/main/java/io/pixelsdb/pixels/sink/writer/PixelsSinkWriterFactory.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/writer/PixelsSinkWriterFactory.java
+@@ -22 +21,0 @@ import io.pixelsdb.pixels.sink.writer.flink.FlinkPollingWriter;
+-import io.pixelsdb.pixels.sink.writer.proto.ProtoWriter;
+@@ -53,2 +52 @@ public class PixelsSinkWriterFactory
+-                                writer = new ProtoWriter();
+-                                break;
++                                throw new IllegalStateException("Proto capture requires an explicit output; use SIBench prepare-cdc");
