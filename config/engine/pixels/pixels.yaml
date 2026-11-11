@@ -10,6 +10,11 @@ engine: pixels
 build_directory: build/services/pixels
 # "local" runs Pixels next to the generator; HOST:PORT names a `sibench pixels-host` agent.
 pixels_host: local
+# Required for reusable columnar baselines. Configure the storage profile before enabling.
+# data_storage:
+#   config: ../../index/storage.yaml
+#   profile: cos
+#   prefix: sibench/pixels
 memory:
   coordinator_heap: 2g
   retina_heap: 16g

@@ -191,6 +191,8 @@ public final class PixelsHost {
         private Duration requestTimeout = SETUP;
         private long requestDeadline;
         private boolean stopped;
+        private String dataUri, storageUri;
+        private boolean retainData;
 
         Session(Path build, Path workRoot, String token, Socket socket) throws IOException {
             this.build = build;
@@ -254,6 +256,7 @@ public final class PixelsHost {
                 case "create" -> create(request);
                 case "upload" -> upload(request);
                 case "load" -> load(request);
+                case "export-baseline", "import-baseline" -> baseline(request);
                 case "start-query" -> startQuery(request);
                 case "check" -> check();
                 case "stop" -> stop();
@@ -265,7 +268,7 @@ public final class PixelsHost {
         private Map<String, ?> create(JsonObject request) throws Exception {
             String table = request.get("table").getAsString();
             if (!table.matches("[A-Za-z0-9_]+")) throw new IOException("Invalid table name");
-            return Map.of("tables", setup("create", request.get("schema").getAsString(), run.resolve("data").toString(),
+            return Map.of("tables", setup("create", request.get("schema").getAsString(), dataUri,
                     write("spec-" + table + ".tsv", request.get("spec").getAsString()).toString(), run.resolve("tables-" + table + ".tsv").toString()));
         }
 
@@ -278,6 +281,8 @@ public final class PixelsHost {
             Files.createDirectory(created);
             run = created;
             stopped = false;
+            storageUri = null;
+            retainData = false;
             String address = socket.getLocalAddress().getHostAddress();
             var ports = new LinkedHashMap<String, Integer>();
             for (String port : List.of("etcd", "etcd_peer", "metadata", "trans", "retina", "node", "query", "index", "scaling", "worker"))
@@ -286,6 +291,24 @@ public final class PixelsHost {
             Files.createSymbolicLink(run.resolve("home/lib"), build.resolve("home/lib"));
             Files.writeString(home.resolve("retina"), address + "\n");
             var generated = new LinkedHashMap<String, String>();
+            dataUri = "file://" + run.resolve("data");
+            if (request.has("data_storage")) {
+                var storage = org.sibench.config.ConfigValues.parse(request.get("data_storage").toString());
+                var profile = org.sibench.config.ConfigValues.object(storage, "profile");
+                String prefix = org.sibench.config.ConfigValues.string(storage, "prefix") + "/runs/" + java.util.UUID.randomUUID();
+                var connection = org.sibench.config.ObjectStore.of("pixels", profile, prefix);
+                if (!connection.virtualHosted() || !prefix.matches("[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*"))
+                    throw new IOException("Invalid Pixels COS storage prefix/addressing");
+                storageUri = "cos://" + connection.bucket() + "/" + prefix + "/";
+                dataUri = storageUri + "data";
+                generated.put("enabled.storage.schemes", "file,cos");
+                generated.put("cos.region", connection.region()); generated.put("cos.endpoint", connection.endpoint());
+                generated.put("cos.access.key", ""); generated.put("cos.secret.key", "");
+                for (String key : List.of("access_key_env", "secret_key_env", "session_token_env"))
+                    if (profile.containsKey(key)) generated.put("sibench.cos." + key.replace('_', '.'),
+                            org.sibench.config.ConfigValues.string(profile, key));
+                retainData = request.has("retain_data") && request.get("retain_data").getAsBoolean();
+            }
             generated.put("pixels.var.dir", run.resolve("var") + "/");
             generated.put("metadata.db.url", "jdbc:derby:" + run.resolve("var/pixels_metadata") + ";create=true");
             for (String server : List.of("metadata", "trans", "retina", "node", "index"))
@@ -310,7 +333,8 @@ public final class PixelsHost {
                 generated.put(path.getKey(), run.resolve(path.getValue()).toString());
             for (var folder : Map.of("retina.buffer.object.storage.folder", "retina-buffer", "retina.offload.checkpoint.dir", "offload",
                     "retina.recovery.checkpoint.dir", "recovery", "retina.storage.gc.journal.dir", "gc-journal").entrySet())
-                generated.put(folder.getKey(), "file://" + run.resolve(folder.getValue()) + "/");
+                generated.put(folder.getKey(), storageUri == null ? "file://" + run.resolve(folder.getValue()) + "/"
+                        : storageUri + folder.getValue() + "/");
             Map<String, String> overlay = new LinkedHashMap<>();
             for (var entry : request.getAsJsonObject("overlay").entrySet()) overlay.put(entry.getKey(), entry.getValue().getAsString());
             config = home.resolve("pixels.properties");
@@ -326,6 +350,8 @@ public final class PixelsHost {
                     "--initial-advertise-peer-urls", "http://" + address + ":" + ports.get("etcd_peer"),
                     "--initial-cluster", "default=http://" + address + ":" + ports.get("etcd_peer")), Map.of());
             await(address, ports.get("etcd"));
+            if (storageUri != null) setup("init-storage", storageUri);
+            if (request.has("baseline_max_timestamp")) setup("seed-timestamps", request.get("baseline_max_timestamp").getAsString());
             setup("init-meta");
             var memory = request.getAsJsonObject("memory");
             launch("coordinator", daemon(memory.get("coordinator_heap").getAsString(), "coordinator", List.of(), build.resolve("jars/pixels-daemon.jar").toString()),
@@ -340,7 +366,27 @@ public final class PixelsHost {
                     Map.of("LD_LIBRARY_PATH", run.resolve("home/lib") + ":" + Path.of(System.getProperty("java.home"), "lib") + ":"
                             + Path.of(System.getProperty("java.home"), "lib/server"), "LD_PRELOAD", run.resolve("home/lib/libjemalloc.so").toString()));
             for (String port : List.of("retina", "index", "trans")) await(address, ports.get(port));
-            return Map.of("properties", Files.readString(config), "address", address, "directory", run.toString());
+            return Map.of("properties", Files.readString(config), "address", address, "directory", run.toString(), "data_uri", dataUri);
+        }
+
+        private Map<String, ?> baseline(JsonObject request) throws Exception {
+            if (storageUri == null || stopped) throw new IOException("Baseline operations require an active COS session");
+            String operation = request.get("op").getAsString();
+            Path result = run.resolve(operation + ".json");
+            if (operation.equals("export-baseline")) {
+                var names = new ArrayList<String>();
+                for (var item : request.getAsJsonArray("tables")) {
+                    String name = item.getAsString();
+                    if (!name.matches("[A-Za-z0-9_]+")) throw new IOException("Invalid baseline table");
+                    names.add(name);
+                }
+                setup(operation, "postgres", String.join(",", names), result.toString());
+            } else {
+                Path spec = write("import-spec.tsv", request.get("spec").getAsString());
+                Path inventory = write("import-inventory.json", request.get("inventory").toString());
+                setup(operation, "postgres", spec.toString(), inventory.toString(), result.toString());
+            }
+            return Map.of("baseline", JsonParser.parseString(Files.readString(result)));
         }
 
         private List<String> daemon(String heap, String role, List<String> options, String classpath) throws IOException {
@@ -377,7 +423,8 @@ public final class PixelsHost {
         private String setup(String... arguments) throws Exception {
             var command = new ArrayList<>(List.of(java(), "-Xmx4g", "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
                     "--add-opens=java.base/java.nio=ALL-UNNAMED", "-cp",
-                    build.resolve("jars/sibench-pixels.jar") + ":" + build.resolve("jars/pixels-cli.jar"), "org.sibench.pixels.PixelsSetup"));
+                    build.resolve("jars/sibench-pixels.jar") + ":" + build.resolve("jars/pixels-cli.jar") + ":"
+                            + build.resolve("jars/pixels-daemon.jar"), "org.sibench.pixels.PixelsSetup"));
             command.addAll(List.of(arguments));
             String name = "setup-" + arguments[0] + "-" + (arguments[0].equals("create") ? Path.of(arguments[3]).getFileName()
                     : arguments.length > 2 ? arguments[2] : "");
@@ -479,6 +526,10 @@ public final class PixelsHost {
 
         private Map<String, ?> delete() throws IOException {
             if (run == null || !stopped || !processes.isEmpty()) throw new IOException("Pixels run has not stopped normally");
+            if (storageUri != null && !retainData) {
+                try { setup("delete-storage", storageUri); }
+                catch (Exception failure) { throw new IOException("Cannot delete owned Pixels COS prefix: " + storageUri, failure); }
+            }
             Generation.deleteTree(run);
             run = null;
             return Map.of();

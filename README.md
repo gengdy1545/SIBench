@@ -94,16 +94,19 @@ java -jar build/sibench/sibench.jar generate config/sibench.yaml
 
 `trace.workload_requests` limits exported workload operations; it excludes the baseline and may be exceeded by already admitted source work. `trace.secondary_indexes` defaults to false. See [generation and publication](docs/trace.md#native-publication) for source phases, request accounting, index selection and failure behavior.
 
-For repeated Pixels runs, prepare a [reusable CDC input](docs/cdc-input.md), then consume it in a [Pixels experiment](docs/pixels-experiment.md):
+For repeated Pixels runs, configure [Pixels COS storage](docs/pixels-experiment.md#prepare-once-restore-for-each-run), prepare reusable inputs, then run a fresh experiment:
 
 ```bash
-java -jar build/sibench/sibench.jar prepare-cdc config/sibench.yaml
+java -jar build/sibench/sibench.jar prepare-csv config/sibench.yaml results/capture/hybench-csv
+java -jar build/sibench/sibench.jar check-csv-input results/capture/hybench-csv
+java -jar build/sibench/sibench.jar prepare-pixels-inputs config/sibench.yaml \
+  results/capture/hybench-csv results/inputs/hybench-pixels
 java -jar build/sibench/sibench.jar check-cdc-input results/capture/hybench
 java -jar build/sibench/sibench.jar pixels-experiment config/sibench.yaml \
-  results/capture/hybench results/pixels/run
+  results/capture/hybench results/inputs/hybench-pixels results/pixels/run
 ```
 
-Preparation runs the configured HyBench TP/AT phases once and retains the baseline and committed row changes. File experiments load a fresh Pixels baseline and consume the input once or a complete transaction prefix, without PostgreSQL. Updates default on; Index Trace export, Trino queries and freshness default off. All output directories must be fresh. Isolated Index Service replay consumes an exported Trace without Pixels or the original database.
+`prepare-csv` generates and seals the baseline without a database. Parallel preparation captures PostgreSQL TP/AT changes and creates a Pixels columnar baseline from that same CSV input. Experiments import the existing Pixels files and rebuild indexes and visibility before applying CDC. Updates default on; Trace, queries and freshness default off. All output directories must be fresh. See the [input contract](docs/cdc-input.md) for publication and the [experiment contract](docs/pixels-experiment.md) for restore and measurement semantics.
 
 Pixels runs locally by default. For a remote Pixels host, start the agent there with the matching build and a token file, set `pixels_host: HOST:PORT` in the engine configuration, and supply `SIBENCH_PIXELS_HOST_TOKEN` to the client:
 
@@ -161,8 +164,10 @@ Use `-Dsibench.build.directory=ABSOLUTE_PATH` for an isolated Maven build/test/p
 | `PixelsGenerationCheck` | `sibench.pixels.build=build/services/pixels` (both build phases) and `sibench.hybench.build=build/benchmarks/HyBench-2024`; runs Pixels locally with small HyBench parameters and replays both value kinds. |
 | `PixelsCdcCheck` | `sibench.pixels.build=build/services/pixels`; real PostgreSQL → sink → Pixels application and RowID/Locator validation. |
 | `PixelsSourceCheck` | `sibench.postgres.runtime=build/services/pixels/postgres/runtime`; source-only PostgreSQL checks for key-change rejection, unchanged-key updates without guard function calls, rollback, preceding triggers and preservation of the original indexes. |
-| `CdcPreparationCheck` | `sibench.pixels.build=build/services/pixels`; real PostgreSQL CDC preparation without target services. The HyBench command check also requires `sibench.hybench.build` and runs two one-minute phases. |
-| `PixelsExperimentCheck` | `sibench.pixels.build`; file application, Trace export and static queries. `sibench.cdc.input` can reuse the matching test input; otherwise the test prepares it. The Trino method additionally requires `sibench.trino.deployment` on the Pixels host; `sibench.pixels.host` and `SIBENCH_PIXELS_HOST_TOKEN` select a remote host. Queries require an ABI-compatible host build and matching Java artifacts. |
+| `CdcPreparationCheck` | `sibench.pixels.build=build/services/pixels`; real PostgreSQL CDC preparation without target services. The HyBench command check also requires `sibench.hybench.build`. |
+| `InputStoreCheck` | `sibench.storage.config`, `sibench.storage.profile`, a fresh `sibench.storage.prefix` and the profile's credentials; a small remote publication/download check. |
+| `PixelsPreparationCheck` | `sibench.pixels.build`, `sibench.hybench.build`, `sibench.storage.config` with the `cos` profile and its credentials; parallel preparation, baseline publication and multi-file import. |
+| `PixelsExperimentCheck` | `sibench.pixels.build`, `sibench.storage.config` with the `cos` profile and its credentials. Reuse matching fixtures with `sibench.cdc.input`, `sibench.csv.input` and `sibench.pixels.baseline`. Queries also require `sibench.trino.deployment`; remote hosts use `sibench.pixels.host` and `SIBENCH_PIXELS_HOST_TOKEN`. |
 | `SlateDbStoreCheck` | Source-built `sibench.slatedb.library`; `sibench.slatedb.storage=PATH`, `sibench.slatedb.profile=NAME`, `sibench.slatedb.object_path=FRESH_PREFIX`, and that profile's environment credentials. Uses one Db against the configured S3 store; no independent reader. |
 
 Native component checks live under [src/test/native](src/test/native). DuckDB Python checks accept the instrumented DuckDB executable; C++ checks require C++17 and the matching build's headers/libraries. Compile Pixels Java probes with JDK 17 and `BUILD/jars/pixels-sink.jar`, then run with that JAR and the probe classes on the classpath. Cloud JNI checks use `make -C src/main/native/index/rocksdb_cloud test` after that backend's build. The sink's `RetinaPayloadBuilderTest` runs through its patched build POM.

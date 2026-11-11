@@ -40,14 +40,18 @@ public final class Generation {
 
     /** Validate every selected input before creating any run output or launching a database. */
     static Plan plan(Path root,Path configuration)throws Exception {
-        return plan(root,configuration,false);
+        return plan(root,configuration,false,null);
     }
 
     static Plan cdcPlan(Path root,Path configuration)throws Exception {
-        return plan(root,configuration,true);
+        return plan(root,configuration,true,null);
     }
 
-    private static Plan plan(Path root,Path configuration,boolean prepareCdc)throws Exception {
+    static Plan csvPlan(Path root,Path configuration,Path output)throws Exception {
+        return plan(root,configuration,true,output);
+    }
+
+    private static Plan plan(Path root,Path configuration,boolean prepareCdc,Path csvOutput)throws Exception {
         root=root.toRealPath();var runtime=SibenchConfig.read(root.resolve(configuration));
         var selections=BenchmarkSelection.read(root,runtime);
         if(prepareCdc) {
@@ -55,7 +59,7 @@ public final class Generation {
             require(selections.size()==1,"prepare-cdc requires one HyBench/cdc/Pixels selection");
         }
         var engines=new java.util.EnumMap<Engine,NativeBuild>(Engine.class);
-        for(var selection:selections)if(!engines.containsKey(selection.engine())) {
+        for(var selection:selections)if(csvOutput==null&&!engines.containsKey(selection.engine())) {
             Engine engine=selection.engine();var settings=SibenchConfig.engine(root,runtime,engine);
             Path build=NativeBuildCheck.engineDirectory(root,settings,engine.configName()).toRealPath();
             var identity=switch(engine) {
@@ -82,7 +86,7 @@ public final class Generation {
             var parameters=selection.benchmark().equals("hybench")?HybenchParameters.read(source.source(),nativeConfig):Map.<String,Object>of();
             var baselineRows=parameters.isEmpty()?ScaleInspector.nativeRows(root,document):HybenchParameters.rows(parameters);
             Path client=root.resolve(string(nativeConfig,"build_directory")).toRealPath();
-            Path output=outputDirectory(root,string(object(document,"artifacts"),"directory"));
+            Path output=outputDirectory(root,csvOutput==null?string(object(document,"artifacts"),"directory"):csvOutput.toString());
             for(var previous:inputs)require(!output.startsWith(previous.output())&&!previous.output().startsWith(output),"Overlapping generation outputs");
             var identity=NativeBuildCheck.verify(root,selection.benchmark(),source.source(),client,source.sourceCommit());
             inputs.add(new Input(selection,document,source,client,output,identity,Map.copyOf(baselineRows),parameters));

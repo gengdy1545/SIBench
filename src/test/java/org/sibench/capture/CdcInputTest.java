@@ -52,7 +52,7 @@ public class CdcInputTest {
         byte[] data = Files.readAllBytes(file);
         Files.write(file, java.util.Arrays.copyOf(data, data.length - 1));
         var document = read(root);
-        var item = CdcInput.file(root, file);
+        var item = InputFiles.file(root, file);
         item.addProperty("transactions", 1);
         var files = new JsonArray(); files.add(item); document.add("cdc_files", files); write(root, document);
         assertThrows(IOException.class, () -> CdcInput.check(root));
@@ -112,11 +112,11 @@ public class CdcInputTest {
                     .setEventCount(endCount).addDataCollections(SinkProto.DataCollection.newBuilder().setDataCollection("public.a").setEventCount(endCount)).build());
         }
         var document = new JsonObject(); document.addProperty("kind", "pixels_cdc_input"); document.addProperty("status", "complete");
-        document.add("schema", CdcInput.file(root, schema)); document.add("source_ddl", CdcInput.file(root, ddl));
+        document.add("schema", InputFiles.file(root, schema)); document.add("source_ddl", InputFiles.file(root, ddl));
         document.add("baseline_rows", new Gson().toJsonTree(Map.of("a", 1)));
-        var baselines = new JsonObject();var entry = CdcInput.file(root, csv); entry.addProperty("table", "a");entry.addProperty("rows", 1);
+        var baselines = new JsonObject();var entry = InputFiles.file(root, csv); entry.addProperty("table", "a");entry.addProperty("rows", 1);
         baselines.add("a.csv", entry);document.add("baseline_files", baselines);
-        var files = new JsonArray(); var value = CdcInput.file(root, file);value.addProperty("transactions", 1);files.add(value);document.add("cdc_files", files);
+        var files = new JsonArray(); var value = InputFiles.file(root, file);value.addProperty("transactions", 1);files.add(value);document.add("cdc_files", files);
         document.add("counts", new Gson().toJsonTree(new CdcInput.Counts(1, 1, 1, 0)));write(root, document);return root;
     }
 

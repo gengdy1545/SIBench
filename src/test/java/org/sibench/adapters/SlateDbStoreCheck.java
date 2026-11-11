@@ -1,5 +1,7 @@
 package org.sibench.adapters;
 
+import org.sibench.config.ObjectStore;
+
 import static org.junit.Assert.*;
 
 import java.io.IOException;

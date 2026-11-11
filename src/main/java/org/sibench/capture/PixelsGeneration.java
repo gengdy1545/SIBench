@@ -81,9 +81,11 @@ final class PixelsGeneration {
                 var reportListener = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
                 var budget = new RequestBudget(Generation.requestTarget(input.document()), input.timeout());
                 var overlay = object(settings, "properties");
-                var pixels = host.call(Map.of("op", "start", "run", hostSetting.equals("local") ? "pixels" : output.getFileName().toString(), "overlay", overlay,
+                var startRequest = new LinkedHashMap<String, Object>(Map.of("op", "start", "run", hostSetting.equals("local") ? "pixels" : output.getFileName().toString(), "overlay", overlay,
                         "memory", object(settings, "memory"), "trace", true, "trace_endpoint", address.getHostAddress() + ":" + traceListener.getLocalPort(),
                         "trace_token", traceToken));
+                if (settings.containsKey("data_storage")) startRequest.put("data_storage", object(settings, "data_storage"));
+                var pixels = host.call(startRequest);
                 Path sinkRoot = Files.createDirectory(output.resolve("sink"));
                 Path pixelsConfig = Files.writeString(sinkRoot.resolve("pixels.properties"), pixels.get("properties").getAsString());
                 try (var trace = new PixelsTrace(output.resolve("trace"), input.source(), Map.of(), budget);

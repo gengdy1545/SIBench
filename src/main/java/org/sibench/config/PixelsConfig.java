@@ -32,7 +32,9 @@ public final class PixelsConfig {
             "debezium.max.queue.size", "debezium.max.queue.size.in.bytes", "debezium.poll.interval.ms");
 
     static Map<String, Object> read(Path directory, Map<String, Object> settings) throws IOException {
-        SibenchConfig.keys(settings, Set.of("build_directory", "pixels_host", "memory", "load", "source",
+        var required = new LinkedHashMap<>(settings);
+        required.remove("data_storage");
+        SibenchConfig.keys(required, Set.of("build_directory", "pixels_host", "memory", "load", "source",
                 "properties", "sink_properties"), "pixels");
         String host = string(settings, "pixels_host");
         require(host.equals("local") || host.matches("[A-Za-z0-9.-]+:[1-9][0-9]{0,4}"),
@@ -52,6 +54,16 @@ public final class PixelsConfig {
         for (String key : Set.of("wal_level", "max_wal_senders", "max_replication_slots"))
             require(!postgres.containsKey(key), "Source PostgreSQL logical replication setting is generator-owned: " + key);
         var result = new LinkedHashMap<>(settings);
+        if (settings.containsKey("data_storage")) {
+            var storage = object(settings, "data_storage");
+            SibenchConfig.keys(storage, Set.of("config", "profile", "prefix"), "pixels data_storage");
+            var profile = ObjectStore.profile(directory.resolve(string(storage, "config")), string(storage, "profile"));
+            String prefix = string(storage, "prefix");
+            require(prefix.matches("[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*")
+                    && prefix.startsWith(string(profile, "prefix")), "Invalid Pixels COS prefix");
+            require(string(profile, "addressing").equals("virtual_hosted"), "Pixels COS requires virtual-hosted addressing");
+            result.put("data_storage", Map.of("profile", profile, "prefix", prefix));
+        }
         result.put("properties", pixelsProperties(properties(directory.resolve(string(settings, "properties")))));
         result.put("sink_properties", sinkProperties(properties(directory.resolve(string(settings, "sink_properties")))));
         return result;
@@ -60,6 +72,7 @@ public final class PixelsConfig {
     /** Pixels overrides; location-like keys always come from the generator's run layout. */
     public static Map<String, String> pixelsProperties(Map<String, String> overrides) {
         for (String key : overrides.keySet()) {
+            require(!key.startsWith("cos.") && !key.startsWith("sibench.cos."), "COS settings belong to data_storage: " + key);
             require(!PIXELS_OWNED.contains(key) && !key.matches(".*\\.(host|hosts|port|dir|path|location|folder|url)"),
                     "Pixels property is assigned by the generator: " + key);
             require(overrides.get(key).indexOf('\n') < 0 && overrides.get(key).indexOf('\r') < 0,

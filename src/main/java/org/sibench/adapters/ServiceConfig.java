@@ -1,5 +1,7 @@
 package org.sibench.adapters;
 
+import org.sibench.config.ObjectStore;
+
 import static org.sibench.config.ConfigValues.*;
 
 import org.sibench.adapters.proto.ValueKind;

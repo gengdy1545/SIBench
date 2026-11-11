@@ -20,16 +20,19 @@ public final class CdcPreparation {
     private static final Duration DRAIN = Duration.ofMinutes(2);
     private CdcPreparation() {}
 
-    public static Map<String, Object> run(Path root, Path configuration) throws Exception {
-        return generate(Generation.cdcPlan(root, configuration));
+    public static Map<String, Object> run(Path root, Path configuration, Path csvDirectory) throws Exception {
+        var plan = Generation.cdcPlan(root, configuration);
+        return generate(plan, CsvInput.open(root.resolve(csvDirectory)));
     }
 
-    static Map<String, Object> generate(Generation.Plan plan) throws Exception {
+    static Map<String, Object> generate(Generation.Plan plan, CsvInput.Verified csv) throws Exception {
         var input = plan.inputs().get(0);
         var build = plan.engines().get(Engine.PIXELS);
+        CsvInput.requireCompatible(csv, input);
         Path output = input.output();
         Files.createDirectories(output.getParent());
         Files.createDirectory(output);
+        CsvInput.materialize(csv, output);
         long started = System.nanoTime();
         var timings = new LinkedHashMap<String, Double>();
         var settings = new LinkedHashMap<>(org.sibench.config.SibenchConfig.postgresSettings(
@@ -46,14 +49,8 @@ public final class CdcPreparation {
                 json(output.resolve("engine-build.json"), build.identity());
                 json(output.resolve("client-build.json"), input.buildIdentity());
                 String url = "jdbc:postgresql://127.0.0.1:" + database.port() + "/postgres?user=sibench&ApplicationName=sibench:hybench";
-                Path load = Files.createDirectory(output.resolve("load"));
-                Generation.hybench(plan, input, load, true, null, Engine.POSTGRES, url, null, () -> {});
                 Path data = output.resolve("native/Data_" + string(input.nativeConfig(), "sf"));
-                HybenchInputs.record(data, input.source().source().resolve("conf/load_data_pg.sql"), load.resolve("inputs.json"));
-                Files.copy(input.source().source().resolve("conf/ddl_pg.sql"), output.resolve("schema.sql"));
-                var schema = PixelsInputs.inspect(input.source(), data);
-                Generation.requireRows(input.baselineRows(), schema.rows());
-                Path spec = Files.writeString(output.resolve("pixels-schema.tsv"), schema.schema().text(), StandardOpenOption.CREATE_NEW);
+                Path spec = output.resolve("pixels-schema.tsv");
                 try (var connection = database.connect("load")) {
                     Generation.requireRows(input.baselineRows(), Hybench.load(connection, input.source().source(), data));
                     PixelsGeneration.prepareSource(connection, input.source());
@@ -75,6 +72,7 @@ public final class CdcPreparation {
                     capture.finish();
                     database.close();
                     var evidence = new LinkedHashMap<String, Object>();
+                    evidence.put("csv_manifest_sha256", csv.sha256());
                     evidence.put("engine", build.identity());
                     evidence.put("client", input.buildIdentity());
                     evidence.put("benchmark_source", Map.of("commit", input.source().sourceCommit(), "files", input.source().fingerprints()));

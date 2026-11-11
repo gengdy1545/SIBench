@@ -83,3 +83,20 @@
  
                   // 1. Calculate Primary Key and Bucket ID
                   ByteString pkByteString;
+
+--- a/pixels-storage/pixels-storage-s3/src/main/java/io/pixelsdb/pixels/storage/s3/Cos.java
++++ b/pixels-storage/pixels-storage-s3/src/main/java/io/pixelsdb/pixels/storage/s3/Cos.java
+@@ -25,0 +26 @@
++import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+@@ -112,0 +114,8 @@
++        String accessVariable = ConfigFactory.Instance().getProperty("sibench.cos.access.key.env");
++        String secretVariable = ConfigFactory.Instance().getProperty("sibench.cos.secret.key.env");
++        String tokenVariable = ConfigFactory.Instance().getProperty("sibench.cos.session.token.env");
++        String access = accessVariable == null ? cosAccessKey : requireNonNull(System.getenv(accessVariable), "Missing COS access-key environment variable");
++        String secret = secretVariable == null ? cosSecretKey : requireNonNull(System.getenv(secretVariable), "Missing COS secret-key environment variable");
++        String token = tokenVariable == null ? null : System.getenv(tokenVariable);
++        software.amazon.awssdk.auth.credentials.AwsCredentials credentials = token == null || token.isEmpty() ? AwsBasicCredentials.create(access, secret)
++                : AwsSessionCredentials.create(access, secret, token);
+@@ -121 +130 @@
+-                        AwsBasicCredentials.create(cosAccessKey, cosSecretKey))).build();
++                        credentials)).build();

@@ -1,5 +1,7 @@
 package org.sibench.adapters;
 
+import org.sibench.config.ObjectStore;
+
 import com.google.protobuf.ByteString;
 
 import org.sibench.adapters.proto.Bound;

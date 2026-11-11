@@ -37,8 +37,29 @@ public final class PixelsSetup {
             }
             case "create" -> {
                 if (args.length != 5) usage();
-                create(args[1], Path.of(args[2]), Path.of(args[3]), Path.of(args[4]));
+                create(args[1], args[2], Path.of(args[3]), Path.of(args[4]));
             }
+            case "seed-timestamps" -> { if (args.length != 2) usage(); PixelsBaseline.seed(Long.parseLong(args[1])); }
+            case "init-storage" -> {
+                if (args.length != 2) usage();
+                if (!io.pixelsdb.pixels.common.physical.StorageFactory.Instance().getStorage(args[1]).listPaths(args[1]).isEmpty())
+                    throw new IllegalStateException("COS run prefix already exists");
+            }
+            case "delete-storage" -> {
+                if (args.length != 2) usage();
+                var storage = io.pixelsdb.pixels.common.physical.StorageFactory.Instance().getStorage(args[1]);
+                // COS requires Content-MD5 for multi-delete; single-object deletion also removes directory markers.
+                var client = ((io.pixelsdb.pixels.storage.s3.AbstractS3) storage).getS3Client();
+                for (String object : storage.listPaths(args[1])) {
+                    var uri = java.net.URI.create(object);
+                    client.deleteObject(software.amazon.awssdk.services.s3.model.DeleteObjectRequest.builder()
+                            .bucket(uri.getHost()).key(uri.getPath().substring(1)).build());
+                }
+                if (!storage.listPaths(args[1]).isEmpty())
+                    throw new IllegalStateException("Owned COS run prefix is not empty after deletion");
+            }
+            case "export-baseline" -> { if (args.length != 4) usage(); PixelsBaseline.export(args[1], args[2], Path.of(args[3])); }
+            case "import-baseline" -> { if (args.length != 5) usage(); PixelsBaseline.restore(args[1], Path.of(args[2]), Path.of(args[3]), Path.of(args[4])); }
             case "load" -> {
                 if (args.length != 7) usage();
                 var counts = new StringBuilder();
@@ -80,7 +101,7 @@ public final class PixelsSetup {
         System.exit(0);
     }
 
-    private static void create(String schema, Path base, Path spec, Path output) throws Exception {
+    private static void create(String schema, String base, Path spec, Path output) throws Exception {
         var metadata = MetadataService.Instance();
         if (!metadata.existSchema(schema) && !metadata.createSchema(schema))
             throw new IllegalStateException("Cannot create Pixels schema: " + schema);
@@ -97,10 +118,14 @@ public final class PixelsSetup {
                 column.setType(definition.substring(colon + 1));
                 columns.add(column);
             }
-            Path directory = base.resolve(schema).resolve(table);
-            Files.createDirectories(directory.resolve("v-0-ordered"));
-            Files.createDirectories(directory.resolve("v-0-compact"));
-            if (!metadata.createTable(schema, table, Storage.Scheme.file, List.of("file://" + directory), columns))
+            String directory = base.replaceAll("/+$", "") + "/" + schema + "/" + table;
+            var storage = io.pixelsdb.pixels.common.physical.StorageFactory.Instance().getStorage(directory);
+            if (storage.getScheme() == Storage.Scheme.file) {
+                Path local = Path.of(java.net.URI.create(directory));
+                Files.createDirectories(local.resolve("v-0-ordered"));
+                Files.createDirectories(local.resolve("v-0-compact"));
+            }
+            if (!metadata.createTable(schema, table, storage.getScheme(), List.of(directory), columns))
                 throw new IllegalStateException("Cannot create Pixels table " + table);
             long tableId = metadata.getTable(schema, table).getId();
             Integer keyColumn = null;

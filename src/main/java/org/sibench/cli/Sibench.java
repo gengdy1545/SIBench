@@ -23,9 +23,16 @@ public final class Sibench {
 
     private static void printServiceHelp(PrintStream out) {
         out.println("       java -jar build/sibench/sibench.jar generate [--root PATH] CONFIG");
-        out.println("       java -jar build/sibench/sibench.jar prepare-cdc [--root PATH] CONFIG");
+        out.println("       java -jar build/sibench/sibench.jar prepare-pixels-baseline CONFIG CSV_INPUT_DIRECTORY OUTPUT_DIRECTORY");
+        out.println("       java -jar build/sibench/sibench.jar prepare-pixels-inputs CONFIG CSV_INPUT_DIRECTORY PIXELS_BASELINE_DIRECTORY");
+        out.println("       java -jar build/sibench/sibench.jar check-pixels-baseline INPUT_DIRECTORY");
+        out.println("       java -jar build/sibench/sibench.jar prepare-csv [--root PATH] CONFIG OUTPUT_DIRECTORY");
+        out.println("       java -jar build/sibench/sibench.jar check-csv-input INPUT_DIRECTORY");
+        out.println("       java -jar build/sibench/sibench.jar publish-input STORAGE_CONFIG PROFILE OBJECT_PATH INPUT_DIRECTORY");
+        out.println("       java -jar build/sibench/sibench.jar fetch-input STORAGE_CONFIG PROFILE OBJECT_PATH MANIFEST_SHA256 OUTPUT_DIRECTORY");
+        out.println("       java -jar build/sibench/sibench.jar prepare-cdc [--root PATH] CONFIG CSV_INPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar check-cdc-input INPUT_DIRECTORY");
-        out.println("       java -jar build/sibench/sibench.jar pixels-experiment CONFIG INPUT_DIRECTORY OUTPUT_DIRECTORY");
+        out.println("       java -jar build/sibench/sibench.jar pixels-experiment CONFIG CDC_INPUT_DIRECTORY PIXELS_BASELINE_DIRECTORY OUTPUT_DIRECTORY");
         out.println(
                 "       java -jar build/sibench/sibench.jar pixels-host ADDRESS:PORT BUILD WORK_ROOT TOKEN_FILE"
                         + "   (Pixels side of CDC generation for a remote pixels_host)");
@@ -64,6 +71,13 @@ public final class Sibench {
             if (!List.of(
                             "inspect-scale",
                             "generate",
+                            "prepare-pixels-baseline",
+                            "prepare-pixels-inputs",
+                            "check-pixels-baseline",
+                            "prepare-csv",
+                            "check-csv-input",
+                            "publish-input",
+                            "fetch-input",
                             "prepare-cdc",
                             "check-cdc-input",
                             "pixels-experiment",
@@ -99,15 +113,57 @@ public final class Sibench {
                 }
             }
             if (args[0].equals("pixels-experiment")) {
-                if (profiles.size() != 3) throw new IllegalArgumentException("pixels-experiment requires CONFIG INPUT_DIRECTORY OUTPUT_DIRECTORY");
-                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(org.sibench.capture.PixelsExperiment.run(
-                        root, Path.of(profiles.get(0)), Path.of(profiles.get(1)), Path.of(profiles.get(2)))));
+                if (profiles.size() != 4) throw new IllegalArgumentException("pixels-experiment requires CONFIG CDC_INPUT_DIRECTORY PIXELS_BASELINE_DIRECTORY OUTPUT_DIRECTORY");
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(org.sibench.capture.PixelsExperiment.run(root,
+                        Path.of(profiles.get(0)), Path.of(profiles.get(1)), Path.of(profiles.get(2)), Path.of(profiles.get(3)))));
+                return 0;
+            }
+            if (args[0].equals("publish-input") || args[0].equals("fetch-input")) {
+                boolean publish = args[0].equals("publish-input");
+                if (profiles.size() != (publish ? 4 : 5)) throw new IllegalArgumentException(
+                        publish ? "publish-input requires STORAGE_CONFIG PROFILE OBJECT_PATH INPUT_DIRECTORY"
+                                : "fetch-input requires STORAGE_CONFIG PROFILE OBJECT_PATH MANIFEST_SHA256 OUTPUT_DIRECTORY");
+                var settings = org.sibench.config.ObjectStore.of(root.resolve(profiles.get(0)), profiles.get(1), profiles.get(2));
+                try (var store = new org.sibench.capture.InputStore(settings)) {
+                    var result = publish ? store.publish(root.resolve(profiles.get(3)))
+                            : store.fetch(profiles.get(3), root.resolve(profiles.get(4)));
+                    out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result));
+                }
+                return 0;
+            }
+            if (args[0].equals("prepare-pixels-baseline")) {
+                if (profiles.size() != 3) throw new IllegalArgumentException("prepare-pixels-baseline requires CONFIG CSV_INPUT_DIRECTORY OUTPUT_DIRECTORY");
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(org.sibench.capture.PixelsBaseline.prepare(root,
+                        Path.of(profiles.get(0)), Path.of(profiles.get(1)), Path.of(profiles.get(2)))));
+                return 0;
+            }
+            if (args[0].equals("prepare-pixels-inputs")) {
+                if (profiles.size() != 3) throw new IllegalArgumentException("prepare-pixels-inputs requires CONFIG CSV_INPUT_DIRECTORY PIXELS_BASELINE_DIRECTORY");
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(org.sibench.capture.PixelsBaseline.prepareInputs(root,
+                        Path.of(profiles.get(0)), Path.of(profiles.get(1)), Path.of(profiles.get(2)))));
+                return 0;
+            }
+            if (args[0].equals("check-pixels-baseline")) {
+                if (profiles.size() != 1) throw new IllegalArgumentException("check-pixels-baseline requires INPUT_DIRECTORY");
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(org.sibench.capture.PixelsBaseline.check(root.resolve(profiles.get(0)))));
+                return 0;
+            }
+            if (args[0].equals("prepare-csv")) {
+                if (profiles.size() != 2) throw new IllegalArgumentException("prepare-csv requires CONFIG OUTPUT_DIRECTORY");
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(
+                        org.sibench.capture.CsvInput.prepare(root, Path.of(profiles.get(0)), Path.of(profiles.get(1)))));
+                return 0;
+            }
+            if (args[0].equals("check-csv-input")) {
+                if (profiles.size() != 1) throw new IllegalArgumentException("check-csv-input requires INPUT_DIRECTORY");
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(
+                        org.sibench.capture.CsvInput.check(root.resolve(profiles.get(0)))));
                 return 0;
             }
             if (args[0].equals("prepare-cdc")) {
-                if (profiles.size() != 1) throw new IllegalArgumentException("prepare-cdc requires one runtime CONFIG");
+                if (profiles.size() != 2) throw new IllegalArgumentException("prepare-cdc requires CONFIG CSV_INPUT_DIRECTORY");
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(
-                        org.sibench.capture.CdcPreparation.run(root, Path.of(profiles.get(0)))));
+                        org.sibench.capture.CdcPreparation.run(root, Path.of(profiles.get(0)), Path.of(profiles.get(1)))));
                 return 0;
             }
             if (args[0].equals("check-cdc-input")) {

@@ -24,6 +24,10 @@ import org.sibench.schema.SourceSchema;
 /** Explicit real-PG capture checks, with eight baseline rows and independently observed commits. */
 public class CdcPreparationCheck {
     @Test(timeout = 240_000) public void hybenchPreparationCommandPublishesBoundInput() throws Exception {
+        prepareHybench(false);
+    }
+
+    static Path prepareHybench(boolean parallel) throws Exception {
         Path root = Path.of("").toRealPath();
         String build = System.getProperty("sibench.pixels.build"), client = System.getProperty("sibench.hybench.build");
         assertNotNull("Set sibench.pixels.build", build);assertNotNull("Set sibench.hybench.build", client);
@@ -43,18 +47,47 @@ public class CdcPreparationCheck {
         pixels.put("build_directory", build);pixels.put("memory", Map.of("coordinator_heap", "1g", "retina_heap", "1g", "sink_heap", "1g"));
         pixels.put("properties", root.resolve("config/engine/pixels/pixels.properties").toString());
         pixels.put("sink_properties", root.resolve("config/engine/pixels/pixels-sink.properties").toString());
+        if (parallel) {
+            String storage = System.getProperty("sibench.storage.config");
+            assertNotNull("Set sibench.storage.config", storage);
+            pixels.put("load", Map.of("rows_per_file", 2000, "threads", 1));
+            pixels.put("data_storage", Map.of("config", root.resolve(storage).toString(), "profile", "cos",
+                    "prefix", "sibench/pixels/prepare-" + java.util.UUID.randomUUID()));
+        }
         Files.writeString(engine, yaml.dump(pixels));
         Files.writeString(config, yaml.dump(Map.of("schema_version", 1, "purpose", "sibench",
                 "benchmarks", List.of(Map.of("config", "config/benchmark/ycsb.yaml", "mode", "api", "engine", "rocksdb"),
                         Map.of("config", benchmark.toString(), "mode", "cdc", "engine", "pixels")),
                 "engines", Map.of("pixels", engine.toString(), "rocksdb", "/unavailable/engine-config.yaml"))));
         var output = new java.io.ByteArrayOutputStream();var errors = new java.io.ByteArrayOutputStream();
-        int status = org.sibench.cli.Sibench.run(new String[] {"prepare-cdc", "--root", root.toString(), config.toString()},
+        int prepared = org.sibench.cli.Sibench.run(new String[] {"prepare-csv", "--root", root.toString(), config.toString(), work.resolve("csv").toString()},
+                new java.io.PrintStream(output), new java.io.PrintStream(errors));
+        assertEquals(errors.toString(java.nio.charset.StandardCharsets.UTF_8), 0, prepared);
+        String csvIdentity = CsvInput.open(work.resolve("csv")).sha256();
+        assertFalse(Files.exists(work.resolve("csv/database")));
+        String[] command = parallel
+                ? new String[] {"prepare-pixels-inputs", "--root", root.toString(), config.toString(), work.resolve("csv").toString(), work.resolve("baseline").toString()}
+                : new String[] {"prepare-cdc", "--root", root.toString(), config.toString(), work.resolve("csv").toString()};
+        int status = org.sibench.cli.Sibench.run(command,
                 new java.io.PrintStream(output), new java.io.PrintStream(errors));
         assertEquals(errors.toString(java.nio.charset.StandardCharsets.UTF_8), 0, status);
         assertEquals("passed", CdcInput.check(work.resolve("input")).get("status"));
         assertFalse(Files.exists(work.resolve("input/database/data")));assertFalse(Files.exists(work.resolve("input/trace")));
         var document = com.google.gson.JsonParser.parseString(Files.readString(work.resolve("input/manifest.json"))).getAsJsonObject();
+        assertEquals(csvIdentity, document.getAsJsonObject("source_evidence").get("csv_manifest_sha256").getAsString());
+        assertEquals(csvIdentity, CsvInput.open(work.resolve("csv")).sha256());
+        if (parallel) {
+            var baseline = PixelsBaseline.open(work.resolve("baseline"));
+            PixelsBaseline.match(baseline, document);
+            assertFalse(Files.exists(work.resolve("baseline/pixels")));
+            var storeConfig = root.resolve(System.getProperty("sibench.storage.config"));
+            try (var store = new InputStore(org.sibench.config.ObjectStore.of(storeConfig, "cos", "sibench/inputs/"))) {
+                var published = store.publish(work.resolve("baseline"));
+                store.fetch(published.get("manifest_sha256").toString(), work.resolve("baseline-cache"));
+                assertEquals(baseline.sha256(), PixelsBaseline.open(work.resolve("baseline-cache")).sha256());
+                Files.writeString(work.resolve("baseline-publication.json"), new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(published));
+            }
+        }
         assertTrue(document.getAsJsonObject("counts").get("businessChanges").getAsLong() > 0);
         assertEquals(2, document.getAsJsonObject("counts").get("markers").getAsInt());
         for (String phase : List.of("tp", "xp")) {
@@ -63,6 +96,7 @@ public class CdcPreparationCheck {
         }
         Files.writeString(work.resolve("acceptance.json"), new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(
                 Map.of("status", "passed", "input", work.resolve("input").toString(), "counts", document.getAsJsonObject("counts"))));
+        return work;
     }
 
     @Test public void realPostgresPublishesPortableCompleteRowChangesWithoutPixels() throws Exception {
@@ -86,13 +120,11 @@ public class CdcPreparationCheck {
         var overrides = new LinkedHashMap<>(object(settings, "sink_properties"));
         overrides.put("sink.proto.maxRecords", "2");settings.put("sink_properties", overrides);
         Path output = Files.createTempDirectory(root.resolve("results/capture"), "cdc-source-check-");
-        Path data = Files.createDirectories(output.resolve("native/Data_1x"));
-        HybenchTest.fixture(data);
-        for (String name : HybenchInputs.RUNTIME_INPUTS) Files.write(data.resolve(name), new byte[0]);
-        Files.createDirectory(output.resolve("load"));
-        HybenchInputs.record(data, source.source().resolve("conf/load_data_pg.sql"), output.resolve("load/inputs.json"));
-        Files.copy(source.source().resolve("conf/ddl_pg.sql"), output.resolve("schema.sql"));
-        Path spec = Files.writeString(output.resolve("pixels-schema.tsv"), PixelsInputs.inspect(source, data).schema().text());
+        var csvFixture = CsvInputTest.fixture(Files.createDirectory(output.resolve("csv-source")));
+        var csv = CsvInput.open(csvFixture.output());
+        CsvInput.materialize(csv, output);
+        Path data = output.resolve("native/Data_1x");
+        Path spec = output.resolve("pixels-schema.tsv");
         var sourceSettings = new LinkedHashMap<>(SibenchConfig.postgresSettings(object(object(settings, "source"), "settings")));
         sourceSettings.putAll(Map.of("wal_level", "logical", "max_wal_senders", "4", "max_replication_slots", "4"));
         var baseline = new LinkedHashMap<String, Long>(); source.tables().forEach(t -> baseline.put(t.name(), 1L));
@@ -143,7 +175,7 @@ public class CdcPreparationCheck {
         }
         var selection = new BenchmarkSelection(root.resolve("config/benchmark/hybench.yaml"), "hybench", BenchmarkSelection.Mode.CDC, Engine.PIXELS);
         var input = new Generation.Input(selection, Map.of("native", Map.of("sf", "1x")), source, root, output, Map.of(), baseline, Map.of());
-        CdcInput.publish(output, input, counts, Map.of("build", identity,
+        CdcInput.publish(output, input, counts, Map.of("build", identity, "csv_manifest_sha256", csv.sha256(),
                 "benchmark_source", Map.of("commit", source.sourceCommit(), "fingerprints", source.fingerprints())));
         try (var files = Files.list(output.resolve("cdc"))) { assertEquals(3, files.filter(p -> p.toString().endsWith(".proto")).count()); }
         Generation.deleteTree(output.resolve("database/data"));

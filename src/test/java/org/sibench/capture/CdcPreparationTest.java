@@ -17,7 +17,7 @@ public class CdcPreparationTest {
         Files.writeString(config, new org.yaml.snakeyaml.Yaml().dump(Map.of("schema_version", 1, "purpose", "sibench",
                 "benchmarks", List.of(Map.of("config", "config/benchmark/ycsb.yaml", "mode", "api", "engine", "rocksdb")),
                 "engines", Map.of("rocksdb", "/missing/engine-config.yaml"))));
-        var failure = assertThrows(IllegalArgumentException.class, () -> CdcPreparation.run(root, config));
+        var failure = assertThrows(IllegalArgumentException.class, () -> CdcPreparation.run(root, config, Path.of("/missing/csv-input")));
         assertTrue(failure.getMessage(), failure.getMessage().contains("prepare-cdc requires one HyBench/cdc/Pixels selection"));
     }
 

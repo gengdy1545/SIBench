@@ -1,4 +1,4 @@
-# Object-storage profiles for RocksDB-Cloud and SlateDB.
+# Object-storage profiles for index backends and reusable input artifacts.
 # Secrets are never written here: each *_env field names an environment variable.
 # One run's effective profile (without secrets) is saved with that run's evidence.
 # A local S3 pass does not stand in for COS; each profile is checked on its own.

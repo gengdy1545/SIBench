@@ -1,5 +1,8 @@
 package org.sibench.capture;
 
+import static org.sibench.capture.InputFiles.*;
+
+
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
@@ -9,14 +12,12 @@ import io.pixelsdb.pixels.sink.SinkProto;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.DigestInputStream;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
+import org.sibench.capture.CsvInput.Table;
 import org.sibench.config.Digests;
 
 /** Portable, closed row-CDC inputs. This is independent of the Index Trace format. */
@@ -25,7 +26,6 @@ public final class CdcInput {
     private CdcInput() {}
 
     record Counts(long transactions, long changes, long businessChanges, long markers) {}
-    private record Table(int id, int columns) {}
     record Verified(JsonObject manifest, Counts counts, String manifestSha256) {}
 
     interface Frame { void accept(int table, byte[] bytes) throws Exception; }
@@ -71,34 +71,9 @@ public final class CdcInput {
 
     static Map<String, Object> publish(Path output, Generation.Input input, Counts expected,
             Map<String, Object> evidence) throws Exception {
-        var document = new JsonObject();
+        var document = CsvInput.baseline(output, input);
         document.addProperty("kind", "pixels_cdc_input");
         document.addProperty("status", "complete");
-        document.add("baseline_rows", new Gson().toJsonTree(input.baselineRows()));
-        document.add("schema", file(output, output.resolve("pixels-schema.tsv")));
-        document.add("source_ddl", file(output, output.resolve("schema.sql")));
-        var baseline = new JsonObject();
-        var original = JsonParser.parseString(Files.readString(output.resolve("load/inputs.json")))
-                .getAsJsonObject().getAsJsonObject("data_sha256");
-        Path data = output.resolve("native/Data_" + org.sibench.config.ConfigValues.string(input.nativeConfig(), "sf"));
-        var csvTables = new HashMap<String, String>();
-        for (String line : Files.readAllLines(input.source().source().resolve("conf/load_data_pg.sql"))) {
-            if (line.isBlank()) continue;
-            String[] copy = HybenchInputs.copyStatement(line);
-            require(copy != null, "Invalid baseline load mapping");
-            csvTables.put(copy[1], copy[0].toLowerCase(java.util.Locale.ROOT));
-        }
-        for (var entry : original.entrySet()) {
-            var value = file(output, data.resolve(entry.getKey()));
-            require(value.get("sha256").equals(entry.getValue()), "Baseline input changed after source loading: " + entry.getKey());
-            if (csvTables.containsKey(entry.getKey())) {
-                String table = csvTables.get(entry.getKey());
-                value.addProperty("table", table);
-                value.addProperty("rows", input.baselineRows().get(table));
-            }
-            baseline.add(entry.getKey(), value);
-        }
-        document.add("baseline_files", baseline);
         var inventory = JsonParser.parseString(Files.readString(output.resolve("cdc/files.json"))).getAsJsonArray();
         var files = new JsonArray();
         for (var item : inventory) {
@@ -124,12 +99,10 @@ public final class CdcInput {
 
     static Verified open(Path directory) throws IOException {
         directory = directory.toRealPath();
+        var manifest = manifest(directory);
         try {
-            require(!Files.isSymbolicLink(directory.resolve("manifest.json")), "Symbolic CDC manifest");
-            byte[] bytes = Files.readAllBytes(directory.resolve("manifest.json"));
-            var document = JsonParser.parseString(new String(bytes, java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();
-            Counts counts = validate(directory, document, true);
-            return new Verified(document, counts, java.util.HexFormat.of().formatHex(Digests.digest().digest(bytes)));
+            Counts counts = validate(directory, manifest.document(), true);
+            return new Verified(manifest.document(), counts, manifest.sha256());
         } catch (RuntimeException malformed) {
             throw new IOException("Invalid CDC input manifest: " + directory, malformed);
         }
@@ -138,39 +111,8 @@ public final class CdcInput {
     private static Counts validate(Path directory, JsonObject document, boolean baselineHashes) throws IOException {
         require(document.get("kind").getAsString().equals("pixels_cdc_input")
                 && document.get("status").getAsString().equals("complete"), "Unpublished or unsupported CDC input");
-        Path schema = verified(directory, document.getAsJsonObject("schema"));
-        verified(directory, document.getAsJsonObject("source_ddl"));
-        var tables = new LinkedHashMap<String, Table>();
-        int id = 0;
-        for (String line : Files.readAllLines(schema)) {
-            String[] fields = line.split("\t");
-            require(fields.length == 3 && fields[0].matches("[a-z][a-z0-9_]*"), "Invalid CDC table schema");
-            require(tables.put(fields[0], new Table(++id, fields[2].split(";").length)) == null, "Duplicate CDC table schema");
-        }
-        require(tables.containsKey("sibench_marker"), "Missing CDC window marker schema");
-        var baselines = document.getAsJsonObject("baseline_files");
-        require(baselines != null && !baselines.isEmpty(), "Missing bound baseline files");
-        var baselineRows = document.getAsJsonObject("baseline_rows");
-        require(baselineRows != null, "Missing baseline row counts");
-        var expectedTables = new java.util.HashSet<>(tables.keySet());
-        expectedTables.remove("sibench_marker");
-        require(expectedTables.equals(baselineRows.keySet()), "Baseline table set differs from schema");
-        var baselineTables = new java.util.HashSet<String>();
+        var tables = CsvInput.validateBaseline(directory, document, baselineHashes);
         var paths = new java.util.HashSet<String>();
-        paths.add(document.getAsJsonObject("schema").get("path").getAsString());
-        require(paths.add(document.getAsJsonObject("source_ddl").get("path").getAsString()), "Aliased CDC schema files");
-        for (var item : baselines.entrySet()) {
-            var file = item.getValue().getAsJsonObject();
-            require(paths.add(file.get("path").getAsString()), "Duplicate baseline file");
-            if (file.has("table")) {
-                String table = file.get("table").getAsString();
-                require(expectedTables.contains(table) && baselineTables.add(table)
-                        && number(file, "rows") == number(baselineRows, table), "Baseline table/count binding differs");
-            }
-            if (baselineHashes) verifyBaseline(directory, file);
-            else require(Files.size(resolve(directory, file.get("path").getAsString())) == number(file, "bytes"), "Baseline size changed");
-        }
-        require(baselineTables.equals(expectedTables), "Missing baseline table CSV");
         var inventory = document.getAsJsonArray("cdc_files");
         require(inventory != null && !inventory.isEmpty(), "Missing closed CDC files");
         long transactions = 0, changes = 0, business = 0, markers = 0;
@@ -263,66 +205,8 @@ public final class CdcInput {
         return new Counts(transactions, changes, business, markers);
     }
 
-    static JsonObject file(Path root, Path path) throws IOException {
-        var result = new JsonObject();
-        result.addProperty("path", root.relativize(path).toString());
-        result.addProperty("bytes", Files.size(path));
-        result.addProperty("sha256", Digests.sha256(path));
-        return result;
-    }
-
-    private static Path verified(Path directory, JsonObject file) throws IOException {
-        Path path = resolve(directory, file.get("path").getAsString());
-        require(Files.size(path) == number(file, "bytes")
-                && Digests.sha256(path).equals(file.get("sha256").getAsString()), "CDC input file changed: " + path);
-        return path;
-    }
-
-    private static void verifyBaseline(Path directory, JsonObject file) throws IOException {
-        Path path = resolve(directory, file.get("path").getAsString());
-        var digest = Digests.digest();
-        long bytes = 0, rows = 0;
-        int last = -1;
-        try (var stream = new DigestInputStream(Files.newInputStream(path), digest)) {
-            byte[] buffer = new byte[1 << 16];
-            for (int n; (n = stream.read(buffer)) != -1;) {
-                bytes += n;
-                if (file.has("table")) for (int i = 0; i < n; i++) if (buffer[i] == '\n') rows++;
-                if (n > 0) last = buffer[n - 1];
-            }
-        }
-        if (last != -1 && last != '\n') rows++;
-        require(bytes == number(file, "bytes")
-                && java.util.HexFormat.of().formatHex(digest.digest()).equals(file.get("sha256").getAsString()), "Baseline input changed: " + path);
-        if (file.has("table")) require(rows == number(file, "rows"), "Baseline CSV row count differs: " + path);
-    }
-
-    private static Path resolve(Path directory, String name) throws IOException {
-        Path relative = Path.of(name);
-        require(!name.isBlank() && !relative.isAbsolute() && relative.normalize().toString().equals(name), "Noncanonical CDC input path");
-        Path path = directory;
-        for (Path part : relative) {
-            require(!part.toString().equals("..") && !part.toString().equals("."), "CDC input path traversal");
-            path = path.resolve(part);
-            require(!Files.isSymbolicLink(path), "Symbolic CDC input path");
-        }
-        require(Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS), "Missing CDC input file: " + path);
-        return path;
-    }
-
     private static void require(boolean valid, String message) throws IOException {
         if (!valid) throw new IOException(message);
     }
 
-    private static long number(JsonObject object, String key) throws IOException {
-        try {
-            var value = object.get(key);
-            require(value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isNumber(), "Missing numeric CDC field: " + key);
-            long result = value.getAsBigDecimal().longValueExact();
-            require(result >= 0, "Negative CDC field: " + key);
-            return result;
-        } catch (ArithmeticException | NumberFormatException invalid) {
-            throw new IOException("Nonintegral or overflowing CDC field: " + key, invalid);
-        }
-    }
 }

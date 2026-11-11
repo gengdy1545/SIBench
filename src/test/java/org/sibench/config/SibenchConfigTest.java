@@ -25,6 +25,19 @@ public class SibenchConfigTest {
         assertEquals("Invalid Pixels host port", failure.getMessage());
     }
 
+    @Test public void pixelsStorageProfilesResolveWithoutReadingOrEmbeddingCredentials() throws Exception {
+        Path root = Path.of("").toAbsolutePath();
+        var settings = new java.util.LinkedHashMap<>(ConfigValues.parse(Files.readString(root.resolve("config/engine/pixels/pixels.yaml"))));
+        settings.keySet().removeAll(java.util.Set.of("schema_version", "purpose", "engine"));
+        settings.put("data_storage", Map.of("config", "../../index/storage.yaml", "profile", "cos", "prefix", "sibench/pixels"));
+        var resolved = PixelsConfig.read(root.resolve("config/engine/pixels"), settings);
+        var profile = ConfigValues.object(ConfigValues.object(resolved, "data_storage"), "profile");
+        assertEquals("COS_SECRET_KEY", profile.get("secret_key_env"));
+        settings.put("data_storage", Map.of("config", "../../index/storage.yaml", "profile", "cos", "prefix", "sibench/../outside"));
+        assertThrows(IllegalArgumentException.class, () -> PixelsConfig.read(root.resolve("config/engine/pixels"), settings));
+        assertThrows(IllegalArgumentException.class, () -> PixelsConfig.pixelsProperties(Map.of("cos.secret.key", "not-allowed")));
+    }
+
     @Test
     public void replayServiceAndAnalysisUseTheSameConfiguration() throws Exception {
         Path root = Path.of("").toAbsolutePath();

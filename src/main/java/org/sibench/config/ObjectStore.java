@@ -1,4 +1,4 @@
-package org.sibench.adapters;
+package org.sibench.config;
 
 import static org.sibench.config.ConfigValues.*;
 
@@ -9,11 +9,11 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Where an object-storage index keeps its objects: one profile of config/index/storage.yaml and the
- * object path of this index below the profile's prefix. Credentials are read from the environment
+ * Storage for indexes and reusable inputs: one profile of config/index/storage.yaml and an
+ * object path below the profile's prefix. Credentials are read from the environment
  * variables the profile names and are never printed.
  */
-record ObjectStore(
+public record ObjectStore(
         String profile,
         String endpoint,
         String region,
@@ -23,7 +23,11 @@ record ObjectStore(
         String accessKey,
         String secretKey,
         String sessionToken) {
-    static ObjectStore of(Path storageConfig, String profile, String objectPath) throws IOException {
+    public static ObjectStore of(Path storageConfig, String profile, String objectPath) throws IOException {
+        return of(profile, profile(storageConfig, profile), objectPath);
+    }
+
+    public static Map<String, Object> profile(Path storageConfig, String profile) throws IOException {
         Map<String, Object> profiles = object(parse(Files.readString(storageConfig)), "profiles");
         require(profiles.containsKey(profile), "Unknown storage profile: " + profile);
         var store = object(profiles, profile);
@@ -35,6 +39,10 @@ record ObjectStore(
                                     "session_token_env")
                             .contains(key),
                     "Unknown storage key: " + key);
+        return store;
+    }
+
+    public static ObjectStore of(String profile, Map<String, Object> store, String objectPath) throws IOException {
         require(string(store, "kind").equals("s3"), "Only S3-compatible storage is supported");
         String prefix = string(store, "prefix");
         require(

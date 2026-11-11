@@ -13,6 +13,8 @@ import org.sibench.trace.IndexKey;
 
 /** Explicit small real-service checks; not part of the ordinary unit test command. */
 public class PixelsExperimentCheck {
+    private static Path capturedInput;
+    private static final Map<Path, Path> baselines = new HashMap<>();
     @Test public void finiteFilesApplyWithoutTraceAndExportOptionalTrace() throws Exception {
         Path input = input();
         for (boolean trace : new boolean[] {false, true}) {
@@ -77,7 +79,9 @@ public class PixelsExperimentCheck {
 
     private static Path input() throws Exception {
         String configured = System.getProperty("sibench.cdc.input");
-        return configured == null ? CdcPreparationCheck.prepareInput() : Path.of(configured).toRealPath();
+        if (configured != null) return Path.of(configured).toRealPath();
+        if (capturedInput == null) capturedInput = CdcPreparationCheck.prepareInput();
+        return capturedInput;
     }
 
     private static Path run(Path input, boolean trace, boolean updates, int prefix, boolean queries, boolean freshness) throws Exception {
@@ -93,6 +97,10 @@ public class PixelsExperimentCheck {
         engine.put("memory", Map.of("coordinator_heap", "1g", "retina_heap", "4g", "sink_heap", "1g"));
         engine.put("properties", root.resolve("config/engine/pixels/pixels.properties").toString());
         engine.put("sink_properties", root.resolve("config/engine/pixels/pixels-sink.properties").toString());
+        String storage = System.getProperty("sibench.storage.config");
+        assertNotNull("Set sibench.storage.config for COS baselines", storage);
+        engine.put("data_storage", Map.of("config", root.resolve(storage).toString(), "profile", System.getProperty("sibench.storage.profile", "cos"),
+                "prefix", "sibench/pixels/check-" + UUID.randomUUID()));
         var gson = new GsonBuilder().setPrettyPrinting().create();
         Path engineConfig = Files.writeString(directory.resolve("engine.json"), gson.toJson(engine));
         var experiment = new LinkedHashMap<>(PixelsExperimentConfig.defaults());
@@ -115,12 +123,26 @@ public class PixelsExperimentCheck {
         if (queries || freshness) {
             var trino = object(experiment, "trino");
             trino.put("deployment_directory", System.getProperty("sibench.trino.deployment"));
+            trino.putAll(Map.of("heap", "8G", "query_memory", "2GB", "query_total_memory", "4GB", "heap_headroom", "2GB", "threads", 4));
             experiment.put("trino", trino);
         }
         var runtime = Map.of("schema_version", 1, "purpose", "sibench", "engines", Map.of("pixels", engineConfig.toString()), "pixels_experiment", experiment);
         Path config = Files.writeString(directory.resolve("runtime.json"), gson.toJson(runtime));
         Path output = directory.resolve("run");
-        PixelsExperiment.run(root, config, input, output);
+        Path baseline = baselines.get(input);
+        if (baseline == null) {
+            baseline = directory.resolve("baseline");
+            String configuredBaseline = System.getProperty("sibench.pixels.baseline");
+            if (configuredBaseline == null) PixelsBaseline.prepare(root, config,
+                    Path.of(System.getProperty("sibench.csv.input", input.resolve("csv-source").toString())), baseline);
+            else baseline = Path.of(configuredBaseline);
+            baselines.put(input, baseline);
+        }
+        String original = PixelsBaseline.open(baseline).sha256();
+        PixelsExperiment.run(root, config, input, baseline, output);
+        assertEquals(original, PixelsBaseline.open(baseline).sha256());
+        assertEquals(original, read(output.resolve("result.json")).get("baseline_manifest_sha256").getAsString());
+        assertFalse("Restores must not re-encode CSV", Files.exists(output.resolve("pixels-inputs")));
         return output;
     }
 
