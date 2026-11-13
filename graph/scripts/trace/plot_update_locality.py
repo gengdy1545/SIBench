@@ -6,6 +6,8 @@ import json
 import pathlib
 import re
 
+from _common import STYLE, save_figure
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -16,11 +18,6 @@ import pandas as pd
 
 def safe(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
-
-
-def save_figure(figure, path):
-    for extension in ("pdf", "png"):
-        figure.savefig(f"{path}.{extension}")
 
 
 def main() -> int:
@@ -35,7 +32,7 @@ def main() -> int:
     run = args.run_directory
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
-    plt.style.use(pathlib.Path(__file__).resolve().parents[2] / "config" / "style.mplstyle")
+    plt.style.use(STYLE)
     summary = json.loads((run / "summary.json").read_text())
     windows = pd.read_csv(run / "windows.csv")
     heatmap = pd.read_csv(run / "heatmap.csv.gz", compression="gzip")

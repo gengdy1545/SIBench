@@ -6,7 +6,7 @@ axes.labelsize: 11
 axes.spines.top: False
 axes.spines.right: False
 axes.axisbelow: True
-axes.prop_cycle: cycler('color', ['0072B2', 'D55E00', '009E73', 'CC79A7', 'E69F00', '56B4E9', '000000'])
+axes.prop_cycle: cycler('color', ['0072B2', 'D55E00', '009E73', 'CC79A7', 'E69F00', '56B4E9', '000000', '999999'])
 xtick.labelsize: 10
 ytick.labelsize: 10
 legend.fontsize: 9

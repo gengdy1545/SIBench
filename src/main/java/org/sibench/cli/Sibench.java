@@ -52,6 +52,7 @@ public final class Sibench {
         out.println(
                 "       java -jar build/sibench/sibench.jar analyze-locality TRACE CONFIG OUTPUT"
                         + "   (static baseline layout, update windows and overlap estimate)");
+        out.println("       java -jar build/sibench/sibench.jar analyze-accesses TRACE OUTPUT WINDOW_REQUESTS PK_BINS SORT_MEMORY_BYTES");
     }
 
     public static void main(String[] args) {
@@ -87,7 +88,8 @@ public final class Sibench {
                             "index-server",
                             "replay-service",
                             "verify-service",
-                            "analyze-locality")
+                            "analyze-locality",
+                            "analyze-accesses")
                     .contains(args[0])) {
                 throw new IllegalArgumentException("Unknown command: " + args[0]);
             }
@@ -268,6 +270,15 @@ public final class Sibench {
                                 service,
                                 root.resolve(profiles.get(2)));
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result.get("result")));
+                return 0;
+            }
+            if (args[0].equals("analyze-accesses")) {
+                if (profiles.size() != 5) throw new IllegalArgumentException(
+                        "analyze-accesses requires TRACE OUTPUT WINDOW_REQUESTS PK_BINS SORT_MEMORY_BYTES");
+                org.sibench.analysis.TraceAccesses.run(root.resolve(profiles.get(0)),
+                        root.resolve(profiles.get(1)), Long.parseLong(profiles.get(2)),
+                        Integer.parseInt(profiles.get(3)), Long.parseLong(profiles.get(4)));
+                out.println(Files.readString(root.resolve(profiles.get(1)).resolve("summary.json")));
                 return 0;
             }
             if (args[0].equals("analyze-locality")) {

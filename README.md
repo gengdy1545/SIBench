@@ -155,9 +155,24 @@ The data API is Get/Put/Delete/Scan/WriteBatch over opaque byte keys/values and 
 
 ## Analysis
 
+Select cached inputs and plot settings in [traces.json](graph/config/traces.json).
+After `mvn package`, generate operation shares and exact returned-row locality:
+
+```bash
+python3 graph/scripts/trace/plot_operation_mix.py
+python3 graph/scripts/trace/prepare_analysis.py
+python3 graph/scripts/trace/plot_access_locality.py
+```
+
+The operation chart reads manifest counts without loading an index. Locality
+extraction runs offline Java snapshot queries against a temporary local index;
+Get, Scan and Write panels share workload request windows and ordered PK ranks.
+See [plotting](graph/README.md) for inputs, costs, output paths and interpretation.
+The separate static update-layout estimate remains available:
+
 ```bash
 java -jar build/sibench/sibench.jar analyze-locality \
-  results/capture/ycsb/trace config/sibench.yaml results/analysis/trace/ycsb-a
+  results/cache/traces/ycsb-a config/sibench.yaml results/analysis/trace/ycsb-a
 python3 graph/scripts/trace/plot_update_locality.py \
   results/analysis/trace/ycsb-a --out results/plots/trace/ycsb-a
 ```
