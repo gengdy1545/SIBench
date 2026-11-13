@@ -57,8 +57,8 @@ struct Store {
   std::shared_ptr<FileSystem> fs;
   std::unique_ptr<Env> env;
   DBCloud* db = nullptr;
-  WriteOptions logged;
-  WriteOptions unlogged;
+  // Fixed at open, so single and batched writes follow one WAL setting.
+  WriteOptions write;
 };
 
 struct Cursor {
@@ -116,10 +116,10 @@ JNIEXPORT jstring JNICALL Java_org_sibench_adapters_CloudRocksStore_version(JNIE
   return env->NewStringUTF(version.c_str());
 }
 
-JNIEXPORT jlong JNICALL Java_org_sibench_adapters_CloudRocksStore_open(
+JNIEXPORT jlong JNICALL Java_org_sibench_adapters_CloudRocksStore_openStore(
     JNIEnv* env, jclass, jstring path, jstring bucket, jstring object_path, jstring region,
     jstring endpoint, jboolean virtual_addressing, jstring access_key, jstring secret_key,
-    jstring session_token, jboolean create) {
+    jstring session_token, jboolean create, jboolean wal) {
   InitAws();
   auto store = std::make_unique<Store>();
   Requests* requests = &store->requests;
@@ -181,19 +181,18 @@ JNIEXPORT jlong JNICALL Java_org_sibench_adapters_CloudRocksStore_open(
     ThrowIo(env, "rocksdb-cloud open: " + status.ToString());
     return 0;
   }
-  store->unlogged.disableWAL = true;
+  store->write.disableWAL = !wal;
   return reinterpret_cast<jlong>(store.release());
 }
 
-JNIEXPORT void JNICALL Java_org_sibench_adapters_CloudRocksStore_put(
-    JNIEnv* env, jclass, jlong handle, jbyteArray key, jbyteArray value, jboolean wal) {
+JNIEXPORT void JNICALL Java_org_sibench_adapters_CloudRocksStore_write(
+    JNIEnv* env, jclass, jlong handle, jbyteArray key, jbyteArray value) {
   Store* store = AsStore(handle);
-  Status status =
-      store->db->Put(wal ? store->logged : store->unlogged, Bytes(env, key), Bytes(env, value));
+  Status status = store->db->Put(store->write, Bytes(env, key), Bytes(env, value));
   if (!status.ok()) ThrowIo(env, status.ToString());
 }
 
-// One WAL-logged write of the whole batch, matching SlateDB's single native batch for baseline loading.
+// One native write of the whole batch, with the store's WAL setting, matching SlateDB's single native batch.
 JNIEXPORT void JNICALL Java_org_sibench_adapters_CloudRocksStore_putAll(
     JNIEnv* env, jclass, jlong handle, jobjectArray keys, jobjectArray values) {
   jsize size = env->GetArrayLength(keys);
@@ -213,7 +212,7 @@ JNIEXPORT void JNICALL Java_org_sibench_adapters_CloudRocksStore_putAll(
       return;
     }
   }
-  Status status = AsStore(handle)->db->Write(AsStore(handle)->logged, &batch);
+  Status status = AsStore(handle)->db->Write(AsStore(handle)->write, &batch);
   if (!status.ok()) ThrowIo(env, status.ToString());
 }
 
@@ -254,11 +253,6 @@ JNIEXPORT void JNICALL Java_org_sibench_adapters_CloudRocksStore_seek(
 JNIEXPORT void JNICALL Java_org_sibench_adapters_CloudRocksStore_seekForPrev(
     JNIEnv* env, jclass, jlong handle, jbyteArray key) {
   AsCursor(handle)->it->SeekForPrev(Bytes(env, key));
-}
-
-JNIEXPORT void JNICALL Java_org_sibench_adapters_CloudRocksStore_seekToLast(JNIEnv*, jclass,
-                                                                            jlong handle) {
-  AsCursor(handle)->it->SeekToLast();
 }
 
 JNIEXPORT void JNICALL Java_org_sibench_adapters_CloudRocksStore_next(JNIEnv*, jclass,

@@ -53,11 +53,7 @@ public final class InputStore implements AutoCloseable {
     public Map<String, Object> publish(Path input) throws Exception {
         input = input.toRealPath();
         var manifest = check(input);
-        var payloads = new java.util.TreeMap<String, JsonObject>();
-        for (String field : java.util.List.of("schema", "source_ddl", "parameter_file", "load_inventory"))
-            if (manifest.has(field)) add(payloads, manifest.getAsJsonObject(field));
-        if (manifest.has("baseline_files")) manifest.getAsJsonObject("baseline_files").entrySet().forEach(e -> add(payloads, e.getValue().getAsJsonObject()));
-        if (manifest.has("cdc_files")) manifest.getAsJsonArray("cdc_files").forEach(e -> add(payloads, e.getAsJsonObject()));
+        var payloads = payloads(manifest);
         var manifestFile = InputFiles.file(input, input.resolve("manifest.json"));
         require(JsonParser.parseString(Files.readString(input.resolve("manifest.json"))).equals(manifest),
                 "Input manifest changed during validation");
@@ -150,7 +146,9 @@ public final class InputStore implements AutoCloseable {
                             "Remote input content differs: " + entry.get("path").getAsString());
                 }
             }
-            check(output);
+            var bound = new java.util.HashSet<>(payloads(check(output)).keySet());
+            bound.add("manifest.json");
+            require(bound.equals(paths), "Remote inventory differs from the files its input manifest binds");
         } catch (Exception | Error failure) {
             try { Files.deleteIfExists(output.resolve("manifest.json")); }
             catch (IOException cleanup) { failure.addSuppressed(cleanup); }
@@ -211,6 +209,16 @@ public final class InputStore implements AutoCloseable {
                 default -> throw new IOException("Unsupported input artifact kind");
             };
         } catch (RuntimeException malformed) { throw new IOException("Invalid input manifest", malformed); }
+    }
+
+    /** The local payload files an input manifest binds, excluding the manifest itself. */
+    private static java.util.TreeMap<String, JsonObject> payloads(JsonObject manifest) {
+        var payloads = new java.util.TreeMap<String, JsonObject>();
+        for (String field : java.util.List.of("schema", "source_ddl", "parameter_file", "load_inventory"))
+            if (manifest.has(field)) add(payloads, manifest.getAsJsonObject(field));
+        if (manifest.has("baseline_files")) manifest.getAsJsonObject("baseline_files").entrySet().forEach(e -> add(payloads, e.getValue().getAsJsonObject()));
+        if (manifest.has("cdc_files")) manifest.getAsJsonArray("cdc_files").forEach(e -> add(payloads, e.getAsJsonObject()));
+        return payloads;
     }
 
     private static void add(Map<String, JsonObject> files, JsonObject entry) {

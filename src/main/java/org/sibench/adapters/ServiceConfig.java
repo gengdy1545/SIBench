@@ -24,7 +24,9 @@ import java.util.Set;
  * server's {@code backend} is {@code rocksdb} for fixtures, or {@code rocksdb_cloud}/{@code slatedb} with {@code storage} (the
  * storage config), {@code profile} and the index's {@code object_path} below the profile prefix.
  * {@code reopen: true} serves an index this server created before instead of a new one: after a
- * restart, or for rocksdb-cloud without its local directory, from the bucket alone.
+ * restart, or for rocksdb-cloud without its local directory, from the bucket alone. The object-storage
+ * backends require {@code wal}: whether every write is also recorded in the engine's WAL. The local
+ * RocksDB fixture always keeps its WAL.
  */
 public record ServiceConfig(
         String adapter,
@@ -33,7 +35,8 @@ public record ServiceConfig(
         int port,
         ValueKind value,
         ObjectStore objects,
-        boolean reopen) {
+        boolean reopen,
+        boolean wal) {
     public ServiceConfig {
         require(port >= 0 && port <= 65535, "Invalid index service port");
         require(Set.of("grpc", "rocksdb", "rocksdb_cloud", "slatedb").contains(adapter), "Unknown service adapter: " + adapter);
@@ -41,6 +44,8 @@ public record ServiceConfig(
         require(adapter.equals("grpc") || path != null, "An index needs a path");
         require(!(adapter.equals("rocksdb_cloud") || adapter.equals("slatedb")) || objects != null,
                 "An object-storage backend needs storage settings");
+        require(wal || adapter.equals("rocksdb_cloud") || adapter.equals("slatedb"),
+                "Only object-storage backends can disable the WAL");
     }
 
     /** The required service target of a replay config. */
@@ -58,7 +63,8 @@ public record ServiceConfig(
                 0,
                 value(service),
                 null,
-                false);
+                false,
+                true);
     }
 
     /** A server with visible mutation acknowledgements and versioned reads. */
@@ -72,13 +78,13 @@ public record ServiceConfig(
                 service,
                 Set.of(
                         "backend", "path", "port", "value", "storage",
-                        "profile", "object_path", "reopen"));
+                        "profile", "object_path", "reopen", "wal"));
         String backend = string(service, "backend");
         require(
                 Set.of("rocksdb", "rocksdb_cloud", "slatedb").contains(backend),
                 "backend must be rocksdb, rocksdb_cloud or slatedb");
         boolean cloud = !backend.equals("rocksdb");
-        for (String key : List.of("storage", "profile", "object_path"))
+        for (String key : List.of("storage", "profile", "object_path", "wal"))
             require(cloud == service.containsKey(key), key + " is required only for object-storage backends");
         return new ServiceConfig(
                 backend,
@@ -92,17 +98,18 @@ public record ServiceConfig(
                                 string(service, "profile"),
                                 string(service, "object_path"))
                         : null,
-                service.containsKey("reopen") && bool(service, "reopen"));
+                service.containsKey("reopen") && bool(service, "reopen"),
+                !cloud || bool(service, "wal"));
     }
 
     /** This server's index, new or reopened. */
     public VersionedIndexBackend backend() throws java.io.IOException {
-        if (adapter.equals("slatedb")) return VersionedIndexBackend.slate(path, value, objects, reopen);
+        if (adapter.equals("slatedb")) return VersionedIndexBackend.slate(path, value, objects, reopen, wal);
         if (objects == null)
             return reopen ? VersionedIndexBackend.open(path, value) : VersionedIndexBackend.create(path, value);
         return reopen
-                ? VersionedIndexBackend.openCloud(path, value, objects)
-                : VersionedIndexBackend.cloud(path, value, objects);
+                ? VersionedIndexBackend.openCloud(path, value, objects, wal)
+                : VersionedIndexBackend.cloud(path, value, objects, wal);
     }
 
     private static ValueKind value(Map<String, Object> service) {

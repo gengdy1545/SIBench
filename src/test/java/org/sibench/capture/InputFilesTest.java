@@ -40,9 +40,10 @@ public class InputFilesTest {
         assertEquals(file, InputFiles.verified(directory, descriptor));
         Files.writeString(file, "new");
         assertThrows(IOException.class, () -> InputFiles.verified(directory, descriptor));
-        for (String value : new String[] {"\"3\"", "0.5", "-1", "9223372036854775808", "true", "null"}) {
+        for (String value : new String[] {"\"3\"", "0.5", "1.0", "1e3", "-1", "9223372036854775808", "true", "null"}) {
             var document = JsonParser.parseString("{\"rows\":" + value + "}").getAsJsonObject();
             assertThrows(value, IOException.class, () -> InputFiles.number(document, "rows"));
         }
+        assertEquals(3L, InputFiles.number(JsonParser.parseString("{\"rows\":3}").getAsJsonObject(), "rows"));
     }
 }

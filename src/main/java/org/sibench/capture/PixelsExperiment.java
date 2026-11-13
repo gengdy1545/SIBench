@@ -31,6 +31,7 @@ public final class PixelsExperiment {
                 : Map.<String, Object>of("counts", verified.counts(), "manifest_sha256", verified.manifestSha256());
         var source = inputs.source();
         var settings = SibenchConfig.engine(root, runtime, Engine.PIXELS);
+        requireQueryPorts(experiment, settings);
         Path build = root.resolve(string(settings, "build_directory")).toRealPath();
         var identity = PixelsBuild.verify(root, build);
         PixelsBaseline.requireStorage(settings);
@@ -100,11 +101,13 @@ public final class PixelsExperiment {
 
             var queries = object(experiment, "queries");
             var trino = object(experiment, "trino");
-            if ((bool(queries, "enabled") || bool(object(experiment, "freshness"), "enabled"))
-                    && !string(trino, "deployment_directory").isBlank()) {
-                var launched = host.call(Map.of("op", "start-query", "settings", trino), timeout);
-                trino.put("server", launched.get("server").getAsString());
-                json(output.resolve("trino.json"), launched);
+            if (bool(queries, "enabled") || bool(freshness, "enabled")) {
+                if (!string(trino, "deployment_directory").isEmpty()) {
+                    var launched = host.call(Map.of("op", "start-query", "settings", trino), timeout);
+                    trino.put("server", launched.get("server").getAsString());
+                    json(output.resolve("trino.json"), launched);
+                } else json(output.resolve("trino.json"), Map.of("ownership", "external", "server", string(trino, "server"),
+                        "user", string(trino, "user"), "catalog", string(trino, "catalog"), "schema", string(trino, "schema")));
             }
             var queryFiles = sql;
             Future<?> queryRun = null;
@@ -162,6 +165,13 @@ public final class PixelsExperiment {
 
     record Inputs(PixelsBaseline.Verified baseline, CdcInput.Verified cdc, SourceSchema source) {}
 
+    static void requireQueryPorts(Map<String, Object> experiment, Map<String, Object> settings) {
+        if ((bool(object(experiment, "queries"), "enabled") || bool(object(experiment, "freshness"), "enabled"))
+                && string(object(experiment, "trino"), "deployment_directory").isEmpty())
+            require(object(settings, "properties").keySet().containsAll(PixelsConfig.SERVICE_PORTS.keySet()),
+                    "External Trino requires fixed Pixels service ports in the engine properties");
+    }
+
     /** Recorded answers apply only to the sealed baseline they were computed from, before any update. */
     static HybenchQueries.Rendered answers(Path directory, Map<String, Object> experiment, PixelsBaseline.Verified baseline) throws IOException {
         var answers = HybenchQueries.open(directory);
@@ -180,7 +190,8 @@ public final class PixelsExperiment {
         var baseline = PixelsBaseline.open(root.resolve(baselineDirectory));
         CdcInput.Verified cdc = null;
         if (updates) {
-            cdc = CdcInput.open(root.resolve(input));
+            // The run restores columnar files and applies CDC frames; it never reads the CDC input's CSV copies.
+            cdc = CdcInput.bind(root.resolve(input));
             PixelsBaseline.match(baseline, cdc.manifest());
             require(integer(experiment, "max_transactions") <= cdc.counts().transactions(),
                     "Requested transaction prefix exceeds the published CDC input");
@@ -194,7 +205,7 @@ public final class PixelsExperiment {
         return new Inputs(baseline, cdc, source);
     }
 
-    private static void query(List<Path> files, Map<String, Object> queries, Map<String, Object> config, Path output,
+    static void query(List<Path> files, Map<String, Object> queries, Map<String, Object> config, Path output,
             HybenchQueries.Rendered answers) throws Exception {
         var client = new TrinoQueries(URI.create(string(config, "server")), string(config, "user"), string(config, "catalog"),
                 string(config, "schema"), Duration.ofSeconds(positive(config, "timeout_seconds")));
@@ -215,6 +226,8 @@ public final class PixelsExperiment {
             String difference = null;
             if (answers != null) {
                 var entry = HybenchQueries.entry(answers, file.getFileName().toString());
+                if (!digest.equals(entry.get("sha256").getAsString()))
+                    throw new IOException("Rendered SQL changed after its query set was verified: " + file);
                 difference = HybenchQueries.difference(entry.getAsJsonArray("expected"), rows,
                         entry.has("order_column") ? entry.get("order_column").getAsInt() : null);
                 record.put("oracle", difference == null ? "matched" : difference);

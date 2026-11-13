@@ -128,7 +128,7 @@ public class PostgresProjectionCheck {
                 assertTrue(reference.queries()>=7);
             }
             Path exported=root.resolve("committed.pb.zst");
-            var writer=new ProtoTrace.Writer(exported);
+            var writer=new ProtoTrace.Writer(exported, true);
             try(writer){for(var operation:operations)writer.append(operation);}
             var committed=new ArrayList<IndexOperationTrace.Operation>();
             ProtoTrace.read(exported,writer.sha256(),writer.logicalSha256(),committed::add);
@@ -306,7 +306,7 @@ public class PostgresProjectionCheck {
                         reference.accept(operation);
                 assertEquals(1001,reference.queries());
             }
-            var file=root.resolve("committed.pb.zst");var trace=new ProtoTrace.Writer(file);
+            var file=root.resolve("committed.pb.zst");var trace=new ProtoTrace.Writer(file, true);
             try(trace){for(var operation:operations)trace.accept(operation);}
             var exported=new ArrayList<IndexOperationTrace.Operation>();
             ProtoTrace.read(file,trace.sha256(),trace.logicalSha256(),exported::add);

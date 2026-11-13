@@ -3,7 +3,7 @@ package org.sibench.adapters;
 import java.io.IOException;
 
 /** Harness metadata, outside the index data RPCs. Every data service implements versioned reads. */
-public record IndexDescription(String name, ValueKind valueKind, Acknowledgement writeAck,
+public record IndexDescription(String name, ValueKind valueKind, Acknowledgement writeAck, boolean wal,
                                String durability, String location) {
     public void require(ValueKind selected) throws IOException {
         if (selected == null)

@@ -61,6 +61,7 @@ final class InputFiles {
         try {
             var value = object.get(key);
             require(value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isNumber(), "Missing numeric input field: " + key);
+            require(value.getAsString().matches("-?[0-9]+"), "Input count must be a JSON integer: " + key);
             long result = value.getAsBigDecimal().longValueExact();
             require(result >= 0, "Negative input field: " + key);
             return result;

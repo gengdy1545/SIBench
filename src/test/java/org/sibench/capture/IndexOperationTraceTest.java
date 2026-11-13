@@ -47,7 +47,7 @@ public class IndexOperationTraceTest {
             written.add(
                     IndexOperationTrace.search(
                             4, 5, 0, new Range(null, false, null, false, false, 0), 0, 9, IndexOperationTrace.SNAPSHOT_SEARCH));
-            try (var writer = new ProtoTrace.Writer(file)) {
+            try (var writer = new ProtoTrace.Writer(file, true)) {
                 for (Operation operation : written) writer.append(operation);
             }
             var decoded = new ArrayList<Operation>();
@@ -73,7 +73,7 @@ public class IndexOperationTraceTest {
         Path file = Files.createTempFile("sibench-unit-", ".pb.zst");
         Files.delete(file);
         Range point = Range.equal(IndexKey.ofInt(1));
-        try (var writer = new ProtoTrace.Writer(file)) {
+        try (var writer = new ProtoTrace.Writer(file, true)) {
             for (Operation invalid :
                     List.of(
                             IndexOperationTrace.search(1, 3, 0, point, 0, 0, 0).withWorkUnitId(-1),
@@ -117,7 +117,7 @@ public class IndexOperationTraceTest {
                             IndexOperationTrace.SNAPSHOT_SEARCH);
             var begin = IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0);
             var end = IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 1, 1, 0);
-            try (var writer = new ProtoTrace.Writer(file)) {
+            try (var writer = new ProtoTrace.Writer(file, true)) {
                 // Resolve a source slot before querying its committed snapshot.
                 writer.append(begin);
                 writer.append(end);
@@ -159,7 +159,7 @@ public class IndexOperationTraceTest {
                             IndexOperationTrace.search(2, 5, 2, point, null, 0, 4, intersect, 1, 2),
                             IndexOperationTrace.search(3, 5, 1, point, null, 0, 2, union, 0, 2),
                             IndexOperationTrace.search(3, 5, 1, Range.equal(IndexKey.ofInt(8)), null, 0, 2, union, 1, 2));
-            try (var writer = new ProtoTrace.Writer(file)) {
+            try (var writer = new ProtoTrace.Writer(file, true)) {
                 for (Operation operation : written) writer.append(operation);
             }
             var decoded = new ArrayList<Operation>();
@@ -187,7 +187,7 @@ public class IndexOperationTraceTest {
                         IndexOperationTrace.search(2, 5, 1, interval, null, 0, 4, 0, 0, 2))) {
             Path target = Files.createTempFile("sibench-invalid-", ".pb.zst");
             Files.delete(target);
-            try (var writer = new ProtoTrace.Writer(target)) {
+            try (var writer = new ProtoTrace.Writer(target, true)) {
                 assertThrows(IOException.class, () -> writer.append(invalid));
             } finally {
                 Files.deleteIfExists(target);

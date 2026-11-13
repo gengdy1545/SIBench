@@ -9,7 +9,7 @@ public final class PixelsExperimentConfig {
     private PixelsExperimentConfig() {}
 
     public static Map<String, Object> settings(Map<String, Object> runtime) {
-        var settings = runtime.containsKey("pixels_experiment") ? object(runtime, "pixels_experiment") : defaults();
+        var settings = object(runtime, "pixels_experiment");
         SibenchConfig.keys(settings, Set.of("trace", "updates", "max_transactions", "timeout_seconds", "queries", "freshness", "trino"), "Pixels experiment");
         bool(settings, "trace");
         bool(settings, "updates");
@@ -52,21 +52,18 @@ public final class PixelsExperimentConfig {
                 "Trino query memory plus heap headroom exceeds the JVM heap");
         require(positive(trino, "threads") <= 256, "Trino threads exceeds 256");
         require(positive(trino, "timeout_seconds") <= 86400, "Trino timeout exceeds 24 hours");
-        if (bool(queries, "enabled") || bool(freshness, "enabled"))
+        boolean external = !string(trino, "server").isEmpty(), managed = !string(trino, "deployment_directory").isEmpty();
+        require(!external || !managed, "Choose either trino.server or trino.deployment_directory");
+        if (external) {
             new org.sibench.query.TrinoQueries(java.net.URI.create(string(trino, "server")), string(trino, "user"),
                     string(trino, "catalog"), string(trino, "schema"), java.time.Duration.ofSeconds(positive(trino, "timeout_seconds")));
+            require(!bool(freshness, "enabled") || java.net.URI.create(string(trino, "server")).getScheme().equals("http"),
+                    "Sink freshness currently requires an HTTP Trino JDBC endpoint");
+        }
+        require(!bool(queries, "enabled") && !bool(freshness, "enabled") || external || managed,
+                "Queries and freshness require trino.server or trino.deployment_directory");
         require(!bool(queries, "enabled") || !string(queries, "directory").isBlank(), "Enabled queries require a SQL directory");
         return settings;
-    }
-
-    public static Map<String, Object> defaults() {
-        return Map.of("trace", false, "updates", true, "max_transactions", 0, "timeout_seconds", 600,
-                "queries", Map.of("enabled", false, "timing", "after", "directory", "", "rounds", 1),
-                "freshness", Map.of("enabled", false, "table", "savingaccount", "column", "fresh_ts", "sample_seconds", 5),
-                "trino", Map.ofEntries(Map.entry("server", "http://127.0.0.1:8080"), Map.entry("user", "sibench"),
-                        Map.entry("catalog", "pixels"), Map.entry("schema", "postgres"), Map.entry("timeout_seconds", 120),
-                        Map.entry("deployment_directory", ""), Map.entry("heap", "40G"), Map.entry("query_memory", "24GB"),
-                        Map.entry("query_total_memory", "28GB"), Map.entry("heap_headroom", "12GB"), Map.entry("threads", 32)));
     }
 
     private static long bytes(String value) {

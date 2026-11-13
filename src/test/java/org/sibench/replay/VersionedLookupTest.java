@@ -46,7 +46,7 @@ public class VersionedLookupTest {
         Path directory = Files.createTempDirectory("sibench-committed-lookup-");
         Path trace = directory.resolve("workload.pb.zst");
         try {
-            try (var writer = new ProtoTrace.Writer(trace)) {
+            try (var writer = new ProtoTrace.Writer(trace, true)) {
                 writer.append(IndexOperationTrace.transaction(version, 6, version, version, 0));
                 for (Operation row : rows) org.sibench.capture.TransferIndexFixtures.appendRow(writer, row);
                 writer.append(IndexOperationTrace.transaction(version, 7, version, version, rows.length));
@@ -205,11 +205,11 @@ public class VersionedLookupTest {
         try {
             Path baseline = directory.resolve("baseline.pb.zst"),
                     workload = directory.resolve("workload.pb.zst");
-            try (var writer = new ProtoTrace.Writer(baseline)) {
+            try (var writer = new ProtoTrace.Writer(baseline, true)) {
                 org.sibench.capture.TransferIndexFixtures.appendRow(
                         writer, TestOps.op(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0));
             }
-            try (var writer = new ProtoTrace.Writer(workload)) {
+            try (var writer = new ProtoTrace.Writer(workload, true)) {
                 writer.append(IndexOperationTrace.transaction(100, 6, 100, 100, 0));
                 org.sibench.capture.TransferIndexFixtures.appendRow(
                         writer, row(5, 1, 100, 1, 50, 3, 1));

@@ -9,8 +9,8 @@ name = "slatedb_jni"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# foyer provides upstream's default in-memory block and metadata caches.
-slatedb = { path = "../../../../../index/slatedb/slatedb", default-features = false, features = ["aws", "foyer"] }
+# foyer provides upstream's default in-memory block and metadata caches; wal_disable exposes Settings::wal_enabled.
+slatedb = { path = "../../../../../index/slatedb/slatedb", default-features = false, features = ["aws", "foyer", "wal_disable"] }
 slatedb-mirror = { path = "../../../../../index/slatedb/slatedb-mirror" }
 async-trait = "0.1.89"
 jni = "0.21.1"

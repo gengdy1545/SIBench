@@ -46,7 +46,7 @@ public final class BaselineCapacityCheck {
     static final class Sink implements IndexBackend {
         final Fingerprint received=new Fingerprint();final Path report;final boolean dropFirst;final AtomicBoolean dropped=new AtomicBoolean();String binding="";
         Sink(Path report,boolean dropFirst) { this.report=report;this.dropFirst=dropFirst; }
-        public IndexDescription describe() { return new IndexDescription("baseline-transport-field-check-sink",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,"diagnostic field receiver; no index storage",location()); }
+        public IndexDescription describe() { return new IndexDescription("baseline-transport-field-check-sink",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,false,"diagnostic field receiver; no index storage",location()); }
         public void write(Mutation write) throws IOException { if (dropFirst && dropped.compareAndSet(false,true)) return;received.write(write); flush(); }
         public ByteString get(GetRequest get) throws IOException { throw new IOException("Baseline-only diagnostic receiver"); }
         public void scan(ScanRequest scan,ValueSink output) throws IOException { throw new IOException("Baseline-only diagnostic receiver"); }

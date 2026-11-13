@@ -25,7 +25,7 @@ final class CommittedOperations {
     private Operation begin, mutation, previousExpansion, searchGroup;
     private int expansionMembers, searchMembers;
     private long abortedTransactions, abortedWrites, abortedSearches, localSearches, coalescedWrites, peakBuffered;
-    private long querySearches;
+    private long querySearches, transactionQuerySearches;
     private boolean knownAbort, knownQuery;
 
     CommittedOperations(Consumer output, boolean exportQueries) {
@@ -81,7 +81,8 @@ final class CommittedOperations {
                 else abortedSearches++;
             } else abortedWrites++;
         }
-        else if (knownQuery && !exportQueries && operation.kind() == SEARCH) querySearches++;
+        // Attributed at the outcome: reads of an aborted query transaction are Abort exclusions.
+        else if (knownQuery && !exportQueries && operation.kind() == SEARCH) transactionQuerySearches++;
         // Operations held for the outcome count against the limit, even when dropped or superseded early.
         else if (sourceOperations++ >= MAX_TRANSACTION_OPERATIONS)
             throw new IOException("Source transaction exceeds operation buffer limit");
@@ -108,7 +109,7 @@ final class CommittedOperations {
                     || operation.expectedCount() != 0)
                 throw new IOException("Invalid source group begin/order");
             transaction = operation.transactionId();
-            ordinal = lastSource = sourceOperations = superseded = 0;
+            ordinal = lastSource = sourceOperations = superseded = transactionQuerySearches = 0;
             mutation = previousExpansion = null;
             expansionMembers = 0;
             begin = operation;
@@ -123,8 +124,10 @@ final class CommittedOperations {
         if (aborted) {
             abortedTransactions++;
             abortedWrites += superseded;
+            abortedSearches += transactionQuerySearches;
         } else {
             coalescedWrites += superseded;
+            querySearches += transactionQuerySearches;
             output.accept(begin);
         }
         for (Operation member : pending) {

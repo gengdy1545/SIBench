@@ -12,10 +12,12 @@ final class SlateDbStore implements OrderedStore {
     private static boolean loaded;
     private final long handle;
     private final String location;
+    private final boolean wal;
     private volatile boolean closed;
 
-    private SlateDbStore(long handle, ObjectStore store) {
+    private SlateDbStore(long handle, ObjectStore store, boolean wal) {
         this.handle = handle;
+        this.wal = wal;
         location = "s3://" + store.bucket() + "/" + store.objectPath();
     }
 
@@ -32,39 +34,42 @@ final class SlateDbStore implements OrderedStore {
         loaded = true;
     }
 
-    static SlateDbStore create(Path path, ObjectStore store) throws IOException {
+    static SlateDbStore create(Path path, ObjectStore store, boolean wal) throws IOException {
         load();
         Path absolute = path.toAbsolutePath();
         Files.createDirectories(absolute.getParent());
         Files.createDirectory(absolute);
-        return open(absolute, store, true);
+        return open(absolute, store, true, wal);
     }
 
-    static SlateDbStore open(Path path, ObjectStore store) throws IOException {
+    static SlateDbStore open(Path path, ObjectStore store, boolean wal) throws IOException {
         load();
         Files.createDirectories(path.toAbsolutePath());
-        return open(path.toAbsolutePath(), store, false);
+        return open(path.toAbsolutePath(), store, false, wal);
     }
 
     /** The local path mirrors the compacted SSTs, as rocksdb-cloud keeps its SST files locally. */
-    private static SlateDbStore open(Path mirror, ObjectStore store, boolean create) throws IOException {
-        return new SlateDbStore(nativeOpen(store.bucket(), store.objectPath(), store.region(),
+    private static SlateDbStore open(Path mirror, ObjectStore store, boolean create, boolean wal) throws IOException {
+        return new SlateDbStore(nativeOpenStore(store.bucket(), store.objectPath(), store.region(),
                 store.endpoint(), store.virtualHosted(), store.accessKey(), store.secretKey(),
-                store.sessionToken(), mirror.toString(), create), store);
+                store.sessionToken(), mirror.toString(), create, wal), store, wal);
     }
 
     @Override public String name() { return nativeVersion(); }
     @Override public String location() { return location; }
+    @Override public boolean wal() { return wal; }
+    // Writes return before the object store holds them, with or without the WAL.
     @Override public Acknowledgement writeAck() { return Acknowledgement.ACK_MEMORY; }
     @Override public String durability() {
         return "acknowledged writes are visible through the same SlateDB instance's memory read path;"
-                + " Flush waits for object-store persistence; compacted SSTs are also mirrored to the local"
-                + " path; independent readers may lag";
+                + (wal ? " the WAL buffer is uploaded to the object store at SlateDB's flush interval and Flush waits for it;"
+                        : " the WAL is disabled, so Flush writes the memtable as an L0 SST and a process failure loses"
+                                + " writes after the last persistence cycle;")
+                + " compacted SSTs are also mirrored to the local path; independent readers may lag";
     }
 
-    @Override public void put(byte[] key, byte[] value, boolean wal) throws IOException {
+    @Override public void put(byte[] key, byte[] value) throws IOException {
         requireOpen();
-        // SlateDB uses its in-memory WAL for both baseline and workload writes.
         nativePut(handle, key, value);
     }
     /** One SlateDB write batch per public batch request. */
@@ -86,7 +91,6 @@ final class SlateDbStore implements OrderedStore {
         return new Cursor() {
             @Override public void seek(byte[] key) { nativeMove(cursor, 0, key); }
             @Override public void seekForPrev(byte[] key) { nativeMove(cursor, 1, key); }
-            @Override public void seekToLast() { nativeMove(cursor, 2, null); }
             @Override public void next() { nativeMove(cursor, 3, null); }
             @Override public void prev() { nativeMove(cursor, 4, null); }
             @Override public boolean valid() throws IOException { return nativeValid(cursor); }
@@ -104,9 +108,10 @@ final class SlateDbStore implements OrderedStore {
 
     private void requireOpen() throws IOException { if (closed) throw new IOException("SlateDB store is closed"); }
     private static native String nativeVersion();
-    private static native long nativeOpen(String bucket, String prefix, String region, String endpoint,
-            boolean virtualHosted, String access, String secret, String token, String mirror, boolean create)
-            throws IOException;
+    // Renamed with the WAL setting, so a library built before it fails to link instead of ignoring the argument.
+    private static native long nativeOpenStore(String bucket, String prefix, String region, String endpoint,
+            boolean virtualHosted, String access, String secret, String token, String mirror, boolean create,
+            boolean wal) throws IOException;
     private static native String nativeRequests(long handle) throws IOException;
     private static native void nativePut(long handle, byte[] key, byte[] value) throws IOException;
     private static native void nativePutAll(long handle, byte[][] keys, byte[][] values) throws IOException;

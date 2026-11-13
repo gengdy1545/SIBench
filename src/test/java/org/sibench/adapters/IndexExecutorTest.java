@@ -37,6 +37,30 @@ public class IndexExecutorTest {
     }
 
     @Test(timeout = 10000)
+    public void failedWritesThatMayHaveAppliedStillReachPersistence() throws Exception {
+        try (var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("partial"), ValueKind.ROW_ID)) {
+            var flushes = new java.util.concurrent.atomic.AtomicInteger();
+            var partial = (IndexBackend) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),
+                    new Class<?>[] {IndexBackend.class}, (proxy, method, args) -> {
+                        if (method.getName().equals("flush")) flushes.incrementAndGet();
+                        Object result;
+                        try { result = method.invoke(backend, args); }
+                        catch (java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
+                        if (method.getName().equals("write")) throw new IOException("applied, then the call failed");
+                        return result;
+                    });
+            var rejected = new IndexExecutor(partial);
+            assertEquals(IndexStatus.INVALID, rejected.submit(WriteBatchRequest.getDefaultInstance()).get(2, TimeUnit.SECONDS).status());
+            rejected.close();
+            assertEquals("A validation rejection changes no state", 0, flushes.get());
+            var failed = new IndexExecutor(partial);
+            assertEquals(IndexStatus.UNAVAILABLE, failed.submit(IndexServerTest.put(7, 1, 70)).get(2, TimeUnit.SECONDS).status());
+            failed.close();
+            assertEquals(1, flushes.get());
+        }
+    }
+
+    @Test(timeout = 10000)
     public void closeWaitsForRunningBackendEvenWhenItsResponseIsCancelled() throws Exception {
         var entered = new java.util.concurrent.CountDownLatch(1);
         var release = new java.util.concurrent.CountDownLatch(1);
@@ -78,7 +102,7 @@ public class IndexExecutorTest {
         int rows = IndexExecution.CHUNK_RESULTS + 5;
         var fail = new java.util.concurrent.atomic.AtomicBoolean();
         var backend = new IndexBackend() {
-            public IndexDescription describe() { return new IndexDescription("fixture",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,"test",location()); }
+            public IndexDescription describe() { return new IndexDescription("fixture",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,false,"test",location()); }
             public void write(Mutation write) { throw new UnsupportedOperationException(); }
             public ByteString get(GetRequest get) { throw new UnsupportedOperationException(); }
             public void scan(ScanRequest scan, ValueSink sink) throws IOException {

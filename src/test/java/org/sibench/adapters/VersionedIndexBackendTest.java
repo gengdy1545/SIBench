@@ -252,7 +252,7 @@ public class VersionedIndexBackendTest {
         try (var store = LocalRocksStore.open(path)) {
             byte[] name = "unsupported_state".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
             byte[] key = java.nio.ByteBuffer.allocate(8 + name.length).putLong(0).put(name).array();
-            store.put(key, new byte[] {1}, true);
+            store.put(key, new byte[] {1});
             store.flush();
         }
         var error = assertThrows(java.io.IOException.class, () -> VersionedIndexBackend.open(path, ValueKind.ROW_ID));
@@ -270,6 +270,9 @@ public class VersionedIndexBackendTest {
             }
             try (var backend = VersionedIndexBackend.open(path, mode.getKey())) {
                 assertEquals(mode.getKey(), backend.describe().valueKind());
+                // The generation fixture keeps its WAL; its description says so.
+                assertTrue(backend.describe().wal());
+                assertEquals(Acknowledgement.ACK_WAL, backend.describe().writeAck());
             }
         }
     }
@@ -292,7 +295,7 @@ public class VersionedIndexBackendTest {
             // The binding survives the reopen: the index still refuses another trace.
             backend.bind("trace-a");
             assertThrows(java.io.IOException.class, () -> backend.bind("trace-b"));
-            assertEquals(path.toAbsolutePath().toString(), backend.location());
+            assertEquals(path.toAbsolutePath().toString(), backend.describe().location());
         }
         var stats = java.nio.file.Files.readAllLines(path.resolveSibling("reopen.engine-stats.jsonl"));
         assertEquals(1, stats.size());

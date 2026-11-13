@@ -29,33 +29,26 @@ public class ReplayConfigTest {
         assertEquals(64, simple.clientCount());
         assertEquals(4096, simple.maxInFlight());
         assertEquals(600, simple.requestTimeoutSeconds());
-        var omittedTimeout = parse(template);
-        var omittedReplay = object(omittedTimeout, "replay");
-        omittedReplay.remove("request_timeout_seconds");
-        omittedTimeout.put("replay", omittedReplay);
-        assertEquals(60, ReplayConfig.from(omittedTimeout).requestTimeoutSeconds());
+        // An omitted dispatch setting would otherwise replay with a different client count or timeout.
+        for (String key : java.util.List.of("dispatch_mode", "client_count", "max_in_flight",
+                "request_timeout_seconds", "baseline_batch_operations")) {
+            var omitted = parse(template);
+            var replay = object(omitted, "replay");
+            replay.remove(key);
+            omitted.put("replay", replay);
+            assertTrue(key, assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(omitted))
+                    .getMessage().contains(key));
+        }
         for (int clients : new int[] {64, 128})
             assertEquals(clients, ReplayConfig.from(parse(template.replace("client_count: 64", "client_count: " + clients)
                     .replace("baseline_batch_operations: 64", "baseline_batch_operations: " + 4096 / clients))).clientCount());
         assertEquals(64, simple.baselineBatchOperations());
-        var omittedBatch = parse(template);
-        var batchReplay = object(omittedBatch, "replay");
-        batchReplay.remove("baseline_batch_operations");
-        omittedBatch.put("replay", batchReplay);
-        assertEquals(ReplayConfig.DEFAULT_BASELINE_BATCH_OPERATIONS, ReplayConfig.from(omittedBatch).baselineBatchOperations());
         // Every client holding a partial batch must still leave an in-flight slot.
         for (String invalid : new String[] {"0", "66", "\"64\""})
             assertThrows(invalid, IllegalArgumentException.class, () -> ReplayConfig.from(parse(
                     template.replace("baseline_batch_operations: 64", "baseline_batch_operations: " + invalid))));
         assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(parse(template.replace("client_count: 64", "client_count: 128"))));
         assertEquals("operation", simple.dispatchMode());
-        assertEquals(
-                "operation",
-                ReplayConfig.from(
-                                parse(
-                                        Files.readString(Path.of("config/sibench.yaml"))
-                                                .replace("  dispatch_mode: operation\n", "")))
-                        .dispatchMode());
         assertEquals(
                 "transaction",
                 ReplayConfig.from(
@@ -88,63 +81,32 @@ public class ReplayConfigTest {
     }
 
     @Test
-    public void rejectsRepetitionUnknownOptionsAndUnsupportedGc() throws Exception {
+    public void rejectsUnknownOptionsAndInvalidDispatchValues() throws Exception {
         String text = Files.readString(Path.of("config/sibench.yaml"));
         for (String invalid :
                 new String[] {
                     text.replace("target:", "target:\n  value: locator"),
-                    text.replace("replay:", "replay:\n  strategy: cycle"),
                     text.replace("replay:", "replay:\n  repeat: 2"),
                     text.replace("enabled: false", "enabled: 'false'"),
                     text.replace("dispatch_mode: operation", "dispatch_mode: parallel"),
                     text.replace("client_count: 64", "client_count: 0"),
                     text.replace("max_in_flight: 4096", "max_in_flight: 0"),
                     text.replace("request_timeout_seconds: 600", "request_timeout_seconds: 86401"),
-                    text.replace("client_count: 64", "client_count: 64\n  routing: index_key"),
-                    text.replace(
-                            "secondary_indexes:",
-                            "transaction_writes:\n"
-                                    + "    coalesce_same_key: true\n"
-                                    + "  secondary_indexes:"),
-                    text + "\nversions:\n  gc:\n    owner: immediate\n",
-                    text + "\nversions:\n  gc:\n    send_delete: false\n"
+                    text + "\nversions:\n  gc:\n    owner: immediate\n"
                 }) {
             assertNotEquals("The invalid fixture must change the public template", text, invalid);
             assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(parse(invalid)));
         }
-        var retired = parse(text);
-        var target = object(retired, "target");
+        var serviceless = parse(text);
+        var target = object(serviceless, "target");
         target.remove("service");
         target.put("value", "locator");
-        retired.put("target", target);
-        assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(retired));
+        serviceless.put("target", target);
+        assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(serviceless));
         assertThrows(
                 IllegalArgumentException.class,
                 () -> new ReplayConfig(true, 0, 300000, 0, 0));
         assertThrows(
                 IllegalArgumentException.class, () -> new ReplayConfig(true, 1, 1, -1, 0));
-    }
-
-    @Test
-    public void rejectsRetiredFixedOptions() throws Exception {
-        String source = Files.readString(Path.of("config/sibench.yaml"));
-        for (String strategy : new String[] {"single_pass", "cycle"}) {
-            var document = parse(source);
-            var replay = object(document, "replay");
-            replay.put("strategy", strategy);
-            document.put("replay", replay);
-            assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(document));
-        }
-        for (String owner : new String[] {"none", "backend", "benchmark"}) {
-            var document = parse(source);
-            document.put("versions", Map.of("gc", Map.of("owner", owner)));
-            assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(document));
-        }
-        var previous = parse(source);
-        var replay = object(previous, "replay");
-        replay.put("strategy", "single_pass");
-        previous.put("replay", replay);
-        previous.put("versions", Map.of("gc", Map.of("owner", "none")));
-        assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(previous));
     }
 }

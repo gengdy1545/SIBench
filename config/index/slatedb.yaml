@@ -9,3 +9,5 @@ service:
   storage: config/index/storage.yaml
   profile: local_s3
   object_path: sibench/dev/slatedb/
+  # Required: also record every write in the engine WAL. false acknowledges from memory; true is the WAL comparison.
+  wal: false

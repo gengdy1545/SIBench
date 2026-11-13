@@ -60,6 +60,12 @@ public class CommittedTraceTest {
                 writer.accept(transaction(0,TRANSACTION_BEGIN,4,4,0));
                 writer.accept(read(4,3,0));
                 writer.accept(transaction(0,TRANSACTION_ABORT,4,4,0));
+
+                // DuckDB classifies the stage before the outcome is known; the rollback still owns this exclusion.
+                writer.expectQuery();
+                writer.accept(transaction(0,TRANSACTION_BEGIN,5,5,0));
+                writer.accept(read(5,3,0));
+                writer.accept(transaction(0,TRANSACTION_ABORT,5,5,0));
             }
             budget.end();
             assertEquals(queries?5:3,budget.count());
@@ -72,6 +78,8 @@ public class CommittedTraceTest {
             assertTrue(decoded.stream().noneMatch(o->o.transactionId()==4||(o.flags()&TRANSACTION_LOCAL_SEARCH)!=0));
             var statistics=(Map<?,?>)writer.statistics().get("source_projection");
             assertEquals(queries?0L:2L,statistics.get("excluded_query_search_members"));
+            assertEquals(2L,statistics.get("excluded_aborted_search_members"));
+            assertEquals(2L,statistics.get("excluded_aborted_transactions"));
             assertEquals(1L,statistics.get("excluded_local_search_members"));
             assertEquals(1L,statistics.get("coalesced_writes"));
         }
@@ -101,7 +109,7 @@ public class CommittedTraceTest {
         Path file = temporary.getRoot().toPath().resolve("committed.pb.zst");
         var budget = new RequestBudget(3, Duration.ofSeconds(10));
         budget.begin("committed", 1, file.resolveSibling("stop"));
-        var writer = new ProtoTrace.Writer(file, true, budget);
+        var writer = new ProtoTrace.Writer(file, true, false, budget);
         try (writer) {
             writer.accept(transaction(0, TRANSACTION_BEGIN, 1, 1, 0));
             writer.accept(read(1, 0, 0));
@@ -148,7 +156,7 @@ public class CommittedTraceTest {
     }
 
     @Test public void malformedSourceCountIsRejectedEvenWhenTheTransactionAborts() throws Exception {
-        var writer = new ProtoTrace.Writer(temporary.getRoot().toPath().resolve("bad-source.pb.zst"));
+        var writer = new ProtoTrace.Writer(temporary.getRoot().toPath().resolve("bad-source.pb.zst"), true);
         writer.accept(transaction(0, TRANSACTION_BEGIN, 1, 1, 0));
         writer.accept(write(1, 1, 99));
         assertThrows(IOException.class, () -> writer.accept(transaction(0, TRANSACTION_ABORT, 1, 1, 2)));
@@ -160,7 +168,7 @@ public class CommittedTraceTest {
         for (boolean commit : List.of(false, true)) {
             Path directory = temporary.getRoot().toPath().resolve("tail-" + commit);
             Map<String, Object> manifest;
-            try (var trace = new RocksTrace(directory, schema, true)) {
+            try (var trace = new RocksTrace(directory, schema, true, false, null)) {
                 trace.baseline(new org.sibench.generation.RocksDbRows.Row(10, "key", new byte[][] {{1}}));
                 trace.finishBaseline(1);
                 trace.event(new org.sibench.generation.RocksDbRows.Event("read", "key", 10, 1, 0, 1, 0, commit));

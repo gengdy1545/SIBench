@@ -64,7 +64,7 @@ public class RocksGenerationCheck {
         org.sibench.replay.ReferenceReplay.run(trace, new org.sibench.replay.ReplayConfig(false, 0, 0, 0, 0, "operation"), run.resolve("reference.json"));
         var replay = new org.sibench.replay.ReplayConfig(false, 0, 0, 0, 0, "operation", 2, 64, 10);
         var service = new org.sibench.adapters.ServiceConfig("rocksdb", null, run.resolve("index"), 0,
-                org.sibench.adapters.ValueKind.ROW_ID, null, false);
+                org.sibench.adapters.ValueKind.ROW_ID, null, false, true);
         assertEquals("passed", org.sibench.adapters.ServiceReplay.run(trace, replay, service, run.resolve("replay.json")).get("status"));
         assertFalse(TraceManifest.read(trace).has("native_data"));
         assertFalse(Files.exists(trace.resolve("data")));

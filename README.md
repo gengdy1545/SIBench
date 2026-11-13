@@ -122,7 +122,7 @@ java -jar build/sibench/sibench.jar pixels-experiment config/sibench.yaml \
   results/capture/hybench results/inputs/hybench-pixels results/pixels/run
 ```
 
-To compare Trino answers on the sealed baseline with an independent PostgreSQL, run `render-queries config/sibench.yaml results/capture/hybench-csv results/capture/hybench-queries SEED INSTANCES` and use its output as `queries.directory` of a static experiment.
+SQL performance experiments accept ordinary `.sql` files without reference answers. For an explicit correctness check against an independent PostgreSQL, run `render-queries config/sibench.yaml results/capture/hybench-csv results/capture/hybench-queries SEED INSTANCES` and use its output as `queries.directory` of a static experiment. Queries and freshness can reuse a dedicated Trino URL; see [deployment settings](docs/pixels-experiment.md#trino-deployment).
 
 `prepare-csv` generates and seals the baseline without a database. Parallel preparation captures PostgreSQL TP/AT changes and creates a Pixels columnar baseline from that same CSV input. Experiments import the existing Pixels files and rebuild indexes and visibility before applying CDC. Updates default on; Trace, queries and freshness default off. With `updates: false`, omit the CDC argument; static experiments need only the Pixels baseline and do not read CSV or CDC files. All output directories must be fresh. See the [input contract](docs/cdc-input.md) for publication and the [experiment contract](docs/pixels-experiment.md) for restore and measurement semantics.
 
@@ -151,7 +151,7 @@ The runtime template selects gRPC, RowID values and explicit client/in-flight li
 
 The data API is Get/Put/Delete/Scan/WriteBatch over opaque byte keys/values and caller timestamps. Get and Scan return values only; Scan uses half-open byte bounds and preserves key order and duplicate values. Replay batches baseline loading and sends each incremental operation as a separate concurrent RPC. Services own asynchronous persistence and expose no Flush RPC. Replay checks input integrity, deployment/value mode and binding, response completion and native result counts. Equal counts do not certify matching values or order. The same immutable Trace can be reused across backends and client settings.
 
-`check-replay CONFIG TRACE` is an optional preflight-only diagnostic; replay already performs these checks. `plan-operations PROFILE TRACE REPLAY_CONFIG` estimates source batch parameters from a calibration Trace, not achievable throughput. Request supply, dispatch warmup and operation rates count the same basic operations; see [replay preflight](docs/trace.md#replay-preflight). To check persisted snapshots explicitly, use `service.reopen: true` and `verify-service`; [only queries from successfully committed transactions are exported](docs/index-service.md#internal-persistence-and-reopening).
+`check-replay CONFIG TRACE` is an optional preflight-only diagnostic; replay already performs these checks. Request supply, dispatch warmup and operation rates count the same basic operations; see [replay preflight](docs/trace.md#replay-preflight). To check persisted snapshots explicitly, use `service.reopen: true` and `verify-service`; see [internal persistence and reopening](docs/index-service.md#internal-persistence-and-reopening) for what a clean reopen does and does not certify.
 
 ## Analysis
 

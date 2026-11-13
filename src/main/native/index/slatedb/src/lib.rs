@@ -170,10 +170,12 @@ impl Requests {
 }
 
 /// Counts every request that reaches the remote store, below SlateDB and its local mirror.
+/// Also serializes conditional PUTs: see `put_opts`.
 #[derive(Debug)]
 struct Counted {
     inner: Arc<dyn ObjectStore>,
     requests: Arc<Requests>,
+    conditional: futures::lock::Mutex<()>,
 }
 
 impl std::fmt::Display for Counted {
@@ -183,6 +185,19 @@ impl std::fmt::Display for Counted {
 }
 
 impl Counted {
+    fn new(inner: Arc<dyn ObjectStore>, requests: Arc<Requests>) -> Self {
+        Self { inner, requests, conditional: futures::lock::Mutex::new(()) }
+    }
+    async fn put_counted(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> slatedb::object_store::Result<PutResult> {
+        let (started, bytes) = (Instant::now(), payload.content_length() as u64);
+        let result = self.inner.put_opts(location, payload, opts).await;
+        self.track(WRITE, |_| bytes, started, result)
+    }
     fn track<T>(
         &self,
         kind: usize,
@@ -248,9 +263,34 @@ impl ObjectStore for Counted {
         payload: PutPayload,
         opts: PutOptions,
     ) -> slatedb::object_store::Result<PutResult> {
-        let (started, bytes) = (Instant::now(), payload.content_length() as u64);
-        let result = self.inner.put_opts(location, payload, opts).await;
-        self.track(WRITE, |_| bytes, started, result)
+        if matches!(opts.mode, PutMode::Overwrite) {
+            return self.put_counted(location, payload, opts).await;
+        }
+        // COS accepts If-None-Match/If-Match but does not enforce them, so SlateDB's memtable flusher and
+        // compactor could both create manifest N and one commit was silently lost, stalling writes. Check
+        // under one lock: exact among this process's writers, the single-writer limit COS runs already have.
+        // The original mode is still forwarded, so a store that enforces it also rejects other processes.
+        let _serial = self.conditional.lock().await;
+        let started = Instant::now();
+        let existing = match self.inner.head(location).await {
+            Ok(meta) => Ok(Some(meta)),
+            Err(slatedb::object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error),
+        };
+        let existing = self.track(INFO, |_| 0, started, existing)?;
+        let conflict = match (&opts.mode, &existing) {
+            (PutMode::Create, Some(_)) => Some("object already exists"),
+            (PutMode::Update(_), None) => Some("object to update does not exist"),
+            (PutMode::Update(expected), Some(meta))
+                if expected.e_tag.is_some() && expected.e_tag != meta.e_tag => Some("object changed"),
+            _ => None,
+        };
+        let path = location.to_string();
+        match (conflict, &opts.mode) {
+            (Some(why), PutMode::Create) => Err(slatedb::object_store::Error::AlreadyExists { path, source: why.into() }),
+            (Some(why), _) => Err(slatedb::object_store::Error::Precondition { path, source: why.into() }),
+            (None, _) => self.put_counted(location, payload, opts).await,
+        }
     }
     async fn put_multipart_opts(
         &self,
@@ -399,18 +439,17 @@ fn call<T: Default>(mut env: JNIEnv, body: impl FnOnce(&mut JNIEnv) -> Result<T>
 
 impl Store {
     /// `mirror` keeps the compacted SSTs on local disk, as rocksdb-cloud keeps its SST files.
+    /// Without `wal`, writes go straight to the memtable and become durable only when it is flushed.
     fn open(
         objects: Arc<dyn ObjectStore>,
         prefix: &str,
         mirror: Option<&std::path::Path>,
         create: bool,
+        wal: bool,
     ) -> Result<Self> {
         install_log();
         let requests = Arc::new(Requests::default());
-        let objects: Arc<dyn ObjectStore> = Arc::new(Counted {
-            inner: objects,
-            requests: requests.clone(),
-        });
+        let objects: Arc<dyn ObjectStore> = Arc::new(Counted::new(objects, requests.clone()));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -466,6 +505,7 @@ impl Store {
             Db::builder(prefix, main)
                 .with_settings(Settings {
                     object_store_max_retries: Some(3),
+                    wal_enabled: wal,
                     ..Settings::default()
                 })
                 .build()
@@ -646,7 +686,7 @@ pub extern "system" fn Java_org_sibench_adapters_SlateDbStore_nativeVersion(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_sibench_adapters_SlateDbStore_nativeOpen(
+pub extern "system" fn Java_org_sibench_adapters_SlateDbStore_nativeOpenStore(
     env: JNIEnv,
     _: JClass,
     bucket: JString,
@@ -659,6 +699,7 @@ pub extern "system" fn Java_org_sibench_adapters_SlateDbStore_nativeOpen(
     token: JString,
     mirror: JString,
     create: jboolean,
+    wal: jboolean,
 ) -> jlong {
     call(env, |env| {
         let bucket = string(env, &bucket)?;
@@ -680,6 +721,7 @@ pub extern "system" fn Java_org_sibench_adapters_SlateDbStore_nativeOpen(
             &string(env, &prefix)?,
             Some(std::path::Path::new(&string(env, &mirror)?)),
             create != 0,
+            wal != 0,
         )?;
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         stores()
@@ -811,7 +853,6 @@ pub extern "system" fn Java_org_sibench_adapters_SlateDbStore_nativeMove(
         match operation {
             0 => value.seek(Bytes::from(bytes(env, &key)?)),
             1 => value.position(Some(Bytes::from(bytes(env, &key)?)), true, true),
-            2 => value.position(None, true, true),
             3 => value.step(false),
             4 => value.step(true),
             _ => Err("Unknown cursor operation".into()),
@@ -885,10 +926,12 @@ mod tests {
     }
 
     /// Counts remote GETs of compacted SSTs only; background manifest and WAL reads are not lookups.
+    /// `cos_like` accepts conditional PUTs without enforcing them, as Tencent COS does.
     #[derive(Debug)]
     struct SstGets {
         inner: Arc<dyn ObjectStore>,
         count: AtomicU64,
+        cos_like: bool,
     }
 
     impl std::fmt::Display for SstGets {
@@ -903,8 +946,11 @@ mod tests {
             &self,
             location: &Path,
             payload: PutPayload,
-            opts: PutOptions,
+            mut opts: PutOptions,
         ) -> slatedb::object_store::Result<PutResult> {
+            if self.cos_like {
+                opts.mode = PutMode::Overwrite;
+            }
             self.inner.put_opts(location, payload, opts).await
         }
         async fn put_multipart_opts(
@@ -956,7 +1002,48 @@ mod tests {
         Arc::new(SstGets {
             inner: Arc::new(InMemory::new()),
             count: AtomicU64::new(0),
+            cos_like: false,
         })
+    }
+
+    /// The 2026-11 COS stall: SlateDB's flusher and compactor both created manifest N, COS kept the
+    /// later PUT, and the lost commit left writers waiting forever. The adapter must keep one winner.
+    #[test]
+    fn conditional_puts_hold_on_a_store_that_ignores_them() {
+        use slatedb::object_store::{Error, UpdateVersion};
+        let cos = Arc::new(SstGets { inner: Arc::new(InMemory::new()), count: AtomicU64::new(0), cos_like: true });
+        let create = || PutOptions { mode: PutMode::Create, ..Default::default() };
+        let update = |put: &PutResult| PutOptions {
+            mode: PutMode::Update(UpdateVersion { e_tag: put.e_tag.clone(), version: put.version.clone() }),
+            ..Default::default()
+        };
+        let manifest = Path::from("db/manifest/00000000000000000069.manifest");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // The defect: directly on the COS-like store both creators succeed.
+            assert!(cos.put_opts(&manifest, "flusher".into(), create()).await.is_ok());
+            assert!(cos.put_opts(&manifest, "compactor".into(), create()).await.is_ok());
+            let objects = Counted::new(cos.clone(), Arc::new(Requests::default()));
+            let next = Path::from("db/manifest/00000000000000000070.manifest");
+            let (a, b) = futures::join!(
+                objects.put_opts(&next, "flusher".into(), create()),
+                objects.put_opts(&next, "compactor".into(), create())
+            );
+            assert_eq!(a.is_ok() as u8 + b.is_ok() as u8, 1, "exactly one creator wins");
+            assert!(matches!(a.err().or(b.err()), Some(Error::AlreadyExists { .. })));
+            let boundary = Path::from("db/boundary");
+            let absent = PutOptions {
+                mode: PutMode::Update(UpdateVersion { e_tag: Some("missing".into()), version: None }),
+                ..Default::default()
+            };
+            assert!(matches!(objects.put_opts(&boundary, "1".into(), absent).await,
+                Err(Error::Precondition { .. })), "an absent object cannot be updated");
+            let first = objects.put_opts(&boundary, "1".into(), create()).await.unwrap();
+            let second = objects.put_opts(&boundary, "2".into(), update(&first)).await.unwrap();
+            assert!(matches!(objects.put_opts(&boundary, "3".into(), update(&first)).await,
+                Err(Error::Precondition { .. })), "a stale version is rejected");
+            objects.put_opts(&boundary, "3".into(), update(&second)).await.unwrap();
+        });
     }
 
     fn reads(objects: &SstGets) -> u64 {
@@ -968,7 +1055,7 @@ mod tests {
         let gets = sst_store();
         let objects: Arc<dyn ObjectStore> = gets.clone();
         let mirror = temporary("mirror");
-        let store = Store::open(objects.clone(), "mirror-test", Some(&mirror), true).unwrap();
+        let store = Store::open(objects.clone(), "mirror-test", Some(&mirror), true, true).unwrap();
         store.put(b"key", b"value").unwrap();
         store
             .runtime
@@ -992,7 +1079,7 @@ mod tests {
         );
         store.close().unwrap();
         drop(store);
-        let reopened = Store::open(objects, "mirror-test", Some(&mirror), false).unwrap();
+        let reopened = Store::open(objects, "mirror-test", Some(&mirror), false, true).unwrap();
         let opened = reads(&gets);
         let mut cursor = Cursor::new(Arc::new(reopened), None, None).unwrap();
         cursor.seek(Bytes::from_static(b"key")).unwrap();
@@ -1007,9 +1094,25 @@ mod tests {
     }
 
     #[test]
+    fn writes_without_a_wal_survive_flush_and_clean_reopen() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = Store::open(objects.clone(), "no-wal-test", None, true, false).unwrap();
+        store.put(b"a", b"A").unwrap();
+        store.flush().unwrap();
+        store.put(b"b", b"B").unwrap();
+        // Clean close flushes the memtable even without a WAL.
+        store.close().unwrap();
+        drop(store);
+        let reopened = Store::open(objects, "no-wal-test", None, false, false).unwrap();
+        assert_eq!(reopened.get(b"a").unwrap().unwrap().as_ref(), b"A");
+        assert_eq!(reopened.get(b"b").unwrap().unwrap().as_ref(), b"B");
+        reopened.close().unwrap();
+    }
+
+    #[test]
     fn a_baseline_batch_is_one_visible_write() {
         let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let store = Store::open(objects, "batch-test", None, true).unwrap();
+        let store = Store::open(objects, "batch-test", None, true, true).unwrap();
         store
             .put_all(vec![
                 (b"a".to_vec(), b"A".to_vec()),
@@ -1041,7 +1144,7 @@ mod tests {
     fn repeated_cursor_seeks_reuse_cached_blocks() {
         let gets = sst_store();
         let objects: Arc<dyn ObjectStore> = gets.clone();
-        let store = Store::open(objects.clone(), "cache-test", None, true).unwrap();
+        let store = Store::open(objects.clone(), "cache-test", None, true, true).unwrap();
         for key in 0..20_000u32 {
             store.put(&key.to_be_bytes(), &[7; 64]).unwrap();
         }
@@ -1053,7 +1156,7 @@ mod tests {
             .unwrap();
         store.close().unwrap();
         drop(store);
-        let store = Arc::new(Store::open(objects, "cache-test", None, false).unwrap());
+        let store = Arc::new(Store::open(objects, "cache-test", None, false, true).unwrap());
         let seek = |key: u32| {
             let mut cursor = Cursor::new(store.clone(), None, None).unwrap();
             cursor
@@ -1082,7 +1185,7 @@ mod tests {
         let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mirror = temporary("native");
         let store =
-            Arc::new(Store::open(objects.clone(), "native-test", Some(&mirror), true).unwrap());
+            Arc::new(Store::open(objects.clone(), "native-test", Some(&mirror), true, true).unwrap());
         for (key, value) in [
             (b"a".as_slice(), b"old".as_slice()),
             (b"b", b"B"),
@@ -1128,13 +1231,14 @@ mod tests {
             objects.clone(),
             "native-test",
             Some(&temporary("second")),
+            true,
             true
         )
         .is_err());
         store.flush().unwrap();
         store.close().unwrap();
         drop(store);
-        let reopened = Store::open(objects, "native-test", Some(&mirror), false).unwrap();
+        let reopened = Store::open(objects, "native-test", Some(&mirror), false, true).unwrap();
         assert_eq!(reopened.get(b"b").unwrap().unwrap().as_ref(), b"replaced");
         reopened.close().unwrap();
     }

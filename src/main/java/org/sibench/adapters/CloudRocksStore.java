@@ -8,7 +8,7 @@ import java.nio.file.Path;
 
 /**
  * rocksdb-cloud through the thin JNI binding in src/main/native/index/rocksdb_cloud: SST files and
- * the MANIFEST go to an S3-compatible bucket, the WAL and a copy of every SST file stay local.
+ * the MANIFEST go to an S3-compatible bucket, a copy of every SST file and the optional WAL stay local.
  * The native library is loaded from {@code sibench.rocksdb_cloud.library}, by default
  * {@code build/index/librocksdb_cloud_jni.so}.
  */
@@ -17,12 +17,14 @@ final class CloudRocksStore implements OrderedStore {
 
     private final long handle;
     private final String bucket, objectPath;
+    private final boolean wal;
     private boolean closed;
 
-    private CloudRocksStore(long handle, String bucket, String objectPath) {
+    private CloudRocksStore(long handle, String bucket, String objectPath, boolean wal) {
         this.handle = handle;
         this.bucket = bucket;
         this.objectPath = objectPath;
+        this.wal = wal;
     }
 
     private static synchronized void load() throws IOException {
@@ -39,20 +41,20 @@ final class CloudRocksStore implements OrderedStore {
     }
 
     /** A new database in the local directory {@code path} and at the store's object path. */
-    static CloudRocksStore create(Path path, ObjectStore store) throws IOException {
-        return open(path, store, true);
+    static CloudRocksStore create(Path path, ObjectStore store, boolean wal) throws IOException {
+        return open(path, store, true, wal);
     }
 
     /** The database at the store's object path, with or without its local directory. */
-    static CloudRocksStore open(Path path, ObjectStore store) throws IOException {
-        return open(path, store, false);
+    static CloudRocksStore open(Path path, ObjectStore store, boolean wal) throws IOException {
+        return open(path, store, false, wal);
     }
 
-    private static CloudRocksStore open(Path path, ObjectStore store, boolean create)
+    private static CloudRocksStore open(Path path, ObjectStore store, boolean create, boolean wal)
             throws IOException {
         load();
         long handle =
-                open(
+                openStore(
                         path.toString(),
                         store.bucket(),
                         store.objectPath(),
@@ -62,8 +64,9 @@ final class CloudRocksStore implements OrderedStore {
                         store.accessKey(),
                         store.secretKey(),
                         store.sessionToken(),
-                        create);
-        var opened = new CloudRocksStore(handle, store.bucket(), store.objectPath());
+                        create,
+                        wal);
+        var opened = new CloudRocksStore(handle, store.bucket(), store.objectPath(), wal);
         try {
             opened.objectRequests();
         } catch (IOException error) {
@@ -88,19 +91,28 @@ final class CloudRocksStore implements OrderedStore {
     }
 
     @Override
-    public String durability() {
-        return "acknowledged writes are in the memtable and the local WAL without fsync; internal persistence uploads SST files and MANIFEST to"
-                + " bucket "
-                + bucket
-                + " at "
-                + objectPath
-                + "; the WAL is not uploaded, so writes after the last persistence cycle are only local";
+    public boolean wal() {
+        return wal;
     }
 
     @Override
-    public void put(byte[] key, byte[] value, boolean wal) throws IOException {
+    public String durability() {
+        return (wal
+                        ? "acknowledged writes are in the memtable and the local WAL without fsync"
+                        : "acknowledged writes are only in the memtable (WAL disabled)")
+                + "; internal persistence flushes memtables and uploads SST files and MANIFEST to bucket "
+                + bucket
+                + " at "
+                + objectPath
+                + (wal
+                        ? "; the WAL is not uploaded, so writes after the last persistence cycle are only local"
+                        : "; a process failure loses writes after the last persistence cycle");
+    }
+
+    @Override
+    public void put(byte[] key, byte[] value) throws IOException {
         requireOpen();
-        put(handle, key, value, wal);
+        write(handle, key, value);
     }
 
     @Override
@@ -128,11 +140,6 @@ final class CloudRocksStore implements OrderedStore {
             @Override
             public void seekForPrev(byte[] key) {
                 CloudRocksStore.seekForPrev(cursor, key);
-            }
-
-            @Override
-            public void seekToLast() {
-                CloudRocksStore.seekToLast(cursor);
             }
 
             @Override
@@ -198,7 +205,8 @@ final class CloudRocksStore implements OrderedStore {
 
     private static native String version();
 
-    private static native long open(
+    // Renamed with the WAL setting, so a library built before it fails to link instead of misreading arguments.
+    private static native long openStore(
             String path,
             String bucket,
             String objectPath,
@@ -208,11 +216,11 @@ final class CloudRocksStore implements OrderedStore {
             String accessKey,
             String secretKey,
             String sessionToken,
-            boolean create)
+            boolean create,
+            boolean wal)
             throws IOException;
 
-    private static native void put(long handle, byte[] key, byte[] value, boolean wal)
-            throws IOException;
+    private static native void write(long handle, byte[] key, byte[] value) throws IOException;
 
     private static native void putAll(long handle, byte[][] keys, byte[][] values) throws IOException;
 
@@ -223,8 +231,6 @@ final class CloudRocksStore implements OrderedStore {
     private static native void seek(long cursor, byte[] key);
 
     private static native void seekForPrev(long cursor, byte[] key);
-
-    private static native void seekToLast(long cursor);
 
     private static native void next(long cursor);
 

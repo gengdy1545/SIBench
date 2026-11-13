@@ -16,6 +16,57 @@ import org.junit.Test;
 public class PixelsExperimentTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test public void externalQueriesAndFreshnessRequireFixedPortsButManagedAndDisabledQueriesDoNot() throws Exception {
+        var settings = org.sibench.config.ConfigValues.object(org.sibench.config.SibenchConfig.read(Path.of("config/sibench.yaml")), "pixels_experiment");
+        PixelsExperiment.requireQueryPorts(settings, Map.of());
+        for (String enabled : List.of("queries", "freshness")) {
+            var section = org.sibench.config.ConfigValues.object(settings, enabled);
+            section.put("enabled", true);
+            settings.put(enabled, section);
+            assertThrows(IllegalArgumentException.class, () -> PixelsExperiment.requireQueryPorts(settings, Map.of("properties", Map.of())));
+            var ports = Map.of("etcd.port", "18801", "metadata.server.port", "18802", "trans.server.port", "18803",
+                    "retina.server.port", "18804", "node.server.port", "18805", "query.schedule.server.port", "18806",
+                    "index.server.port", "18807", "scaling.metrics.server.port", "18808", "worker.coordinate.server.port", "18809");
+            PixelsExperiment.requireQueryPorts(settings, Map.of("properties", ports));
+            var trino = org.sibench.config.ConfigValues.object(settings, "trino");
+            trino.put("deployment_directory", "/opt/trino-deployment");
+            settings.put("trino", trino);
+            PixelsExperiment.requireQueryPorts(settings, Map.of());
+            trino.put("deployment_directory", "");
+            section.put("enabled", false);
+        }
+    }
+
+    @Test public void plainSqlRunsWithoutReferenceAnswersAndStillConsumesAllResults() throws Exception {
+        Path root = temporary.getRoot().toPath();
+        Path sql = Files.writeString(root.resolve("query.sql"), "SELECT 1");
+        assertNull(PixelsExperiment.answers(root, Map.of("updates", false), null));
+        assertNull(PixelsExperiment.answers(root, Map.of("updates", true), null));
+        var server = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        var statements = new java.util.ArrayList<String>();
+        server.createContext("/", request -> {
+            String body;
+            if (request.getRequestMethod().equals("POST")) {
+                String statement = new String(request.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                statements.add(statement);
+                body = statement.startsWith("EXPLAIN ") ? "{\"id\":\"plan\",\"data\":[[\"plan\"]]}" : "{\"id\":\"query\",\"data\":[[999],[1000]]}";
+            } else body = "{\"queryStats\":{}}";
+            byte[] bytes = body.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            request.sendResponseHeaders(200, bytes.length);
+            request.getResponseBody().write(bytes);
+            request.close();
+        });
+        server.start();
+        try {
+            PixelsExperiment.query(List.of(sql), Map.of("rounds", 1), Map.of("server", "http://127.0.0.1:" + server.getAddress().getPort(),
+                    "user", "test", "catalog", "pixels", "schema", "postgres", "timeout_seconds", 3), root, null);
+            assertEquals(List.of("EXPLAIN SELECT 1", "SELECT 1"), statements);
+            var record = JsonParser.parseString(Files.readString(root.resolve("queries/0-0-result.json"))).getAsJsonObject();
+            assertFalse(record.has("oracle"));
+            assertEquals(2, record.getAsJsonObject("result").get("rows").getAsInt());
+        } finally { server.stop(0); }
+    }
+
     @Test public void staticInputNeedsOnlyTheSealedBaselineAndStillRejectsTampering() throws Exception {
         Path root = temporary.getRoot().toPath();
         Path csv = Files.createDirectory(root.resolve("csv"));

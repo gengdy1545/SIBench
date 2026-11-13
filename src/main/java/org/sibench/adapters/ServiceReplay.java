@@ -30,8 +30,9 @@ public final class ServiceReplay {
             Path directory, ReplayConfig config, ServiceConfig service, Path report)
             throws IOException {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
-        var input = ReplayInput.prepare(directory, config);
+        // The declared value kinds come from the manifest; check them before decoding the workload.
         org.sibench.trace.TraceManifest.requireValue(directory,service.value());
+        var input = ReplayInput.prepare(directory, config);
         var preflight = input.preflight();
         String mode = service.value() == ValueKind.ROW_ID ? "rowid" : "locator";
         String binding = ReplayInput.binding(directory, config) + " mode=" + mode;
@@ -147,8 +148,9 @@ public final class ServiceReplay {
             Path directory, ReplayConfig config, ServiceConfig service, Path report)
             throws IOException {
         if (Files.exists(report)) throw new IOException("Verification report already exists: " + report);
-        var input = ReplayInput.prepare(directory, config);
+        // The declared value kinds come from the manifest; check them before decoding the workload.
         org.sibench.trace.TraceManifest.requireValue(directory,service.value());
+        var input = ReplayInput.prepare(directory, config);
         var preflight = input.preflight();
         String mode = service.value() == ValueKind.ROW_ID ? "rowid" : "locator";
         String binding = ReplayInput.binding(directory, config) + " mode=" + mode;
@@ -251,6 +253,8 @@ public final class ServiceReplay {
         manifest.put("value_kind", description.valueKind().name().toLowerCase(java.util.Locale.ROOT));
         manifest.put("backend", description.name());
         manifest.put("index_location", location);
+        manifest.put("write_ack", description.writeAck().name());
+        manifest.put("wal", description.wal());
         manifest.put("durability", description.durability());
         manifest.put(
                 "coverage",

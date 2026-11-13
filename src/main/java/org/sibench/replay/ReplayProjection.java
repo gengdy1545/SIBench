@@ -35,10 +35,6 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     private boolean failed;
     private long skippedWrites;
 
-    public ReplayProjection(boolean secondaryIndexes, IndexOperationTrace.Consumer target) {
-        this(new ReplayConfig(secondaryIndexes, 0, 0, 0, 0), false, target);
-    }
-
     public ReplayProjection(
             ReplayConfig config, boolean sourceTransactions, IndexOperationTrace.Consumer target) {
         this(config, sourceTransactions, ReplayTarget.immediate(target));
@@ -121,6 +117,8 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
             throw new IOException("Only mutations and searches are allowed inside a source group");
         if (sourceTransactions && IndexOperationTrace.isMutation(operation))
             validateMutation(operation);
+        else if (sourceTransactions && operation.kind() == IndexOperationTrace.INSERT)
+            throw new IOException("Workload write outside a committed source transaction");
         else if (operation.kind() != IndexOperationTrace.SEARCH
                 && (operation.transactionId() != 0 || operation.mutationOrdinal() != 0))
             throw new IOException("Unexpected source transaction metadata");

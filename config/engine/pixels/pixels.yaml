@@ -3,8 +3,8 @@
 # generate-pixels selects this engine independently of the native benchmark engine selection.
 # prepare-cdc verifies only this build's source PostgreSQL and sink artifacts, retaining baseline/row-CDC
 # input without reading target storage/properties, starting Pixels or contacting pixels_host. See docs/cdc-input.md.
-# Endpoints, run directories and semantic switches are assigned by the generator; the property
-# files below hold only overrides of the upstream defaults pinned by third_party/.
+# Hosts, run directories and semantic switches are assigned by the generator. The property files
+# hold upstream overrides, including optional fixed service ports for a dedicated external Trino.
 schema_version: 1
 purpose: engine
 engine: pixels

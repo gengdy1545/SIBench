@@ -48,7 +48,7 @@ public class HybenchTest {
             }
             assertEquals(1,number(db,"SELECT count(*) FROM transfer WHERE id=11 AND fresh_ts IS NOT NULL"));
             assertEquals(13,number(db,"SELECT count(*) FROM duckdb_indexes()"));
-            var catalog=Hybench.catalog(source());assertEquals(21,catalog.size());
+            var catalog=IndexCatalog.duckDbDefinitions(org.sibench.schema.SourceSchema.hybench(source()));assertEquals(21,catalog.size());
             var type=catalog.stream().filter(i->i.name().equals("idx_transfer_3")).findFirst().orElseThrow();
             assertEquals("varchar",type.type());assertFalse(type.encode("salary").equals(type.encode("salary ")));
             assertTrue(db.getAutoCommit());

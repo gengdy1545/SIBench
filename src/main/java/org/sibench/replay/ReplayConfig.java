@@ -20,9 +20,6 @@ public record ReplayConfig(
         int maxInFlight,
         long requestTimeoutSeconds,
         int baselineBatchOperations) {
-    /** Baseline Puts per WriteBatch RPC when unset; workload operations are always sent individually. */
-    public static final int DEFAULT_BASELINE_BATCH_OPERATIONS = 64;
-
     /** Unbatched baseline, for fixtures that do not exercise baseline batching. */
     public ReplayConfig(boolean secondaryIndexes, long durationSeconds, long plannedOperationsPerSecond,
             long warmupOperations, int reservePercent, String dispatchMode, int clientCount, int maxInFlight,
@@ -106,8 +103,11 @@ public record ReplayConfig(
                         "request_timeout_seconds",
                         "baseline_batch_operations",
                         "trace_budget"));
-        String dispatchMode =
-                replay.containsKey("dispatch_mode") ? string(replay, "dispatch_mode") : "operation";
+        // The runtime configuration owns every dispatch setting; an omitted key must not select a hidden default.
+        for (String key : Set.of("dispatch_mode", "client_count", "max_in_flight", "request_timeout_seconds",
+                "baseline_batch_operations"))
+            require(replay.containsKey(key), "Missing replay setting: " + key);
+        String dispatchMode = string(replay, "dispatch_mode");
         long seconds = 0, rate = 0, warmup = 0;
         int reserve = 0;
         if (replay.containsKey("trace_budget")) {
@@ -131,18 +131,10 @@ public record ReplayConfig(
                 warmup,
                 reserve,
                 dispatchMode,
-                replay.containsKey("client_count")
-                        ? Math.toIntExact(integer(replay, "client_count"))
-                        : 1,
-                replay.containsKey("max_in_flight")
-                        ? Math.toIntExact(integer(replay, "max_in_flight"))
-                        : 4096,
-                replay.containsKey("request_timeout_seconds")
-                        ? integer(replay, "request_timeout_seconds")
-                        : 60,
-                replay.containsKey("baseline_batch_operations")
-                        ? Math.toIntExact(integer(replay, "baseline_batch_operations"))
-                        : DEFAULT_BASELINE_BATCH_OPERATIONS);
+                Math.toIntExact(integer(replay, "client_count")),
+                Math.toIntExact(integer(replay, "max_in_flight")),
+                integer(replay, "request_timeout_seconds"),
+                Math.toIntExact(integer(replay, "baseline_batch_operations")));
     }
 
     public long requiredOperations() {

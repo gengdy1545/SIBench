@@ -35,6 +35,27 @@ public class TrinoQueriesTest {
         } finally { server.stop(0); }
     }
 
+    @Test public void interruptedQueriesStillCancelTheirServerContinuation() throws Exception {
+        var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String origin = "http://127.0.0.1:" + server.getAddress().getPort();
+        var cancelled = new AtomicBoolean();
+        server.createContext("/", request -> {
+            if (request.getRequestMethod().equals("DELETE")) cancelled.set(request.getRequestURI().getPath().equals("/page"));
+            byte[] bytes = ("{\"id\":\"q1\",\"nextUri\":\"" + origin + "/page\",\"data\":[[1]]}").getBytes(StandardCharsets.UTF_8);
+            request.sendResponseHeaders(200, bytes.length);request.getResponseBody().write(bytes);request.close();
+        });
+        server.start();
+        try {
+            var client = new TrinoQueries(URI.create(origin), "test", "pixels", "postgres", Duration.ofSeconds(3));
+            assertThrows(IllegalStateException.class, () -> client.execute("SELECT 1", row -> {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("caller stopped");
+            }));
+            assertTrue("The interrupt remains visible to the caller", Thread.interrupted());
+            assertTrue(cancelled.get());
+        } finally { server.stop(0); }
+    }
+
     @Test public void errorsAndForeignContinuationsCannotBecomeSuccessfulSamples() throws Exception {
         for (String response : List.of("{\"id\":\"q1\",\"error\":{\"message\":\"bad SQL\"}}",
                 "{\"id\":\"q1\",\"nextUri\":\"http://example.invalid/page\"}")) {

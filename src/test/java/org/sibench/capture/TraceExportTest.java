@@ -103,7 +103,7 @@ public class TraceExportTest {
 
     @Test public void baselineCannotIntroduceAnUnresolvedVersion() throws Exception {
         Path file = temporary.getRoot().toPath().resolve("invalid-baseline.pb.zst");
-        try (var writer = new ProtoTrace.Writer(file)) {
+        try (var writer = new ProtoTrace.Writer(file, true)) {
             assertTrue(assertThrows(IOException.class,
                     () -> writer.append(write(0, INSERT, 1, 0, IndexKey.ofInt(1), 1, 0, 0, 1)))
                     .getMessage().contains("Baseline"));

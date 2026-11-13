@@ -5,7 +5,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -67,20 +66,6 @@ final class NativeProcess {
                 process.destroyForcibly();
             }
         }
-    }
-
-    static List<String> java(Path classpathLibraries, Path sibenchJar, String... arguments) {
-        return java(classpathLibraries, sibenchJar, List.of(arguments));
-    }
-
-    static List<String> java(Path classpathLibraries, Path sibenchJar, List<String> arguments) {
-        var command = new ArrayList<String>();
-        command.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
-        command.add("-Xmx512m");
-        command.add("-cp");
-        command.add(classpathLibraries.toString() + "/*:" + sibenchJar);
-        command.addAll(arguments);
-        return command;
     }
 
     /** The jar (or class directory) that contains this code; native JVMs reuse it for the driver. */

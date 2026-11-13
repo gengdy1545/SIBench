@@ -92,10 +92,6 @@ public final class ProtoTrace {
                 "bytes", writer.bytesWritten(), "statistics", writer.statistics());
     }
 
-    public static IndexOperationTrace.Source source(Path file, String physical, String logical) {
-        return consumer -> read(file, physical, logical, consumer);
-    }
-
     public static final class Writer implements Closeable, IndexOperationTrace.Consumer {
         private final java.security.MessageDigest physical = org.sibench.config.Digests.digest();
         private final DataOutputStream output;
@@ -114,24 +110,17 @@ public final class ProtoTrace {
         private volatile long bytesWritten = Integer.BYTES;
         private final boolean secondaryIndexes;
         private final RequestBudget budget;
-        private long indexEntries, primaryEntries, effectiveRequests, uncompressedBytes;
+        private long primaryEntries, effectiveRequests, uncompressedBytes;
         private final Map<String, Long> requestTypes = new LinkedHashMap<>();
         private final Map<String, Long> controls = new LinkedHashMap<>();
         private final Map<String, Long> writeOrigins = new LinkedHashMap<>();
 
-        public Writer(Path file) throws IOException {
-            this(file, true);
+        /** A baseline or fixture stream: no request budget and no query filtering. */
+        public Writer(Path file, boolean secondaryIndexes) throws IOException {
+            this(file, secondaryIndexes, false, null);
         }
 
         /** Export filtering leaves source execution unchanged and keeps query groups indivisible. */
-        public Writer(Path file, boolean secondaryIndexes) throws IOException {
-            this(file, secondaryIndexes, null);
-        }
-
-        Writer(Path file, boolean secondaryIndexes, RequestBudget budget) throws IOException {
-            this(file, secondaryIndexes, false, budget);
-        }
-
         Writer(Path file, boolean secondaryIndexes, boolean exportQueries, RequestBudget budget) throws IOException {
             this.budget = budget;
             this.secondaryIndexes = secondaryIndexes;
@@ -214,7 +203,6 @@ public final class ProtoTrace {
             int operations = operationCount(record);
             effectiveRequests = Math.addExact(effectiveRequests, operations);
             if (budget != null) budget.record(operations);
-            indexEntries += operationCount(record);
             String type;
             if (request.hasPut() || request.hasDelete()) {
                 ByteString key = request.hasPut() ? request.getPut().getKey() : request.getDelete().getKey();
@@ -255,8 +243,8 @@ public final class ProtoTrace {
         public long lastCommittedVersion() { return projection.lastCommittedVersion(); }
         long bytesWritten() { return bytesWritten; }
         public Map<String, Object> statistics() {
-            return Map.of("index_entries", indexEntries, "effective_requests", effectiveRequests,
-                    "primary_entries", primaryEntries, "secondary_entries", indexEntries - primaryEntries,
+            return Map.of("effective_requests", effectiveRequests,
+                    "primary_entries", primaryEntries, "secondary_entries", effectiveRequests - primaryEntries,
                     "request_types", Map.copyOf(requestTypes), "transaction_markers", Map.copyOf(controls),
                     "write_origins", Map.copyOf(writeOrigins), "uncompressed_message_bytes", uncompressedBytes,
                     "source_projection", projection.statistics());

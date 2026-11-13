@@ -17,14 +17,14 @@ public final class ProtoTraceBenchmark {
             int rows = Integer.parseInt(args[2]), transactions = Integer.parseInt(args[3]);
             Files.createDirectory(directory);
             var files = new LinkedHashMap<String, Object>();
-            var baseline = new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"));
+            var baseline = new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"), true);
             try (baseline) {
                 for (int row = 1; row <= rows; row++) baseline.append(IndexOperationTrace.write(0,
                         IndexOperationTrace.INSERT, 1, 0, IndexKey.ofInt(row), 0, 0, 0, row)
                         .withWorkUnitId(1 + (row - 1) / IndexOperationTrace.BLOCK_RECORDS).withExpansion(0, 1));
             }
             files.put("baseline", ProtoTrace.file("baseline.pb.zst", baseline));
-            var workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"));
+            var workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"), true);
             try (workload) {
                 for (long version = 1; version <= transactions; version++) {
                     long event = version * 4, row = 1 + (version - 1) % rows;

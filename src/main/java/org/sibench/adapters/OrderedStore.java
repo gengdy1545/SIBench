@@ -17,14 +17,17 @@ interface OrderedStore extends AutoCloseable {
     /** Write acknowledgment and internal persistence levels. */
     String durability();
 
-    /** Durability reached by a successful incremental write, separate from query visibility. */
+    /** Whether every write, single or batched, is also recorded in the engine's WAL; fixed when the store opens. */
+    boolean wal();
+
+    /** Durability reached by a successful write, separate from query visibility. */
     default Acknowledgement writeAck() {
-        return Acknowledgement.ACK_WAL;
+        return wal() ? Acknowledgement.ACK_WAL : Acknowledgement.ACK_MEMORY;
     }
 
-    void put(byte[] key, byte[] value, boolean wal) throws IOException;
+    void put(byte[] key, byte[] value) throws IOException;
 
-    /** One native batch of ordinary writes; keys and values pair up, with the same WAL policy as individual writes. */
+    /** One native batch of ordinary writes; keys and values pair up, with the same WAL setting as individual writes. */
     void putAll(List<byte[]> keys, List<byte[]> values) throws IOException;
 
     /** The value of the exact key, or null. */
@@ -74,8 +77,6 @@ interface OrderedStore extends AutoCloseable {
         void seek(byte[] key);
 
         void seekForPrev(byte[] key);
-
-        void seekToLast();
 
         void next();
 

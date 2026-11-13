@@ -84,14 +84,19 @@ public final class HybenchQueries {
     }
 
     /**
-     * Comparable form: numbers to 5 significant digits (PostgreSQL and Trino sum and average REAL
-     * columns in different orders and precisions), timestamps without trailing fractional zeros, CHAR
-     * without its padding. Results with fewer than 5 matching digits are reported as different.
+     * Comparable form: integer-typed values exactly; other numbers to 5 significant digits (PostgreSQL
+     * and Trino sum and average REAL columns in different orders and precisions), timestamps without
+     * trailing fractional zeros, CHAR without its padding. Results with fewer than 5 matching digits
+     * are reported as different. Trino serializes integer types as JSON literals without a fraction or
+     * exponent and floating types always with one.
      */
     static JsonElement canonical(Object value) {
         if (value == null || value instanceof JsonNull) return JsonNull.INSTANCE;
-        if (value instanceof JsonPrimitive primitive) value = primitive.isNumber() ? primitive.getAsBigDecimal()
-                : primitive.isBoolean() ? primitive.getAsBoolean() : primitive.getAsString();
+        if (value instanceof JsonPrimitive primitive) value = !primitive.isNumber()
+                ? primitive.isBoolean() ? primitive.getAsBoolean() : primitive.getAsString()
+                : primitive.getAsString().matches("-?[0-9]+") ? primitive.getAsBigInteger() : primitive.getAsBigDecimal();
+        if (value instanceof Integer || value instanceof Long || value instanceof Short || value instanceof java.math.BigInteger)
+            return new JsonPrimitive(value.toString());
         if (value instanceof Number number) {
             var decimal = new BigDecimal(number.toString()).round(new MathContext(5)).stripTrailingZeros();
             return new JsonPrimitive(decimal.signum() == 0 ? "0" : decimal.toPlainString());
@@ -155,8 +160,8 @@ public final class HybenchQueries {
         var settings = org.sibench.config.SibenchConfig.cdcSource(root, runtime);
         var build = NativeBuildCheck.engineDirectory(root, settings, "pixels").toRealPath();
         var engine = PixelsBuild.verifySource(root, build);
-        // PostgreSQL COPY reads the table files itself, so their contents are verified before loading.
-        var csv = CsvInput.open(root.resolve(csvDirectory));
+        // PostgreSQL COPY reads the table files itself; their contents are verified after it has read them.
+        var csv = CsvInput.bind(root.resolve(csvDirectory));
         CsvInput.requireCompatible(csv, input);
         var directory = input.output();
         InputFiles.requireSeparate(directory, csv.directory());
@@ -167,6 +172,8 @@ public final class HybenchQueries {
                 ((Number) parameters.get("company_number")).longValue());
         java.nio.file.Files.createDirectories(directory.getParent());
         java.nio.file.Files.createDirectory(directory);
+        // A failed render must not be mistaken for a plain SQL directory without answers.
+        java.nio.file.Files.writeString(directory.resolve("INCOMPLETE"), "Query rendering pending\n", java.nio.file.StandardOpenOption.CREATE_NEW);
         var sourceSettings = org.sibench.config.SibenchConfig.postgresSettings(
                 org.sibench.config.ConfigValues.object(org.sibench.config.ConfigValues.object(settings, "source"), "settings"));
         try (var database = org.sibench.generation.PostgresDatabase.create(build.resolve("postgres/runtime"),
@@ -175,6 +182,8 @@ public final class HybenchQueries {
             try (var connection = database.connect("oracle")) {
                 Generation.requireRows(input.baselineRows(), Hybench.load(connection, input.source().source(),
                         csv.directory().resolve("native/Data_" + csv.manifest().get("sf").getAsString())));
+                if (!CsvInput.open(csv.directory()).sha256().equals(csv.sha256()))
+                    throw new IOException("CSV input changed while loading the answer database");
                 var applicants = values(connection, "SELECT DISTINCT applicantid FROM loantrans ORDER BY 1");
                 var random = new Random(seed);
                 int number = 0;
@@ -212,6 +221,7 @@ public final class HybenchQueries {
                     java.nio.file.StandardOpenOption.CREATE_NEW);
             // Published answers no longer need their working database.
             Generation.deleteTree(directory.resolve("database"));
+            java.nio.file.Files.delete(directory.resolve("INCOMPLETE"));
             return Map.of("status", "complete", "directory", directory.toString(), "queries", queries.size(),
                     "manifest_sha256", InputFiles.manifest(directory).sha256());
         }
@@ -219,6 +229,8 @@ public final class HybenchQueries {
 
     /** A rendered set binds every SQL file of its directory by digest; other directories are plain SQL lists. */
     static Rendered open(java.nio.file.Path directory) throws IOException {
+        if (java.nio.file.Files.exists(directory.resolve("INCOMPLETE"), java.nio.file.LinkOption.NOFOLLOW_LINKS))
+            throw new IOException("Query rendering did not complete: " + directory);
         if (!java.nio.file.Files.exists(directory.resolve("manifest.json"))) return null;
         var manifest = InputFiles.manifest(directory).document();
         try {

@@ -42,12 +42,16 @@ public record ObjectStore(
         return store;
     }
 
+    /** A key strictly below a profile prefix, at a path boundary even when the prefix lacks its slash. */
+    static boolean below(String path, String prefix) {
+        String scope = prefix.isEmpty() || prefix.endsWith("/") ? prefix : prefix + "/";
+        return path.startsWith(scope) && path.length() > scope.length();
+    }
+
     public static ObjectStore of(String profile, Map<String, Object> store, String objectPath) throws IOException {
         require(string(store, "kind").equals("s3"), "Only S3-compatible storage is supported");
         String prefix = string(store, "prefix");
-        require(
-                objectPath.startsWith(prefix) && objectPath.length() > prefix.length(),
-                "object_path must lie below the profile prefix " + prefix);
+        require(below(objectPath, prefix), "object_path must lie below the profile prefix " + prefix);
         String addressing = string(store, "addressing");
         require(
                 addressing.equals("virtual_hosted") || addressing.equals("path"),

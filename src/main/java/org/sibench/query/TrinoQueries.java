@@ -60,10 +60,15 @@ public final class TrinoQueries {
             if (!info.has("queryStats")) throw new IOException("Trino query metrics missing for " + id);
             return new Result(id, rows, seconds, stats, info.getAsJsonObject("queryStats"));
         } catch (Exception | Error failure) {
-            if (next != null) try {
-                http.send(request(next, System.nanoTime() + Duration.ofSeconds(5).toNanos()).DELETE().build(),
-                        HttpResponse.BodyHandlers.discarding());
-            } catch (Exception cancel) { failure.addSuppressed(cancel); }
+            if (next != null) {
+                // An interrupted caller still cancels the server query; the request has its own 5-second bound.
+                boolean interrupted = Thread.interrupted();
+                try {
+                    http.send(request(next, System.nanoTime() + Duration.ofSeconds(5).toNanos()).DELETE().build(),
+                            HttpResponse.BodyHandlers.discarding());
+                } catch (Exception cancel) { failure.addSuppressed(cancel); }
+                finally { if (interrupted) Thread.currentThread().interrupt(); }
+            }
             throw failure;
         }
     }

@@ -63,11 +63,11 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
         manifest.addProperty("source_directory","/missing/generation-checkout");
         Files.writeString(moved.resolve("manifest.json"),new com.google.gson.Gson().toJson(manifest));
         assertEquals("trace_integrity_and_supply_valid",ReplayInput.check(moved,REPLAY).get("status"));
-        var unsupported=new ServiceConfig("rocksdb",null,output.resolve("unsupported-index"),0,ValueKind.LOCATOR,null,false);
+        var unsupported=new ServiceConfig("rocksdb",null,output.resolve("unsupported-index"),0,ValueKind.LOCATOR,null,false,true);
         var failure=assertThrows(IOException.class,()->ServiceReplay.run(moved,REPLAY,unsupported,output.resolve("unsupported.json")));
         assertTrue(failure.getMessage(),failure.getMessage().contains("does not provide LOCATOR"));
         assertFalse(Files.exists(unsupported.path()));
-        var service=new ServiceConfig("rocksdb",null,output.resolve("index"),0,ValueKind.ROW_ID,null,false);
+        var service=new ServiceConfig("rocksdb",null,output.resolve("index"),0,ValueKind.ROW_ID,null,false,true);
         assertEquals("passed",ServiceReplay.run(moved,REPLAY,service,output.resolve("replay.json")).get("status"));
         var reference=org.sibench.replay.ReferenceReplay.run(moved,REPLAY,output.resolve("reference.json"));
         assertEquals("passed",reference.get("status"));
@@ -118,8 +118,8 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
                 Files.writeString(path,changed.toString());
                 assertThrows(IOException.class,()->ReplayInput.check(trace,REPLAY));
             }
-            var retired=manifest.deepCopy();retired.addProperty("output","full");
-            Files.writeString(path,retired.toString());
+            var unsupported=manifest.deepCopy();unsupported.addProperty("output","full");
+            Files.writeString(path,unsupported.toString());
             assertThrows(IOException.class,()->TraceManifest.read(trace));
         }finally {Files.writeString(path,original);}
         Path analysis=output.resolve("locality");org.sibench.analysis.UpdateLocality.run(trace,Path.of("config/sibench.yaml"),analysis);
@@ -135,7 +135,7 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
             sql(db,"CREATE TABLE sbtest1(id INTEGER PRIMARY KEY,k INTEGER NOT NULL,c VARCHAR NOT NULL,pad VARCHAR NOT NULL)");
             sql(db,"CREATE INDEX k_1 ON sbtest1(k)");sql(db,"INSERT INTO sbtest1 VALUES(10,1,'A',''),(20,1,'B',''),(30,2,'C','')");
             history(db,"sbtest1","id");
-            var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"),true);
+            var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"),true,false,null);
             db.setAutoCommit(false);trace.baseline(db,Map.of("sbtest1",3L));db.commit();db.setAutoCommit(true);
             logging(db);
             try(var worker=DuckDbHostDriver.open(socket,receipts);var older=DuckDbHostDriver.open(socket,receipts)) {
@@ -152,7 +152,7 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
             var sessions=DuckDbReceipts.load(db,files(receipts),output.resolve("receipts"));
             DuckDbStatements.bind(db,sessions);DuckDbReceipts.bind(db);DuckDbTransactions.bind(db,"data");
             DuckDbIdentities.bind(db);DuckDbAccesses.bind(db,IndexCatalog.duckDbDefinitions(source));DuckDbMutations.bind(db);
-            draft=trace.workload(db,Map.of("input","hand-controlled capture"));
+            try(trace){trace.append(db);draft=trace.finish(db,Map.of("input","hand-controlled capture"));}
             assertEquals(1L,draft.manifest().get("aborted_transactions"));
         }
         Path moved=publish(draft);
@@ -169,7 +169,7 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
             sql(db,"CREATE INDEX k_1 ON sbtest1(k)");
             sql(db,"INSERT INTO sbtest1 VALUES(10,1,'original','')");
             history(db,"sbtest1","id");
-            try(var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"),true)) {
+            try(var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"),true,false,null)) {
                 db.setAutoCommit(false);trace.baseline(db,Map.of("sbtest1",1L));db.commit();db.setAutoCommit(true);
                 long rawPrefix=0;
                 for(int window=0;window<2;window++) {

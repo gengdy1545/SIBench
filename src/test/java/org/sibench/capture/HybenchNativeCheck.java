@@ -135,7 +135,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
         try(var observer=connect()) {
             assertEquals(8706,Hybench.load(observer,source,output.resolve("Data_1x")).values().stream().mapToLong(Long::longValue).sum());
             observer.setAutoCommit(false);NativeHistory.initialize(observer, org.sibench.config.Engine.DUCKDB);
-            for(var index:Hybench.catalog(source))if(index.indexId()==0)
+            for(var index:IndexCatalog.duckDbDefinitions(org.sibench.schema.SourceSchema.hybench(source)))if(index.indexId()==0)
                 NativeHistory.install(observer, org.sibench.config.Engine.DUCKDB,index.tableId(),"main",index.table(),index.column());
             observer.commit();observer.setAutoCommit(true);
             Path raw=output.resolve("native.csv");
@@ -169,11 +169,11 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             var loaded=Hybench.load(observer,source,output.resolve("Data_1x"));
             assertEquals(8706,loaded.values().stream().mapToLong(Long::longValue).sum());
             Files.writeString(output.resolve("loaded.json"),new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(loaded));
-            var catalog=Hybench.catalog(source);
+            var catalog=IndexCatalog.duckDbDefinitions(org.sibench.schema.SourceSchema.hybench(source));
             observer.setAutoCommit(false);NativeHistory.initialize(observer, org.sibench.config.Engine.DUCKDB);
             for(var index:catalog)if(index.indexId()==0)NativeHistory.install(observer, org.sibench.config.Engine.DUCKDB,index.tableId(),"main",index.table(),index.column());
             observer.commit();observer.setAutoCommit(true);
-            var baseline=output.resolve("baseline.pb.zst");var baseWriter=new ProtoTrace.Writer(baseline);
+            var baseline=output.resolve("baseline.pb.zst");var baseWriter=new ProtoTrace.Writer(baseline, true);
             observer.setAutoCommit(false);
             try(baseWriter){assertEquals(loaded,NativeBaseline.write(observer,org.sibench.config.Engine.DUCKDB,catalog,baseWriter));}
             observer.commit();observer.setAutoCommit(true);
@@ -209,7 +209,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
                 if(row.key()!=null)assertTrue(ids.add(DuckDbIdentities.observedRow(observer,row.table(),row.key(),
                         row.read(),row.local(),row.query())));
             }
-            var trace=output.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(trace);
+            var trace=output.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(trace, true);
             try(writer){DuckDbProjection.write(observer,true,writer);}
             long[] ids={0},searches={0},matched={0};
             try(var backend=VersionedIndexBackend.create(output.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {

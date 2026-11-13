@@ -59,7 +59,7 @@ public class UpdateLocalityTest {
 
     private IndexOperationTrace.Source export(List<Operation> operations) throws Exception {
         Path file = temporary.newFolder().toPath().resolve("workload.pb.zst");
-        try (var writer = new ProtoTrace.Writer(file)) {
+        try (var writer = new ProtoTrace.Writer(file, true)) {
             for (var operation : operations) writer.append(operation);
         }
         return consumer -> ProtoTrace.read(file, null, null, consumer);

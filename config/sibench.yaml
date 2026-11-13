@@ -30,7 +30,8 @@ engines:
   postgres: config/engine/postgres.yaml
   rocksdb: config/engine/rocksdb.yaml
   pixels: config/engine/pixels/pixels.yaml
-# pixels-experiment CONFIG INPUT_DIRECTORY OUTPUT_DIRECTORY; independent of prepare-cdc.
+# pixels-experiment CONFIG [CDC_INPUT_DIRECTORY] PIXELS_BASELINE_DIRECTORY OUTPUT_DIRECTORY; independent of prepare-cdc.
+# With updates: false, omit the CDC input directory.
 pixels_experiment:
   trace: false
   updates: true
@@ -47,9 +48,9 @@ pixels_experiment:
     column: fresh_ts
     sample_seconds: 5
   trino:
-    # Empty uses an existing cluster. A verified build on pixels_host starts a run-scoped node.
+    # Set server for a dedicated external cluster with fixed Pixels service ports, or deployment_directory for a managed node.
+    server: ""
     deployment_directory: ""
-    server: http://127.0.0.1:8080
     user: sibench
     catalog: pixels
     schema: postgres

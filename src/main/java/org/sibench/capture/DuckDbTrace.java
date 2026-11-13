@@ -36,10 +36,6 @@ public final class DuckDbTrace implements AutoCloseable {
     long lastVersion() { return commits+aborts; }
 
 
-    public DuckDbTrace(Mode mode,SourceSchema source,Path directory,boolean secondaryIndexes)throws IOException {
-        this(mode,source,directory,secondaryIndexes,false,null);
-    }
-
     DuckDbTrace(Mode mode,SourceSchema source,Path directory,boolean secondaryIndexes,boolean exportQueries,RequestBudget budget)throws IOException {
         if(mode!=Mode.CAPTURE || source.benchmark().equals("ycsb"))
             throw new IllegalArgumentException("Unsupported native benchmark mode");
@@ -129,10 +125,6 @@ public final class DuckDbTrace implements AutoCloseable {
         manifest.put("source_evidence",Map.copyOf(evidence));
         finished=true;
         return new Draft(directory,manifest);
-    }
-
-    public Draft workload(Connection database,Map<String,Object> evidence)throws SQLException,IOException {
-        try(this) { append(database);return finish(database,evidence); }
     }
 
     @Override public void close()throws IOException {

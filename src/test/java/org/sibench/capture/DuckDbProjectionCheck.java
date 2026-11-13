@@ -33,7 +33,7 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
             long id10=number(db,"SELECT _sib_row_id FROM sibench_history.identities_1 WHERE id=10");
             long id20=number(db,"SELECT _sib_row_id FROM sibench_history.identities_1 WHERE id=20");
             long id30=number(db,"SELECT _sib_row_id FROM sibench_history.identities_1 WHERE id=30");
-            var baseline=root.resolve("baseline.pb.zst");var baseWriter=new ProtoTrace.Writer(baseline);
+            var baseline=root.resolve("baseline.pb.zst");var baseWriter=new ProtoTrace.Writer(baseline, true);
             db.setAutoCommit(false);
             try(baseWriter){assertEquals(java.util.Map.of("items",3L),NativeBaseline.write(db,org.sibench.config.Engine.DUCKDB,CATALOG,baseWriter));}
             assertEquals(6,baseWriter.count());db.commit();db.setAutoCommit(true);
@@ -76,7 +76,7 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
                 }
             }
             assertEquals(7,expected.size());
-            var workload=root.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(workload);
+            var workload=root.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(workload, true);
             try(writer){assertEquals(30,DuckDbProjection.write(db,true,writer));}
             try(var backend=VersionedIndexBackend.create(root.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {
                 long[] requests={0},searches={0};
@@ -142,7 +142,7 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
             assertEquals(1,number(db,"SELECT count(*) FROM sibench_changes"));
             assertEquals(1,number(db,"SELECT count(*) FROM sibench_source_mutations WHERE statement_outcome='failed' AND event='complete'"));
             assertEquals(2,number(db,"SELECT count(*) FROM items"));
-            var trace=root.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(trace);
+            var trace=root.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(trace, true);
             try(writer){assertEquals(5,DuckDbProjection.write(db,true,writer));}
             assertEquals(0, ProtoTrace.read(trace,writer.sha256(),writer.logicalSha256(), ignored -> fail("Aborted transaction leaked")));
         }

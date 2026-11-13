@@ -16,11 +16,11 @@ public class ServiceReplayTest {
 
     @Test public void deploymentDescriptionRejectsWrongValueModeAndMissingEvidence() throws Exception {
         var description = new IndexDescription("fixture",ValueKind.ROW_ID,
-                Acknowledgement.ACK_MEMORY,"async persistence","fixture");
+                Acknowledgement.ACK_MEMORY,false,"async persistence","fixture");
         description.require(ValueKind.ROW_ID);
         assertThrows(IOException.class, () -> description.require(ValueKind.LOCATOR));
         assertThrows(IOException.class, () -> new IndexDescription("fixture",ValueKind.ROW_ID,
-                null,"async persistence","fixture").require(ValueKind.ROW_ID));
+                null,false,"async persistence","fixture").require(ValueKind.ROW_ID));
         assertThrows(IOException.class, () -> description.require(null));
         var json = new com.google.gson.Gson();
         assertEquals(description, json.fromJson(json.toJson(description), IndexDescription.class));
@@ -38,7 +38,7 @@ public class ServiceReplayTest {
         Path root = temporary.getRoot().toPath();
         Path index = root.resolve("index");
         Path report = root.resolve("report.json");
-        var service = new ServiceConfig("rocksdb", null, index, 0, ValueKind.ROW_ID, null, false);
+        var service = new ServiceConfig("rocksdb", null, index, 0, ValueKind.ROW_ID, null, false, true);
         var error = assertThrows(IOException.class, () -> ServiceReplay.run(
                 root.resolve("missing-trace"), new ReplayConfig(true, 0, 0, 0, 0), service, report));
         assertTrue(error.getMessage().contains("Incomplete Trace"));

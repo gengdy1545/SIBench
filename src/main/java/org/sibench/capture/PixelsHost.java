@@ -289,9 +289,9 @@ public final class PixelsHost {
             storageUri = null;
             retainData = false;
             String address = socket.getLocalAddress().getHostAddress();
-            var ports = new LinkedHashMap<String, Integer>();
-            for (String port : List.of("etcd", "etcd_peer", "metadata", "trans", "retina", "node", "query", "index", "scaling", "worker"))
-                ports.put(port, freePort(address));
+            Map<String, String> overlay = new LinkedHashMap<>();
+            for (var entry : request.getAsJsonObject("overlay").entrySet()) overlay.put(entry.getKey(), entry.getValue().getAsString());
+            var ports = ports(address, overlay);
             Path home = Files.createDirectories(run.resolve("home/etc"));
             Files.createSymbolicLink(run.resolve("home/lib"), build.resolve("home/lib"));
             Files.writeString(home.resolve("retina"), address + "\n");
@@ -321,9 +321,7 @@ public final class PixelsHost {
             generated.put("query.schedule.server.host", address);
             generated.put("worker.coordinate.server.host", address);
             generated.put("scaling.metrics.server.host", address);
-            for (var port : Map.of("metadata.server.port", "metadata", "trans.server.port", "trans", "retina.server.port", "retina",
-                    "node.server.port", "node", "query.schedule.server.port", "query", "index.server.port", "index",
-                    "scaling.metrics.server.port", "scaling", "worker.coordinate.server.port", "worker", "etcd.port", "etcd").entrySet())
+            for (var port : PixelsConfig.SERVICE_PORTS.entrySet())
                 generated.put(port.getKey(), Integer.toString(ports.get(port.getValue())));
             generated.put("etcd.hosts", address);
             generated.put("retina.enable", "true");
@@ -340,8 +338,6 @@ public final class PixelsHost {
                     "retina.recovery.checkpoint.dir", "recovery", "retina.storage.gc.journal.dir", "gc-journal").entrySet())
                 generated.put(folder.getKey(), storageUri == null ? "file://" + run.resolve(folder.getValue()) + "/"
                         : storageUri + folder.getValue() + "/");
-            Map<String, String> overlay = new LinkedHashMap<>();
-            for (var entry : request.getAsJsonObject("overlay").entrySet()) overlay.put(entry.getKey(), entry.getValue().getAsString());
             config = home.resolve("pixels.properties");
             Files.writeString(config, properties(Files.readString(build.resolve("defaults/pixels.properties")), overlay, generated),
                     StandardOpenOption.CREATE_NEW);
@@ -616,6 +612,25 @@ public final class PixelsHost {
         if (!unknown.isEmpty()) throw new IllegalArgumentException("Unknown Pixels properties: " + unknown.keySet());
         pending.forEach((key, value) -> text.append(key).append('=').append(value).append('\n'));
         return text.toString();
+    }
+
+    static Map<String, Integer> ports(String address, Map<String, String> overrides) throws IOException {
+        PixelsConfig.pixelsProperties(overrides);
+        var ports = new LinkedHashMap<String, Integer>();
+        for (var entry : PixelsConfig.SERVICE_PORTS.entrySet()) if (overrides.containsKey(entry.getKey())) {
+            int port = Integer.parseInt(overrides.get(entry.getKey()));
+            try (var probe = new ServerSocket(port, 1, InetAddress.getByName(address))) {
+                ports.put(entry.getValue(), port);
+            }
+        }
+        var services = new ArrayList<>(PixelsConfig.SERVICE_PORTS.values());
+        services.add("etcd_peer");
+        for (String service : services) if (!ports.containsKey(service)) {
+            int port;
+            do { port = freePort(address); } while (ports.containsValue(port));
+            ports.put(service, port);
+        }
+        return ports;
     }
 
     private static int freePort(String address) throws IOException {

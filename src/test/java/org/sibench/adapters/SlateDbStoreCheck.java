@@ -28,21 +28,21 @@ public class SlateDbStoreCheck {
         ObjectStore objects = ObjectStore.of(Path.of(required("sibench.slatedb.storage")),
                 required("sibench.slatedb.profile"), required("sibench.slatedb.object_path"));
         Path local = temporary.getRoot().toPath().resolve("index");
-        try (var store = SlateDbStore.create(local, objects)) {
-            store.put(bytes("a"), bytes("A"), true);
-            store.put(bytes("b"), bytes("B"), true);
-            store.put(bytes("d"), bytes("D"), true);
+        try (var store = SlateDbStore.create(local, objects, false)) {
+            store.put(bytes("a"), bytes("A"));
+            store.put(bytes("b"), bytes("B"));
+            store.put(bytes("d"), bytes("D"));
             assertArrayEquals(bytes("A"), store.get(bytes("a")));
             assertNull(store.get(bytes("absent")));
             try (var cursor = store.cursor(bytes("b"), bytes("e"))) {
-                store.put(bytes("b"), bytes("replacement"), true);
+                store.put(bytes("b"), bytes("replacement"));
                 cursor.seek(bytes("a"));
                 assertTrue(cursor.valid());
                 assertArrayEquals(bytes("b"), cursor.key());
                 assertArrayEquals(bytes("B"), cursor.value());
                 cursor.next(); assertTrue(cursor.valid()); assertArrayEquals(bytes("d"), cursor.key());
                 cursor.next(); assertFalse(cursor.valid());
-                cursor.seekToLast(); assertTrue(cursor.valid()); assertArrayEquals(bytes("d"), cursor.key());
+                cursor.seekForPrev(bytes("z")); assertTrue(cursor.valid()); assertArrayEquals(bytes("d"), cursor.key());
                 cursor.prev(); assertTrue(cursor.valid()); assertArrayEquals(bytes("b"), cursor.key());
                 cursor.prev(); assertFalse(cursor.valid());
                 cursor.seekForPrev(bytes("c")); assertTrue(cursor.valid()); assertArrayEquals(bytes("b"), cursor.key());
@@ -53,11 +53,11 @@ public class SlateDbStoreCheck {
             long[] writes = store.objectRequests().get("write");
             assertTrue("Remote uploads and their bytes are counted", writes[0] > 0 && writes[2] > 0);
         }
-        assertThrows(IOException.class, () -> SlateDbStore.create(local, objects));
-        try (var reopened = SlateDbStore.open(local, objects)) {
+        assertThrows(IOException.class, () -> SlateDbStore.create(local, objects, false));
+        try (var reopened = SlateDbStore.open(local, objects, false)) {
             assertArrayEquals(bytes("replacement"), reopened.get(bytes("b")));
         }
         // Refuse a second creator even when it uses a different local diagnostic directory.
-        assertThrows(IOException.class, () -> SlateDbStore.create(temporary.getRoot().toPath().resolve("other"), objects));
+        assertThrows(IOException.class, () -> SlateDbStore.create(temporary.getRoot().toPath().resolve("other"), objects, false));
     }
 }

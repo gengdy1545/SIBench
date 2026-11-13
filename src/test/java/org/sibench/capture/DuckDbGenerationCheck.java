@@ -119,7 +119,7 @@ public class DuckDbGenerationCheck {
             assertFalse(manifest.has("native_data"));
             assertFalse(Files.exists(directory.resolve("data")));
             try(var windows=Files.walk(directory.resolve("workload"))){assertTrue(windows.noneMatch(p->p.endsWith("native.csv")));}
-            var service=new ServiceConfig("rocksdb",null,directory.resolve("index"),0,ValueKind.ROW_ID,null,false);
+            var service=new ServiceConfig("rocksdb",null,directory.resolve("index"),0,ValueKind.ROW_ID,null,false,true);
             assertEquals("passed",ServiceReplay.run(trace,replay,service,directory.resolve("replay.json")).get("status"));
             assertEquals("passed",org.sibench.replay.ReferenceReplay.run(trace,replay,
                     directory.resolve("reference.json")).get("status"));

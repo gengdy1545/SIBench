@@ -67,6 +67,25 @@ public class InputStoreTest {
         }
     }
 
+    @Test public void inventoryFilesOutsideTheInputManifestAreRejected() throws Exception {
+        var input = CsvInputTest.fixture(temporary.newFolder("source").toPath());
+        try (var store = store()) {
+            var receipt = store.publish(input.output());
+            var inventory = com.google.gson.JsonParser.parseString(new String(objects.get("inputs/manifests/"
+                    + receipt.get("manifest_sha256") + ".json"), java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();
+            var extra = inventory.getAsJsonArray("files").get(0).getAsJsonObject().deepCopy();
+            extra.addProperty("path", "unbound/extra.bin");
+            inventory.getAsJsonArray("files").add(extra);
+            byte[] bytes = inventory.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            String identity = java.util.HexFormat.of().formatHex(org.sibench.config.Digests.digest().digest(bytes));
+            objects.put("inputs/manifests/" + identity + ".json", bytes);
+            Path destination = temporary.getRoot().toPath().resolve("unbound");
+            assertTrue(assertThrows(java.io.IOException.class, () -> store.fetch(identity, destination))
+                    .getMessage().contains("binds"));
+            assertFalse(Files.exists(destination.resolve("manifest.json")));
+        }
+    }
+
     @Test public void traversalIsRejectedBeforeCreatingAnyOutput() throws Exception {
         var entry = new com.google.gson.JsonObject();
         entry.addProperty("path", "../outside");entry.addProperty("bytes", 0);entry.addProperty("sha256", "0".repeat(64));

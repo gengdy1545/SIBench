@@ -93,8 +93,10 @@ final class PostgresCapture implements AutoCloseable {
                     if(chunk!=null)throw new IOException("PG source ended inside a transaction");
                     stream.finish();transactions.endStream(pid);
                     session.sha256=HexFormat.of().formatHex(digest.digest());
+                    // The backend may leave pg_stat_activity as soon as it reads the ACK; publish completion first.
+                    session.ended.complete(null);
                     var ack=ByteBuffer.wrap(new byte[]{'E'});while(ack.hasRemaining())socket.write(ack);
-                    session.ended.complete(null);return;
+                    return;
                 }
                 if(chunk==null)chunk=transactions.begin(pid);
                 chunk.append(line,event,encoded.length);

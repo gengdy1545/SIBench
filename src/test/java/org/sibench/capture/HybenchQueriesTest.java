@@ -54,12 +54,21 @@ public class HybenchQueriesTest {
                 row(java.sql.Timestamp.valueOf("2023-11-02 08:30:00.25"), 0.333333f, 8, null));
         var expected = HybenchQueries.expected(postgres, null);
         var trino = List.of(json("[\"2023-11-02 08:30:00.250\", 0.33333334, 8, null]"),
-                json("[\"2023-11-01 10:00:00.000\", 2400, 7, \"acme\"]"));
+                json("[\"2023-11-01 10:00:00.000\", 2400.0, 7, \"acme\"]"));
         assertNull(HybenchQueries.difference(expected, trino, null));
         assertNotNull(HybenchQueries.difference(expected, List.of(trino.get(0)), null));
         assertNotNull(HybenchQueries.difference(expected, List.of(trino.get(0), trino.get(1), trino.get(1)), null));
         assertNotNull(HybenchQueries.difference(expected, List.of(trino.get(0), json("[\"2023-11-01 10:00:00.000\", 2401, 7, \"acme\"]")), null));
         assertNotNull(HybenchQueries.difference(expected, List.of(trino.get(0), json("[\"2023-11-01 10:00:00.000\", 2400, 9, \"acme\"]")), null));
+    }
+
+    @Test public void integerTypesCompareExactlyWhileFloatingSumsKeepFiveDigits() {
+        // Trino 466 writes integer types without a fraction and REAL/DOUBLE with one (Jackson writeNumber).
+        var expected = HybenchQueries.expected(List.of(row(1234567, 1234567L, 1234567.0f)), null);
+        assertNull(HybenchQueries.difference(expected, List.of(json("[1234567, 1234567, 1234567.1]")), null));
+        assertNotNull(HybenchQueries.difference(expected, List.of(json("[1234649, 1234567, 1234567.1]")), null));
+        assertNotNull(HybenchQueries.difference(expected, List.of(json("[1234567, 1234649, 1234567.1]")), null));
+        assertNotNull(HybenchQueries.difference(expected, List.of(json("[1234567, 1234567, 1234749.0]")), null));
     }
 
     @Test public void limitedOrderingComparesKeysSoTiesMayChooseDifferentRows() {
@@ -91,5 +100,9 @@ public class HybenchQueriesTest {
         Files.writeString(directory.resolve("001-IQ-3-0.sql"), "select 3\n");
         assertThrows(IOException.class, () -> HybenchQueries.open(directory));
         assertNull(HybenchQueries.open(temporary.newFolder("plain").toPath()));
+        Path failed = temporary.newFolder("failed-render").toPath();
+        Files.writeString(failed.resolve("001-IQ-3-0.sql"), "select 1\n");
+        Files.writeString(failed.resolve("INCOMPLETE"), "Query rendering pending\n");
+        assertThrows(IOException.class, () -> HybenchQueries.open(failed));
     }
 }

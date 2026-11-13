@@ -63,7 +63,7 @@ final class PixelsTrace implements AutoCloseable {
         Files.createDirectory(directory);
         Files.writeString(directory.resolve("INCOMPLETE"), "Native generation/publication pending\n", StandardOpenOption.CREATE_NEW);
         baseline = new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"), false);
-        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"), false, budget);
+        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"), false, false, budget);
         units = WorkUnits.create(directory);
         manifest.put("output", "proto");
         manifest.put("value_kinds", List.of("row_id", "locator"));

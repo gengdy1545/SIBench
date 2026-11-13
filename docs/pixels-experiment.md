@@ -25,7 +25,7 @@ java -jar build/sibench/sibench.jar pixels-experiment config/sibench.yaml \
   results/capture/hybench results/inputs/hybench-pixels results/pixels/run
 ```
 
-For static queries, set `pixels_experiment.updates: false` and `queries.enabled: true` with a rendered SQL directory, then omit CDC:
+For static queries, set `pixels_experiment.updates: false`, `queries.enabled: true` with a rendered SQL directory and a [Trino deployment](#trino-deployment), then omit CDC:
 
 ```bash
 java -jar build/sibench/sibench.jar pixels-experiment config/sibench.yaml \
@@ -56,7 +56,7 @@ Current integration uses one Retina/index server and ordered baseline files. The
 
 ## Modes and configuration
 
-The `pixels_experiment` block in [the runtime configuration](../config/sibench.yaml) owns experiment switches. Engine resources and the Pixels host remain in [the Pixels engine configuration](../config/engine/pixels/pixels.yaml).
+The required `pixels_experiment` block in [the runtime configuration](../config/sibench.yaml) owns experiment switches. Engine resources and the Pixels host remain in [the Pixels engine configuration](../config/engine/pixels/pixels.yaml).
 
 | Workflow | updates | trace | queries.enabled | freshness.enabled |
 | --- | --- | --- | --- | --- |
@@ -71,7 +71,7 @@ The `pixels_experiment` block in [the runtime configuration](../config/sibench.y
 
 Trace preparation rejects business queries and freshness. Static experiments reject an update prefix or freshness. `max_transactions: 0` consumes the complete input once; a positive value selects that many complete source transactions, including any marker transactions within the prefix. It must fit the published input count. File replay does not loop and does not use the benchmark profile's Index Trace request budget.
 
-The baseline manifest and local schema/DDL are checked before target startup. Update experiments also check the CDC manifest, common CSV/schema bindings, complete CDC transactions and hashes. Pixels creates new physical table/index IDs; the sink converter resolves source database/table names against that metadata and never routes by capture-local frame IDs. Imported footers and the primary-key scan independently check row counts. Trace-enabled runs capture index reconstruction as their baseline, then the actual CDC index calls; they never splice a baseline from another physical run.
+The baseline manifest and local schema/DDL are checked before target startup. Update experiments also check the CDC manifest, common CSV/schema bindings, complete CDC transactions and the hashes of every CDC file. They do not read the CDC input's retained CSV copies, so those copies are checked by descriptor and size only; `check-cdc-input`, `fetch-input` and preparation still hash them in full. Pixels creates new physical table/index IDs; the sink converter resolves source database/table names against that metadata and never routes by capture-local frame IDs. Imported footers and the primary-key scan independently check row counts. Trace-enabled runs capture index reconstruction as their baseline, then the actual CDC index calls; they never splice a baseline from another physical run.
 
 With Trace disabled, Pixels uses its RocksDB index provider and creates no tracer channel, projector or Trace directory. The file sink still reports every native transaction begin and successful commit, propagates failures, verifies applied transaction/change totals, drains and closes normally. With Trace enabled, the existing tracer barriers bind index calls to the actual Pixels versions, RowIDs and physical locations. Two executions need not allocate identical physical IDs.
 
@@ -81,15 +81,17 @@ With Trace disabled, Pixels uses its RocksDB index provider and creates no trace
 
 Queries default off. `queries.directory` names ready-to-run UTF-8 `.sql` files, sorted by filename; `rounds` is a positive finite count. Each file contains one statement with parameters already resolved. SIBench issues `EXPLAIN`, then executes the statement, consumes every result page and rejects SQL/HTTP errors and timeouts. It does not retry business statements automatically. Outstanding query continuations are cancelled on client failure where possible.
 
+Ordinary SQL directories require no reference answers and do not export or compare result values; their result records contain completion and performance metrics. Reference-answer comparison is limited to the explicitly prepared query sets below. For separate measurements, leave `queries.enabled: false` in application throughput/freshness experiments and `freshness.enabled: false` in SQL performance experiments. Both workflows can use the same dedicated Trino cluster in successive runs.
+
 Each result records the exact SQL, its input digest, source filename/round, Query ID, fully consumed output-row count, client elapsed time, StatementStats and the server's full QueryStats. Plans have their own Query IDs. Elapsed query time ends after the last result page and excludes the subsequent metrics request. `processedBytes` must not be reported as physical Scan I/O; use the appropriate server/connector counters and retain their names and scope. A query during updates may observe a different read snapshot from its separate EXPLAIN request.
 
 ### Rendered HyBench queries with recorded answers
 
 `render-queries CONFIG CSV_INPUT_DIRECTORY FRESH_OUTPUT_DIRECTORY SEED INSTANCES` renders HyBench IQ-1–IQ-5, AP-1–AP-7 and AP-13 from the verified client build's `conf/stmt_postgres.toml`. Each template gets `INSTANCES` parameter draws from HyBench's own domains (customers 1…`customer_number`, companies after them, loan applicants present in the CSV), seeded by `SEED`. HyBench's blocked-account sampling and random-row helper queries are not reproduced. Each statement is written with literal parameters, so PostgreSQL and Trino execute identical text.
 
-The command verifies the sealed CSV and loads it into a fresh, uninstrumented PostgreSQL from the source-only Pixels build. It records each statement's answer there, publishes `manifest.json` last and deletes the database. The manifest binds the CSV identity, template digest, seed, client and PostgreSQL build, and every SQL file by size and digest. Set `queries.directory` to the output. A rendered set requires `updates: false` and a baseline from the same CSV; unlisted, missing or changed SQL files are rejected before any service starts.
+The command verifies the sealed CSV and loads it into a fresh, uninstrumented PostgreSQL from the source-only Pixels build. It records each statement's answer there, publishes `manifest.json` last, deletes the database and only then removes its `INCOMPLETE` marker; a directory that still has the marker is rejected rather than run as plain SQL. The manifest binds the CSV identity, template digest, seed, client and PostgreSQL build, and every SQL file by size and digest. Set `queries.directory` to the output. A rendered set requires `updates: false` and a baseline from the same CSV; unlisted, missing or changed SQL files are rejected before any service starts.
 
-After each Trino execution the experiment compares the consumed rows with the recorded answer and fails on the first difference; the result file records `oracle: matched`. Rows are compared as a multiset. For `ORDER BY … LIMIT` statements only the ordered sort-key values are compared, because tied rows may legitimately differ. Values compare as numbers to five significant digits (the engines sum and average `real` columns in different orders and precisions), timestamps without trailing fractional zeros, and `CHAR` without padding.
+After each Trino execution the experiment compares the consumed rows with the recorded answer and fails on the first difference; the result file records `oracle: matched`. Rows are compared as a multiset. For `ORDER BY … LIMIT` statements only the ordered sort-key values are compared, because tied rows may legitimately differ. Integer-typed values compare exactly; other numbers compare to five significant digits (the engines sum and average `real` columns in different orders and precisions). Timestamps compare without trailing fractional zeros and `CHAR` without padding.
 
 Excluded templates: IQ-6, AP-8 and AP-10 (a `LIMIT` inside a subquery chooses among ties), AP-9 and AP-10 (PostgreSQL casts and date arithmetic would need translation), AP-11 (its answer can list every investing customer and company) and AP-12 (`100.0` makes the rate a PostgreSQL `numeric` but a one-decimal Trino `DECIMAL`).
 
@@ -125,6 +127,26 @@ python3 scripts/install_trino.py CONNECTOR_BUILD SERVER_TAR_GZ CENTRAL_SHA1_FILE
 
 The installer verifies inputs, installs only the required connector, copies the JDK and publishes file hashes in `deployment.json`. Keep the archive, checksum and matching build receipt for regeneration. The Java runtime requires a valid trust store.
 
-Set `trino.deployment_directory` to that absolute destination **on the Pixels host**. SIBench starts one coordinator that also acts as a worker for each experiment, using that run's Pixels properties, then stops its Java process with the session. COS files can be shared with a separate worker, which still needs the exact metadata/Retina endpoints, credentials and a separately validated deployment. Empty `deployment_directory` uses `trino.server`; that external cluster must already be configured for the exact target metadata and storage of the run.
+For a managed node, set `trino.deployment_directory` to that absolute destination **on the Pixels host** and leave `trino.server` empty. SIBench starts one coordinator that also acts as a worker for each experiment, using that run's Pixels properties, then stops its Java process with the session.
 
-Resource settings are explicit: JVM heap, per-query user memory, total query memory, heap headroom and CPU/worker-thread count. Query total memory plus heap headroom must fit the heap. Set these values for the execution host; leave enough memory for Pixels/native allocations, other processes and the OS. Cloud-function execution is disabled. Managed setup verifies an active node and a successful Pixels marker-table scan before business queries.
+For an existing dedicated cluster, set `trino.server` to its fixed HTTP(S) coordinator origin and leave `trino.deployment_directory` empty. SIBench sends SQL and freshness requests to that cluster without starting, restarting or stopping its processes. Queries or freshness require exactly one of these two settings. Freshness currently requires HTTP.
+
+An external cluster requires fixed Pixels service ports in the engine's existing `properties` file, for example:
+
+```properties
+etcd.port=18801
+metadata.server.port=18802
+trans.server.port=18803
+retina.server.port=18804
+node.server.port=18805
+query.schedule.server.port=18806
+index.server.port=18807
+scaling.metrics.server.port=18808
+worker.coordinate.server.port=18809
+```
+
+Ports must be distinct, within 1–65535, and available on the Pixels host; occupied fixed ports fail before services start. Unspecified service ports remain automatically allocated for managed or query-disabled runs; the etcd peer port is always automatically allocated. Fixed ports change listening addresses only: each run still creates fresh metadata, index and working data. Run experiments using the same ports serially. Configure every Trino coordinator/worker's Pixels connector with the same service hosts/ports and COS settings/credentials, using the matching source-built connector. Workers on other hosts require a reachable `pixels_host: HOST:PORT` agent; `pixels_host: local` binds Pixels to loopback. Each run records its effective `pixels.properties`; external cluster build identities and resource settings must be recorded by the experiment operator. External configuration is not automatically rewritten or certified by SIBench.
+
+Restart all relevant Trino nodes between runs when the experiment requires clearing process caches or reloading connector configuration. Restarting Trino does not clear operating-system or remote-storage caches; record cache conditions separately when comparing performance.
+
+Managed-node resource settings are explicit: JVM heap, per-query user memory, total query memory, heap headroom and CPU/worker-thread count. Query total memory plus heap headroom must fit the heap. Set these values for the execution host; leave enough memory for Pixels/native allocations, other processes and the OS. External clusters use their own resource settings. Cloud-function execution is disabled in managed setup, which verifies an active node and a successful Pixels marker-table scan before business queries.

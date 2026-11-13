@@ -97,11 +97,19 @@ public final class CdcInput {
         return Map.of("status", "passed", "counts", verified.counts(), "manifest_sha256", verified.manifestSha256());
     }
 
-    static Verified open(Path directory) throws IOException {
+    static Verified open(Path directory) throws IOException { return open(directory, true); }
+
+    /**
+     * For consumers that apply CDC frames but never read the retained CSV copies: those copies keep their
+     * descriptor and size checks, while every CDC frame is still scanned and hashed.
+     */
+    static Verified bind(Path directory) throws IOException { return open(directory, false); }
+
+    private static Verified open(Path directory, boolean baselineHashes) throws IOException {
         directory = directory.toRealPath();
         var manifest = manifest(directory);
         try {
-            Counts counts = validate(directory, manifest.document(), true);
+            Counts counts = validate(directory, manifest.document(), baselineHashes);
             return new Verified(directory, manifest.document(), counts, manifest.sha256());
         } catch (RuntimeException malformed) {
             throw new IOException("Invalid CDC input manifest: " + directory, malformed);

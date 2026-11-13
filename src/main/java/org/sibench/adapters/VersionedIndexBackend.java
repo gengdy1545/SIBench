@@ -40,10 +40,10 @@ public final class VersionedIndexBackend implements IndexBackend {
     }
 
     /** A new, empty rocksdb-cloud index: local files in {@code path}, objects in the store. */
-    static VersionedIndexBackend cloud(Path path, ValueKind valueKind, ObjectStore objects)
+    static VersionedIndexBackend cloud(Path path, ValueKind valueKind, ObjectStore objects, boolean wal)
             throws IOException {
         prepare(path, valueKind);
-        return created(CloudRocksStore.create(path, objects), valueKind, path);
+        return created(CloudRocksStore.create(path, objects, wal), valueKind, path);
     }
 
     /** An index this class created in {@code path}, reopened, e.g. after a restart. */
@@ -56,20 +56,20 @@ public final class VersionedIndexBackend implements IndexBackend {
      * A rocksdb-cloud index reopened from its local files, or, when {@code path} does not exist,
      * from the bucket alone (a cold start).
      */
-    static VersionedIndexBackend openCloud(Path path, ValueKind valueKind, ObjectStore objects)
+    static VersionedIndexBackend openCloud(Path path, ValueKind valueKind, ObjectStore objects, boolean wal)
             throws IOException {
         Files.createDirectories(path.getParent());
-        return reopened(CloudRocksStore.open(path, objects), valueKind, path);
+        return reopened(CloudRocksStore.open(path, objects, wal), valueKind, path);
     }
 
     static VersionedIndexBackend slate(Path path, ValueKind valueKind, ObjectStore objects,
-            boolean reopen) throws IOException {
+            boolean reopen, boolean wal) throws IOException {
         if (reopen) {
             Files.createDirectories(path.getParent());
-            return reopened(SlateDbStore.open(path, objects), valueKind, path);
+            return reopened(SlateDbStore.open(path, objects, wal), valueKind, path);
         }
         prepare(path, valueKind);
-        return created(SlateDbStore.create(path, objects), valueKind, path);
+        return created(SlateDbStore.create(path, objects, wal), valueKind, path);
     }
 
     private static void prepare(Path path, ValueKind valueKind) throws IOException {
@@ -82,7 +82,7 @@ public final class VersionedIndexBackend implements IndexBackend {
     private static VersionedIndexBackend created(OrderedStore store, ValueKind valueKind, Path path)
             throws IOException {
         try {
-            store.put(VALUE_KIND, new byte[] {valueKindByte(valueKind)}, true);
+            store.put(VALUE_KIND, new byte[] {valueKindByte(valueKind)});
         } catch (IOException | RuntimeException error) {
             store.close();
             throw error;
@@ -124,7 +124,7 @@ public final class VersionedIndexBackend implements IndexBackend {
 
     @Override
     public IndexDescription describe() {
-        return new IndexDescription(store.name(), valueKind, store.writeAck(), store.durability(), store.location());
+        return new IndexDescription(store.name(), valueKind, store.writeAck(), store.wal(), store.durability(), store.location());
     }
 
     @Override
@@ -133,7 +133,7 @@ public final class VersionedIndexBackend implements IndexBackend {
         boolean put = mutation.hasPut();
         ByteString key = put ? mutation.getPut().getKey() : mutation.getDelete().getKey();
         long ts = put ? mutation.getPut().getTs() : mutation.getDelete().getTs();
-        store.put(versioned(entry(key), ts), value(put, mutation.getPut().getValue()), true);
+        store.put(versioned(entry(key), ts), value(put, mutation.getPut().getValue()));
     }
 
     @Override
@@ -303,7 +303,7 @@ public final class VersionedIndexBackend implements IndexBackend {
                 throw new IllegalArgumentException("An index must name the trace it holds");
             byte[] stored = store.get(TRACE_BINDING);
             if (stored == null)
-                store.put(TRACE_BINDING, binding.getBytes(java.nio.charset.StandardCharsets.UTF_8), true);
+                store.put(TRACE_BINDING, binding.getBytes(java.nio.charset.StandardCharsets.UTF_8));
             else if (!binding.equals(new String(stored, java.nio.charset.StandardCharsets.UTF_8)))
                 throw new IOException(
                         "Index holds "
@@ -312,11 +312,6 @@ public final class VersionedIndexBackend implements IndexBackend {
                                 + binding);
             bound = binding;
         }
-    }
-
-    @Override
-    public String location() {
-        return store.location();
     }
 
     @Override

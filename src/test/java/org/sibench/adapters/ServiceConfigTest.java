@@ -15,7 +15,9 @@ public class ServiceConfigTest {
     @Test public void serverPortMustFitTheNetworkPortRange() {
         for (int port : new int[] {-1, 65536})
             assertThrows(IllegalArgumentException.class, () -> new ServiceConfig("rocksdb", null,
-                    temporary.getRoot().toPath(), port, ValueKind.ROW_ID, null, false));
+                    temporary.getRoot().toPath(), port, ValueKind.ROW_ID, null, false, true));
+        assertThrows(IllegalArgumentException.class, () -> new ServiceConfig("rocksdb", null,
+                temporary.getRoot().toPath(), 0, ValueKind.ROW_ID, null, false, false));
     }
 
     @Test
@@ -36,6 +38,9 @@ public class ServiceConfigTest {
         var error = assertThrows(IllegalArgumentException.class,
                 () -> ServiceConfig.ofServer(temporary.getRoot().toPath(), config));
         assertTrue(error.getMessage().contains("Unknown key: unknown_option"));
+        // The generation fixture keeps its WAL; only comparison backends select it.
+        Files.writeString(config, current + "  wal: false\n");
+        assertThrows(IllegalArgumentException.class, () -> ServiceConfig.ofServer(temporary.getRoot().toPath(), config));
     }
 
     @Test
@@ -78,10 +83,19 @@ public class ServiceConfigTest {
                     """.formatted(backend);
             Files.writeString(config, base);
             assertThrows(IllegalArgumentException.class, () -> ServiceConfig.ofServer(root, config));
-            Files.writeString(config, base + "  storage: storage.yaml\n  profile: test\n  object_path: test/run\n");
-            var selected = ServiceConfig.ofServer(root, config);
-            assertEquals(backend, selected.adapter());
-            assertEquals("test/run", selected.objects().objectPath());
+            String storage = base + "  storage: storage.yaml\n  profile: test\n  object_path: test/run\n";
+            Files.writeString(config, storage);
+            assertTrue(assertThrows(IllegalArgumentException.class, () -> ServiceConfig.ofServer(root, config))
+                    .getMessage().contains("wal"));
+            for (boolean wal : new boolean[] {false, true}) {
+                Files.writeString(config, storage + "  wal: " + wal + "\n");
+                var selected = ServiceConfig.ofServer(root, config);
+                assertEquals(backend, selected.adapter());
+                assertEquals("test/run", selected.objects().objectPath());
+                assertEquals(wal, selected.wal());
+            }
+            Files.writeString(config, storage + "  wal: 'false'\n");
+            assertThrows(IllegalArgumentException.class, () -> ServiceConfig.ofServer(root, config));
         }
     }
 

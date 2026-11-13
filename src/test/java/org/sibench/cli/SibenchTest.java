@@ -17,7 +17,7 @@ public class SibenchTest {
 
     @Test public void staticPixelsCommandAcceptsBaselineWithoutCdc() throws Exception {
         Path root = temporary.getRoot().toPath();
-        var settings = new java.util.LinkedHashMap<>(org.sibench.config.PixelsExperimentConfig.defaults());
+        var settings = org.sibench.config.ConfigValues.object(org.sibench.config.SibenchConfig.read(java.nio.file.Path.of("config/sibench.yaml")), "pixels_experiment");
         settings.put("updates", false);
         java.nio.file.Files.writeString(root.resolve("runtime.json"), new com.google.gson.Gson().toJson(java.util.Map.of(
                 "schema_version", 1, "purpose", "sibench", "pixels_experiment", settings)));
@@ -128,9 +128,8 @@ public class SibenchTest {
     }
 
     @Test
-    public void rejectsRetiredGenerationCommandsEvenForHelp() {
-        for(String command:new String[]{"prepare","postgres-config","check-schema","audit-rows",
-                "audit-baseline","access-ledger","compare-ledgers","snapshot-index-counters","check-capture-completeness"}) {
+    public void rejectsUnknownCommandsEvenForHelp() {
+        for(String command:new String[]{"no-such-command"}) {
             var output = new ByteArrayOutputStream();
             var errors = new ByteArrayOutputStream();
             try (var out = new PrintStream(output); var err = new PrintStream(errors)) {

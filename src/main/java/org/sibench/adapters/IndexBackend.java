@@ -53,9 +53,6 @@ public interface IndexBackend extends AutoCloseable {
      */
     void bind(String binding) throws IOException;
 
-    /** Where the index lives: a local directory or an object-storage location. */
-    String location();
-
     @Override
     void close() throws IOException;
 }

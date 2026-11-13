@@ -70,7 +70,7 @@ public final class PixelsGeneration {
         sourceSettings.putAll(Map.of("wal_level", "logical", "max_wal_senders", "4", "max_replication_slots", "4"));
         String hostSetting = string(settings, "pixels_host");
         try (var host = hostSetting.equals("local") ? PixelsHost.local(build.directory(), output.resolve("pixels"), new com.google.gson.Gson().toJsonTree(build.identity()).getAsJsonObject())
-                     : PixelsHost.Client.connect(hostSetting, token(), new com.google.gson.Gson().toJsonTree(build.identity()).getAsJsonObject());
+                     : PixelsHost.Client.connect(hostSetting, PixelsExperiment.hostToken(), new com.google.gson.Gson().toJsonTree(build.identity()).getAsJsonObject());
              var database = PostgresDatabase.create(build.directory().resolve("postgres/runtime"), output.resolve("database"), sourceSettings)) {
             // A terminated generator stops its source cluster; data and logs stay for diagnosis.
             var stopSource = new Thread(() -> {
@@ -454,12 +454,6 @@ public final class PixelsGeneration {
             throw new IOException("pixels-sink did not stop");
         }
         if (sink.exitValue() != 0 && sink.exitValue() != 143) throw new IOException("pixels-sink stopped with " + sink.exitValue());
-    }
-
-    private static String token() throws IOException {
-        String token = System.getenv("SIBENCH_PIXELS_HOST_TOKEN");
-        if (token == null || token.isBlank()) throw new IOException("Set SIBENCH_PIXELS_HOST_TOKEN for a remote Pixels host");
-        return token;
     }
 
     private static void execute(Connection database, String sql) throws Exception {

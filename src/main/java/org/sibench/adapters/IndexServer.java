@@ -24,52 +24,45 @@ public final class IndexServer implements AutoCloseable {
             private <T> void submit(Message request, StreamObserver<T> out, Function<IndexResponse,T> result) {
                 executor.submit(request).thenAccept(response -> finish(response, out, result));
             }
+            // Validation failures arrive as INVALID responses; finish() maps them and callback errors to gRPC status.
             @Override public void put(PutRequest put, StreamObserver<PutResponse> out) {
-                try { submit(put, out, r -> PutResponse.getDefaultInstance()); }
-                catch (IllegalArgumentException error) { invalid(out, error); }
+                submit(put, out, r -> PutResponse.getDefaultInstance());
             }
             @Override public void delete(DeleteRequest delete, StreamObserver<DeleteResponse> out) {
-                try { submit(delete, out, r -> DeleteResponse.getDefaultInstance()); }
-                catch (IllegalArgumentException error) { invalid(out, error); }
+                submit(delete, out, r -> DeleteResponse.getDefaultInstance());
             }
             @Override public void writeBatch(WriteBatchRequest batch, StreamObserver<WriteBatchResponse> out) {
-                try {
-                    submit(batch, out, r -> WriteBatchResponse.getDefaultInstance());
-                } catch (IllegalArgumentException error) { invalid(out, error); }
+                submit(batch, out, r -> WriteBatchResponse.getDefaultInstance());
             }
             @Override public void get(GetRequest get, StreamObserver<GetResponse> out) {
-                try {
-                    submit(get, out, response -> {
-                        if (response.values().size() > 1) throw new IllegalArgumentException("Get returned multiple entries");
-                        var result = GetResponse.newBuilder();
-                        if (response.values().size() == 1) result.setValue(response.values().get(0));
-                        return result.build();
-                    });
-                } catch (IllegalArgumentException error) { invalid(out, error); }
+                submit(get, out, response -> {
+                    if (response.values().size() > 1) throw new IllegalStateException("Get returned multiple entries");
+                    var result = GetResponse.newBuilder();
+                    if (response.values().size() == 1) result.setValue(response.values().get(0));
+                    return result.build();
+                });
             }
             @Override public void scan(ScanRequest scan, StreamObserver<ScanResponse> out) {
-                try {
-                    var call = (ServerCallStreamObserver<ScanResponse>) out;
-                    var ready = new Object();
-                    call.setOnReadyHandler(() -> { synchronized (ready) { ready.notifyAll(); } });
-                    java.util.function.Consumer<IndexResponse> send = response -> {
-                        synchronized (ready) {
-                            while (!call.isReady() && !call.isCancelled()) {
-                                try { ready.wait(10); }
-                                catch (InterruptedException error) {
-                                    Thread.currentThread().interrupt(); throw new IllegalStateException("Scan interrupted", error);
-                                }
+                var call = (ServerCallStreamObserver<ScanResponse>) out;
+                var ready = new Object();
+                call.setOnReadyHandler(() -> { synchronized (ready) { ready.notifyAll(); } });
+                java.util.function.Consumer<IndexResponse> send = response -> {
+                    synchronized (ready) {
+                        while (!call.isReady() && !call.isCancelled()) {
+                            try { ready.wait(10); }
+                            catch (InterruptedException error) {
+                                Thread.currentThread().interrupt(); throw new IllegalStateException("Scan interrupted", error);
                             }
                         }
-                        if (call.isCancelled()) throw new IllegalStateException("Scan cancelled");
-                        out.onNext(ScanResponse.newBuilder().addAllValues(response.values()).build());
-                    };
-                    executor.submit(scan, send).thenAccept(response -> {
-                        if (response.status() != IndexStatus.OK) { failed(out, response); return; }
-                        try { if (!response.values().isEmpty()) send.accept(response); out.onCompleted(); }
-                        catch (RuntimeException error) { out.onError(io.grpc.Status.UNAVAILABLE.withDescription(error.toString()).asRuntimeException()); }
-                    });
-                } catch (IllegalArgumentException error) { invalid(out, error); }
+                    }
+                    if (call.isCancelled()) throw new IllegalStateException("Scan cancelled");
+                    out.onNext(ScanResponse.newBuilder().addAllValues(response.values()).build());
+                };
+                executor.submit(scan, send).thenAccept(response -> {
+                    if (response.status() != IndexStatus.OK) { failed(out, response); return; }
+                    try { if (!response.values().isEmpty()) send.accept(response); out.onCompleted(); }
+                    catch (RuntimeException error) { out.onError(io.grpc.Status.UNAVAILABLE.withDescription(error.toString()).asRuntimeException()); }
+                });
             }
         };
         // The benchmark harness checks target identity before application, outside the data schema.
@@ -121,9 +114,6 @@ public final class IndexServer implements AutoCloseable {
         var status = response.status() == IndexStatus.INVALID
                 ? io.grpc.Status.INVALID_ARGUMENT : io.grpc.Status.UNAVAILABLE;
         out.onError(status.withDescription(response.message()).asRuntimeException());
-    }
-    private static void invalid(StreamObserver<?> out, IllegalArgumentException error) {
-        out.onError(io.grpc.Status.INVALID_ARGUMENT.withDescription(error.getMessage()).asRuntimeException());
     }
     public int port() { return server.getPort(); }
     public void awaitTermination() throws InterruptedException { server.awaitTermination(); }

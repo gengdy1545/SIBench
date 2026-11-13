@@ -64,7 +64,8 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
             pool.execute(() -> {
                 IndexResponse result = IndexExecution.execute(backend, request, partial);
                 synchronized (IndexExecutor.this) {
-                    if (result.status() == IndexStatus.OK && write) changes++;
+                    // A failed write may be partially applied; only validation rejections leave state untouched.
+                    if (write && result.status() != IndexStatus.INVALID) changes++;
                 }
                 response.complete(result);
                 synchronized (IndexExecutor.this) { pending.remove(response); }

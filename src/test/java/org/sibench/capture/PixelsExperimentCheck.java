@@ -103,7 +103,7 @@ public class PixelsExperimentCheck {
                 "prefix", "sibench/pixels/check-" + UUID.randomUUID()));
         var gson = new GsonBuilder().setPrettyPrinting().create();
         Path engineConfig = Files.writeString(directory.resolve("engine.json"), gson.toJson(engine));
-        var experiment = new LinkedHashMap<>(PixelsExperimentConfig.defaults());
+        var experiment = org.sibench.config.ConfigValues.object(org.sibench.config.SibenchConfig.read(java.nio.file.Path.of("config/sibench.yaml")), "pixels_experiment");
         experiment.putAll(Map.of("trace", trace, "updates", updates, "max_transactions", prefix));
         Path sql = Files.createDirectory(directory.resolve("sql"));
         if (queries) {

@@ -244,7 +244,7 @@ public final class DriverCapacityCheck {
         }
         IndexBackend backend = new IndexBackend() {
             public IndexDescription describe() {
-                return new IndexDescription("recorded-response-fixture",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,
+                return new IndexDescription("recorded-response-fixture",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,false,
                         "diagnostic responses; no persistent index",fixture.toString());
             }
             private List<IndexResponse> find(Message request) throws IOException {

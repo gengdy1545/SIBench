@@ -105,7 +105,7 @@ public class PostgresGenerationCheck {
                 var database=PostgresDatabase.create(Path.of(runtime),output.resolve("source"),sockets.resolve("capture.sock"),org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=database.connect("load-schema")){PostgresDatabase.unloggedTables(setup);}
             PostgresSysbench.run(root,root.resolve(client),config,database,output.resolve("load"),"oltp_read_write",null);
-            var trace=new PostgresTrace(output.resolve("trace"),source,secondaryIndexes);
+            var trace=new PostgresTrace(output.resolve("trace"),source,secondaryIndexes,false,null);
             try(var setup=database.connect("load")) {
                 PostgresDatabase.finishLoad(setup);
                 setup.setAutoCommit(false);NativeHistory.initialize(setup,Engine.POSTGRES);int id=0;

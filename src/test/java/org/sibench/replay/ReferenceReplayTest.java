@@ -34,10 +34,10 @@ public class ReferenceReplayTest {
                 workload = directory.resolve("workload.pb.zst");
         Path report = directory.resolve("report.json");
         try {
-            try (var writer = new ProtoTrace.Writer(baseline)) {
+            try (var writer = new ProtoTrace.Writer(baseline, true)) {
                 org.sibench.capture.TransferIndexFixtures.appendRow(writer, row(1, 0, 5, 50));
             }
-            try (var writer = new ProtoTrace.Writer(workload)) {
+            try (var writer = new ProtoTrace.Writer(workload, true)) {
                 writer.append(search(0, 1, 1));
                 writer.append(search(1, 10, 1));
                 writer.append(search(2, 20, 1));
@@ -91,10 +91,10 @@ public class ReferenceReplayTest {
         Path baseline = directory.resolve("baseline.pb.zst"),
                 workload = directory.resolve("workload.pb.zst");
         try {
-            try (var writer = new ProtoTrace.Writer(baseline)) {
+            try (var writer = new ProtoTrace.Writer(baseline, true)) {
                 org.sibench.capture.TransferIndexFixtures.appendRow(writer, row(1, 0, 5, 50));
             }
-            try (var writer = new ProtoTrace.Writer(workload)) {
+            try (var writer = new ProtoTrace.Writer(workload, true)) {
                 writer.append(IndexOperationTrace.transaction(0, 6, 1, 1, 0));
                 org.sibench.capture.TransferIndexFixtures.appendRow(
                         writer, TestOps.op(1, 3, 5, 0, 2, 1, 1, 9, 0, 50, 10, 20, 0, 1, 1));

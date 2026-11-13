@@ -18,6 +18,33 @@ import org.junit.Test;
 public class PixelsHostTest {
     @org.junit.Rule public org.junit.rules.TemporaryFolder temporary = new org.junit.rules.TemporaryFolder();
 
+    @Test public void fixedPortsSurviveAcrossSessionsAndAutomaticPortsRemainDistinct() throws Exception {
+        int metadata, retina, etcd;
+        try (var first = new ServerSocket(0); var second = new ServerSocket(0); var third = new ServerSocket(0)) {
+            metadata = first.getLocalPort(); retina = second.getLocalPort(); etcd = third.getLocalPort();
+        }
+        var overrides = Map.of("metadata.server.port", Integer.toString(metadata), "retina.server.port", Integer.toString(retina), "etcd.port", Integer.toString(etcd));
+        for (int run = 0; run < 2; run++) {
+            var ports = PixelsHost.ports("127.0.0.1", overrides);
+            assertEquals(Integer.valueOf(metadata), ports.get("metadata"));
+            assertEquals(Integer.valueOf(retina), ports.get("retina"));
+            assertEquals(Integer.valueOf(etcd), ports.get("etcd"));
+            assertEquals(10, ports.size());
+            assertEquals(10, new java.util.HashSet<>(ports.values()).size());
+        }
+        assertEquals(10, new java.util.HashSet<>(PixelsHost.ports("127.0.0.1", Map.of()).values()).size());
+        assertEquals("metadata.server.port=18801\n", PixelsHost.properties("metadata.server.port=1\n",
+                Map.of("metadata.server.port", "18801"), Map.of("metadata.server.port", "18801")));
+    }
+
+    @Test public void occupiedFixedPortsFailBeforeAnyServiceStarts() throws Exception {
+        try (var occupied = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            assertThrows(IOException.class, () -> PixelsHost.ports("127.0.0.1",
+                    Map.of("metadata.server.port", Integer.toString(occupied.getLocalPort()))));
+            assertFalse(occupied.isClosed());
+        }
+    }
+
     private Object session(java.nio.file.Path root) throws Exception {
         var type = Class.forName("org.sibench.capture.PixelsHost$Session");
         var constructor = type.getDeclaredConstructors()[0];

@@ -43,7 +43,7 @@ public class ProtoTraceTest {
         var expected = IndexOperationTrace.search(7, 1, 0,
                 IndexOperationTrace.Range.equal(IndexKey.ofInt(42)), 0, 1, IndexOperationTrace.SNAPSHOT_SEARCH).withWorkUnitId(3);
         assertEquals(List.of(expected), decoded);
-        var writer = new ProtoTrace.Writer(temporary.getRoot().toPath().resolve("operation-get.pb.zst"));
+        var writer = new ProtoTrace.Writer(temporary.getRoot().toPath().resolve("operation-get.pb.zst"), true);
         try (writer) { writer.append(expected); }
         assertEquals(HexFormat.of().formatHex(org.sibench.config.Digests.digest().digest(bytes.toByteArray())),
                 writer.logicalSha256());
@@ -60,7 +60,7 @@ public class ProtoTraceTest {
         var decoded = new ArrayList<Operation>();
         ProtoTrace.read(file, null, null, decoded::add);
         assertEquals(expected, decoded);
-        var writer = new ProtoTrace.Writer(temporary.getRoot().toPath().resolve("transaction-boundaries.pb.zst"));
+        var writer = new ProtoTrace.Writer(temporary.getRoot().toPath().resolve("transaction-boundaries.pb.zst"), true);
         try (writer) { for (var operation : expected) writer.append(operation); }
         assertEquals(HexFormat.of().formatHex(org.sibench.config.Digests.digest().digest(plain)), writer.logicalSha256());
 
@@ -121,14 +121,14 @@ public class ProtoTraceTest {
         var plain = new java.io.ByteArrayOutputStream();
         expected.writeDelimitedTo(plain);
         String digest = HexFormat.of().formatHex(org.sibench.config.Digests.digest().digest(plain.toByteArray()));
-        var writer = new ProtoTrace.Writer(file);
+        var writer = new ProtoTrace.Writer(file, true);
         try (writer) { writer.append(operation); }
         assertEquals(digest, writer.logicalSha256());
         var decoded = new ArrayList<Operation>();
         assertEquals(1, ProtoTrace.read(file, writer.sha256(), digest, decoded::add));
         assertEquals(List.of(operation), decoded);
         Files.delete(file);
-        try (var different = new ProtoTrace.Writer(file)) { different.append(operation.withWorkUnitId(2)); }
+        try (var different = new ProtoTrace.Writer(file, true)) { different.append(operation.withWorkUnitId(2)); }
         assertTrue(assertThrows(IOException.class, () -> ProtoTrace.read(file, null, digest, ignored -> {}))
                 .getMessage().contains("logical digest mismatch"));
     }
@@ -144,7 +144,7 @@ public class ProtoTraceTest {
         var search = IndexOperationTrace.search(2, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 0, 0, 0)
                 .withTransaction(1, 0).withWorkUnitId(1);
         int searches = ProtoTrace.MAX_TRANSACTION_OPERATIONS;
-        var writer = new ProtoTrace.Writer(file);
+        var writer = new ProtoTrace.Writer(file, true);
         try (writer) {
             writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
             for (int i = 0; i < searches; i++) writer.accept(search);
@@ -154,12 +154,12 @@ public class ProtoTraceTest {
         long[] read = {0};
         ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), operation -> read[0]++);
         assertEquals(searches + 2, read[0]);
-        var readOnly = new ProtoTrace.Writer(file.resolveSibling("read-only-overflow.pb.zst"));
+        var readOnly = new ProtoTrace.Writer(file.resolveSibling("read-only-overflow.pb.zst"), true);
         readOnly.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
         for (int i = 0; i < searches; i++) readOnly.accept(search);
         assertThrows(IOException.class, () -> readOnly.accept(search));
         assertThrows(IOException.class, readOnly::close);
-        var buffered = new ProtoTrace.Writer(file.resolveSibling("buffered.pb.zst"));
+        var buffered = new ProtoTrace.Writer(file.resolveSibling("buffered.pb.zst"), true);
         buffered.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
         buffered.accept(write(IndexOperationTrace.UPSERT, 1, 1, 1).withExpansion(0, 1));
         var after = IndexOperationTrace.search(13, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 0, 0, 0)
@@ -175,7 +175,7 @@ public class ProtoTraceTest {
         Path stop = file.resolveSibling("primitive-count.stop");
         var budget = new RequestBudget(4, java.time.Duration.ofSeconds(10));
         budget.begin("mixed", 1, stop);
-        var writer = new ProtoTrace.Writer(file, false, budget);
+        var writer = new ProtoTrace.Writer(file, false, false, budget);
         try (writer) {
             writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
             for (int ordinal = 1; ordinal <= 2; ordinal++) {
@@ -207,7 +207,7 @@ public class ProtoTraceTest {
     }
 
     @Test public void capturedAbortValidatesMoreThanAMillionReadsWithoutBufferingOrExporting() throws Exception {
-        var writer = new ProtoTrace.Writer(temporary.getRoot().toPath().resolve("large-abort.pb.zst"));
+        var writer = new ProtoTrace.Writer(temporary.getRoot().toPath().resolve("large-abort.pb.zst"), true);
         var search = IndexOperationTrace.search(2, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 0, 0, 0)
                 .withTransaction(1, 0).withWorkUnitId(1);
         int count = ProtoTrace.MAX_TRANSACTION_OPERATIONS + 1;
@@ -259,7 +259,7 @@ public class ProtoTraceTest {
             var budget = new RequestBudget(2, java.time.Duration.ofSeconds(10));
             Path stop = file.resolveSibling("stop-" + secondary);
             budget.begin("mixed", 1, stop);
-            var writer = new ProtoTrace.Writer(file, secondary, budget);
+            var writer = new ProtoTrace.Writer(file, secondary, false, budget);
             try (writer) {
                 writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
                 for (int i = 0; i < 2; i++) writer.accept(IndexOperationTrace.search(11, 1, i,
@@ -289,7 +289,6 @@ public class ProtoTraceTest {
             assertEquals(secondary ? 11 : 7, writer.count());
             assertEquals(Files.size(file), writer.bytesWritten());
             var stats = writer.statistics();
-            assertEquals(secondary ? 7L : 3L, stats.get("index_entries"));
             assertEquals(secondary ? 7L : 3L, stats.get("effective_requests"));
             assertEquals(secondary ? 4L : 3L, stats.get("primary_entries"));
             assertEquals(secondary ? 3L : 0L, stats.get("secondary_entries"));
@@ -313,7 +312,7 @@ public class ProtoTraceTest {
                 IndexOperationTrace.search(22,1,0,new IndexOperationTrace.Range(IndexKey.ofInt(2),true,null,false,false,3),
                         0,0,IndexOperationTrace.SNAPSHOT_SEARCH));
         Path file=temporary.getRoot().toPath().resolve("short-scans.pb.zst");
-        var writer=new ProtoTrace.Writer(file);
+        var writer=new ProtoTrace.Writer(file, true);
         try(writer){for(var operation:original)writer.append(operation);}
         var decoded=new ArrayList<Operation>();
         ProtoTrace.read(file,writer.sha256(),writer.logicalSha256(),decoded::add);
@@ -333,7 +332,7 @@ public class ProtoTraceTest {
                         0, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
                         .withTransaction(1, 1).withVersion(1).withWorkUnitId(1),
                 IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_ABORT, 1, 1, 1));
-        var writer = new ProtoTrace.Writer(file);
+        var writer = new ProtoTrace.Writer(file, true);
         try (writer) { for (var operation : original) writer.append(operation); }
         var decoded = new ArrayList<Operation>();
         ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add);
@@ -359,7 +358,7 @@ public class ProtoTraceTest {
         for (int i = 0; i < 2; i++) original.add(IndexOperationTrace.search(15, 1, 0,
                 IndexOperationTrace.Range.equal(IndexKey.ofInt(i + 1)), null, 1, 1,
                 IndexOperationTrace.UNION_GROUP | IndexOperationTrace.SNAPSHOT_SEARCH, i, 2).withWorkUnitId(2));
-        var writer = new ProtoTrace.Writer(file);
+        var writer = new ProtoTrace.Writer(file, true);
         try (writer) { for (Operation operation : original) writer.append(operation); }
         var decoded = new ArrayList<Operation>();
         assertEquals(6, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
@@ -376,7 +375,7 @@ public class ProtoTraceTest {
     @Test
     public void onlyFinalPhysicalWritesSurviveRepeatedPrimaryAndSecondaryUpdates() throws Exception {
         var file = temporary.getRoot().toPath().resolve("net-state.pb.zst");
-        var writer = new ProtoTrace.Writer(file);
+        var writer = new ProtoTrace.Writer(file, true);
         try (writer) {
             writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
             IndexMutation.emit(write(IndexOperationTrace.UPSERT, 2, 1, 1),
@@ -422,7 +421,7 @@ public class ProtoTraceTest {
         for (int outcome = 0; outcome < 3; outcome++) {
             boolean aborted = outcome != 0;
             Path file = temporary.getRoot().toPath().resolve("superseded-" + outcome + ".pb.zst");
-            var writer = new ProtoTrace.Writer(file);
+            var writer = new ProtoTrace.Writer(file, true);
             try (writer) {
                 if (outcome == 2) writer.expectAbort();
                 writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
@@ -454,7 +453,7 @@ public class ProtoTraceTest {
             assertThrows(IOException.class, () -> writer.append(IndexOperationTrace.search(1, 1, 1,
                     IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 1, 0, IndexOperationTrace.SNAPSHOT_SEARCH)));
         }
-        var aborted = new ProtoTrace.Writer(file.resolveSibling("invalid-aborted-snapshot.pb.zst"));
+        var aborted = new ProtoTrace.Writer(file.resolveSibling("invalid-aborted-snapshot.pb.zst"), true);
         aborted.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
         assertThrows(IOException.class, () -> aborted.append(IndexOperationTrace.search(1, 1, 0,
                 IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 1, 0, IndexOperationTrace.SNAPSHOT_SEARCH)
@@ -467,7 +466,7 @@ public class ProtoTraceTest {
         var file = temporary.getRoot().toPath().resolve("aborted-snapshots.pb.zst");
         var budget = new RequestBudget(0, java.time.Duration.ofSeconds(10));
         budget.begin("snapshot", 1, file.resolveSibling("stop"));
-        var writer = new ProtoTrace.Writer(file, true, budget);
+        var writer = new ProtoTrace.Writer(file, true, false, budget);
         try (writer) {
             writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
             writer.append(IndexOperationTrace.search(1, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)),
@@ -491,7 +490,7 @@ public class ProtoTraceTest {
     @Test
     public void malformedAbortedSourceIsRejectedBeforeItsWritesCanBeFiltered() throws Exception {
         var file = temporary.getRoot().toPath().resolve("malformed-source.pb.zst");
-        var writer = new ProtoTrace.Writer(file);
+        var writer = new ProtoTrace.Writer(file, true);
         writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
         writer.append(write(IndexOperationTrace.UPSERT, 2, 1, 1).withExpansion(0, 2));
         assertThrows(IOException.class, () -> writer.append(IndexOperationTrace.transaction(
@@ -502,7 +501,7 @@ public class ProtoTraceTest {
     @Test
     public void corruptTruncatedAndMisboundFilesAreRejected() throws Exception {
         Path file = temporary.getRoot().toPath().resolve("trace.pb.zst");
-        var writer = new ProtoTrace.Writer(file);
+        var writer = new ProtoTrace.Writer(file, true);
         try (writer) { writer.append(write(IndexOperationTrace.INSERT, 1, 0, 0)); }
         byte[] complete = Files.readAllBytes(file);
         for (int magic : new int[] {0, 0x53494f5a}) {
@@ -614,7 +613,7 @@ public class ProtoTraceTest {
     @Test
     public void inventoryRequiresCanonicalFileAndBindsItsCountAndIdentity() throws Exception {
         Path root = temporary.getRoot().toPath();
-        var writer = new ProtoTrace.Writer(root.resolve("baseline.pb.zst"));
+        var writer = new ProtoTrace.Writer(root.resolve("baseline.pb.zst"), true);
         try (writer) { writer.append(write(IndexOperationTrace.INSERT, 1, 0, 0)); }
         var files = new com.google.gson.JsonArray();
         files.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("baseline.pb.zst", writer)));
@@ -642,10 +641,10 @@ public class ProtoTraceTest {
     @Test
     public void unfinishedTransactionsAndGroupsCannotBePublished() throws Exception {
         Path root = temporary.getRoot().toPath();
-        var transaction = new ProtoTrace.Writer(root.resolve("transaction.pb.zst"));
+        var transaction = new ProtoTrace.Writer(root.resolve("transaction.pb.zst"), true);
         transaction.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
         assertThrows(IOException.class, transaction::close);
-        var group = new ProtoTrace.Writer(root.resolve("group.pb.zst"));
+        var group = new ProtoTrace.Writer(root.resolve("group.pb.zst"), true);
         group.append(IndexOperationTrace.search(1, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)),
                 null, 0, 0, IndexOperationTrace.UNION_GROUP, 0, 2).withWorkUnitId(1));
         assertThrows(IOException.class, group::close);
@@ -654,7 +653,7 @@ public class ProtoTraceTest {
     @Test
     public void multipleBlocksPreserveEveryMemberAndRequireTheirFinalTerminator() throws Exception {
         Path file = temporary.getRoot().toPath().resolve("blocks.pb.zst");
-        var writer = new ProtoTrace.Writer(file);
+        var writer = new ProtoTrace.Writer(file, true);
         try (writer) {
             for (int i = 1; i <= 9000; i++) writer.append(IndexOperationTrace.write(0,
                     IndexOperationTrace.INSERT, 1, 0, IndexKey.ofInt(i), 0, 0, 0, i).withWorkUnitId(1));

@@ -39,9 +39,6 @@ public final class Sibench {
                 "       java -jar build/sibench/sibench.jar pixels-host ADDRESS:PORT BUILD WORK_ROOT TOKEN_FILE"
                         + "   (Pixels side of CDC generation for a remote pixels_host)");
         out.println(
-                "       java -jar build/sibench/sibench.jar plan-operations PROFILE CALIBRATION_TRACE"
-                        + " REPLAY_CONFIG   (native parameters for the replay configuration's operation budget)");
-        out.println(
                 "       java -jar build/sibench/sibench.jar index-server SERVICE_CONFIG"
                         + "   (serves a new or reopened RocksDB / rocksdb-cloud / SlateDB index)");
         out.println(
@@ -90,7 +87,6 @@ public final class Sibench {
                             "index-server",
                             "replay-service",
                             "verify-service",
-                            "plan-operations",
                             "analyze-locality")
                     .contains(args[0])) {
                 throw new IllegalArgumentException("Unknown command: " + args[0]);
@@ -204,16 +200,6 @@ public final class Sibench {
                 return 0;
             }
             root = root.toRealPath();
-            if (args[0].equals("plan-operations")) {
-                if (profiles.size() != 3)
-                    throw new IllegalArgumentException(
-                            "plan-operations requires PROFILE CALIBRATION_TRACE REPLAY_CONFIG");
-                var plan =
-                        org.sibench.capture.CapturePlan.operations(
-                                root, Path.of(profiles.get(0)), root.resolve(profiles.get(1)), Path.of(profiles.get(2)));
-                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(plan));
-                return 0;
-            }
             if (args[0].equals("index-server")) {
                 if (profiles.size() != 1)
                     throw new IllegalArgumentException("index-server requires SERVICE_CONFIG");

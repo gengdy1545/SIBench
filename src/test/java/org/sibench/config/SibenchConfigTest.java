@@ -38,6 +38,26 @@ public class SibenchConfigTest {
         assertThrows(IllegalArgumentException.class, () -> PixelsConfig.pixelsProperties(Map.of("cos.secret.key", "not-allowed")));
     }
 
+    @Test public void objectPathsStayBelowTheProfilePrefixAtAPathBoundary() {
+        assertTrue(ObjectStore.below("sibench/pixels", "sibench/"));
+        assertTrue(ObjectStore.below("sibench/pixels", "sibench"));
+        assertFalse(ObjectStore.below("sibenchX/pixels", "sibench"));
+        assertFalse(ObjectStore.below("sibench/", "sibench/"));
+        assertFalse(ObjectStore.below("sibench", "sibench"));
+        assertTrue(ObjectStore.below("any/key", ""));
+    }
+
+    @Test public void pixelsServicePortsCanBeFixedWithoutExposingOtherOwnedProperties() {
+        assertEquals(Map.of("metadata.server.port", "18801", "retina.server.port", "18802"),
+                PixelsConfig.pixelsProperties(Map.of("metadata.server.port", "18801", "retina.server.port", "18802")));
+        for (String invalid : java.util.List.of("0", "-1", "65536", "18801\nother=1", "abc"))
+            assertThrows(IllegalArgumentException.class, () -> PixelsConfig.pixelsProperties(Map.of("metadata.server.port", invalid)));
+        assertThrows(IllegalArgumentException.class, () -> PixelsConfig.pixelsProperties(
+                Map.of("metadata.server.port", "18801", "retina.server.port", "18801")));
+        for (String owned : java.util.List.of("metadata.server.host", "unknown.server.port", "etcd.hosts", "metadata.db.url", "index.rocksdb.data.path"))
+            assertThrows(IllegalArgumentException.class, () -> PixelsConfig.pixelsProperties(Map.of(owned, "elsewhere")));
+    }
+
     @Test
     public void replayServiceAndAnalysisUseTheSameConfiguration() throws Exception {
         Path root = Path.of("").toAbsolutePath();
@@ -130,19 +150,11 @@ public class SibenchConfigTest {
     }
 
     @Test
-    public void rejectsOldPurposesAndUnknownTopLevelOptions() {
-        for (String purpose : new String[] {"index_replay", "update_locality"})
+    public void rejectsOtherPurposesAndUnknownTopLevelOptions() {
+        for (String purpose : new String[] {"index_service"})
             assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(
                     Map.of("schema_version", 1, "purpose", purpose)));
         assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(
                 Map.of("schema_version", 1, "purpose", "sibench", "replaay", Map.of())));
-    }
-
-    @Test
-    public void rejectsRetiredPgGenerationSettings() {
-        assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(Map.of(
-                "schema_version", 1, "purpose", "sibench", "generation", Map.of(
-                        "pending_transaction_bytes", 1000, "pending_transactions", 10,
-                        "operation_target", 100, "output_byte_target", 1000))));
     }
 }

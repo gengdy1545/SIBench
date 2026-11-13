@@ -34,6 +34,17 @@ public class ReplayProjectionTest {
     }
 
     @Test
+    public void rejectsBaselineInsertInsideWorkload() throws Exception {
+        var insert = IndexOperationTrace.write(1, IndexOperationTrace.INSERT, 1, 0, IndexKey.ofInt(1), 0, 0, 0, 1)
+                .withWorkUnitId(1).withExpansion(0, 1);
+        IndexOperationTrace.Source source = consumer -> { consumer.accept(insert); return 1; };
+        ReplayInput.checkStream(source, new ReplayConfig(false, 0, 0, 0, 0), false);
+        assertTrue(assertThrows(IOException.class,
+                () -> ReplayInput.checkStream(source, new ReplayConfig(false, 0, 0, 0, 0), true))
+                .getMessage().contains("outside a committed source transaction"));
+    }
+
+    @Test
     public void rejectsAbortBoundariesEvenWithoutWrites() throws Exception {
         var query = IndexOperationTrace.search(1, 3, 0, Range.equal(IndexKey.ofInt(1)), 0, 0, 0)
                 .withTransaction(10, 0);

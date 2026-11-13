@@ -5,7 +5,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -127,10 +126,6 @@ public final class Hybench {
         return java.util.Collections.unmodifiableMap(counts);
     }
 
-    /** DuckDB CHAR aliases VARCHAR; preserve its exact native string comparison semantics. */
-    public static List<IndexCatalog.Definition> catalog(Path source)throws IOException {
-        return IndexCatalog.duckDbDefinitions(SourceSchema.hybench(source));
-    }
     private static void execute(Connection database,String sql)throws SQLException {
         try(var query=database.createStatement()){query.execute(sql);}
     }

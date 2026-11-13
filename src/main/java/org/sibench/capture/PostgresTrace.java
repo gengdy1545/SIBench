@@ -25,10 +25,6 @@ final class PostgresTrace {
     private final IndexCatalog catalog;
     private final Map<String,Object> manifest;
 
-    PostgresTrace(Path directory,SourceSchema source,boolean secondaryIndexes)throws IOException {
-        this(directory,source,secondaryIndexes,false,null);
-    }
-
     PostgresTrace(Path directory,SourceSchema source,boolean secondaryIndexes,boolean exportQueries,RequestBudget budget)throws IOException {
         this.budget=budget;
         this.exportQueries=exportQueries;

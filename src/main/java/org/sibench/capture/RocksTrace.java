@@ -20,10 +20,6 @@ final class RocksTrace implements AutoCloseable {
     private boolean baselineClosed, closed;
     private boolean independentReads;
 
-    RocksTrace(Path directory, SourceSchema source, boolean secondaryIndexes) throws IOException {
-        this(directory, source, secondaryIndexes, false, null);
-    }
-
     RocksTrace(Path directory, SourceSchema source, boolean secondaryIndexes, boolean exportQueries, RequestBudget budget) throws IOException {
         this.directory = directory;
         var catalog = IndexCatalog.fromSchema(source);

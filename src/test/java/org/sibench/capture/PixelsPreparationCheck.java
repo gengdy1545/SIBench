@@ -13,7 +13,7 @@ public class PixelsPreparationCheck {
     @Test(timeout = 300_000) public void parallelConsumersPublishTheSameCsvIdentity() throws Exception {
         Path work = CdcPreparationCheck.prepareHybench(true), root = Path.of("").toRealPath();
         var runtime = ConfigValues.parse(Files.readString(work.resolve("runtime.yaml")));
-        var experiment = new LinkedHashMap<>(PixelsExperimentConfig.defaults());
+        var experiment = org.sibench.config.ConfigValues.object(org.sibench.config.SibenchConfig.read(java.nio.file.Path.of("config/sibench.yaml")), "pixels_experiment");
         experiment.put("updates", false); experiment.put("trace", true);
         runtime.put("pixels_experiment", experiment);
         Path config = Files.writeString(work.resolve("restore.json"), new com.google.gson.Gson().toJson(runtime));

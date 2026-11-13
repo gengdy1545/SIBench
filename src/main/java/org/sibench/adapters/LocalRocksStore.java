@@ -21,8 +21,7 @@ final class LocalRocksStore implements OrderedStore {
     private final Options options;
     private final RocksDB db;
     private final Path path;
-    private final WriteOptions logged = new WriteOptions(),
-            unlogged = new WriteOptions().setDisableWAL(true);
+    private final WriteOptions logged = new WriteOptions();
 
     private LocalRocksStore(Options options, RocksDB db, Path path) {
         this.options = options;
@@ -66,9 +65,14 @@ final class LocalRocksStore implements OrderedStore {
     }
 
     @Override
-    public void put(byte[] key, byte[] value, boolean wal) throws IOException {
+    public boolean wal() {
+        return true;
+    }
+
+    @Override
+    public void put(byte[] key, byte[] value) throws IOException {
         try {
-            db.put(wal ? logged : unlogged, key, value);
+            db.put(logged, key, value);
         } catch (RocksDBException error) {
             throw new IOException(error);
         }
@@ -110,11 +114,6 @@ final class LocalRocksStore implements OrderedStore {
             @Override
             public void seekForPrev(byte[] key) {
                 iterator.seekForPrev(key);
-            }
-
-            @Override
-            public void seekToLast() {
-                iterator.seekToLast();
             }
 
             @Override
@@ -185,7 +184,6 @@ final class LocalRocksStore implements OrderedStore {
     @Override
     public void close() {
         logged.close();
-        unlogged.close();
         db.close();
         options.close();
     }

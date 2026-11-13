@@ -15,11 +15,16 @@ import java.util.TreeMap;
 
 /**
  * Pixels CDC generation settings. The property files hold overrides of the pinned upstream
- * defaults; endpoints, run directories and switches that define the generated Trace's semantics
- * belong to the generator and are rejected here.
+ * defaults, including optional fixed service ports. Hosts, run directories and switches that define
+ * the generated Trace's semantics belong to the generator and are rejected here.
  */
 public final class PixelsConfig {
     private PixelsConfig() {}
+
+    public static final Map<String, String> SERVICE_PORTS = Map.of(
+            "etcd.port", "etcd", "metadata.server.port", "metadata", "trans.server.port", "trans",
+            "retina.server.port", "retina", "node.server.port", "node", "query.schedule.server.port", "query",
+            "index.server.port", "index", "scaling.metrics.server.port", "scaling", "worker.coordinate.server.port", "worker");
 
     private static final Set<String> PIXELS_OWNED = Set.of("pixels.var.dir", "etcd.hosts", "retina.enable",
             "index.server.enabled", "enabled.single.point.index.schemes", "enabled.main.index.scheme",
@@ -56,7 +61,7 @@ public final class PixelsConfig {
             var profile = ObjectStore.profile(directory.resolve(string(storage, "config")), string(storage, "profile"));
             String prefix = string(storage, "prefix");
             require(prefix.matches("[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*")
-                    && prefix.startsWith(string(profile, "prefix")), "Invalid Pixels COS prefix");
+                    && ObjectStore.below(prefix, string(profile, "prefix")), "Invalid Pixels COS prefix");
             require(string(profile, "addressing").equals("virtual_hosted"), "Pixels COS requires virtual-hosted addressing");
             result.put("data_storage", Map.of("profile", profile, "prefix", prefix));
         }
@@ -84,11 +89,16 @@ public final class PixelsConfig {
             require(!postgres.containsKey(key), "Source PostgreSQL logical replication setting is generator-owned: " + key);
     }
 
-    /** Pixels overrides; location-like keys always come from the generator's run layout. */
+    /** Pixels overrides; fixed service ports are allowed, while locations come from the run layout. */
     public static Map<String, String> pixelsProperties(Map<String, String> overrides) {
+        var ports = new java.util.HashSet<Integer>();
         for (String key : overrides.keySet()) {
             require(!key.startsWith("cos.") && !key.startsWith("sibench.cos."), "COS settings belong to data_storage: " + key);
-            require(!PIXELS_OWNED.contains(key) && !key.matches(".*\\.(host|hosts|port|dir|path|location|folder|url)"),
+            if (SERVICE_PORTS.containsKey(key)) {
+                String value = overrides.get(key);
+                require(value.matches("[1-9][0-9]{0,4}") && Integer.parseInt(value) <= 65535, "Invalid Pixels service port: " + key);
+                require(ports.add(Integer.parseInt(value)), "Duplicate Pixels service port: " + value);
+            } else require(!PIXELS_OWNED.contains(key) && !key.matches(".*\\.(host|hosts|port|dir|path|location|folder|url)"),
                     "Pixels property is assigned by the generator: " + key);
             require(overrides.get(key).indexOf('\n') < 0 && overrides.get(key).indexOf('\r') < 0,
                     "Multiline Pixels property: " + key);

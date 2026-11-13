@@ -61,6 +61,21 @@ public class CdcInputTest {
         assertThrows(IOException.class, () -> CdcInput.check(second));
     }
 
+    @Test public void experimentBindingSkipsUnreadCsvContentButStillChecksCdcFrames() throws Exception {
+        Path root = fixture(1, 1);
+        // A same-size CSV change is caught only by full input checks; experiments never read the copy.
+        Files.writeString(root.resolve("baseline/a.csv"), "2\n");
+        assertThrows(IOException.class, () -> CdcInput.open(root));
+        assertEquals(1, CdcInput.bind(root).counts().transactions());
+        Files.writeString(root.resolve("baseline/a.csv"), "22\n");
+        assertThrows(IOException.class, () -> CdcInput.bind(root));
+        Path frames = fixture(1, 1), file = frames.resolve("cdc/00000000.proto");
+        byte[] data = Files.readAllBytes(file);
+        data[data.length - 1] ^= 1;
+        Files.write(file, data);
+        assertThrows(IOException.class, () -> CdcInput.bind(frames));
+    }
+
     @Test public void missingExtraAndUnorderedFilesAreRejected() throws Exception {
         Path missing = fixture(1, 1);
         Files.delete(missing.resolve("cdc/00000000.proto"));
