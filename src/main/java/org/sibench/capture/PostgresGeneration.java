@@ -38,7 +38,7 @@ final class PostgresGeneration {
                 else PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,output.resolve("load"),"oltp_read_write",null);
                 timings.put("native_load_seconds",seconds(loadStart));long baselineStart=System.nanoTime();
                 var budget=new RequestBudget(Generation.requestTarget(input.document()),input.timeout());
-                var trace=new PostgresTrace(output.resolve("trace"),input.source(),Generation.secondaryIndexes(input.document()),budget);
+                var trace=new PostgresTrace(output.resolve("trace"),input.source(),Generation.secondaryIndexes(input.document()),Generation.exportQueries(input.document()),budget);
                 try(var setup=database.connect("baseline")) {
                     PostgresDatabase.finishLoad(setup);
                     // Mark loaded pages visible before copying keys, avoiding another wide-table scan.
@@ -61,12 +61,13 @@ final class PostgresGeneration {
                 long workloadStart=System.nanoTime();var stages=new LinkedHashMap<String,Object>();
                 // HyBench runs AP once, then shares the remaining requests between TP and XP.
                 var workloads=hybench?java.util.List.of("ap","tp","xp"):java.util.List.copyOf(object(input.nativeConfig(),"workloads").keySet());
-                int remaining=hybench?2:workloads.size();
+                int remaining=(int)workloads.stream().filter(workload->Generation.budgetStage(input.document(),input.selection().benchmark(),workload)).count();
                 for(String workload:workloads) {
                     Path stage=Files.createDirectory(output.resolve(workload));
-                    boolean setup=hybench&&workload.equals("ap");
-                    Path stop=setup?null:stage.resolve("budget.stop");
-                    budget.begin(workload,setup?0:remaining--,stop);
+                    boolean supplies=Generation.budgetStage(input.document(),input.selection().benchmark(),workload);
+                    trace.queryStage(Generation.queryStage(input.selection().benchmark(),workload));
+                    Path stop=supplies?stage.resolve("budget.stop"):null;
+                    budget.begin(workload,supplies?remaining--:0,stop);
                     var batches=new java.util.ArrayList<Map<String,Object>>();
                     do {
                         budget.checkTime();long before=budget.count();
@@ -74,8 +75,8 @@ final class PostgresGeneration {
                         batches.add(hybench?runHybench(plan,input,database,capture,batch,workload,url,stop)
                                 :PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,batch,workload,capture));
                         trace.awaitProjection(capture,input.timeout());
-                        if(budget.enabled()&&!setup)budget.requireProgress(before);
-                    } while(budget.enabled()&&!setup&&!budget.reached());
+                        if(budget.enabled()&&supplies)budget.requireProgress(before);
+                    } while(budget.enabled()&&supplies&&!budget.reached());
                     budget.end();stages.put(workload,batches);
                 }
                 json(output.resolve("request-budget.json"),budget.finish());

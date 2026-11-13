@@ -6,6 +6,28 @@ import java.time.Duration;
 import org.junit.Test;
 
 public class RequestBudgetTest {
+    @Test public void excludedQueryStagesDoNotConsumeSupplyAndBothSwitchStatesReachTheTarget() throws Exception {
+        for(boolean queries:java.util.List.of(false,true)) {
+            var document=java.util.Map.<String,Object>of("trace",java.util.Map.of("export_queries",queries));
+            var budget=new RequestBudget(10,Duration.ofSeconds(10));
+            boolean querySupply=Generation.budgetStage(document,"ycsb","workloadc");
+            assertEquals(queries,querySupply);
+            budget.begin("query",querySupply?2:0,null);
+            if(querySupply)budget.record(5);
+            budget.end();
+            budget.begin("mixed",1,null);
+            budget.record(6);
+            if(!queries) {
+                assertFalse(budget.reached());
+                assertThrows(IOException.class,budget::end);
+                budget.record(5);
+            }
+            budget.end();
+            assertEquals(11L,budget.finish().get("effective_requests"));
+            assertEquals(1L,budget.finish().get("overshoot_requests"));
+        }
+    }
+
     @Test public void carriesDrainedOvershootIntoRemainingWorkloads() throws Exception {
         var budget = new RequestBudget(10, Duration.ofSeconds(10));
         budget.begin("first", 2, null);

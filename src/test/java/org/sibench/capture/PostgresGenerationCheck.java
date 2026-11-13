@@ -26,14 +26,27 @@ public class PostgresGenerationCheck {
         run(false);
     }
     @Test public void sharedOutputBudgetControlsRealSourceAdmission() throws Exception {
+        for(boolean queries:java.util.List.of(false,true))sharedOutputBudget(queries);
+    }
+    private void sharedOutputBudget(boolean queries) throws Exception {
         Path root=Path.of("").toRealPath();
         Path output=Files.createTempDirectory(root.resolve("results/capture"),"postgres-budget-");
-        var result=Generation.run(root,settings(root,output)).get(0);
+        var configuration=settings(root,output);
+        var profile=output.resolve("profile.yaml");
+        var document=parse(Files.readString(profile));
+        document.put("trace",Map.of("secondary_indexes",false,"export_queries",queries,"workload_requests",600));
+        Files.writeString(profile,new org.yaml.snakeyaml.Yaml().dump(document));
+        var result=Generation.run(root,configuration).get(0);
         assertEquals(1024L,result.get("baseline_operations"));
         assertFalse(Files.exists(output.resolve("generated/database/data")));
         var budget=object(object(result,"source_evidence"),"request_budget");
         assertTrue(((Number)budget.get("effective_requests")).longValue()>=600);
         assertEquals(6,object(budget,"stages").size());
+        var query=object(object(budget,"stages"),"oltp_point_select");
+        assertEquals(queries,((Number)query.get("effective_requests")).longValue()>0);
+        assertEquals(queries,((Number)query.get("target_requests")).longValue()>0);
+        assertTrue(Files.isRegularFile(output.resolve("generated/oltp_point_select/batch-0/summary.json")));
+        assertFalse(Files.exists(output.resolve("generated/oltp_point_select/batch-1"))&&!queries);
         assertTrue(Files.exists(output.resolve("generated/oltp_read_write/budget.stop")));
         assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
                 new org.sibench.replay.ReplayConfig(false,0,0,0,0,"operation"),output.resolve("reference.json")).get("status"));

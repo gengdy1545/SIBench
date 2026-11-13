@@ -105,7 +105,7 @@ public final class ProtoTrace {
         private long count;
         private String logicalSha256;
         private final TraceRequests requests = new TraceRequests(ValueKind.ROW_ID);
-        private final CommittedOperations projection = new CommittedOperations(this::appendExported);
+        private final CommittedOperations projection;
         private final List<Operation> group = new ArrayList<>();
         private int records;
         private long transaction;
@@ -129,8 +129,13 @@ public final class ProtoTrace {
         }
 
         Writer(Path file, boolean secondaryIndexes, RequestBudget budget) throws IOException {
+            this(file, secondaryIndexes, false, budget);
+        }
+
+        Writer(Path file, boolean secondaryIndexes, boolean exportQueries, RequestBudget budget) throws IOException {
             this.budget = budget;
             this.secondaryIndexes = secondaryIndexes;
+            projection = new CommittedOperations(this::appendExported, exportQueries);
             output = new DataOutputStream(new BufferedOutputStream(new DigestOutputStream(
                     Files.newOutputStream(file, StandardOpenOption.CREATE_NEW), physical)));
             output.writeInt(MAGIC);
@@ -147,6 +152,7 @@ public final class ProtoTrace {
         }
 
         void expectAbort() throws IOException { projection.expectAbort(); }
+        void expectQuery() throws IOException { projection.expectQuery(); }
 
         private void appendExported(Operation operation) throws IOException {
             if (operation.grouped()) {

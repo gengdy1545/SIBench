@@ -77,11 +77,16 @@ public final class Generation {
             var document=parse(Files.readString(selection.config()));
             keys(document,Set.of("schema_version","purpose","benchmark","source","native","trace","artifacts"));
             secondaryIndexes(document);
+            exportQueries(document);
             requestTarget(document);
             require(integer(document,"schema_version")==1&&string(document,"purpose").equals("native_capture"),"Expected native_capture profile");
             keys(object(document,"source"),Set.of("path","commit"));keys(object(document,"artifacts"),Set.of("directory"));
             var source=SourceSchema.read(root,document);var nativeConfig=object(document,"native");
             validateNative(selection.benchmark(),nativeConfig);
+            var stages=selection.benchmark().equals("hybench")?List.of("ap","tp","xp"):
+                    List.copyOf(object(nativeConfig,"workloads").keySet());
+            require(requestTarget(document)==0||stages.stream().anyMatch(stage->budgetStage(document,selection.benchmark(),stage)),
+                    "The selected workloads cannot supply the exported request target with independent queries disabled");
             var parameters=selection.benchmark().equals("hybench")?HybenchParameters.read(source.source(),nativeConfig):Map.<String,Object>of();
             var baselineRows=parameters.isEmpty()?ScaleInspector.nativeRows(root,document):HybenchParameters.rows(parameters);
             Path client=root.resolve(string(nativeConfig,"build_directory")).toRealPath();
@@ -108,8 +113,29 @@ public final class Generation {
     static boolean secondaryIndexes(Map<String,Object> document) {
         if (!document.containsKey("trace")) return false;
         var trace = object(document,"trace");
-        keys(trace,Set.of("secondary_indexes", "workload_requests"));
+        keys(trace,Set.of("secondary_indexes", "export_queries", "workload_requests"));
         return bool(trace,"secondary_indexes");
+    }
+
+    static boolean exportQueries(Map<String,Object> document) {
+        return document.containsKey("trace") && object(document,"trace").containsKey("export_queries")
+                && bool(object(document,"trace"),"export_queries");
+    }
+
+    /** These pinned client stages contain only independent queries; mixed stages stay unclassified. */
+    static boolean queryStage(String benchmark,String stage) {
+        return switch(benchmark) {
+            case "hybench" -> stage.equals("ap");
+            case "sysbench" -> stage.equals("oltp_point_select");
+            case "ycsb" -> stage.equals("workloadc");
+            default -> throw new IllegalArgumentException("Unknown benchmark: "+benchmark);
+        };
+    }
+
+    static boolean budgetStage(Map<String,Object> document,String benchmark,String stage) {
+        // HyBench AP ends with rollback and cannot supply committed operations even with queries enabled.
+        return !(benchmark.equals("hybench")&&stage.equals("ap"))
+                && (exportQueries(document)||!queryStage(benchmark,stage));
     }
 
     static long requestTarget(Map<String,Object> document) {
@@ -232,17 +258,19 @@ public final class Generation {
                         table.indexes().stream().filter(SourceSchema.Index::primary).findFirst().orElseThrow().column());
                 database.commit();
                 var budget=new RequestBudget(requestTarget(input.document()),input.timeout());
-                try(var trace=new DuckDbTrace(input.selection().mode(),input.source(),out.resolve("trace"),secondaryIndexes(input.document()),budget)) {
+                try(var trace=new DuckDbTrace(input.selection().mode(),input.source(),out.resolve("trace"),secondaryIndexes(input.document()),exportQueries(input.document()),budget)) {
                     trace.baseline(database,expected);database.commit();database.setAutoCommit(true);
                     timings.put("baseline_indexes_seconds",seconds(baselineStart));long workloadStart=System.nanoTime();
                     boolean hybench=input.selection().benchmark().equals("hybench");
                     var names=hybench?List.of("ap","tp","xp"):List.copyOf(object(input.nativeConfig(),"workloads").keySet());
-                    int remaining=hybench?2:names.size();long rawPrefix=0;double projectionSeconds=0;
+                    int remaining=(int)names.stream().filter(name->budgetStage(input.document(),input.selection().benchmark(),name)).count();
+                    long rawPrefix=0;double projectionSeconds=0;
                     Path workloads=Files.createDirectory(out.resolve("workload"));
                     for(String name:names) {
                         Path stageRoot=Files.createDirectory(workloads.resolve(name));
-                        boolean setup=hybench&&name.equals("ap");
-                        budget.begin(name,setup?0:remaining--,null);
+                        boolean supplies=budgetStage(input.document(),input.selection().benchmark(),name);
+                        trace.queryStage(queryStage(input.selection().benchmark(),name));
+                        budget.begin(name,supplies?remaining--:0,null);
                         int batch=0;
                         do {
                             budget.checkTime();long before=budget.count();
@@ -265,8 +293,8 @@ public final class Generation {
                             projectionSeconds+=seconds(projectionStart);
                             // The window's facts and receipts are projected and checked; they are not retained.
                             Files.delete(raw);deleteTree(window.resolve("clients"));deleteTree(window.resolve("receipts"));
-                            if(budget.enabled()&&!setup)budget.requireProgress(before);
-                        } while(budget.enabled()&&!setup&&!budget.reached());
+                            if(budget.enabled()&&supplies)budget.requireProgress(before);
+                        } while(budget.enabled()&&supplies&&!budget.reached());
                         budget.end();
                     }
                     timings.put("workload_and_projection_seconds",seconds(workloadStart));
@@ -303,8 +331,12 @@ public final class Generation {
 
     /** The run's effective runtime, engine and benchmark settings, recorded before the engine starts. */
     static Map<String,Object> effectiveConfig(Plan plan,Input input) {
+        var benchmark=new LinkedHashMap<>(input.document());
+        var trace=new LinkedHashMap<>(input.document().containsKey("trace")?object(input.document(),"trace"):Map.<String,Object>of());
+        trace.put("secondary_indexes",secondaryIndexes(input.document()));
+        trace.put("export_queries",exportQueries(input.document()));benchmark.put("trace",trace);
         return Map.of("runtime",plan.runtime(),"engine_settings",plan.engines().get(input.selection().engine()).settings(),
-                "benchmark",input.document(),"mode",input.selection().mode(),"engine",input.selection().engine());
+                "benchmark",benchmark,"mode",input.selection().mode(),"engine",input.selection().engine());
     }
 
     private static double seconds(long start){return (System.nanoTime()-start)/1e9;}

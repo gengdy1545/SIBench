@@ -32,6 +32,7 @@ native:
     oltp_point_select:
       events: 1404403
 trace:
+  export_queries: false
   secondary_indexes: false
   workload_requests: 10000000
 artifacts:

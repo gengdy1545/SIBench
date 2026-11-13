@@ -31,15 +31,16 @@ public final class DuckDbTrace implements AutoCloseable {
     private long unitCount,commits,aborts,localSearches,statements;
     private int windows;
     private boolean finished;
+    private boolean queryStage;
 
     long lastVersion() { return commits+aborts; }
 
 
     public DuckDbTrace(Mode mode,SourceSchema source,Path directory,boolean secondaryIndexes)throws IOException {
-        this(mode,source,directory,secondaryIndexes,null);
+        this(mode,source,directory,secondaryIndexes,false,null);
     }
 
-    DuckDbTrace(Mode mode,SourceSchema source,Path directory,boolean secondaryIndexes,RequestBudget budget)throws IOException {
+    DuckDbTrace(Mode mode,SourceSchema source,Path directory,boolean secondaryIndexes,boolean exportQueries,RequestBudget budget)throws IOException {
         if(mode!=Mode.CAPTURE || source.benchmark().equals("ycsb"))
             throw new IllegalArgumentException("Unsupported native benchmark mode");
         this.secondaryIndexes=secondaryIndexes;this.mode=mode;this.directory=directory;catalog=IndexCatalog.duckDbDefinitions(source);
@@ -48,8 +49,10 @@ public final class DuckDbTrace implements AutoCloseable {
         Files.createDirectory(directory);
         Files.writeString(directory.resolve("INCOMPLETE"),"Native trace generation/publication pending\n",StandardOpenOption.CREATE_NEW);
         units=WorkUnits.create(directory);
-        workload=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,budget);
+        workload=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,exportQueries,budget);
     }
+
+    void queryStage(boolean value) { queryStage=value; }
 
     public void baseline(Connection database,Map<String,Long> expected)throws SQLException,IOException {
         var writer=new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"),secondaryIndexes);base=writer;
@@ -83,6 +86,7 @@ public final class DuckDbTrace implements AutoCloseable {
         long before=lastVersion(),baseUnit=unitCount;
         long[] origins=origins(database);
         IndexOperationTrace.Consumer output=operation->{
+            if(queryStage&&operation.kind()==IndexOperationTrace.TRANSACTION_BEGIN)workload.expectQuery();
             if(!IndexOperationTrace.isControl(operation)) {
                 int unit=Arrays.binarySearch(origins,1,origins.length,operation.sourceEvent());
                 if(unit<1)throw new IOException("Operation has no exact native source origin");

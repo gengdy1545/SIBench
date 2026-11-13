@@ -18,12 +18,13 @@ final class RocksTrace implements AutoCloseable {
     private final WorkUnits.Output units;
     private long commits, aborts, searches, changes, version;
     private boolean baselineClosed, closed;
+    private boolean independentReads;
 
     RocksTrace(Path directory, SourceSchema source, boolean secondaryIndexes) throws IOException {
-        this(directory, source, secondaryIndexes, null);
+        this(directory, source, secondaryIndexes, false, null);
     }
 
-    RocksTrace(Path directory, SourceSchema source, boolean secondaryIndexes, RequestBudget budget) throws IOException {
+    RocksTrace(Path directory, SourceSchema source, boolean secondaryIndexes, boolean exportQueries, RequestBudget budget) throws IOException {
         this.directory = directory;
         var catalog = IndexCatalog.fromSchema(source);
         manifest = new LinkedHashMap<>(IndexCatalog.provenance(source, catalog.definitions()));
@@ -31,12 +32,13 @@ final class RocksTrace implements AutoCloseable {
         Files.createDirectory(directory);
         Files.writeString(directory.resolve("INCOMPLETE"), "Native generation/publication pending\n", StandardOpenOption.CREATE_NEW);
         baseline = new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"),secondaryIndexes);
-        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,budget);
+        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,exportQueries,budget);
         units = WorkUnits.create(directory);
         manifest.put("output", "proto"); manifest.put("value_kinds", List.of("row_id"));
         manifest.put("mode", "api"); manifest.put("generation", "native_rocksdb");
         manifest.put("secondary_index_coverage", secondaryIndexes ? "all_source_definitions" : "primary_only");
     }
+    void independentReads(boolean value) { independentReads=value; }
     void baseline(RocksDbRows.Row row) throws IOException {
         IndexMutation.emit(write(0, INSERT, 1, 0, IndexKey.ofText(row.key()), 0, 0, 0, row.id())
                 .withWorkUnitId(1 + baseline.count() / BLOCK_RECORDS), Map.of(), Map.of(), baseline);
@@ -51,6 +53,7 @@ final class RocksTrace implements AutoCloseable {
             throw new IOException("Invalid RocksDB source publication order");
         version = event.version();
         units.lines().write("{\"work_unit_id\":" + version + ",\"source_event\":" + version + "}\n");
+        if(independentReads&&(event.kind().equals("read")||event.kind().equals("scan")))workload.expectQuery();
         workload.accept(transaction(0, TRANSACTION_BEGIN, version, version, 0));
         long writes = 0;
         if (event.kind().equals("read") || event.kind().equals("scan")) {

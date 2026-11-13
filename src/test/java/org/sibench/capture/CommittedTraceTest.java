@@ -29,6 +29,74 @@ public class CommittedTraceTest {
                 .withTransaction(tx, ordinal).withWorkUnitId(tx).withExpansion(0, 1);
     }
 
+    @Test public void querySwitchKeepsMixedAndUnclassifiedReadsAndCountsOnlyExportedOperations() throws Exception {
+        for(boolean queries : List.of(false,true)) {
+            var file=temporary.getRoot().toPath().resolve("queries-"+queries+".pb.zst");
+            var budget=new RequestBudget(3,Duration.ofSeconds(10));
+            budget.begin("workload",1,null);
+            var writer=new ProtoTrace.Writer(file,true,queries,budget);
+            try(writer) {
+                writer.expectQuery();
+                writer.accept(transaction(0,TRANSACTION_BEGIN,1,1,0));
+                for(int i=0;i<2;i++)writer.accept(search(10,1,0,Range.equal(IndexKey.ofInt(i+1)),null,0,1,
+                        SNAPSHOT_SEARCH|UNION_GROUP,i,2).withTransaction(1,0).withWorkUnitId(1));
+                writer.accept(transaction(0,TRANSACTION_COMMIT,1,1,0));
+                assertEquals(queries?2:0,budget.count());
+
+                writer.accept(transaction(0,TRANSACTION_BEGIN,2,2,0));
+                writer.accept(read(2,1,0)); // A committed-snapshot lookup needed before a write.
+                writer.accept(write(2,1,20));
+                writer.accept(write(2,2,30)); // The final write replaces the earlier same-key write.
+                writer.accept(search(10,1,0,Range.equal(IndexKey.ofInt(1)),1,1,TRANSACTION_LOCAL_SEARCH)
+                        .withTransaction(2,2).withVersion(2).withWorkUnitId(2));
+                writer.accept(transaction(0,TRANSACTION_COMMIT,2,2,2));
+
+                // A zero-row UPDATE or an unknown source can have reads without any row-change fact.
+                writer.accept(transaction(0,TRANSACTION_BEGIN,3,3,0));
+                writer.accept(read(3,2,0));
+                writer.accept(transaction(0,TRANSACTION_COMMIT,3,3,0));
+
+                writer.expectAbort();writer.expectQuery();
+                writer.accept(transaction(0,TRANSACTION_BEGIN,4,4,0));
+                writer.accept(read(4,3,0));
+                writer.accept(transaction(0,TRANSACTION_ABORT,4,4,0));
+            }
+            budget.end();
+            assertEquals(queries?5:3,budget.count());
+            assertEquals(queries?2L:0L,budget.finish().get("overshoot_requests"));
+            var decoded=new ArrayList<Operation>();
+            ProtoTrace.read(file,writer.sha256(),writer.logicalSha256(),decoded::add);
+            assertEquals(queries?4:2,decoded.stream().filter(o->o.kind()==SEARCH).count());
+            assertEquals(1,decoded.stream().filter(IndexOperationTrace::isMutation).count());
+            assertEquals(30,decoded.stream().filter(IndexOperationTrace::isMutation).findFirst().orElseThrow().rowId());
+            assertTrue(decoded.stream().noneMatch(o->o.transactionId()==4||(o.flags()&TRANSACTION_LOCAL_SEARCH)!=0));
+            var statistics=(Map<?,?>)writer.statistics().get("source_projection");
+            assertEquals(queries?0L:2L,statistics.get("excluded_query_search_members"));
+            assertEquals(1L,statistics.get("excluded_local_search_members"));
+            assertEquals(1L,statistics.get("coalesced_writes"));
+        }
+    }
+
+    @Test public void queryClassificationCannotHideWritesIncompleteTransactionsOrBrokenGroups() throws Exception {
+        for(boolean queries:List.of(false,true)) {
+            var projection=new CommittedOperations(ignored->{},queries);
+            projection.expectQuery();
+            assertThrows(IOException.class,projection::expectQuery);
+            assertThrows(IOException.class,projection::finish);
+            projection.accept(transaction(0,TRANSACTION_BEGIN,1,1,0));
+            assertThrows(IOException.class,projection::expectQuery);
+            assertThrows(IOException.class,()->projection.accept(write(1,1,20)));
+            assertThrows(IOException.class,projection::finish);
+
+            var grouped=new CommittedOperations(ignored->{},queries);
+            grouped.expectQuery();
+            grouped.accept(transaction(0,TRANSACTION_BEGIN,1,1,0));
+            grouped.accept(search(10,1,0,Range.equal(IndexKey.ofInt(1)),null,0,1,
+                    SNAPSHOT_SEARCH|INTERSECT_GROUP,0,2).withTransaction(1,0).withWorkUnitId(1));
+            assertThrows(IOException.class,()->grouped.accept(transaction(0,TRANSACTION_COMMIT,1,1,0)));
+        }
+    }
+
     @Test public void onlyCommittedTransactionsReachTheTraceAndRequestBudget() throws Exception {
         Path file = temporary.getRoot().toPath().resolve("committed.pb.zst");
         var budget = new RequestBudget(3, Duration.ofSeconds(10));

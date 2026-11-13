@@ -11,6 +11,9 @@ import org.sibench.trace.TraceManifest;
 /** Explicit real upstream A/B/C/F/D/E generation and independent replay; the native database is discarded. */
 public class RocksGenerationCheck {
     @Test public void upstreamApiExportsFinalTraceWithoutNativeData() throws Exception {
+        for(boolean queries:List.of(false,true))generate(queries);
+    }
+    private void generate(boolean queries) throws Exception {
         Path root = Path.of("").toRealPath();
         String runtime = System.getProperty("sibench.rocksdb.build"), client = System.getProperty("sibench.ycsb.build");
         assertNotNull("Set sibench.rocksdb.build", runtime); assertNotNull("Set sibench.ycsb.build", client);
@@ -20,7 +23,7 @@ public class RocksGenerationCheck {
         var workloads = object(n, "workloads");
         for (String name : workloads.keySet()) { var workload = object(workloads, name); workload.put("operationcount", 320); workloads.put(name, workload); }
         n.put("workloads", workloads); document.put("native", n);
-        document.put("trace", Map.of("secondary_indexes", false, "workload_requests", 2400));
+        document.put("trace", Map.of("secondary_indexes", false, "export_queries", queries, "workload_requests", 2400));
         document.put("artifacts", Map.of("directory", root.relativize(run.resolve("generated")).toString()));
         var json = new GsonBuilder().setPrettyPrinting().create();
         Path profile = run.resolve("profile.json"); Files.writeString(profile, json.toJson(document));
@@ -36,6 +39,25 @@ public class RocksGenerationCheck {
         var budget=object(object(result,"source_evidence"),"request_budget");
         assertTrue(((Number)budget.get("effective_requests")).longValue()>=2400);
         assertEquals(6,object(budget,"stages").size());
+        var query=object(object(budget,"stages"),"workloadc");
+        assertEquals(queries,((Number)query.get("effective_requests")).longValue()>0);
+        assertEquals(queries,((Number)query.get("target_requests")).longValue()>0);
+        assertTrue(Files.isRegularFile(run.resolve("generated/workloadc/batch-0/summary.json")));
+        if(!queries)assertFalse(Files.exists(run.resolve("generated/workloadc/batch-1")));
+        long independentReads=0;
+        for(String name:workloads.keySet())if(!name.equals("workloadf")) {
+            try(var batches=Files.list(run.resolve("generated/"+name))) {
+                for(Path batch:batches.toList()) {
+                    var summary=parse(Files.readString(batch.resolve("summary.json")));
+                    for(String kind:List.of("READ","SCAN"))if(summary.containsKey(kind))
+                        independentReads+=((Number)object(summary,kind).get("Operations")).longValue();
+                }
+            }
+        }
+        var files=(List<?>)object(result,"proto_files").get("workload");
+        @SuppressWarnings("unchecked") var file=(Map<String,Object>)files.get(0);
+        var projection=object(object(file,"statistics"),"source_projection");
+        assertEquals(queries?0:independentReads,((Number)projection.get("excluded_query_search_members")).longValue());
         assertTrue(Files.exists(run.resolve("generated/workloada/batch-1")));
         Path trace = run.resolve("generated/trace");
         assertFalse(Files.exists(trace.resolve("INCOMPLETE")));

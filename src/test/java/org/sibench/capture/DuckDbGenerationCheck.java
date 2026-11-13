@@ -21,6 +21,41 @@ import org.yaml.snakeyaml.Yaml;
 /** Real capture-source generation using the configured dispatcher and portable consumers. */
 public class DuckDbGenerationCheck {
     @Rule public Timeout timeout=Timeout.seconds(600);
+    @Test public void queryFilteringPreservesRealCaptureSupplyUnderBothSettings() throws Exception {
+        Path root=Path.of("").toRealPath();
+        String client=System.getProperty("sibench.sysbench.build"),host=System.getProperty("sibench.duckdb.host");
+        assertNotNull(client);assertNotNull(host);
+        for(boolean queries:List.of(false,true)) {
+            Path output=Files.createTempDirectory(root.resolve("results/capture"),"duckdb-query-budget-");
+            var document=DuckDbGenerationTest.profile("sysbench");var n=object(document,"native");
+            n.put("tables",2);n.put("table-size",512);n.put("prepare_threads",2);n.put("threads",2);
+            n.put("timeout_minutes",2);n.put("build_directory",client);
+            var workloads=new LinkedHashMap<String,Object>();
+            for(String name:object(n,"workloads").keySet())workloads.put(name,Map.of("events",10));
+            n.put("workloads",workloads);document.put("native",n);
+            document.put("trace",Map.of("secondary_indexes",false,"export_queries",queries,"workload_requests",1000));
+            document.put("artifacts",Map.of("directory",root.relativize(output.resolve("generated")).toString()));
+            var yaml=new Yaml();Path profile=output.resolve("profile.yaml"),engine=output.resolve("duckdb.yaml"),runtime=output.resolve("runtime.yaml");
+            Files.writeString(profile,yaml.dump(document));
+            Files.writeString(engine,yaml.dump(Map.of("schema_version",1,"purpose","engine","engine","duckdb",
+                    "build_directory",Path.of(host).getParent().toString(),"memory_limit","1GiB","threads",2)));
+            Files.writeString(runtime,yaml.dump(Map.of("schema_version",1,"purpose","sibench",
+                    "benchmarks",List.of(Map.of("config",profile.toString(),"mode","capture","engine","duckdb")),
+                    "engines",Map.of("duckdb",engine.toString()))));
+            var result=Generation.run(root,runtime).get(0);
+            var budget=object(object(result,"source_evidence"),"request_budget");
+            assertTrue(((Number)budget.get("effective_requests")).longValue()>=1000);
+            var query=object(object(budget,"stages"),"oltp_point_select");
+            assertEquals(queries,((Number)query.get("effective_requests")).longValue()>0);
+            assertEquals(queries,((Number)query.get("target_requests")).longValue()>0);
+            assertTrue(Files.isDirectory(output.resolve("generated/workload/oltp_point_select/batch-0")));
+            if(!queries)assertFalse(Files.exists(output.resolve("generated/workload/oltp_point_select/batch-1")));
+            assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
+                    new ReplayConfig(false,0,0,0,0,"operation"),output.resolve("reference.json")).get("status"));
+            assertFalse(Files.exists(output.resolve("generated/data")));
+        }
+    }
+
     @Test public void generatesTheCaptureSuitesAndReplaysRelocatedTraces()throws Exception {
         Path root=Path.of("").toRealPath();String retained=System.getProperty("sibench.generation.output");
         Files.createDirectories(root.resolve("results/capture"));

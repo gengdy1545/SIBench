@@ -108,7 +108,7 @@ java -jar build/sibench/sibench.jar generate config/sibench.yaml
 
 For a live PostgreSQL → sink → Pixels Trace, use `java -jar build/sibench/sibench.jar generate-pixels config/sibench.yaml`. This command uses the selected HyBench profile and `engines.pixels`, independently of the native engine selection. It starts a separate uninstrumented source PostgreSQL and fresh Pixels state loaded from the same CSVs. It does not invoke native PG capture. Choose a fresh `artifacts.directory` for each run; native and Pixels outputs cannot share an existing directory.
 
-`trace.workload_requests` limits exported workload operations; it excludes the baseline and may be exceeded by already admitted source work. `trace.secondary_indexes` defaults to false. See [generation and publication](docs/trace.md#native-publication) for source phases, request accounting, index selection and failure behavior.
+`trace.export_queries` defaults to false, filtering identified independent queries while retaining write-path and unclassified reads. `trace.workload_requests` sets the minimum exported workload operations under either query setting; it excludes the baseline and may be exceeded by already admitted source work. `trace.secondary_indexes` defaults to false. See [generation and publication](docs/trace.md#native-publication) for filtering coverage, source phases, request accounting, index selection and failure behavior.
 
 For repeated Pixels runs, configure [Pixels COS storage](docs/pixels-experiment.md#prepare-once-restore-for-each-run), prepare reusable inputs, then run a fresh experiment:
 

@@ -231,19 +231,19 @@ public class ProtoTraceTest {
 
     @Test public void capturedAbortStillRejectsInvalidFactsAndContradictoryOutcomes() throws Exception {
         var begin = IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0);
-        var future = new CommittedOperations(operation -> fail("No aborted source operation may be exported"));
+        var future = new CommittedOperations(operation -> fail("No aborted source operation may be exported"), false);
         future.expectAbort();
         future.accept(begin);
         assertThrows(IOException.class, () -> future.accept(IndexOperationTrace.search(1, 1, 0,
                 IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 1, 0, IndexOperationTrace.SNAPSHOT_SEARCH)
                 .withTransaction(1, 0)));
-        var expansion = new CommittedOperations(operation -> fail("No aborted source operation may be exported"));
+        var expansion = new CommittedOperations(operation -> fail("No aborted source operation may be exported"), false);
         expansion.expectAbort();
         expansion.accept(begin);
         expansion.accept(write(IndexOperationTrace.UPSERT, 2, 1, 1).withExpansion(0, 2));
         assertThrows(IOException.class, () -> expansion.accept(IndexOperationTrace.transaction(
                 0, IndexOperationTrace.TRANSACTION_ABORT, 1, 1, 1)));
-        var outcome = new CommittedOperations(operation -> fail("No aborted source operation may be exported"));
+        var outcome = new CommittedOperations(operation -> fail("No aborted source operation may be exported"), false);
         outcome.expectAbort();
         assertThrows(IOException.class, outcome::expectAbort);
         assertThrows(IOException.class, outcome::finish);

@@ -27,7 +27,7 @@ final class RocksGeneration {
         json(out.resolve("engine-build.json"), build.identity()); json(out.resolve("client-build.json"), input.buildIdentity());
         var stages = new LinkedHashMap<String, Object>();
         var budget = new RequestBudget(Generation.requestTarget(input.document()),input.timeout());
-        try (var trace = new RocksTrace(out.resolve("trace"), input.source(), Generation.secondaryIndexes(input.document()),budget)) {
+        try (var trace = new RocksTrace(out.resolve("trace"), input.source(), Generation.secondaryIndexes(input.document()),Generation.exportQueries(input.document()),budget)) {
             long closeStarted;
             var rows = new RocksDbRows(out.resolve("database"), fields, settings, trace::event);
             try (rows) {
@@ -42,10 +42,14 @@ final class RocksGeneration {
                     rows.finishLoad(); trace.finishBaseline(expected);
                     timings.put("baseline_generation_load_export_seconds", seconds(load));
                     long workload = System.nanoTime(), records = expected;
-                    int remaining = object(n,"workloads").size();
+                    int remaining = (int)object(n,"workloads").keySet().stream()
+                            .filter(name->Generation.budgetStage(input.document(),"ycsb",name)).count();
                     for (String name : object(n, "workloads").keySet()) {
                         Path stageRoot=Files.createDirectory(out.resolve(name));
-                        budget.begin(name,remaining--,null);
+                        boolean supplies=Generation.budgetStage(input.document(),"ycsb",name);
+                        // shortcut: retain F reads until the client exposes a shared read-modify-write identity.
+                        trace.independentReads(!name.equals("workloadf"));
+                        budget.begin(name,supplies?remaining--:0,null);
                         var batches=new ArrayList<Map<String,Object>>();
                         do {
                             budget.checkTime();
@@ -54,8 +58,8 @@ final class RocksGeneration {
                             var result = stage(plan,input,binding,name,records,stageRoot.resolve("batch-"+batches.size()),budget);
                             batches.add(result);
                             records+=((Number)result.get("inserted")).longValue();
-                            if(budget.enabled())budget.requireProgress(before);
-                        } while(budget.enabled()&&!budget.reached());
+                            if(budget.enabled()&&supplies)budget.requireProgress(before);
+                        } while(budget.enabled()&&supplies&&!budget.reached());
                         budget.end();stages.put(name,batches);
                     }
                     json(out.resolve("request-budget.json"),budget.finish());

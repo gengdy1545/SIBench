@@ -34,6 +34,7 @@ native:
       properties:
         readallfields: false
 trace:
+  export_queries: false
   secondary_indexes: false
   workload_requests: 10000000
 artifacts:

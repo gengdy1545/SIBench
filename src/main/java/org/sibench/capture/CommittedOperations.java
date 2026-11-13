@@ -15,6 +15,7 @@ import static org.sibench.capture.IndexOperationTrace.*;
 final class CommittedOperations {
     static final int MAX_TRANSACTION_OPERATIONS = 1_000_000;
     private final Consumer output;
+    private final boolean exportQueries;
     private final ArrayList<Operation> pending = new ArrayList<>();
     private record Entry(int table, int index, IndexKey indexedValue, IndexKey primaryKey) {
         Entry(Operation operation) { this(operation.table(), operation.index(), operation.indexedValue(), operation.key()); }
@@ -24,9 +25,19 @@ final class CommittedOperations {
     private Operation begin, mutation, previousExpansion, searchGroup;
     private int expansionMembers, searchMembers;
     private long abortedTransactions, abortedWrites, abortedSearches, localSearches, coalescedWrites, peakBuffered;
-    private boolean knownAbort;
+    private long querySearches;
+    private boolean knownAbort, knownQuery;
 
-    CommittedOperations(Consumer output) { this.output = output; }
+    CommittedOperations(Consumer output, boolean exportQueries) {
+        this.output = output;
+        this.exportQueries = exportQueries;
+    }
+
+    /** Only a source boundary that certifies an independent query may supply this hint. */
+    void expectQuery() throws IOException {
+        if (transaction != 0 || knownQuery) throw new IOException("Query classification must precede its transaction");
+        knownQuery = true;
+    }
 
     void expectAbort() throws IOException {
         if (transaction != 0 || knownAbort) throw new IOException("Source outcome must precede its transaction");
@@ -37,6 +48,8 @@ final class CommittedOperations {
         validate(operation);
         if (knownAbort && transaction == 0 && operation.kind() != TRANSACTION_BEGIN)
             throw new IOException("Captured Abort requires a source transaction begin");
+        if (knownQuery && transaction == 0 && operation.kind() != TRANSACTION_BEGIN)
+            throw new IOException("Query classification requires a source transaction begin");
         if (operation.kind() == INSERT && operation.version() != 0)
             throw new IOException("Baseline requires timestamp zero");
         if (isControl(operation)) {
@@ -68,6 +81,7 @@ final class CommittedOperations {
                 else abortedSearches++;
             } else abortedWrites++;
         }
+        else if (knownQuery && !exportQueries && operation.kind() == SEARCH) querySearches++;
         // Operations held for the outcome count against the limit, even when dropped or superseded early.
         else if (sourceOperations++ >= MAX_TRANSACTION_OPERATIONS)
             throw new IOException("Source transaction exceeds operation buffer limit");
@@ -130,9 +144,11 @@ final class CommittedOperations {
         lastVersion = transaction;
         transaction = 0;
         knownAbort = false;
+        knownQuery = false;
     }
 
     private void mutation(Operation operation) throws IOException {
+        if (knownQuery) throw new IOException("An independent query changed source rows");
         if (transaction == 0 || operation.transactionId() != transaction || operation.version() != transaction
                 || operation.mutationOrdinal() < 1)
             throw new IOException("Mutation missing matching source group/version");
@@ -205,7 +221,8 @@ final class CommittedOperations {
     }
 
     void finish() throws IOException {
-        if (transaction != 0 || searchGroup != null || knownAbort) throw new IOException("Incomplete source transaction or search group");
+        if (transaction != 0 || searchGroup != null || knownAbort || knownQuery)
+            throw new IOException("Incomplete source transaction or search group");
     }
 
     long lastCommittedVersion() { return lastCommittedVersion; }
@@ -214,6 +231,7 @@ final class CommittedOperations {
         return Map.of("excluded_aborted_transactions", abortedTransactions,
                 "excluded_aborted_writes", abortedWrites, "excluded_aborted_search_members", abortedSearches,
                 "excluded_local_search_members", localSearches,
+                "excluded_query_search_members", querySearches,
                 "coalesced_writes", coalescedWrites, "peak_buffered_operations", peakBuffered);
     }
 }
