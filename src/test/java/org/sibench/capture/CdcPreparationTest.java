@@ -12,13 +12,13 @@ import org.junit.rules.TemporaryFolder;
 public class CdcPreparationTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
-    @Test public void rejectsMissingCdcSelectionBeforeLookingForNativeBuilds() throws Exception {
+    @Test public void rejectsMissingHybenchSelectionBeforeLookingForNativeBuilds() throws Exception {
         Path root = Path.of("").toRealPath(), config = temporary.newFile().toPath();
         Files.writeString(config, new org.yaml.snakeyaml.Yaml().dump(Map.of("schema_version", 1, "purpose", "sibench",
                 "benchmarks", List.of(Map.of("config", "config/benchmark/ycsb.yaml", "mode", "api", "engine", "rocksdb")),
                 "engines", Map.of("rocksdb", "/missing/engine-config.yaml"))));
         var failure = assertThrows(IllegalArgumentException.class, () -> CdcPreparation.run(root, config, Path.of("/missing/csv-input")));
-        assertTrue(failure.getMessage(), failure.getMessage().contains("prepare-cdc requires one HyBench/cdc/Pixels selection"));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("requires one HyBench benchmark selection"));
     }
 
     @Test public void protoFileLimitIsAValidatedEngineOverride() {

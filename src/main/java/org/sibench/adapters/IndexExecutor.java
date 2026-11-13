@@ -11,21 +11,17 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 
 /** Concurrent index calls; a successful response follows visible application, without transactions. */
 public final class IndexExecutor implements AutoCloseable, IndexExecution.Executor {
-    static final long FLUSH_TIMEOUT_SECONDS = 3600;
     private final IndexBackend backend;
     private final ExecutorService writers, readers;
     private final java.util.concurrent.ScheduledExecutorService maintenance;
     private long changes, persisted;
     private IOException maintenanceFailure;
     private final Set<CompletableFuture<IndexResponse>> pending = new HashSet<>();
-    private final ReentrantLock flushLock = new ReentrantLock();
     private boolean closed;
-    private IOException failure;
 
     public IndexExecutor(IndexBackend backend) {
         this(backend, 5000);
@@ -68,8 +64,6 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
             pool.execute(() -> {
                 IndexResponse result = IndexExecution.execute(backend, request, partial);
                 synchronized (IndexExecutor.this) {
-                    if (result.status() != IndexStatus.OK && failure == null)
-                        failure = new IOException("Accepted request failed: " + result.message());
                     if (result.status() == IndexStatus.OK && write) changes++;
                 }
                 response.complete(result);
@@ -79,9 +73,8 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
         return response;
     }
 
-    /** Background persistence does not wait for unrelated queries or require a client barrier. */
+    /** Background persistence on the single maintenance thread; it requires no client barrier. */
     private void persist() {
-        flushLock.lock();
         try {
             long through;
             synchronized (this) {
@@ -92,7 +85,7 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
             synchronized (this) { persisted = through; }
         } catch (IOException | RuntimeException error) {
             synchronized (this) { maintenanceFailure = new IOException("Background persistence failed", error); }
-        } finally { flushLock.unlock(); }
+        }
     }
 
     synchronized void requireHealthy() throws IOException {
@@ -100,36 +93,7 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
         if (maintenanceFailure != null) throw maintenanceFailure;
     }
 
-    /** Drains calls already accepted, then persists them at the backend's declared durability. */
-    public void flush() throws IOException {
-        flushLock.lock();
-        try {
-            List<CompletableFuture<IndexResponse>> accepted;
-            synchronized (this) {
-                if (closed) throw new IOException("Index executor is closed");
-                accepted = List.copyOf(pending);
-            }
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(FLUSH_TIMEOUT_SECONDS);
-            for (var response : accepted) {
-                try {
-                    response.get(Math.max(1, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
-                } catch (InterruptedException error) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Flush interrupted", error);
-                } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException error) {
-                    throw new IOException("Flush could not complete accepted requests", error);
-                }
-            }
-            synchronized (this) {
-                if (closed) throw new IOException("Index executor is closed");
-                if (failure != null) throw failure;
-                if (maintenanceFailure != null) throw maintenanceFailure;
-            }
-            backend.flush();
-        } finally { flushLock.unlock(); }
-    }
-
-    /** Backend handles may be closed only after workers and an active Flush have exited. */
+    /** Backend handles may be closed only after workers and active persistence have exited. */
     @Override
     public void close() throws IOException {
         Set<CompletableFuture<IndexResponse>> accepted;
@@ -151,9 +115,6 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
             }
             if (!maintenance.awaitTermination(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS))
                 throw new IOException("Persistence shutdown timed out; backend must remain open");
-            if (!flushLock.tryLock(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS))
-                throw new IOException("Flush shutdown timed out; backend must remain open");
-            flushLock.unlock();
             synchronized (this) { if (maintenanceFailure != null) throw maintenanceFailure; }
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();

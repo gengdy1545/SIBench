@@ -18,7 +18,8 @@ public class PixelsPreparationCheck {
         runtime.put("pixels_experiment", experiment);
         Path config = Files.writeString(work.resolve("restore.json"), new com.google.gson.Gson().toJson(runtime));
         Path restored = work.resolve("restored");
-        PixelsExperiment.run(root, config, work.resolve("input"), work.resolve("baseline-cache"), restored);
+        PixelsExperiment.run(root, config, null, work.resolve("baseline-cache"), restored);
+        assertFalse(Files.exists(restored.resolve("input.json")));
         var manifest = com.google.gson.JsonParser.parseString(Files.readString(restored.resolve("trace/manifest.json"))).getAsJsonObject();
         assertEquals(8706, manifest.get("baseline_rows").getAsLong());
         var csv = CsvInput.open(work.resolve("csv"));

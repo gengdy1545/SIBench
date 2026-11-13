@@ -51,12 +51,10 @@ public record BenchmarkSelection(Path config, String benchmark, Mode mode,Engine
             boolean supported = switch (mode) {
                 case API -> benchmark.equals("ycsb") && engine == Engine.ROCKSDB;
                 case CAPTURE -> !benchmark.equals("ycsb") && (engine == Engine.DUCKDB || engine == Engine.POSTGRES);
-                case CDC -> benchmark.equals("hybench") && engine == Engine.PIXELS;
+                case CDC -> false;
             };
             require(supported, "Unsupported benchmark/mode/engine combination: " + benchmark + "/"
                     + string(item, "mode") + "/" + string(item, "engine"));
-            if (mode == Mode.CDC && profile.containsKey("trace"))
-                require(!bool(object(profile,"trace"),"secondary_indexes"), "Pixels CDC supports primary indexes only");
             result.add(new BenchmarkSelection(path, benchmark, mode, engine));
         }
         return List.copyOf(result);
@@ -73,7 +71,7 @@ public record BenchmarkSelection(Path config, String benchmark, Mode mode,Engine
         return switch (string(item, "mode")) {
             case "api" -> Mode.API;
             case "capture" -> Mode.CAPTURE;
-            case "cdc" -> Mode.CDC;
+            case "cdc" -> throw new IllegalArgumentException("Use generate-pixels or prepare-cdc; benchmark selections describe native generation");
             default -> throw new IllegalArgumentException("Unknown benchmark mode: " + string(item, "mode"));
         };
     }

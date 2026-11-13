@@ -37,16 +37,6 @@ public class IndexExecutorTest {
     }
 
     @Test(timeout = 10000)
-    public void flushCannotCertifyAnAcceptedFailedRequest() throws Exception {
-        try (var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("failed"), ValueKind.ROW_ID);
-                var executor = new IndexExecutor(backend)) {
-            var invalid = PutRequest.newBuilder().setTs(-1).build();
-            assertEquals(IndexStatus.INVALID, executor.submit(invalid).get(3, TimeUnit.SECONDS).status());
-            assertThrows(IOException.class, executor::flush);
-        }
-    }
-
-    @Test(timeout = 10000)
     public void closeWaitsForRunningBackendEvenWhenItsResponseIsCancelled() throws Exception {
         var entered = new java.util.concurrent.CountDownLatch(1);
         var release = new java.util.concurrent.CountDownLatch(1);
@@ -84,7 +74,7 @@ public class IndexExecutorTest {
     }
 
     @Test(timeout = 10000)
-    public void aFailureAfterAResultChunkStillFailsTheQueryAndFlush() throws Exception {
+    public void aFailureAfterAResultChunkStillFailsTheQuery() throws Exception {
         int rows = IndexExecution.CHUNK_RESULTS + 5;
         var fail = new java.util.concurrent.atomic.AtomicBoolean();
         var backend = new IndexBackend() {
@@ -122,7 +112,6 @@ public class IndexExecutorTest {
             var rejected = new TraceRequests(ValueKind.ROW_ID).receive(operation, 2);
             rejected.add(chunks.get(0));
             assertThrows(IOException.class, () -> rejected.finish(failed));
-            assertThrows(IOException.class, executor::flush);
         }
     }
 }

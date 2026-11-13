@@ -40,26 +40,10 @@ public final class Generation {
 
     /** Validate every selected input before creating any run output or launching a database. */
     static Plan plan(Path root,Path configuration)throws Exception {
-        return plan(root,configuration,false,null);
-    }
-
-    static Plan cdcPlan(Path root,Path configuration)throws Exception {
-        return plan(root,configuration,true,null);
-    }
-
-    static Plan csvPlan(Path root,Path configuration,Path output)throws Exception {
-        return plan(root,configuration,true,output);
-    }
-
-    private static Plan plan(Path root,Path configuration,boolean prepareCdc,Path csvOutput)throws Exception {
         root=root.toRealPath();var runtime=SibenchConfig.read(root.resolve(configuration));
         var selections=BenchmarkSelection.read(root,runtime);
-        if(prepareCdc) {
-            selections=selections.stream().filter(s->s.benchmark().equals("hybench")&&s.mode()==Mode.CDC).toList();
-            require(selections.size()==1,"prepare-cdc requires one HyBench/cdc/Pixels selection");
-        }
         var engines=new java.util.EnumMap<Engine,NativeBuild>(Engine.class);
-        for(var selection:selections)if(csvOutput==null&&!engines.containsKey(selection.engine())) {
+        for(var selection:selections)if(!engines.containsKey(selection.engine())) {
             Engine engine=selection.engine();var settings=SibenchConfig.engine(root,runtime,engine);
             Path build=NativeBuildCheck.engineDirectory(root,settings,engine.configName()).toRealPath();
             var identity=switch(engine) {
@@ -69,10 +53,25 @@ public final class Generation {
                 }
                 case POSTGRES -> NativeBuildCheck.verifyPostgres(root,build);
                 case ROCKSDB -> NativeBuildCheck.verifyRocks(root,build);
-                case PIXELS -> PixelsBuild.verify(root,build);
+                case PIXELS -> throw new IllegalArgumentException("Use generate-pixels for PG-to-Pixels generation");
             };
             engines.put(engine,new NativeBuild(build,identity,settings));
         }
+        return inputs(root,runtime,selections,engines,null);
+    }
+
+    static BenchmarkSelection hybenchSelection(Path root,Map<String,Object> runtime)throws IOException {
+        return BenchmarkSelection.read(root,runtime).stream().filter(s->s.benchmark().equals("hybench"))
+                .findFirst().orElseThrow(()->new IllegalArgumentException("Preparation requires one HyBench benchmark selection"));
+    }
+
+    static Plan csvPlan(Path root,Path configuration,Path output)throws Exception {
+        root=root.toRealPath();var runtime=SibenchConfig.read(root.resolve(configuration));
+        return inputs(root,runtime,List.of(hybenchSelection(root,runtime)),Map.of(),output);
+    }
+
+    static Plan inputs(Path root,Map<String,Object> runtime,List<BenchmarkSelection> selections,
+            Map<Engine,NativeBuild> engines,Path csvOutput)throws Exception {
         var inputs=new ArrayList<Input>();
         for(var selection:selections) {
             var document=parse(Files.readString(selection.config()));
@@ -182,7 +181,7 @@ public final class Generation {
             case POSTGRES -> PostgresGeneration.generate(plan,input);
             case ROCKSDB -> RocksGeneration.generate(plan,input);
             case DUCKDB -> generate(plan,input);
-            case PIXELS -> PixelsGeneration.generate(plan,input);
+            case PIXELS -> throw new IllegalArgumentException("Use generate-pixels for PG-to-Pixels generation");
         });
         return List.copyOf(reports);
     }

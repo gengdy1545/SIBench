@@ -38,6 +38,73 @@ static CURSORS: OnceLock<[Mutex<HashMap<i64, Arc<Mutex<Cursor>>>>; CURSOR_SHARDS
     OnceLock::new();
 const OWNER: &[u8] = b"SIBench SlateDB byte store\n";
 
+/// SlateDB reports background failures and write backpressure only through `log`. Without a logger
+/// they vanish, so a stalled writer leaves no first error. Each call site prints at most once per
+/// interval, with the number of suppressed repeats, because backpressure warns on every waiting write.
+struct ServerLog {
+    sites: Mutex<HashMap<(&'static str, u32), (Instant, u64)>>,
+}
+
+const LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+static SERVER_LOG: OnceLock<ServerLog> = OnceLock::new();
+
+impl ServerLog {
+    /// The number of suppressed repeats to report, or None while the site is throttled.
+    fn admit(&self, site: (&'static str, u32), now: Instant) -> Option<u64> {
+        let mut sites = self.sites.lock().ok()?;
+        match sites.get_mut(&site) {
+            Some((last, suppressed)) if now.duration_since(*last) < LOG_INTERVAL => {
+                *suppressed += 1;
+                None
+            }
+            Some((last, suppressed)) => {
+                let repeats = *suppressed;
+                *last = now;
+                *suppressed = 0;
+                Some(repeats)
+            }
+            None => {
+                sites.insert(site, (now, 0));
+                Some(0)
+            }
+        }
+    }
+}
+
+impl log::Log for ServerLog {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let site = (record.file_static().unwrap_or("?"), record.line().unwrap_or(0));
+        if let Some(repeats) = self.admit(site, Instant::now()) {
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            eprintln!(
+                "slatedb {epoch} {} {}: {} (suppressed repeats: {repeats})",
+                record.level(),
+                record.target(),
+                record.args()
+            );
+        }
+    }
+    fn flush(&self) {}
+}
+
+fn install_log() {
+    let logger = SERVER_LOG.get_or_init(|| ServerLog {
+        sites: Mutex::default(),
+    });
+    // Another logger in the process already receives these records.
+    if log::set_logger(logger).is_ok() {
+        log::set_max_level(log::LevelFilter::Warn);
+    }
+}
+
 struct Store {
     runtime: Runtime,
     db: Db,
@@ -338,6 +405,7 @@ impl Store {
         mirror: Option<&std::path::Path>,
         create: bool,
     ) -> Result<Self> {
+        install_log();
         let requests = Arc::new(Requests::default());
         let objects: Arc<dyn ObjectStore> = Arc::new(Counted {
             inner: objects,
@@ -795,6 +863,19 @@ mod tests {
     use super::*;
     use slatedb::config::{FlushOptions, FlushType};
     use slatedb::object_store::memory::InMemory;
+
+    /// Backpressure warns per waiting write; each site prints once per interval and then reports its repeats.
+    #[test]
+    fn server_log_throttles_each_call_site() {
+        let log = ServerLog { sites: Mutex::default() };
+        let (start, site, other) = (Instant::now(), ("db.rs", 341), ("flush.rs", 20));
+        assert_eq!(log.admit(site, start), Some(0));
+        assert_eq!(log.admit(site, start + std::time::Duration::from_secs(1)), None);
+        assert_eq!(log.admit(site, start + std::time::Duration::from_secs(2)), None);
+        assert_eq!(log.admit(other, start + std::time::Duration::from_secs(2)), Some(0));
+        assert_eq!(log.admit(site, start + LOG_INTERVAL), Some(2));
+        assert_eq!(log.admit(site, start + LOG_INTERVAL), None);
+    }
 
     fn temporary(name: &str) -> std::path::PathBuf {
         let path =

@@ -150,7 +150,7 @@ public final class DriverCapacityCheck {
                 inputTrace.baseline().read(load);
                 load.finish();
             }
-            executor.flush();
+            backend.flush();
             System.out.println("phase=record records=" + records[0] + " queries=" + queries[0]);
             ReplayTarget.Factory factory = client -> new ServiceClient(requests) {
                 @Override CompletableFuture<IndexResponse> transmit(Message request, java.util.function.Consumer<IndexResponse> partial) throws IOException {

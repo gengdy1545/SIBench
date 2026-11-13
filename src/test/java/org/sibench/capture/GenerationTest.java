@@ -13,6 +13,15 @@ import org.junit.rules.TemporaryFolder;
 public class GenerationTest {
     @Rule public TemporaryFolder temporary=new TemporaryFolder();
 
+    @Test public void preparationSelectsHybenchWithoutRequiringItsNativeOrPixelsEngine()throws Exception {
+        var root=temporary.getRoot().toPath();
+        Files.writeString(root.resolve("hybench.yaml"),"benchmark: hybench\n");
+        var selected=Generation.hybenchSelection(root,Map.of("benchmarks",java.util.List.of(
+                Map.of("config","hybench.yaml","mode","capture","engine","postgres"))));
+        assertEquals("hybench",selected.benchmark());
+        assertEquals(org.sibench.config.Engine.POSTGRES,selected.engine());
+    }
+
     @Test public void failedPublicationRetainsTheClosedDatabase()throws Exception {
         var database=Files.createDirectories(temporary.getRoot().toPath().resolve("database/data"));
         Files.writeString(database.resolve("page"),"state");

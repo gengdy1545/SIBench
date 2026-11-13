@@ -23,6 +23,25 @@ public class PixelsBaselineTest {
         assertEquals("passed", PixelsBaseline.check(root).get("status"));
     }
 
+    /** Binding checks only descriptors; the single conversion read must still reject a same-size change before use. */
+    @Test public void conversionRejectsACsvChangedAfterBinding() throws Exception {
+        var input = CsvInputTest.fixture(temporary.newFolder("csv").toPath());
+        var csv = CsvInput.bind(input.output());
+        var ddl = csv.manifest().getAsJsonObject("source_ddl");
+        var source = org.sibench.schema.SourceSchema.captured(csv.directory().resolve(ddl.get("path").getAsString()),
+                csv.manifest().getAsJsonObject("source_evidence").getAsJsonObject("benchmark_source").get("commit").getAsString(),
+                ddl.get("sha256").getAsString());
+        PixelsBaseline.convert(csv, source, temporary.getRoot().toPath().resolve("ok"), 1000);
+        Path file = input.output().resolve("native/Data_1x/customer.csv");
+        String text = Files.readString(file);
+        int digit = text.indexOf('1');
+        Files.writeString(file, text.substring(0, digit) + '2' + text.substring(digit + 1));
+        var changed = CsvInput.bind(input.output());
+        var failure = assertThrows(java.io.IOException.class, () -> PixelsBaseline.convert(changed, source,
+                temporary.getRoot().toPath().resolve("changed"), 1000));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("CSV changed"));
+    }
+
     @Test public void invalidObjectOwnershipCountsAndTimestampsAreRejected() throws Exception {
         Path root = fixture();
         String original = Files.readString(root.resolve("manifest.json"));
@@ -84,6 +103,7 @@ public class PixelsBaselineTest {
             document.add(field, file);
         }
         document.add("baseline_rows", csv.manifest().get("baseline_rows"));
+        document.add("source_evidence", csv.manifest().get("source_evidence"));
         var inventory = new JsonObject(); inventory.addProperty("max_timestamp", 10); inventory.addProperty("index_buckets", 8);
         var files = new JsonArray();
         for (String table : csv.manifest().getAsJsonObject("baseline_rows").keySet()) {

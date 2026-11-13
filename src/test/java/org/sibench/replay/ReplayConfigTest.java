@@ -35,8 +35,19 @@ public class ReplayConfigTest {
         omittedTimeout.put("replay", omittedReplay);
         assertEquals(60, ReplayConfig.from(omittedTimeout).requestTimeoutSeconds());
         for (int clients : new int[] {64, 128})
-            assertEquals(clients, ReplayConfig.from(parse(template.replace(
-                    "client_count: 64", "client_count: " + clients))).clientCount());
+            assertEquals(clients, ReplayConfig.from(parse(template.replace("client_count: 64", "client_count: " + clients)
+                    .replace("baseline_batch_operations: 64", "baseline_batch_operations: " + 4096 / clients))).clientCount());
+        assertEquals(64, simple.baselineBatchOperations());
+        var omittedBatch = parse(template);
+        var batchReplay = object(omittedBatch, "replay");
+        batchReplay.remove("baseline_batch_operations");
+        omittedBatch.put("replay", batchReplay);
+        assertEquals(ReplayConfig.DEFAULT_BASELINE_BATCH_OPERATIONS, ReplayConfig.from(omittedBatch).baselineBatchOperations());
+        // Every client holding a partial batch must still leave an in-flight slot.
+        for (String invalid : new String[] {"0", "66", "\"64\""})
+            assertThrows(invalid, IllegalArgumentException.class, () -> ReplayConfig.from(parse(
+                    template.replace("baseline_batch_operations: 64", "baseline_batch_operations: " + invalid))));
+        assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(parse(template.replace("client_count: 64", "client_count: 128"))));
         assertEquals("operation", simple.dispatchMode());
         assertEquals(
                 "operation",
@@ -58,6 +69,7 @@ public class ReplayConfigTest {
         var longDocument = parse(template);
         var replay = object(longDocument, "replay");
         replay.put("client_count", 128);
+        replay.put("baseline_batch_operations", 32);
         replay.put("trace_budget", Map.of("duration_seconds", 1800,
                 "planned_operations_per_second", 300000,
                 "warmup_operations", 18000000, "reserve_percent", 20));

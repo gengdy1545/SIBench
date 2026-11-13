@@ -206,6 +206,53 @@ public class ProtoTraceTest {
         assertEquals(1L, budget.finish().get("overshoot_requests"));
     }
 
+    @Test public void capturedAbortValidatesMoreThanAMillionReadsWithoutBufferingOrExporting() throws Exception {
+        var writer = new ProtoTrace.Writer(temporary.getRoot().toPath().resolve("large-abort.pb.zst"));
+        var search = IndexOperationTrace.search(2, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 0, 0, 0)
+                .withTransaction(1, 0).withWorkUnitId(1);
+        int count = ProtoTrace.MAX_TRANSACTION_OPERATIONS + 1;
+        try (writer) {
+            writer.expectAbort();
+            writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
+            for (int i = 0; i < count; i++) writer.accept(search);
+            writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_ABORT, 1, 1, 0));
+            // The known outcome applies to exactly one source transaction.
+            writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 2, 2, 0));
+            writer.accept(IndexOperationTrace.search(3, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)),
+                    0, 0, IndexOperationTrace.SNAPSHOT_SEARCH).withTransaction(2, 0).withWorkUnitId(2));
+            writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 2, 2, 0));
+        }
+        assertEquals(3, writer.count());
+        var statistics = (Map<?, ?>) writer.statistics().get("source_projection");
+        assertEquals((long) count, statistics.get("excluded_aborted_search_members"));
+        assertEquals(1L, statistics.get("peak_buffered_operations"));
+        assertEquals(1L, statistics.get("excluded_aborted_transactions"));
+    }
+
+    @Test public void capturedAbortStillRejectsInvalidFactsAndContradictoryOutcomes() throws Exception {
+        var begin = IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0);
+        var future = new CommittedOperations(operation -> fail("No aborted source operation may be exported"));
+        future.expectAbort();
+        future.accept(begin);
+        assertThrows(IOException.class, () -> future.accept(IndexOperationTrace.search(1, 1, 0,
+                IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 1, 0, IndexOperationTrace.SNAPSHOT_SEARCH)
+                .withTransaction(1, 0)));
+        var expansion = new CommittedOperations(operation -> fail("No aborted source operation may be exported"));
+        expansion.expectAbort();
+        expansion.accept(begin);
+        expansion.accept(write(IndexOperationTrace.UPSERT, 2, 1, 1).withExpansion(0, 2));
+        assertThrows(IOException.class, () -> expansion.accept(IndexOperationTrace.transaction(
+                0, IndexOperationTrace.TRANSACTION_ABORT, 1, 1, 1)));
+        var outcome = new CommittedOperations(operation -> fail("No aborted source operation may be exported"));
+        outcome.expectAbort();
+        assertThrows(IOException.class, outcome::expectAbort);
+        assertThrows(IOException.class, outcome::finish);
+        outcome.accept(begin);
+        assertThrows(IOException.class, outcome::expectAbort);
+        assertThrows(IOException.class, () -> outcome.accept(IndexOperationTrace.transaction(
+                0, IndexOperationTrace.TRANSACTION_COMMIT, 1, 1, 0)));
+    }
+
     @Test public void primaryExportKeepsTransactionsAndWholeGroupsWithSeparateCounts() throws Exception {
         for (boolean secondary : List.of(false, true)) {
             Path file = temporary.getRoot().toPath().resolve("scope-" + secondary + ".pb.zst");
@@ -372,10 +419,12 @@ public class ProtoTraceTest {
     public void interleavedSupersededWritesLeaveFinalWritesInTheirLastSourceOrder() throws Exception {
         // Keys 1,2,1,3,2: the survivors are ordinals 3, 4 and 5, in that order.
         int[] keys = {1, 2, 1, 3, 2};
-        for (boolean aborted : List.of(false, true)) {
-            Path file = temporary.getRoot().toPath().resolve("superseded-" + aborted + ".pb.zst");
+        for (int outcome = 0; outcome < 3; outcome++) {
+            boolean aborted = outcome != 0;
+            Path file = temporary.getRoot().toPath().resolve("superseded-" + outcome + ".pb.zst");
             var writer = new ProtoTrace.Writer(file);
             try (writer) {
+                if (outcome == 2) writer.expectAbort();
                 writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
                 for (int i = 0; i < keys.length; i++)
                     writer.append(IndexOperationTrace.write(10 + i, IndexOperationTrace.UPSERT, 1, 0,
@@ -394,7 +443,7 @@ public class ProtoTraceTest {
             var filtered = (Map<?, ?>) writer.statistics().get("source_projection");
             assertEquals(aborted ? 5L : 0L, filtered.get("excluded_aborted_writes"));
             assertEquals(aborted ? 0L : 2L, filtered.get("coalesced_writes"));
-            assertEquals(5L, filtered.get("peak_buffered_operations"));
+            assertEquals(outcome == 2 ? 0L : 5L, filtered.get("peak_buffered_operations"));
         }
     }
 

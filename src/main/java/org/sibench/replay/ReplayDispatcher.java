@@ -129,6 +129,7 @@ public final class ReplayDispatcher implements AutoCloseable {
     private long admitted, measuredLastSend;
     private boolean measurementStarted;
     private final Map<Integer, ReplayTarget> clients = new LinkedHashMap<>();
+    private ReplayTarget lastClient;
     private final BitSet workUnits = new BitSet();
     private final Map<Integer, long[]> counts = new TreeMap<>();
     private final Map<Long, Pending> inFlight = new LinkedHashMap<>();
@@ -355,6 +356,9 @@ public final class ReplayDispatcher implements AutoCloseable {
                 client = Objects.requireNonNull(factory.open(clientId));
                 clients.put(clientId, client);
             }
+            // Work units route whole to one client: leaving it ends its unit, so its partial baseline batch is complete.
+            if (lastClient != null && lastClient != client) lastClient.flush();
+            lastClient = client;
             long sequence = sent + 1;
             long deadline =
                     nanoTime.getAsLong() + TimeUnit.SECONDS.toNanos(config.requestTimeoutSeconds());

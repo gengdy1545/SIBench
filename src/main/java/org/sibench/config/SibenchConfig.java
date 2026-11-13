@@ -24,7 +24,6 @@ public final class SibenchConfig {
         for (String key : document.keySet())
             require(Set.of("schema_version", "purpose", "target", "replay",
                     "analysis", "benchmarks", "engines", "pixels_experiment").contains(key), "Unknown SIBench option: " + key);
-        if (document.containsKey("pixels_experiment")) PixelsExperimentConfig.settings(document);
         if (document.containsKey("benchmarks")) BenchmarkSelection.validate(document.get("benchmarks"));
         if (document.containsKey("engines")) {
             var engines = object(document, "engines");
@@ -41,12 +40,7 @@ public final class SibenchConfig {
         String name = engine.configName();
         require(engines.containsKey(name), "No engine configuration selected for " + name);
         Path file = root.resolve(string(engines, name));
-        var document = parse(Files.readString(file));
-        require(integer(document, "schema_version") == 1 && string(document, "purpose").equals("engine")
-                && string(document, "engine").equals(name), "Expected " + name + " engine config v1");
-        var settings = new java.util.LinkedHashMap<>(document);
-        settings.keySet().removeAll(Set.of("schema_version", "purpose", "engine"));
-        require(!string(settings, "build_directory").isBlank(), name + " build_directory must not be blank");
+        var settings = engineDocument(file, engine);
         switch (engine) {
             case DUCKDB -> {
                 keys(settings, Set.of("build_directory", "memory_limit", "threads"), name);
@@ -65,6 +59,23 @@ public final class SibenchConfig {
             case PIXELS -> settings = new java.util.LinkedHashMap<>(PixelsConfig.read(file.getParent(), settings));
         }
         return java.util.Collections.unmodifiableMap(settings);
+    }
+
+    /** File CDC capture consumes only source PostgreSQL and sink settings. */
+    public static Map<String,Object> cdcSource(Path root,Map<String,Object> runtime)throws IOException {
+        Path file=root.resolve(string(object(runtime,"engines"),"pixels"));
+        return PixelsConfig.readSource(file.getParent(),engineDocument(file,Engine.PIXELS));
+    }
+
+    private static java.util.LinkedHashMap<String,Object> engineDocument(Path file,Engine engine)throws IOException {
+        String name=engine.configName();
+        var document = parse(Files.readString(file));
+        require(integer(document, "schema_version") == 1 && string(document, "purpose").equals("engine")
+                && string(document, "engine").equals(name), "Expected " + name + " engine config v1");
+        var settings = new java.util.LinkedHashMap<>(document);
+        settings.keySet().removeAll(Set.of("schema_version", "purpose", "engine"));
+        require(!string(settings, "build_directory").isBlank(), name + " build_directory must not be blank");
+        return settings;
     }
 
     /** PostgreSQL server settings; the generator owns network endpoints and the capture's query identifiers. */

@@ -24,10 +24,8 @@ interface OrderedStore extends AutoCloseable {
 
     void put(byte[] key, byte[] value, boolean wal) throws IOException;
 
-    /** Ordinary writes; keys and values pair up, with the same WAL policy as individual writes. */
-    default void putAll(List<byte[]> keys, List<byte[]> values) throws IOException {
-        for (int i = 0; i < keys.size(); i++) put(keys.get(i), values.get(i), true);
-    }
+    /** One native batch of ordinary writes; keys and values pair up, with the same WAL policy as individual writes. */
+    void putAll(List<byte[]> keys, List<byte[]> values) throws IOException;
 
     /** The value of the exact key, or null. */
     byte[] get(byte[] key) throws IOException;

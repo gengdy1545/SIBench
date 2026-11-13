@@ -24,11 +24,19 @@ final class CommittedOperations {
     private Operation begin, mutation, previousExpansion, searchGroup;
     private int expansionMembers, searchMembers;
     private long abortedTransactions, abortedWrites, abortedSearches, localSearches, coalescedWrites, peakBuffered;
+    private boolean knownAbort;
 
     CommittedOperations(Consumer output) { this.output = output; }
 
+    void expectAbort() throws IOException {
+        if (transaction != 0 || knownAbort) throw new IOException("Source outcome must precede its transaction");
+        knownAbort = true;
+    }
+
     void accept(Operation operation) throws IOException {
         validate(operation);
+        if (knownAbort && transaction == 0 && operation.kind() != TRANSACTION_BEGIN)
+            throw new IOException("Captured Abort requires a source transaction begin");
         if (operation.kind() == INSERT && operation.version() != 0)
             throw new IOException("Baseline requires timestamp zero");
         if (isControl(operation)) {
@@ -53,6 +61,13 @@ final class CommittedOperations {
                     operation.expansionPosition(), operation.expansionSize())
                     .withTransaction(operation.transactionId(), operation.mutationOrdinal()).withWorkUnitId(operation.workUnitId());
         if (transaction == 0) output.accept(operation);
+        // PG already holds the complete native transaction; validate its aborted operations without retaining them again.
+        else if (knownAbort) {
+            if (operation.kind() == SEARCH) {
+                if ((operation.flags() & TRANSACTION_LOCAL_SEARCH) != 0) localSearches++;
+                else abortedSearches++;
+            } else abortedWrites++;
+        }
         // Operations held for the outcome count against the limit, even when dropped or superseded early.
         else if (sourceOperations++ >= MAX_TRANSACTION_OPERATIONS)
             throw new IOException("Source transaction exceeds operation buffer limit");
@@ -90,6 +105,7 @@ final class CommittedOperations {
             throw new IOException("Source outcome or mutation count mismatch");
         requireCompleteExpansion();
         boolean aborted = operation.kind() == TRANSACTION_ABORT;
+        if (knownAbort && !aborted) throw new IOException("Source outcome differs from the captured Abort");
         if (aborted) {
             abortedTransactions++;
             abortedWrites += superseded;
@@ -113,6 +129,7 @@ final class CommittedOperations {
         lastWrites.clear();
         lastVersion = transaction;
         transaction = 0;
+        knownAbort = false;
     }
 
     private void mutation(Operation operation) throws IOException {
@@ -188,7 +205,7 @@ final class CommittedOperations {
     }
 
     void finish() throws IOException {
-        if (transaction != 0 || searchGroup != null) throw new IOException("Incomplete source transaction or search group");
+        if (transaction != 0 || searchGroup != null || knownAbort) throw new IOException("Incomplete source transaction or search group");
     }
 
     long lastCommittedVersion() { return lastCommittedVersion; }

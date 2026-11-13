@@ -1,6 +1,42 @@
 --- a/pixels-cli/src/main/java/io/pixelsdb/pixels/cli/executor/LoadExecutor.java
 +++ b/pixels-cli/src/main/java/io/pixelsdb/pixels/cli/executor/LoadExecutor.java
-@@ -123,7 +123,7 @@
+@@ -22,6 +22,7 @@
+ import io.pixelsdb.pixels.cli.load.*;
+ import io.pixelsdb.pixels.common.exception.MetadataException;
+ import io.pixelsdb.pixels.common.exception.RetinaException;
++import io.pixelsdb.pixels.common.exception.TransException;
+ import io.pixelsdb.pixels.common.metadata.MetadataService;
+ import io.pixelsdb.pixels.common.metadata.domain.File;
+ import io.pixelsdb.pixels.common.metadata.domain.Path;
+@@ -44,7 +45,9 @@
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.ScheduledExecutorService;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicReference;
+ 
+ /**
+  * @author hank
+@@ -74,6 +77,9 @@
+ 
+         TransService transService = TransService.Instance();
+         TransContext context = transService.beginTrans(false);
++        // The coordinator rejects commits of expired write transactions; renew the lease until commit.
++        AtomicReference<Throwable> leaseFailure = new AtomicReference<>();
++        ScheduledExecutorService leaseRenewal = renewLease(transService, context, leaseFailure);
+         MetadataService metadataService = MetadataService.Instance();
+         ConcurrentLinkedQueue<LoadedInfo> loadedInfos = new ConcurrentLinkedQueue<>();
+         long startTime = System.currentTimeMillis();
+@@ -92,6 +98,7 @@
+             }
+ 
+             startConsumers(threadNum, inputFiles, parameters, loadedInfos);
++            requireLease(leaseFailure);
+ 
+             int retinaServerPort = Integer.parseInt(ConfigFactory.Instance().getProperty("retina.server.port"));
+             for(LoadedInfo loadedInfo : loadedInfos)
+@@ -123,15 +130,23 @@
  
                  } catch (RetinaException e)
                  {
@@ -9,6 +45,83 @@
                  }
              }
  
++            // No renewal may race the commit; a renewal failure before this point blocks it.
++            stopRenewal(leaseRenewal);
++            requireLease(leaseFailure);
+             transService.commitTrans(context.getTransId(), false);
+             System.out.println(command + " is successful");
+         } catch (Exception failure)
+         {
+             System.err.println(command + " failed");
++            Throwable lease = leaseFailure.get();
++            if (lease != null && failure.getCause() != lease)
++            {
++                failure.addSuppressed(lease);
++            }
+             List<Long> fileIds = new ArrayList<>();
+             for (LoadedInfo loadedInfo : loadedInfos)
+             {
+@@ -164,12 +179,60 @@
+             throw failure;
+         } finally
+         {
++            leaseRenewal.shutdownNow();
+             long endTime = System.currentTimeMillis();
+             System.out.println("Text files in '" + origin + "' are loaded by " + threadNum +
+                         " threads in " + (endTime - startTime) / 1000.0 + "s.");
+         }
+     }
+ 
++    /**
++     * Checks the lease from one thread, as extendTransLease requires; it contacts the coordinator only
++     * when the lease is expiring. The first failure is recorded and ends the renewal.
++     */
++    private static ScheduledExecutorService renewLease(TransService transService, TransContext context,
++                                                       AtomicReference<Throwable> failure)
++    {
++        ScheduledExecutorService renewal = Executors.newSingleThreadScheduledExecutor(task -> {
++            Thread thread = new Thread(task, "load-lease-renewal-" + context.getTransId());
++            thread.setDaemon(true);
++            return thread;
++        });
++        long interval = Math.max(1000L, context.getLease().getPeriodMs() / 10);
++        renewal.scheduleWithFixedDelay(() -> {
++            try
++            {
++                if (!transService.extendTransLease(context))
++                {
++                    throw new TransException("LOAD transaction " + context.getTransId() + " lease has expired");
++                }
++            } catch (Throwable error)
++            {
++                failure.compareAndSet(null, error);
++                throw new IllegalStateException("LOAD lease renewal stopped", error);
++            }
++        }, interval, interval, TimeUnit.MILLISECONDS);
++        return renewal;
++    }
++
++    private static void stopRenewal(ScheduledExecutorService renewal) throws InterruptedException, TransException
++    {
++        renewal.shutdownNow();
++        if (!renewal.awaitTermination(60, TimeUnit.SECONDS))
++        {
++            throw new TransException("LOAD lease renewal did not stop before commit");
++        }
++    }
++
++    private static void requireLease(AtomicReference<Throwable> failure) throws TransException
++    {
++        Throwable error = failure.get();
++        if (error != null)
++        {
++            throw new TransException("LOAD transaction lease renewal failed", error);
++        }
++    }
++
+     /**
+      * Start concurrent consumers that consumes the input (source) files and load them into pixels files of a table.
+      * @param concurrency the number of threads for data loading
 --- a/pixels-cli/src/main/java/io/pixelsdb/pixels/cli/load/AbstractPixelsConsumer.java
 +++ b/pixels-cli/src/main/java/io/pixelsdb/pixels/cli/load/AbstractPixelsConsumer.java
 @@ -45,7 +45,6 @@
@@ -100,3 +213,47 @@
 @@ -121 +130 @@
 -                        AwsBasicCredentials.create(cosAccessKey, cosSecretKey))).build();
 +                        credentials)).build();
+--- a/pixels-common/src/main/java/io/pixelsdb/pixels/common/retina/RetinaService.java
++++ b/pixels-common/src/main/java/io/pixelsdb/pixels/common/retina/RetinaService.java
+@@ -204,6 +204,12 @@
+             String token = UUID.randomUUID().toString();
+             CompletableFuture<RetinaProto.UpdateRecordResponse> future = new CompletableFuture<>();
+             pendingRequests.put(token, future);
++            // A stream failed concurrently may already have drained the pending requests.
++            if (isClosed)
++            {
++                pendingRequests.remove(token);
++                throw new RetinaException("Stream is already closed");
++            }
+ 
+             RetinaProto.UpdateRecordRequest request = RetinaProto.UpdateRecordRequest.newBuilder()
+                     .setHeader(RetinaProto.RequestHeader.newBuilder().setToken(token).build())
+@@ -243,6 +249,20 @@
+             }
+         }
+ 
++        /** A failed stream answers no pending or later request; fail them instead of leaving them unresolved. */
++        void fail(Throwable error)
++        {
++            isClosed = true;
++            for (String token : pendingRequests.keySet())
++            {
++                CompletableFuture<RetinaProto.UpdateRecordResponse> future = pendingRequests.remove(token);
++                if (future != null)
++                {
++                    future.completeExceptionally(error);
++                }
++            }
++        }
++
+         @Override
+         public void close()
+         {
+@@ -286,6 +306,7 @@
+             public void onError(Throwable t)
+             {
+                 logger.error("Retina Stream update failed from server side", t);
++                handler.fail(t);
+                 latch.countDown();
+             }
+ 

@@ -72,10 +72,8 @@ public final class InputStore implements AutoCloseable {
                 require(existing.contentLength() == size, "Existing content object has a different size");
             } catch (S3Exception absent) {
                 if (absent.statusCode() != 404) throw absent;
-                upload(path, key, size);
+                upload(path, key, size, entry.get("sha256").getAsString());
             }
-            require(Files.size(path) == size && Digests.sha256(path).equals(entry.get("sha256").getAsString()),
-                    "Input changed during publication: " + path);
             entries.add(entry);
         }
         var inventory = new JsonObject();
@@ -161,55 +159,46 @@ public final class InputStore implements AutoCloseable {
         return Map.of("status", "passed", "manifest_sha256", identity, "directory", output.toString());
     }
 
-    void upload(Path file, String key, long size) throws IOException {
-        if (size <= 64L << 20) {
-            client.putObject(PutObjectRequest.builder().bucket(bucket).key(key).build(), RequestBody.fromFile(file));
-            return;
-        }
-        long partBytes = Math.max(64L << 20, (size + 9_999) / 10_000);
-        require(partBytes <= 5L << 30, "Input object exceeds multipart capacity");
-        String upload = client.createMultipartUpload(CreateMultipartUploadRequest.builder().bucket(bucket).key(key).build()).uploadId();
-        var completed = new ArrayList<CompletedPart>();
-        try {
-            for (long offset = 0; offset < size; offset += partBytes) {
-                final long start = offset, length = Math.min(partBytes, size - offset);
-                int number = completed.size() + 1;
-                var part = client.uploadPart(UploadPartRequest.builder().bucket(bucket).key(key).uploadId(upload)
-                        .partNumber(number).contentLength(length).build(), RequestBody.fromContentProvider(() -> {
-                            try { return slice(file, start, length); }
-                            catch (IOException failure) { throw new java.io.UncheckedIOException(failure); }
-                        }, length, "application/octet-stream"));
-                completed.add(CompletedPart.builder().partNumber(number).eTag(part.eTag()).build());
+    /** Uploads exactly the hashed bytes, so a content key never holds bytes other than its digest. */
+    void upload(Path file, String key, long size, String sha256) throws IOException {
+        var digest = Digests.digest();
+        try (var input = Files.newInputStream(file)) {
+            if (size <= 64L << 20) {
+                byte[] bytes = read(input, digest, size, file, sha256);
+                client.putObject(PutObjectRequest.builder().bucket(bucket).key(key).build(), RequestBody.fromBytes(bytes));
+                return;
             }
-            client.completeMultipartUpload(CompleteMultipartUploadRequest.builder().bucket(bucket).key(key).uploadId(upload)
-                    .multipartUpload(CompletedMultipartUpload.builder().parts(completed).build()).build());
-        } catch (RuntimeException | Error failure) {
-            try { client.abortMultipartUpload(AbortMultipartUploadRequest.builder().bucket(bucket).key(key).uploadId(upload).build()); }
-            catch (RuntimeException abort) { failure.addSuppressed(abort); }
-            throw failure;
+            long partBytes = Math.max(64L << 20, (size + 9_999) / 10_000);
+            require(partBytes <= 256L << 20, "Input object exceeds multipart capacity");
+            String upload = client.createMultipartUpload(CreateMultipartUploadRequest.builder().bucket(bucket).key(key).build()).uploadId();
+            var completed = new ArrayList<CompletedPart>();
+            try {
+                for (long offset = 0; offset < size; offset += partBytes) {
+                    long length = Math.min(partBytes, size - offset);
+                    byte[] part = read(input, digest, length, file, offset + length == size ? sha256 : null);
+                    int number = completed.size() + 1;
+                    var response = client.uploadPart(UploadPartRequest.builder().bucket(bucket).key(key).uploadId(upload)
+                            .partNumber(number).contentLength((long) part.length).build(), RequestBody.fromBytes(part));
+                    completed.add(CompletedPart.builder().partNumber(number).eTag(response.eTag()).build());
+                }
+                client.completeMultipartUpload(CompleteMultipartUploadRequest.builder().bucket(bucket).key(key).uploadId(upload)
+                        .multipartUpload(CompletedMultipartUpload.builder().parts(completed).build()).build());
+            } catch (IOException | RuntimeException | Error failure) {
+                try { client.abortMultipartUpload(AbortMultipartUploadRequest.builder().bucket(bucket).key(key).uploadId(upload).build()); }
+                catch (RuntimeException abort) { failure.addSuppressed(abort); }
+                throw failure;
+            }
         }
     }
 
-    private static java.io.InputStream slice(Path path, long offset, long size) throws IOException {
-        var stream = Files.newInputStream(path);
-        try { stream.skipNBytes(offset); }
-        catch (IOException error) { stream.close(); throw error; }
-        return new java.io.FilterInputStream(stream) {
-            long remaining = size;
-            @Override public int read() throws IOException {
-                if (remaining == 0) return -1;
-                int value = super.read();
-                if (value >= 0) remaining--;
-                return value;
-            }
-            @Override public int read(byte[] bytes, int off, int len) throws IOException {
-                if (len == 0) return 0;
-                if (remaining == 0) return -1;
-                int count = in.read(bytes, off, (int) Math.min(len, remaining));
-                if (count > 0) remaining -= count;
-                return count;
-            }
-        };
+    /** Reads the next bytes; the last read also requires end of file and the expected digest. */
+    private static byte[] read(java.io.InputStream input, java.security.MessageDigest digest, long length, Path file,
+            String sha256) throws IOException {
+        byte[] bytes = input.readNBytes(Math.toIntExact(length));
+        digest.update(bytes);
+        require(bytes.length == length && (sha256 == null || input.read() == -1
+                && HexFormat.of().formatHex(digest.digest()).equals(sha256)), "Input changed during publication: " + file);
+        return bytes;
     }
 
     private static JsonObject check(Path input) throws IOException {

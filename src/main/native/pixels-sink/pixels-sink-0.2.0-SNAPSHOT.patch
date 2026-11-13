@@ -1327,3 +1327,23 @@ index cc901d2..65698f0 100644
 -                                writer = new ProtoWriter();
 -                                break;
 +                                throw new IllegalStateException("Proto capture requires an explicit output; use SIBench prepare-cdc");
+diff --git a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableWriter.java b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableWriter.java
+index dc2b900..3d80552 100644
+--- a/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableWriter.java
++++ b/src/main/java/io/pixelsdb/pixels/sink/writer/retina/TableWriter.java
+@@ -102,7 +102,14 @@ public abstract class TableWriter
+         }
+         flushExecutor.submit(() ->
+         {
+-            flush(batch);
++            // A submitted task's exception would stay in its unread Future; stop generation instead.
++            try
++            {
++                flush(batch);
++            } catch (Throwable error)
++            {
++                io.pixelsdb.pixels.sink.SibenchReport.fail("Retina flush failed for table " + tableName, error);
++            }
+         });
+     }
+ 

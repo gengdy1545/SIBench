@@ -69,6 +69,13 @@ final class InputFiles {
         }
     }
 
+    /** A new output never lies inside, or contains, a sealed input it is derived from. */
+    static void requireSeparate(Path output, Path... inputs) throws IOException {
+        for (Path input : inputs)
+            require(input == null || !output.startsWith(input) && !input.startsWith(output),
+                    "Output must be separate from its sealed input: " + output);
+    }
+
     private static void require(boolean valid, String message) throws IOException {
         if (!valid) throw new IOException(message);
     }

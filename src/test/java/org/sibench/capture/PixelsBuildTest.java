@@ -15,6 +15,38 @@ import org.sibench.config.Digests;
 public class PixelsBuildTest {
     @Rule public TemporaryFolder temporary=new TemporaryFolder();
 
+    @Test public void cdcSourceNeedsOnlyItsOwnArtifactsAndRejectsChangedInputs() throws Exception {
+        Path root=Path.of("").toRealPath(),build=temporary.getRoot().toPath();
+        var jars=new LinkedHashMap<String,String>();
+        for(String name:java.util.List.of("pixels-sink.jar","sibench-pixels.jar"))
+            jars.put(name,file(build,"jars/"+name,name));
+        var binaries=new LinkedHashMap<String,String>();
+        for(String name:java.util.List.of("postgres","pg_ctl","initdb"))
+            binaries.put(name,file(build,"postgres/runtime/bin/"+name,name));
+        var javaIdentity=Map.of("pixels_commit",pin("pixels"),"pixels_sink_commit",pin("pixels-sink"),
+                "pixels_patch_sha256",Digests.sha256(root.resolve("src/main/native/pixels/pixels-0.2.0-SNAPSHOT.patch")),
+                "pixels_sink_patch_sha256",Digests.sha256(root.resolve("src/main/native/pixels-sink/pixels-sink-0.2.0-SNAPSHOT.patch")),
+                "tracer_sources_sha256",PixelsBuild.treeSha256(root.resolve("src/main/native/pixels")),
+                "build_script_sha256",Digests.sha256(root.resolve("scripts/build-pixels.sh")),"jars",jars);
+        Files.writeString(build.resolve("java-build.json"),new Gson().toJson(javaIdentity));
+        Files.writeString(build.resolve("native-build.json"),new Gson().toJson(Map.of("postgresql_commit",pin("postgresql"),"files",binaries)));
+        PixelsBuild.verifySource(root,build);
+        assertFalse(Files.exists(build.resolve("home")));
+        for(String name:java.util.List.of("jars/pixels-sink.jar","jars/sibench-pixels.jar","postgres/runtime/bin/postgres",
+                "postgres/runtime/bin/pg_ctl","postgres/runtime/bin/initdb")) {
+            Path path=build.resolve(name);String original=Files.readString(path);
+            Files.writeString(path,"changed");
+            assertThrows(name,IOException.class,()->PixelsBuild.verifySource(root,build));
+            Files.writeString(path,original);
+        }
+    }
+
+    private static String pin(String component)throws Exception {
+        var process=new ProcessBuilder("git","ls-files","--stage","--","third_party/"+component).start();
+        String result=new String(process.getInputStream().readAllBytes(),java.nio.charset.StandardCharsets.UTF_8);
+        assertEquals(0,process.waitFor());return result.split("\\s+")[1];
+    }
+
     @Test public void everyLoadedNativeComponentAndRuntimeInputMustStillMatchItsBuild() throws Exception {
         Path build=temporary.getRoot().toPath();
         var jars=new LinkedHashMap<String,String>();

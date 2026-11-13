@@ -18,7 +18,19 @@ public record ReplayConfig(
         String dispatchMode,
         int clientCount,
         int maxInFlight,
-        long requestTimeoutSeconds) {
+        long requestTimeoutSeconds,
+        int baselineBatchOperations) {
+    /** Baseline Puts per WriteBatch RPC when unset; workload operations are always sent individually. */
+    public static final int DEFAULT_BASELINE_BATCH_OPERATIONS = 64;
+
+    /** Unbatched baseline, for fixtures that do not exercise baseline batching. */
+    public ReplayConfig(boolean secondaryIndexes, long durationSeconds, long plannedOperationsPerSecond,
+            long warmupOperations, int reservePercent, String dispatchMode, int clientCount, int maxInFlight,
+            long requestTimeoutSeconds) {
+        this(secondaryIndexes, durationSeconds, plannedOperationsPerSecond, warmupOperations, reservePercent,
+                dispatchMode, clientCount, maxInFlight, requestTimeoutSeconds, 1);
+    }
+
     public ReplayConfig(
             boolean secondaryIndexes,
             long durationSeconds,
@@ -60,6 +72,10 @@ public record ReplayConfig(
         require(
                 requestTimeoutSeconds > 0 && requestTimeoutSeconds <= 86400,
                 "Request timeout must be between 1 and 86400 seconds");
+        // Partial batches held by every client must leave an in-flight slot, or admission could wait forever.
+        require(baselineBatchOperations > 0
+                        && (long) (baselineBatchOperations - 1) * clientCount < maxInFlight,
+                "baseline_batch_operations must be positive and client_count × (batch − 1) below max_in_flight");
         require(durationSeconds >= 0 && plannedOperationsPerSecond >= 0, "Invalid trace budget");
         require(
                 (durationSeconds == 0) == (plannedOperationsPerSecond == 0),
@@ -88,6 +104,7 @@ public record ReplayConfig(
                         "client_count",
                         "max_in_flight",
                         "request_timeout_seconds",
+                        "baseline_batch_operations",
                         "trace_budget"));
         String dispatchMode =
                 replay.containsKey("dispatch_mode") ? string(replay, "dispatch_mode") : "operation";
@@ -122,7 +139,10 @@ public record ReplayConfig(
                         : 4096,
                 replay.containsKey("request_timeout_seconds")
                         ? integer(replay, "request_timeout_seconds")
-                        : 60);
+                        : 60,
+                replay.containsKey("baseline_batch_operations")
+                        ? Math.toIntExact(integer(replay, "baseline_batch_operations"))
+                        : DEFAULT_BASELINE_BATCH_OPERATIONS);
     }
 
     public long requiredOperations() {
@@ -146,6 +166,7 @@ public record ReplayConfig(
         report.put("client_routing", "source_work_unit_round_robin");
         report.put("max_in_flight", maxInFlight);
         report.put("request_timeout_seconds", requestTimeoutSeconds);
+        report.put("baseline_batch_operations", baselineBatchOperations);
         report.put("duration_seconds", durationSeconds);
         report.put("planned_operations_per_second", plannedOperationsPerSecond);
         report.put("warmup_operations", warmupOperations);

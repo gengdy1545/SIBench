@@ -129,7 +129,22 @@ final class PostgresGeneration {
         for(var session:sessions)for(var count:object(session,"counts").entrySet())
             source.merge(count.getKey(),((Number)count.getValue()).longValue(),Math::addExact);
         var client=com.google.gson.JsonParser.parseString(Files.readString(batch.resolve("summary.json"))).getAsJsonObject();
+        if(phase.equals("tp"))requireTpWindow(client.getAsJsonObject("tp"),source,sessions.size(),positive(input.nativeConfig(),"clients"));
         return Map.of("phase",phase,"client",new com.google.gson.Gson().fromJson(client,Map.class),"source",source,"sessions",sessions.size());
+    }
+
+    /**
+     * Independent client evidence for a TP window: one session per client, and HyBench samples every
+     * committed or business-rolled-back transaction but not a conflict abort. AP/IQ samples count
+     * statements inside long transactions and XP adds freshness sessions, so only TP has these exact bounds.
+     */
+    static void requireTpWindow(com.google.gson.JsonObject samples,Map<String,Long> source,int sessions,long clients)throws java.io.IOException {
+        long sampled=0;
+        for(var entry:samples.entrySet())sampled=Math.addExact(sampled,entry.getValue().getAsLong());
+        long commits=source.get("commits"),aborts=source.get("aborts");
+        if(sessions!=clients||sampled<commits||sampled>commits+aborts)
+            throw new java.io.IOException("HyBench TP client evidence differs from captured sessions: sessions "+sessions+"/"+clients
+                    +", samples "+sampled+", commits "+commits+", aborts "+aborts);
     }
 
     private static double seconds(long start){return (System.nanoTime()-start)/1e9;}

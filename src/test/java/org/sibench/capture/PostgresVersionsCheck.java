@@ -13,6 +13,35 @@ import org.sibench.generation.PostgresDatabase;
 public class PostgresVersionsCheck {
     @Rule public TemporaryFolder temporary=new TemporaryFolder();
 
+    /** An XID held by the projection for the whole workload would stop pruning of every benchmark table. */
+    @Test public void projectionHoldsNoTransactionIdAcrossTheWorkload()throws Exception {
+        String runtime=System.getProperty("sibench.postgres.runtime");assertNotNull(runtime);
+        try(var cluster=PostgresDatabase.create(Path.of(runtime),temporary.getRoot().toPath().resolve("source"),org.sibench.generation.PostgresTestSettings.SETTINGS);
+                var database=cluster.connect("projection");var observer=cluster.connect("observer");
+                var transactions=new PostgresTransactions(temporary.getRoot().toPath().resolve("spool"),1L<<20,2048)) {
+            database.setAutoCommit(false);NativeHistory.initialize(database,Engine.POSTGRES);database.commit();
+            try(var versions=new PostgresVersions(database)) {
+                assertNull(projectionXid(observer));
+                for(long i=1;i<=1024;i++) {
+                    var chunk=transactions.begin(1);chunk.csn=i;chunk.transaction=i;chunk.committed=true;
+                    versions.begin(chunk);versions.finish(chunk);chunk.close();
+                }
+                assertNull(projectionXid(observer));
+                try(var query=database.createStatement();var rows=query.executeQuery("SELECT count(*) FROM sibench_history.commits")) {
+                    assertTrue(rows.next());assertEquals(1024,rows.getLong(1));
+                }
+            }
+            database.commit();
+        }
+    }
+
+    private static String projectionXid(java.sql.Connection observer)throws Exception {
+        try(var query=observer.createStatement();var rows=query.executeQuery(
+                "SELECT backend_xid::text FROM pg_stat_activity WHERE application_name='projection'")) {
+            assertTrue(rows.next());String xid=rows.getString(1);assertFalse(rows.next());return xid;
+        }
+    }
+
     @Test public void growingCommitMappingsKeepAnIndexedPreparedLookup()throws Exception {
         String runtime=System.getProperty("sibench.postgres.runtime");assertNotNull(runtime);
         try(var cluster=PostgresDatabase.create(Path.of(runtime),temporary.getRoot().toPath().resolve("source"),org.sibench.generation.PostgresTestSettings.SETTINGS);

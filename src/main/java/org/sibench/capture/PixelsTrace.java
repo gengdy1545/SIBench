@@ -154,6 +154,8 @@ final class PixelsTrace implements AutoCloseable {
         units.lines().write("{\"work_unit_id\":" + version + ",\"source_event\":" + (sourceEvent + 1) + "}\n");
         workload.accept(transaction(0, TRANSACTION_BEGIN, version, version, 0));
         var written = new HashSet<Map.Entry<Integer, IndexKey>>();
+        // Retina resolves a key before changing it; a miss must precede an insert and a hit an update or delete.
+        var resolved = new HashMap<Map.Entry<Integer, IndexKey>, Boolean>();
         long ordinal = 0;
         for (Fact fact : facts) {
             Table table = tables.get(fact.table());
@@ -161,6 +163,8 @@ final class PixelsTrace implements AutoCloseable {
             long event = ++sourceEvent;
             if (fact.kind() == LOOKUP) {
                 boolean local = written.contains(Map.entry(table.id(), key));
+                if (resolved.put(Map.entry(table.id(), key), fact.rowId() >= 0) != null)
+                    throw new IOException("Repeated Pixels key resolution without a change");
                 var search = search(event, table.id(), 0, Range.equal(key), version - 1, fact.rowId() >= 0 ? 1 : 0,
                         local ? TRANSACTION_LOCAL_SEARCH : SNAPSHOT_SEARCH).withTransaction(version, ordinal).withWorkUnitId(version);
                 workload.accept(local ? search.withVersion(version) : search);
@@ -168,6 +172,9 @@ final class PixelsTrace implements AutoCloseable {
                 continue;
             }
             if (fact.kind() != DELETE && fact.kind() != PUT && fact.kind() != UPDATE) throw new IOException("Unknown Pixels fact");
+            Boolean found = resolved.remove(Map.entry(table.id(), key));
+            if (found != null && found != (fact.kind() != PUT))
+                throw new IOException("Pixels key resolution disagrees with the applied source change");
             ordinal++;
             changes++;
             written.add(Map.entry(table.id(), key));
@@ -177,6 +184,7 @@ final class PixelsTrace implements AutoCloseable {
                             fact.fileId(), position(fact), fact.rowId());
             workload.accept(operation.withTransaction(version, ordinal).withWorkUnitId(version).withExpansion(0, 1));
         }
+        if (!resolved.isEmpty()) throw new IOException("Pixels resolved keys the source transaction did not change");
         workload.accept(transaction(0, TRANSACTION_COMMIT, version, version, ordinal));
     }
 

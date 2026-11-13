@@ -56,7 +56,7 @@ public final class ServiceReplay {
                 factory = InProcessService.factory(executor, requests);
             }
             if (description != null) description.require(service.value());
-            requests.baselineBatch(Math.max(1, config.maxInFlight() / config.clientCount()));
+            requests.baselineBatch(config.baselineBatchOperations());
             var result = new LinkedHashMap<String, Object>();
             String location = null;
             for (boolean runtime : new boolean[] {false, true}) {
@@ -83,6 +83,7 @@ public final class ServiceReplay {
                     var phaseReport = new LinkedHashMap<String, Object>();
                     phaseReport.put("operations", projection.dispatched());
                     phaseReport.put("rpc_requests", requests.rpcRequests() - rpcRequestsBefore);
+                    if (!runtime) phaseReport.put("batch_operations", config.baselineBatchOperations());
                     var kinds = new java.util.TreeMap<String,Long>();
                     requests.rpcKinds().forEach((kind,count) -> {
                         long calls = count - kindsBefore.getOrDefault(kind,0L);
@@ -247,9 +248,7 @@ public final class ServiceReplay {
         manifest.put("baseline_trace_sha256", trace.get("baseline_trace_sha256").getAsString());
         manifest.put("last_source_version", lastVersion);
         manifest.put("index_definitions", trace.get("index_definitions"));
-        manifest.put("key_encoding", "IndexKey order-preserving components; table(u32) index(u32) [value] PK ~version(u64)");
         manifest.put("value_kind", description.valueKind().name().toLowerCase(java.util.Locale.ROOT));
-        manifest.put("versioning_mode", "encoded_key");
         manifest.put("backend", description.name());
         manifest.put("index_location", location);
         manifest.put("durability", description.durability());

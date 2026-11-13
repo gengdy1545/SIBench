@@ -23,6 +23,7 @@ public final class Sibench {
 
     private static void printServiceHelp(PrintStream out) {
         out.println("       java -jar build/sibench/sibench.jar generate [--root PATH] CONFIG");
+        out.println("       java -jar build/sibench/sibench.jar generate-pixels [--root PATH] CONFIG");
         out.println("       java -jar build/sibench/sibench.jar prepare-pixels-baseline CONFIG CSV_INPUT_DIRECTORY OUTPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar prepare-pixels-inputs CONFIG CSV_INPUT_DIRECTORY PIXELS_BASELINE_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar check-pixels-baseline INPUT_DIRECTORY");
@@ -32,7 +33,8 @@ public final class Sibench {
         out.println("       java -jar build/sibench/sibench.jar fetch-input STORAGE_CONFIG PROFILE OBJECT_PATH MANIFEST_SHA256 OUTPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar prepare-cdc [--root PATH] CONFIG CSV_INPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar check-cdc-input INPUT_DIRECTORY");
-        out.println("       java -jar build/sibench/sibench.jar pixels-experiment CONFIG CDC_INPUT_DIRECTORY PIXELS_BASELINE_DIRECTORY OUTPUT_DIRECTORY");
+        out.println("       java -jar build/sibench/sibench.jar render-queries CONFIG CSV_INPUT_DIRECTORY OUTPUT_DIRECTORY SEED INSTANCES");
+        out.println("       java -jar build/sibench/sibench.jar pixels-experiment CONFIG [CDC_INPUT_DIRECTORY] PIXELS_BASELINE_DIRECTORY OUTPUT_DIRECTORY");
         out.println(
                 "       java -jar build/sibench/sibench.jar pixels-host ADDRESS:PORT BUILD WORK_ROOT TOKEN_FILE"
                         + "   (Pixels side of CDC generation for a remote pixels_host)");
@@ -71,6 +73,7 @@ public final class Sibench {
             if (!List.of(
                             "inspect-scale",
                             "generate",
+                            "generate-pixels",
                             "prepare-pixels-baseline",
                             "prepare-pixels-inputs",
                             "check-pixels-baseline",
@@ -80,6 +83,7 @@ public final class Sibench {
                             "fetch-input",
                             "prepare-cdc",
                             "check-cdc-input",
+                            "render-queries",
                             "pixels-experiment",
                             "pixels-host",
                             "check-replay",
@@ -113,9 +117,17 @@ public final class Sibench {
                 }
             }
             if (args[0].equals("pixels-experiment")) {
-                if (profiles.size() != 4) throw new IllegalArgumentException("pixels-experiment requires CONFIG CDC_INPUT_DIRECTORY PIXELS_BASELINE_DIRECTORY OUTPUT_DIRECTORY");
+                if (profiles.size() != 3 && profiles.size() != 4) throw new IllegalArgumentException("pixels-experiment requires CONFIG [CDC_INPUT_DIRECTORY] PIXELS_BASELINE_DIRECTORY OUTPUT_DIRECTORY");
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(org.sibench.capture.PixelsExperiment.run(root,
-                        Path.of(profiles.get(0)), Path.of(profiles.get(1)), Path.of(profiles.get(2)), Path.of(profiles.get(3)))));
+                        Path.of(profiles.get(0)), profiles.size() == 4 ? Path.of(profiles.get(1)) : null,
+                        Path.of(profiles.get(profiles.size() - 2)), Path.of(profiles.get(profiles.size() - 1)))));
+                return 0;
+            }
+            if (args[0].equals("render-queries")) {
+                if (profiles.size() != 5) throw new IllegalArgumentException("render-queries requires CONFIG CSV_INPUT_DIRECTORY OUTPUT_DIRECTORY SEED INSTANCES");
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(org.sibench.capture.HybenchQueries.prepare(root,
+                        Path.of(profiles.get(0)), Path.of(profiles.get(1)), Path.of(profiles.get(2)),
+                        Long.parseLong(profiles.get(3)), Integer.parseInt(profiles.get(4)))));
                 return 0;
             }
             if (args[0].equals("publish-input") || args[0].equals("fetch-input")) {
@@ -176,6 +188,12 @@ public final class Sibench {
                 if (profiles.size() != 1) throw new IllegalArgumentException("generate requires one runtime CONFIG");
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(
                         org.sibench.capture.Generation.run(root,Path.of(profiles.get(0)))));
+                return 0;
+            }
+            if (args[0].equals("generate-pixels")) {
+                if (profiles.size() != 1) throw new IllegalArgumentException("generate-pixels requires one runtime CONFIG");
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(
+                        org.sibench.capture.PixelsGeneration.run(root,Path.of(profiles.get(0)))));
                 return 0;
             }
             if (args[0].equals("pixels-host")) {

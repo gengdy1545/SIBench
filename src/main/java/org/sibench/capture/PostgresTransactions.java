@@ -27,6 +27,7 @@ final class PostgresTransactions implements AutoCloseable {
     private final Map<Integer,Long> consumed=new HashMap<>();
     private long segmentSequence;
     private long bytes, memoryBytes, peakBytes, peakMemoryBytes, sequence, holds, sealedBytes, safe = -1;
+    private long spoolBytes, peakSpoolBytes;
     private int peakTransactions;
     private Throwable failure;
     private boolean finished;
@@ -50,13 +51,13 @@ final class PostgresTransactions implements AutoCloseable {
 
     private synchronized void reserve(long additional) throws IOException {
         check();
-        if (additional > limit - bytes) throw new IOException("Pending source transaction byte budget reached");
         bytes += additional;
         peakBytes = Math.max(peakBytes, bytes);
     }
 
     private synchronized boolean keepInMemory(Chunk chunk, int cost) {
-        if (chunk.bytes > MEMORY_BYTES || cost > PENDING_MEMORY_BYTES - memoryBytes) return false;
+        if (chunk.bytes > Math.min(MEMORY_BYTES, limit)
+                || cost > Math.min(PENDING_MEMORY_BYTES, limit) - memoryBytes) return false;
         memoryBytes += cost;
         chunk.memoryBytes += cost;
         peakMemoryBytes = Math.max(peakMemoryBytes, memoryBytes);
@@ -69,8 +70,10 @@ final class PostgresTransactions implements AutoCloseable {
     }
 
     synchronized Map<String, Object> metrics() {
-        return Map.ofEntries(Map.entry("encoded_byte_limit", limit), Map.entry("transaction_limit", transactionLimit),
-                Map.entry("memory_encoded_byte_limit", PENDING_MEMORY_BYTES),
+        return Map.ofEntries(Map.entry("spool_byte_limit", limit), Map.entry("transaction_limit", transactionLimit),
+                Map.entry("memory_encoded_byte_limit", Math.min(PENDING_MEMORY_BYTES, limit)),
+                Map.entry("pending_spool_bytes", spoolBytes), Map.entry("peak_spool_bytes", peakSpoolBytes),
+                Map.entry("sealed_encoded_hold_threshold", limit / 2),
                 Map.entry("spool_segment_target_bytes", SEGMENT_BYTES),
                 Map.entry("peak_encoded_bytes", peakBytes), Map.entry("peak_memory_encoded_bytes", peakMemoryBytes),
                 Map.entry("peak_transactions", peakTransactions), Map.entry("pending_encoded_bytes", bytes),
@@ -96,7 +99,7 @@ final class PostgresTransactions implements AutoCloseable {
 
     /**
      * Native flow control acts at transaction completion; transactions that never write are held
-     * natively at their next statement while completed transactions fill half the budget. Only
+     * natively at their next statement when completed encoded bytes reach the hold threshold. Only
      * completed ones count: they drain once the watermark passes them, which no held source can stop.
      */
     synchronized boolean full() {
@@ -172,14 +175,17 @@ final class PostgresTransactions implements AutoCloseable {
             if (segment.writing) throw new IOException("Source spool ends inside a transaction");
             tails.remove(pid);
         }
-        segment.output.close();
-        boolean remove;
-        synchronized (this) {
-            segment.retired = true;
-            remove = segment.references == 0 && !segment.deleted;
-            if (remove) segment.deleted = true;
+        try { segment.output.close(); }
+        finally {
+            segment.channel.close();
+            boolean remove;
+            synchronized (this) {
+                segment.retired = true;
+                remove = segment.references == 0 && !segment.deleted;
+                if (remove) segment.deleted = true;
+            }
+            if (remove) segment.delete();
         }
-        if (remove) Files.delete(segment.file);
     }
 
     private final class Segment {
@@ -188,13 +194,26 @@ final class PostgresTransactions implements AutoCloseable {
         final BufferedWriter output;
         int references;
         boolean writing, retired, deleted;
+        long storedBytes;
 
         Segment(Path file) throws IOException {
             this.file = file;
             channel = FileChannel.open(file, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
             try {
-                var compressed = new com.github.luben.zstd.ZstdOutputStream(new BufferedOutputStream(
-                        Channels.newOutputStream(channel)), com.github.luben.zstd.RecyclingBufferPool.INSTANCE, 1)
+                var storage = new FilterOutputStream(Channels.newOutputStream(channel)) {
+                    @Override public void write(int value) throws IOException { write(new byte[]{(byte)value}, 0, 1); }
+                    @Override public void write(byte[] values, int offset, int length) throws IOException {
+                        synchronized (PostgresTransactions.this) {
+                            if (length > limit - spoolBytes) throw new IOException("Pending source spool byte budget reached");
+                            spoolBytes += length;
+                            storedBytes += length;
+                            peakSpoolBytes = Math.max(peakSpoolBytes, spoolBytes);
+                        }
+                        out.write(values, offset, length);
+                    }
+                };
+                var compressed = new com.github.luben.zstd.ZstdOutputStream(new BufferedOutputStream(storage),
+                        com.github.luben.zstd.RecyclingBufferPool.INSTANCE, 1)
                         .setChecksum(true).setCloseFrameOnFlush(true);
                 output = new BufferedWriter(new OutputStreamWriter(compressed, StandardCharsets.UTF_8));
             } catch (IOException | RuntimeException | Error error) { channel.close(); throw error; }
@@ -207,7 +226,12 @@ final class PostgresTransactions implements AutoCloseable {
                 remove = retired && references == 0 && !deleted;
                 if (remove) deleted = true;
             }
-            if (remove) Files.delete(file);
+            if (remove) delete();
+        }
+
+        void delete() throws IOException {
+            Files.delete(file);
+            synchronized (PostgresTransactions.this) { spoolBytes -= storedBytes; }
         }
     }
 
@@ -285,10 +309,12 @@ final class PostgresTransactions implements AutoCloseable {
         private void seal() throws IOException {
             if (sealed) throw new IOException("Repeated source transaction completion");
             if (output != null) {
-                output.flush();
-                length = segment.channel.position() - offset;
-                output = null;
-                synchronized (PostgresTransactions.this) { segment.writing = false; }
+                try { output.flush(); }
+                finally {
+                    length = segment.channel.position() - offset;
+                    output = null;
+                    synchronized (PostgresTransactions.this) { segment.writing = false; }
+                }
             }
         }
 
@@ -326,14 +352,19 @@ final class PostgresTransactions implements AutoCloseable {
     }
 
     synchronized void retainFailure() throws IOException {
+        var closeErrors = new ArrayList<String>();
         for (Chunk chunk : pending) {
-            if (chunk.output != null) chunk.seal();
+            if (chunk.output != null) try { chunk.seal(); }
+            catch (IOException error) { closeErrors.add(error.toString()); }
         }
-        for (int pid : List.copyOf(tails.keySet())) endStream(pid);
+        for (int pid : List.copyOf(tails.keySet())) try { endStream(pid); }
+        catch (IOException error) { closeErrors.add(error.toString()); }
         try (var output = new com.google.gson.stream.JsonWriter(Files.newBufferedWriter(
                 directory.resolve("failure.json"), StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW))) {
             output.beginObject().name("error").value(String.valueOf(failure)).name("budgets");
             new com.google.gson.Gson().toJson(metrics(), Map.class, output);
+            output.name("spool_close_errors");
+            new com.google.gson.Gson().toJson(closeErrors, List.class, output);
             output.name("pending_transactions_truncated").value(pending.size() > DIAGNOSTIC_TRANSACTIONS);
             output.name("pending_transactions").beginArray();
             int details = 0;

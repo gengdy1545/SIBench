@@ -2180,6 +2180,7 @@ dependencies = [
  "bytes",
  "futures",
  "jni 0.21.1",
+ "log",
  "slatedb",
  "slatedb-mirror",
  "tokio",

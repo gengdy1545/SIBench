@@ -25,6 +25,7 @@ public final class VersionedIndexBackend implements IndexBackend {
     /** One JSON line per internal persistence cycle: the engine's state and object-storage requests so far. */
     private final Path engineStats;
     private long flushes;
+    private volatile String bound;
 
     private VersionedIndexBackend(OrderedStore store, ValueKind valueKind, Path path) {
         this.store = store;
@@ -294,18 +295,23 @@ public final class VersionedIndexBackend implements IndexBackend {
     }
 
     @Override
-    public synchronized void bind(String binding) throws IOException {
-        if (binding == null || binding.isEmpty())
-            throw new IllegalArgumentException("An index must name the trace it holds");
-        byte[] stored = store.get(TRACE_BINDING);
-        if (stored == null)
-            store.put(TRACE_BINDING, binding.getBytes(java.nio.charset.StandardCharsets.UTF_8), true);
-        else if (!binding.equals(new String(stored, java.nio.charset.StandardCharsets.UTF_8)))
-            throw new IOException(
-                    "Index holds "
-                            + new String(stored, java.nio.charset.StandardCharsets.UTF_8)
-                            + ", not "
-                            + binding);
+    public void bind(String binding) throws IOException {
+        // Every harness call names its Trace; once accepted, the stored binding cannot change for this instance.
+        if (binding != null && binding.equals(bound)) return;
+        synchronized (this) {
+            if (binding == null || binding.isEmpty())
+                throw new IllegalArgumentException("An index must name the trace it holds");
+            byte[] stored = store.get(TRACE_BINDING);
+            if (stored == null)
+                store.put(TRACE_BINDING, binding.getBytes(java.nio.charset.StandardCharsets.UTF_8), true);
+            else if (!binding.equals(new String(stored, java.nio.charset.StandardCharsets.UTF_8)))
+                throw new IOException(
+                        "Index holds "
+                                + new String(stored, java.nio.charset.StandardCharsets.UTF_8)
+                                + ", not "
+                                + binding);
+            bound = binding;
+        }
     }
 
     @Override

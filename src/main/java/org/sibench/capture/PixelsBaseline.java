@@ -17,18 +17,21 @@ public final class PixelsBaseline {
 
     /** Both consumers finish independently; one failure does not discard the other's published input. */
     public static Map<String, Object> prepareInputs(Path root, Path configuration, Path csvDirectory, Path baselineOutput) throws Exception {
-        var plan = Generation.cdcPlan(root, configuration);
+        root = root.toRealPath();
+        var plan = PixelsGeneration.plan(root, configuration, false);
         var csv = CsvInput.open(root.resolve(csvDirectory));
         CsvInput.requireCompatible(csv, plan.inputs().get(0));
         Path output = root.resolve(baselineOutput).toAbsolutePath().normalize(), cdcOutput = plan.inputs().get(0).output();
-        require(!output.startsWith(cdcOutput) && !cdcOutput.startsWith(output)
-                && !csv.directory().startsWith(output) && !output.startsWith(csv.directory()) && !Files.exists(output),
-                "Preparation outputs must be fresh and independent of each other and CSV");
+        require(!Files.exists(output), "Preparation outputs must be fresh");
+        InputFiles.requireSeparate(output, cdcOutput, csv.directory());
+        InputFiles.requireSeparate(cdcOutput, csv.directory());
         requireStorage(plan.engines().get(Engine.PIXELS).settings());
         var pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+        Path project = root;
         try {
+            var input = plan.inputs().get(0);
             var cdc = pool.submit(() -> CdcPreparation.generate(plan, csv));
-            var pixels = pool.submit(() -> prepare(root, configuration, csvDirectory, baselineOutput));
+            var pixels = pool.submit(() -> prepare(project, configuration, csv, output, input.timeout()));
             var result = new LinkedHashMap<String, Object>();
             Exception failure = null;
             for (var entry : Map.of("cdc", cdc, "pixels_baseline", pixels).entrySet()) {
@@ -46,11 +49,19 @@ public final class PixelsBaseline {
 
     public static Map<String, Object> prepare(Path root, Path configuration, Path csvDirectory, Path output) throws Exception {
         root = root.toRealPath(); output = root.resolve(output).toAbsolutePath().normalize();
-        var csv = CsvInput.open(root.resolve(csvDirectory));
+        // Conversion reads and hashes every table CSV before any use; the descriptors suffice here.
+        var csv = CsvInput.bind(root.resolve(csvDirectory));
+        var profile = object(parse(Files.readString(Generation.hybenchSelection(root, SibenchConfig.read(root.resolve(configuration))).config())), "native");
+        Generation.validateNative("hybench", profile);
+        return prepare(root, configuration, csv, output, Duration.ofMinutes(positive(profile, "timeout_minutes")));
+    }
+
+    /** Preparation is bounded by the HyBench profile's native timeout, like the CDC branch, not by experiment settings. */
+    private static Map<String, Object> prepare(Path root, Path configuration, CsvInput.Verified csv, Path output, Duration timeout) throws Exception {
+        InputFiles.requireSeparate(output, csv.directory());
         var runtime = SibenchConfig.read(root.resolve(configuration));
         var settings = SibenchConfig.engine(root, runtime, Engine.PIXELS);
         requireStorage(settings);
-        var timeout = Duration.ofSeconds(positive(PixelsExperimentConfig.settings(runtime), "timeout_seconds"));
         Path build = root.resolve(string(settings, "build_directory")).toRealPath();
         var identity = PixelsBuild.verify(root, build);
         var document = csv.manifest();
@@ -61,72 +72,89 @@ public final class PixelsBaseline {
         json(output.resolve("effective-config.json"), runtime);
         json(output.resolve("engine-build.json"), identity);
         long started = System.nanoTime();
-        String deployment = string(settings, "pixels_host");
-        try (var host = deployment.equals("local") ? PixelsHost.local(build, output.resolve("pixels"), new Gson().toJsonTree(identity).getAsJsonObject())
-                : PixelsHost.Client.connect(deployment, PixelsExperiment.hostToken(), new Gson().toJsonTree(identity).getAsJsonObject())) {
-            var pixels = host.call(Map.of("op", "start", "run", deployment.equals("local") ? "pixels" : "baseline-" + UUID.randomUUID(),
-                    "overlay", object(settings, "properties"), "memory", object(settings, "memory"), "trace", false,
-                    "data_storage", object(settings, "data_storage"), "retain_data", true), timeout);
-            json(output.resolve("pixels-host.json"), Map.of("deployment", deployment, "directory", pixels.get("directory"),
-                    "data_uri", pixels.get("data_uri"), "build", host.identity()));
+        try {
             var expected = rows(document);
-            var paths = new LinkedHashMap<String, Path>();
-            for (var item : document.getAsJsonObject("baseline_files").entrySet()) {
-                var file = item.getValue().getAsJsonObject();
-                if (file.has("table")) paths.put(file.get("table").getAsString(), csv.directory().resolve(file.get("path").getAsString()));
-            }
             Path prepared = output.resolve("load");
-            var inputs = PixelsInputs.prepare(source, paths, prepared, positive(object(settings, "load"), "rows_per_file"));
-            Generation.requireRows(expected, inputs.rows());
-            for (var item : document.getAsJsonObject("baseline_files").entrySet()) {
-                var file = item.getValue().getAsJsonObject();
-                if (file.has("table")) require(file.get("sha256").getAsString().equals(inputs.sha256().get(file.get("table").getAsString())), "CSV changed during Pixels preparation");
-            }
-            String spec = Files.readString(csv.directory().resolve(document.getAsJsonObject("schema").get("path").getAsString()));
-            require(spec.equals(inputs.schema().text()), "Pixels schema differs from sealed CSV");
-            host.call(Map.of("op", "create", "schema", "postgres", "table", "baseline", "spec", targetSchema(spec)), timeout);
-            for (var table : paths.keySet()) {
-                try (var files = Files.list(prepared.resolve(table))) {
-                    for (Path file : files.sorted().toList()) { host.upload(table, file.getFileName().toString(), file, timeout); Files.delete(file); }
+            var paths = tablePaths(csv);
+            String spec = convert(csv, source, prepared, positive(object(settings, "load"), "rows_per_file"));
+            String deployment = string(settings, "pixels_host");
+            try (var host = deployment.equals("local") ? PixelsHost.local(build, output.resolve("pixels"), new Gson().toJsonTree(identity).getAsJsonObject())
+                    : PixelsHost.Client.connect(deployment, PixelsExperiment.hostToken(), new Gson().toJsonTree(identity).getAsJsonObject())) {
+                var pixels = host.call(Map.of("op", "start", "run", deployment.equals("local") ? "pixels" : "baseline-" + UUID.randomUUID(),
+                        "overlay", object(settings, "properties"), "memory", object(settings, "memory"), "trace", false,
+                        "data_storage", object(settings, "data_storage"), "retain_data", true), timeout);
+                json(output.resolve("pixels-host.json"), Map.of("deployment", deployment, "directory", pixels.get("directory"),
+                        "data_uri", pixels.get("data_uri"), "build", host.identity()));
+                host.call(Map.of("op", "create", "schema", "postgres", "table", "baseline", "spec", targetSchema(spec)), timeout);
+                for (var table : paths.keySet()) {
+                    try (var files = Files.list(prepared.resolve(table))) {
+                        for (Path file : files.sorted().toList()) { host.upload(table, file.getFileName().toString(), file, timeout); Files.delete(file); }
+                    }
+                    Files.delete(prepared.resolve(table));
                 }
-                Files.delete(prepared.resolve(table));
+                Files.delete(prepared);
+                var loaded = host.call(Map.of("op", "load", "schema", "postgres", "tables", List.copyOf(expected.keySet()),
+                        "rows_per_file", positive(object(settings, "load"), "rows_per_file"), "threads", positive(object(settings, "load"), "threads")), timeout);
+                var actual = new LinkedHashMap<String, Long>();
+                loaded.getAsJsonObject("rows").entrySet().forEach(e -> actual.put(e.getKey(), e.getValue().getAsLong()));
+                Generation.requireRows(expected, actual);
+                var inventory = host.call(Map.of("op", "export-baseline", "tables", List.copyOf(expected.keySet())), timeout).getAsJsonObject("baseline");
+                host.call(Map.of("op", "stop"), timeout);
+                for (String field : List.of("schema", "source_ddl")) {
+                    var descriptor = document.getAsJsonObject(field);
+                    Files.copy(InputFiles.verified(csv.directory(), descriptor), output.resolve(descriptor.get("path").getAsString()));
+                }
+                var manifest = new JsonObject();
+                manifest.addProperty("kind", "pixels_baseline_input"); manifest.addProperty("status", "complete");
+                manifest.addProperty("csv_manifest_sha256", csv.sha256());
+                manifest.add("schema", document.get("schema")); manifest.add("source_ddl", document.get("source_ddl"));
+                manifest.add("baseline_rows", document.get("baseline_rows")); manifest.add("inventory", inventory);
+                manifest.addProperty("data_uri", pixels.get("data_uri").getAsString());
+                manifest.add("engine", new Gson().toJsonTree(identity));
+                var profile = object(object(settings, "data_storage"), "profile");
+                manifest.add("storage", new Gson().toJsonTree(Map.of("endpoint", string(profile, "endpoint"),
+                        "region", string(profile, "region"), "bucket", string(profile, "bucket"))));
+                manifest.add("source_evidence", document.get("source_evidence"));
+                validate(output, manifest);
+                json(output.resolve("manifest.json"), manifest);
+                host.call(Map.of("op", "delete"), timeout);
+                var result = Map.<String, Object>of("status", "complete", "seconds", (System.nanoTime() - started) / 1e9,
+                        "manifest_sha256", Digests.sha256(output.resolve("manifest.json")), "data_uri", manifest.get("data_uri").getAsString());
+                json(output.resolve("result.json"), result);
+                return result;
             }
-            Files.delete(prepared);
-            var loaded = host.call(Map.of("op", "load", "schema", "postgres", "tables", List.copyOf(expected.keySet()),
-                    "rows_per_file", positive(object(settings, "load"), "rows_per_file"), "threads", positive(object(settings, "load"), "threads")), timeout);
-            var actual = new LinkedHashMap<String, Long>();
-            loaded.getAsJsonObject("rows").entrySet().forEach(e -> actual.put(e.getKey(), e.getValue().getAsLong()));
-            Generation.requireRows(expected, actual);
-            var inventory = host.call(Map.of("op", "export-baseline", "tables", List.copyOf(expected.keySet())), timeout).getAsJsonObject("baseline");
-            host.call(Map.of("op", "stop"), timeout);
-            for (String field : List.of("schema", "source_ddl")) {
-                var descriptor = document.getAsJsonObject(field);
-                Files.copy(InputFiles.verified(csv.directory(), descriptor), output.resolve(descriptor.get("path").getAsString()));
-            }
-            var manifest = new JsonObject();
-            manifest.addProperty("kind", "pixels_baseline_input"); manifest.addProperty("status", "complete");
-            manifest.addProperty("csv_manifest_sha256", csv.sha256());
-            manifest.add("schema", document.get("schema")); manifest.add("source_ddl", document.get("source_ddl"));
-            manifest.add("baseline_rows", document.get("baseline_rows")); manifest.add("inventory", inventory);
-            manifest.addProperty("data_uri", pixels.get("data_uri").getAsString());
-            manifest.add("engine", new Gson().toJsonTree(identity));
-            var profile = object(object(settings, "data_storage"), "profile");
-            manifest.add("storage", new Gson().toJsonTree(Map.of("endpoint", string(profile, "endpoint"),
-                    "region", string(profile, "region"), "bucket", string(profile, "bucket"))));
-            manifest.add("source_evidence", document.get("source_evidence"));
-            validate(output, manifest);
-            json(output.resolve("manifest.json"), manifest);
-            host.call(Map.of("op", "delete"), timeout);
-            var result = Map.<String, Object>of("status", "complete", "seconds", (System.nanoTime() - started) / 1e9,
-                    "manifest_sha256", Digests.sha256(output.resolve("manifest.json")), "data_uri", manifest.get("data_uri").getAsString());
-            json(output.resolve("result.json"), result);
-            return result;
         } catch (Exception | Error failure) {
             var stack = new java.io.StringWriter(); failure.printStackTrace(new java.io.PrintWriter(stack));
             try { Files.writeString(output.resolve("failure.txt"), stack.toString(), StandardOpenOption.CREATE_NEW); }
             catch (Exception diagnostic) { failure.addSuppressed(diagnostic); }
             throw failure;
         }
+    }
+
+    private static Map<String, Path> tablePaths(CsvInput.Verified csv) {
+        var paths = new LinkedHashMap<String, Path>();
+        for (var item : csv.manifest().getAsJsonObject("baseline_files").entrySet()) {
+            var file = item.getValue().getAsJsonObject();
+            if (file.has("table")) paths.put(file.get("table").getAsString(), csv.directory().resolve(file.get("path").getAsString()));
+        }
+        return paths;
+    }
+
+    /**
+     * Converts each table CSV once and compares the digests of exactly the bytes read with the sealed manifest.
+     * A changed CSV fails here, before any Pixels service starts or any shard is uploaded. Returns the bound schema.
+     */
+    static String convert(CsvInput.Verified csv, SourceSchema source, Path prepared, long rowsPerFile) throws IOException {
+        var document = csv.manifest();
+        var inputs = PixelsInputs.prepare(source, tablePaths(csv), prepared, rowsPerFile);
+        Generation.requireRows(rows(document), inputs.rows());
+        for (var item : document.getAsJsonObject("baseline_files").entrySet()) {
+            var file = item.getValue().getAsJsonObject();
+            if (file.has("table")) require(file.get("sha256").getAsString().equals(inputs.sha256().get(file.get("table").getAsString())), "CSV changed during Pixels preparation");
+        }
+        String spec = Files.readString(csv.directory().resolve(document.getAsJsonObject("schema").get("path").getAsString()));
+        require(spec.equals(inputs.schema().text()), "Pixels schema differs from sealed CSV");
+        return spec;
     }
 
     static Verified open(Path directory) throws IOException {

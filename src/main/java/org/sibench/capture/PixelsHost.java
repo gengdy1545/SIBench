@@ -45,6 +45,11 @@ public final class PixelsHost {
         try (var server = new ServerSocket(Integer.parseInt(listen.substring(colon + 1)), 1, address)) {
             System.out.println("pixels-host on " + server.getLocalSocketAddress());
             while (true) try (var socket = server.accept()) {
+                // A controller lost without closing its connection must still end the session and its cleanup.
+                socket.setKeepAlive(true);
+                socket.setOption(jdk.net.ExtendedSocketOptions.TCP_KEEPIDLE, 60);
+                socket.setOption(jdk.net.ExtendedSocketOptions.TCP_KEEPINTERVAL, 10);
+                socket.setOption(jdk.net.ExtendedSocketOptions.TCP_KEEPCOUNT, 6);
                 new Session(build, workRoot, token, socket).run();
             } catch (Exception failure) {
                 failure.printStackTrace();

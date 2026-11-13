@@ -57,6 +57,23 @@ public class ReplayDispatcherTest {
         assertEquals(Long.MAX_VALUE / 1e6, (double) longSamples.describe().get("p99_ms"), 0);
     }
 
+    /** A client's last baseline batch is sent when dispatch leaves its work unit, not when its next unit arrives. */
+    @Test
+    public void leavingAClientFlushesItsPartialBaselineBatch() throws Exception {
+        var events = new ArrayList<String>();
+        ReplayTarget.Factory factory = client -> new ReplayTarget() {
+            @Override public SendHandle send(long sequence, Operation operation, org.sibench.adapters.proto.TraceOperation stored) {
+                events.add("send-" + client + "-" + operation.workUnitId());
+                return SendHandle.completed();
+            }
+            @Override public void flush() { events.add("flush-" + client); }
+        };
+        try (var dispatcher = new ReplayDispatcher(config(2, 10), factory, 0, System::nanoTime)) {
+            for (long unit : new long[] {1, 1, 2, 3}) dispatcher.send(baseline(unit).withWorkUnitId(unit));
+            assertEquals(List.of("send-0-1", "send-0-1", "flush-0", "send-1-2", "flush-1", "send-0-3"), events);
+        }
+    }
+
     @Test
     public void onlyTheFinalBusinessResponseCompletesLatency() throws Exception {
         var now = new AtomicLong(1_000_000);

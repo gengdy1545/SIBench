@@ -21,6 +21,7 @@
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
 #include "rocksdb/version.h"
+#include "rocksdb/write_batch.h"
 
 using namespace ROCKSDB_NAMESPACE;
 
@@ -189,6 +190,30 @@ JNIEXPORT void JNICALL Java_org_sibench_adapters_CloudRocksStore_put(
   Store* store = AsStore(handle);
   Status status =
       store->db->Put(wal ? store->logged : store->unlogged, Bytes(env, key), Bytes(env, value));
+  if (!status.ok()) ThrowIo(env, status.ToString());
+}
+
+// One WAL-logged write of the whole batch, matching SlateDB's single native batch for baseline loading.
+JNIEXPORT void JNICALL Java_org_sibench_adapters_CloudRocksStore_putAll(
+    JNIEnv* env, jclass, jlong handle, jobjectArray keys, jobjectArray values) {
+  jsize size = env->GetArrayLength(keys);
+  if (size != env->GetArrayLength(values)) {
+    ThrowIo(env, "Batch keys and values differ in length");
+    return;
+  }
+  WriteBatch batch;
+  for (jsize i = 0; i < size; i++) {
+    auto key = static_cast<jbyteArray>(env->GetObjectArrayElement(keys, i));
+    auto value = static_cast<jbyteArray>(env->GetObjectArrayElement(values, i));
+    Status added = batch.Put(Bytes(env, key), Bytes(env, value));
+    env->DeleteLocalRef(key);
+    env->DeleteLocalRef(value);
+    if (!added.ok()) {
+      ThrowIo(env, added.ToString());
+      return;
+    }
+  }
+  Status status = AsStore(handle)->db->Write(AsStore(handle)->logged, &batch);
   if (!status.ok()) ThrowIo(env, status.ToString());
 }
 

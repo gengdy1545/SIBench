@@ -1,12 +1,12 @@
 # SIBench
 
-SIBench captures native benchmark workloads for isolated Index Service replay and runs Pixels experiments from reusable CDC files. Pixels experiments independently select Index Trace export, Trino queries and sink freshness. See the [Trace](docs/trace.md), [Index Service](docs/index-service.md) and [Pixels experiment](docs/pixels-experiment.md) contracts.
+SIBench captures native benchmark workloads for isolated Index Service replay and runs Pixels experiments from reusable columnar baselines and optional CDC files. Pixels experiments independently select Index Trace export, Trino queries and sink freshness. See the [Trace](docs/trace.md), [Index Service](docs/index-service.md) and [Pixels experiment](docs/pixels-experiment.md) contracts.
 
 | Source | Mode / engine | Workload |
 | --- | --- | --- |
 | YCSB | `api` / RocksDB | A/B/C/F/D/E; Read-modify-write remains two API calls. |
 | sysbench | Default `capture` / PostgreSQL; optional DuckDB | Six configured OLTP workloads. |
-| HyBench | Default `cdc` / Pixels; optional native `capture` / PostgreSQL or DuckDB | CDC uses the HyBench TP/AT subset with AP/IQ disabled. Native capture retains AP → TP → concurrent XP. CDC exports Pixels' primary-index calls while applying changes from an uninstrumented PostgreSQL. |
+| HyBench | Default `capture` / PostgreSQL; optional DuckDB | Native capture retains AP → TP → concurrent XP. The separate `generate-pixels` command applies PostgreSQL TP/AT changes to Pixels and captures its primary-index calls, with AP/IQ disabled. |
 
 ## Build
 
@@ -104,7 +104,9 @@ java -jar build/sibench/sibench.jar inspect-scale
 java -jar build/sibench/sibench.jar generate config/sibench.yaml
 ```
 
-`generate` validates every selected input before starting a host, ignores unselected profiles, runs selections in order and stops at the first failure. Native API/capture uses one fresh database per source. Pixels CDC uses a fresh source PostgreSQL and a fresh Pixels database loaded independently from the same inputs. Working databases are deleted after publication. Existing/overlapping outputs, changed build/source inputs and unsupported configurations are rejected. Successful publication requires normal shutdown; failures retain diagnostics and cannot resume.
+`generate` runs only the native API/capture selections, using one fresh database per source. It validates every selected input before starting a host, ignores unselected engine builds and Pixels experiment settings, runs selections in order and stops at the first failure. The default HyBench selection uses PostgreSQL; engines never fall back automatically. Working databases are deleted after publication. Existing/overlapping outputs, changed build/source inputs and unsupported configurations are rejected. Successful publication requires normal shutdown; failures retain diagnostics and cannot resume.
+
+For a live PostgreSQL → sink → Pixels Trace, use `java -jar build/sibench/sibench.jar generate-pixels config/sibench.yaml`. This command uses the selected HyBench profile and `engines.pixels`, independently of the native engine selection. It starts a separate uninstrumented source PostgreSQL and fresh Pixels state loaded from the same CSVs. It does not invoke native PG capture. Choose a fresh `artifacts.directory` for each run; native and Pixels outputs cannot share an existing directory.
 
 `trace.workload_requests` limits exported workload operations; it excludes the baseline and may be exceeded by already admitted source work. `trace.secondary_indexes` defaults to false. See [generation and publication](docs/trace.md#native-publication) for source phases, request accounting, index selection and failure behavior.
 
@@ -120,7 +122,9 @@ java -jar build/sibench/sibench.jar pixels-experiment config/sibench.yaml \
   results/capture/hybench results/inputs/hybench-pixels results/pixels/run
 ```
 
-`prepare-csv` generates and seals the baseline without a database. Parallel preparation captures PostgreSQL TP/AT changes and creates a Pixels columnar baseline from that same CSV input. Experiments import the existing Pixels files and rebuild indexes and visibility before applying CDC. Updates default on; Trace, queries and freshness default off. All output directories must be fresh. See the [input contract](docs/cdc-input.md) for publication and the [experiment contract](docs/pixels-experiment.md) for restore and measurement semantics.
+To compare Trino answers on the sealed baseline with an independent PostgreSQL, run `render-queries config/sibench.yaml results/capture/hybench-csv results/capture/hybench-queries SEED INSTANCES` and use its output as `queries.directory` of a static experiment.
+
+`prepare-csv` generates and seals the baseline without a database. Parallel preparation captures PostgreSQL TP/AT changes and creates a Pixels columnar baseline from that same CSV input. Experiments import the existing Pixels files and rebuild indexes and visibility before applying CDC. Updates default on; Trace, queries and freshness default off. With `updates: false`, omit the CDC argument; static experiments need only the Pixels baseline and do not read CSV or CDC files. All output directories must be fresh. See the [input contract](docs/cdc-input.md) for publication and the [experiment contract](docs/pixels-experiment.md) for restore and measurement semantics.
 
 Pixels runs locally by default. For a remote Pixels host, start the agent there with the matching build and a token file, set `pixels_host: HOST:PORT` in the engine configuration, and supply `SIBENCH_PIXELS_HOST_TOKEN` to the client:
 
@@ -128,7 +132,7 @@ Pixels runs locally by default. For a remote Pixels host, start the agent there 
 java -jar build/sibench/sibench.jar pixels-host ADDRESS:PORT build/services/pixels WORK_ROOT TOKEN_FILE
 ```
 
-The source PostgreSQL and sink remain on the generator during live `generate` runs. See [host lifecycle and limits](docs/trace.md#pixels-host) for identity checks, uploads and cleanup. Engine memory and phase timeouts are separate resource controls, not whole-run quotas.
+The source PostgreSQL and sink remain on the generator during live `generate-pixels` runs. See [host lifecycle and limits](docs/trace.md#pixels-host) for identity checks, uploads and cleanup. Engine memory and phase timeouts are separate resource controls, not whole-run quotas.
 
 ## Replay and service
 
@@ -177,6 +181,7 @@ Use `-Dsibench.build.directory=ABSOLUTE_PATH` for an isolated Maven build/test/p
 | `DuckDbTraceCheck,DuckDbAccessesCheck,DuckDbGenerationCheck,HybenchNativeCheck` | `sibench.duckdb.host=build/services/duckdb/duckdb_host`; source integration also needs `sibench.sysbench.build` and/or `sibench.hybench.build`. `HybenchSamplingCheck` needs only the HyBench build. |
 | `PixelsGenerationCheck` | `sibench.pixels.build=build/services/pixels` (both build phases) and `sibench.hybench.build=build/benchmarks/HyBench-2024`; runs Pixels locally with small HyBench parameters and replays both value kinds. |
 | `PixelsCdcCheck` | `sibench.pixels.build=build/services/pixels`; real PostgreSQL → sink → Pixels application and RowID/Locator validation. |
+| `PixelsLoadLeaseCheck` | `sibench.pixels.build=build/services/pixels` and `mkfifo`; one local LOAD held open beyond the 300-second write-transaction lease must still commit (about seven minutes). |
 | `PixelsSourceCheck` | `sibench.postgres.runtime=build/services/pixels/postgres/runtime`; source-only PostgreSQL checks for key-change rejection, unchanged-key updates without guard function calls, rollback, preceding triggers and preservation of the original indexes. |
 | `CdcPreparationCheck` | `sibench.pixels.build=build/services/pixels`; real PostgreSQL CDC preparation without target services. The HyBench command check also requires `sibench.hybench.build`. |
 | `InputStoreCheck` | `sibench.storage.config`, `sibench.storage.profile`, a fresh `sibench.storage.prefix` and the profile's credentials; a small remote publication/download check. |

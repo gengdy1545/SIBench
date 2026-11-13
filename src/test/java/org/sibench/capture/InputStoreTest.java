@@ -19,6 +19,7 @@ import software.amazon.awssdk.services.s3.model.*;
 public class InputStoreTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
     private final Map<String, byte[]> objects = new HashMap<>();
+    private java.util.function.Consumer<String> beforeHead = key -> {};
     private int uploads;
 
     @Test public void publishesContentOnceAndRestoresAVerifiedIndependentInput() throws Exception {
@@ -102,7 +103,8 @@ public class InputStoreTest {
         Path file = temporary.newFile("multipart").toPath();
         long size = (64L << 20) + 1;
         try (var data = new java.io.RandomAccessFile(file.toFile(), "rw")) { data.setLength(size); }
-        for (boolean fail : new boolean[] {false, true}) {
+        String sha256 = org.sibench.config.Digests.sha256(file);
+        for (String mode : new String[] {"complete", "fail", "changed"}) {
             var events = new java.util.ArrayList<String>();
             var client = (S3Client) java.lang.reflect.Proxy.newProxyInstance(S3Client.class.getClassLoader(), new Class<?>[] {S3Client.class},
                     (proxy, method, args) -> switch (method.getName()) {
@@ -111,7 +113,7 @@ public class InputStoreTest {
                         case "uploadPart" -> {
                             var request = (UploadPartRequest) args[0];
                             events.add("part-" + request.partNumber());
-                            if (fail && request.partNumber() == 2) throw S3Exception.builder().statusCode(503).message("injected").build();
+                            if (mode.equals("fail") && request.partNumber() == 2) throw S3Exception.builder().statusCode(503).message("injected").build();
                             long expected = request.partNumber() == 1 ? 64L << 20 : 1;
                             assertEquals(expected, request.contentLength().longValue());
                             var body = (RequestBody) args[1];
@@ -130,11 +132,37 @@ public class InputStoreTest {
                         default -> throw new AssertionError(method);
                     });
             try (var store = new InputStore(client, "test", "inputs/")) {
-                if (fail) assertThrows(S3Exception.class, () -> store.upload(file, "inputs/object", size));
-                else store.upload(file, "inputs/object", size);
+                switch (mode) {
+                    case "fail" -> assertThrows(S3Exception.class, () -> store.upload(file, "inputs/object", size, sha256));
+                    // Bytes differing from the content key never complete an object under that key.
+                    case "changed" -> assertThrows(java.io.IOException.class, () -> store.upload(file, "inputs/object", size, "0".repeat(64)));
+                    default -> store.upload(file, "inputs/object", size, sha256);
+                }
             }
-            assertEquals(java.util.List.of("part-1", "part-2", fail ? "abort" : "complete"), events);
+            assertEquals(switch (mode) {
+                case "complete" -> java.util.List.of("part-1", "part-2", "complete");
+                case "fail" -> java.util.List.of("part-1", "part-2", "abort");
+                default -> java.util.List.of("part-1", "abort");
+            }, events);
         }
+    }
+
+    @Test public void publishNeverStoresBytesThatChangedAfterValidation() throws Exception {
+        var input = CsvInputTest.fixture(temporary.newFolder("source").toPath());
+        var file = CsvInput.open(input.output()).manifest().getAsJsonObject("baseline_files").getAsJsonObject("customer.csv");
+        Path csv = input.output().resolve(file.get("path").getAsString());
+        String key = "inputs/objects/" + file.get("sha256").getAsString();
+        // The payload changes, keeping its size, between validation and its upload.
+        beforeHead = head -> {
+            if (!head.equals(key)) return;
+            try {
+                byte[] bytes = Files.readAllBytes(csv);
+                bytes[0] ^= 1;
+                Files.write(csv, bytes);
+            } catch (java.io.IOException error) { throw new java.io.UncheckedIOException(error); }
+        };
+        try (var store = store()) { assertThrows(java.io.IOException.class, () -> store.publish(input.output())); }
+        assertFalse("A content key must never hold other bytes", objects.containsKey(key));
     }
 
     private InputStore store() throws Exception {
@@ -142,6 +170,7 @@ public class InputStoreTest {
                 (proxy, method, args) -> switch (method.getName()) {
                     case "close" -> null;
                     case "headObject" -> {
+                        beforeHead.accept(((HeadObjectRequest) args[0]).key());
                         byte[] data = objects.get(((HeadObjectRequest) args[0]).key());
                         if (data == null) throw NoSuchKeyException.builder().statusCode(404).message("missing").build();
                         yield HeadObjectResponse.builder().contentLength((long) data.length).build();

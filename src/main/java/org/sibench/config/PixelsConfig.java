@@ -48,11 +48,7 @@ public final class PixelsConfig {
         SibenchConfig.keys(load, Set.of("rows_per_file", "threads"), "pixels load");
         positive(load, "rows_per_file");
         require(positive(load, "threads") <= 256, "Pixels load threads exceeds 256");
-        var source = object(settings, "source");
-        SibenchConfig.keys(source, Set.of("settings"), "pixels source");
-        var postgres = SibenchConfig.postgresSettings(object(source, "settings"));
-        for (String key : Set.of("wal_level", "max_wal_senders", "max_replication_slots"))
-            require(!postgres.containsKey(key), "Source PostgreSQL logical replication setting is generator-owned: " + key);
+        sourceSettings(object(settings, "source"));
         var result = new LinkedHashMap<>(settings);
         if (settings.containsKey("data_storage")) {
             var storage = object(settings, "data_storage");
@@ -67,6 +63,25 @@ public final class PixelsConfig {
         result.put("properties", pixelsProperties(properties(directory.resolve(string(settings, "properties")))));
         result.put("sink_properties", sinkProperties(properties(directory.resolve(string(settings, "sink_properties")))));
         return result;
+    }
+
+    static Map<String,Object> readSource(Path directory,Map<String,Object> settings)throws IOException {
+        for(String key:settings.keySet())
+            require(Set.of("build_directory","pixels_host","memory","load","source","properties","sink_properties","data_storage")
+                    .contains(key),"Unknown pixels engine option: "+key);
+        var source=object(settings,"source");sourceSettings(source);
+        String heap=string(object(settings,"memory"),"sink_heap");
+        require(heap.matches("[1-9][0-9]*[mg]"),"Invalid JVM heap: sink_heap");
+        return Map.of("build_directory",string(settings,"build_directory"),"source",source,
+                "memory",Map.of("sink_heap",heap),
+                "sink_properties",sinkProperties(properties(directory.resolve(string(settings,"sink_properties")))));
+    }
+
+    private static void sourceSettings(Map<String,Object> source) {
+        SibenchConfig.keys(source, Set.of("settings"), "pixels source");
+        var postgres = SibenchConfig.postgresSettings(object(source, "settings"));
+        for (String key : Set.of("wal_level", "max_wal_senders", "max_replication_slots"))
+            require(!postgres.containsKey(key), "Source PostgreSQL logical replication setting is generator-owned: " + key);
     }
 
     /** Pixels overrides; location-like keys always come from the generator's run layout. */

@@ -118,6 +118,27 @@ public class PixelsTraceTest {
         workload.close();
     }
 
+    /** A source change Pixels could not resolve, or a resolution without its change, diverges from the source. */
+    @Test public void keyResolutionMustMatchTheAppliedChange() throws Exception {
+        List<List<PixelsTrace.Fact>> divergent = List.of(
+                List.of(fact(PixelsTrace.LOOKUP, 10, 1, -1)),
+                List.of(fact(PixelsTrace.LOOKUP, 10, 1, 100)),
+                List.of(fact(PixelsTrace.LOOKUP, 10, 1, -1), fact(PixelsTrace.UPDATE, 10, 1, 201)),
+                List.of(fact(PixelsTrace.LOOKUP, 10, 1, 100), fact(PixelsTrace.PUT, 10, 1, 201)),
+                List.of(fact(PixelsTrace.LOOKUP, 10, 1, 100), fact(PixelsTrace.LOOKUP, 10, 1, 100), fact(PixelsTrace.DELETE, 10, 1, 100)));
+        for (var facts : divergent) {
+            var trace = trace(null);
+            trace.fact(fact(PixelsTrace.PUT, 3, 1, 100));
+            trace.finishBaseline(Map.of("sbtest1", 1L));
+            trace.begin(10);
+            for (var fact : facts) trace.fact(fact);
+            trace.commit(10);
+            assertThrows(facts.toString(), IOException.class, () -> trace.covered(trace.committedSnapshot()));
+            // The failed export leaves its transaction open; closing then reports it as incomplete.
+            assertThrows(IOException.class, trace::close);
+        }
+    }
+
     @Test public void mixedMarkerTransactionIsRejected() throws Exception {
         var trace = trace(null);
         trace.finishBaseline(Map.of());

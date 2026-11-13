@@ -79,11 +79,16 @@ public final class CsvInput {
                 "baseline_rows", input.manifest().getAsJsonObject("baseline_rows"));
     }
 
-    static Verified open(Path directory) throws IOException {
+    static Verified open(Path directory) throws IOException { return open(directory, true); }
+
+    /** Manifest, schema, DDL and file sizes only; a consumer reading every baseline CSV compares their digests itself. */
+    static Verified bind(Path directory) throws IOException { return open(directory, false); }
+
+    private static Verified open(Path directory, boolean contents) throws IOException {
         directory = directory.toRealPath();
         var manifest = manifest(directory);
         try {
-            validate(directory, manifest.document(), true);
+            validate(directory, manifest.document(), contents);
             return new Verified(directory, manifest.document(), manifest.sha256());
         } catch (RuntimeException malformed) {
             throw new IOException("Invalid CSV input: " + directory, malformed);

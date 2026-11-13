@@ -75,6 +75,16 @@ final class LocalRocksStore implements OrderedStore {
     }
 
     @Override
+    public void putAll(java.util.List<byte[]> keys, java.util.List<byte[]> values) throws IOException {
+        try (var batch = new org.rocksdb.WriteBatch()) {
+            for (int i = 0; i < keys.size(); i++) batch.put(keys.get(i), values.get(i));
+            db.write(logged, batch);
+        } catch (RocksDBException error) {
+            throw new IOException(error);
+        }
+    }
+
+    @Override
     public byte[] get(byte[] key) throws IOException {
         try {
             return db.get(key);

@@ -57,7 +57,7 @@ public class CdcPreparationCheck {
         Files.writeString(engine, yaml.dump(pixels));
         Files.writeString(config, yaml.dump(Map.of("schema_version", 1, "purpose", "sibench",
                 "benchmarks", List.of(Map.of("config", "config/benchmark/ycsb.yaml", "mode", "api", "engine", "rocksdb"),
-                        Map.of("config", benchmark.toString(), "mode", "cdc", "engine", "pixels")),
+                        Map.of("config", benchmark.toString(), "mode", "capture", "engine", "postgres")),
                 "engines", Map.of("pixels", engine.toString(), "rocksdb", "/unavailable/engine-config.yaml"))));
         var output = new java.io.ByteArrayOutputStream();var errors = new java.io.ByteArrayOutputStream();
         int prepared = org.sibench.cli.Sibench.run(new String[] {"prepare-csv", "--root", root.toString(), config.toString(), work.resolve("csv").toString()},

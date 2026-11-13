@@ -104,6 +104,12 @@ final class CloudRocksStore implements OrderedStore {
     }
 
     @Override
+    public void putAll(java.util.List<byte[]> keys, java.util.List<byte[]> values) throws IOException {
+        requireOpen();
+        putAll(handle, keys.toArray(byte[][]::new), values.toArray(byte[][]::new));
+    }
+
+    @Override
     public byte[] get(byte[] key) throws IOException {
         requireOpen();
         return get(handle, key);
@@ -207,6 +213,8 @@ final class CloudRocksStore implements OrderedStore {
 
     private static native void put(long handle, byte[] key, byte[] value, boolean wal)
             throws IOException;
+
+    private static native void putAll(long handle, byte[][] keys, byte[][] values) throws IOException;
 
     private static native byte[] get(long handle, byte[] key) throws IOException;
 

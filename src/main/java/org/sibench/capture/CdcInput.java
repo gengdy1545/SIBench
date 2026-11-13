@@ -26,7 +26,7 @@ public final class CdcInput {
     private CdcInput() {}
 
     record Counts(long transactions, long changes, long businessChanges, long markers) {}
-    record Verified(JsonObject manifest, Counts counts, String manifestSha256) {}
+    record Verified(Path directory, JsonObject manifest, Counts counts, String manifestSha256) {}
 
     interface Frame { void accept(int table, byte[] bytes) throws Exception; }
 
@@ -102,7 +102,7 @@ public final class CdcInput {
         var manifest = manifest(directory);
         try {
             Counts counts = validate(directory, manifest.document(), true);
-            return new Verified(manifest.document(), counts, manifest.sha256());
+            return new Verified(directory, manifest.document(), counts, manifest.sha256());
         } catch (RuntimeException malformed) {
             throw new IOException("Invalid CDC input manifest: " + directory, malformed);
         }

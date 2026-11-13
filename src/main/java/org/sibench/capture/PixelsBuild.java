@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.sibench.config.Digests;
@@ -16,6 +17,31 @@ import org.sibench.config.Digests;
  */
 final class PixelsBuild {
     private PixelsBuild() {}
+
+    /** CDC preparation does not consume a Pixels server, Retina library or etcd binary. */
+    static Map<String,Object> verifySource(Path root,Path build)throws IOException {
+        var java=read(build.resolve("java-build.json"));
+        var nativeBuild=read(build.resolve("native-build.json"));
+        require(java.get("pixels_commit").getAsString().equals(gitlink(root,"third_party/pixels"))
+                &&java.get("pixels_sink_commit").getAsString().equals(gitlink(root,"third_party/pixels-sink"))
+                &&nativeBuild.get("postgresql_commit").getAsString().equals(gitlink(root,"third_party/postgresql")),
+                "CDC source build differs from the repository gitlinks");
+        require(java.get("pixels_patch_sha256").getAsString().equals(Digests.sha256(
+                root.resolve("src/main/native/pixels/pixels-0.2.0-SNAPSHOT.patch")))
+                &&java.get("pixels_sink_patch_sha256").getAsString().equals(Digests.sha256(
+                root.resolve("src/main/native/pixels-sink/pixels-sink-0.2.0-SNAPSHOT.patch")))
+                &&java.get("tracer_sources_sha256").getAsString().equals(treeSha256(root.resolve("src/main/native/pixels")))
+                &&java.get("build_script_sha256").getAsString().equals(Digests.sha256(root.resolve("scripts/build-pixels.sh"))),
+                "CDC source build inputs changed");
+        for(String jar:List.of("pixels-sink.jar","sibench-pixels.jar"))
+            require(Digests.sha256(build.resolve("jars").resolve(jar)).equals(java.getAsJsonObject("jars").get(jar).getAsString()),
+                    "CDC source build file changed: "+jar);
+        for(String binary:List.of("postgres","pg_ctl","initdb"))
+            require(Digests.sha256(build.resolve("postgres/runtime/bin").resolve(binary)).equals(
+                    nativeBuild.getAsJsonObject("files").get(binary).getAsString()),"CDC source build file changed: "+binary);
+        return Map.of("java",new com.google.gson.Gson().fromJson(java,Map.class),
+                "native",new com.google.gson.Gson().fromJson(nativeBuild,Map.class));
+    }
 
     static Map<String, Object> verify(Path root, Path build) throws IOException {
         var java = read(build.resolve("java-build.json"));

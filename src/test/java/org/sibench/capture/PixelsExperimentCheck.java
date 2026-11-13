@@ -126,7 +126,9 @@ public class PixelsExperimentCheck {
             trino.putAll(Map.of("heap", "8G", "query_memory", "2GB", "query_total_memory", "4GB", "heap_headroom", "2GB", "threads", 4));
             experiment.put("trino", trino);
         }
-        var runtime = Map.of("schema_version", 1, "purpose", "sibench", "engines", Map.of("pixels", engineConfig.toString()), "pixels_experiment", experiment);
+        // Baseline preparation takes its bound from the selected HyBench profile, as CDC preparation does.
+        var runtime = Map.of("schema_version", 1, "purpose", "sibench", "engines", Map.of("pixels", engineConfig.toString()), "pixels_experiment", experiment,
+                "benchmarks", List.of(Map.of("config", "config/benchmark/hybench.yaml", "mode", "capture", "engine", "postgres")));
         Path config = Files.writeString(directory.resolve("runtime.json"), gson.toJson(runtime));
         Path output = directory.resolve("run");
         Path baseline = baselines.get(input);
@@ -139,7 +141,9 @@ public class PixelsExperimentCheck {
             baselines.put(input, baseline);
         }
         String original = PixelsBaseline.open(baseline).sha256();
-        PixelsExperiment.run(root, config, input, baseline, output);
+        PixelsExperiment.run(root, config, updates ? input : null, baseline, output);
+        assertEquals(updates, Files.exists(output.resolve("input.json")));
+        assertEquals(updates, read(output.resolve("result.json")).has("input_manifest_sha256"));
         assertEquals(original, PixelsBaseline.open(baseline).sha256());
         assertEquals(original, read(output.resolve("result.json")).get("baseline_manifest_sha256").getAsString());
         assertFalse("Restores must not re-encode CSV", Files.exists(output.resolve("pixels-inputs")));

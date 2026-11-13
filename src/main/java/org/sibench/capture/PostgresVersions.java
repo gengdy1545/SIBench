@@ -16,9 +16,11 @@ final class PostgresVersions implements AutoCloseable {
     PostgresVersions(Connection database)throws SQLException {
         this.database=database;
         // Empty-table statistics must not cache full scans as the private mapping tables grow.
-        sql("SET LOCAL enable_seqscan=off");
+        sql("SET enable_seqscan=off");
         sql("ALTER TABLE sibench_history.commits ADD COLUMN source_csn BIGINT");
         sql("CREATE UNIQUE INDEX sibench_commit_csn ON sibench_history.commits(source_csn)");
+        // An XID held across the workload would stop native pruning of every benchmark table.
+        database.commit();
         commit=database.prepareStatement("INSERT INTO sibench_history.commits VALUES(?,?,?)");
         older=database.prepareStatement("SELECT commit_version FROM sibench_history.commits WHERE source_csn<=? ORDER BY source_csn DESC LIMIT 1");
     }
@@ -39,7 +41,7 @@ final class PostgresVersions implements AutoCloseable {
         if(chunk.committed&&chunk.transaction>0) {
             if(pendingCommits.put(chunk.transaction,version)!=null)throw new SQLException("Duplicate PG writer transaction");
             commit.setLong(1,chunk.transaction);commit.setLong(2,version);commit.setLong(3,chunk.csn);commit.addBatch();
-            if(pendingCommits.size()==1024){commit.executeBatch();pendingCommits.clear();}
+            if(pendingCommits.size()==1024){commit.executeBatch();database.commit();pendingCommits.clear();}
             if(recent.put(chunk.csn,version)!=null)throw new SQLException("Duplicate PG writer completion counter");
             if(recent.size()>65536)recent.pollFirstEntry();
         }

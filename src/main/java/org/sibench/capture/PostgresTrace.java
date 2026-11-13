@@ -53,9 +53,17 @@ final class PostgresTrace {
         try(var lines=units.lines();writer;var versions=new PostgresVersions(database);
                 var projection=new PostgresProjection(database,catalog,directory,versions,units,secondaryIndexes,writer::accept)) {
             for(PostgresTransactions.Chunk next;(next=capture.transactions.next(()->capture.watermark(database)))!=null;)
-                try(var chunk=next){
-                    if (projection.accept(chunk)) projectedTransactions++;
-                    capture.updateHold(database);
+                {
+                    var chunk=next;
+                    try {
+                        if(chunk.hasRequests&&!chunk.committed)writer.expectAbort();
+                        if (projection.accept(chunk)) projectedTransactions++;
+                        capture.updateHold(database);
+                    } catch(Exception|Error failure) {
+                        capture.fail(failure);
+                        throw failure;
+                    }
+                    chunk.close();
                 }
             var counts=projection.counts();
             long requests=0,commits=0,aborts=0;

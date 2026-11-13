@@ -12,6 +12,8 @@ replay:
   dispatch_mode: operation
   client_count: 64
   max_in_flight: 4096
+  # Baseline Puts per WriteBatch RPC; client_count × (batch − 1) must stay below max_in_flight. Workload operations are sent one per RPC.
+  baseline_batch_operations: 64
   request_timeout_seconds: 600
 benchmarks:
   - config: config/benchmark/ycsb.yaml
@@ -21,8 +23,8 @@ benchmarks:
     mode: capture
     engine: postgres
   - config: config/benchmark/hybench.yaml
-    mode: cdc
-    engine: pixels
+    mode: capture
+    engine: postgres
 engines:
   duckdb: config/engine/duckdb.yaml
   postgres: config/engine/postgres.yaml

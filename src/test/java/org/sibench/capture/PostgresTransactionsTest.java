@@ -305,15 +305,49 @@ public class PostgresTransactionsTest {
     }
 
     @Test public void quotasAndUnfinishedTransactionsFailWithoutDroppingFacts() throws Exception {
-        try (var source = new PostgresTransactions(temporary.getRoot().toPath().resolve("bytes"), 100, 2)) {
+        Path scratch = temporary.getRoot().toPath().resolve("bytes");
+        try (var source = new PostgresTransactions(scratch, 64 << 10, 2)) {
             var chunk = source.begin(1);
-            assertTrue(assertThrows(IOException.class, () -> append(chunk, 1, "x".repeat(101)))
-                    .getMessage().contains("byte budget"));
+            byte[] random = new byte[300_000];
+            new java.util.Random(7).nextBytes(random);
+            var error = assertThrows(IOException.class, () -> {
+                append(chunk, 1, java.util.Base64.getEncoder().encodeToString(random));
+                source.complete(chunk, 1, true, true);
+            });
+            assertTrue(error.getMessage().contains("spool byte budget"));
             assertTrue(assertThrows(IOException.class, source::finish).getMessage().contains("unfinished"));
+            source.fail(error);
+            source.retainFailure();
+            assertTrue(Files.readString(scratch.resolve("failure.json")).contains("spool byte budget"));
+            try (var files = Files.list(scratch)) {
+                for (Path file : files.filter(p -> p.toString().endsWith(".zst")).toList())
+                    assertTrue(Files.size(file) <= 64 << 10);
+            }
+            Files.delete(scratch.resolve("failure.json"));
         }
         try (var source = new PostgresTransactions(temporary.getRoot().toPath().resolve("count"), 1000, 1)) {
             source.begin(1);
             assertTrue(assertThrows(IOException.class, () -> source.begin(2)).getMessage().contains("limit"));
+        }
+    }
+
+    @Test public void largeCompressibleTransactionUsesTheSpoolBudgetInsteadOfEncodedSize() throws Exception {
+        Path scratch = temporary.getRoot().toPath().resolve("compressed-budget");
+        try (var source = new PostgresTransactions(scratch, 64 << 10, 2)) {
+            var chunk = source.begin(1);
+            for (int i = 0; i < 20; i++) append(chunk, 1, "x".repeat(100_000));
+            source.complete(chunk, 1, false, false);
+            assertTrue(((Number) source.metrics().get("pending_encoded_bytes")).longValue() > 2_000_000);
+            long physical;
+            try (var files = Files.list(scratch)) { physical = Files.size(files.findFirst().orElseThrow()); }
+            assertEquals(physical, source.metrics().get("pending_spool_bytes"));
+            assertTrue(physical < 64 << 10);
+            int[] seen = {0};
+            read(chunk, event -> { assertEquals("x".repeat(100_000), event.get("value").getAsString()); seen[0]++; });
+            assertEquals(20, seen[0]);
+            source.endStream(1);
+            chunk.close();
+            assertEquals(0L, source.metrics().get("pending_spool_bytes"));
         }
     }
 

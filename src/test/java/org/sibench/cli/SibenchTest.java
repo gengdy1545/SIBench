@@ -13,6 +13,23 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 
 public class SibenchTest {
+    @org.junit.Rule public org.junit.rules.TemporaryFolder temporary = new org.junit.rules.TemporaryFolder();
+
+    @Test public void staticPixelsCommandAcceptsBaselineWithoutCdc() throws Exception {
+        Path root = temporary.getRoot().toPath();
+        var settings = new java.util.LinkedHashMap<>(org.sibench.config.PixelsExperimentConfig.defaults());
+        settings.put("updates", false);
+        java.nio.file.Files.writeString(root.resolve("runtime.json"), new com.google.gson.Gson().toJson(java.util.Map.of(
+                "schema_version", 1, "purpose", "sibench", "pixels_experiment", settings)));
+        var output = new ByteArrayOutputStream(); var errors = new ByteArrayOutputStream();
+        try (var out = new PrintStream(output); var err = new PrintStream(errors)) {
+            assertEquals(1, Sibench.run(new String[] {"pixels-experiment", "--root", root.toString(),
+                    "runtime.json", "missing-baseline", "output"}, out, err));
+        }
+        assertTrue(errors.toString(StandardCharsets.UTF_8), errors.toString(StandardCharsets.UTF_8).contains("missing-baseline"));
+        assertEquals(0, output.size());
+    }
+
     @Test
     public void producesJsonForAllProfiles() {
         ByteArrayOutputStream output = new ByteArrayOutputStream();
@@ -41,6 +58,8 @@ public class SibenchTest {
             {"inspect-scale", "--root"},
             {"inspect-scale", "--unknown"},
             {"generate"},
+            {"generate-pixels"},
+            {"generate-pixels", "missing-config.yaml"},
             {"unknown-command", "--help"},
             {"generate", "missing-config.yaml"},
             {"replay", "config/sibench.yaml"},

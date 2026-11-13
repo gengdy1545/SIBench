@@ -29,11 +29,30 @@ import org.sibench.schema.SourceSchema;
  * load both databases. Each workload window ends with a marker transaction whose arrival in Pixels
  * proves every earlier source commit was applied and projected.
  */
-final class PixelsGeneration {
+public final class PixelsGeneration {
     private static final String MARKER = "sibench_marker", SLOT = "sibench";
     private static final Duration CONNECT = Duration.ofMinutes(5);
 
     private PixelsGeneration() {}
+
+    public static Map<String,Object> run(Path root,Path configuration)throws Exception {
+        var plan=plan(root,configuration,false);
+        return generate(plan,plan.inputs().get(0));
+    }
+
+    static Generation.Plan plan(Path root,Path configuration,boolean sourceOnly)throws Exception {
+        root=root.toRealPath();var runtime=SibenchConfig.read(root.resolve(configuration));
+        var selected=Generation.hybenchSelection(root,runtime);
+        if(!sourceOnly)require(!Generation.secondaryIndexes(parse(Files.readString(selected.config()))),
+                "Pixels CDC supports primary indexes only");
+        var selection=new org.sibench.config.BenchmarkSelection(selected.config(),selected.benchmark(),
+                org.sibench.config.BenchmarkSelection.Mode.CDC,Engine.PIXELS);
+        var settings=sourceOnly?SibenchConfig.cdcSource(root,runtime):SibenchConfig.engine(root,runtime,Engine.PIXELS);
+        Path build=NativeBuildCheck.engineDirectory(root,settings,"pixels").toRealPath();
+        var identity=sourceOnly?PixelsBuild.verifySource(root,build):PixelsBuild.verify(root,build);
+        return Generation.inputs(root,runtime,List.of(selection),
+                Map.of(Engine.PIXELS,new Generation.NativeBuild(build,identity,settings)),null);
+    }
 
     static Map<String, Object> generate(Generation.Plan plan, Generation.Input input) throws Exception {
         if (!input.selection().benchmark().equals("hybench") || Generation.secondaryIndexes(input.document()))
@@ -284,8 +303,12 @@ final class PixelsGeneration {
             }
             Files.delete(prepared);
             progress(output, "pixels_load_begin", Map.of());
-            host.call(Map.of("op", "load", "schema", "postgres", "tables", tables.stream().map(SourceSchema.Table::name).toList(),
+            var loaded = host.call(Map.of("op", "load", "schema", "postgres", "tables", tables.stream().map(SourceSchema.Table::name).toList(),
                     "rows_per_file", positive(settings, "rows_per_file"), "threads", positive(settings, "threads")), timeout);
+            // File footers and traced primary-index entries are independent counts of the same rows.
+            var footers = new java.util.LinkedHashMap<String, Long>();
+            loaded.getAsJsonObject("rows").entrySet().forEach(e -> footers.put(e.getKey(), e.getValue().getAsLong()));
+            Generation.requireRows(expected, footers);
             double pixels = seconds(started);
             progress(output, "pixels_load_complete", Map.of("seconds", pixels));
             awaitLoad(sourceLoad, timeout);
@@ -340,7 +363,8 @@ final class PixelsGeneration {
         for (var table : source.tables()) {
             String key = table.indexes().stream().filter(SourceSchema.Index::primary).findFirst().orElseThrow().column();
             execute(database, "ALTER TABLE " + quote(table.name()) + " REPLICA IDENTITY FULL");
-            execute(database, "CREATE TRIGGER sibench_reject_key_change BEFORE UPDATE ON " + quote(table.name())
+            // AFTER sees the final row of every BEFORE trigger, whatever their name order.
+            execute(database, "CREATE TRIGGER sibench_reject_key_change AFTER UPDATE ON " + quote(table.name())
                     + " FOR EACH ROW WHEN (OLD." + quote(key) + " IS DISTINCT FROM NEW." + quote(key)
                     + ") EXECUTE FUNCTION public.sibench_reject_key_change()");
         }

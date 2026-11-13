@@ -17,6 +17,16 @@ import org.sibench.config.SibenchConfig;
 public class PixelsGenerationTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test public void pixelsRejectsSecondaryCaptureBeforeReadingItsBuild() throws Exception {
+        Path root=Path.of("").toRealPath(),config=temporary.newFile().toPath(),profile=temporary.newFile().toPath();
+        Files.writeString(profile,"benchmark: hybench\ntrace:\n  secondary_indexes: true\n");
+        Files.writeString(config,new org.yaml.snakeyaml.Yaml().dump(Map.of("schema_version",1,"purpose","sibench",
+                "benchmarks",java.util.List.of(Map.of("config",profile.toString(),"mode","capture","engine","postgres")),
+                "engines",Map.of("pixels","missing.yaml"))));
+        var failure=assertThrows(IllegalArgumentException.class,()->PixelsGeneration.run(root,config));
+        assertEquals("Pixels CDC supports primary indexes only",failure.getMessage());
+    }
+
     @Test public void sinkOverridesCannotFilterOrRewriteSourceEventsOrHideTypos() {
         var accepted=new java.util.ArrayList<String>();
         for (String key:java.util.List.of("debezium.skipped.operations","debezium.column.exclude.list", "debezium.unknown",

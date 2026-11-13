@@ -59,8 +59,8 @@ public class SibenchConfigTest {
         assertEquals(java.util.List.of("ycsb", "sysbench", "hybench"),
                 selected.stream().map(BenchmarkSelection::benchmark).toList());
         assertEquals(java.util.List.of(BenchmarkSelection.Mode.API, BenchmarkSelection.Mode.CAPTURE,
-                BenchmarkSelection.Mode.CDC), selected.stream().map(BenchmarkSelection::mode).toList());
-        assertEquals(java.util.List.of(Engine.ROCKSDB, Engine.POSTGRES, Engine.PIXELS),
+                BenchmarkSelection.Mode.CAPTURE), selected.stream().map(BenchmarkSelection::mode).toList());
+        assertEquals(java.util.List.of(Engine.ROCKSDB, Engine.POSTGRES, Engine.POSTGRES),
                 selected.stream().map(BenchmarkSelection::engine).toList());
         var postgres = SibenchConfig.engine(root, document, Engine.POSTGRES);
         assertEquals("build/services/postgres", ConfigValues.string(postgres, "build_directory"));
@@ -98,11 +98,35 @@ public class SibenchConfigTest {
         assertEquals(java.util.List.of(),accepted);
     }
 
-    @Test public void cdcSecondaryExportFailsDuringSelectionBeforeAnyBuildOrRun() throws Exception {
+    @Test public void nativeSelectionCannotStartPixels() throws Exception {
         var root=temporary.getRoot().toPath();
-        Files.writeString(root.resolve("hybench.yaml"),"benchmark: hybench\ntrace:\n  secondary_indexes: true\n");
+        Files.writeString(root.resolve("hybench.yaml"),"benchmark: hybench\n");
         assertThrows(IllegalArgumentException.class,()->BenchmarkSelection.read(root,Map.of("benchmarks",java.util.List.of(
                 Map.of("config","hybench.yaml","mode","cdc","engine","pixels")))));
+    }
+
+    @Test public void nativeConfigurationDoesNotValidateUnusedPixelsExperimentSettings() {
+        var runtime=Map.<String,Object>of("schema_version",1,"purpose","sibench",
+                "pixels_experiment",Map.of("timeout_seconds",-1));
+        SibenchConfig.validate(runtime);
+        assertThrows(IllegalArgumentException.class,()->PixelsExperimentConfig.settings(runtime));
+    }
+
+    @Test public void cdcSourceDoesNotReadTargetStorageOrPixelsProperties() throws Exception {
+        Path root=temporary.getRoot().toPath();
+        Files.writeString(root.resolve("sink.properties"),"sink.proto.maxRecords=2\n");
+        var settings=new java.util.LinkedHashMap<String,Object>(Map.of("schema_version",1,"purpose","engine","engine","pixels",
+                "build_directory","source-build","source",Map.of("settings",Map.of("shared_buffers","64MB")),
+                "memory",Map.of("sink_heap","1g"),"sink_properties","sink.properties",
+                "properties","missing.properties","data_storage",Map.of("config","missing-storage.yaml")));
+        Files.writeString(root.resolve("pixels.yaml"),new Yaml().dump(settings));
+        var runtime=Map.<String,Object>of("engines",Map.of("pixels","pixels.yaml"));
+        var source=SibenchConfig.cdcSource(root,runtime);
+        assertEquals("2",ConfigValues.object(source,"sink_properties").get("sink.proto.maxRecords"));
+        assertFalse(source.containsKey("data_storage"));
+        settings.put("source",Map.of("settings",Map.of("wal_level","minimal")));
+        Files.writeString(root.resolve("pixels.yaml"),new Yaml().dump(settings));
+        assertThrows(IllegalArgumentException.class,()->SibenchConfig.cdcSource(root,runtime));
     }
 
     @Test

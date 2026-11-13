@@ -21,7 +21,7 @@ public final class CdcPreparation {
     private CdcPreparation() {}
 
     public static Map<String, Object> run(Path root, Path configuration, Path csvDirectory) throws Exception {
-        var plan = Generation.cdcPlan(root, configuration);
+        var plan = PixelsGeneration.plan(root, configuration, true);
         return generate(plan, CsvInput.open(root.resolve(csvDirectory)));
     }
 
@@ -30,6 +30,7 @@ public final class CdcPreparation {
         var build = plan.engines().get(Engine.PIXELS);
         CsvInput.requireCompatible(csv, input);
         Path output = input.output();
+        InputFiles.requireSeparate(output, csv.directory());
         Files.createDirectories(output.getParent());
         Files.createDirectory(output);
         CsvInput.materialize(csv, output);

@@ -5,3 +5,67 @@ diff --git a/connector/src/main/java/io/pixelsdb/pixels/trino/PixelsTypeParser.j
 -            return this.baseRegistry.fromSqlType(signature);
 +            // Pixels float is a 32-bit IEEE value; Trino names that type real.
 +            return this.baseRegistry.fromSqlType(signature.equalsIgnoreCase("float") ? "real" : signature);
+--- a/connector/src/main/java/io/pixelsdb/pixels/trino/PixelsBlockLoader.java
++++ b/connector/src/main/java/io/pixelsdb/pixels/trino/PixelsBlockLoader.java
+@@ -108,6 +108,8 @@
+                 }
+                 break;
+             case CHAR:
++                // Pixels stores CHAR with its padding, as PostgreSQL and the index keys do; Trino CHAR values have none.
++                trimCharPadding(vector, batchSize);
+             case VARCHAR:
+             case STRING:
+             case BINARY:
+@@ -208,4 +210,35 @@
+     {
+         return vector.noNulls ? Optional.empty() : Optional.of(vector.isNull);
+     }
++
++    private static void trimCharPadding(ColumnVector vector, int size)
++    {
++        if (vector instanceof BinaryColumnVector values)
++        {
++            for (int i = 0; i < size; ++i)
++            {
++                while (values.lens[i] > 0 && values.vector[i][values.start[i] + values.lens[i] - 1] == ' ')
++                {
++                    values.lens[i]--;
++                }
++            }
++            return;
++        }
++        DictionaryColumnVector values = (DictionaryColumnVector) vector;
++        int entries = values.dictOffsets.length - 1;
++        int[] offsets = new int[entries + 1];
++        byte[] bytes = new byte[values.dictOffsets[entries]];
++        for (int entry = 0; entry < entries; ++entry)
++        {
++            int start = values.dictOffsets[entry], end = values.dictOffsets[entry + 1];
++            while (end > start && values.dictArray[end - 1] == ' ')
++            {
++                end--;
++            }
++            System.arraycopy(values.dictArray, start, bytes, offsets[entry], end - start);
++            offsets[entry + 1] = offsets[entry] + end - start;
++        }
++        values.dictArray = bytes;
++        values.dictOffsets = offsets;
++    }
+ }
+\ No newline at end of file
+--- a/connector/src/main/java/io/pixelsdb/pixels/trino/impl/PixelsTupleDomainPredicate.java
++++ b/connector/src/main/java/io/pixelsdb/pixels/trino/impl/PixelsTupleDomainPredicate.java
+@@ -282,7 +282,12 @@
+                 return Domain.create(ValueSet.of(BOOLEAN, false), hasNullValue);
+             }
+         }
+-        else if (type instanceof CharType || type instanceof VarcharType)
++        else if (type instanceof CharType)
++        {
++            // Statistics keep the stored CHAR padding; Trino CHAR literals have none, so padded bounds could prune matches.
++            return createDomain(type, hasNullValue, (StringColumnStats) columnStats, Chars::trimTrailingSpaces);
++        }
++        else if (type instanceof VarcharType)
+         {
+             return createDomain(type, hasNullValue, (StringColumnStats) columnStats);
+         }

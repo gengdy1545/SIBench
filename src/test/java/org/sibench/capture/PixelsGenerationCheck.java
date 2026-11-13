@@ -45,10 +45,10 @@ public class PixelsGenerationCheck {
         pixels.put("sink_properties", root.resolve("config/engine/pixels/pixels-sink.properties").toString());
         Files.writeString(engine, yaml.dump(pixels));
         Files.writeString(settings, yaml.dump(Map.of("schema_version", 1, "purpose", "sibench",
-                "benchmarks", List.of(Map.of("config", profile.toString(), "mode", "cdc", "engine", "pixels")),
+                "benchmarks", List.of(Map.of("config", profile.toString(), "mode", "capture", "engine", "postgres")),
                 "engines", Map.of("pixels", engine.toString()))));
 
-        var manifest = Generation.run(root, settings).get(0);
+        var manifest = PixelsGeneration.run(root, settings);
         assertEquals(List.of("row_id", "locator"), manifest.get("value_kinds"));
         assertEquals(0L, manifest.get("aborted_transactions"));
         assertTrue(((Number) manifest.get("window_markers")).longValue() >= 2);

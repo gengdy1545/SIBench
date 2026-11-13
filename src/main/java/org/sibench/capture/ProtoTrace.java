@@ -146,6 +146,8 @@ public final class ProtoTrace {
             projection.accept(operation);
         }
 
+        void expectAbort() throws IOException { projection.expectAbort(); }
+
         private void appendExported(Operation operation) throws IOException {
             if (operation.grouped()) {
                 if (operation.expansionPosition() != group.size()

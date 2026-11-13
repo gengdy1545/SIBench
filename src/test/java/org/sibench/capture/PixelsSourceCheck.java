@@ -51,16 +51,18 @@ public class PixelsSourceCheck {
             connection.setAutoCommit(true);
             assertEquals("2100", value(connection, "SELECT balance FROM savingaccount WHERE accountid=1"));
 
-            // A preceding trigger can change the key even when the UPDATE does not assign it.
+            // A BEFORE trigger, named before or after the guard, can change the key even when the UPDATE does not assign it.
             statement.execute("CREATE FUNCTION change_key() RETURNS trigger LANGUAGE plpgsql AS $$ "
                     + "BEGIN NEW.accountid=99; RETURN NEW; END $$");
-            statement.execute("CREATE TRIGGER a_change_key BEFORE UPDATE ON savingaccount "
-                    + "FOR EACH ROW EXECUTE FUNCTION change_key()");
-            var indirect = assertThrows(SQLException.class,
-                    () -> statement.executeUpdate("UPDATE savingaccount SET balance=2200 WHERE accountid=1"));
-            assertTrue(indirect.getMessage(), indirect.getMessage().contains("primary key assignment is unsupported"));
-            assertEquals("2100", value(connection, "SELECT balance FROM savingaccount WHERE accountid=1"));
-            statement.execute("DROP TRIGGER a_change_key ON savingaccount");
+            for (String trigger : new String[] {"a_change_key", "z_change_key"}) {
+                statement.execute("CREATE TRIGGER " + trigger + " BEFORE UPDATE ON savingaccount "
+                        + "FOR EACH ROW EXECUTE FUNCTION change_key()");
+                var indirect = assertThrows(trigger, SQLException.class,
+                        () -> statement.executeUpdate("UPDATE savingaccount SET balance=2200 WHERE accountid=1"));
+                assertTrue(indirect.getMessage(), indirect.getMessage().contains("primary key assignment is unsupported"));
+                assertEquals("2100", value(connection, "SELECT balance FROM savingaccount WHERE accountid=1"));
+                statement.execute("DROP TRIGGER " + trigger + " ON savingaccount");
+            }
 
             for (var table : source.tables()) {
                 String key = table.indexes().stream().filter(SourceSchema.Index::primary).findFirst().orElseThrow().column();
