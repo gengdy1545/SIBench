@@ -157,11 +157,12 @@ The data API is Get/Put/Delete/Scan/WriteBatch over opaque byte keys/values and 
 
 ```bash
 java -jar build/sibench/sibench.jar analyze-locality \
-  results/capture/ycsb/trace config/sibench.yaml results/locality
-python3 scripts/plot_update_locality.py results/locality --out results/locality/plots
+  results/capture/ycsb/trace config/sibench.yaml results/analysis/trace/ycsb-a
+python3 graph/scripts/trace/plot_update_locality.py \
+  results/analysis/trace/ycsb-a --out results/plots/trace/ycsb-a
 ```
 
-Locality windows count final primary-entry changes per committed version, classified by the surviving source operation; intermediate row updates are not counted. Plotting requires Python 3, pandas and matplotlib. Static layout overlap does not measure actual SST/compaction cost. `inspect-scale` reports configured native source counts without generating data.
+Locality windows count final primary-entry changes per committed version, classified by the surviving source operation; intermediate row updates are not counted. See [plotting](graph/README.md) for Python dependencies, shared styling and PDF/PNG output. Static layout overlap does not measure actual SST/compaction cost. `inspect-scale` reports configured native source counts without generating data.
 
 ## Tests
 

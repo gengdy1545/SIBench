@@ -2,7 +2,6 @@
 """Plot the CSVs written by `analyze-locality`; it does no Trace or key interpretation."""
 
 import argparse
-import gzip
 import json
 import pathlib
 import re
@@ -11,6 +10,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 import pandas as pd
 
 
@@ -18,14 +18,24 @@ def safe(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
 
 
+def save_figure(figure, path):
+    for extension in ("pdf", "png"):
+        figure.savefig(f"{path}.{extension}")
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_directory", type=pathlib.Path)
-    parser.add_argument("--out", type=pathlib.Path, default=None)
+    parser.add_argument(
+        "--out", type=pathlib.Path,
+        default=pathlib.Path("results/plots/trace/locality"),
+        help="output directory (default: %(default)s); overwrite matching figures",
+    )
     args = parser.parse_args()
     run = args.run_directory
-    out = args.out or run / "plots"
+    out = args.out
     out.mkdir(parents=True, exist_ok=True)
+    plt.style.use(pathlib.Path(__file__).resolve().parents[2] / "config" / "style.mplstyle")
     summary = json.loads((run / "summary.json").read_text())
     windows = pd.read_csv(run / "windows.csv")
     heatmap = pd.read_csv(run / "heatmap.csv.gz", compression="gzip")
@@ -52,16 +62,14 @@ def main() -> int:
             aspect="auto",
             origin="lower",
             interpolation="nearest",
-            cmap="magma",
-            norm=matplotlib.colors.LogNorm(vmin=1, vmax=max(2, int(pivot.to_numpy().max()))),
+            norm=LogNorm(vmin=1, vmax=max(2, int(pivot.to_numpy().max()))),
         )
         ax.set_title(f"{name}: update count by window and ordered block bin")
         ax.set_xlabel(f"block bin (0..{len(pivot.columns) - 1})")
         ax.set_ylabel("business-change window")
         fig.colorbar(image, ax=ax, label="modifications (log scale)")
         fig.tight_layout()
-        fig.savefig(out / f"heatmap-{safe(name)}.png", dpi=130)
-        fig.savefig(out / f"heatmap-{safe(name)}.svg")
+        save_figure(fig, out / f"heatmap-{safe(name)}")
         plt.close(fig)
 
     for (table, index), group in windows.groupby(["table", "index"], sort=True):
@@ -94,8 +102,7 @@ def main() -> int:
         axes[1].set_ylim(0, 1.02)
         axes[1].legend()
         fig.tight_layout()
-        fig.savefig(out / f"coverage-{safe(name)}.png", dpi=130)
-        fig.savefig(out / f"coverage-{safe(name)}.svg")
+        save_figure(fig, out / f"coverage-{safe(name)}")
         plt.close(fig)
 
     # One compact source-wide comparison, independent of an index's absolute block count.
@@ -113,8 +120,7 @@ def main() -> int:
     ax.set_ylim(0, 1.02)
     ax.legend(fontsize=7, ncol=2)
     fig.tight_layout()
-    fig.savefig(out / "business-coverage.png", dpi=130)
-    fig.savefig(out / "business-coverage.svg")
+    save_figure(fig, out / "business-coverage")
     plt.close(fig)
 
     if l0 is not None:
@@ -129,8 +135,7 @@ def main() -> int:
             ax.set_ylabel("files")
             ax.legend(fontsize=8)
             fig.tight_layout()
-            fig.savefig(out / f"l0-overlap-{safe(name)}.png", dpi=130)
-            fig.savefig(out / f"l0-overlap-{safe(name)}.svg")
+            save_figure(fig, out / f"l0-overlap-{safe(name)}")
             plt.close(fig)
     return 0
 

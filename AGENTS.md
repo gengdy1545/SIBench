@@ -55,7 +55,9 @@
   redesigning a backend engine.
 - Use Python/Shell for orchestration, offline analysis and reporting; call the
   Java CLI instead of duplicating core configuration or workload semantics.
-- Keep build, capture, plotting and report entry points in `scripts/`. Put manual
+- Keep build, capture and report entry points in `scripts/`. Keep plotting scripts
+  under `graph/scripts/`, styles under `graph/config/`, and plotting dependencies
+  and usage in `graph/`. Put manual
   development probes in ignored `develop/scripts/`; required runtime validation
   and default tests must remain independent of that directory.
 - Ship the tests, fixtures and checks needed to maintain delivered behavior,
