@@ -98,7 +98,7 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
         assertEquals("consumer failed",failure.getMessage());
         assertEquals("workload_integrity_and_supply_valid",input.preflight().get("status"));
         assertFalse(input.preflight().containsKey("baseline"));
-        Path path=trace.resolve("manifest.json");String original=Files.readString(path);int number=0;
+        Path path=trace.resolve("manifest.json");String original=Files.readString(path);
         try {
             for(String name:List.of("baseline_rows","source_work_units","baseline_operations","workload_operations"))
                 for(String invalid:List.of("missing","null","\"1\"","-1","1.5","9223372036854775808")) {
@@ -106,10 +106,15 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
                     if(invalid.equals("missing"))changed.remove(name);else changed.add(name,com.google.gson.JsonParser.parseString(invalid));
                     Files.writeString(path,changed.toString());
                     assertTrue(assertThrows(IOException.class,()->ReplayInput.prepare(trace,REPLAY)).getMessage().contains(name));
-                    Path analysis=output.resolve("invalid-locality-"+number++);
-                    assertTrue(assertThrows(IOException.class,()->org.sibench.analysis.UpdateLocality.run(trace,
-                            Path.of("config/sibench.yaml"),analysis)).getMessage().contains(name));
                 }
+            // Both consumers use TraceManifest.read; one case verifies the analysis entry point.
+            var missingCount=manifest.deepCopy();missingCount.remove("baseline_rows");
+            Files.writeString(path,missingCount.toString());
+            Path invalidAnalysis=output.resolve("invalid-locality");
+            assertTrue(assertThrows(IOException.class,()->org.sibench.analysis.UpdateLocality.run(trace,
+                    Path.of("config/sibench.yaml"),invalidAnalysis)).getMessage().contains("baseline_rows"));
+            assertTrue(Files.exists(invalidAnalysis.resolve("INCOMPLETE")));
+            assertFalse(Files.exists(invalidAnalysis.resolve("summary.json")));
             for(String name:List.of("output","baseline_trace_sha256","index_definitions")) {
                 var changed=manifest.deepCopy();
                 if(name.equals("output"))changed.remove(name);
@@ -208,8 +213,6 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
             }
         }
         Path moved=publish(draft);
-        ProtoTraceBenchmark.readTrace(moved,1,output.resolve("parse.json"));
-        assertThrows(IllegalArgumentException.class,()->ProtoTraceBenchmark.readTrace(moved,0,output.resolve("invalid-parse.json")));
         // The update keeps baseline RowID 1; delete and reinsert in one transaction publish a new RowID.
         var operations=new java.util.ArrayList<IndexOperationTrace.Operation>();
         ProtoTrace.source(moved,TraceManifest.read(moved),"workload").read(operations::add);

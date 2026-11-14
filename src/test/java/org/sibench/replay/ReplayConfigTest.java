@@ -6,16 +6,29 @@ import static org.sibench.config.ConfigValues.parse;
 
 import org.junit.Test;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 
 public class ReplayConfigTest {
+    private static final String TEMPLATE = """
+            schema_version: 1
+            purpose: sibench
+            target:
+              secondary_indexes: {enabled: false}
+              service: {adapter: grpc, endpoint: 'test-host:50599', value: row_id}
+            replay:
+              dispatch_mode: operation
+              client_count: 64
+              max_in_flight: 4096
+              baseline_batch_operations: 64
+              request_timeout_seconds: 600
+            """;
+
     @Test
     public void validatesProfilesAndComputesOverflowCheckedBudget() throws Exception {
         Path root = Path.of("").toAbsolutePath();
-        String template = Files.readString(root.resolve("config/sibench.yaml"));
-        var simple = ReplayConfig.read(root, Path.of("config/sibench.yaml"));
+        String template = TEMPLATE;
+        var simple = ReplayConfig.from(parse(template));
         assertFalse(simple.secondaryIndexes());
         var withSecondary = parse(template);
         var target = object(withSecondary, "target");
@@ -53,7 +66,7 @@ public class ReplayConfigTest {
                 "transaction",
                 ReplayConfig.from(
                                 parse(
-                                        Files.readString(Path.of("config/sibench.yaml"))
+                                        template
                                                 .replace(
                                                         "dispatch_mode: operation",
                                                         "dispatch_mode: transaction")))
@@ -82,7 +95,7 @@ public class ReplayConfigTest {
 
     @Test
     public void rejectsUnknownOptionsAndInvalidDispatchValues() throws Exception {
-        String text = Files.readString(Path.of("config/sibench.yaml"));
+        String text = TEMPLATE;
         for (String invalid :
                 new String[] {
                     text.replace("target:", "target:\n  value: locator"),
@@ -94,7 +107,7 @@ public class ReplayConfigTest {
                     text.replace("request_timeout_seconds: 600", "request_timeout_seconds: 86401"),
                     text + "\nversions:\n  gc:\n    owner: immediate\n"
                 }) {
-            assertNotEquals("The invalid fixture must change the public template", text, invalid);
+            assertNotEquals("The invalid fixture must change the template", text, invalid);
             assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(parse(invalid)));
         }
         var serviceless = parse(text);

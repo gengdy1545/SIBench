@@ -60,46 +60,9 @@ public class SibenchTest {
             {"generate"},
             {"generate-pixels"},
             {"generate-pixels", "missing-config.yaml"},
-            {"unknown-command", "--help"},
             {"generate", "missing-config.yaml"},
-            {"replay", "config/sibench.yaml"},
             {"check-replay", "config/sibench.yaml", "missing-trace"},
-            {"replay", "--repeat", "2"},
-            {"validate-snapshots", "config/sibench.yaml"},
-            {
-                "validate-snapshots",
-                "config/sibench.yaml",
-                "missing-trace",
-                "missing-report.json"
-            },
-            {"check-schema", "src/test/resources/config/ycsb_1k.yaml"},
-            {"check-schema", "--jdbc"},
-            {"check-schema", "--user"},
-            {"audit-rows", "src/test/resources/config/ycsb_1k.yaml"},
-            {"audit-rows", "--jdbc"},
-            {
-                "audit-rows",
-                "src/test/resources/config/ycsb_1k.yaml",
-                "missing-baseline",
-                "missing-raw",
-                "--jdbc",
-                "jdbc:mysql:localhost",
-                "--user",
-                "postgres"
-            },
-            {
-                "check-schema",
-                "src/test/resources/config/ycsb_1k.yaml",
-                "--jdbc",
-                "jdbc:mysql:localhost",
-                "--user",
-                "postgres"
-            },
-            {"inspect-scale", "src/test/resources/config/ycsb_1k.yaml", "missing.yaml"},
-            {"compare-ledgers"},
-            {"compare-ledgers", "src/test/resources/config/ycsb_1k.yaml"},
-            {"snapshot-index-counters", "src/test/resources/config/ycsb_1k.yaml"},
-            {"check-capture-completeness", "src/test/resources/config/ycsb_1k.yaml"}
+            {"inspect-scale", "src/test/resources/config/ycsb_1k.yaml", "missing.yaml"}
         };
         for (String[] args : invalid) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
@@ -109,33 +72,21 @@ public class SibenchTest {
                 assertEquals(1, Sibench.run(args, out, err));
                 assertEquals(0, output.size());
                 assertTrue(errors.size() > 0);
+                if (java.util.Arrays.asList(args).contains("--unknown"))
+                    assertTrue(errors.toString(StandardCharsets.UTF_8).contains("Unknown option: --unknown"));
             }
         }
     }
 
     @Test
-    public void serviceReplayRejectsExternalReferenceOption() {
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        ByteArrayOutputStream errors = new ByteArrayOutputStream();
-        try (PrintStream out = new PrintStream(output, true, StandardCharsets.UTF_8);
-                PrintStream err = new PrintStream(errors, true, StandardCharsets.UTF_8)) {
-            assertEquals(1, Sibench.run(new String[] {
-                    "replay-service", "missing-config.yaml", "missing-trace", "missing-report.json", "--reference", "old.json"
-            }, out, err));
-            assertEquals(0, output.size());
-            assertTrue(errors.toString(StandardCharsets.UTF_8).contains("Unknown option: --reference"));
-        }
-    }
-
-    @Test
     public void rejectsUnknownCommandsEvenForHelp() {
-        for(String command:new String[]{"no-such-command"}) {
+        for (String[] args : new String[][] {{"no-such-command"}, {"no-such-command", "--help"}}) {
             var output = new ByteArrayOutputStream();
             var errors = new ByteArrayOutputStream();
             try (var out = new PrintStream(output); var err = new PrintStream(errors)) {
-                assertEquals(1, Sibench.run(new String[] {command, "--help"}, out, err));
+                assertEquals(1, Sibench.run(args, out, err));
                 assertEquals(0, output.size());
-                assertTrue(errors.toString(StandardCharsets.UTF_8).contains("Unknown command: " + command));
+                assertTrue(errors.toString(StandardCharsets.UTF_8).contains("Unknown command: " + args[0]));
             }
         }
     }

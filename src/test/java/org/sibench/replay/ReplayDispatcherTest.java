@@ -147,7 +147,7 @@ public class ReplayDispatcherTest {
         var firstSent = new CountDownLatch(1);
         var secondSent = new CountDownLatch(1);
         var error = new AtomicReference<Throwable>();
-        try (var dispatcher = new ReplayDispatcher(config(1, 1), client -> (seq, op, stored) -> {
+        try (var dispatcher = new ReplayDispatcher(config(2, 1), client -> (seq, op, stored) -> {
             if (seq == 2) secondSent.countDown();
             return samples.get((int) seq - 1).handle();
         })) {
@@ -181,6 +181,8 @@ public class ReplayDispatcherTest {
             assertNull(error.get());
             assertFalse(sender.isAlive());
             var report = dispatcher.describe();
+            assertEquals(1L, report.get("peak_in_flight"));
+            assertEquals(2, report.get("used_clients"));
             assertTrue((double) report.get("backpressure_seconds") >= (release - waiting) / 1e9);
             assertLatency((Map<?, ?>) report.get("search_latency"), samples.toArray(ResponseTiming[]::new));
         }
@@ -696,51 +698,6 @@ public class ReplayDispatcherTest {
             assertEquals(4L, dispatcher.describe().get("completed_responses"));
             assertEquals(3L, dispatcher.describe().get("work_units"));
             dispatcher.requireClientCoverage();
-        }
-    }
-
-    @Test
-    public void backpressureBoundsResponsesWithoutChangingRouting() throws Exception {
-        List<CompletableFuture<Void>> responses = new CopyOnWriteArrayList<>();
-        CountDownLatch first = new CountDownLatch(1), second = new CountDownLatch(1);
-        AtomicReference<Throwable> error = new AtomicReference<>();
-        try (var dispatcher =
-                new ReplayDispatcher(
-                        config(2, 1),
-                        client ->
-                                (seq, op, stored) -> {
-                                    CompletableFuture<Void> response = new CompletableFuture<>();
-                                    responses.add(response);
-                                    if (seq == 1) first.countDown();
-                                    else second.countDown();
-                                    return new ReplayTarget.SendHandle(
-                                            CompletableFuture.completedFuture(null), response);
-                                })) {
-            Thread sender =
-                    new Thread(
-                            () -> {
-                                try {
-                                    dispatcher.send(search(1));
-                                    dispatcher.send(search(2));
-                                    dispatcher.drain();
-                                } catch (Throwable failure) {
-                                    error.set(failure);
-                                }
-                            });
-            sender.start();
-            try {
-                assertTrue(first.await(1, TimeUnit.SECONDS));
-                assertFalse(second.await(50, TimeUnit.MILLISECONDS));
-                responses.get(0).complete(null);
-                assertTrue(second.await(1, TimeUnit.SECONDS));
-                responses.get(1).complete(null);
-            } finally {
-                for (var response : responses) response.complete(null);
-                sender.join(3000);
-            }
-            assertNull(error.get());
-            assertFalse(sender.isAlive());
-            assertEquals(1L, dispatcher.describe().get("peak_in_flight"));
         }
     }
 

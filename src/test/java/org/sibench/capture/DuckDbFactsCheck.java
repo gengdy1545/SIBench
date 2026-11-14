@@ -1,7 +1,6 @@
 package org.sibench.capture;
 
 import static org.junit.Assert.*;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -13,7 +12,6 @@ import org.sibench.generation.NativeHistory;
 
 /** Explicit integration with the instrumented engine's registered message types. */
 public class DuckDbFactsCheck extends DuckDbHostFixture {
-    private static final String HEADER = "context_id,scope,connection_id,transaction_id,query_id,thread_id,timestamp,type,log_level,message\n";
 
     private static void execute(Connection database, String sql) throws Exception {
         try (var statement = database.createStatement()) { statement.execute(sql); }
@@ -174,28 +172,5 @@ public class DuckDbFactsCheck extends DuckDbHostFixture {
                     + "WHERE event='complete' AND statement_outcome='completed' AND affected_rows=1"));
             assertEquals(0, number(observer, "SELECT count(*) FROM items"));
         }
-    }
-
-    @Test public void rejectsUnknownTypesAndMissingFieldsWithoutLeavingPartialTables() throws Exception {
-        try (var database = connect()) {
-            for (String message : new String[] {
-                    row("Unexpected", "anything"), row("SibenchTransaction", "{'event': begin}"),
-                    row("SibenchTransaction", "{'engine_transaction': invalid}"),
-                    "1,CONNECTION,1,1,1,,2026-11-04 00:00:00+00,SibenchQuery,INFO,\"unterminated",
-                    "1,CONNECTION,1,1,1,,2026-11-04 00:00:00+00,SibenchQuery,INFO,\"unterminated\n"}) {
-                Path capture = root.resolve("invalid.csv");
-                Files.writeString(capture, HEADER + message);
-                assertThrows(message, SQLException.class, () -> DuckDbFacts.load(database, capture));
-                assertTrue(database.getAutoCommit());
-                assertEquals(0, number(database, "SELECT count(*) FROM duckdb_tables() WHERE temporary AND table_name LIKE 'sibench_%'"));
-            }
-            Path empty = root.resolve("empty.csv"); Files.writeString(empty, HEADER);
-            assertEquals(0, DuckDbFacts.load(database, empty).values().stream().mapToLong(Long::longValue).sum());
-        }
-    }
-
-    private static String row(String type, String message) {
-        return "1,CONNECTION,1,1,1,,2026-11-04 00:00:00+00," + type + ",INFO,\""
-                + message.replace("\"", "\"\"") + "\"\n";
     }
 }

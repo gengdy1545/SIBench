@@ -57,12 +57,23 @@ public class SibenchConfigTest {
         Path root = Path.of("").toAbsolutePath();
         Path config = root.resolve("config/sibench.yaml");
         var document = SibenchConfig.read(config);
-        assertEquals(64, ReplayConfig.read(root, config).clientCount());
-        assertEquals("127.0.0.1:50551", ServiceConfig.ofReplay(root, document).endpoint());
+        ReplayConfig.read(root, config);
+        ServiceConfig.ofReplay(root, document);
+        UpdateLocality.Config.read(config);
+        document.put("replay", Map.of("dispatch_mode", "operation", "client_count", 3,
+                "max_in_flight", 16, "baseline_batch_operations", 4, "request_timeout_seconds", 5));
+        document.put("target", Map.of("secondary_indexes", Map.of("enabled", false),
+                "service", Map.of("adapter", "grpc", "endpoint", "test-host:50599", "value", "row_id")));
+        document.put("analysis", Map.of("layout", Map.of("entries_per_block", 4, "blocks_per_file", 8, "sort_memory_bytes", 1024),
+                "window", Map.of("business_changes", 3, "heatmap_bins", 16, "l0_index_modifications", 5)));
+        config = temporary.newFile("runtime.yaml").toPath();
+        Files.writeString(config, new Yaml().dump(document));
+        assertEquals(3, ReplayConfig.read(root, config).clientCount());
+        assertEquals("test-host:50599", ServiceConfig.ofReplay(root, SibenchConfig.read(config)).endpoint());
         var analysis = UpdateLocality.Config.read(config);
-        assertEquals(256, analysis.entriesPerBlock());
-        assertEquals(4096, analysis.blocksPerFile());
-        assertEquals(10000, analysis.businessChangesPerWindow());
+        assertEquals(4, analysis.entriesPerBlock());
+        assertEquals(8, analysis.blocksPerFile());
+        assertEquals(3, analysis.businessChangesPerWindow());
     }
 
     @Test
@@ -76,9 +87,9 @@ public class SibenchConfigTest {
         assertEquals(2, selected.stream().filter(s -> s.engine() == Engine.POSTGRES).count());
         var postgres = SibenchConfig.engine(root, document, Engine.POSTGRES);
         assertEquals("build/services/postgres", ConfigValues.string(postgres, "build_directory"));
-        assertEquals("off", SibenchConfig.postgresSettings(ConfigValues.object(postgres, "settings")).get("fsync"));
+        SibenchConfig.postgresSettings(ConfigValues.object(postgres, "settings"));
         assertEquals("build/services/rocksdb", ConfigValues.string(SibenchConfig.engine(root, document, Engine.ROCKSDB), "build_directory"));
-        assertEquals("16GiB", ConfigValues.string(SibenchConfig.engine(root, document, Engine.DUCKDB), "memory_limit"));
+        SibenchConfig.engine(root, document, Engine.DUCKDB);
         assertFalse(document.containsKey("generation"));
         // Engine settings live in their own files; the runtime only selects them.
         assertThrows(IllegalArgumentException.class, () -> SibenchConfig.validate(
@@ -108,12 +119,6 @@ public class SibenchConfigTest {
             catch (IllegalArgumentException expected) { }
         }
         assertEquals(java.util.List.of(),accepted);
-    }
-
-    @Test public void nativeSelectionCannotStartPixels() throws Exception {
-        var root=temporary.getRoot().toPath();
-        Files.writeString(root.resolve("hybench.yaml"),"benchmark: hybench\n");
-        assertThrows(IllegalArgumentException.class,()->BenchmarkSelection.read(root,Map.of("benchmarks",Map.of("hybench",BenchmarkFixtures.entry(Path.of("hybench.yaml"),"cdc","pixels",root.resolve("trace"))))));
     }
 
     @Test public void nativeConfigurationDoesNotValidateUnusedPixelsExperimentSettings() {

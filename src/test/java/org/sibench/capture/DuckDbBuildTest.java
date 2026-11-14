@@ -80,8 +80,9 @@ public class DuckDbBuildTest {
             Path file=build.resolve(name);byte[] before=Files.readAllBytes(file);
             Files.writeString(file,"changed\n");
             assertThrows(IOException.class,()->NativeBuildCheck.verifyEngine(root,build));
-            Files.write(file,before); assertEquals(original,NativeBuildCheck.verifyEngine(root,build));
+            Files.write(file,before);
         }
+        assertEquals(original,NativeBuildCheck.verifyEngine(root,build));
     }
 
     @Test public void generationRejectsAnotherJdbcEvenWithMatchingReceipt() throws Exception {

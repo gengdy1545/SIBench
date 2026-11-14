@@ -64,8 +64,9 @@ public class PostgresBuildTest {
             Path file=build.resolve(name);byte[] before=Files.readAllBytes(file);
             Files.writeString(file,"changed\n");
             assertThrows(IOException.class,()->NativeBuildCheck.verifyPostgres(root,build));
-            Files.write(file,before); assertEquals(original,NativeBuildCheck.verifyPostgres(root,build));
+            Files.write(file,before);
         }
+        assertEquals(original,NativeBuildCheck.verifyPostgres(root,build));
         assertThrows(java.nio.file.FileAlreadyExistsException.class,()->action("postgres-record"));
     }
 

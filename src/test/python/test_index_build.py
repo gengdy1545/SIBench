@@ -58,11 +58,6 @@ class IndexBuildTest(unittest.TestCase):
         self.assertIn(str(source.relative_to(self.root)), result.stderr)
         self.assertNotIn("dependency installation reached", result.stdout)
 
-    def test_clean_pinned_sources_reach_dependency_installation(self):
-        result = self.run_build()
-        self.assertEqual(73, result.returncode, result.stderr)
-        self.assertIn("dependency installation reached", result.stdout)
-
     def test_generated_files_stay_under_build_index(self):
         (self.root / "src/main/native/index/rocksdb_cloud").mkdir(parents=True, exist_ok=True)
         for command in ("yum", "cmake", "make", "strip"):

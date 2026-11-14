@@ -6,7 +6,6 @@ import static org.sibench.capture.IndexOperationTrace.*;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -71,14 +70,6 @@ public class TransactionConsistentTraceTest {
                 assertEquals(1, oracle.queries());
                 assertNull(oracle.lookupPrimary(1, IndexKey.ofInt(2), 0));
             }
-        }
-    }
-
-    @Test public void exporterRejectsTheRemovedQueryFilter() {
-        for (boolean value : List.of(false, true)) {
-            var failure = assertThrows(IllegalArgumentException.class, () -> Generation.secondaryIndexes(
-                    Map.of("trace", Map.of("secondary_indexes", false, "export_queries", value))));
-            assertTrue(failure.getMessage().contains("export_queries"));
         }
     }
 

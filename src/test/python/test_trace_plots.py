@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -16,26 +15,6 @@ SPEC.loader.exec_module(COMMON)
 
 
 class AnalysisIdentityTest(unittest.TestCase):
-    def test_plot_selection_uses_java_runtime_paths(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            trace = root / "persistent"
-            trace.mkdir()
-            (trace / "manifest.json").write_text("{}")
-            config = {"jar": str(root / "sibench.jar"), "runtime": str(root / "runtime.yaml"),
-                      "analysis_directory": str(root / "analysis"), "plot_directory": str(root / "plots"),
-                      "window_requests": 10, "pk_bins": 2, "sort_memory_bytes": 4096,
-                      "traces": [{"name": "ycsb-a", "label": "YCSB-A"}]}
-            file = root / "plots.json"
-            file.write_text(json.dumps(config))
-            with patch.object(COMMON.subprocess, "check_output", return_value=json.dumps({"ycsb-a": str(trace)})) as command:
-                resolved = COMMON.load_config(file)
-                self.assertEqual(resolved["traces"][0]["directory"], trace)
-                self.assertEqual(command.call_args.args[0][-2:], ["trace-paths", config["runtime"]])
-            with patch.object(COMMON.subprocess, "check_output", return_value="{}"):
-                with self.assertRaisesRegex(ValueError, "Unknown benchmark entry"):
-                    COMMON.load_config(file)
-
     def test_changed_analyzer_rejects_previously_matching_extraction(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

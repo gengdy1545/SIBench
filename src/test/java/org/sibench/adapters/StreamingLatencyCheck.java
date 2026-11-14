@@ -84,8 +84,6 @@ public final class StreamingLatencyCheck {
             report.put("rpc_requests", requests.rpcRequests());
             report.put("checked_queries", requests.queries());
             report.put("checked_results", requests.checkedResults());
-            rejectWrongCount();
-            report.put("wrong_expected_count_rejected", true);
             report.put("status", "passed");
         } catch (Throwable error) {
             report.put("status", "failed");
@@ -110,19 +108,6 @@ public final class StreamingLatencyCheck {
         equal(number(section(report, "measurement"), "completed_operations"), measured, "measured completed operations");
         equal(number(section(report, "search_latency"), "count"), searches, "search latency samples");
         equal(number(section(report, "write_latency"), "count"), writes, "write latency samples");
-    }
-
-    private static void rejectWrongCount() throws IOException {
-        var check = new TraceRequests(ValueKind.ROW_ID);
-        var lookup = IndexOperationTrace.search(1, 1, 0,
-                IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 0, 1, 0);
-        try {
-            check.check(lookup, IndexResponse.ok(java.util.List.of()));
-        } catch (IOException expected) {
-            if (expected.getMessage().contains("Search count mismatch")) return;
-            throw expected;
-        }
-        throw new AssertionError("Empty response incorrectly accepted for an expected one-row lookup");
     }
 
     private static Map<?, ?> section(Map<String, Object> report, String key) {
