@@ -13,9 +13,10 @@ public final class IndexVersionCheck {
     private static final ByteString KEY=ByteString.copyFrom(IndexKey.ofInt(7).bytes());
 
     public static void main(String[] args) throws Exception {
-        var config=ServiceConfig.ofServer(Path.of(""),Path.of(args[0]));
+        if(args.length!=3)throw new IllegalArgumentException("Expected CONFIG SERVICE_CONFIG REPORT");
+        var config=ServiceConfig.ofServer(Path.of(""),Path.of(args[1]),org.sibench.config.SibenchConfig.read(Path.of(args[0])));
         try(var backend=config.backend()) { check(backend); }
-        Files.writeString(Path.of(args[1]),"{\"status\":\"passed\",\"scope\":\"hand-derived version, deletion and reinsert checks plus Flush; not full Trace result identities\"}\n",StandardOpenOption.CREATE_NEW);
+        Files.writeString(Path.of(args[2]),"{\"status\":\"passed\",\"scope\":\"hand-derived version, deletion and reinsert checks plus Flush; not full Trace result identities\"}\n",StandardOpenOption.CREATE_NEW);
     }
 
     static void check(IndexBackend backend) throws Exception {

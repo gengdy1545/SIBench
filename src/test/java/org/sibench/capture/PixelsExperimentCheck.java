@@ -99,8 +99,8 @@ public class PixelsExperimentCheck {
         engine.put("sink_properties", root.resolve("config/engine/pixels/pixels-sink.properties").toString());
         String storage = System.getProperty("sibench.storage.config");
         assertNotNull("Set sibench.storage.config for COS baselines", storage);
-        engine.put("data_storage", Map.of("config", root.resolve(storage).toString(), "profile", System.getProperty("sibench.storage.profile", "cos"),
-                "prefix", "sibench/pixels/check-" + UUID.randomUUID()));
+        assertNotNull("Set sibench.storage.uri", System.getProperty("sibench.storage.uri"));
+        engine.put("data_storage", System.getProperty("sibench.storage.uri") + "/check-" + UUID.randomUUID());
         var gson = new GsonBuilder().setPrettyPrinting().create();
         Path engineConfig = Files.writeString(directory.resolve("engine.json"), gson.toJson(engine));
         var experiment = org.sibench.config.ConfigValues.object(org.sibench.config.SibenchConfig.read(java.nio.file.Path.of("config/sibench.yaml")), "pixels_experiment");
@@ -127,8 +127,9 @@ public class PixelsExperimentCheck {
             experiment.put("trino", trino);
         }
         // Baseline preparation takes its bound from the selected HyBench profile, as CDC preparation does.
-        var runtime = Map.of("schema_version", 1, "purpose", "sibench", "engines", Map.of("pixels", engineConfig.toString()), "pixels_experiment", experiment,
-                "benchmarks", List.of(Map.of("config", "config/benchmark/hybench.yaml", "mode", "capture", "engine", "postgres")));
+        var runtime = Map.of("schema_version", 1, "purpose", "sibench",
+                "object_storage", object(org.sibench.config.SibenchConfig.read(root.resolve(storage)), "object_storage"), "engines", Map.of("pixels", engineConfig.toString()), "pixels_experiment", experiment,
+                "benchmarks", Map.of("hybench",org.sibench.config.BenchmarkFixtures.entry(Path.of("config/benchmark/hybench.yaml"),"capture","postgres",directory.resolve("trace"))));
         Path config = Files.writeString(directory.resolve("runtime.json"), gson.toJson(runtime));
         Path output = directory.resolve("run");
         Path baseline = baselines.get(input);

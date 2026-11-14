@@ -26,7 +26,7 @@ public class SlateDbStoreCheck {
     @Test
     public void sameInstanceAckRangesSnapshotFlushAndReopen() throws Exception {
         ObjectStore objects = ObjectStore.of(Path.of(required("sibench.slatedb.storage")),
-                required("sibench.slatedb.profile"), required("sibench.slatedb.object_path"));
+                required("sibench.slatedb.uri"));
         Path local = temporary.getRoot().toPath().resolve("index");
         try (var store = SlateDbStore.create(local, objects, false)) {
             store.put(bytes("a"), bytes("A"));

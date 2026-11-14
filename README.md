@@ -55,7 +55,7 @@ RocksDB-Cloud loads `build/index/librocksdb_cloud_jni.so` by default. Select Sla
 
 ## Native generation
 
-Edit [config/sibench.yaml](config/sibench.yaml) to select benchmarks and engines. Source scale, workloads and outputs belong to [config/benchmark/](config/benchmark/); engine paths and resources belong to [config/engine/](config/engine/).
+Edit [config/sibench.yaml](config/sibench.yaml) to select benchmarks and engines. Source scale, workloads and working outputs belong to [config/benchmark/](config/benchmark/); engine paths and resources belong to [config/engine/](config/engine/).
 
 **Public profiles are substantial runs:** 87,060,000 baseline rows and at least 10,000,000 exported workload requests per Trace. Create separate configurations with smaller inputs and fresh output paths for short runs. Inspect scale before generating:
 
@@ -64,7 +64,7 @@ java -jar build/sibench/sibench.jar inspect-scale
 java -jar build/sibench/sibench.jar generate config/sibench.yaml
 ```
 
-`generate` runs the selected native sources in order and stops on failure. YCSB publishes separate `workloada/trace` through `workloadf/trace`, indexed by `traces.json`. For live PostgreSQL → Pixels capture, use `generate-pixels CONFIG` with a separate fresh output. There is no automatic engine fallback.
+`generate` runs entries with `trace.generate: true` and stops on failure. Each named entry (for example `ycsb-a`) owns its local `trace.directory` and optional upload URI in the runtime config. YCSB entries share one initial load and run their selected workloads independently. See [Trace selection and storage](docs/trace.md#selection-and-storage). For live PostgreSQL → Pixels capture, use `generate-pixels CONFIG` with a separate fresh output. There is no automatic engine fallback.
 
 Successful runs publish after normal shutdown, then delete working databases. Failed runs retain diagnostics and cannot resume. Existing or overlapping outputs and mismatched source/build inputs are rejected. See [Trace](docs/trace.md) for visibility, index coverage and supported accesses.
 
@@ -72,17 +72,17 @@ For repeated [Pixels experiments](docs/pixels-experiment.md), prepare CSV/CDC in
 
 ## Replay and service
 
-Configure [object storage](config/index/storage.yaml) and the selected [backend](config/index/). Supply credentials through the named environment variables; the bucket must exist. Each new index needs a fresh local path and object prefix.
+Configure [object-storage connections](config/sibench.yaml) and the selected [backend](config/index/). Supply credentials through the named environment variables; the bucket must exist. Each new index needs a fresh local path and object prefix.
 
 Start the service, then replay from another terminal:
 
 ```bash
-java -jar build/sibench/sibench.jar index-server config/index/rocksdb_cloud.yaml
+java -jar build/sibench/sibench.jar index-server config/sibench.yaml config/index/rocksdb_cloud.yaml
 ```
 
 ```bash
 java -jar build/sibench/sibench.jar replay-service config/sibench.yaml \
-  results/capture/ycsb/workloada/trace results/service.json
+  ycsb-a results/service.json
 ```
 
 Client and service must agree on value mode and secondary-index selection. The same immutable Trace can be reused across backends and client settings. Replay validates input integrity, response completion and expected result counts; matching counts do not certify values or order. Write acknowledgment guarantees same-instance visibility; durability depends on the backend. See the [Index Service contract](docs/index-service.md).
@@ -91,7 +91,7 @@ RocksDB-Cloud and SlateDB are comparison targets. Local RocksDB supports generat
 
 ## Analysis
 
-Select inputs in [graph/config/traces.json](graph/config/traces.json), then run:
+Select benchmark names and labels in [graph/config/traces.json](graph/config/traces.json); their paths come from its runtime CONFIG. Then run:
 
 ```bash
 python3 graph/scripts/trace/plot_operation_mix.py

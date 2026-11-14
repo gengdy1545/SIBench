@@ -301,7 +301,10 @@ public final class PixelsHost {
                 var storage = org.sibench.config.ConfigValues.parse(request.get("data_storage").toString());
                 var profile = org.sibench.config.ConfigValues.object(storage, "profile");
                 String prefix = org.sibench.config.ConfigValues.string(storage, "prefix") + "/runs/" + java.util.UUID.randomUUID();
-                var connection = org.sibench.config.ObjectStore.of("pixels", profile, prefix);
+                var resolved = new LinkedHashMap<>(profile);
+                resolved.put("prefix", prefix);
+                resolved.put("uri", "cos://" + profile.get("bucket") + "/" + prefix);
+                var connection = org.sibench.config.ObjectStore.connect(resolved);
                 if (!connection.virtualHosted() || !prefix.matches("[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*"))
                     throw new IOException("Invalid Pixels COS storage prefix/addressing");
                 storageUri = "cos://" + connection.bucket() + "/" + prefix + "/";

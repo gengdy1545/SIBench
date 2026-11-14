@@ -1,6 +1,8 @@
 package org.sibench.cli;
 
 import org.sibench.replay.ReplayInput;
+import org.sibench.config.BenchmarkSelection;
+import org.sibench.config.SibenchConfig;
 import com.google.gson.GsonBuilder;
 
 import org.sibench.capture.RunTiming;
@@ -23,14 +25,15 @@ public final class Sibench {
 
     private static void printServiceHelp(PrintStream out) {
         out.println("       java -jar build/sibench/sibench.jar generate [--root PATH] CONFIG");
+        out.println("       java -jar build/sibench/sibench.jar trace-paths CONFIG");
         out.println("       java -jar build/sibench/sibench.jar generate-pixels [--root PATH] CONFIG");
         out.println("       java -jar build/sibench/sibench.jar prepare-pixels-baseline CONFIG CSV_INPUT_DIRECTORY OUTPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar prepare-pixels-inputs CONFIG CSV_INPUT_DIRECTORY PIXELS_BASELINE_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar check-pixels-baseline INPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar prepare-csv [--root PATH] CONFIG OUTPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar check-csv-input INPUT_DIRECTORY");
-        out.println("       java -jar build/sibench/sibench.jar publish-input STORAGE_CONFIG PROFILE OBJECT_PATH INPUT_DIRECTORY");
-        out.println("       java -jar build/sibench/sibench.jar fetch-input STORAGE_CONFIG PROFILE OBJECT_PATH MANIFEST_SHA256 OUTPUT_DIRECTORY");
+        out.println("       java -jar build/sibench/sibench.jar publish-input CONFIG OBJECT_URI INPUT_DIRECTORY");
+        out.println("       java -jar build/sibench/sibench.jar fetch-input CONFIG OBJECT_URI MANIFEST_SHA256 OUTPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar prepare-cdc [--root PATH] CONFIG CSV_INPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar check-cdc-input INPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar render-queries CONFIG CSV_INPUT_DIRECTORY OUTPUT_DIRECTORY SEED INSTANCES");
@@ -39,20 +42,20 @@ public final class Sibench {
                 "       java -jar build/sibench/sibench.jar pixels-host ADDRESS:PORT BUILD WORK_ROOT TOKEN_FILE"
                         + "   (Pixels side of CDC generation for a remote pixels_host)");
         out.println(
-                "       java -jar build/sibench/sibench.jar index-server SERVICE_CONFIG"
+                "       java -jar build/sibench/sibench.jar index-server CONFIG SERVICE_CONFIG"
                         + "   (serves a new or reopened RocksDB / rocksdb-cloud / SlateDB index)");
         out.println(
                 "       java -jar build/sibench/sibench.jar replay-service REPLAY_CONFIG"
-                        + " TRACE_DIRECTORY REPORT"
+                        + " BENCHMARK REPORT"
                         + "   (target.service: grpc endpoint or in-process rocksdb path)");
         out.println(
                 "       java -jar build/sibench/sibench.jar verify-service REPLAY_CONFIG"
-                        + " TRACE_DIRECTORY REPORT"
+                        + " BENCHMARK REPORT"
                         + "   (snapshot searches against an index already holding the trace)");
         out.println(
-                "       java -jar build/sibench/sibench.jar analyze-locality TRACE CONFIG OUTPUT"
+                "       java -jar build/sibench/sibench.jar analyze-locality CONFIG BENCHMARK OUTPUT"
                         + "   (static baseline layout, update windows and overlap estimate)");
-        out.println("       java -jar build/sibench/sibench.jar analyze-accesses TRACE OUTPUT WINDOW_REQUESTS PK_BINS SORT_MEMORY_BYTES");
+        out.println("       java -jar build/sibench/sibench.jar analyze-accesses CONFIG BENCHMARK OUTPUT WINDOW_REQUESTS PK_BINS SORT_MEMORY_BYTES");
     }
 
     public static void main(String[] args) {
@@ -70,6 +73,7 @@ public final class Sibench {
         try {
             if (!List.of(
                             "inspect-scale",
+                            "trace-paths",
                             "generate",
                             "generate-pixels",
                             "prepare-pixels-baseline",
@@ -130,13 +134,13 @@ public final class Sibench {
             }
             if (args[0].equals("publish-input") || args[0].equals("fetch-input")) {
                 boolean publish = args[0].equals("publish-input");
-                if (profiles.size() != (publish ? 4 : 5)) throw new IllegalArgumentException(
-                        publish ? "publish-input requires STORAGE_CONFIG PROFILE OBJECT_PATH INPUT_DIRECTORY"
-                                : "fetch-input requires STORAGE_CONFIG PROFILE OBJECT_PATH MANIFEST_SHA256 OUTPUT_DIRECTORY");
-                var settings = org.sibench.config.ObjectStore.of(root.resolve(profiles.get(0)), profiles.get(1), profiles.get(2));
+                if (profiles.size() != (publish ? 3 : 4)) throw new IllegalArgumentException(
+                        publish ? "publish-input requires CONFIG OBJECT_URI INPUT_DIRECTORY"
+                                : "fetch-input requires CONFIG OBJECT_URI MANIFEST_SHA256 OUTPUT_DIRECTORY");
+                var settings = org.sibench.config.ObjectStore.of(root.resolve(profiles.get(0)), profiles.get(1));
                 try (var store = new org.sibench.capture.InputStore(settings)) {
-                    var result = publish ? store.publish(root.resolve(profiles.get(3)))
-                            : store.fetch(profiles.get(3), root.resolve(profiles.get(4)));
+                    var result = publish ? store.publish(root.resolve(profiles.get(2)))
+                            : store.fetch(profiles.get(2), root.resolve(profiles.get(3)));
                     out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result));
                 }
                 return 0;
@@ -182,6 +186,14 @@ public final class Sibench {
                         org.sibench.capture.CdcInput.check(root.resolve(profiles.get(0)))));
                 return 0;
             }
+            if (args[0].equals("trace-paths")) {
+                if (profiles.size() != 1) throw new IllegalArgumentException("trace-paths requires CONFIG");
+                var paths = new LinkedHashMap<String, String>();
+                BenchmarkSelection.directories(root, SibenchConfig.read(root.resolve(profiles.get(0))))
+                        .forEach((name, path) -> paths.put(name, path.toString()));
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(paths));
+                return 0;
+            }
             if (args[0].equals("generate")) {
                 if (profiles.size() != 1) throw new IllegalArgumentException("generate requires one runtime CONFIG");
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(
@@ -203,9 +215,9 @@ public final class Sibench {
             }
             root = root.toRealPath();
             if (args[0].equals("index-server")) {
-                if (profiles.size() != 1)
-                    throw new IllegalArgumentException("index-server requires SERVICE_CONFIG");
-                var service = ServiceConfig.ofServer(root, Path.of(profiles.get(0)));
+                if (profiles.size() != 2)
+                    throw new IllegalArgumentException("index-server requires CONFIG SERVICE_CONFIG");
+                var service = ServiceConfig.ofServer(root, Path.of(profiles.get(1)), SibenchConfig.read(root.resolve(profiles.get(0))));
                 RunTiming.current().measure(service.path());
                 var backend = service.backend();
                 IndexServer server;
@@ -244,13 +256,13 @@ public final class Sibench {
             if (args[0].equals("replay-service")) {
                 if (profiles.size() != 3)
                     throw new IllegalArgumentException(
-                            "replay-service requires REPLAY_CONFIG TRACE_DIRECTORY REPORT");
+                            "replay-service requires REPLAY_CONFIG BENCHMARK REPORT");
                 var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
                 ReplayConfig config = ReplayConfig.from(document);
                 ServiceConfig service = ServiceConfig.ofReplay(root, document);
                 var result =
                         ServiceReplay.run(
-                                root.resolve(profiles.get(1)),
+                                BenchmarkSelection.directory(root, document, profiles.get(1)),
                                 config,
                                 service,
                                 root.resolve(profiles.get(2)));
@@ -260,12 +272,12 @@ public final class Sibench {
             if (args[0].equals("verify-service")) {
                 if (profiles.size() != 3)
                     throw new IllegalArgumentException(
-                            "verify-service requires REPLAY_CONFIG TRACE_DIRECTORY REPORT");
+                            "verify-service requires REPLAY_CONFIG BENCHMARK REPORT");
                 var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
                 ServiceConfig service = ServiceConfig.ofReplay(root, document);
                 var result =
                         ServiceReplay.verify(
-                                root.resolve(profiles.get(1)),
+                                BenchmarkSelection.directory(root, document, profiles.get(1)),
                                 ReplayConfig.from(document),
                                 service,
                                 root.resolve(profiles.get(2)));
@@ -273,30 +285,31 @@ public final class Sibench {
                 return 0;
             }
             if (args[0].equals("analyze-accesses")) {
-                if (profiles.size() != 5) throw new IllegalArgumentException(
-                        "analyze-accesses requires TRACE OUTPUT WINDOW_REQUESTS PK_BINS SORT_MEMORY_BYTES");
-                org.sibench.analysis.TraceAccesses.run(root.resolve(profiles.get(0)),
-                        root.resolve(profiles.get(1)), Long.parseLong(profiles.get(2)),
-                        Integer.parseInt(profiles.get(3)), Long.parseLong(profiles.get(4)));
-                out.println(Files.readString(root.resolve(profiles.get(1)).resolve("summary.json")));
+                if (profiles.size() != 6) throw new IllegalArgumentException(
+                        "analyze-accesses requires CONFIG BENCHMARK OUTPUT WINDOW_REQUESTS PK_BINS SORT_MEMORY_BYTES");
+                var document = SibenchConfig.read(root.resolve(profiles.get(0)));
+                org.sibench.analysis.TraceAccesses.run(BenchmarkSelection.directory(root, document, profiles.get(1)),
+                        root.resolve(profiles.get(2)), Long.parseLong(profiles.get(3)),
+                        Integer.parseInt(profiles.get(4)), Long.parseLong(profiles.get(5)));
+                out.println(Files.readString(root.resolve(profiles.get(2)).resolve("summary.json")));
                 return 0;
             }
             if (args[0].equals("analyze-locality")) {
                 if (profiles.size() != 3)
                     throw new IllegalArgumentException(
-                            "analyze-locality requires TRACE CONFIG OUTPUT_DIRECTORY");
+                            "analyze-locality requires CONFIG BENCHMARK OUTPUT_DIRECTORY");
                 org.sibench.analysis.UpdateLocality.run(
+                        BenchmarkSelection.directory(root, SibenchConfig.read(root.resolve(profiles.get(0))), profiles.get(1)),
                         root.resolve(profiles.get(0)),
-                        root.resolve(profiles.get(1)),
                         root.resolve(profiles.get(2)));
                 out.println(Files.readString(root.resolve(profiles.get(2)).resolve("summary.json")));
                 return 0;
             }
             if (args[0].equals("check-replay")) {
                 if (profiles.size() != 2)
-                    throw new IllegalArgumentException("check-replay requires REPLAY_CONFIG TRACE_DIRECTORY");
+                    throw new IllegalArgumentException("check-replay requires REPLAY_CONFIG BENCHMARK");
                 var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
-                var result = ReplayInput.check(root.resolve(profiles.get(1)), ReplayConfig.from(document));
+                var result = ReplayInput.check(BenchmarkSelection.directory(root, document, profiles.get(1)), ReplayConfig.from(document));
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result));
                 return 0;
             }
@@ -342,7 +355,7 @@ public final class Sibench {
                     + " leaves a single timing artifact.");
         out.println(
                 "       java -jar build/sibench/sibench.jar check-replay [--root PATH]"
-                        + " REPLAY_CONFIG TRACE_DIRECTORY");
+                        + " REPLAY_CONFIG BENCHMARK");
 
     }
 }

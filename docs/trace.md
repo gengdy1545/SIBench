@@ -2,6 +2,43 @@
 
 A Trace is an immutable baseline and workload for isolated index replay. Native `generate`, live `generate-pixels` and Trace-enabled [Pixels experiments](pixels-experiment.md) publish the same format. Workload configuration controls source execution; export preserves supported accesses and does not promise deterministic concurrent ordering.
 
+## Selection and storage
+
+`config/sibench.yaml` owns named benchmark entries and object-storage connections. Each entry references one source configuration and engine; YCSB entries also select one `workload` from that configuration. Scale and workload parameters remain in `config/benchmark/`. A sysbench entry without `workload` retains the source configuration's complete sequence of workloads.
+
+```yaml
+benchmarks:
+  ycsb-a:
+    config: config/benchmark/ycsb.yaml
+    mode: api
+    engine: rocksdb
+    workload: workloada
+    trace:
+      generate: true
+      directory: results/traces/ycsb-a
+      upload:
+        enabled: true
+        path: cos://YOUR-BUCKET/sibench/traces/ycsb-a/
+```
+
+`trace.generate` controls only generation. Analysis and replay resolve the same named entry even when generation is disabled; they never regenerate or download implicitly. The local directory is persistent input, with no additional cache. Working databases, logs and effective configuration snapshots remain below the source configuration's `artifacts.directory`. Both working and persistent outputs must be fresh and nonoverlapping. Completed local bundles move to the persistent directory after normal native shutdown; failed moves retain the source bundle. Directory moves require the same filesystem; native and Pixels generation check this, resolved path overlaps and upload credentials before starting a database. Existing Traces are never overwritten.
+
+`object_storage.aws` and `object_storage.cos` define endpoint, region, addressing (`path` or `virtual_hosted`) and credential environment-variable names. `s3://BUCKET/PREFIX` selects AWS; `cos://BUCKET/PREFIX` selects COS. Bucket and prefix belong only to the URI. Unknown schemes, traversal, ambiguous/encoded paths, queries and embedded credentials are rejected. The same resolver serves Index Service storage and reusable input transfers. Only connections actually opened read credentials; a local run needs none. A local S3-compatible service can be selected by setting the AWS connection's endpoint and addressing in an explicit test runtime config. Backend native clients keep their own I/O implementation and storage semantics.
+
+An enabled upload requires `path`. Successful local generation uploads through the shared input-transfer implementation, verifies complete remote payload and inventory readbacks, and records the returned inventory identity in `trace-publication.json` beside the source run's effective configuration. A failed upload leaves the persistent local Trace usable, records the failure and fails the command. Content objects live at `PREFIX/objects/<sha256>`; the immutable selection inventory is published last at `PREFIX/manifests/<sha256>.json`. Uploads neither overwrite a mutable current pointer nor delete older data. Retire superseded inventories/payloads explicitly after checking their consumers.
+
+The same transfer commands can publish a completed Trace or restore it on another host:
+
+```bash
+java -jar build/sibench/sibench.jar publish-input config/sibench.yaml \
+  s3://YOUR-BUCKET/sibench/traces/ycsb-a/ results/traces/ycsb-a
+java -jar build/sibench/sibench.jar fetch-input config/sibench.yaml \
+  s3://YOUR-BUCKET/sibench/traces/ycsb-a/ INVENTORY_SHA256 results/traces/ycsb-a
+java -jar build/sibench/sibench.jar check-replay config/sibench.yaml ycsb-a
+```
+
+Fetch requires a fresh local directory and verifies the inventory and payload identities before exposing its manifest. Use the inventory digest returned by publication, not the digest of the Trace's own `manifest.json`. Each analysis/replay result continues to bind the actual Trace identity; editing a configuration does not change an existing Trace. Each generation records its effective configuration and build identities separately from subsequent consumer settings.
+
 ## Native publication
 
 | File | Contents |
@@ -17,7 +54,7 @@ Every catalog table must have baseline entries unless declared in `empty_baselin
 
 `trace.workload_requests` targets effective requests after projection: writes and individual read members, excluding baseline and transaction markers. Every selected workload receives its budget; admitted work drains and may exceed it. No-progress batches fail. Without a target, each configured stage runs once. `request-budget.json` records counts and overshoot.
 
-YCSB loads once, closes the database and restores identical files for each independent workload. `traces.json` indexes the resulting Traces. The initial-state identity binds files, seed and baseline; a workload never inherits another workload's mutations. Native block caches are fresh; OS caches are not cleared.
+YCSB loads once, closes the database and restores identical files for each independent workload. `traces.json` indexes the resulting named persistent Trace locations. The initial-state identity binds files, seed and baseline; a workload never inherits another workload's mutations. Native block caches are fresh; OS caches are not cleared.
 
 ### Pixels host
 
@@ -92,7 +129,7 @@ YCSB Scan preserves its explicit maximum result count. Failed/partial SQL execut
 
 ## Replay preflight
 
-`check-replay CONFIG TRACE` validates without an adapter; ordinary replay performs the same preflight. It checks identities/digests, catalog, counts, version coverage, final-write uniqueness, provenance, snapshots/private contexts, routing, value capability and supply. Baseline validation is fused with loading and accepts only timestamp-zero Puts.
+`check-replay CONFIG BENCHMARK` validates without an adapter; ordinary replay performs the same preflight. It checks identities/digests, catalog, counts, version coverage, final-write uniqueness, provenance, snapshots/private contexts, routing, value capability and supply. Baseline validation is fused with loading and accepts only timestamp-zero Puts.
 
 Required supply is warmup + `ceil(rate × measurement_seconds × (1 + margin))`, counted in effective requests. Insufficient supply fails before sending. Baseline and markers do not count; private entries add no requests. Warmup membership follows input order through completion. Finite supply does not establish achievable throughput, and replay has no segmented resume/checkpoint support.
 

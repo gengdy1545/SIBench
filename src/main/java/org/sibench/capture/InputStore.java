@@ -53,7 +53,7 @@ public final class InputStore implements AutoCloseable {
     public Map<String, Object> publish(Path input) throws Exception {
         input = input.toRealPath();
         var manifest = check(input);
-        var payloads = payloads(manifest);
+        var payloads = payloads(input, manifest);
         var manifestFile = InputFiles.file(input, input.resolve("manifest.json"));
         require(JsonParser.parseString(Files.readString(input.resolve("manifest.json"))).equals(manifest),
                 "Input manifest changed during validation");
@@ -62,7 +62,7 @@ public final class InputStore implements AutoCloseable {
         for (var entry : payloads.values()) {
             Path path = InputFiles.resolve(input, name(entry.get("path").getAsString()));
             String key = prefix + "objects/" + digest(entry.get("sha256").getAsString());
-            long size = entry.get("bytes").getAsLong();
+            long size = InputFiles.number(entry, "bytes");
             try {
                 var existing = client.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build());
                 require(existing.contentLength() == size, "Existing content object has a different size");
@@ -70,6 +70,7 @@ public final class InputStore implements AutoCloseable {
                 if (absent.statusCode() != 404) throw absent;
                 upload(path, key, size, entry.get("sha256").getAsString());
             }
+            if (manifest.has("output")) verifyRemote(key, size, entry.get("sha256").getAsString());
             entries.add(entry);
         }
         var inventory = new JsonObject();
@@ -82,6 +83,7 @@ public final class InputStore implements AutoCloseable {
         // Identical keys always carry identical bytes; no conditional PUT or directory rename is assumed.
         client.putObject(PutObjectRequest.builder().bucket(bucket).key(prefix + "manifests/" + identity + ".json").build(),
                 RequestBody.fromBytes(bytes));
+        if (manifest.has("output")) verifyRemote(prefix + "manifests/" + identity + ".json", bytes.length, identity);
         return Map.of("status", "published", "bucket", bucket, "object_path", prefix,
                 "manifest_sha256", identity, "files", entries.size());
     }
@@ -123,11 +125,12 @@ public final class InputStore implements AutoCloseable {
         output = output.toAbsolutePath().normalize();
         Files.createDirectories(output.getParent());
         Files.createDirectory(output);
-        // Publish the canonical manifest only after all payloads are present and verified.
+        Path staging = Files.createTempDirectory(output, ".fetch-");
+        // Keep the canonical manifest hidden until its payload bindings have also been checked.
         entries.sort(java.util.Comparator.comparing(e -> e.get("path").getAsString().equals("manifest.json")));
         try {
             for (var entry : entries) {
-                Path target = output.resolve(entry.get("path").getAsString());
+                Path target = staging.resolve(entry.get("path").getAsString());
                 Files.createDirectories(target.getParent());
                 var digest = Digests.digest();
                 try (var source = new DigestInputStream(client.getObject(GetObjectRequest.builder().bucket(bucket)
@@ -146,15 +149,36 @@ public final class InputStore implements AutoCloseable {
                             "Remote input content differs: " + entry.get("path").getAsString());
                 }
             }
-            var bound = new java.util.HashSet<>(payloads(check(output)).keySet());
-            bound.add("manifest.json");
-            require(bound.equals(paths), "Remote inventory differs from the files its input manifest binds");
+            var bound = payloads(staging, check(staging));
+            var expected = new java.util.HashSet<>(bound.keySet());
+            expected.add("manifest.json");
+            require(expected.equals(paths), "Remote inventory differs from the files its input manifest binds");
+            for (var entry : entries) {
+                var file = bound.get(entry.get("path").getAsString());
+                if (file != null) require(file.get("sha256").equals(entry.get("sha256"))
+                        && InputFiles.number(file, "bytes") == InputFiles.number(entry, "bytes"),
+                        "Remote inventory differs from the content its input manifest binds");
+            }
+            try (var filesToPublish = Files.list(staging)) {
+                for (Path file : filesToPublish.sorted(java.util.Comparator.comparing(
+                        path -> path.getFileName().toString().equals("manifest.json"))).toList())
+                    Files.move(file, output.resolve(file.getFileName()));
+            }
+            Files.delete(staging);
         } catch (Exception | Error failure) {
             try { Files.deleteIfExists(output.resolve("manifest.json")); }
             catch (IOException cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
         }
         return Map.of("status", "passed", "manifest_sha256", identity, "directory", output.toString());
+    }
+
+    private void verifyRemote(String key, long size, String expected) throws IOException {
+        var digest = Digests.digest();
+        try (var input = new DigestInputStream(client.getObject(GetObjectRequest.builder().bucket(bucket).key(key).build()), digest)) {
+            require(input.transferTo(java.io.OutputStream.nullOutputStream()) == size
+                    && HexFormat.of().formatHex(digest.digest()).equals(expected), "Remote readback differs: " + key);
+        }
     }
 
     /** Uploads exactly the hashed bytes, so a content key never holds bytes other than its digest. */
@@ -202,6 +226,7 @@ public final class InputStore implements AutoCloseable {
     private static JsonObject check(Path input) throws IOException {
         try {
             var manifest = InputFiles.manifest(input).document();
+            if (manifest.has("output")) return org.sibench.trace.TraceManifest.read(input);
             return switch (manifest.get("kind").getAsString()) {
                 case "hybench_csv_input" -> CsvInput.open(input).manifest();
                 case "pixels_cdc_input" -> CdcInput.open(input).manifest();
@@ -212,8 +237,30 @@ public final class InputStore implements AutoCloseable {
     }
 
     /** The local payload files an input manifest binds, excluding the manifest itself. */
-    private static java.util.TreeMap<String, JsonObject> payloads(JsonObject manifest) {
+    private static java.util.TreeMap<String, JsonObject> payloads(Path input, JsonObject manifest) throws IOException {
         var payloads = new java.util.TreeMap<String, JsonObject>();
+        if (manifest.has("output")) {
+            for (String stream : java.util.List.of("baseline", "workload")) {
+                ProtoTrace.source(input, manifest, stream);
+                for (var file : manifest.getAsJsonObject("proto_files").getAsJsonArray(stream)) {
+                    var descriptor = file.getAsJsonObject();
+                    InputFiles.resolve(input, name(descriptor.get("path").getAsString()));
+                    add(payloads, descriptor);
+                }
+            }
+            Path units = InputFiles.resolve(input, WorkUnits.FILE);
+            var physical = Digests.digest(); var logical = Digests.digest();
+            try (var raw = new DigestInputStream(Files.newInputStream(units), physical);
+                 var plain = new DigestInputStream(new com.github.luben.zstd.ZstdInputStream(raw), logical)) {
+                plain.transferTo(java.io.OutputStream.nullOutputStream());
+            }
+            require(HexFormat.of().formatHex(logical.digest()).equals(manifest.get("work_units_sha256").getAsString()),
+                    "Trace work-unit digest differs");
+            var file = new JsonObject();file.addProperty("path", WorkUnits.FILE);
+            file.addProperty("bytes", Files.size(units));file.addProperty("sha256", HexFormat.of().formatHex(physical.digest()));
+            add(payloads, file);
+            return payloads;
+        }
         for (String field : java.util.List.of("schema", "source_ddl", "parameter_file", "load_inventory"))
             if (manifest.has(field)) add(payloads, manifest.getAsJsonObject(field));
         if (manifest.has("baseline_files")) manifest.getAsJsonObject("baseline_files").entrySet().forEach(e -> add(payloads, e.getValue().getAsJsonObject()));

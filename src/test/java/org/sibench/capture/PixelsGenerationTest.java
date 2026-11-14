@@ -21,7 +21,7 @@ public class PixelsGenerationTest {
         Path root=Path.of("").toRealPath(),config=temporary.newFile().toPath(),profile=temporary.newFile().toPath();
         Files.writeString(profile,"benchmark: hybench\ntrace:\n  secondary_indexes: true\n");
         Files.writeString(config,new org.yaml.snakeyaml.Yaml().dump(Map.of("schema_version",1,"purpose","sibench",
-                "benchmarks",java.util.List.of(Map.of("config",profile.toString(),"mode","capture","engine","postgres")),
+                "benchmarks",Map.of("hybench", org.sibench.config.BenchmarkFixtures.entry(profile,"capture","postgres",temporary.getRoot().toPath().resolve("trace"))),
                 "engines",Map.of("pixels","missing.yaml"))));
         var failure=assertThrows(IllegalArgumentException.class,()->PixelsGeneration.run(root,config));
         assertEquals("Pixels CDC supports primary indexes only",failure.getMessage());

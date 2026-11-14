@@ -15,7 +15,7 @@ python3 -m pip install -r graph/requirements.txt
 | `scripts/index/` | Index Service performance, backend comparisons and resources. |
 | `scripts/pixels/` | Pixels query performance and sink freshness. |
 | `config/style.mplstyle` | Shared Matplotlib fonts, colors and export defaults. |
-| `config/traces.json` | Ordered Trace selection, paths and analysis parameters. |
+| `config/traces.json` | Runtime configuration, ordered benchmark names, labels and analysis parameters. |
 | `requirements.txt` | Plotting dependencies. |
 
 Plotting consumes analysis tables and experiment reports. Trace decoding, key
@@ -25,19 +25,21 @@ directory, alongside SIBench build and orchestration scripts.
 
 ## Trace storage
 
-COS holds the current published collection, with one selected Trace per
-benchmark/workload. Local Trace directories are disposable caches, conventionally
-under `results/cache/traces/<name>/`. Keep the complete manifest, baseline,
-workload and work-unit files together; verify downloaded bytes against the
-published inventory before analysis. Retain input identities in analysis results.
-Plotting consumes explicitly selected inputs and does not start benchmark
-generation when a cache is missing. Dataset scale and index scope must be taken
-from each input manifest; a current-format development input is not a full-scale
-benchmark result.
+Trace directories come from named entries in the runtime CONFIG; the plotting JSON
+sets its `runtime` path. The Java `trace-paths` command resolves them, so Python
+does not duplicate configuration semantics. Use the persistent local Trace directly;
+no additional cache is needed. For another host, use the verified transfer workflow
+in [Trace selection and storage](../docs/trace.md#selection-and-storage).
+Plotting never generates or downloads missing input. Keep each complete Trace bundle
+together; dataset scale and index scope come from its manifest. Analysis results bind
+the selected input and analyzer identities.
+
+All three entry points require the configured SIBench JAR to resolve benchmark paths,
+including the manifest-only operation-mix plot.
 
 ## Operation mix and access locality
 
-Edit `config/traces.json` to select Trace directories and display labels. Paths
+Edit `config/traces.json` to select benchmark names and display labels. Paths
 inside this file resolve from the repository root, including when the command
 runs from another directory. Trace list order controls the bars within each
 operation group. All three entry points accept `--config PATH`.
@@ -60,13 +62,13 @@ Manifest counts alone do not independently validate Trace payloads. Output is
 `results/plots/trace/operation_mix.{pdf,png,csv}`; CSV retains exact counts,
 fractions and input manifest identities.
 
-`prepare_analysis.py` invokes the configured SIBench JAR once per input. Build
+`prepare_analysis.py` resolves paths with the configured SIBench JAR, then invokes its analyzer once per input. Build
 it with the root Maven project (`mvn package`, with the native dependency paths
 required by your build). The Java CLI can also be called directly:
 
 ```bash
 java -jar build/sibench/sibench.jar analyze-accesses \
-  results/cache/traces/ycsb-a results/analysis/trace/ycsb-a/accesses \
+  config/sibench.yaml ycsb-a results/analysis/trace/ycsb-a/accesses \
   10000 2000 134217728
 ```
 
@@ -124,7 +126,7 @@ Generate locality tables, then plot them:
 
 ```bash
 java -jar build/sibench/sibench.jar analyze-locality \
-  results/cache/traces/ycsb-a config/sibench.yaml results/analysis/trace/ycsb-a
+  config/sibench.yaml ycsb-a results/analysis/trace/ycsb-a
 python3 graph/scripts/trace/plot_update_locality.py \
   results/analysis/trace/ycsb-a \
   --out results/plots/trace/ycsb-a

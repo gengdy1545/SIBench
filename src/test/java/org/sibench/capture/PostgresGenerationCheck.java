@@ -41,7 +41,7 @@ public class PostgresGenerationCheck {
         assertTrue(((Number)object(statistics,"source_projection").get("transaction_local_search_members")).longValue()>0);
         assertTrue(((Number)object(object(statistics,"index_operations"),"primary").get("get")).longValue()>0);
         assertTrue(((Number)object(object(statistics,"index_operations"),"secondary").get("put")).longValue()>0);
-        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
+        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),
                 new org.sibench.replay.ReplayConfig(true,0,0,0,0, "operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
         assertFalse(Files.exists(output.resolve("generated/database/data")));
     }
@@ -64,7 +64,7 @@ public class PostgresGenerationCheck {
         assertEquals(8706L,result.get("baseline_rows"));
         var coverage=object(result,"query_coverage");
         for(int i=1;i<=6;i++)assertTrue(((Number)object(object(coverage,"iq"),"IQ-"+i).get("successful_queries")).longValue()>0);
-        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
+        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),
                 new org.sibench.replay.ReplayConfig(true,0,0,0,0, "operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
         assertFalse(Files.exists(output.resolve("generated/database/data")));
         var properties=new java.util.Properties();
@@ -94,7 +94,7 @@ public class PostgresGenerationCheck {
         assertTrue(((Number)query.get("target_requests")).longValue()>0);
         assertTrue(Files.isRegularFile(output.resolve("generated/oltp_point_select/batch-0/summary.json")));
         assertTrue(Files.exists(output.resolve("generated/oltp_update_index/budget.stop")));
-        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
+        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),
                 new org.sibench.replay.ReplayConfig(false,0,0,0,0,"operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
     }
     @Test public void failedPublicationRetainsTheClosedDatabase() throws Exception {
@@ -132,7 +132,7 @@ public class PostgresGenerationCheck {
         Files.writeString(engine,yaml.dump(Map.of("schema_version",1,"purpose","engine","engine","postgres",
                 "build_directory",Path.of(runtime).getParent().toString(),"settings",org.sibench.generation.PostgresTestSettings.SETTINGS)));
         Files.writeString(settings,yaml.dump(Map.of("schema_version",1,"purpose","sibench",
-                "benchmarks",java.util.List.of(Map.of("config",profile.toString(),"mode","capture","engine","postgres")),
+                "benchmarks",Map.of("sysbench", org.sibench.config.BenchmarkFixtures.entry(profile,"capture","postgres",output.resolve("trace"))),
                 "engines",Map.of("postgres",engine.toString()))));
         return settings;
     }

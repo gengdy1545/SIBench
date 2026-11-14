@@ -48,12 +48,13 @@ final class RocksGeneration {
                 Path destination=out.resolve(name);
                 document.put("artifacts",Map.of("directory",plan.root().relativize(destination).toString()));
                 var source=org.sibench.schema.SourceSchema.of("ycsb",input.source().source(),nativeConfig);
-                var selected=new Generation.Input(input.selection(),document,source,input.build(),destination,
+                var entry=plan.selections().stream().filter(s->s.benchmark().equals("ycsb")&&s.workload().equals(name)).findFirst().orElseThrow();
+                var selected=new Generation.Input(entry,document,source,input.build(),destination,
                         input.buildIdentity(),input.baselineRows(),input.parameters());
                 var report=workload(plan,selected,name,settings,initial.resolve("database"),baseline,load,initialIdentity);
                 String identity=(String)object(object(report,"source_evidence"),"initial_state").get("physical_sha256");
                 if(initialIdentity==null)initialIdentity=identity;
-                reports.add(report);catalog.put(name,Map.of("trace",name+"/trace","manifest_sha256",Digests.sha256(destination.resolve("trace/manifest.json"))));
+                reports.add(report);catalog.put(entry.name(),Map.of("trace",entry.directory().toString(),"manifest_sha256",Digests.sha256(destination.resolve("trace/manifest.json"))));
             }
             String identity=initialIdentity;
             Generation.publishThenDiscard(()->{
@@ -105,7 +106,7 @@ final class RocksGeneration {
                     "effective_config_sha256",Digests.sha256(out.resolve("effective-config.json")));
             var manifest=Generation.publishThenDiscard(()->trace.publish(evidence),out.resolve("database"),timings);
             timings.put("total_seconds",seconds(started));
-            json(out.resolve("result.json"),Map.of("status","complete","trace",out.resolve("trace").toString(),"timings",timings));
+            json(out.resolve("result.json"),Map.of("status","complete","trace",input.selection().directory().toString(),"timings",timings));
             return manifest;
         }catch(Exception|Error failure){diagnostic(out,failure);throw failure;}
     }

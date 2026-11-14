@@ -21,8 +21,8 @@ import java.util.Set;
  * </ul>
  *
  * {@code value} is {@code locator} or {@code row_id}: what an index entry points to. An index
- * server's {@code backend} is {@code rocksdb} for fixtures, or {@code rocksdb_cloud}/{@code slatedb} with {@code storage} (the
- * storage config), {@code profile} and the index's {@code object_path} below the profile prefix.
+ * server's {@code backend} is {@code rocksdb} for fixtures, or {@code rocksdb_cloud}/{@code slatedb} with a {@code storage} URI
+ * resolved through the runtime configuration's AWS or COS connection.
  * {@code reopen: true} serves an index this server created before instead of a new one: after a
  * restart, or for rocksdb-cloud without its local directory, from the bucket alone. The object-storage
  * backends require {@code wal}: whether every write is also recorded in the engine's WAL. The local
@@ -68,7 +68,7 @@ public record ServiceConfig(
     }
 
     /** A server with visible mutation acknowledgements and versioned reads. */
-    public static ServiceConfig ofServer(Path root, Path path) throws java.io.IOException {
+    public static ServiceConfig ofServer(Path root, Path path, Map<String, Object> runtime) throws java.io.IOException {
         Map<String, Object> document = parse(Files.readString(root.resolve(path)));
         keys(document, Set.of("schema_version", "purpose", "service"));
         require(integer(document, "schema_version") == 1, "Expected index service config v1");
@@ -78,13 +78,13 @@ public record ServiceConfig(
                 service,
                 Set.of(
                         "backend", "path", "port", "value", "storage",
-                        "profile", "object_path", "reopen", "wal"));
+                        "reopen", "wal"));
         String backend = string(service, "backend");
         require(
                 Set.of("rocksdb", "rocksdb_cloud", "slatedb").contains(backend),
                 "backend must be rocksdb, rocksdb_cloud or slatedb");
         boolean cloud = !backend.equals("rocksdb");
-        for (String key : List.of("storage", "profile", "object_path", "wal"))
+        for (String key : List.of("storage", "wal"))
             require(cloud == service.containsKey(key), key + " is required only for object-storage backends");
         return new ServiceConfig(
                 backend,
@@ -94,9 +94,7 @@ public record ServiceConfig(
                 value(service),
                 cloud
                         ? ObjectStore.of(
-                                root.resolve(string(service, "storage")),
-                                string(service, "profile"),
-                                string(service, "object_path"))
+                                runtime, string(service, "storage"))
                         : null,
                 service.containsKey("reopen") && bool(service, "reopen"),
                 !cloud || bool(service, "wal"));

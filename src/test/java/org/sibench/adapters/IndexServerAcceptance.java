@@ -6,8 +6,8 @@ import java.nio.file.Path;
 /** Real service acceptance process: stdin requests a clean close of both server and backend. */
 public final class IndexServerAcceptance {
     public static void main(String[] args) throws Exception {
-        if (args.length != 1) throw new IllegalArgumentException("Expected SERVICE_CONFIG");
-        var config = ServiceConfig.ofServer(Path.of("").toAbsolutePath(), Path.of(args[0]));
+        if (args.length != 2) throw new IllegalArgumentException("Expected CONFIG SERVICE_CONFIG");
+        var config = ServiceConfig.ofServer(Path.of("").toAbsolutePath(), Path.of(args[1]), org.sibench.config.SibenchConfig.read(Path.of(args[0])));
         try (var backend = config.backend(); var server = IndexServer.start(config.port(), backend)) {
             System.out.println("READY " + server.port());
             System.out.flush();

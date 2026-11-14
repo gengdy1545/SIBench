@@ -7,76 +7,96 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/** Resolves exactly the selected benchmark profiles, without generating data or opening a database. */
-public record BenchmarkSelection(Path config, String benchmark, Mode mode,Engine engine) {
+/** Named workload selections and their persistent Trace locations. */
+public record BenchmarkSelection(Path config, String benchmark, Mode mode, Engine engine,
+        String name, String workload, Path directory, boolean generate, String upload) {
     public enum Mode { API, CAPTURE, CDC }
 
     public static void validate(Object value) {
-        require(value instanceof List<?> && !((List<?>) value).isEmpty(),
-                "benchmarks must be a nonempty list");
-        var paths = new HashSet<String>();
-        for (Object entry : (List<?>) value) {
-            var item = item(entry);
-            String config = string(item, "config");
-            require(!config.isBlank(), "Benchmark config must not be blank");
-            require(paths.add(config), "Duplicate benchmark config: " + config);
-            mode(item);
-            engine(item);
+        var selections = object(Map.of("benchmarks", value == null ? "" : value), "benchmarks");
+        require(!selections.isEmpty(), "benchmarks must be a nonempty mapping");
+        for (String name : selections.keySet()) {
+            require(name.matches("[a-z0-9][a-z0-9_-]*"), "Invalid benchmark entry name: " + name);
+            var item = object(selections, name);
+            for (String key : item.keySet()) require(Set.of("config", "mode", "engine", "workload", "trace").contains(key), "Unknown benchmark option: " + key);
+            require(!string(item, "config").isBlank(), "Benchmark config must not be blank");
+            mode(item); engine(item);
+            if (item.containsKey("workload")) require(!string(item, "workload").isBlank(), "Empty workload selection");
+            var trace = object(item, "trace");
+            SibenchConfig.keys(trace, Set.of("generate", "directory", "upload"), "benchmark trace");
+            bool(trace, "generate");
+            String directory = string(trace, "directory");
+            require(!directory.isBlank() && !directory.contains("://"), "Trace directory must be a local path");
+            var upload = object(trace, "upload");
+            for (String key : upload.keySet()) require(Set.of("enabled", "path").contains(key), "Unknown Trace upload option: " + key);
+            boolean enabled = bool(upload, "enabled");
+            if (enabled || upload.containsKey("path")) ObjectStore.uri(string(upload, "path"));
         }
+    }
+
+    /** Consumers resolve paths without loading source configurations, builds or cloud credentials. */
+    public static Map<String, Path> directories(Path root, Map<String, Object> runtime) {
+        validate(runtime.get("benchmarks"));
+        var selections = object(runtime, "benchmarks");
+        var result = new LinkedHashMap<String, Path>();
+        for (String name : selections.keySet()) {
+            Path directory = root.resolve(string(object(object(selections, name), "trace"), "directory")).toAbsolutePath().normalize();
+            for (Path previous : result.values()) require(!directory.startsWith(previous) && !previous.startsWith(directory), "Overlapping Trace directories");
+            result.put(name, directory);
+        }
+        return java.util.Collections.unmodifiableMap(result);
+    }
+
+    public static Path directory(Path root, Map<String, Object> runtime, String name) {
+        Path result = directories(root, runtime).get(name);
+        require(result != null, "Unknown benchmark entry: " + name);
+        return result;
     }
 
     public static List<BenchmarkSelection> read(Path root, Map<String, Object> runtime) throws IOException {
-        Object selections = runtime.get("benchmarks");
-        validate(selections);
-        Path project = root.toRealPath();
-        var names = new HashSet<String>();
-        var paths = new HashSet<Path>();
+        var directories = directories(root, runtime);
+        var selections = object(runtime, "benchmarks");
+        var identities = new HashSet<String>();
+        var sources = new LinkedHashMap<String, String>();
         var result = new ArrayList<BenchmarkSelection>();
-        for (Object entry : (List<?>) selections) {
-            var item = item(entry);
-            Path path = project.resolve(string(item, "config")).toRealPath();
-            require(paths.add(path), "Duplicate benchmark config: " + path);
+        for (String name : selections.keySet()) {
+            var item = object(selections, name);
+            Path path = root.resolve(string(item, "config")).toRealPath();
             var profile = parse(Files.readString(path));
             String benchmark = string(profile, "benchmark");
-            require(Set.of("ycsb", "sysbench", "hybench").contains(benchmark),
-                    "Unsupported benchmark: " + benchmark);
-            require(names.add(benchmark), "Duplicate benchmark: " + benchmark);
-            Mode mode = mode(item);
-            Engine engine = engine(item);
-            // Each supported combination names one operation source and its native engine.
-            boolean supported = switch (mode) {
-                case API -> benchmark.equals("ycsb") && engine == Engine.ROCKSDB;
-                case CAPTURE -> !benchmark.equals("ycsb") && (engine == Engine.DUCKDB || engine == Engine.POSTGRES);
-                case CDC -> false;
-            };
-            require(supported, "Unsupported benchmark/mode/engine combination: " + benchmark + "/"
-                    + string(item, "mode") + "/" + string(item, "engine"));
-            result.add(new BenchmarkSelection(path, benchmark, mode, engine));
+            require(Set.of("ycsb", "sysbench", "hybench").contains(benchmark), "Unsupported benchmark: " + benchmark);
+            Mode mode = mode(item); Engine engine = engine(item);
+            boolean supported = mode == Mode.API ? benchmark.equals("ycsb") && engine == Engine.ROCKSDB
+                    : !benchmark.equals("ycsb") && (engine == Engine.DUCKDB || engine == Engine.POSTGRES);
+            require(supported, "Unsupported benchmark/mode/engine combination: " + benchmark + "/" + mode + "/" + engine);
+            String source = path + ":" + mode + ":" + engine;
+            String previous = sources.putIfAbsent(benchmark, source);
+            require(previous == null || previous.equals(source), "Conflicting source configurations for " + benchmark);
+            var workloads = benchmark.equals("hybench") ? Set.of("xp") : object(object(profile, "native"), "workloads").keySet();
+            require(!benchmark.equals("ycsb") || item.containsKey("workload") || workloads.size() == 1, "Select one workload for " + name);
+            String workload = item.containsKey("workload") ? string(item, "workload")
+                    : benchmark.equals("hybench") ? "xp" : benchmark.equals("ycsb") ? workloads.iterator().next() : "";
+            require(workload.isEmpty() || workloads.contains(workload), "Unknown workload for " + name + ": " + workload);
+            require(identities.add(benchmark + ":" + workload), "Duplicate benchmark workload: " + benchmark + "/" + workload);
+            var trace = object(item, "trace"); var upload = object(trace, "upload");
+            result.add(new BenchmarkSelection(path, benchmark, mode, engine, name, workload, directories.get(name),
+                    bool(trace, "generate"), bool(upload, "enabled") ? string(upload, "path") : null));
         }
         return List.copyOf(result);
-    }
-
-    private static Map<String, Object> item(Object entry) {
-        var item = object(java.util.Collections.singletonMap("benchmark selection", entry), "benchmark selection");
-        require(item.keySet().equals(Set.of("config", "mode","engine")),
-                "Each benchmark selection requires exactly config, mode and engine");
-        return item;
     }
 
     private static Mode mode(Map<String, Object> item) {
         return switch (string(item, "mode")) {
             case "api" -> Mode.API;
             case "capture" -> Mode.CAPTURE;
-            case "cdc" -> throw new IllegalArgumentException("Use generate-pixels or prepare-cdc; benchmark selections describe native generation");
-            default -> throw new IllegalArgumentException("Unknown benchmark mode: " + string(item, "mode"));
+            default -> throw new IllegalArgumentException("Benchmark mode must be api or capture; use generate-pixels or prepare-cdc for CDC");
         };
     }
 
-    private static Engine engine(Map<String,Object> item) {
-        return Engine.of(string(item, "engine"));
-    }
+    private static Engine engine(Map<String, Object> item) { return Engine.of(string(item, "engine")); }
 }

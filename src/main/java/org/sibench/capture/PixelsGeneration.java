@@ -36,8 +36,15 @@ public final class PixelsGeneration {
     private PixelsGeneration() {}
 
     public static Map<String,Object> run(Path root,Path configuration)throws Exception {
+        var selected=Generation.hybenchSelection(root,SibenchConfig.read(root.resolve(configuration)));
+        if(!selected.generate())return Map.of("status","skipped","benchmark",selected.name());
+        Generation.freshDirectory(selected.directory());
         var plan=plan(root,configuration,false);
-        return generate(plan,plan.inputs().get(0));
+        Generation.validatePublication(plan);
+        var input=plan.inputs().get(0);
+        var result=generate(plan,input);
+        Generation.persist(plan,input.selection(),input.output());
+        return result;
     }
 
     static Generation.Plan plan(Path root,Path configuration,boolean sourceOnly)throws Exception {
@@ -46,7 +53,8 @@ public final class PixelsGeneration {
         if(!sourceOnly)require(!Generation.secondaryIndexes(parse(Files.readString(selected.config()))),
                 "Pixels CDC supports primary indexes only");
         var selection=new org.sibench.config.BenchmarkSelection(selected.config(),selected.benchmark(),
-                org.sibench.config.BenchmarkSelection.Mode.CDC,Engine.PIXELS);
+                org.sibench.config.BenchmarkSelection.Mode.CDC,Engine.PIXELS,selected.name(),selected.workload(),
+                selected.directory(),selected.generate(),selected.upload());
         var settings=sourceOnly?SibenchConfig.cdcSource(root,runtime):SibenchConfig.engine(root,runtime,Engine.PIXELS);
         Path build=NativeBuildCheck.engineDirectory(root,settings,"pixels").toRealPath();
         var identity=sourceOnly?PixelsBuild.verifySource(root,build):PixelsBuild.verify(root,build);
@@ -185,7 +193,7 @@ public final class PixelsGeneration {
                                 + ":" + pixels.get("directory").getAsString(), failure);
                     }
                     timings.put("total_seconds", seconds(started));
-                    json(output.resolve("result.json"), Map.of("status", "complete", "trace", output.resolve("trace").toString(), "timings", timings));
+                    json(output.resolve("result.json"), Map.of("status", "complete", "trace", input.selection().directory().toString(), "timings", timings));
                     return manifest;
                 }
             } finally {

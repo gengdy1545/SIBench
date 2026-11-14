@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = ROOT / "graph/config/traces.json"
@@ -13,7 +14,7 @@ STYLE = ROOT / "graph/config/style.mplstyle"
 def load_config(path):
     config = json.loads(Path(path).read_text())
     expected = {"jar", "analysis_directory", "plot_directory", "window_requests",
-                "pk_bins", "sort_memory_bytes", "traces"}
+                "pk_bins", "sort_memory_bytes", "traces", "runtime"}
     if set(config) != expected:
         raise ValueError(f"Expected configuration keys: {sorted(expected)}")
     for key in ("window_requests", "pk_bins", "sort_memory_bytes"):
@@ -21,23 +22,27 @@ def load_config(path):
             raise ValueError(f"{key} must be a positive integer")
     if config["pk_bins"] > 1_000_000:
         raise ValueError("pk_bins must not exceed 1000000")
-    for key in ("jar", "analysis_directory", "plot_directory"):
+    for key in ("jar", "analysis_directory", "plot_directory", "runtime"):
         config[key] = ROOT / config[key]
     if not isinstance(config["traces"], list) or not config["traces"]:
         raise ValueError("Select at least one Trace")
+    paths = json.loads(subprocess.check_output(
+        ["java", "-jar", str(config["jar"]), "trace-paths", str(config["runtime"])], cwd=ROOT, text=True))
     names = set()
     for trace in config["traces"]:
-        if set(trace) != {"name", "label", "directory"}:
-            raise ValueError("Each Trace needs name, label and directory")
+        if set(trace) != {"name", "label"}:
+            raise ValueError("Each Trace needs name and label")
         name = trace["name"]
         if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name) or name in names:
             raise ValueError(f"Invalid or duplicate Trace name: {name}")
         if not isinstance(trace["label"], str) or not trace["label"].strip():
             raise ValueError("Trace labels must be nonempty strings")
         names.add(name)
-        trace["directory"] = ROOT / trace["directory"]
+        if name not in paths:
+            raise ValueError(f"Unknown benchmark entry: {name}")
+        trace["directory"] = Path(paths[name])
         if not (trace["directory"] / "manifest.json").is_file():
-            raise FileNotFoundError(f"Missing Trace cache: {trace['directory']}; fetch the published input first")
+            raise FileNotFoundError(f"Missing Trace: {trace['directory']}; generate or fetch the selected input first")
         source = trace["directory"].resolve()
         for key in ("analysis_directory", "plot_directory"):
             destination = config[key].resolve()

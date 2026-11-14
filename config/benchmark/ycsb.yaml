@@ -35,5 +35,6 @@ native:
 trace:
   secondary_indexes: false
   workload_requests: 10000000
+# Working database, logs and receipts; persistent Trace paths belong to the runtime CONFIG.
 artifacts:
   directory: results/capture/ycsb

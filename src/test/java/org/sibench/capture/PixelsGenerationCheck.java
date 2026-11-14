@@ -45,7 +45,7 @@ public class PixelsGenerationCheck {
         pixels.put("sink_properties", root.resolve("config/engine/pixels/pixels-sink.properties").toString());
         Files.writeString(engine, yaml.dump(pixels));
         Files.writeString(settings, yaml.dump(Map.of("schema_version", 1, "purpose", "sibench",
-                "benchmarks", List.of(Map.of("config", profile.toString(), "mode", "capture", "engine", "postgres")),
+                "benchmarks", Map.of("hybench", org.sibench.config.BenchmarkFixtures.entry(profile,"capture","postgres",output.resolve("trace"))),
                 "engines", Map.of("pixels", engine.toString()))));
 
         var manifest = PixelsGeneration.run(root, settings);
@@ -77,7 +77,7 @@ public class PixelsGenerationCheck {
         // Working state is gone after publication: source cluster data and the Pixels run directory.
         assertFalse(Files.exists(output.resolve("generated/database/data")));
         assertFalse(Files.exists(output.resolve("generated/pixels")));
-        var report = org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
+        var report = org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),
                 new org.sibench.replay.ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 4096, 60, 1), output.resolve("reference.json"));
         assertEquals("passed", report.get("status"));
     }

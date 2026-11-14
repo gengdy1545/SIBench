@@ -51,13 +51,13 @@ public class CdcPreparationCheck {
             String storage = System.getProperty("sibench.storage.config");
             assertNotNull("Set sibench.storage.config", storage);
             pixels.put("load", Map.of("rows_per_file", 2000, "threads", 1));
-            pixels.put("data_storage", Map.of("config", root.resolve(storage).toString(), "profile", "cos",
-                    "prefix", "sibench/pixels/prepare-" + java.util.UUID.randomUUID()));
+            assertNotNull("Set sibench.storage.uri", System.getProperty("sibench.storage.uri"));
+            pixels.put("data_storage", System.getProperty("sibench.storage.uri") + "/prepare-" + java.util.UUID.randomUUID());
         }
         Files.writeString(engine, yaml.dump(pixels));
         Files.writeString(config, yaml.dump(Map.of("schema_version", 1, "purpose", "sibench",
-                "benchmarks", List.of(Map.of("config", "config/benchmark/ycsb.yaml", "mode", "api", "engine", "rocksdb"),
-                        Map.of("config", benchmark.toString(), "mode", "capture", "engine", "postgres")),
+                "benchmarks", Map.of("hybench",org.sibench.config.BenchmarkFixtures.entry(benchmark,"capture","postgres",work.resolve("trace"))),
+                "object_storage", parallel ? object(SibenchConfig.read(root.resolve(System.getProperty("sibench.storage.config"))), "object_storage") : Map.of(),
                 "engines", Map.of("pixels", engine.toString(), "rocksdb", "/unavailable/engine-config.yaml"))));
         var output = new java.io.ByteArrayOutputStream();var errors = new java.io.ByteArrayOutputStream();
         int prepared = org.sibench.cli.Sibench.run(new String[] {"prepare-csv", "--root", root.toString(), config.toString(), work.resolve("csv").toString()},
@@ -81,7 +81,7 @@ public class CdcPreparationCheck {
             PixelsBaseline.match(baseline, document);
             assertFalse(Files.exists(work.resolve("baseline/pixels")));
             var storeConfig = root.resolve(System.getProperty("sibench.storage.config"));
-            try (var store = new InputStore(org.sibench.config.ObjectStore.of(storeConfig, "cos", "sibench/inputs/"))) {
+            try (var store = new InputStore(org.sibench.config.ObjectStore.of(storeConfig, System.getProperty("sibench.storage.uri")))) {
                 var published = store.publish(work.resolve("baseline"));
                 store.fetch(published.get("manifest_sha256").toString(), work.resolve("baseline-cache"));
                 assertEquals(baseline.sha256(), PixelsBaseline.open(work.resolve("baseline-cache")).sha256());
@@ -173,7 +173,7 @@ public class CdcPreparationCheck {
                 assertEquals(new CdcInput.Counts(6, 8, 7, 1), counts);
             }
         }
-        var selection = new BenchmarkSelection(root.resolve("config/benchmark/hybench.yaml"), "hybench", BenchmarkSelection.Mode.CDC, Engine.PIXELS);
+        var selection = new BenchmarkSelection(root.resolve("config/benchmark/hybench.yaml"), "hybench", BenchmarkSelection.Mode.CDC, Engine.PIXELS, "hybench", "xp", root.resolve("unused-trace"), false, null);
         var input = new Generation.Input(selection, Map.of("native", Map.of("sf", "1x")), source, root, output, Map.of(), baseline, Map.of());
         CdcInput.publish(output, input, counts, Map.of("build", identity, "csv_manifest_sha256", csv.sha256(),
                 "benchmark_source", Map.of("commit", source.sourceCommit(), "fingerprints", source.fingerprints())));

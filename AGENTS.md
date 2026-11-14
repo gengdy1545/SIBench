@@ -124,9 +124,12 @@
   state: keep only what Trace export needs, publish the Trace after normal host
   shutdown and then delete the database. Retain failure diagnostics; do not add
   crash recovery or reusable initial-state caches without an explicit need.
-  Keep one current published Trace collection in COS, with one selected Trace per
-  benchmark/workload. Local Trace copies are disposable caches; verify their COS
-  counterparts before deleting the only local copy. Record accepted losses of
+  Named benchmark entries in the runtime configuration own persistent local Trace
+  directories, generation switches and optional upload URIs. Analysis and replay
+  use those same entries without an additional cache. Keep one current selection
+  per benchmark/workload. Share AWS/COS connection settings and environment-variable
+  credential references in the runtime configuration; URI schemes select the store.
+  Verify published counterparts before deleting the only local copy. Record accepted losses of
   historical reproducibility when retiring obsolete Trace payloads, and preserve
   selected raw reports, logs and manifests. Input integrity and source-completeness
   checks remain required in normal generation.

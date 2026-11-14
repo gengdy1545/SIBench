@@ -18,7 +18,7 @@ final class SlateDbStore implements OrderedStore {
     private SlateDbStore(long handle, ObjectStore store, boolean wal) {
         this.handle = handle;
         this.wal = wal;
-        location = "s3://" + store.bucket() + "/" + store.objectPath();
+        location = store.location();
     }
 
     private static synchronized void load() throws IOException {

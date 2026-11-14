@@ -15,16 +15,112 @@ replay:
   # Baseline Puts per WriteBatch RPC; client_count × (batch − 1) must stay below max_in_flight. Workload operations are sent one per RPC.
   baseline_batch_operations: 64
   request_timeout_seconds: 600
+# URI schemes select a connection: s3:// uses aws; cos:// uses cos.
+# Bucket and object prefix belong to each URI. Credentials are resolved only on use.
+object_storage:
+  aws:
+    endpoint: https://s3.us-east-1.amazonaws.com
+    region: us-east-1
+    addressing: virtual_hosted
+    access_key_env: AWS_ACCESS_KEY_ID
+    secret_key_env: AWS_SECRET_ACCESS_KEY
+    session_token_env: AWS_SESSION_TOKEN
+  cos:
+    endpoint: https://cos-internal.ap-guangzhou.tencentcos.cn
+    region: ap-guangzhou
+    addressing: virtual_hosted
+    versioning: disabled
+    access_key_env: COS_SECRET_ID
+    secret_key_env: COS_SECRET_KEY
+    session_token_env: COS_SESSION_TOKEN
 benchmarks:
-  - config: config/benchmark/ycsb.yaml
+  hybench:
+    config: config/benchmark/hybench.yaml
+    mode: capture
+    engine: postgres
+    trace:
+      generate: true
+      directory: results/traces/hybench
+      upload:
+        enabled: false
+        # path: cos://YOUR-BUCKET/sibench/traces/hybench/
+  sysbench:
+    config: config/benchmark/sysbench.yaml
+    mode: capture
+    engine: postgres
+    workload: oltp_read_write
+    trace:
+      generate: true
+      directory: results/traces/sysbench
+      upload:
+        enabled: false
+        # path: cos://YOUR-BUCKET/sibench/traces/sysbench/
+  ycsb-a:
+    config: config/benchmark/ycsb.yaml
     mode: api
     engine: rocksdb
-  - config: config/benchmark/sysbench.yaml
-    mode: capture
-    engine: postgres
-  - config: config/benchmark/hybench.yaml
-    mode: capture
-    engine: postgres
+    workload: workloada
+    trace:
+      generate: true
+      directory: results/traces/ycsb-a
+      upload:
+        enabled: false
+        # path: cos://YOUR-BUCKET/sibench/traces/ycsb-a/
+  ycsb-b:
+    config: config/benchmark/ycsb.yaml
+    mode: api
+    engine: rocksdb
+    workload: workloadb
+    trace:
+      generate: true
+      directory: results/traces/ycsb-b
+      upload:
+        enabled: false
+        # path: cos://YOUR-BUCKET/sibench/traces/ycsb-b/
+  ycsb-c:
+    config: config/benchmark/ycsb.yaml
+    mode: api
+    engine: rocksdb
+    workload: workloadc
+    trace:
+      generate: true
+      directory: results/traces/ycsb-c
+      upload:
+        enabled: false
+        # path: cos://YOUR-BUCKET/sibench/traces/ycsb-c/
+  ycsb-d:
+    config: config/benchmark/ycsb.yaml
+    mode: api
+    engine: rocksdb
+    workload: workloadd
+    trace:
+      generate: true
+      directory: results/traces/ycsb-d
+      upload:
+        enabled: false
+        # path: cos://YOUR-BUCKET/sibench/traces/ycsb-d/
+  ycsb-e:
+    config: config/benchmark/ycsb.yaml
+    mode: api
+    engine: rocksdb
+    workload: workloade
+    trace:
+      generate: true
+      directory: results/traces/ycsb-e
+      upload:
+        enabled: false
+        # path: cos://YOUR-BUCKET/sibench/traces/ycsb-e/
+  ycsb-f:
+    config: config/benchmark/ycsb.yaml
+    mode: api
+    engine: rocksdb
+    workload: workloadf
+    trace:
+      generate: true
+      directory: results/traces/ycsb-f
+      upload:
+        enabled: false
+        # path: cos://YOUR-BUCKET/sibench/traces/ycsb-f/
 engines:
   duckdb: config/engine/duckdb.yaml
   postgres: config/engine/postgres.yaml

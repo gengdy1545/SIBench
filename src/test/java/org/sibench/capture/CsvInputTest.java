@@ -91,7 +91,7 @@ public class CsvInputTest {
         Files.createDirectory(output.resolve("native/parameters"));
         Files.writeString(output.resolve("native/parameters/parameters.toml"),
                 new com.moandjiezana.toml.TomlWriter().write(Map.of("1x", parameters)));
-        var selection = new BenchmarkSelection(root.resolve("config/benchmark/hybench.yaml"), "hybench", BenchmarkSelection.Mode.CDC, Engine.PIXELS);
+        var selection = new BenchmarkSelection(root.resolve("config/benchmark/hybench.yaml"), "hybench", BenchmarkSelection.Mode.CDC, Engine.PIXELS, "hybench", "xp", root.resolve("unused-trace"), false, null);
         var input = new Generation.Input(selection, Map.of("native", Map.of("sf", "1x")), source, root, output, Map.of(), rows, parameters);
         CsvInput.publish(output, input, Map.of("benchmark_source", Map.of("commit", source.sourceCommit(), "files", source.fingerprints())));
         return input;

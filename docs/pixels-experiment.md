@@ -7,13 +7,10 @@
 Set `data_storage` in [the Pixels engine YAML](../config/engine/pixels/pixels.yaml):
 
 ```yaml
-data_storage:
-  config: ../../index/storage.yaml
-  profile: cos
-  prefix: sibench/pixels
+data_storage: cos://YOUR-BUCKET/sibench/baselines/pixels
 ```
 
-The config path is relative to the engine YAML. Use virtual-hosted addressing and supply the profile's credential variables on the Pixels host and external Trino workers. Reusable baselines require COS; live `generate-pixels` can use local files.
+The connection comes from `object_storage.cos` in the runtime CONFIG. Use virtual-hosted addressing and supply its credential variables on the Pixels host and external Trino workers. Pixels data paths currently require `cos://`; `s3://` is explicitly rejected until its native integration is available. Reusable baselines require COS; live `generate-pixels` can use local files.
 
 ```bash
 java -jar build/sibench/sibench.jar prepare-csv config/sibench.yaml results/capture/hybench-csv
@@ -42,16 +39,16 @@ Success requires normal service shutdown before result/Trace publication, then r
 
 ## Publish and fetch inputs
 
-Configure endpoint/bucket and credential variables in [storage.yaml](../config/index/storage.yaml). CSV, CDC and Pixels baseline inputs share these commands:
+Configure connections in [config/sibench.yaml](../config/sibench.yaml); the URI supplies bucket and prefix. CSV, CDC and Pixels baseline inputs share these commands:
 
 ```bash
-java -jar build/sibench/sibench.jar publish-input config/index/storage.yaml cos \
-  sibench/inputs/hybench results/capture/hybench-csv
-java -jar build/sibench/sibench.jar fetch-input config/index/storage.yaml cos \
-  sibench/inputs/hybench MANIFEST_SHA256 results/inputs/hybench-csv
+java -jar build/sibench/sibench.jar publish-input config/sibench.yaml \
+  cos://YOUR-BUCKET/sibench/inputs/hybench results/capture/hybench-csv
+java -jar build/sibench/sibench.jar fetch-input config/sibench.yaml \
+  cos://YOUR-BUCKET/sibench/inputs/hybench MANIFEST_SHA256 results/inputs/hybench-csv
 ```
 
-Use the returned `manifest_sha256`, not the inner input-manifest digest. Objects live below `OBJECT_PATH/objects/`; inventories at `OBJECT_PATH/manifests/<sha256>.json`. Only manifest-bound local files transfer. Columnar objects remain at their bound COS paths: retain that canonical prefix with the baseline manifest.
+Use the returned `manifest_sha256`, not the inner input-manifest digest. Objects live below `PREFIX/objects/`; inventories at `PREFIX/manifests/<sha256>.json`. Only manifest-bound local files transfer. Columnar objects remain at their bound COS paths: retain that canonical prefix with the baseline manifest.
 
 Publication reuses content objects and needs no conditional PUT or exclusive writer; keys must remain immutable under trusted producers. PUT acknowledgment does not certify remote durability/visibility. Fetch verifies exact inventories, hashes and semantic checks, requires a fresh destination and writes the canonical manifest last. Failure retains partial files without a canonical manifest. Check an existing cache with its `check-*` command instead of fetching over it.
 

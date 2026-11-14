@@ -59,7 +59,7 @@ The service checks dirty state every five seconds and persists completed writes,
 
 Controlled shutdown bounds transport/execution waits to 30 seconds each, stops maintenance and persists dirty writes. Native handles remain valid until workers/persistence exit; a timeout does not authorize closing active handles. Successful replay establishes request completion and visibility, not durability of every ACK.
 
-Set `service.reopen: true` to open persisted state and validate binding/value kind. `verify-service CONFIG TRACE REPORT` checks original snapshot queries and rejects query-free Traces; it does not force persistence. Reopen after a completed persistence cycle or controlled shutdown. Clean reopen does not establish crash recovery, cross-instance visibility or autoscaling.
+Set `service.reopen: true` to open persisted state and validate binding/value kind. `verify-service CONFIG BENCHMARK REPORT` checks original snapshot queries and rejects query-free Traces; it does not force persistence. Reopen after a completed persistence cycle or controlled shutdown. Clean reopen does not establish crash recovery, cross-instance visibility or autoscaling.
 
 ## Backends
 
@@ -71,6 +71,6 @@ Set `service.reopen: true` to open persisted state and validate binding/value ki
 | SlateDB | Memory-visible (`ACK_MEMORY`) under either WAL setting. | With WAL, persistence waits for uploaded WAL; without WAL, it writes an L0 SST. Clean close flushes either mode. SSTs have local mirrors; WAL/manifests stay remote. |
 | Local RocksDB | Local WAL without fsync. | No power-loss durability promise; retained historical tombstones. |
 
-`service.wal` is required and applies equally to baseline and workload writes; both cloud templates set false. Buckets must exist. SlateDB refuses existing prefixes on creation and depends on conditional object writes for ownership, fencing and publication. Verify these primitives on the actual deployment. On endpoints that ignore PUT conditions, the adapter serializes/checks conditional PUTs within one process only: **run exactly one SlateDB service process per object prefix**. This cannot fence other processes or certify deployment durability.
+`index-server CONFIG SERVICE_CONFIG` resolves the backend's `service.storage` URI through CONFIG's shared object-storage connections; see [selection and storage](trace.md#selection-and-storage). `service.wal` is required and applies equally to baseline and workload writes; both cloud templates set false. Buckets must exist. SlateDB refuses existing prefixes on creation and depends on conditional object writes for ownership, fencing and publication. Verify these primitives on the actual deployment. On endpoints that ignore PUT conditions, the adapter serializes/checks conditional PUTs within one process only: **run exactly one SlateDB service process per object prefix**. This cannot fence other processes or certify deployment durability.
 
 Cloud backends report engine and remote-request statistics below local copies in `<index>.engine-stats.jsonl`. Missing data is N/A. Object latency percentiles are nearest-rank bucket upper bounds over successes/failures; cumulative parallel latency is not wall time, and SDK-internal retries are not separately counted. Build success and reopening do not certify full-input capacity or recovery.

@@ -42,8 +42,14 @@ public class RocksGenerationCheck {
         Path profile = run.resolve("profile.json"); Files.writeString(profile, json.toJson(document));
         Path engine = run.resolve("rocksdb.json"); Files.writeString(engine, json.toJson(Map.of("schema_version", 1, "purpose", "engine",
                 "engine", "rocksdb", "build_directory", runtime, "cache_bytes", 32L << 20, "write_buffer_bytes", 4L << 20, "background_jobs", 2)));
+        var selections = new LinkedHashMap<String,Object>();
+        for (String workload : workloads.keySet()) {
+            String name = "ycsb-" + workload.charAt(workload.length()-1);
+            var entry = org.sibench.config.BenchmarkFixtures.entry(profile,"api","rocksdb",run.resolve("traces").resolve(name));
+            entry.put("workload",workload);selections.put(name,entry);
+        }
         Path config = run.resolve("runtime.json"); Files.writeString(config, json.toJson(Map.of(
-                "schema_version", 1, "purpose", "sibench", "benchmarks", List.of(Map.of("config", profile.toString(), "mode", "api", "engine", "rocksdb")),
+                "schema_version", 1, "purpose", "sibench", "benchmarks", selections,
                 "engines", Map.of("rocksdb", engine.toString()))));
         var results=Generation.run(root,config);
         var names=List.of("workloada","workloadb","workloadc","workloadf","workloadd","workloade");
@@ -79,7 +85,7 @@ public class RocksGenerationCheck {
             if(name.equals("workloadc")) {
                 assertEquals(Map.of("get",budget.get("effective_requests")),statistics.get("request_types"));
             }
-            Path trace=output.resolve("trace");
+            Path trace=run.resolve("traces/ycsb-"+name.charAt(name.length()-1));
             assertFalse(Files.exists(trace.resolve("INCOMPLETE")));
             assertEquals("passed",org.sibench.replay.ReferenceReplay.run(trace,new org.sibench.replay.ReplayConfig(false,0,0,0,0,"operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
             var replay=new org.sibench.replay.ReplayConfig(false,0,0,0,0,"operation",2,64,10, 1);
@@ -91,6 +97,6 @@ public class RocksGenerationCheck {
         assertFalse(Files.exists(run.resolve("generated/initial")));
         assertTrue(Files.isRegularFile(run.resolve("generated/traces.json")));
         var rejected = assertThrows(IllegalArgumentException.class, () -> Generation.run(root, config));
-        assertTrue(rejected.getMessage().contains("output already exists"));
+        assertTrue(rejected.getMessage().contains("already exists"));
     }
 }

@@ -14,8 +14,10 @@ public class CdcPreparationTest {
 
     @Test public void rejectsMissingHybenchSelectionBeforeLookingForNativeBuilds() throws Exception {
         Path root = Path.of("").toRealPath(), config = temporary.newFile().toPath();
+        var entry=org.sibench.config.BenchmarkFixtures.entry(Path.of("config/benchmark/ycsb.yaml"),"api","rocksdb",temporary.getRoot().toPath().resolve("trace"));
+        entry.put("workload","workloada");
         Files.writeString(config, new org.yaml.snakeyaml.Yaml().dump(Map.of("schema_version", 1, "purpose", "sibench",
-                "benchmarks", List.of(Map.of("config", "config/benchmark/ycsb.yaml", "mode", "api", "engine", "rocksdb")),
+                "benchmarks", Map.of("ycsb-a",entry),
                 "engines", Map.of("rocksdb", "/missing/engine-config.yaml"))));
         var failure = assertThrows(IllegalArgumentException.class, () -> CdcPreparation.run(root, config, Path.of("/missing/csv-input")));
         assertTrue(failure.getMessage(), failure.getMessage().contains("requires one HyBench benchmark selection"));

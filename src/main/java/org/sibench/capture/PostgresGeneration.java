@@ -92,7 +92,7 @@ final class PostgresGeneration {
                         "request_budget",budget.finish(),"effective_config_sha256",Digests.sha256(output.resolve("effective-config.json")),"baseline_rows",input.baselineRows());
                 var manifest=Generation.publishThenDiscard(()->trace.publish(evidence),database.data(),timings);
                 timings.put("total_seconds",seconds(started));
-                json(output.resolve("result.json"),Map.of("status","complete","trace",output.resolve("trace").toString(),"timings",timings));
+                json(output.resolve("result.json"),Map.of("status","complete","trace",input.selection().directory().toString(),"timings",timings));
                 return manifest;
             }catch(Exception|Error failure){capture.fail(failure);throw failure;}
         }catch(Exception|Error failure) {

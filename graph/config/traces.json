@@ -6,13 +6,38 @@
   "pk_bins": 2000,
   "sort_memory_bytes": 134217728,
   "traces": [
-    {"name": "hybench", "label": "HyBench", "directory": "results/cache/traces/hybench"},
-    {"name": "sysbench", "label": "sysbench", "directory": "results/cache/traces/sysbench"},
-    {"name": "ycsb-a", "label": "YCSB-A", "directory": "results/cache/traces/ycsb-a"},
-    {"name": "ycsb-b", "label": "YCSB-B", "directory": "results/cache/traces/ycsb-b"},
-    {"name": "ycsb-c", "label": "YCSB-C", "directory": "results/cache/traces/ycsb-c"},
-    {"name": "ycsb-d", "label": "YCSB-D", "directory": "results/cache/traces/ycsb-d"},
-    {"name": "ycsb-e", "label": "YCSB-E", "directory": "results/cache/traces/ycsb-e"},
-    {"name": "ycsb-f", "label": "YCSB-F", "directory": "results/cache/traces/ycsb-f"}
-  ]
+    {
+      "name": "hybench",
+      "label": "HyBench"
+    },
+    {
+      "name": "sysbench",
+      "label": "sysbench"
+    },
+    {
+      "name": "ycsb-a",
+      "label": "YCSB-A"
+    },
+    {
+      "name": "ycsb-b",
+      "label": "YCSB-B"
+    },
+    {
+      "name": "ycsb-c",
+      "label": "YCSB-C"
+    },
+    {
+      "name": "ycsb-d",
+      "label": "YCSB-D"
+    },
+    {
+      "name": "ycsb-e",
+      "label": "YCSB-E"
+    },
+    {
+      "name": "ycsb-f",
+      "label": "YCSB-F"
+    }
+  ],
+  "runtime": "config/sibench.yaml"
 }

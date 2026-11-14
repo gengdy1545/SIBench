@@ -21,7 +21,7 @@ public class SibenchConfigTest {
         var settings = new java.util.LinkedHashMap<>(ConfigValues.parse(Files.readString(root.resolve("config/engine/pixels/pixels.yaml"))));
         settings.remove("schema_version"); settings.remove("purpose"); settings.remove("engine");
         settings.put("pixels_host", "host:65536");
-        var failure = assertThrows(IllegalArgumentException.class, () -> PixelsConfig.read(root.resolve("config/engine/pixels"), settings));
+        var failure = assertThrows(IllegalArgumentException.class, () -> PixelsConfig.read(root.resolve("config/engine/pixels"), settings, SibenchConfig.read(root.resolve("config/sibench.yaml"))));
         assertEquals("Invalid Pixels host port", failure.getMessage());
     }
 
@@ -29,22 +29,16 @@ public class SibenchConfigTest {
         Path root = Path.of("").toAbsolutePath();
         var settings = new java.util.LinkedHashMap<>(ConfigValues.parse(Files.readString(root.resolve("config/engine/pixels/pixels.yaml"))));
         settings.keySet().removeAll(java.util.Set.of("schema_version", "purpose", "engine"));
-        settings.put("data_storage", Map.of("config", "../../index/storage.yaml", "profile", "cos", "prefix", "sibench/pixels"));
-        var resolved = PixelsConfig.read(root.resolve("config/engine/pixels"), settings);
+        settings.put("data_storage", "cos://bucket/sibench/pixels");
+        var resolved = PixelsConfig.read(root.resolve("config/engine/pixels"), settings, SibenchConfig.read(root.resolve("config/sibench.yaml")));
         var profile = ConfigValues.object(ConfigValues.object(resolved, "data_storage"), "profile");
         assertEquals("COS_SECRET_KEY", profile.get("secret_key_env"));
-        settings.put("data_storage", Map.of("config", "../../index/storage.yaml", "profile", "cos", "prefix", "sibench/../outside"));
-        assertThrows(IllegalArgumentException.class, () -> PixelsConfig.read(root.resolve("config/engine/pixels"), settings));
+        settings.put("data_storage", "cos://bucket/sibench/../outside");
+        assertThrows(IllegalArgumentException.class, () -> PixelsConfig.read(root.resolve("config/engine/pixels"), settings, SibenchConfig.read(root.resolve("config/sibench.yaml"))));
+        settings.put("data_storage", "s3://bucket/sibench/pixels");
+        assertTrue(assertThrows(IllegalArgumentException.class, () -> PixelsConfig.read(root.resolve("config/engine/pixels"), settings,
+                SibenchConfig.read(root.resolve("config/sibench.yaml")))).getMessage().contains("AWS S3 is not integrated"));
         assertThrows(IllegalArgumentException.class, () -> PixelsConfig.pixelsProperties(Map.of("cos.secret.key", "not-allowed")));
-    }
-
-    @Test public void objectPathsStayBelowTheProfilePrefixAtAPathBoundary() {
-        assertTrue(ObjectStore.below("sibench/pixels", "sibench/"));
-        assertTrue(ObjectStore.below("sibench/pixels", "sibench"));
-        assertFalse(ObjectStore.below("sibenchX/pixels", "sibench"));
-        assertFalse(ObjectStore.below("sibench/", "sibench/"));
-        assertFalse(ObjectStore.below("sibench", "sibench"));
-        assertTrue(ObjectStore.below("any/key", ""));
     }
 
     @Test public void pixelsServicePortsCanBeFixedWithoutExposingOtherOwnedProperties() {
@@ -76,12 +70,10 @@ public class SibenchConfigTest {
         Path root = Path.of("").toAbsolutePath();
         var document = SibenchConfig.read(root.resolve("config/sibench.yaml"));
         var selected = BenchmarkSelection.read(root, document);
-        assertEquals(java.util.List.of("ycsb", "sysbench", "hybench"),
-                selected.stream().map(BenchmarkSelection::benchmark).toList());
-        assertEquals(java.util.List.of(BenchmarkSelection.Mode.API, BenchmarkSelection.Mode.CAPTURE,
-                BenchmarkSelection.Mode.CAPTURE), selected.stream().map(BenchmarkSelection::mode).toList());
-        assertEquals(java.util.List.of(Engine.ROCKSDB, Engine.POSTGRES, Engine.POSTGRES),
-                selected.stream().map(BenchmarkSelection::engine).toList());
+        assertEquals(java.util.List.of("hybench", "sysbench", "ycsb-a", "ycsb-b", "ycsb-c", "ycsb-d", "ycsb-e", "ycsb-f"),
+                selected.stream().map(BenchmarkSelection::name).toList());
+        assertEquals(6, selected.stream().filter(s -> s.engine() == Engine.ROCKSDB).count());
+        assertEquals(2, selected.stream().filter(s -> s.engine() == Engine.POSTGRES).count());
         var postgres = SibenchConfig.engine(root, document, Engine.POSTGRES);
         assertEquals("build/services/postgres", ConfigValues.string(postgres, "build_directory"));
         assertEquals("off", SibenchConfig.postgresSettings(ConfigValues.object(postgres, "settings")).get("fsync"));
@@ -121,8 +113,7 @@ public class SibenchConfigTest {
     @Test public void nativeSelectionCannotStartPixels() throws Exception {
         var root=temporary.getRoot().toPath();
         Files.writeString(root.resolve("hybench.yaml"),"benchmark: hybench\n");
-        assertThrows(IllegalArgumentException.class,()->BenchmarkSelection.read(root,Map.of("benchmarks",java.util.List.of(
-                Map.of("config","hybench.yaml","mode","cdc","engine","pixels")))));
+        assertThrows(IllegalArgumentException.class,()->BenchmarkSelection.read(root,Map.of("benchmarks",Map.of("hybench",BenchmarkFixtures.entry(Path.of("hybench.yaml"),"cdc","pixels",root.resolve("trace"))))));
     }
 
     @Test public void nativeConfigurationDoesNotValidateUnusedPixelsExperimentSettings() {

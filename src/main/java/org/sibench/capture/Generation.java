@@ -36,12 +36,13 @@ public final class Generation {
         Duration timeout(){return Duration.ofMinutes(positive(nativeConfig(),"timeout_minutes"));}
     }
     record NativeBuild(Path directory,Map<String,Object> identity,Map<String,Object> settings) {}
-    record Plan(Path root,Map<String,Object> runtime,Map<Engine,NativeBuild> engines,List<Input> inputs) {}
+    record Plan(Path root,Map<String,Object> runtime,Map<Engine,NativeBuild> engines,List<Input> inputs,
+            List<BenchmarkSelection> selections) {}
 
     /** Validate every selected input before creating any run output or launching a database. */
     static Plan plan(Path root,Path configuration)throws Exception {
         root=root.toRealPath();var runtime=SibenchConfig.read(root.resolve(configuration));
-        var selections=BenchmarkSelection.read(root,runtime);
+        var selections=BenchmarkSelection.read(root,runtime).stream().filter(BenchmarkSelection::generate).toList();
         var engines=new java.util.EnumMap<Engine,NativeBuild>(Engine.class);
         for(var selection:selections)if(!engines.containsKey(selection.engine())) {
             Engine engine=selection.engine();var settings=SibenchConfig.engine(root,runtime,engine);
@@ -57,7 +58,28 @@ public final class Generation {
             };
             engines.put(engine,new NativeBuild(build,identity,settings));
         }
-        return inputs(root,runtime,selections,engines,null);
+        var plan=inputs(root,runtime,selections,engines,null);
+        validatePublication(plan);
+        return plan;
+    }
+
+    /** Native and Pixels generation share publication checks before starting any database. */
+    static void validatePublication(Plan plan)throws IOException {
+        var destinations=new ArrayList<Path>();
+        for(var selection:plan.selections()) {
+            Path destination=freshDirectory(selection.directory());
+            for(Path previous:destinations)require(!destination.startsWith(previous)&&!previous.startsWith(destination),"Overlapping Trace directories");
+            destinations.add(destination);
+            for(var input:plan.inputs()) {
+                require(!destination.startsWith(input.output())&&!input.output().startsWith(destination),
+                        "Trace directory must not overlap any generation working output");
+                if(selection.benchmark().equals(input.selection().benchmark()))
+                    require(Files.getFileStore(existingAncestor(destination.getParent())).equals(
+                            Files.getFileStore(existingAncestor(input.output().getParent()))),
+                            "Trace directory and generation working output must use the same filesystem");
+            }
+            if(selection.upload()!=null)org.sibench.config.ObjectStore.of(plan.runtime(),selection.upload());
+        }
     }
 
     static BenchmarkSelection hybenchSelection(Path root,Map<String,Object> runtime)throws IOException {
@@ -73,7 +95,11 @@ public final class Generation {
     static Plan inputs(Path root,Map<String,Object> runtime,List<BenchmarkSelection> selections,
             Map<Engine,NativeBuild> engines,Path csvOutput)throws Exception {
         var inputs=new ArrayList<Input>();
-        for(var selection:selections) {
+        var groups=new LinkedHashMap<String,List<BenchmarkSelection>>();
+        for(var selection:selections)groups.computeIfAbsent(selection.benchmark(),ignored->new ArrayList<>()).add(selection);
+        for(var group:groups.values()) {
+            var selection=group.get(0);
+            require(group.size()==1||selection.benchmark().equals("ycsb"),"Only YCSB supports multiple named workloads per source run");
             var document=parse(Files.readString(selection.config()));
             keys(document,Set.of("schema_version","purpose","benchmark","source","native","trace","artifacts"));
             secondaryIndexes(document);
@@ -82,6 +108,12 @@ public final class Generation {
             keys(object(document,"source"),Set.of("path","commit"));keys(object(document,"artifacts"),Set.of("directory"));
             var source=SourceSchema.read(root,document);var nativeConfig=object(document,"native");
             validateNative(selection.benchmark(),nativeConfig);
+            if(!selection.benchmark().equals("hybench")&&!selection.workload().isEmpty()) {
+                var workloads=new LinkedHashMap<String,Object>();
+                for(var member:group)workloads.put(member.workload(),object(object(nativeConfig,"workloads"),member.workload()));
+                nativeConfig.put("workloads",workloads);document.put("native",nativeConfig);
+                source=SourceSchema.of(selection.benchmark(),source.source(),nativeConfig);
+            }
             var parameters=selection.benchmark().equals("hybench")?HybenchParameters.read(source.source(),nativeConfig):Map.<String,Object>of();
             var baselineRows=parameters.isEmpty()?ScaleInspector.nativeRows(root,document):HybenchParameters.rows(parameters);
             Path client=root.resolve(string(nativeConfig,"build_directory")).toRealPath();
@@ -90,7 +122,7 @@ public final class Generation {
             var identity=NativeBuildCheck.verify(root,selection.benchmark(),source.source(),client,source.sourceCommit());
             inputs.add(new Input(selection,document,source,client,output,identity,Map.copyOf(baselineRows),parameters));
         }
-        return new Plan(root,runtime,Map.copyOf(engines),List.copyOf(inputs));
+        return new Plan(root,runtime,Map.copyOf(engines),List.copyOf(inputs),List.copyOf(selections));
     }
 
     static Path outputDirectory(Path root,String configured) throws IOException {
@@ -98,11 +130,23 @@ public final class Generation {
         require(output.startsWith(root.resolve("results/capture"))&&!output.equals(root.resolve("results/capture")),
                 "Generation output must be under results/capture");
         require(!Files.exists(output,java.nio.file.LinkOption.NOFOLLOW_LINKS),"Generation output already exists: "+output);
-        Path ancestor=output.getParent();
-        while(!Files.exists(ancestor,java.nio.file.LinkOption.NOFOLLOW_LINKS))ancestor=ancestor.getParent();
+        Path ancestor=existingAncestor(output.getParent());
         output=ancestor.toRealPath().resolve(ancestor.relativize(output)).normalize();
         require(output.startsWith(root.resolve("results/capture")),"Generation output escapes results/capture");
         return output;
+    }
+
+    static Path freshDirectory(Path path)throws IOException {
+        path=path.toAbsolutePath().normalize();
+        require(!Files.exists(path,java.nio.file.LinkOption.NOFOLLOW_LINKS),"Output already exists: "+path);
+        Path parent=existingAncestor(path.getParent());
+        return parent.toRealPath().resolve(parent.relativize(path)).normalize();
+    }
+
+    private static Path existingAncestor(Path parent) {
+        while(parent!=null&&!Files.exists(parent,java.nio.file.LinkOption.NOFOLLOW_LINKS))parent=parent.getParent();
+        require(parent!=null&&Files.isDirectory(parent),"Invalid output parent");
+        return parent;
     }
 
     static boolean secondaryIndexes(Map<String,Object> document) {
@@ -192,8 +236,42 @@ public final class Generation {
             case DUCKDB -> reports.add(generate(plan,input));
             case PIXELS -> throw new IllegalArgumentException("Use generate-pixels for PG-to-Pixels generation");
             }
+            for(var selection:plan.selections()) {
+                if(!selection.generate()||!selection.benchmark().equals(input.selection().benchmark()))continue;
+                Path source=input.output();
+                if(selection.benchmark().equals("ycsb"))source=source.resolve(selection.workload());
+                persist(plan,selection,source);
+            }
         }
         return List.copyOf(reports);
+    }
+
+    static void persist(Plan plan,BenchmarkSelection selection,Path source)throws Exception {
+        Path destination=freshDirectory(selection.directory());
+        org.sibench.trace.TraceManifest.read(source.resolve("trace"));
+        var receipt=new LinkedHashMap<String,Object>();
+        receipt.put("benchmark",selection.name());receipt.put("workload",selection.workload());
+        receipt.put("directory",destination.toString());receipt.put("manifest_sha256",Digests.sha256(source.resolve("trace/manifest.json")));
+        receipt.put("local_trace_published",false);
+        try {
+            Files.createDirectories(destination.getParent());
+            // shortcut: same-filesystem publication; add copying only when cross-filesystem output is needed.
+            Files.move(source.resolve("trace"),destination);
+            receipt.put("local_trace_published",true);
+            if(selection.upload()!=null) {
+                receipt.put("upload_path",selection.upload());
+                try(var store=new InputStore(org.sibench.config.ObjectStore.of(plan.runtime(),selection.upload()))) {
+                    receipt.put("upload",store.publish(destination));
+                }
+            }
+        }catch(Exception failure) {
+            receipt.put("status","failed");receipt.put("error",failure.toString());
+            try{json(source.resolve("trace-publication.json"),receipt);}
+            catch(IOException diagnostic){failure.addSuppressed(diagnostic);}
+            throw failure;
+        }
+        receipt.put("status","complete");
+        json(source.resolve("trace-publication.json"),receipt);
     }
 
     private static Map<String,Object> generate(Plan plan,Input input)throws Exception {
@@ -297,7 +375,7 @@ public final class Generation {
             timings.put("native_close_seconds",seconds(closeStart));
             var manifest=publishThenDiscard(draft::publish,out.resolve("data"),timings);
             timings.put("total_seconds",seconds(started));
-            json(out.resolve("result.json"),Map.of("status","complete","trace",out.resolve("trace").toString(),"timings",timings));
+            json(out.resolve("result.json"),Map.of("status","complete","trace",input.selection().directory().toString(),"timings",timings));
             return manifest;
         }catch(Exception|Error failure) {
             primaryFailure=failure;
@@ -318,7 +396,9 @@ public final class Generation {
         trace.put("secondary_indexes",secondaryIndexes(input.document()));
         benchmark.put("trace",trace);
         return Map.of("runtime",plan.runtime(),"engine_settings",plan.engines().get(input.selection().engine()).settings(),
-                "benchmark",benchmark,"mode",input.selection().mode(),"engine",input.selection().engine());
+                "benchmark",benchmark,"mode",input.selection().mode(),"engine",input.selection().engine(),
+                "selection",Map.of("name",input.selection().name(),"workload",input.selection().workload(),
+                        "trace_directory",input.selection().directory().toString()));
     }
 
     private static double seconds(long start){return (System.nanoTime()-start)/1e9;}

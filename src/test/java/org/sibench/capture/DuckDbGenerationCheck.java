@@ -34,7 +34,7 @@ public class DuckDbGenerationCheck {
         Files.writeString(engine,yaml.dump(Map.of("schema_version",1,"purpose","engine","engine","duckdb",
                 "build_directory",Path.of(host).getParent().toString(),"memory_limit","1GiB","threads",2)));
         Files.writeString(runtime,yaml.dump(Map.of("schema_version",1,"purpose","sibench",
-                "benchmarks",List.of(Map.of("config",profile.toString(),"mode","capture","engine","duckdb")),
+                "benchmarks",Map.of("sysbench",org.sibench.config.BenchmarkFixtures.entry(profile,"capture","duckdb",output.resolve("trace"))),
                 "engines",Map.of("duckdb",engine.toString()))));
         var result=Generation.run(root,runtime).get(0);
         var budget=object(object(result,"source_evidence"),"request_budget");
@@ -47,7 +47,7 @@ public class DuckDbGenerationCheck {
         assertTrue(((Number)query.get("effective_requests")).longValue()>0);
         assertTrue(((Number)query.get("target_requests")).longValue()>0);
         assertTrue(Files.isDirectory(output.resolve("generated/workload/oltp_point_select/batch-0")));
-        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
+        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),
                 new ReplayConfig(false,0,0,0,0,"operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
         assertFalse(Files.exists(output.resolve("generated/data")));
     }
@@ -57,7 +57,7 @@ public class DuckDbGenerationCheck {
         Files.createDirectories(root.resolve("results/capture"));
         Path output=retained==null?Files.createTempDirectory(root.resolve("results/capture"),"generation-"):Files.createDirectory(Path.of(retained));
         assertTrue(output.startsWith(root.resolve("results/capture")));
-        var selections=new java.util.ArrayList<Map<String,String>>();
+        var selections=new java.util.LinkedHashMap<String,Object>();
         for(String benchmark:List.of("sysbench","hybench")) {
             var document=DuckDbGenerationTest.profile(benchmark);var n=object(document,"native");
             String build=System.getProperty("sibench."+benchmark+".build");assertNotNull("Set the "+benchmark+" build",build);
@@ -80,7 +80,7 @@ public class DuckDbGenerationCheck {
             document.put("trace",Map.of("secondary_indexes",false,"workload_requests",1000));
             document.put("artifacts",Map.of("directory",root.relativize(output.resolve(benchmark)).toString()));
             Path profile=output.resolve(benchmark+".yaml");Files.writeString(profile,new Yaml().dump(document));
-            selections.add(Map.of("config",profile.toString(),"engine","duckdb","mode","capture"));
+            selections.put(benchmark,org.sibench.config.BenchmarkFixtures.entry(profile,"capture","duckdb",output.resolve("traces").resolve(benchmark)));
         }
         Files.writeString(output.resolve("unselected.yaml"),"invalid unselected profile: [");
         String host=System.getProperty("sibench.duckdb.host");assertNotNull("Set sibench.duckdb.host",host);
@@ -90,7 +90,8 @@ public class DuckDbGenerationCheck {
         var runtime=new LinkedHashMap<String,Object>(Map.of("schema_version",1,"purpose","sibench","benchmarks",selections,
                 "engines",Map.of("duckdb",engine.toString())));
         Path config=output.resolve("runtime.yaml");
-        var invalid=new LinkedHashMap<>(runtime);invalid.put("benchmarks",List.of(selections.get(0),Map.of("config",selections.get(1).get("config"),"engine","duckdb","mode","api")));
+        var invalid=new LinkedHashMap<>(runtime);
+        var invalidEntries=new LinkedHashMap<>(selections);var bad=object(selections,"hybench");bad.put("mode","api");invalidEntries.put("hybench",bad);invalid.put("benchmarks",invalidEntries);
         Files.writeString(config,new Yaml().dump(invalid));
         assertThrows(IllegalArgumentException.class,()->Generation.run(root,config));
         assertFalse(Files.exists(output.resolve("sysbench")));assertFalse(Files.exists(output.resolve("hybench")));
@@ -105,7 +106,7 @@ public class DuckDbGenerationCheck {
         var moved=Files.createDirectory(output.resolve("relocated"));
         for(String benchmark:List.of("sysbench","hybench")) {
             var directory=output.resolve(benchmark);
-            var trace=Files.move(directory.resolve("trace"),moved.resolve(benchmark));
+            var trace=Files.move(output.resolve("traces").resolve(benchmark),moved.resolve(benchmark));
             assertEquals("passed",org.sibench.replay.ReferenceReplay.run(trace,
                     new ReplayConfig(false,0,0,0,0, "operation", 1, 4096, 60, 1),directory.resolve("reference.json")).get("status"));
             assertFalse(Files.exists(directory.resolve("data")));

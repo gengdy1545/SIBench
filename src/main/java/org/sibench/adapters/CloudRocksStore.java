@@ -16,14 +16,15 @@ final class CloudRocksStore implements OrderedStore {
     private static boolean loaded;
 
     private final long handle;
-    private final String bucket, objectPath;
+    private final String bucket, objectPath, location;
     private final boolean wal;
     private boolean closed;
 
-    private CloudRocksStore(long handle, String bucket, String objectPath, boolean wal) {
+    private CloudRocksStore(long handle, String bucket, String objectPath, String location, boolean wal) {
         this.handle = handle;
         this.bucket = bucket;
         this.objectPath = objectPath;
+        this.location = location;
         this.wal = wal;
     }
 
@@ -66,7 +67,7 @@ final class CloudRocksStore implements OrderedStore {
                         store.sessionToken(),
                         create,
                         wal);
-        var opened = new CloudRocksStore(handle, store.bucket(), store.objectPath(), wal);
+        var opened = new CloudRocksStore(handle, store.bucket(), store.objectPath(), store.location(), wal);
         try {
             opened.objectRequests();
         } catch (IOException error) {
@@ -87,7 +88,7 @@ final class CloudRocksStore implements OrderedStore {
 
     @Override
     public String location() {
-        return "s3://" + bucket + "/" + objectPath;
+        return location;
     }
 
     @Override

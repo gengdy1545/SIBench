@@ -12,15 +12,13 @@ import org.sibench.config.ObjectStore;
 public class InputStoreCheck {
     @Test public void remoteRoundTripPreservesThePublishedInput() throws Exception {
         String configuration = System.getProperty("sibench.storage.config");
-        String profile = System.getProperty("sibench.storage.profile");
-        String prefix = System.getProperty("sibench.storage.prefix");
+        String prefix = System.getProperty("sibench.storage.uri");
         assertNotNull("Set sibench.storage.config", configuration);
-        assertNotNull("Set sibench.storage.profile", profile);
-        assertNotNull("Set a fresh sibench.storage.prefix", prefix);
+        assertNotNull("Set a fresh sibench.storage.uri", prefix);
         Path work = Files.createTempDirectory(Path.of("results/capture"), "input-store-check-");
         var input = CsvInputTest.fixture(Files.createDirectory(work.resolve("source")));
         var original = CsvInput.open(input.output());
-        var settings = ObjectStore.of(Path.of(configuration), profile, prefix);
+        var settings = ObjectStore.of(Path.of(configuration), prefix);
         long started = System.nanoTime();
         try (var store = new InputStore(settings)) {
             var receipt = store.publish(input.output());

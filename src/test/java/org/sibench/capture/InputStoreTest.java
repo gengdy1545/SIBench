@@ -20,7 +20,110 @@ public class InputStoreTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
     private final Map<String, byte[]> objects = new HashMap<>();
     private java.util.function.Consumer<String> beforeHead = key -> {};
+    private java.util.function.Consumer<String> afterGet = key -> {};
     private int uploads;
+
+    static Path traceFixture(Path directory) throws Exception {
+        Files.createDirectories(directory);
+        var manifest = new com.google.gson.JsonObject();
+        manifest.addProperty("output", "proto");
+        manifest.add("value_kinds", new com.google.gson.Gson().toJsonTree(java.util.List.of("row_id")));
+        for (String count : java.util.List.of("baseline_rows", "source_work_units", "baseline_operations", "workload_operations", "last_resolved_version"))
+            manifest.addProperty(count, 0);
+        var streams = new com.google.gson.JsonObject();
+        for (String stream : java.util.List.of("baseline", "workload")) {
+            var writer = new ProtoTrace.Writer(directory.resolve(stream + ".pb.zst"), false);
+            writer.close();
+            var files = new com.google.gson.Gson().toJsonTree(java.util.List.of(ProtoTrace.file(stream + ".pb.zst", writer))).getAsJsonArray();
+            streams.add(stream, files); manifest.addProperty(stream + "_trace_sha256", ProtoTrace.identity(files));
+        }
+        manifest.add("proto_files", streams);
+        try (var units = new com.github.luben.zstd.ZstdOutputStream(Files.newOutputStream(directory.resolve(WorkUnits.FILE)))) { }
+        manifest.addProperty("work_units_sha256", java.util.HexFormat.of().formatHex(org.sibench.config.Digests.digest().digest(new byte[0])));
+        Files.writeString(directory.resolve("manifest.json"), manifest.toString());
+        return directory;
+    }
+
+    @Test public void traceRoundTripPreservesEveryByteAndRejectsIncompleteSources() throws Exception {
+        Path trace = traceFixture(temporary.getRoot().toPath().resolve("trace"));
+        try (var store = store()) {
+            var receipt = store.publish(trace);
+            Path restored = temporary.getRoot().toPath().resolve("restored-trace");
+            store.fetch(receipt.get("manifest_sha256").toString(), restored);
+            try (var files = Files.list(trace)) {
+                for (Path file : files.toList()) assertArrayEquals(Files.readAllBytes(file), Files.readAllBytes(restored.resolve(file.getFileName())));
+            }
+            Files.writeString(trace.resolve("INCOMPLETE"), "not published");
+            assertThrows(java.io.IOException.class, () -> store.publish(trace));
+        }
+    }
+
+    @Test public void tracePublicationDetectsSameSizeRemoteCorruptionBeforePublishingInventory() throws Exception {
+        Path trace = traceFixture(temporary.getRoot().toPath().resolve("trace"));
+        beforeHead = key -> {
+            if (objects.containsKey(key)) {
+                byte[] corrupted = objects.get(key).clone(); corrupted[0] ^= 1; objects.put(key, corrupted);
+            }
+        };
+        try (var store = store()) {
+            // Empty baseline/workload payloads share a digest; the second reference sees corrupt bytes.
+            assertTrue(assertThrows(java.io.IOException.class, () -> store.publish(trace)).getMessage().contains("Remote readback"));
+            assertTrue(objects.keySet().stream().noneMatch(key -> key.startsWith("inputs/manifests/")));
+        }
+    }
+
+    @Test public void tracePublicationRejectsChangedWorkUnitBytes() throws Exception {
+        Path trace = traceFixture(temporary.getRoot().toPath().resolve("trace"));
+        try (var units = new com.github.luben.zstd.ZstdOutputStream(Files.newOutputStream(trace.resolve(WorkUnits.FILE)))) {
+            units.write("wrong source events".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+        try (var store = store()) {
+            assertTrue(assertThrows(java.io.IOException.class, () -> store.publish(trace)).getMessage().contains("work-unit digest"));
+            assertTrue(objects.isEmpty());
+        }
+    }
+
+    @Test public void traceInventoryCannotSubstitutePayloadBytesOrSizes() throws Exception {
+        Path trace = traceFixture(temporary.getRoot().toPath().resolve("trace"));
+        try (var store = store()) {
+            var receipt = store.publish(trace);
+            for (boolean resize : new boolean[] {false, true}) {
+                var inventory = com.google.gson.JsonParser.parseString(new String(objects.get("inputs/manifests/"
+                        + receipt.get("manifest_sha256") + ".json"), java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();
+                var manifest = com.google.gson.JsonParser.parseString(Files.readString(trace.resolve("manifest.json"))).getAsJsonObject();
+                var payload = manifest.getAsJsonObject("proto_files").getAsJsonArray("workload").get(0).getAsJsonObject();
+                if (resize) payload.addProperty("bytes", payload.get("bytes").getAsLong() + 1);
+                else payload.addProperty("sha256", "0".repeat(64));
+                byte[] changed = manifest.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                String sha = java.util.HexFormat.of().formatHex(org.sibench.config.Digests.digest().digest(changed));
+                objects.put("inputs/objects/" + sha, changed);
+                for (var item : inventory.getAsJsonArray("files")) {
+                    var entry = item.getAsJsonObject();
+                    if (!entry.get("path").getAsString().equals("manifest.json")) continue;
+                    entry.addProperty("sha256", sha); entry.addProperty("bytes", changed.length);
+                }
+                byte[] bytes = inventory.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                String identity = java.util.HexFormat.of().formatHex(org.sibench.config.Digests.digest().digest(bytes));
+                objects.put("inputs/manifests/" + identity + ".json", bytes);
+                Path output = temporary.getRoot().toPath().resolve("substituted-" + resize);
+                assertTrue(assertThrows(java.io.IOException.class, () -> store.fetch(identity, output))
+                        .getMessage().contains("binds"));
+                assertFalse(Files.exists(output.resolve("manifest.json")));
+            }
+        }
+    }
+
+    @Test public void fetchKeepsTheManifestHiddenUntilValidationFinishes() throws Exception {
+        Path trace = traceFixture(temporary.getRoot().toPath().resolve("trace"));
+        Path output = temporary.getRoot().toPath().resolve("download");
+        try (var store = store()) {
+            var receipt = store.publish(trace);
+            afterGet = key -> assertFalse("Download exposed its manifest during validation", Files.exists(output.resolve("manifest.json")));
+            store.fetch(receipt.get("manifest_sha256").toString(), output);
+            assertTrue(Files.isRegularFile(output.resolve("manifest.json")));
+            try (var files = Files.list(output)) { assertEquals(4, files.count()); }
+        }
+    }
 
     @Test public void publishesContentOnceAndRestoresAVerifiedIndependentInput() throws Exception {
         var input = CsvInputTest.fixture(temporary.newFolder("source").toPath());
@@ -202,10 +305,13 @@ public class InputStoreTest {
                         yield PutObjectResponse.builder().eTag("test").build();
                     }
                     case "getObject" -> {
-                        byte[] data = objects.get(((GetObjectRequest) args[0]).key());
+                        String key = ((GetObjectRequest) args[0]).key();
+                        byte[] data = objects.get(key);
                         if (data == null) throw NoSuchKeyException.builder().statusCode(404).message("missing").build();
                         yield new ResponseInputStream<>(GetObjectResponse.builder().contentLength((long) data.length).build(),
-                                AbortableInputStream.create(new ByteArrayInputStream(data)));
+                                AbortableInputStream.create(new ByteArrayInputStream(data) {
+                                    @Override public void close() { afterGet.accept(key); }
+                                }));
                     }
                     default -> throw new AssertionError("Unexpected object-store call: " + method);
                 });

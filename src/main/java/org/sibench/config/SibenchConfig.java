@@ -23,7 +23,8 @@ public final class SibenchConfig {
         require(string(document, "purpose").equals("sibench"), "Expected sibench purpose");
         for (String key : document.keySet())
             require(Set.of("schema_version", "purpose", "target", "replay",
-                    "analysis", "benchmarks", "engines", "pixels_experiment").contains(key), "Unknown SIBench option: " + key);
+                    "analysis", "benchmarks", "engines", "pixels_experiment", "object_storage").contains(key), "Unknown SIBench option: " + key);
+        if (document.containsKey("object_storage")) ObjectStore.validate(object(document, "object_storage"));
         if (document.containsKey("benchmarks")) BenchmarkSelection.validate(document.get("benchmarks"));
         if (document.containsKey("engines")) {
             var engines = object(document, "engines");
@@ -56,7 +57,7 @@ public final class SibenchConfig {
                 new org.sibench.generation.RocksDbRows.Settings(positive(settings, "cache_bytes"),
                         positive(settings, "write_buffer_bytes"), Math.toIntExact(positive(settings, "background_jobs")));
             }
-            case PIXELS -> settings = new java.util.LinkedHashMap<>(PixelsConfig.read(file.getParent(), settings));
+            case PIXELS -> settings = new java.util.LinkedHashMap<>(PixelsConfig.read(file.getParent(), settings, runtime));
         }
         return java.util.Collections.unmodifiableMap(settings);
     }
