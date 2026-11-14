@@ -80,7 +80,9 @@ public class DuckDbGenerationCheck {
             document.put("trace",Map.of("secondary_indexes",false,"workload_requests",1000));
             document.put("artifacts",Map.of("directory",root.relativize(output.resolve(benchmark)).toString()));
             Path profile=output.resolve(benchmark+".yaml");Files.writeString(profile,new Yaml().dump(document));
-            selections.put(benchmark,org.sibench.config.BenchmarkFixtures.entry(profile,"capture","duckdb",output.resolve("traces").resolve(benchmark)));
+            var entry=org.sibench.config.BenchmarkFixtures.entry(profile,"capture","duckdb",output.resolve("traces").resolve(benchmark));
+            if(benchmark.equals("hybench"))entry.put("workload","xp");
+            selections.put(benchmark,entry);
         }
         Files.writeString(output.resolve("unselected.yaml"),"invalid unselected profile: [");
         String host=System.getProperty("sibench.duckdb.host");assertNotNull("Set sibench.duckdb.host",host);
@@ -106,6 +108,7 @@ public class DuckDbGenerationCheck {
         var moved=Files.createDirectory(output.resolve("relocated"));
         for(String benchmark:List.of("sysbench","hybench")) {
             var directory=output.resolve(benchmark);
+            if(benchmark.equals("hybench"))directory=directory.resolve("xp");
             var trace=Files.move(output.resolve("traces").resolve(benchmark),moved.resolve(benchmark));
             assertEquals("passed",org.sibench.replay.ReferenceReplay.run(trace,
                     new ReplayConfig(false,0,0,0,0, "operation", 1, 4096, 60, 1),directory.resolve("reference.json")).get("status"));

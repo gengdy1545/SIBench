@@ -45,7 +45,7 @@ public class PostgresGenerationCheck {
                 new org.sibench.replay.ReplayConfig(true,0,0,0,0, "operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
         assertFalse(Files.exists(output.resolve("generated/database/data")));
     }
-    @Test(timeout=180000) public void hybenchXpCapturesIqAtAndTransactionLocalReads() throws Exception {
+    @Test(timeout=360000) public void hybenchTpAndXpPublishIndependentTracesAndReplay() throws Exception {
         Path root=Path.of("").toRealPath();
         Path output=Files.createTempDirectory(root.resolve("results/capture"),"hybench-query-stages-");
         Path configuration=settings(root,output);
@@ -60,17 +60,33 @@ public class PostgresGenerationCheck {
         document.put("trace",Map.of("secondary_indexes",true));
         document.put("artifacts",Map.of("directory",root.relativize(output.resolve("generated")).toString()));
         Files.writeString(output.resolve("profile.yaml"),new org.yaml.snakeyaml.Yaml().dump(document));
-        var result=Generation.run(root,configuration).get(0);
-        assertEquals(8706L,result.get("baseline_rows"));
-        var coverage=object(result,"query_coverage");
-        for(int i=1;i<=6;i++)assertTrue(((Number)object(object(coverage,"iq"),"IQ-"+i).get("successful_queries")).longValue()>0);
-        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),
-                new org.sibench.replay.ReplayConfig(true,0,0,0,0, "operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
-        assertFalse(Files.exists(output.resolve("generated/database/data")));
-        var properties=new java.util.Properties();
-        try(var file=Files.newInputStream(output.resolve("generated/xp/batch-0/resolved.props"))){properties.load(file);}
-        assertEquals("1",properties.getProperty("xapclient"));
-        assertEquals("1",properties.getProperty("xtpclient"));
+        var runtime=parse(Files.readString(configuration));var selections=new LinkedHashMap<String,Object>();
+        for(String phase:java.util.List.of("tp","xp"))selections.put("hybench-"+phase,
+                org.sibench.config.BenchmarkFixtures.entry(output.resolve("profile.yaml"),"capture","postgres",
+                        output.resolve("traces/hybench-"+phase),phase));
+        runtime.put("benchmarks",selections);
+        Files.writeString(configuration,new org.yaml.snakeyaml.Yaml().dump(runtime));
+        var results=Generation.run(root,configuration);assertEquals(2,results.size());
+        for(int index=0;index<2;index++) {
+            String phase=index==0?"tp":"xp";var result=results.get(index);
+            assertEquals(8706L,result.get("baseline_rows"));
+            var stages=object(object(result,"source_evidence"),"stages");
+            assertEquals(java.util.Set.of(phase),stages.keySet());
+            var batch=(Map<String,Object>)((java.util.List<?>)stages.get(phase)).get(0);
+            var counts=object(object(batch,"client"),phase);
+            assertEquals(phase.equals("tp")?18:12,counts.size());
+            for(var count:counts.values())assertTrue(((Number)count).longValue()>0);
+            var coverage=object(result,"query_coverage");
+            for(int i=1;i<=6;i++)assertEquals(phase.equals("xp"),
+                    ((Number)object(object(coverage,"iq"),"IQ-"+i).get("successful_queries")).longValue()>0);
+            Path generated=output.resolve("generated").resolve(phase);
+            assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("traces/hybench-"+phase),
+                    new org.sibench.replay.ReplayConfig(true,0,0,0,0, "operation", 1, 4096, 60, 1),generated.resolve("reference.json")).get("status"));
+            assertFalse(Files.exists(generated.resolve("database/data")));
+            var properties=new java.util.Properties();
+            try(var file=Files.newInputStream(generated.resolve(phase+"/batch-0/resolved.props"))){properties.load(file);}
+            assertEquals(phase,properties.getProperty("sibench.phase"));
+        }
     }
     private void sharedOutputBudget() throws Exception {
         Path root=Path.of("").toRealPath();

@@ -96,4 +96,25 @@ public class BenchmarkSelectionTest {
         assertTrue(assertThrows(IllegalArgumentException.class, () -> BenchmarkSelection.read(root, runtime(Map.of("a", entry("unknown.yaml", "api", "rocksdb", "a")))))
                 .getMessage().contains("Unsupported benchmark"));
     }
+
+    @Test public void hybenchSelectsIndependentTpAndXpAndRejectsAmbiguousOrDuplicateModes() throws Exception {
+        var root = temporary.getRoot().toPath();
+        Files.writeString(root.resolve("hybench.yaml"), "benchmark: hybench\n");
+        var tp = entry("hybench.yaml", "capture", "postgres", "hybench-tp"); tp.put("workload", "tp");
+        var xp = entry("hybench.yaml", "capture", "postgres", "hybench-xp"); xp.put("workload", "xp");
+        var entries = new LinkedHashMap<String, Object>(); entries.put("hybench-tp", tp); entries.put("hybench-xp", xp);
+        var selected = BenchmarkSelection.read(root, runtime(entries));
+        assertEquals(List.of("tp", "xp"), selected.stream().map(BenchmarkSelection::workload).toList());
+        assertEquals(selected.get(0).config(), selected.get(1).config());
+        assertNotEquals(selected.get(0).directory(), selected.get(1).directory());
+        xp.put("workload", "tp");
+        assertTrue(assertThrows(IllegalArgumentException.class, () -> BenchmarkSelection.read(root, runtime(entries)))
+                .getMessage().contains("Duplicate benchmark workload"));
+        xp.put("workload", "at");
+        assertTrue(assertThrows(IllegalArgumentException.class, () -> BenchmarkSelection.read(root, runtime(entries)))
+                .getMessage().contains("Unknown workload"));
+        xp.remove("workload");
+        assertTrue(assertThrows(IllegalArgumentException.class, () -> BenchmarkSelection.read(root, runtime(entries)))
+                .getMessage().contains("Select one workload"));
+    }
 }

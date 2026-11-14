@@ -34,16 +34,28 @@ object_storage:
     secret_key_env: COS_SECRET_KEY
     session_token_env: COS_SESSION_TOKEN
 benchmarks:
-  hybench:
+  hybench-tp:
     config: config/benchmark/hybench.yaml
     mode: capture
     engine: postgres
+    workload: tp
     trace:
       generate: true
-      directory: results/traces/hybench
+      directory: results/traces/hybench-tp
       upload:
         enabled: false
-        # path: cos://YOUR-BUCKET/sibench/traces/hybench/
+        # path: cos://YOUR-BUCKET/sibench/traces/hybench-tp/
+  hybench-xp:
+    config: config/benchmark/hybench.yaml
+    mode: capture
+    engine: postgres
+    workload: xp
+    trace:
+      generate: true
+      directory: results/traces/hybench-xp
+      upload:
+        enabled: false
+        # path: cos://YOUR-BUCKET/sibench/traces/hybench-xp/
   sysbench:
     config: config/benchmark/sysbench.yaml
     mode: capture

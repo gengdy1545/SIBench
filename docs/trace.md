@@ -4,7 +4,7 @@ A Trace is an immutable baseline and workload for isolated index replay. Native 
 
 ## Selection and storage
 
-`config/sibench.yaml` owns named benchmark entries and object-storage connections. Each entry references one source configuration and engine; YCSB entries also select one `workload` from that configuration. Scale and workload parameters remain in `config/benchmark/`. A sysbench entry without `workload` retains the source configuration's complete sequence of workloads.
+`config/sibench.yaml` owns named benchmark entries and object-storage connections. Each entry references one source configuration and engine. HyBench entries explicitly select `workload: tp` or `workload: xp`; YCSB entries select one workload from their shared source configuration. Scale and workload parameters remain in `config/benchmark/`. A sysbench entry without `workload` retains the source configuration's complete sequence of workloads.
 
 ```yaml
 benchmarks:
@@ -55,6 +55,8 @@ Every catalog table must have baseline entries unless declared in `empty_baselin
 `trace.workload_requests` targets effective requests after projection: writes and individual read members, excluding baseline and transaction markers. Every selected workload receives its budget; admitted work drains and may exceed it. No-progress batches fail. Without a target, each configured stage runs once. `request-budget.json` records counts and overshoot.
 
 YCSB loads once, closes the database and restores identical files for each independent workload. `traces.json` indexes the resulting named persistent Trace locations. The initial-state identity binds files, seed and baseline; a workload never inherits another workload's mutations. Native block caches are fresh; OS caches are not cleared.
+
+HyBench publishes `hybench-tp` and `hybench-xp` independently from the same source configuration. TP runs the upstream TP-1–TP-18 transaction mix with `native.clients`; XP runs AT-1–AT-6 and IQ-1–IQ-6 with its explicit transaction/query client counts. TP includes read-only transactions and reads inside updates; it is not a write-only workload. Each selection generates and loads a fresh native database, with working state beneath `artifacts.directory/tp` or `artifacts.directory/xp`. The scale and schema match, but the unseeded upstream generator does not promise identical baseline contents. Inputs, effective settings and build identities are recorded for each run. Existing Trace destinations are rejected; validate replacements and switch consumers before deleting old payloads.
 
 ### Pixels host
 
@@ -143,7 +145,7 @@ Only clean pinned sources and supported schemas are accepted. Generation creates
 | --- | --- |
 | YCSB | UTF-8 keys, binary fields, one primary index; independent official A–F workloads. F remains separate Read and Update calls. |
 | sysbench | sbtest tables with id primary and k secondary indexes; configured supported scripts, including native conflict retries. |
-| HyBench native | Eight tables, eight primary and thirteen secondary indexes; XP runs AT/IQ. Native transaction conflicts roll back and continue; other SQL errors fail. |
+| HyBench native | Eight tables, eight primary and thirteen secondary indexes; TP runs TP-1–TP-18 and XP runs AT/IQ. Native transaction conflicts roll back and continue; other SQL errors fail. |
 | HyBench CDC | Same CSV baseline in uninstrumented PostgreSQL and Pixels; TP/AT only. One Pixels transaction per committed source transaction. SQL reads, read-only/aborted transactions and secondary indexes are outside the exported scope. |
 
 Native capture rejects primary-key assignments, including later-aborted attempts. Pixels rejects actual key changes but permits unchanged-key assignments. CDC requires FULL replica identity. Its index lookups must agree with each following change; write/commit, asynchronous sink or visibility failures prevent publication because Pixels cannot undo applied index entries.

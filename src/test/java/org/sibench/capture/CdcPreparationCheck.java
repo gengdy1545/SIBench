@@ -56,7 +56,7 @@ public class CdcPreparationCheck {
         }
         Files.writeString(engine, yaml.dump(pixels));
         Files.writeString(config, yaml.dump(Map.of("schema_version", 1, "purpose", "sibench",
-                "benchmarks", Map.of("hybench",org.sibench.config.BenchmarkFixtures.entry(benchmark,"capture","postgres",work.resolve("trace"))),
+                "benchmarks", Map.of("hybench",org.sibench.config.BenchmarkFixtures.entry(benchmark,"capture","postgres",work.resolve("trace"),"xp")),
                 "object_storage", parallel ? object(SibenchConfig.read(root.resolve(System.getProperty("sibench.storage.config"))), "object_storage") : Map.of(),
                 "engines", Map.of("pixels", engine.toString(), "rocksdb", "/unavailable/engine-config.yaml"))));
         var output = new java.io.ByteArrayOutputStream();var errors = new java.io.ByteArrayOutputStream();

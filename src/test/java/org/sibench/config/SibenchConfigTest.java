@@ -81,10 +81,10 @@ public class SibenchConfigTest {
         Path root = Path.of("").toAbsolutePath();
         var document = SibenchConfig.read(root.resolve("config/sibench.yaml"));
         var selected = BenchmarkSelection.read(root, document);
-        assertEquals(java.util.List.of("hybench", "sysbench", "ycsb-a", "ycsb-b", "ycsb-c", "ycsb-d", "ycsb-e", "ycsb-f"),
+        assertEquals(java.util.List.of("hybench-tp", "hybench-xp", "sysbench", "ycsb-a", "ycsb-b", "ycsb-c", "ycsb-d", "ycsb-e", "ycsb-f"),
                 selected.stream().map(BenchmarkSelection::name).toList());
         assertEquals(6, selected.stream().filter(s -> s.engine() == Engine.ROCKSDB).count());
-        assertEquals(2, selected.stream().filter(s -> s.engine() == Engine.POSTGRES).count());
+        assertEquals(3, selected.stream().filter(s -> s.engine() == Engine.POSTGRES).count());
         var postgres = SibenchConfig.engine(root, document, Engine.POSTGRES);
         assertEquals("build/services/postgres", ConfigValues.string(postgres, "build_directory"));
         SibenchConfig.postgresSettings(ConfigValues.object(postgres, "settings"));

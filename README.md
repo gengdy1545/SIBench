@@ -6,7 +6,7 @@ SIBench captures native benchmark index operations into reusable Traces and repl
 | --- | --- | --- |
 | YCSB | RocksDB (`api`) | A–F, each restored from the same initial files. |
 | sysbench | PostgreSQL or DuckDB (`capture`) | `oltp_read_write`. |
-| HyBench | PostgreSQL or DuckDB (`capture`) | XP with concurrent AT and IQ clients. |
+| HyBench | PostgreSQL or DuckDB (`capture`) | Separate TP (TP-1–TP-18) and XP (concurrent AT/IQ) Traces. TP includes reads. |
 | HyBench → Pixels | PostgreSQL → pixels-sink → Pixels (`cdc`) | TP/AT changes and Pixels primary-index calls; AP/IQ disabled. |
 
 ## Build
@@ -64,7 +64,7 @@ java -jar build/sibench/sibench.jar inspect-scale
 java -jar build/sibench/sibench.jar generate config/sibench.yaml
 ```
 
-`generate` runs entries with `trace.generate: true` and stops on failure. Each named entry (for example `ycsb-a`) owns its local `trace.directory` and optional upload URI in the runtime config. YCSB entries share one initial load and run their selected workloads independently. See [Trace selection and storage](docs/trace.md#selection-and-storage). For live PostgreSQL → Pixels capture, use `generate-pixels CONFIG` with a separate fresh output. There is no automatic engine fallback.
+`generate` runs entries with `trace.generate: true` and stops on failure. Each named entry (for example `hybench-tp`, `hybench-xp` or `ycsb-a`) owns its local `trace.directory` and optional upload URI in the runtime config. HyBench entries select `tp` or `xp` and each load a fresh database; YCSB entries share one initial load and run their selected workloads independently. See [Trace selection and storage](docs/trace.md#selection-and-storage). For live PostgreSQL → Pixels capture, use `generate-pixels CONFIG` with a separate fresh output. There is no automatic engine fallback.
 
 Successful runs publish after normal shutdown, then delete working databases. Failed runs retain diagnostics and cannot resume. Existing or overlapping outputs and mismatched source/build inputs are rejected. See [Trace](docs/trace.md) for visibility, index coverage and supported accesses.
 
@@ -91,7 +91,7 @@ RocksDB-Cloud and SlateDB are comparison targets. Local RocksDB supports generat
 
 ## Analysis
 
-Select benchmark names and labels in [graph/config/traces.json](graph/config/traces.json); their paths come from its runtime CONFIG. Then run:
+Set shared data paths in [global_config.py](graph/config/global_config.py) and select benchmark names and labels in each figure's configuration under `graph/config/`. Then run:
 
 ```bash
 python3 graph/scripts/trace/plot_operation_mix.py
@@ -103,7 +103,7 @@ See [plotting](graph/README.md) for dependencies, outputs and static update-layo
 
 ## Tests
 
-After building both embedded runtimes, run the default suites with Python 3.9+ and local socket access:
+After building both embedded runtimes and installing the [plotting dependencies and font](graph/README.md), run the default suites with Python 3.9+ and local socket access:
 
 ```bash
 mvn test

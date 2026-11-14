@@ -45,7 +45,7 @@ public class PixelsGenerationCheck {
         pixels.put("sink_properties", root.resolve("config/engine/pixels/pixels-sink.properties").toString());
         Files.writeString(engine, yaml.dump(pixels));
         Files.writeString(settings, yaml.dump(Map.of("schema_version", 1, "purpose", "sibench",
-                "benchmarks", Map.of("hybench", org.sibench.config.BenchmarkFixtures.entry(profile,"capture","postgres",output.resolve("trace"))),
+                "benchmarks", Map.of("hybench", org.sibench.config.BenchmarkFixtures.entry(profile,"capture","postgres",output.resolve("trace"),"xp")),
                 "engines", Map.of("pixels", engine.toString()))));
 
         var manifest = PixelsGeneration.run(root, settings);

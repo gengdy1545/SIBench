@@ -96,7 +96,10 @@ public final class Generation {
             Map<Engine,NativeBuild> engines,Path csvOutput)throws Exception {
         var inputs=new ArrayList<Input>();
         var groups=new LinkedHashMap<String,List<BenchmarkSelection>>();
-        for(var selection:selections)groups.computeIfAbsent(selection.benchmark(),ignored->new ArrayList<>()).add(selection);
+        for(var selection:selections) {
+            String group=selection.benchmark().equals("hybench")?"hybench:"+selection.workload():selection.benchmark();
+            groups.computeIfAbsent(group,ignored->new ArrayList<>()).add(selection);
+        }
         for(var group:groups.values()) {
             var selection=group.get(0);
             require(group.size()==1||selection.benchmark().equals("ycsb"),"Only YCSB supports multiple named workloads per source run");
@@ -117,7 +120,10 @@ public final class Generation {
             var parameters=selection.benchmark().equals("hybench")?HybenchParameters.read(source.source(),nativeConfig):Map.<String,Object>of();
             var baselineRows=parameters.isEmpty()?ScaleInspector.nativeRows(root,document):HybenchParameters.rows(parameters);
             Path client=root.resolve(string(nativeConfig,"build_directory")).toRealPath();
-            Path output=outputDirectory(root,csvOutput==null?string(object(document,"artifacts"),"directory"):csvOutput.toString());
+            String configured=string(object(document,"artifacts"),"directory");
+            if(selection.benchmark().equals("hybench")&&selection.mode()==Mode.CAPTURE)
+                configured=Path.of(configured).resolve(selection.workload()).toString();
+            Path output=outputDirectory(root,csvOutput==null?configured:csvOutput.toString());
             for(var previous:inputs)require(!output.startsWith(previous.output())&&!previous.output().startsWith(output),"Overlapping generation outputs");
             var identity=NativeBuildCheck.verify(root,selection.benchmark(),source.source(),client,source.sourceCommit());
             inputs.add(new Input(selection,document,source,client,output,identity,Map.copyOf(baselineRows),parameters));
@@ -156,10 +162,9 @@ public final class Generation {
         return bool(trace,"secondary_indexes");
     }
 
-    static List<String> workloads(Map<String,Object> document) {
-        String benchmark=string(document,"benchmark");
-        return benchmark.equals("hybench")?List.of("xp"):
-                List.copyOf(object(object(document,"native"),"workloads").keySet());
+    static List<String> workloads(Input input) {
+        return input.selection().benchmark().equals("hybench")?List.of(input.selection().workload()):
+                List.copyOf(object(input.nativeConfig(),"workloads").keySet());
     }
 
     static long requestTarget(Map<String,Object> document) {
@@ -238,6 +243,7 @@ public final class Generation {
             }
             for(var selection:plan.selections()) {
                 if(!selection.generate()||!selection.benchmark().equals(input.selection().benchmark()))continue;
+                if(selection.benchmark().equals("hybench")&&!selection.workload().equals(input.selection().workload()))continue;
                 Path source=input.output();
                 if(selection.benchmark().equals("ycsb"))source=source.resolve(selection.workload());
                 persist(plan,selection,source);
@@ -324,7 +330,7 @@ public final class Generation {
                     trace.baseline(database,expected);database.commit();database.setAutoCommit(true);
                     timings.put("baseline_indexes_seconds",seconds(baselineStart));long workloadStart=System.nanoTime();
                     boolean hybench=input.selection().benchmark().equals("hybench");
-                    var names=workloads(input.document());
+                    var names=workloads(input);
                     int remaining=names.size();
                     long rawPrefix=0;double projectionSeconds=0;
                     Path workloads=Files.createDirectory(out.resolve("workload"));

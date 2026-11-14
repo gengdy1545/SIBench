@@ -77,10 +77,10 @@ public record BenchmarkSelection(Path config, String benchmark, Mode mode, Engin
             String source = path + ":" + mode + ":" + engine;
             String previous = sources.putIfAbsent(benchmark, source);
             require(previous == null || previous.equals(source), "Conflicting source configurations for " + benchmark);
-            var workloads = benchmark.equals("hybench") ? Set.of("xp") : object(object(profile, "native"), "workloads").keySet();
-            require(!benchmark.equals("ycsb") || item.containsKey("workload") || workloads.size() == 1, "Select one workload for " + name);
+            var workloads = benchmark.equals("hybench") ? Set.of("tp", "xp") : object(object(profile, "native"), "workloads").keySet();
+            require(benchmark.equals("sysbench") || item.containsKey("workload") || workloads.size() == 1, "Select one workload for " + name);
             String workload = item.containsKey("workload") ? string(item, "workload")
-                    : benchmark.equals("hybench") ? "xp" : benchmark.equals("ycsb") ? workloads.iterator().next() : "";
+                    : benchmark.equals("sysbench") ? "" : workloads.iterator().next();
             require(workload.isEmpty() || workloads.contains(workload), "Unknown workload for " + name + ": " + workload);
             require(identities.add(benchmark + ":" + workload), "Duplicate benchmark workload: " + benchmark + "/" + workload);
             var trace = object(item, "trace"); var upload = object(trace, "upload");

@@ -129,7 +129,7 @@ public class PixelsExperimentCheck {
         // Baseline preparation takes its bound from the selected HyBench profile, as CDC preparation does.
         var runtime = Map.of("schema_version", 1, "purpose", "sibench",
                 "object_storage", object(org.sibench.config.SibenchConfig.read(root.resolve(storage)), "object_storage"), "engines", Map.of("pixels", engineConfig.toString()), "pixels_experiment", experiment,
-                "benchmarks", Map.of("hybench",org.sibench.config.BenchmarkFixtures.entry(Path.of("config/benchmark/hybench.yaml"),"capture","postgres",directory.resolve("trace"))));
+                "benchmarks", Map.of("hybench",org.sibench.config.BenchmarkFixtures.entry(Path.of("config/benchmark/hybench.yaml"),"capture","postgres",directory.resolve("trace"),"xp")));
         Path config = Files.writeString(directory.resolve("runtime.json"), gson.toJson(runtime));
         Path output = directory.resolve("run");
         Path baseline = baselines.get(input);

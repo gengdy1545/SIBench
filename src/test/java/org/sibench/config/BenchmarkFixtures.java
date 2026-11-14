@@ -12,4 +12,10 @@ public final class BenchmarkFixtures {
         return new LinkedHashMap<>(Map.of("config", config.toString(), "mode", mode, "engine", engine,
                 "trace", Map.of("generate", true, "directory", trace.toString(), "upload", Map.of("enabled", false))));
     }
+
+    public static Map<String, Object> entry(Path config, String mode, String engine, Path trace, String workload) {
+        var entry = entry(config, mode, engine, trace);
+        entry.put("workload", workload);
+        return entry;
+    }
 }

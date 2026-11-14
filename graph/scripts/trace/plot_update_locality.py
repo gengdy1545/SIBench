@@ -6,7 +6,9 @@ import json
 import pathlib
 import re
 
-from _common import STYLE, save_figure
+from _common import save_figure
+from graph.config import update_locality_config as style
+from graph.config.global_config import apply_style
 
 import matplotlib
 
@@ -32,7 +34,7 @@ def main() -> int:
     run = args.run_directory
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
-    plt.style.use(STYLE)
+    apply_style()
     summary = json.loads((run / "summary.json").read_text())
     windows = pd.read_csv(run / "windows.csv")
     heatmap = pd.read_csv(run / "heatmap.csv.gz", compression="gzip")
@@ -53,7 +55,7 @@ def main() -> int:
         )
         if pivot.empty:
             continue
-        fig, ax = plt.subplots(figsize=(11, max(3.2, 0.13 * len(pivot))))
+        fig, ax = plt.subplots(figsize=style.HEATMAP_FIGURE_SIZE)
         image = ax.imshow(
             pivot.to_numpy(),
             aspect="auto",
@@ -61,49 +63,43 @@ def main() -> int:
             interpolation="nearest",
             norm=LogNorm(vmin=1, vmax=max(2, int(pivot.to_numpy().max()))),
         )
-        ax.set_title(f"{name}: update count by window and ordered block bin")
-        ax.set_xlabel(f"block bin (0..{len(pivot.columns) - 1})")
-        ax.set_ylabel("business-change window")
-        fig.colorbar(image, ax=ax, label="modifications (log scale)")
-        fig.tight_layout()
+        ax.set_title(style.HEATMAP_TITLE.format(name=name))
+        ax.set_xlabel(style.HEATMAP_X_LABEL.format(last_bin=len(pivot.columns) - 1))
+        ax.set_ylabel(style.HEATMAP_Y_LABEL)
+        fig.colorbar(image, ax=ax, label=style.HEATMAP_COLORBAR_LABEL)
         save_figure(fig, out / f"heatmap-{safe(name)}")
         plt.close(fig)
 
     for (table, index), group in windows.groupby(["table", "index"], sort=True):
         name = names.get((int(table), int(index)), f"t{int(table)}-i{int(index)}")
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
-        for category, style in (("business", "-"), ("index", "--")):
+        fig, axes = plt.subplots(1, 2, figsize=style.COVERAGE_FIGURE_SIZE)
+        for category, line_style in style.COVERAGE_LINE_STYLES.items():
             part = group[group["category"] == category].sort_values("window")
             if part.empty:
                 continue
             axes[0].plot(
                 part["window"],
                 part["cumulative_block_ratio"],
-                style,
+                line_style,
                 label=f"{category} cumulative blocks",
             )
             axes[1].plot(
                 part["window"],
                 part["hit_blocks"] / part["blocks"].where(part["blocks"] > 0),
-                style,
+                line_style,
                 label=f"{category} window blocks",
             )
-        axes[0].set_title(f"{name}: cumulative block coverage")
-        axes[0].set_xlabel("window")
-        axes[0].set_ylabel("fraction of baseline blocks")
-        axes[0].set_ylim(0, 1.02)
-        axes[0].legend()
-        axes[1].set_title(f"{name}: blocks touched in each window")
-        axes[1].set_xlabel("window")
-        axes[1].set_ylabel("fraction of baseline blocks")
-        axes[1].set_ylim(0, 1.02)
-        axes[1].legend()
-        fig.tight_layout()
+        for ax, title in zip(axes, style.COVERAGE_TITLES):
+            ax.set_title(title.format(name=name))
+            ax.set_xlabel(style.COVERAGE_X_LABEL)
+            ax.set_ylabel(style.COVERAGE_Y_LABEL)
+            ax.set_ylim(style.COVERAGE_Y_LIMITS)
+            ax.legend(**style.COVERAGE_LEGEND_STYLE)
         save_figure(fig, out / f"coverage-{safe(name)}")
         plt.close(fig)
 
     # One compact source-wide comparison, independent of an index's absolute block count.
-    fig, ax = plt.subplots(figsize=(10, 4.5))
+    fig, ax = plt.subplots(figsize=style.BUSINESS_FIGURE_SIZE)
     for (table, index, category), part in windows.groupby(
         ["table", "index", "category"], sort=True
     ):
@@ -111,27 +107,25 @@ def main() -> int:
             continue
         name = names.get((int(table), int(index)), f"t{int(table)}-i{int(index)}")
         ax.plot(part["window"], part["cumulative_block_ratio"], label=name)
-    ax.set_title("Business changes: cumulative block coverage")
-    ax.set_xlabel("window")
-    ax.set_ylabel("fraction of baseline blocks")
-    ax.set_ylim(0, 1.02)
-    ax.legend(fontsize=7, ncol=2)
-    fig.tight_layout()
+    ax.set_title(style.BUSINESS_TITLE)
+    ax.set_xlabel(style.COVERAGE_X_LABEL)
+    ax.set_ylabel(style.COVERAGE_Y_LABEL)
+    ax.set_ylim(style.COVERAGE_Y_LIMITS)
+    ax.legend(**style.BUSINESS_LEGEND_STYLE)
     save_figure(fig, out / "business-coverage")
     plt.close(fig)
 
     if l0 is not None:
         for (table, index), part in l0.groupby(["table", "index"], sort=True):
             name = names.get((int(table), int(index)), f"t{int(table)}-i{int(index)}")
-            fig, ax = plt.subplots(figsize=(10, 3.8))
+            fig, ax = plt.subplots(figsize=style.L0_FIGURE_SIZE)
             ax.plot(part["batch"], part["hit_files"], label="files with actual hits")
             ax.plot(part["batch"], part["span_files"], label="files in min..max range")
             ax.plot(part["batch"], part["l1_files"], "--", label="all L1 files")
-            ax.set_title(f"{name}: assumed L0 file overlap with static L1")
-            ax.set_xlabel("assumed L0 batch")
-            ax.set_ylabel("files")
-            ax.legend(fontsize=8)
-            fig.tight_layout()
+            ax.set_title(style.L0_TITLE.format(name=name))
+            ax.set_xlabel(style.L0_X_LABEL)
+            ax.set_ylabel(style.L0_Y_LABEL)
+            ax.legend(**style.L0_LEGEND_STYLE)
             save_figure(fig, out / f"l0-overlap-{safe(name)}")
             plt.close(fig)
     return 0

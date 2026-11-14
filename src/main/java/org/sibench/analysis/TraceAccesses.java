@@ -10,8 +10,11 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -29,15 +32,17 @@ import org.sibench.config.Digests;
 import org.sibench.replay.ReplayConfig;
 import org.sibench.replay.ReplayInput;
 import org.sibench.state.ExternalSort;
+import org.sibench.state.ByteKeys;
 import org.sibench.state.SpillingMap;
 import org.sibench.trace.IndexEntry;
+import org.sibench.trace.IndexKey;
 import org.sibench.trace.TraceManifest;
 
 /** Exact returned-row locality in Trace request order, not physical engine I/O. */
 public final class TraceAccesses {
     private TraceAccesses() {}
 
-    public static void run(Path trace, Path output, long windowRequests, int bins, long sortBytes)
+    public static void run(Path trace, Path output, long windowRequests, long sortBytes)
             throws IOException {
         trace = trace.toRealPath();
         output = output.toAbsolutePath().normalize();
@@ -46,9 +51,11 @@ public final class TraceAccesses {
         output = ancestor.toRealPath().resolve(ancestor.relativize(output)).normalize();
         if (output.startsWith(trace) || trace.startsWith(output))
             throw new IOException("Analysis output must not overlap its Trace");
-        if (windowRequests < 1 || bins < 1 || bins > 1_000_000 || sortBytes < 1)
-            throw new IllegalArgumentException("Positive window/sort budgets and 1..1000000 PK bins required");
+        if (windowRequests < 1 || sortBytes < 1)
+            throw new IllegalArgumentException("Positive window and sort budgets required");
         var manifest = TraceManifest.read(trace);
+        var tables = IndexCatalog.fromManifest(manifest).definitions().stream()
+                .filter(d -> d.indexId() == 0).toList();
         String identity = Digests.sha256(trace.resolve("manifest.json"));
         TraceManifest.requireValue(trace, ValueKind.ROW_ID);
         var input = ReplayInput.prepare(trace,
@@ -60,16 +67,12 @@ public final class TraceAccesses {
         Path working = Files.createTempDirectory(workingRoot, "trace-accesses-");
         try {
             var result = analyze(input.baseline(), input.workload(), working, output,
-                    windowRequests, bins, sortBytes);
+                    tables, windowRequests, sortBytes);
             result.put("manifest_sha256", identity);
             result.put("baseline_trace_sha256", manifest.get("baseline_trace_sha256").getAsString());
             result.put("workload_trace_sha256", manifest.get("workload_trace_sha256").getAsString());
             result.put("baseline_rows", manifest.get("baseline_rows").getAsLong());
             result.put("secondary_index_coverage", manifest.get("secondary_index_coverage").getAsString());
-            var tables = IndexCatalog.fromManifest(manifest).definitions().stream()
-                    .filter(d -> d.indexId() == 0)
-                    .map(d -> Map.of("id", d.tableId(), "name", d.table())).toList();
-            result.put("table_names", tables);
             if (!identity.equals(Digests.sha256(trace.resolve("manifest.json"))))
                 throw new IOException("Trace manifest changed during analysis");
             var counts = (Map<?, ?>) result.get("operation_counts");
@@ -118,27 +121,25 @@ public final class TraceAccesses {
         return ByteBuffer.allocate(12).putInt(table).put(value.asReadOnlyByteBuffer()).array();
     }
 
-    private static void collect(Operation operation, ExternalSort keys) throws IOException {
-        if (operation.kind() == IndexOperationTrace.INSERT || IndexOperationTrace.isMutation(operation))
-            keys.add(primary(operation), operation.kind() == IndexOperationTrace.LOGICAL_DELETE
-                    ? new byte[0] : row(operation.table(), IndexEntry.rowId(operation.rowId())));
-        for (Operation local : operation.localWrites()) collect(local, keys);
+    private static void collect(Operation operation, ExternalSort rows) throws IOException {
+        if ((operation.kind() == IndexOperationTrace.INSERT || IndexOperationTrace.isMutation(operation))
+                && operation.kind() != IndexOperationTrace.LOGICAL_DELETE)
+            rows.add(row(operation.table(), IndexEntry.rowId(operation.rowId())), primary(operation));
+        for (Operation local : operation.localWrites()) collect(local, rows);
     }
 
     /** Analyzes baseline and workload sources that have already passed replay preflight. */
     static Map<String, Object> analyze(IndexOperationTrace.Source baseline,
             IndexOperationTrace.Source workload, Path working, Path output,
-            long windowRequests, int bins, long sortBytes) throws IOException {
+            List<IndexCatalog.Definition> tables, long windowRequests, long sortBytes) throws IOException {
         Files.createDirectories(working);
         Files.createDirectories(output);
         try (var backend = VersionedIndexBackend.create(working.resolve("index"), ValueKind.ROW_ID);
-                var keys = new ExternalSort(working.resolve("keys"), sortBytes);
                 var rowSort = new ExternalSort(working.resolve("rows"), sortBytes);
-                var primaryRanks = new SpillingMap(working.resolve("primary-ranks"), 65536, 8);
-                var rowRanks = new SpillingMap(working.resolve("row-ranks"), 65536, 8)) {
+                var rowKeys = new SpillingMap(working.resolve("row-keys"), 65536, 8)) {
             var writes = new ArrayList<Mutation>();
             var loader = records((request, views) -> {
-                for (var view : views) collect(view, keys);
+                for (var view : views) collect(view, rowSort);
                 if (request.hasPut()) writes.add(Mutation.newBuilder().setPut(request.getPut()).build());
                 if (request.hasDelete()) writes.add(Mutation.newBuilder().setDelete(request.getDelete()).build());
                 if (writes.size() >= 1024) { backend.writeBatch(writes); writes.clear(); }
@@ -146,46 +147,25 @@ public final class TraceAccesses {
             baseline.read(loader);
             workload.read(loader);
             backend.writeBatch(writes);
-            long count = 0;
-            var tables = new TreeMap<Integer, long[]>();
-            try (var sorted = keys.sorted(); var bulk = primaryRanks.bulk()) {
-                byte[] previous = null;
-                long rank = -1;
+            try (var sorted = rowSort.sorted(); var bulk = rowKeys.bulk()) {
+                byte[] previous = null, primary = null;
                 while (sorted.hasNext()) {
                     byte[] key = sorted.peekKey(), value = sorted.peekValue();
                     if (!Arrays.equals(previous, key)) {
-                        rank = count++;
-                        bulk.append(key, rank);
-                        int table = ByteBuffer.wrap(key).getInt();
-                        if (!tables.containsKey(table)) tables.put(table, new long[]{rank, 0});
-                        tables.get(table)[1]++;
-                        previous = key;
-                    }
-                    if (value.length != 0)
-                        rowSort.add(value, ByteBuffer.allocate(8).putLong(rank).array());
-                    sorted.advance();
-                }
-                bulk.finish();
-            }
-            try (var sorted = rowSort.sorted(); var bulk = rowRanks.bulk()) {
-                byte[] previous = null, rank = null;
-                while (sorted.hasNext()) {
-                    byte[] key = sorted.peekKey(), value = sorted.peekValue();
-                    if (!Arrays.equals(previous, key)) {
-                        bulk.append(key, value); previous = key; rank = value;
-                    } else if (!Arrays.equals(rank, value)) {
+                        bulk.append(key, value); previous = key; primary = value;
+                    } else if (!Arrays.equals(primary, value)) {
                         throw new IOException("One table/RowID maps to different primary keys");
                     }
                     sorted.advance();
                 }
                 bulk.finish();
             }
-            var hotRanks = new LinkedHashMap<ByteString, Long>(65536, 0.75f, true) {
-                @Override protected boolean removeEldestEntry(Map.Entry<ByteString, Long> eldest) {
+            var hotKeys = new LinkedHashMap<ByteString, byte[]>(65536, 0.75f, true) {
+                @Override protected boolean removeEldestEntry(Map.Entry<ByteString, byte[]> eldest) {
                     return size() > 65536;
                 }
             };
-            try (var density = new Density(output, windowRequests, bins, count)) {
+            try (var density = new Density(working, output, tables, windowRequests, sortBytes)) {
                 workload.read(records((request, views) -> {
                     if (request.hasReadGroup()) {
                         var group = request.getReadGroup();
@@ -193,7 +173,7 @@ public final class TraceAccesses {
                         try (var members = new SpillingMap(groupDirectory, 4096, 8)) {
                             for (int i = 0; i < group.getRequestsCount(); i++)
                                 read(backend, TraceRequests.read(group.getRequests(i)), views.get(i),
-                                        rowRanks, hotRanks, density, members, i);
+                                        rowKeys, hotKeys, density, members, i);
                             long combined = 0;
                             try (var entries = members.scan(null, null, false)) {
                                 while (entries.next()) {
@@ -207,20 +187,16 @@ public final class TraceAccesses {
                         if (Files.exists(groupDirectory)) removeWorking(groupDirectory);
                     } else if (request.hasGet() || request.hasScan()) {
                         long hits = read(backend, request.hasGet() ? request.getGet() : request.getScan(),
-                                views.get(0), rowRanks, hotRanks, density, null, 0);
+                                views.get(0), rowKeys, hotKeys, density, null, 0);
                         requireCount(hits, request.getMetadata().getExpectedCount());
                     } else {
                         int kind = request.hasPut() ? 2 : 3;
                         density.begin(kind);
-                        long rank = primaryRanks.get(primary(views.get(0)));
-                        density.hit(kind, rank);
+                        density.hit(kind, primary(views.get(0)));
                     }
                 }));
+                density.write();
                 var result = density.describe();
-                var ranges = new ArrayList<Map<String, Object>>();
-                for (var table : tables.entrySet())
-                    ranges.add(Map.of("table", table.getKey(), "start", table.getValue()[0], "keys", table.getValue()[1]));
-                result.put("tables", ranges);
                 result.put("sort_memory_bytes", sortBytes);
                 return result;
             }
@@ -228,26 +204,27 @@ public final class TraceAccesses {
     }
 
     private static long read(IndexBackend backend, Message request, Operation operation,
-            SpillingMap ranks, Map<ByteString, Long> hotRanks, Density density,
+            SpillingMap keys, Map<ByteString, byte[]> hotKeys, Density density,
             SpillingMap members, int member) throws IOException {
         int kind = request instanceof GetRequest ? 0 : 1;
         density.begin(kind);
         long[] hits = {0};
         IndexBackend.ValueSink sink = value -> {
             var identity = ByteString.copyFrom(row(operation.table(), value));
-            Long rank = hotRanks.get(identity);
-            if (rank == null) {
-                rank = ranks.get(identity.toByteArray());
-                hotRanks.put(identity, rank);
+            byte[] key = hotKeys.get(identity);
+            if (key == null) {
+                key = keys.getBytes(identity.toByteArray());
+                if (key == null) throw new IOException("Result has no primary key");
+                hotKeys.put(identity, key);
             }
-            density.hit(kind, rank);
+            density.hit(kind, key);
             hits[0]++;
             if (members != null) {
-                byte[] key = value.toByteArray(), old = members.getBytes(key);
+                byte[] rowId = value.toByteArray(), old = members.getBytes(rowId);
                 long seen = old == null ? 0 : ByteBuffer.wrap(old).getLong();
                 long last = old == null ? -1 : ByteBuffer.wrap(old).getLong(8);
                 if (last != member)
-                    members.putBytes(key, ByteBuffer.allocate(16).putLong(seen + 1).putLong(member).array());
+                    members.putBytes(rowId, ByteBuffer.allocate(16).putLong(seen + 1).putLong(member).array());
             }
         };
         if (request instanceof GetRequest get) {
@@ -263,41 +240,58 @@ public final class TraceAccesses {
     }
 
     private static final class Density implements AutoCloseable {
-        private final BufferedWriter csv;
-        private final long windowRequests, keys, ranksPerBin;
-        private final int requestedBins, bins;
-        private final long[][] cells;
+        private final Path output;
+        private final ExternalSort counts;
+        private final Map<Integer, IndexCatalog.Definition> tables = new TreeMap<>();
+        private final long windowRequests;
         private final long[] requests = new long[4], hits = new long[4];
         private long sequence, window;
 
-        Density(Path output, long windowRequests, int bins, long keys) throws IOException {
-            this.windowRequests = windowRequests; this.keys = keys; this.requestedBins = bins;
-            ranksPerBin = Math.max(1, keys / bins + (keys % bins == 0 ? 0 : 1));
-            this.bins = (int) Math.max(1, keys / ranksPerBin + (keys % ranksPerBin == 0 ? 0 : 1));
-            cells = new long[4][this.bins];
-            csv = new BufferedWriter(new OutputStreamWriter(new GZIPOutputStream(
-                    Files.newOutputStream(output.resolve("access_density.csv.gz"))), StandardCharsets.UTF_8));
-            csv.write("window,pk_bin,get_hits,scan_hits,put_hits,delete_hits\n");
+        Density(Path working, Path output, List<IndexCatalog.Definition> tables,
+                long windowRequests, long sortBytes) {
+            this.output = output;
+            this.windowRequests = windowRequests;
+            for (var table : tables) this.tables.put(table.tableId(), table);
+            counts = new ExternalSort(working.resolve("access-counts"), sortBytes);
         }
 
-        void begin(int kind) throws IOException {
-            long next = sequence / windowRequests;
-            if (next != window) { flush(); window = next; }
+        void begin(int kind) {
+            window = sequence / windowRequests;
             requests[kind]++; sequence++;
         }
 
-        void hit(int kind, long rank) throws IOException {
-            if (rank < 0 || rank >= keys) throw new IOException("Result/write has no primary-key rank");
-            cells[kind][(int) (rank / ranksPerBin)]++;
+        void hit(int kind, byte[] primary) throws IOException {
+            int table = ByteBuffer.wrap(primary).getInt();
+            if (!tables.containsKey(table)) throw new IOException("Access names an unknown table");
+            // The window is part of the key: only repeated hits on the same PK are combined.
+            byte[] key = ByteBuffer.allocate(primary.length + 8).putInt(table).putLong(window)
+                    .put(primary, 4, primary.length - 4).array();
+            counts.add(key, new byte[]{(byte) kind});
             hits[kind]++;
         }
 
-        private void flush() throws IOException {
-            for (int bin = 0; bin < bins; bin++) {
-                if (cells[0][bin] != 0 || cells[1][bin] != 0 || cells[2][bin] != 0 || cells[3][bin] != 0)
-                    csv.write(window + "," + bin + "," + cells[0][bin] + "," + cells[1][bin]
-                            + "," + cells[2][bin] + "," + cells[3][bin] + "\n");
-                for (var series : cells) series[bin] = 0;
+        void write() throws IOException {
+            try (var sorted = counts.sorted()) {
+                for (var table : tables.values()) {
+                    try (var csv = new BufferedWriter(new OutputStreamWriter(new GZIPOutputStream(
+                            Files.newOutputStream(output.resolve("table-" + table.tableId() + ".csv.gz"))),
+                            StandardCharsets.UTF_8))) {
+                        csv.write("window,pk,key,get_hits,scan_hits,put_hits,delete_hits\n");
+                        while (sorted.hasNext() && ByteBuffer.wrap(sorted.peekKey()).getInt() == table.tableId()) {
+                            byte[] key = sorted.peekKey();
+                            long[] totals = new long[4];
+                            do {
+                                totals[sorted.peekValue()[0]]++;
+                                sorted.advance();
+                            } while (sorted.hasNext() && Arrays.equals(key, sorted.peekKey()));
+                            var pk = IndexKey.decode(ByteKeys.decode(ByteBuffer.wrap(key, 16, key.length - 16)));
+                            csv.write(ByteBuffer.wrap(key).getLong(4) + ",\""
+                                    + label(pk, table.type()).replace("\"", "\"\"") + "\","
+                                    + HexFormat.of().formatHex(pk.bytes()) + "," + totals[0] + ","
+                                    + totals[1] + "," + totals[2] + "," + totals[3] + "\n");
+                        }
+                    }
+                }
             }
         }
 
@@ -305,19 +299,35 @@ public final class TraceAccesses {
             var result = new LinkedHashMap<String, Object>();
             result.put("status", "complete");
             result.put("window_requests", windowRequests);
-            result.put("requested_pk_bins", requestedBins);
-            result.put("pk_bins", bins);
-            result.put("ranks_per_bin", ranksPerBin);
-            result.put("primary_key_count", keys);
+            result.put("tables", tables.values().stream().map(t ->
+                    Map.of("id", t.tableId(), "name", t.table(), "key_type", t.type())).toList());
             result.put("workload_requests", sequence);
             result.put("windows", sequence / windowRequests + (sequence % windowRequests == 0 ? 0 : 1));
             result.put("operation_counts", Map.of("get", requests[0], "scan", requests[1], "put", requests[2], "delete", requests[3]));
             result.put("row_hits", Map.of("get", hits[0], "scan", hits[1], "put", hits[2], "delete", hits[3]));
-            result.put("scope", "All exported primitive requests; baseline/markers excluded. Each ReadGroup member occupies one request position; hits count member results before union/intersection. Writes include secondary maintenance; updates are Puts/Deletes. PK ranks sort distinct table/PK keys in baseline, writes and private contexts; empty reads have no row hits. Counts describe returned rows/write entries, not physical I/O.");
+            result.put("scope", "One count per window and exact table/PK, without PK bins or ranks. All exported primitive requests; baseline/markers excluded. Each ReadGroup member occupies one request position; hits count member results before union/intersection. Writes include secondary maintenance; updates are Puts/Deletes. Empty reads have no row hits. Counts describe returned rows/write entries, not physical I/O.");
             return result;
         }
 
-        @Override public void close() throws IOException { flush(); csv.close(); }
+        @Override public void close() throws IOException { counts.close(); }
+    }
+
+    private static String label(IndexKey key, String type) throws IOException {
+        if (type.equals("int")) return Long.toString(key.intValue());
+        if (type.equals("timestamp")) {
+            long micros = key.intValue();
+            if (micros == Long.MIN_VALUE) return "-infinity";
+            if (micros == Long.MAX_VALUE) return "infinity";
+            return LocalDateTime.ofEpochSecond(Math.floorDiv(micros, 1_000_000),
+                    (int) Math.floorMod(micros, 1_000_000) * 1000, ZoneOffset.UTC).toString();
+        }
+        if (type.equals("varchar") || type.equals("text")) {
+            byte[] bytes = key.bytes();
+            String text = new String(bytes, 1, bytes.length - 2, StandardCharsets.UTF_8);
+            if (!key.equals(IndexKey.ofText(text))) throw new IOException("Invalid textual PK");
+            return text;
+        }
+        throw new IOException("Unsupported primary key type: " + type);
     }
 
     private static void removeWorking(Path directory) throws IOException {

@@ -42,7 +42,7 @@ final class RocksGeneration {
             timings.put("initial_load_and_export_seconds",seconds(loadStarted));
             var reports=new ArrayList<Map<String,Object>>();String initialIdentity=null;
             var catalog=new LinkedHashMap<String,Object>();
-            for(String name:Generation.workloads(input.document())) {
+            for(String name:Generation.workloads(input)) {
                 var document=new LinkedHashMap<>(input.document());var nativeConfig=new LinkedHashMap<>(n);
                 nativeConfig.put("workloads",Map.of(name,object(object(n,"workloads"),name)));document.put("native",nativeConfig);
                 Path destination=out.resolve(name);

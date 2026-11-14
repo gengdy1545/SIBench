@@ -59,7 +59,7 @@ final class PostgresGeneration {
                     return null;
                 });
                 long workloadStart=System.nanoTime();var stages=new LinkedHashMap<String,Object>();
-                var workloads=Generation.workloads(input.document());
+                var workloads=Generation.workloads(input);
                 int remaining=workloads.size();
                 for(String workload:workloads) {
                     Path stage=Files.createDirectory(output.resolve(workload));

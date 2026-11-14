@@ -1,27 +1,33 @@
 """Paths, input selection and export shared by the Trace plotting entry points."""
 
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_CONFIG = ROOT / "graph/config/traces.json"
-STYLE = ROOT / "graph/config/style.mplstyle"
+# Allow direct script execution from any working directory.
+sys.path.insert(0, str(ROOT))
+from graph.config import global_config
+from graph.config.global_config import OUTPUT_FORMATS, SAVE_PARAMS
 
 
-def load_config(path):
-    config = json.loads(Path(path).read_text())
-    expected = {"jar", "analysis_directory", "plot_directory", "window_requests",
-                "pk_bins", "sort_memory_bytes", "traces", "runtime"}
-    if set(config) != expected:
-        raise ValueError(f"Expected configuration keys: {sorted(expected)}")
-    for key in ("window_requests", "pk_bins", "sort_memory_bytes"):
+def load_inputs(traces):
+    config = {
+        "jar": global_config.SIBENCH_JAR,
+        "runtime": global_config.RUNTIME_CONFIG,
+        "analysis_directory": global_config.ANALYSIS_DIRECTORY,
+        "plot_directory": global_config.PLOT_DIRECTORY,
+        "window_requests": global_config.WINDOW_REQUESTS,
+        "sort_memory_bytes": global_config.SORT_MEMORY_BYTES,
+        "traces": deepcopy(traces),
+    }
+    for key in ("window_requests", "sort_memory_bytes"):
         if type(config[key]) is not int or config[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
-    if config["pk_bins"] > 1_000_000:
-        raise ValueError("pk_bins must not exceed 1000000")
     for key in ("jar", "analysis_directory", "plot_directory", "runtime"):
         config[key] = ROOT / config[key]
     if not isinstance(config["traces"], list) or not config["traces"]:
@@ -59,7 +65,7 @@ def load_analysis(config, trace):
     if (summary.get("status") != "complete" or summary["manifest_sha256"] != identity
             or preparation["jar_sha256"] != hashlib.sha256(config["jar"].read_bytes()).hexdigest()
             or summary["window_requests"] != config["window_requests"]
-            or summary["requested_pk_bins"] != config["pk_bins"]
+            or "requested_pk_bins" in summary
             or summary["sort_memory_bytes"] != config["sort_memory_bytes"]):
         raise ValueError(f"Stale analysis for {trace['name']}; run prepare_analysis.py")
     return directory, summary
@@ -67,5 +73,5 @@ def load_analysis(config, trace):
 
 def save_figure(figure, path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    for extension in ("pdf", "png"):
-        figure.savefig(f"{path}.{extension}")
+    for extension in OUTPUT_FORMATS:
+        figure.savefig(f"{path}.{extension}", **SAVE_PARAMS)

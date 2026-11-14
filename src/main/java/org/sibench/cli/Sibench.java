@@ -55,7 +55,7 @@ public final class Sibench {
         out.println(
                 "       java -jar build/sibench/sibench.jar analyze-locality CONFIG BENCHMARK OUTPUT"
                         + "   (static baseline layout, update windows and overlap estimate)");
-        out.println("       java -jar build/sibench/sibench.jar analyze-accesses CONFIG BENCHMARK OUTPUT WINDOW_REQUESTS PK_BINS SORT_MEMORY_BYTES");
+        out.println("       java -jar build/sibench/sibench.jar analyze-accesses CONFIG BENCHMARK OUTPUT WINDOW_REQUESTS SORT_MEMORY_BYTES");
     }
 
     public static void main(String[] args) {
@@ -285,12 +285,12 @@ public final class Sibench {
                 return 0;
             }
             if (args[0].equals("analyze-accesses")) {
-                if (profiles.size() != 6) throw new IllegalArgumentException(
-                        "analyze-accesses requires CONFIG BENCHMARK OUTPUT WINDOW_REQUESTS PK_BINS SORT_MEMORY_BYTES");
+                if (profiles.size() != 5) throw new IllegalArgumentException(
+                        "analyze-accesses requires CONFIG BENCHMARK OUTPUT WINDOW_REQUESTS SORT_MEMORY_BYTES");
                 var document = SibenchConfig.read(root.resolve(profiles.get(0)));
                 org.sibench.analysis.TraceAccesses.run(BenchmarkSelection.directory(root, document, profiles.get(1)),
                         root.resolve(profiles.get(2)), Long.parseLong(profiles.get(3)),
-                        Integer.parseInt(profiles.get(4)), Long.parseLong(profiles.get(5)));
+                        Long.parseLong(profiles.get(4)));
                 out.println(Files.readString(root.resolve(profiles.get(2)).resolve("summary.json")));
                 return 0;
             }

@@ -8,7 +8,7 @@ native:
   timeout_minutes: 720
   build_directory: build/benchmarks/HyBench-2024
   sf: 10x
-  clients: 32
+  clients: 32 # TP clients; XP uses its two explicit client counts below.
   xp_transaction_clients: 32
   # Set to zero to disable IQ clients in the source workload.
   xp_query_clients: 32
@@ -19,6 +19,6 @@ native:
 trace:
   secondary_indexes: false
   workload_requests: 10000000
-# Working database, logs and receipts; persistent Trace paths belong to the runtime CONFIG.
+# Native capture uses tp/ and xp/ beneath this working root; persistent Trace paths belong to CONFIG.
 artifacts:
   directory: results/capture/hybench
