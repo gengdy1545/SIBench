@@ -110,7 +110,7 @@ public final class ReferenceReplay {
                 result.put("snapshot_queries", index.snapshotQueries());
                 result.put("retained_index_versions", index.retainedVersions());
                 result.put("skipped_entry_histories", index.skippedHistories());
-                result.put("read_model", "committed_snapshot");
+                result.put("read_model", "snapshot_with_private_writes");
                 results.add(result);
             }
         }
@@ -125,7 +125,7 @@ public final class ReferenceReplay {
                     + " implementation; resolved-source version history and timestamp lookup,"
                     + " ordered point/range/limited scans, pinned entries and intersection/union"
                     + " search groups over order-preserving keys of the complete declared source"
-                    + " indexes from successful transactions, excluding transaction-local reads;"
+                    + " indexes, including transaction-private read contexts and rollback reads;"
                     + " no RPC, persistence, concurrent MVCC, physical GC, rate scheduling or sustained-duration proof");
         Files.writeString(
                 report,

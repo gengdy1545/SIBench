@@ -20,48 +20,6 @@ public record ReplayConfig(
         int maxInFlight,
         long requestTimeoutSeconds,
         int baselineBatchOperations) {
-    /** Unbatched baseline, for fixtures that do not exercise baseline batching. */
-    public ReplayConfig(boolean secondaryIndexes, long durationSeconds, long plannedOperationsPerSecond,
-            long warmupOperations, int reservePercent, String dispatchMode, int clientCount, int maxInFlight,
-            long requestTimeoutSeconds) {
-        this(secondaryIndexes, durationSeconds, plannedOperationsPerSecond, warmupOperations, reservePercent,
-                dispatchMode, clientCount, maxInFlight, requestTimeoutSeconds, 1);
-    }
-
-    public ReplayConfig(
-            boolean secondaryIndexes,
-            long durationSeconds,
-            long plannedOperationsPerSecond,
-            long warmupOperations,
-            int reservePercent,
-            String dispatchMode) {
-        this(
-                secondaryIndexes,
-                durationSeconds,
-                plannedOperationsPerSecond,
-                warmupOperations,
-                reservePercent,
-                dispatchMode,
-                1,
-                4096,
-                60);
-    }
-
-    public ReplayConfig(
-            boolean secondaryIndexes,
-            long durationSeconds,
-            long plannedOperationsPerSecond,
-            long warmupOperations,
-            int reservePercent) {
-        this(
-                secondaryIndexes,
-                durationSeconds,
-                plannedOperationsPerSecond,
-                warmupOperations,
-                reservePercent,
-                "operation");
-    }
-
     public ReplayConfig {
         require(Set.of("operation", "transaction").contains(dispatchMode), "Invalid dispatch mode");
         require(clientCount > 0, "Client count must be positive");

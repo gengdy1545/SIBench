@@ -34,6 +34,7 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     private Thread owner;
     private boolean failed;
     private long skippedWrites;
+    private long privateReads, privateWriteEntries;
 
     public ReplayProjection(
             ReplayConfig config, boolean sourceTransactions, IndexOperationTrace.Consumer target) {
@@ -215,6 +216,10 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     }
 
     private void countDispatch(Operation operation) {
+        if (!operation.localWrites().isEmpty()) {
+            privateReads++;
+            privateWriteEntries += operation.localWrites().size();
+        }
         dispatched++;
         effectiveRequests++;
         if (!operation.grouped() || operation.expansionPosition() == 0) {
@@ -305,6 +310,8 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         report.put("search_groups", searchGroups);
         report.put("filtered_secondary_operations", filtered);
         report.put("committed_transactions", transactions);
+        report.put("private_context_reads", privateReads);
+        report.put("private_context_entries", privateWriteEntries);
         report.put("last_resolved_version", lastVersion);
         report.put("change_delivery", sourceTransactions ? "committed_transactions" : "baseline");
         report.put("transaction_control_records", controls);

@@ -73,7 +73,7 @@ public final class DriverCapacityCheck {
 
     static ReplayConfig config(Path trace, int clients) throws IOException {
         boolean secondary = org.sibench.trace.TraceManifest.secondaryIndexes(org.sibench.trace.TraceManifest.read(trace));
-        return new ReplayConfig(secondary, 0, 0, 0, 0, "operation", clients, 4096, 60);
+        return new ReplayConfig(secondary, 0, 0, 0, 0, "operation", clients, 4096, 60, 1);
     }
 
     private static void plan(Path trace, long wanted, Path report) throws Exception {

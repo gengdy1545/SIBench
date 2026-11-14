@@ -62,6 +62,23 @@ public class PixelsBaselineTest {
         }
     }
 
+    @Test public void emptyTablesNeedNoColumnarFilesButNonemptyTablesDo()throws Exception {
+        Path root=fixture();
+        var document=JsonParser.parseString(Files.readString(root.resolve("manifest.json"))).getAsJsonObject();
+        var files=document.getAsJsonObject("inventory").getAsJsonArray("files");
+        String table=files.remove(0).getAsJsonObject().get("table").getAsString();
+        Files.writeString(root.resolve("manifest.json"),document.toString());
+        assertThrows(java.io.IOException.class,()->PixelsBaseline.open(root));
+        document.getAsJsonObject("baseline_rows").addProperty(table,0);
+        Files.writeString(root.resolve("manifest.json"),document.toString());
+        assertEquals(0L,(long)PixelsBaseline.rows(PixelsBaseline.open(root).manifest()).get(table));
+        document.getAsJsonObject("baseline_rows").keySet().forEach(t->document.getAsJsonObject("baseline_rows").addProperty(t,0));
+        document.getAsJsonObject("inventory").add("files",new JsonArray());
+        document.getAsJsonObject("inventory").addProperty("max_timestamp",0);
+        Files.writeString(root.resolve("manifest.json"),document.toString());
+        assertEquals("passed",PixelsBaseline.check(root).get("status"));
+    }
+
     @Test public void differentStorageAndReaderAreRejected() throws Exception {
         var baseline = PixelsBaseline.open(fixture());
         var profile = org.sibench.config.ConfigValues.parse(baseline.manifest().get("storage").toString());

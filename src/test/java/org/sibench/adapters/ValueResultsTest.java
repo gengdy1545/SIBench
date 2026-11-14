@@ -113,7 +113,7 @@ public class ValueResultsTest {
                  var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve(kind + "-" + seed), kind)) {
                 for (var operation : operations) {
                     model.accept(operation);
-                    assertEquals(IndexStatus.OK, IndexExecution.execute(backend, requests.request(operation)).status());
+                    assertEquals(IndexStatus.OK, IndexTestSupport.execute(backend, requests.request(operation)).status());
                 }
                 for (long ts : new long[] {0, 1, 17, 60, 120}) for (boolean reverse : new boolean[] {false, true}) {
                     for (int a = 0; a < IndexReferenceSpillTest.VALUES; a += 3) for (int b = 0; b < 5; b++) {
@@ -123,7 +123,7 @@ public class ValueResultsTest {
                         var second = model.search(IndexReferenceSpillTest.TABLE, 2, secondRange, ts);
                         var firstQuery = query(1, firstRange, ts);
                         var secondQuery = query(2, secondRange, ts);
-                        var answers = List.of(backend.scan(firstQuery), backend.scan(secondQuery));
+                        var answers = List.of(IndexTestSupport.scan(backend, firstQuery), IndexTestSupport.scan(backend, secondQuery));
                         assertEquals(first.stream().map(row -> value(row, rowIds)).toList(), answers.get(0));
                         assertEquals(second.stream().map(row -> value(row, rowIds)).toList(), answers.get(1));
                         var group = ReadGroup.newBuilder().addRequests(ReadRequest.newBuilder().setScan(firstQuery))

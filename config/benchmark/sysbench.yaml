@@ -20,19 +20,8 @@ native:
   binary: src/sysbench
   workloads:
     oltp_read_write:
-      events: 561761
-    oltp_update_index:
-      events: 702202
-    oltp_update_non_index:
-      events: 702202
-    oltp_delete:
-      events: 351101
-    oltp_insert:
-      events: 351101
-    oltp_point_select:
-      events: 1404403
+      events: 10000000
 trace:
-  export_queries: false
   secondary_indexes: false
   workload_requests: 10000000
 artifacts:

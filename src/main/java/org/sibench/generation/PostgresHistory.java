@@ -32,8 +32,6 @@ final class PostgresHistory {
         trigger(database,"insert_"+id,"AFTER INSERT",source,"REFERENCING NEW TABLE AS new_rows");
         function(database,"primary_key_"+id,"RAISE EXCEPTION 'Primary key assignments are unsupported by RowID identities';");
         trigger(database,"primary_key_"+id,"BEFORE UPDATE OF "+pk,source,"");
-        sql(database,"CREATE TRIGGER sibench_row_change AFTER INSERT OR UPDATE OR DELETE ON "+source
-                +" FOR EACH ROW EXECUTE FUNCTION sibench_history.row_change()");
     }
 
     private static void function(Connection database,String name,String body)throws SQLException {

@@ -73,7 +73,7 @@ final class PostgresCapture implements AutoCloseable {
 
     private void receive(SocketChannel socket) {
         Session session=null;
-        try(socket;var input=new BufferedReader(new InputStreamReader(Channels.newInputStream(socket),StandardCharsets.UTF_8),1<<16)) {
+        try(socket;var input=new BufferedReader(new InputStreamReader(PostgresFacts.bounded(Channels.newInputStream(socket)),StandardCharsets.UTF_8),1<<16)) {
             String name=input.readLine();
             if(name==null||!name.matches("pg-[0-9]+\\.jsonl\\.zst"))throw new IOException("Invalid PG source stream name");
             int pid=Integer.parseInt(name.substring(3,name.indexOf('.')));

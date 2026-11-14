@@ -32,10 +32,10 @@ check postgres-prepared
 compiler=${CC:-cc}
 "$compiler" --version > "$BUILD/compiler-version.txt"
 cd "$BUILD/source"
-./configure --prefix="$BUILD/runtime" --without-readline --without-zlib CC="$compiler"
+./configure --prefix="$BUILD/runtime" --libdir="$BUILD/runtime/lib/postgresql" --without-readline --without-zlib CC="$compiler"
 make -C src/backend generated-headers
 make -j "$jobs"
 make install
-"$compiler" -fPIC -shared -I src/include -o "$BUILD/runtime/lib/row_capture.so" row_capture.c
+"$compiler" -fPIC -shared -I src/include -o "$BUILD/runtime/lib/postgresql/row_capture.so" row_capture.c
 check postgres-record
 printf '\nPostgreSQL runtime: %s\n' "$BUILD/runtime"

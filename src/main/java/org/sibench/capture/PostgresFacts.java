@@ -12,8 +12,10 @@ import java.nio.file.Path;
 
 /** Stream integrity is established while decoding, before any capture can be published. */
 public final class PostgresFacts {
+    static final int MAX_EVENT_BYTES = 16 << 20;
     private static final java.util.Set<String> EVENTS=java.util.Set.of("capture_start","capture_end",
             "executor_start","executor_run_end","executor_end","transaction_commit","transaction_abort",
+            "subtransaction_begin","subtransaction_commit","subtransaction_abort",
             "row_change","row_identity","plan_scan","plan_bitmap_heap","scan_rescan","scan_next","scan_end",
             "scan_summary","scan_orphan","heap_visibility","vm_visible","bitmap_candidate","bitmap_end",
             "bitmap_heap_candidate","bitmap_heap_lossy","bitmap_heap_unbound","bitmap_verdicts",
@@ -24,7 +26,7 @@ public final class PostgresFacts {
 
     public static Receipt read(Path file,Consumer consumer)throws IOException {
         var stream=new Stream(file.getFileName().toString());
-        try(var input=new BufferedReader(new InputStreamReader(new ZstdInputStream(Files.newInputStream(file)),StandardCharsets.UTF_8))) {
+        try(var input=new BufferedReader(new InputStreamReader(bounded(new ZstdInputStream(Files.newInputStream(file))),StandardCharsets.UTF_8))) {
             String line;
             while((line=input.readLine())!=null) {
                 JsonObject event=parse(line);
@@ -33,6 +35,25 @@ public final class PostgresFacts {
             }
         }catch(RuntimeException invalid){throw new IOException("Invalid PostgreSQL capture: "+file,invalid);}
         return stream.finish();
+    }
+
+    /** Bound each decoded event before readLine or JSON parsing can materialize it. */
+    static java.io.InputStream bounded(java.io.InputStream input) {
+        return new java.io.FilterInputStream(input) {
+            int bytes;
+            private void count(int value)throws IOException {
+                if(value=='\n')bytes=0;
+                else if(++bytes>MAX_EVENT_BYTES)throw new IOException("PG native event exceeds 16 MiB");
+            }
+            @Override public int read()throws IOException {
+                int value=in.read();if(value>=0)count(value);return value;
+            }
+            @Override public int read(byte[] buffer,int offset,int length)throws IOException {
+                int count=in.read(buffer,offset,length);
+                for(int i=0;i<count;i++)count(buffer[offset+i]);
+                return count;
+            }
+        };
     }
 
     static JsonObject parse(String line)throws IOException {

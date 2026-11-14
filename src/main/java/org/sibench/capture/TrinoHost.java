@@ -15,24 +15,31 @@ final class TrinoHost {
     private TrinoHost() {}
 
     static JsonObject verify(Path directory, String pixelsCommit) throws IOException {
+        directory=directory.toRealPath();
         var receipt = JsonParser.parseString(Files.readString(directory.resolve("deployment.json"))).getAsJsonObject();
         if (!receipt.get("pixels_commit").getAsString().equals(pixelsCommit))
             throw new IOException("Trino connector and Pixels source pins differ");
         for (String key : List.of("server_directory", "java_home")) {
             Path relative = Path.of(receipt.get(key).getAsString());
-            if (relative.isAbsolute() || !directory.resolve(relative).normalize().startsWith(directory))
+            if (relative.isAbsolute() || !directory.resolve(relative).normalize().startsWith(directory)
+                    || !directory.resolve(relative).toRealPath().startsWith(directory))
                 throw new IOException("Trino deployment location escapes its directory");
         }
         for (var entry : receipt.getAsJsonObject("files").entrySet()) {
             Path file = directory.resolve(entry.getKey()).normalize();
-            if (!file.startsWith(directory) || !Digests.sha256(file).equals(entry.getValue().getAsString()))
+            if (!file.startsWith(directory) || !file.toRealPath().startsWith(directory)
+                    || !Digests.sha256(file).equals(entry.getValue().getAsString()))
                 throw new IOException("Trino deployment file differs: " + entry.getKey());
         }
         Path server = directory.resolve(receipt.get("server_directory").getAsString());
-        for (String folder : List.of("lib", "plugin")) try (var files = Files.walk(server.resolve(folder))) {
-            for (Path file : files.filter(p -> p.getFileName().toString().endsWith(".jar")).toList())
-                if (!receipt.getAsJsonObject("files").has(directory.relativize(file).toString()))
+        for (String folder : List.of("lib", "plugin")) try (var files = Files.walk(server.resolve(folder), FileVisitOption.FOLLOW_LINKS)) {
+            for (Path file : files.toList()) {
+                if (!file.toRealPath().startsWith(directory))
+                    throw new IOException("Trino deployment location escapes its directory");
+                if (file.getFileName().toString().endsWith(".jar")
+                        && !receipt.getAsJsonObject("files").has(directory.relativize(file).toString()))
                     throw new IOException("Unlisted Trino deployment JAR: " + file);
+            }
         }
         return receipt;
     }

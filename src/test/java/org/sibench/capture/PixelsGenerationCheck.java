@@ -78,7 +78,7 @@ public class PixelsGenerationCheck {
         assertFalse(Files.exists(output.resolve("generated/database/data")));
         assertFalse(Files.exists(output.resolve("generated/pixels")));
         var report = org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
-                new org.sibench.replay.ReplayConfig(false, 0, 0, 0, 0, "operation"), output.resolve("reference.json"));
+                new org.sibench.replay.ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 4096, 60, 1), output.resolve("reference.json"));
         assertEquals("passed", report.get("status"));
     }
 }

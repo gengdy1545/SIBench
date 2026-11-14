@@ -1,6 +1,6 @@
 --- a/core/src/main/java/site/ycsb/Client.java
 +++ b/core/src/main/java/site/ycsb/Client.java
-@@ -275,6 +275,15 @@
+@@ -275,7 +275,17 @@
  
    @SuppressWarnings("unchecked")
    public static void main(String[] args) {
@@ -14,9 +14,11 @@
 +
 +  public static void run(String[] args) {
      Properties props = parseArguments(args);
++    Utils.seed(Long.parseLong(props.getProperty("sibench.seed")));
  
      boolean status = Boolean.valueOf(props.getProperty(STATUS_PROPERTY, String.valueOf(false)));
-@@ -384,7 +393,7 @@
+     String label = props.getProperty(LABEL_PROPERTY, "");
+@@ -384,7 +394,7 @@
      } catch (WorkloadException e) {
        e.printStackTrace();
        e.printStackTrace(System.out);
@@ -25,22 +27,20 @@
      }
  
      try {
-@@ -394,10 +403,10 @@
+@@ -394,10 +404,10 @@
      } catch (IOException e) {
        System.err.println("Could not export measurements, error: " + e.getMessage());
        e.printStackTrace();
 -      System.exit(-1);
--    }
--
--    System.exit(0);
 +      fail();
-+    }
-+
+     }
+ 
+-    System.exit(0);
 +    tracer.close();
    }
  
    private static List<ClientThread> initDb(String dbname, Properties props, int threadcount,
-@@ -448,7 +457,7 @@
+@@ -448,7 +458,7 @@
  
        if (initFailed) {
          System.err.println("Error initializing datastore bindings.");
@@ -49,7 +49,7 @@
        }
      }
      return clients;
-@@ -469,7 +478,7 @@
+@@ -469,7 +479,7 @@
      } catch (WorkloadException e) {
        e.printStackTrace();
        e.printStackTrace(System.out);
@@ -58,7 +58,7 @@
      }
    }
  
-@@ -520,7 +529,7 @@
+@@ -520,7 +530,7 @@
      } catch (Exception e) {
        e.printStackTrace();
        e.printStackTrace(System.out);
@@ -67,7 +67,7 @@
      }
  
      return null;
-@@ -540,7 +549,7 @@
+@@ -540,7 +550,7 @@
      if (args.length == 0) {
        usageMessage();
        System.out.println("At least one argument specifying a workload is required.");
@@ -76,7 +76,7 @@
      }
  
      while (args[argindex].startsWith("-")) {
-@@ -549,7 +558,7 @@
+@@ -549,7 +559,7 @@
          if (argindex >= args.length) {
            usageMessage();
            System.out.println("Missing argument value for -threads.");
@@ -85,7 +85,7 @@
          }
          int tcount = Integer.parseInt(args[argindex]);
          props.setProperty(THREAD_COUNT_PROPERTY, String.valueOf(tcount));
-@@ -559,7 +568,7 @@
+@@ -559,7 +569,7 @@
          if (argindex >= args.length) {
            usageMessage();
            System.out.println("Missing argument value for -target.");
@@ -94,7 +94,7 @@
          }
          int ttarget = Integer.parseInt(args[argindex]);
          props.setProperty(TARGET_PROPERTY, String.valueOf(ttarget));
-@@ -578,7 +587,7 @@
+@@ -578,7 +588,7 @@
          if (argindex >= args.length) {
            usageMessage();
            System.out.println("Missing argument value for -db.");
@@ -103,7 +103,7 @@
          }
          props.setProperty(DB_PROPERTY, args[argindex]);
          argindex++;
-@@ -587,7 +596,7 @@
+@@ -587,7 +597,7 @@
          if (argindex >= args.length) {
            usageMessage();
            System.out.println("Missing argument value for -l.");
@@ -112,7 +112,7 @@
          }
          props.setProperty(LABEL_PROPERTY, args[argindex]);
          argindex++;
-@@ -596,7 +605,7 @@
+@@ -596,7 +606,7 @@
          if (argindex >= args.length) {
            usageMessage();
            System.out.println("Missing argument value for -P.");
@@ -121,7 +121,7 @@
          }
          String propfile = args[argindex];
          argindex++;
-@@ -607,7 +616,7 @@
+@@ -607,7 +617,7 @@
          } catch (IOException e) {
            System.out.println("Unable to open the properties file " + propfile);
            System.out.println(e.getMessage());
@@ -130,7 +130,7 @@
          }
  
          //Issue #5 - remove call to stringPropertyNames to make compilable under Java 1.5
-@@ -622,13 +631,13 @@
+@@ -622,13 +632,13 @@
          if (argindex >= args.length) {
            usageMessage();
            System.out.println("Missing argument value for -p");
@@ -146,7 +146,7 @@
          }
  
          String name = args[argindex].substring(0, eq);
-@@ -638,7 +647,7 @@
+@@ -638,7 +648,7 @@
        } else {
          usageMessage();
          System.out.println("Unknown option " + args[argindex]);
@@ -155,7 +155,7 @@
        }
  
        if (argindex >= args.length) {
-@@ -655,7 +664,7 @@
+@@ -655,7 +665,7 @@
          System.out.println("An argument specifier without corresponding value was found at the end of the supplied " +
              "command line arguments.");
        }
@@ -164,7 +164,7 @@
      }
  
      //overwrite file properties with properties from the command line
-@@ -671,7 +680,7 @@
+@@ -671,7 +681,7 @@
  
      if (!checkRequiredProperties(props)) {
        System.out.println("Failed check required properties.");
@@ -175,7 +175,35 @@
      return props;
 --- a/core/src/main/java/site/ycsb/ClientThread.java
 +++ b/core/src/main/java/site/ycsb/ClientThread.java
-@@ -122,3 +122,8 @@
+@@ -20,7 +20,6 @@
+ import site.ycsb.measurements.Measurements;
+ import java.util.Properties;
+ import java.util.concurrent.CountDownLatch;
+-import java.util.concurrent.ThreadLocalRandom;
+ import java.util.concurrent.locks.LockSupport;
+ 
+ /**
+@@ -87,6 +86,7 @@
+ 
+   @Override
+   public void run() {
++    Utils.seed(Long.parseLong(props.getProperty("sibench.seed")) ^ (0x9e3779b97f4a7c15L * (threadid + 1)));
+     try {
+       db.init();
+     } catch (DBException e) {
+@@ -110,7 +110,7 @@
+     // GH issue 4 - throws exception if _target>1 because random.nextInt argument must be >0
+     // and the sleep() doesn't make sense for granularities < 1 ms anyway
+     if ((targetOpsPerMs > 0) && (targetOpsPerMs <= 1.0)) {
+-      long randomMinorDelay = ThreadLocalRandom.current().nextInt((int) targetOpsTickNs);
++      long randomMinorDelay = site.ycsb.Utils.random().nextInt((int) targetOpsTickNs);
+       sleepUntil(System.nanoTime() + randomMinorDelay);
+     }
+     try {
+@@ -119,6 +119,11 @@
+ 
+         while (((opcount == 0) || (opsdone < opcount)) && !workload.isStopRequested()) {
+ 
 +          Object stop = props.get("sibench.stop");
 +          if (stop instanceof java.util.function.BooleanSupplier &&
 +              ((java.util.function.BooleanSupplier) stop).getAsBoolean()) {
@@ -193,3 +221,170 @@
      }
  
      try {
+--- a/core/src/main/java/site/ycsb/RandomByteIterator.java
++++ b/core/src/main/java/site/ycsb/RandomByteIterator.java
+@@ -16,7 +16,6 @@
+  */
+ package site.ycsb;
+ 
+-import java.util.concurrent.ThreadLocalRandom;
+ 
+ /**
+  *  A ByteIterator that generates a random sequence of bytes.
+@@ -33,7 +32,7 @@
+   }
+ 
+   private void fillBytesImpl(byte[] buffer, int base) {
+-    int bytes = ThreadLocalRandom.current().nextInt();
++    int bytes = site.ycsb.Utils.random().nextInt();
+ 
+     switch (buffer.length - base) {
+     default:
+--- a/core/src/main/java/site/ycsb/Utils.java
++++ b/core/src/main/java/site/ycsb/Utils.java
+@@ -23,12 +23,21 @@
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.concurrent.ThreadLocalRandom;
+ 
+ /**
+  * Utility functions.
+  */
+ public final class Utils {
++  private static final ThreadLocal<java.util.Random> RANDOM = ThreadLocal.withInitial(() -> new java.util.Random(0));
++
++  public static java.util.Random random() {
++    return RANDOM.get();
++  }
++
++  public static void seed(long seed) {
++    RANDOM.set(new java.util.Random(seed));
++  }
++
+   private Utils() {
+     // not used
+   }
+@@ -222,7 +231,7 @@
+    */
+   public static <T> T [] shuffleArray(final T[] array) {
+     for (int i = array.length -1; i > 0; i--) {
+-      final int idx = ThreadLocalRandom.current().nextInt(i + 1);
++      final int idx = site.ycsb.Utils.random().nextInt(i + 1);
+       final T temp = array[idx];
+       array[idx] = array[i];
+       array[i] = temp;
+--- a/core/src/main/java/site/ycsb/generator/DiscreteGenerator.java
++++ b/core/src/main/java/site/ycsb/generator/DiscreteGenerator.java
+@@ -19,7 +19,6 @@
+ 
+ import java.util.ArrayList;
+ import java.util.Collection;
+-import java.util.concurrent.ThreadLocalRandom;
+ 
+ import static java.util.Objects.requireNonNull;
+ 
+@@ -55,7 +54,7 @@
+       sum += p.weight;
+     }
+ 
+-    double val = ThreadLocalRandom.current().nextDouble();
++    double val = site.ycsb.Utils.random().nextDouble();
+ 
+     for (Pair p : values) {
+       double pw = p.weight / sum;
+--- a/core/src/main/java/site/ycsb/generator/ExponentialGenerator.java
++++ b/core/src/main/java/site/ycsb/generator/ExponentialGenerator.java
+@@ -17,7 +17,6 @@
+ 
+ package site.ycsb.generator;
+ 
+-import java.util.concurrent.ThreadLocalRandom;
+ 
+ /**
+  * A generator of an exponential distribution. It produces a sequence
+@@ -66,7 +65,7 @@
+    */
+   @Override
+   public Double nextValue() {
+-    return -Math.log(ThreadLocalRandom.current().nextDouble()) / gamma;
++    return -Math.log(site.ycsb.Utils.random().nextDouble()) / gamma;
+   }
+ 
+   @Override
+--- a/core/src/main/java/site/ycsb/generator/HistogramGenerator.java
++++ b/core/src/main/java/site/ycsb/generator/HistogramGenerator.java
+@@ -20,7 +20,6 @@
+ import java.io.FileReader;
+ import java.io.IOException;
+ import java.util.ArrayList;
+-import java.util.concurrent.ThreadLocalRandom;
+ 
+ /**
+  * Generate integers according to a histogram distribution.  The histogram
+@@ -88,7 +87,7 @@
+ 
+   @Override
+   public Long nextValue() {
+-    int number = ThreadLocalRandom.current().nextInt((int) area);
++    int number = site.ycsb.Utils.random().nextInt((int) area);
+     int i;
+ 
+     for (i = 0; i < (buckets.length - 1); i++) {
+--- a/core/src/main/java/site/ycsb/generator/HotspotIntegerGenerator.java
++++ b/core/src/main/java/site/ycsb/generator/HotspotIntegerGenerator.java
+@@ -17,7 +17,6 @@
+ package site.ycsb.generator;
+ 
+ import java.util.Random;
+-import java.util.concurrent.ThreadLocalRandom;
+ 
+ /**
+  * Generate integers resembling a hotspot distribution where x% of operations
+@@ -74,7 +73,7 @@
+   @Override
+   public Long nextValue() {
+     long value = 0;
+-    Random random = ThreadLocalRandom.current();
++    Random random = site.ycsb.Utils.random();
+     if (random.nextDouble() < hotOpnFraction) {
+       // Choose a value from the hot set.
+       value = lowerBound + Math.abs(random.nextLong()) % hotInterval;
+--- a/core/src/main/java/site/ycsb/generator/UniformLongGenerator.java
++++ b/core/src/main/java/site/ycsb/generator/UniformLongGenerator.java
+@@ -17,7 +17,6 @@
+ 
+ package site.ycsb.generator;
+ 
+-import java.util.concurrent.ThreadLocalRandom;
+ 
+ /**
+  * Generates longs randomly uniform from an interval.
+@@ -41,7 +40,7 @@
+ 
+   @Override
+   public Long nextValue() {
+-    long ret = Math.abs(ThreadLocalRandom.current().nextLong()) % interval  + lb;
++    long ret = Math.abs(site.ycsb.Utils.random().nextLong()) % interval  + lb;
+     setLastValue(ret);
+ 
+     return ret;
+--- a/core/src/main/java/site/ycsb/generator/ZipfianGenerator.java
++++ b/core/src/main/java/site/ycsb/generator/ZipfianGenerator.java
+@@ -17,7 +17,6 @@
+ 
+ package site.ycsb.generator;
+ 
+-import java.util.concurrent.ThreadLocalRandom;
+ 
+ /**
+  * A generator of a zipfian distribution. It produces a sequence of items, such that some items are more popular than
+@@ -247,7 +246,7 @@
+       }
+     }
+ 
+-    double u = ThreadLocalRandom.current().nextDouble();
++    double u = site.ycsb.Utils.random().nextDouble();
+     double uz = u * zetan;
+ 
+     if (uz < 1.0) {

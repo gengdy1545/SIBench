@@ -27,11 +27,29 @@ public class VersionedIndexBackendTest {
 
     private static final int TABLE = IndexReferenceSpillTest.TABLE, ROWS = IndexReferenceSpillTest.ROWS;
 
+    @Test public void initializationFailureClosesTheStoreAndPreservesTheFirstError()throws Exception {
+        for(String action:List.of("created","reopened")) {
+            int[] closed={0};
+            var original=new java.io.IOException("injected metadata failure");
+            var store=(OrderedStore)java.lang.reflect.Proxy.newProxyInstance(OrderedStore.class.getClassLoader(),
+                    new Class<?>[]{OrderedStore.class},(proxy,method,args)->{
+                        if(method.getName().equals("close")){closed[0]++;throw new java.io.IOException("injected close failure");}
+                        throw original;
+                    });
+            var method=VersionedIndexBackend.class.getDeclaredMethod(action,OrderedStore.class,ValueKind.class,java.nio.file.Path.class);
+            method.setAccessible(true);
+            var error=assertThrows(java.lang.reflect.InvocationTargetException.class,()->method.invoke(null,store,ValueKind.ROW_ID,
+                    temporary.getRoot().toPath().resolve(action)));
+            assertSame(original,error.getCause());assertEquals(1,closed[0]);
+            assertEquals("injected close failure",original.getSuppressed()[0].getMessage());
+        }
+    }
+
     private VersionedIndexBackend load(List<Operation> operations, ValueKind kind) throws Exception {
         var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("db-" + kind + "-" + System.nanoTime()), kind);
         var requests = new TraceRequests(kind);
         for (Operation operation : operations) {
-            var response = IndexExecution.execute(backend, requests.request(operation));
+            var response = IndexTestSupport.execute(backend, requests.request(operation));
             assertEquals(response.message(), IndexStatus.OK, response.status());
         }
         return backend;
@@ -74,7 +92,7 @@ public class VersionedIndexBackendTest {
                                         random.nextBoolean() || trial % 3 == 0, random.nextBoolean(),
                                         random.nextBoolean() ? 0 : 1 + random.nextInt(9));
                                 same("index " + index + " at " + time + " " + range,
-                                        model.search(TABLE, index, range, time), backend.scan(search(index, range, time)), rowIds);
+                                        model.search(TABLE, index, range, time), IndexTestSupport.scan(backend, search(index, range, time)), rowIds);
                             }
                         }
                         // Pinned entries: one (value, PK) of a secondary index.
@@ -134,16 +152,16 @@ public class VersionedIndexBackendTest {
                     var wanted = new ArrayList<>(expected.values());
                     if (reverse) java.util.Collections.reverse(wanted);
                     var scan = ScanRequest.newBuilder().setReadTs(ts).setReverse(reverse);
-                    assertEquals(wanted, backend.scan(scan.build()));
+                    assertEquals(wanted, IndexTestSupport.scan(backend, scan.build()));
                     assertEquals(wanted.subList(0, Math.min(2, wanted.size())),
-                            backend.scan(scan.clone().setLimit(2).build()));
+                            IndexTestSupport.scan(backend, scan.clone().setLimit(2).build()));
                     var end = ByteString.copyFromUtf8("b");
                     var bounded = new ArrayList<>(expected.entrySet().stream().filter(r -> order.compare(r.getKey(), a) >= 0
                             && order.compare(r.getKey(), end) < 0).map(java.util.Map.Entry::getValue).toList());
                     if (reverse) java.util.Collections.reverse(bounded);
-                    assertEquals(bounded, backend.scan(scan.clone().setStartKey(a).setEndKey(end).build()));
-                    assertTrue(backend.scan(scan.clone().setEndKey(ByteString.EMPTY).build()).isEmpty());
-                    assertEquals(wanted, backend.scan(scan.clone().setStartKey(ByteString.EMPTY).build()));
+                    assertEquals(bounded, IndexTestSupport.scan(backend, scan.clone().setStartKey(a).setEndKey(end).build()));
+                    assertTrue(IndexTestSupport.scan(backend, scan.clone().setEndKey(ByteString.EMPTY).build()).isEmpty());
+                    assertEquals(wanted, IndexTestSupport.scan(backend, scan.clone().setStartKey(ByteString.EMPTY).build()));
                 }
             }
         }
@@ -170,14 +188,14 @@ public class VersionedIndexBackendTest {
                     java.util.Collections.reverse(initial); java.util.Collections.reverse(deleted);
                     java.util.Collections.reverse(reinserted);
                 }
-                same("initial", initial, backend.scan(search(0, bounds, 0)), true);
-                same("tombstone hides older rows", deleted, backend.scan(search(0, bounds, 4)), true);
-                same("reinserted identity", reinserted, backend.scan(search(0, bounds, 7)), true);
+                same("initial", initial, IndexTestSupport.scan(backend, search(0, bounds, 0)), true);
+                same("tombstone hides older rows", deleted, IndexTestSupport.scan(backend, search(0, bounds, 4)), true);
+                same("reinserted identity", reinserted, IndexTestSupport.scan(backend, search(0, bounds, 7)), true);
                 same("limit counts visible rows", initial.subList(0, 2),
-                        backend.scan(search(0, bounds, 0).toBuilder().setLimit(2).build()), true);
+                        IndexTestSupport.scan(backend, search(0, bounds, 0).toBuilder().setLimit(2).build()), true);
                 Range exclusive = new Range(IndexKey.ofInt(1), false, IndexKey.ofInt(4), false, descending, 0);
                 same("invisible lower entry then visible successor", List.of(row(3, 0, 30)),
-                        backend.scan(search(0, exclusive, 0)), true);
+                        IndexTestSupport.scan(backend, search(0, exclusive, 0)), true);
             }
         }
     }
@@ -196,10 +214,10 @@ public class VersionedIndexBackendTest {
                 var initial = new ArrayList<>(List.of(row(1, 0, 11), row(3, 0, 30), row(4, 0, 40)));
                 var latest = new ArrayList<>(List.of(row(2, 5, 25), row(3, 0, 30), row(1, 7, 17), row(4, 0, 40)));
                 if (descending) { java.util.Collections.reverse(initial); java.util.Collections.reverse(latest); }
-                same("initial secondary", initial, backend.scan(search(1, all, 0)), true);
-                same("same PK moves between secondary entries", latest, backend.scan(search(1, all, 7)), true);
+                same("initial secondary", initial, IndexTestSupport.scan(backend, search(1, all, 0)), true);
+                same("same PK moves between secondary entries", latest, IndexTestSupport.scan(backend, search(1, all, 7)), true);
                 same("secondary limit", latest.subList(0, 2),
-                        backend.scan(search(1, all, 7).toBuilder().setLimit(2).build()), true);
+                        IndexTestSupport.scan(backend, search(1, all, 7).toBuilder().setLimit(2).build()), true);
             }
         }
     }
@@ -220,7 +238,7 @@ public class VersionedIndexBackendTest {
                     var group = ReadGroup.newBuilder().setCombineMode(ReadGroup.CombineMode.INTERSECTION)
                             .addRequests(ReadRequest.newBuilder().setScan(search(1, Range.equal(IndexKey.ofInt(a)), last)))
                             .addRequests(ReadRequest.newBuilder().setScan(search(2, Range.equal(IndexKey.ofInt(b)), last))).build();
-                    var results = List.of(backend.scan(group.getRequests(0).getScan()),backend.scan(group.getRequests(1).getScan()));
+                    var results = List.of(IndexTestSupport.scan(backend, group.getRequests(0).getScan()),IndexTestSupport.scan(backend, group.getRequests(1).getScan()));
                     var response = TraceRequests.combine(group,results);
                     assertEquals(intersection, response.size());
                     var union = TraceRequests.combine(group.toBuilder().setCombineMode(ReadGroup.CombineMode.UNION).build(),results);
@@ -232,12 +250,12 @@ public class VersionedIndexBackendTest {
     @Test
     public void rejectsWhatTheProtocolForbids() throws Exception {
         try (var backend = load(List.of(), ValueKind.ROW_ID)) {
-            assertEquals(IndexStatus.INVALID, IndexExecution.execute(backend, PutRequest.newBuilder().setTs(-1).build()).status());
-            assertEquals(IndexStatus.INVALID, IndexExecution.execute(backend, GetRequest.newBuilder().setReadTs(-1).build()).status());
+            assertEquals(IndexStatus.INVALID, IndexTestSupport.execute(backend, PutRequest.newBuilder().setTs(-1).build()).status());
+            assertEquals(IndexStatus.INVALID, IndexTestSupport.execute(backend, GetRequest.newBuilder().setReadTs(-1).build()).status());
         }
         try (var backend = load(List.of(), ValueKind.ROW_ID)) {
             for (var trace : List.of(ReadGroup.getDefaultInstance(), TraceOperation.getDefaultInstance(), TraceRecord.getDefaultInstance()))
-                assertEquals(IndexStatus.INVALID, IndexExecution.execute(backend, trace).status());
+                assertEquals(IndexStatus.INVALID, IndexTestSupport.execute(backend, trace).status());
         }
         // An index directory is never reused.
         var path = temporary.getRoot().toPath().resolve("once");
@@ -290,8 +308,8 @@ public class VersionedIndexBackendTest {
             backend.flush();
         }
         try (var backend = VersionedIndexBackend.open(path, ValueKind.ROW_ID)) {
-            same("retained old value", List.of(row(7, 0, 70)), backend.scan(search(0, Range.equal(IndexKey.ofInt(7)), 41)), true);
-            same("retained latest value", List.of(row(7, 42, 71)), backend.scan(search(0, Range.equal(IndexKey.ofInt(7)), 42)), true);
+            same("retained old value", List.of(row(7, 0, 70)), IndexTestSupport.scan(backend, search(0, Range.equal(IndexKey.ofInt(7)), 41)), true);
+            same("retained latest value", List.of(row(7, 42, 71)), IndexTestSupport.scan(backend, search(0, Range.equal(IndexKey.ofInt(7)), 42)), true);
             // The binding survives the reopen: the index still refuses another trace.
             backend.bind("trace-a");
             assertThrows(java.io.IOException.class, () -> backend.bind("trace-b"));

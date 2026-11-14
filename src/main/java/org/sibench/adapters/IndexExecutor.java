@@ -24,19 +24,14 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
     private boolean closed;
 
     public IndexExecutor(IndexBackend backend) {
-        this(backend, 5000);
-    }
-
-    IndexExecutor(IndexBackend backend, long intervalMillis) {
         this.backend = backend;
         int processors = Runtime.getRuntime().availableProcessors();
         writers = pool(processors, "sibench-write");
         readers = pool(2 * processors, "sibench-read");
-        if (intervalMillis < 1) throw new IllegalArgumentException("Invalid maintenance interval");
         maintenance = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(work -> {
             var thread = new Thread(work, "sibench-persistence"); thread.setDaemon(true); return thread;
         });
-        maintenance.scheduleWithFixedDelay(this::persist, intervalMillis, intervalMillis, TimeUnit.MILLISECONDS);
+        maintenance.scheduleWithFixedDelay(this::persist, 5, 5, TimeUnit.SECONDS);
     }
 
     private static ExecutorService pool(int count, String name) {

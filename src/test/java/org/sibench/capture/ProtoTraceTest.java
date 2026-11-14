@@ -18,6 +18,20 @@ import java.util.*;
 public class ProtoTraceTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test public void closeFailureCannotReplaceTheUnfinishedSourceError()throws Exception {
+        var writer=new ProtoTrace.Writer(temporary.getRoot().toPath().resolve("close-error.pb.zst"),true);
+        writer.accept(IndexOperationTrace.transaction(0,IndexOperationTrace.TRANSACTION_BEGIN,1,1,0));
+        var field=writer.getClass().getDeclaredField("output");field.setAccessible(true);
+        var output=(java.io.DataOutputStream)field.get(writer);
+        field.set(writer,new java.io.DataOutputStream(output) {
+            @Override public void close()throws IOException {super.close();throw new IOException("injected close failure");}
+        });
+        var failure=assertThrows(IOException.class,writer::close);
+        assertTrue(failure.getMessage().contains("Incomplete source"));
+        assertEquals("injected close failure",failure.getSuppressed()[0].getMessage());
+        assertThrows(IllegalStateException.class,writer::sha256);
+    }
+
     @Test public void operationRecordOwnsMetadataAndReusesRpcPayload() throws Exception {
         var get = GetRequest.newBuilder().setKey(ByteString.copyFrom(HexFormat.of().parseHex(
                 "00000001000000000180" + "00ff".repeat(6) + "2a0000"))).build();
@@ -175,7 +189,7 @@ public class ProtoTraceTest {
         Path stop = file.resolveSibling("primitive-count.stop");
         var budget = new RequestBudget(4, java.time.Duration.ofSeconds(10));
         budget.begin("mixed", 1, stop);
-        var writer = new ProtoTrace.Writer(file, false, false, budget);
+        var writer = new ProtoTrace.Writer(file, false, budget);
         try (writer) {
             writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
             for (int ordinal = 1; ordinal <= 2; ordinal++) {
@@ -206,7 +220,7 @@ public class ProtoTraceTest {
         assertEquals(1L, budget.finish().get("overshoot_requests"));
     }
 
-    @Test public void capturedAbortValidatesMoreThanAMillionReadsWithoutBufferingOrExporting() throws Exception {
+    @Test public void capturedAbortStreamsMoreThanAMillionReadsWithoutBuffering() throws Exception {
         var writer = new ProtoTrace.Writer(temporary.getRoot().toPath().resolve("large-abort.pb.zst"), true);
         var search = IndexOperationTrace.search(2, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 0, 0, 0)
                 .withTransaction(1, 0).withWorkUnitId(1);
@@ -222,28 +236,28 @@ public class ProtoTraceTest {
                     0, 0, IndexOperationTrace.SNAPSHOT_SEARCH).withTransaction(2, 0).withWorkUnitId(2));
             writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 2, 2, 0));
         }
-        assertEquals(3, writer.count());
+        assertEquals(count + 3L, writer.count());
         var statistics = (Map<?, ?>) writer.statistics().get("source_projection");
-        assertEquals((long) count, statistics.get("excluded_aborted_search_members"));
+        assertEquals((long) count, statistics.get("retained_rollback_search_members"));
         assertEquals(1L, statistics.get("peak_buffered_operations"));
-        assertEquals(1L, statistics.get("excluded_aborted_transactions"));
+        assertEquals(1L, statistics.get("aborted_transactions"));
     }
 
     @Test public void capturedAbortStillRejectsInvalidFactsAndContradictoryOutcomes() throws Exception {
         var begin = IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0);
-        var future = new CommittedOperations(operation -> fail("No aborted source operation may be exported"), false);
+        var future = new CommittedOperations(operation -> fail("Invalid source operations must not be exported"));
         future.expectAbort();
         future.accept(begin);
         assertThrows(IOException.class, () -> future.accept(IndexOperationTrace.search(1, 1, 0,
                 IndexOperationTrace.Range.equal(IndexKey.ofInt(1)), 1, 0, IndexOperationTrace.SNAPSHOT_SEARCH)
                 .withTransaction(1, 0)));
-        var expansion = new CommittedOperations(operation -> fail("No aborted source operation may be exported"), false);
+        var expansion = new CommittedOperations(operation -> fail("Invalid source operations must not be exported"));
         expansion.expectAbort();
         expansion.accept(begin);
         expansion.accept(write(IndexOperationTrace.UPSERT, 2, 1, 1).withExpansion(0, 2));
         assertThrows(IOException.class, () -> expansion.accept(IndexOperationTrace.transaction(
                 0, IndexOperationTrace.TRANSACTION_ABORT, 1, 1, 1)));
-        var outcome = new CommittedOperations(operation -> fail("No aborted source operation may be exported"), false);
+        var outcome = new CommittedOperations(operation -> fail("Invalid source operations must not be exported"));
         outcome.expectAbort();
         assertThrows(IOException.class, outcome::expectAbort);
         assertThrows(IOException.class, outcome::finish);
@@ -259,7 +273,7 @@ public class ProtoTraceTest {
             var budget = new RequestBudget(2, java.time.Duration.ofSeconds(10));
             Path stop = file.resolveSibling("stop-" + secondary);
             budget.begin("mixed", 1, stop);
-            var writer = new ProtoTrace.Writer(file, secondary, false, budget);
+            var writer = new ProtoTrace.Writer(file, secondary, budget);
             try (writer) {
                 writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
                 for (int i = 0; i < 2; i++) writer.accept(IndexOperationTrace.search(11, 1, i,
@@ -267,8 +281,6 @@ public class ProtoTraceTest {
                         IndexOperationTrace.UNION_GROUP | IndexOperationTrace.SNAPSHOT_SEARCH, i, 2).withTransaction(1, 0).withWorkUnitId(1));
                 IndexMutation.emit(write(IndexOperationTrace.UPSERT, 1, 1, 1),
                         Map.of(1, IndexKey.ofInt(2)), Map.of(1, IndexKey.ofInt(3)), writer);
-                writer.accept(IndexOperationTrace.search(13, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)),
-                        0, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH).withTransaction(1, 1).withVersion(1).withWorkUnitId(1));
                 writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 1, 1, 1));
                 writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 2, 2, 0));
                 writer.accept(IndexOperationTrace.search(15, 1, 1, IndexOperationTrace.Range.equal(IndexKey.ofInt(3)),
@@ -281,20 +293,22 @@ public class ProtoTraceTest {
                 writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 3, 3, 0));
             }
             assertTrue(Files.isRegularFile(stop));
-            assertEquals(secondary ? 7 : 3, budget.count());
+            assertEquals(secondary ? 8 : 3, budget.count());
             budget.end();
-            assertEquals(secondary ? 5L : 1L, budget.finish().get("overshoot_requests"));
+            assertEquals(secondary ? 6L : 1L, budget.finish().get("overshoot_requests"));
             var decoded = new ArrayList<Operation>();
-            assertEquals(secondary ? 11 : 7, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
-            assertEquals(secondary ? 11 : 7, writer.count());
+            assertEquals(secondary ? 12 : 7, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
+            assertEquals(secondary ? 12 : 7, writer.count());
             assertEquals(Files.size(file), writer.bytesWritten());
             var stats = writer.statistics();
-            assertEquals(secondary ? 7L : 3L, stats.get("effective_requests"));
+            assertEquals(secondary ? 8L : 3L, stats.get("effective_requests"));
             assertEquals(secondary ? 4L : 3L, stats.get("primary_entries"));
-            assertEquals(secondary ? 3L : 0L, stats.get("secondary_entries"));
+            assertEquals(secondary ? 4L : 0L, stats.get("secondary_entries"));
+            assertEquals(Map.of("primary",Map.of("get",secondary?3L:2L,"put",1L),
+                    "secondary",secondary?Map.of("scan",2L,"put",1L,"delete",1L):Map.of()),stats.get("index_operations"));
             assertEquals(Map.of("begin", 2L, "commit", 2L), stats.get("transaction_markers"));
             assertEquals(secondary
-                    ? Map.of("put", 2L, "delete", 1L, "union_query", 2L)
+                    ? Map.of("put", 2L, "delete", 1L, "union_query", 2L, "scan", 1L)
                     : Map.of("put", 1L, "union_query", 1L), stats.get("request_types"));
             if (!secondary) {
                 assertTrue(decoded.stream().allMatch(o -> o.index() == 0));
@@ -323,14 +337,11 @@ public class ProtoTraceTest {
     }
 
     @Test
-    public void abortedWritesAndLocalReadsAreExcludedBeforeCounting() throws Exception {
+    public void abortedWritesAreExcludedBeforeCounting() throws Exception {
         Path file = temporary.getRoot().toPath().resolve("abort.pb.zst");
         var original = List.of(
                 IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0),
                 write(IndexOperationTrace.UPSERT, 2, 1, 1).withExpansion(0, 1),
-                IndexOperationTrace.search(13, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)),
-                        0, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
-                        .withTransaction(1, 1).withVersion(1).withWorkUnitId(1),
                 IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_ABORT, 1, 1, 1));
         var writer = new ProtoTrace.Writer(file, true);
         try (writer) { for (var operation : original) writer.append(operation); }
@@ -340,7 +351,6 @@ public class ProtoTraceTest {
         assertEquals(0L, writer.statistics().get("effective_requests"));
         var filtered = (Map<?, ?>) writer.statistics().get("source_projection");
         assertEquals(1L, filtered.get("excluded_aborted_writes"));
-        assertEquals(1L, filtered.get("excluded_local_search_members"));
     }
 
     @Test
@@ -351,9 +361,6 @@ public class ProtoTraceTest {
         original.add(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
         original.add(write(IndexOperationTrace.LOGICAL_DELETE, 1, 1, 1).withExpansion(0, 1));
         original.add(write(IndexOperationTrace.UPSERT, 2, 1, 2).withExpansion(0, 1));
-        original.add(IndexOperationTrace.search(13, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)),
-                0, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
-                .withTransaction(1, 2).withVersion(1).withWorkUnitId(1));
         original.add(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 1, 1, 2));
         for (int i = 0; i < 2; i++) original.add(IndexOperationTrace.search(15, 1, 0,
                 IndexOperationTrace.Range.equal(IndexKey.ofInt(i + 1)), null, 1, 1,
@@ -364,7 +371,7 @@ public class ProtoTraceTest {
         assertEquals(6, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
         assertEquals(List.of(original.get(0), original.get(1), original.get(3),
                 IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_COMMIT, 1, 1, 0),
-                original.get(6), original.get(7)), decoded);
+                original.get(5), original.get(6)), decoded);
         try (var model = new IndexReferenceReplay(true, true, new IndexReferenceReplay.Settings(null, 1, 1, 1024))) {
             for (Operation operation : decoded) if (!IndexOperationTrace.isControl(operation)) model.accept(operation);
             assertEquals(1, model.lookupPrimary(1, IndexKey.ofInt(1), 0).value());
@@ -462,29 +469,33 @@ public class ProtoTraceTest {
     }
 
     @Test
-    public void abortedSourceDropsItsSnapshotAndWholeLocalGroup() throws Exception {
+    public void abortedSourceRetainsItsSnapshotAndWholeReadGroup() throws Exception {
         var file = temporary.getRoot().toPath().resolve("aborted-snapshots.pb.zst");
         var budget = new RequestBudget(0, java.time.Duration.ofSeconds(10));
         budget.begin("snapshot", 1, file.resolveSibling("stop"));
-        var writer = new ProtoTrace.Writer(file, true, false, budget);
+        var writer = new ProtoTrace.Writer(file, true, budget);
         try (writer) {
             writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
             writer.append(IndexOperationTrace.search(1, 1, 0, IndexOperationTrace.Range.equal(IndexKey.ofInt(1)),
                     0, 1, IndexOperationTrace.SNAPSHOT_SEARCH).withTransaction(1, 0).withWorkUnitId(1));
-            writer.append(write(IndexOperationTrace.UPSERT, 2, 1, 1).withExpansion(0, 1));
             for (int member = 0; member < 2; member++)
                 writer.append(IndexOperationTrace.search(13, 1, 0,
                         IndexOperationTrace.Range.equal(IndexKey.ofInt(member + 1)), null, 0, 1,
-                        IndexOperationTrace.UNION_GROUP | IndexOperationTrace.TRANSACTION_LOCAL_SEARCH, member, 2)
-                        .withTransaction(1, 1).withVersion(1).withWorkUnitId(1));
+                        IndexOperationTrace.UNION_GROUP | IndexOperationTrace.SNAPSHOT_SEARCH, member, 2)
+                        .withTransaction(1, 0).withWorkUnitId(1));
+            writer.append(IndexOperationTrace.write(14, IndexOperationTrace.UPSERT, 1, 0,
+                    IndexKey.ofInt(1), 1, 0, 0, 2).withTransaction(1, 1).withWorkUnitId(1).withExpansion(0, 1));
             assertEquals(0, budget.count());
             writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_ABORT, 1, 1, 1));
         }
         var decoded = new ArrayList<Operation>();
-        assertEquals(0, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
-        assertEquals(0, budget.count());
+        assertEquals(3, ProtoTrace.read(file, writer.sha256(), writer.logicalSha256(), decoded::add));
+        assertEquals(3, budget.count());
+        assertTrue(decoded.stream().allMatch(o -> o.transactionId() == 0));
+        assertTrue(decoded.get(1).grouped());
+        assertTrue(decoded.get(2).grouped());
         budget.end();
-        assertEquals(2L, ((Map<?, ?>) writer.statistics().get("source_projection")).get("excluded_local_search_members"));
+        assertEquals(3L, ((Map<?, ?>) writer.statistics().get("source_projection")).get("retained_rollback_search_members"));
     }
 
     @Test

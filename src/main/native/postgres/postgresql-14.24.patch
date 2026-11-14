@@ -149,6 +149,30 @@
  
  		ResourceOwnerRelease(TopTransactionResourceOwner,
  							 RESOURCE_RELEASE_BEFORE_LOCKS,
+@@ -4859,6 +4864,7 @@
+ 	/*
+ 	 * Call start-of-subxact callbacks
+ 	 */
++	sib_subtransaction("subtransaction_begin", s->subTransactionId, s->parent->subTransactionId);
+ 	CallSubXactCallbacks(SUBXACT_EVENT_START_SUB, s->subTransactionId,
+ 						 s->parent->subTransactionId);
+ 
+@@ -4918,6 +4924,7 @@
+ 							s->parent->subTransactionId);
+ 	AtSubCommit_Notify();
+ 
++	sib_subtransaction("subtransaction_commit", s->subTransactionId, s->parent->subTransactionId);
+ 	CallSubXactCallbacks(SUBXACT_EVENT_COMMIT_SUB, s->subTransactionId,
+ 						 s->parent->subTransactionId);
+ 
+@@ -5093,6 +5100,7 @@
+ 		if (FullTransactionIdIsValid(s->fullTransactionId))
+ 			AtSubAbort_childXids();
+ 
++		sib_subtransaction("subtransaction_abort", s->subTransactionId, s->parent->subTransactionId);
+ 		CallSubXactCallbacks(SUBXACT_EVENT_ABORT_SUB, s->subTransactionId,
+ 							 s->parent->subTransactionId);
+ 
 --- a/src/backend/catalog/index.c
 +++ b/src/backend/catalog/index.c
 @@ -20,6 +20,7 @@
@@ -197,16 +221,18 @@
  
  	/*
  	 * startup tuple receiver, if we will be emitting tuples
-@@ -372,6 +375,8 @@
+@@ -372,6 +375,10 @@
  	if (queryDesc->totaltime)
  		InstrStopNode(queryDesc->totaltime, estate->es_processed);
  
-+	sib_executor_run_end(dest, estate->es_processed);
++	sib_executor_run_end(dest, estate->es_processed,
++		queryDesc->operation == CMD_SELECT && !queryDesc->plannedstmt->hasModifyingCTE &&
++		ScanDirectionIsForward(direction) && (count == 0 || estate->es_processed < count));
 +
  	MemoryContextSwitchTo(oldcontext);
  }
  
-@@ -463,6 +468,8 @@
+@@ -463,6 +470,8 @@
  {
  	EState	   *estate;
  	MemoryContext oldcontext;
@@ -502,3 +528,68 @@
  	/*
  	 * User locks are not released by transaction end, so be sure to release
  	 * them explicitly.
+--- a/src/backend/commands/trigger.c
++++ b/src/backend/commands/trigger.c
+@@ -12,6 +12,7 @@
+  *-------------------------------------------------------------------------
+  */
+ #include "postgres.h"
++#include "sibench_capture.h"
+ 
+ #include "access/genam.h"
+ #include "access/htup_details.h"
+@@ -2383,6 +2384,8 @@
+ {
+ 	TriggerDesc *trigdesc = relinfo->ri_TrigDesc;
+ 
++	sib_row_change(relinfo->ri_RelationDesc, NULL, slot, estate->es_output_cid);
++
+ 	if (relinfo->ri_FdwRoutine && transition_capture &&
+ 		transition_capture->tcs_insert_new_table)
+ 	{
+@@ -2632,7 +2635,8 @@
+ 				 errmsg("cannot collect transition tuples from child foreign tables")));
+ 	}
+ 
+-	if ((trigdesc && trigdesc->trig_delete_after_row) ||
++	if (sib_relation(relinfo->ri_RelationDesc) ||
++		(trigdesc && trigdesc->trig_delete_after_row) ||
+ 		(transition_capture && transition_capture->tcs_delete_old_table))
+ 	{
+ 		TupleTableSlot *slot = ExecGetTriggerOldSlot(estate, relinfo);
+@@ -2649,7 +2653,10 @@
+ 		else
+ 			ExecForceStoreHeapTuple(fdw_trigtuple, slot, false);
+ 
+-		AfterTriggerSaveEvent(estate, relinfo, TRIGGER_EVENT_DELETE,
++		sib_row_change(relinfo->ri_RelationDesc, slot, NULL, estate->es_output_cid);
++		if ((trigdesc && trigdesc->trig_delete_after_row) ||
++		(transition_capture && transition_capture->tcs_delete_old_table))
++			AfterTriggerSaveEvent(estate, relinfo, TRIGGER_EVENT_DELETE,
+ 							  true, slot, NULL, NIL, NULL,
+ 							  transition_capture);
+ 	}
+@@ -2946,7 +2953,8 @@
+ 				 errmsg("cannot collect transition tuples from child foreign tables")));
+ 	}
+ 
+-	if ((trigdesc && trigdesc->trig_update_after_row) ||
++	if (sib_relation(relinfo->ri_RelationDesc) ||
++		(trigdesc && trigdesc->trig_update_after_row) ||
+ 		(transition_capture &&
+ 		 (transition_capture->tcs_update_old_table ||
+ 		  transition_capture->tcs_update_new_table)))
+@@ -2972,7 +2980,12 @@
+ 		else
+ 			ExecClearTuple(oldslot);
+ 
+-		AfterTriggerSaveEvent(estate, relinfo, TRIGGER_EVENT_UPDATE,
++		sib_row_change(relinfo->ri_RelationDesc, oldslot, newslot, estate->es_output_cid);
++		if ((trigdesc && trigdesc->trig_update_after_row) ||
++		(transition_capture &&
++		 (transition_capture->tcs_update_old_table ||
++		  transition_capture->tcs_update_new_table)))
++			AfterTriggerSaveEvent(estate, relinfo, TRIGGER_EVENT_UPDATE,
+ 							  true, oldslot, newslot, recheckIndexes,
+ 							  ExecGetAllUpdatedCols(relinfo, estate),
+ 							  transition_capture);

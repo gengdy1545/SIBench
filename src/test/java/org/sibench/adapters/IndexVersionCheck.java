@@ -27,7 +27,7 @@ public final class IndexVersionCheck {
         }
         for(int pass=0;pass<2;pass++) {
             for(int timestamp=0;timestamp<=5;timestamp++) {
-                var actual=backend.scan(ScanRequest.newBuilder().setReadTs(timestamp).build());
+                var actual=IndexTestSupport.scan(backend, ScanRequest.newBuilder().setReadTs(timestamp).build());
                 if(timestamp==2) { if(!actual.isEmpty())throw new IOException("Deletion resurrected an older value"); }
                 else require(actual,timestamp<2?70+timestamp:73);
             }

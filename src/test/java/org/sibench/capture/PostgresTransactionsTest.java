@@ -14,14 +14,68 @@ import java.util.concurrent.atomic.AtomicLong;
 public class PostgresTransactionsTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test public void fullReadCompletionDoesNotRequireExecutorCleanupAndKeepsFailedGaps()throws Exception {
+        try(var source=new PostgresTransactions(temporary.getRoot().toPath().resolve("reads"),1<<20,8)) {
+            var chunk=source.begin(7);
+            long sequence=0;
+            for(String fields:java.util.List.of("\"event\":\"executor_start\",\"req\":1",
+                    "\"event\":\"executor_run_end\",\"req\":1,\"read_complete\":true",
+                    "\"event\":\"executor_end\",\"req\":1",
+                    "\"event\":\"executor_start\",\"req\":2",
+                    "\"event\":\"executor_run_end\",\"req\":2,\"read_complete\":false",
+                    "\"event\":\"transaction_abort\",\"xid\":0",
+                    "\"event\":\"executor_start\",\"req\":3",
+                    "\"event\":\"executor_run_end\",\"req\":3,\"read_complete\":true")) {
+                String line="{\"subid\":1,\"depth\":1,\"sequence\":"+(++sequence)+","+fields+"}";
+                chunk.append(line,com.google.gson.JsonParser.parseString(line).getAsJsonObject(),line.length()+1);
+            }
+            assertTrue(chunk.completed(1));assertFalse(chunk.completed(2));assertTrue(chunk.completed(3));
+            source.complete(chunk,1,false,false);chunk.close();
+        }
+    }
+
     private static void append(PostgresTransactions.Chunk chunk, int pid, String value) throws IOException {
-        String line = "{\"event\":\"sample\",\"pid\":" + pid + ",\"value\":\"" + value + "\"}";
+        String line = "{\"subid\":1,\"event\":\"sample\",\"pid\":" + pid + ",\"value\":\"" + value + "\"}";
         chunk.append(line, com.google.gson.JsonParser.parseString(line).getAsJsonObject(),
                 (line + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
     }
 
     private static void read(PostgresTransactions.Chunk chunk, PostgresTransactions.Events consumer) throws IOException {
         chunk.read(consumer);
+    }
+
+    private static com.google.gson.JsonObject event(PostgresTransactions.Chunk chunk,String fields)throws IOException {
+        String line="{"+fields+"}";
+        var event=com.google.gson.JsonParser.parseString(line).getAsJsonObject();
+        chunk.append(line,event,line.length()+1);return event;
+    }
+
+    @Test public void nativeSubtransactionOutcomesCertifyBothPastReadsAndFinalSurvival()throws Exception {
+        try(var source=new PostgresTransactions(temporary.getRoot().toPath().resolve("subtransactions"),1<<20,8)) {
+            var chunk=source.begin(7);
+            event(chunk,"\"event\":\"subtransaction_begin\",\"subid\":2,\"parent_subid\":1");
+            var parent=event(chunk,"\"event\":\"sample\",\"subid\":2,\"sequence\":2");
+            event(chunk,"\"event\":\"subtransaction_begin\",\"subid\":3,\"parent_subid\":2");
+            var child=event(chunk,"\"event\":\"sample\",\"subid\":3,\"sequence\":4");
+            event(chunk,"\"event\":\"subtransaction_commit\",\"subid\":3,\"parent_subid\":2");
+            event(chunk,"\"event\":\"subtransaction_abort\",\"subid\":2,\"parent_subid\":1,\"sequence\":6");
+            var outer=event(chunk,"\"event\":\"sample\",\"subid\":1,\"sequence\":7");
+            source.complete(chunk,1,true,true);
+            assertEquals(6,chunk.rollbackAt(parent));assertEquals(6,chunk.rollbackAt(child));
+            assertFalse(chunk.survived(parent));assertFalse(chunk.survived(child));assertTrue(chunk.survived(outer));
+        }
+        for(String invalid:java.util.List.of("\"event\":\"sample\",\"subid\":2",
+                "\"event\":\"sample\"","\"event\":\"subtransaction_commit\",\"subid\":1,\"parent_subid\":0")) {
+            try(var source=new PostgresTransactions(temporary.newFolder().toPath().resolve("invalid"),1<<20,8)) {
+                var chunk=source.begin(7);assertThrows(IOException.class,()->event(chunk,invalid));
+            }
+        }
+        try(var source=new PostgresTransactions(temporary.newFolder().toPath().resolve("unclosed"),1<<20,8)) {
+            var chunk=source.begin(7);
+            event(chunk,"\"event\":\"subtransaction_begin\",\"subid\":2,\"parent_subid\":1");
+            assertThrows(IOException.class,()->source.complete(chunk,1,true,true));
+            event(chunk,"\"event\":\"subtransaction_abort\",\"subid\":2,\"parent_subid\":1,\"sequence\":2");
+        }
     }
 
     @Test public void grantsSourceCreditOnlyAfterOrderedConsumption()throws Exception {
@@ -118,9 +172,9 @@ public class PostgresTransactionsTest {
     }
 
     @Test public void spillTransitionPreservesNestedFactsAndUtf8Accounting() throws Exception {
-        String first = "{\"event\":\"row_change\",\"pid\":1,\"new\":{\"key\":\"α🙂\",\"n\":9223372036854775807,\"value\":null}}";
-        String large = "{\"event\":\"row_change\",\"pid\":1,\"new\":{\"value\":\"" + "x".repeat(300_000) + "\"}}";
-        String last = "{\"event\":\"scan_rescan\",\"pid\":1,\"keys\":[{\"value\":\"\\\"\\nα🙂\"}],\"found\":false}";
+        String first = "{\"subid\":1,\"event\":\"row_change\",\"pid\":1,\"new\":{\"key\":\"α🙂\",\"n\":9223372036854775807,\"value\":null}}";
+        String large = "{\"subid\":1,\"event\":\"row_change\",\"pid\":1,\"new\":{\"value\":\"" + "x".repeat(300_000) + "\"}}";
+        String last = "{\"subid\":1,\"event\":\"scan_rescan\",\"pid\":1,\"keys\":[{\"value\":\"\\\"\\nα🙂\"}],\"found\":false}";
         var lines = java.util.List.of(first, large, last);
         long expectedBytes = 0;
         try (var source = new PostgresTransactions(temporary.getRoot().toPath().resolve("transition"), 1 << 20, 1)) {

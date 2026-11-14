@@ -11,32 +11,26 @@ import java.util.Objects;
 
 import static org.sibench.capture.IndexOperationTrace.*;
 
-/** Validates native source operations before exporting only successful transactions. */
+/** Validates source outcomes, exporting committed writes and certified snapshot reads. */
 final class CommittedOperations {
     static final int MAX_TRANSACTION_OPERATIONS = 1_000_000;
     private final Consumer output;
-    private final boolean exportQueries;
     private final ArrayList<Operation> pending = new ArrayList<>();
     private record Entry(int table, int index, IndexKey indexedValue, IndexKey primaryKey) {
         Entry(Operation operation) { this(operation.table(), operation.index(), operation.indexedValue(), operation.key()); }
     }
-    private final Map<Entry, Integer> lastWrites = new HashMap<>();
+    private record LastWrite(Operation operation, int slot) {}
+    private final Map<Entry, LastWrite> lastWrites = new HashMap<>();
     private long transaction, lastVersion, lastCommittedVersion, ordinal, lastSource, sourceOperations, superseded;
     private Operation begin, mutation, previousExpansion, searchGroup;
     private int expansionMembers, searchMembers;
-    private long abortedTransactions, abortedWrites, abortedSearches, localSearches, coalescedWrites, peakBuffered;
-    private long querySearches, transactionQuerySearches;
-    private boolean knownAbort, knownQuery;
+    private long abortedTransactions, abortedWrites, coalescedWrites, peakBuffered;
+    private boolean knownAbort;
+    private long retainedAbortReads;
+    private long localSearches, pendingContextEntries;
 
-    CommittedOperations(Consumer output, boolean exportQueries) {
+    CommittedOperations(Consumer output) {
         this.output = output;
-        this.exportQueries = exportQueries;
-    }
-
-    /** Only a source boundary that certifies an independent query may supply this hint. */
-    void expectQuery() throws IOException {
-        if (transaction != 0 || knownQuery) throw new IOException("Query classification must precede its transaction");
-        knownQuery = true;
     }
 
     void expectAbort() throws IOException {
@@ -46,10 +40,10 @@ final class CommittedOperations {
 
     void accept(Operation operation) throws IOException {
         validate(operation);
+        if (!operation.localWrites().isEmpty() && (operation.flags() & TRANSACTION_LOCAL_SEARCH) != 0)
+            throw new IOException("Source read has conflicting private visibility");
         if (knownAbort && transaction == 0 && operation.kind() != TRANSACTION_BEGIN)
             throw new IOException("Captured Abort requires a source transaction begin");
-        if (knownQuery && transaction == 0 && operation.kind() != TRANSACTION_BEGIN)
-            throw new IOException("Query classification requires a source transaction begin");
         if (operation.kind() == INSERT && operation.version() != 0)
             throw new IOException("Baseline requires timestamp zero");
         if (isControl(operation)) {
@@ -62,7 +56,13 @@ final class CommittedOperations {
             lastSource = operation.sourceEvent();
         }
         if (searchGroup != null && !operation.grouped()) throw new IOException("Interrupted source search group");
-        if (operation.kind() == SEARCH) search(operation);
+        if (operation.kind() == SEARCH) {
+            search(operation);
+            if ((operation.flags() & TRANSACTION_LOCAL_SEARCH) != 0) {
+                localSearches++;
+                operation = snapshot(operation).withLocalWrites(privateWrites(operation));
+            } else if (operation.transactionId() != 0 && operation.mutationOrdinal() > 0) localSearches++;
+        }
         else if (isMutation(operation)) mutation(operation);
         else if (transaction != 0 || operation.transactionId() != 0 || operation.mutationOrdinal() != 0)
             throw new IOException("Unexpected source transaction metadata");
@@ -72,30 +72,29 @@ final class CommittedOperations {
             operation = IndexOperationTrace.search(operation.sourceEvent(), operation.table(), operation.index(),
                     operation.range(), operation.key(), lastCommittedVersion, operation.expectedCount(), operation.flags(),
                     operation.expansionPosition(), operation.expansionSize())
-                    .withTransaction(operation.transactionId(), operation.mutationOrdinal()).withWorkUnitId(operation.workUnitId());
+                    .withTransaction(operation.transactionId(), operation.mutationOrdinal()).withWorkUnitId(operation.workUnitId())
+                    .withLocalWrites(operation.localWrites());
+        if (isMutation(operation)) {
+            var previous = lastWrites.put(new Entry(operation), new LastWrite(operation, knownAbort ? -1 : pending.size()));
+            if (lastWrites.size() > MAX_TRANSACTION_OPERATIONS) throw new IOException("Private write context exceeds operation limit");
+            if (previous != null && !knownAbort) {
+                pending.set(previous.slot(), null);
+                superseded++;
+            }
+        }
         if (transaction == 0) output.accept(operation);
         // PG already holds the complete native transaction; validate its aborted operations without retaining them again.
         else if (knownAbort) {
-            if (operation.kind() == SEARCH) {
-                if ((operation.flags() & TRANSACTION_LOCAL_SEARCH) != 0) localSearches++;
-                else abortedSearches++;
-            } else abortedWrites++;
+            if (operation.kind() == SEARCH) retainAbortRead(operation);
+            else abortedWrites++;
         }
-        // Attributed at the outcome: reads of an aborted query transaction are Abort exclusions.
-        else if (knownQuery && !exportQueries && operation.kind() == SEARCH) transactionQuerySearches++;
         // Operations held for the outcome count against the limit, even when dropped or superseded early.
         else if (sourceOperations++ >= MAX_TRANSACTION_OPERATIONS)
             throw new IOException("Source transaction exceeds operation buffer limit");
-        else if (operation.kind() == SEARCH && (operation.flags() & TRANSACTION_LOCAL_SEARCH) != 0) localSearches++;
         else {
-            // A superseded write is never exported; its slot keeps the survivors' source order.
-            if (isMutation(operation)) {
-                Integer previous = lastWrites.put(new Entry(operation), pending.size());
-                if (previous != null) {
-                    pending.set(previous, null);
-                    superseded++;
-                }
-            }
+            pendingContextEntries += operation.localWrites().size();
+            if (pendingContextEntries > MAX_TRANSACTION_OPERATIONS)
+                throw new IOException("Buffered private read contexts exceed operation limit");
             pending.add(operation);
             peakBuffered = Math.max(peakBuffered, pending.size());
         }
@@ -109,7 +108,7 @@ final class CommittedOperations {
                     || operation.expectedCount() != 0)
                 throw new IOException("Invalid source group begin/order");
             transaction = operation.transactionId();
-            ordinal = lastSource = sourceOperations = superseded = transactionQuerySearches = 0;
+            ordinal = lastSource = sourceOperations = superseded = pendingContextEntries = 0;
             mutation = previousExpansion = null;
             expansionMembers = 0;
             begin = operation;
@@ -124,16 +123,14 @@ final class CommittedOperations {
         if (aborted) {
             abortedTransactions++;
             abortedWrites += superseded;
-            abortedSearches += transactionQuerySearches;
         } else {
             coalescedWrites += superseded;
-            querySearches += transactionQuerySearches;
             output.accept(begin);
         }
         for (Operation member : pending) {
             if (member == null) continue;
             if (aborted) {
-                if (member.kind() == SEARCH) abortedSearches++;
+                if (member.kind() == SEARCH) retainAbortRead(member);
                 else abortedWrites++;
             } else output.accept(member.kind() == SEARCH ? member : member.withExpansion(0, 1));
         }
@@ -147,11 +144,34 @@ final class CommittedOperations {
         lastVersion = transaction;
         transaction = 0;
         knownAbort = false;
-        knownQuery = false;
+    }
+
+    private void retainAbortRead(Operation operation) throws IOException {
+        output.accept(operation.withTransaction(0, 0).withVersion(0));
+        retainedAbortReads++;
+    }
+
+    private static Operation snapshot(Operation operation) {
+        return IndexOperationTrace.search(operation.sourceEvent(), operation.table(), operation.index(), operation.range(),
+                operation.key(), operation.readTimestamp(), operation.expectedCount(),
+                operation.flags() & ~TRANSACTION_LOCAL_SEARCH | SNAPSHOT_SEARCH,
+                operation.expansionPosition(), operation.expansionSize())
+                .withTransaction(operation.transactionId(), operation.mutationOrdinal()).withWorkUnitId(operation.workUnitId());
+    }
+
+    private java.util.List<Operation> privateWrites(Operation read) {
+        var selected = new java.util.TreeMap<com.google.protobuf.ByteString, Operation>(
+                com.google.protobuf.ByteString.unsignedLexicographicalComparator());
+        for (var latest : lastWrites.values()) {
+            var write = latest.operation();
+            if (!read.containsWrite(write)) continue;
+            var key = new org.sibench.trace.IndexEntry(write.table(), write.index(), write.indexedValue(), write.key()).bytes();
+            selected.put(key, IndexOperationTrace.privateWrite(write));
+        }
+        return java.util.List.copyOf(selected.values());
     }
 
     private void mutation(Operation operation) throws IOException {
-        if (knownQuery) throw new IOException("An independent query changed source rows");
         if (transaction == 0 || operation.transactionId() != transaction || operation.version() != transaction
                 || operation.mutationOrdinal() < 1)
             throw new IOException("Mutation missing matching source group/version");
@@ -196,8 +216,8 @@ final class CommittedOperations {
         } else if (operation.transactionId() != 0 || operation.mutationOrdinal() != 0 || local)
             throw new IOException("Transaction-local search outside source group");
         // A standalone snapshot has the same resolved-source dependency as one inside a group.
-        if (!local && (operation.readTimestamp() > lastVersion
-                || operation.readTimestamp() != lastVersion && (operation.flags() & SNAPSHOT_SEARCH) == 0))
+        if (operation.readTimestamp() > lastVersion
+                || !local && operation.readTimestamp() != lastVersion && (operation.flags() & SNAPSHOT_SEARCH) == 0)
             throw new IOException("Search requires an available source snapshot");
         if (!operation.grouped()) return;
         if (operation.expansionPosition() != searchMembers) throw new IOException("Search group member out of order");
@@ -224,17 +244,17 @@ final class CommittedOperations {
     }
 
     void finish() throws IOException {
-        if (transaction != 0 || searchGroup != null || knownAbort || knownQuery)
+        if (transaction != 0 || searchGroup != null || knownAbort)
             throw new IOException("Incomplete source transaction or search group");
     }
 
     long lastCommittedVersion() { return lastCommittedVersion; }
 
     Map<String, Long> statistics() {
-        return Map.of("excluded_aborted_transactions", abortedTransactions,
-                "excluded_aborted_writes", abortedWrites, "excluded_aborted_search_members", abortedSearches,
-                "excluded_local_search_members", localSearches,
-                "excluded_query_search_members", querySearches,
+        return Map.of("aborted_transactions", abortedTransactions,
+                "excluded_aborted_writes", abortedWrites,
+                "retained_rollback_search_members", retainedAbortReads,
+                "transaction_local_search_members", localSearches,
                 "coalesced_writes", coalescedWrites, "peak_buffered_operations", peakBuffered);
     }
 }

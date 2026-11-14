@@ -27,6 +27,7 @@ final class PostgresCounts {
                 long count=event.get("processed").getAsLong();
                 if(count<0)throw new IOException("Negative PG processed count");
                 processed=Math.addExact(processed,count);returned=true;
+                if(event.has("read_complete")&&event.get("read_complete").getAsBoolean())ended=true;
             }
             case "executor_end" -> {if(depth==1){if(!active)throw new IOException("PG execution ended without a request");ended=true;}}
             case "transaction_commit","transaction_abort" -> {

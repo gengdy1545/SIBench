@@ -9,7 +9,6 @@ native:
   build_directory: build/benchmarks/HyBench-2024
   sf: 1x
   clients: 1
-  ap_clients: 1
   xp_transaction_clients: 1
   xp_query_clients: 1
   duration_minutes: 1

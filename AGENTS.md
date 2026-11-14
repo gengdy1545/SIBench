@@ -65,6 +65,15 @@
   or implementation language is not a reason to move them into `develop/`.
   Document their entry points and prerequisites; do not duplicate core semantics
   in orchestration tests, but preserve independent correctness oracles.
+- Keep test fixtures, fault injection, synthetic responses and test-only helpers
+  under `src/test/`, outside production artifacts and execution paths. Do not add
+  runtime flags, environment/system-property switches or mutable hooks solely
+  for tests, or bypass production validation to make tests pass. Exercise real boundaries
+  from tests; retain dependency injection only when the abstraction also serves
+  production responsibilities. Move test-only machinery without weakening
+  runtime validation, error handling or independent regression coverage.
+  Language-native test modules are allowed in their owning build layout when
+  production compilation and artifacts exclude them entirely.
 - Keep delivered Trace and Index Service contracts under `docs/`.
   Keep development guides, experiment notes and diagnostic configurations in the
   ignored `develop/` directory. Required test fixtures belong under test resources
@@ -115,7 +124,11 @@
   state: keep only what Trace export needs, publish the Trace after normal host
   shutdown and then delete the database. Retain failure diagnostics; do not add
   crash recovery or reusable initial-state caches without an explicit need.
-  Published Traces are retained artifacts. Input integrity and source-completeness
+  Keep one current published Trace collection in COS, with one selected Trace per
+  benchmark/workload. Local Trace copies are disposable caches; verify their COS
+  counterparts before deleting the only local copy. Record accepted losses of
+  historical reproducibility when retiring obsolete Trace payloads, and preserve
+  selected raw reports, logs and manifests. Input integrity and source-completeness
   checks remain required in normal generation.
 - Maintain the current design by default. Do not add or retain superseded APIs,
   format readers, compatibility flags, fallback implementations or transition
@@ -165,6 +178,12 @@
   entry points. Keep externally relevant formats, service semantics, failure
   behavior and limits in `docs/`. Readers must be able to build, use and test the
   delivered project without local development notes.
+- Organize public documentation around complete user workflows. Keep input
+  preparation, validation and transfer with the workflow that consumes them;
+  Pixels CSV/CDC and columnar input instructions belong in the Pixels experiment
+  guide. Do not split implementation components into separate user guides.
+  Prefer short commands, tables and links over repeated explanations; remove
+  redundant pages and update their references together.
 - Put source investigations, build implementation details, tuning, detailed
   validation procedures and experiment records in `develop/`, indexed for reading
   on demand. When moving prose there, preserve public prerequisites and contracts;

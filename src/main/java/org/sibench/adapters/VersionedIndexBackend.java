@@ -84,7 +84,7 @@ public final class VersionedIndexBackend implements IndexBackend {
         try {
             store.put(VALUE_KIND, new byte[] {valueKindByte(valueKind)});
         } catch (IOException | RuntimeException error) {
-            store.close();
+            try { store.close(); } catch (IOException | RuntimeException cleanup) { error.addSuppressed(cleanup); }
             throw error;
         }
         return new VersionedIndexBackend(store, valueKind, path);
@@ -92,25 +92,24 @@ public final class VersionedIndexBackend implements IndexBackend {
 
     private static VersionedIndexBackend reopened(OrderedStore store, ValueKind valueKind, Path path)
             throws IOException {
-        byte[] stored = store.get(VALUE_KIND);
-        if (stored == null || stored.length != 1 || stored[0] != valueKindByte(valueKind)) {
-            store.close();
-            throw new IOException("Reopened index does not hold " + valueKind + " values");
-        }
-        var backend = new VersionedIndexBackend(store, valueKind, path);
-        byte[] prefix = new byte[] {0};
-        try (var entries = store.cursor(prefix, ByteKeys.successor(prefix))) {
-            entries.seek(prefix);
-            while (entries.valid()) {
-                if (!Arrays.equals(entries.key(), VALUE_KIND) && !Arrays.equals(entries.key(), TRACE_BINDING))
-                    throw new IOException("Unsupported index metadata");
-                entries.next();
+        try {
+            byte[] stored = store.get(VALUE_KIND);
+            if (stored == null || stored.length != 1 || stored[0] != valueKindByte(valueKind))
+                throw new IOException("Reopened index does not hold " + valueKind + " values");
+            byte[] prefix = new byte[] {0};
+            try (var entries = store.cursor(prefix, ByteKeys.successor(prefix))) {
+                entries.seek(prefix);
+                while (entries.valid()) {
+                    if (!Arrays.equals(entries.key(), VALUE_KIND) && !Arrays.equals(entries.key(), TRACE_BINDING))
+                        throw new IOException("Unsupported index metadata");
+                    entries.next();
+                }
             }
+            return new VersionedIndexBackend(store, valueKind, path);
         } catch (IOException | RuntimeException error) {
-            store.close();
+            try { store.close(); } catch (IOException | RuntimeException cleanup) { error.addSuppressed(cleanup); }
             throw error;
         }
-        return backend;
     }
 
     private static byte valueKindByte(ValueKind kind) {
@@ -153,6 +152,10 @@ public final class VersionedIndexBackend implements IndexBackend {
     @Override
     public ByteString get(GetRequest get) throws IOException {
         IndexExecution.validateGet(get);
+        if (get.getLocalWritesCount() != 0) {
+            var write = get.getLocalWrites(0);
+            return write.hasPut() ? write.getPut().getValue() : null;
+        }
         try (var cursor = store.cursor(null, null)) {
             return visible(cursor, entry(get.getKey()), get.getReadTs());
         }
@@ -161,6 +164,41 @@ public final class VersionedIndexBackend implements IndexBackend {
     @Override
     public void scan(ScanRequest scan, ValueSink sink) throws IOException {
         IndexExecution.validateScan(scan);
+        if (scan.getLocalWritesCount() == 0) {
+            scanEntries(scan, (key, value) -> { sink.accept(value); return true; });
+            return;
+        }
+        var writes = new java.util.TreeMap<byte[], ByteString>(Arrays::compareUnsigned);
+        for (var write : scan.getLocalWritesList())
+            writes.put(entry(write.hasPut() ? write.getPut().getKey() : write.getDelete().getKey()),
+                    write.hasPut() ? write.getPut().getValue() : null);
+        var iterator = (scan.getReverse() ? writes.descendingMap() : writes).entrySet().iterator();
+        // Merge private writes before applying the result limit; they never touch the ordered store.
+        class Merge {
+            java.util.Map.Entry<byte[], ByteString> next = iterator.hasNext() ? iterator.next() : null;
+            long count;
+            boolean full() { return scan.getLimit() != 0 && count >= scan.getLimit(); }
+            void advance() { next = iterator.hasNext() ? iterator.next() : null; }
+            void emit(ByteString value) throws IOException { if (value != null && !full()) { sink.accept(value); count++; } }
+            boolean base(byte[] key, ByteString value) throws IOException {
+                while (next != null && !full()) {
+                    int order = Arrays.compareUnsigned(next.getKey(), key) * (scan.getReverse() ? -1 : 1);
+                    if (order > 0) break;
+                    emit(next.getValue()); advance();
+                    if (order == 0) return !full();
+                }
+                emit(value); return !full();
+            }
+        }
+        var merge = new Merge();
+        scanEntries(scan.toBuilder().clearLocalWrites().setLimit(0).build(), merge::base);
+        while (merge.next != null && !merge.full()) { merge.emit(merge.next.getValue()); merge.advance(); }
+    }
+
+    @FunctionalInterface
+    private interface EntrySink { boolean accept(byte[] key, ByteString value) throws IOException; }
+
+    private void scanEntries(ScanRequest scan, EntrySink sink) throws IOException {
         byte[] start = scan.hasStartKey() ? entry(scan.getStartKey()) : new byte[] {1};
         byte[] end = scan.hasEndKey() ? entry(scan.getEndKey()) : new byte[] {2};
         if (Arrays.compareUnsigned(start, end) >= 0) return;
@@ -173,7 +211,7 @@ public final class VersionedIndexBackend implements IndexBackend {
                     long ts = ~ByteBuffer.wrap(key, entry.length, VERSION).getLong();
                     if (ts > scan.getReadTs()) cursor.seek(versioned(entry, scan.getReadTs()));
                     ByteString result = visibleAt(cursor, entry);
-                    if (result != null) { sink.accept(result); found++; }
+                    if (result != null) { if (!sink.accept(entry, result)) return; found++; }
                     if (cursor.valid() && sameEntry(cursor.key(), entry)) {
                         cursor.next();
                         if (cursor.valid() && sameEntry(cursor.key(), entry)) {
@@ -188,7 +226,7 @@ public final class VersionedIndexBackend implements IndexBackend {
                 while (cursor.valid() && (limit == 0 || found < limit)) {
                     byte[] entry = logical(cursor.key());
                     ByteString result = visible(versions, entry, scan.getReadTs());
-                    if (result != null) { sink.accept(result); found++; }
+                    if (result != null) { if (!sink.accept(entry, result)) return; found++; }
                     cursor.seekForPrev(entry);
                 }
             }

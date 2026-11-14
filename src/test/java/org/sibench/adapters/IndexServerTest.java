@@ -97,7 +97,7 @@ public class IndexServerTest {
                     assertThrows(ExecutionException.class,()->response.get(3,TimeUnit.SECONDS));
                 }
             }
-            assertTrue(backend.scan(ScanRequest.getDefaultInstance()).isEmpty());
+            assertTrue(IndexTestSupport.scan(backend, ScanRequest.getDefaultInstance()).isEmpty());
         }
     }
 
@@ -273,7 +273,7 @@ public class IndexServerTest {
                 try { return method.invoke(backend,args); } catch(java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
             });
             var batch=WriteBatchRequest.newBuilder(); for(int k=1;k<=3;k++) batch.addMutations(Mutation.newBuilder().setPut(put(k,0,k)));
-            assertEquals(IndexStatus.OK,IndexExecution.execute(wrapped,batch.build()).status());
+            assertEquals(IndexStatus.OK,IndexTestSupport.execute(wrapped,batch.build()).status());
             assertEquals(List.of(3),sizes);
         }
     }

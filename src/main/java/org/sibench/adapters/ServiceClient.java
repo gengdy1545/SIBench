@@ -117,7 +117,7 @@ abstract class ServiceClient implements ReplayTarget {
             groupResponse = new CompletableFuture<>();
         }
         var checked = groupResponse;
-        var request = TraceRequests.read(stored.getReadGroup().getRequests(operation.expansionPosition()));
+        var request = requests.forwardRead(stored.getReadGroup().getRequests(operation.expansionPosition()));
         var items = new ArrayList<ByteString>();
         var answer = transmit(request, chunk -> {
             if (!chunk.more() || chunk.status() != IndexStatus.OK)

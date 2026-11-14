@@ -333,7 +333,7 @@ public final class NativeBuildCheck {
         for(var entry:tree(build.resolve("runtime")).entrySet())artifacts.put("runtime/"+entry.getKey(),entry.getValue());
         for(String file:List.of("source-files.json","compiler-version.txt","source/config.status"))
             artifacts.put(file,Digests.sha256(build.resolve(file)));
-        for(String file:List.of("bin/postgres","bin/initdb","bin/pg_ctl","lib/row_capture.so"))
+        for(String file:List.of("bin/postgres","bin/initdb","bin/pg_ctl","lib/postgresql/row_capture.so"))
             if(!Files.isRegularFile(build.resolve("runtime/"+file)))throw new IOException("Missing PostgreSQL artifact: "+file);
         return java.util.Map.of("inputs",engineInputs(root,"postgres","postgresql"),"artifacts",artifacts);
     }

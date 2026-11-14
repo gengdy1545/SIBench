@@ -290,7 +290,7 @@ public final class UpdateLocality {
         return consumer -> {
             var pending = new LinkedHashMap<RowKey, List<Operation>>();
             try (var validation = new org.sibench.replay.ReplayProjection(
-                    new org.sibench.replay.ReplayConfig(true, 0, 0, 0, 0, "operation"), true, ignored -> {})) {
+                    new org.sibench.replay.ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 4096, 60, 1), true, ignored -> {})) {
                 long records = source.read(operation -> {
                     validation.accept(operation);
                     if (IndexOperationTrace.isMutation(operation))

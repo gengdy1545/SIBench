@@ -77,7 +77,7 @@ public class VersionedLookupTest {
                 var model = new IndexReferenceReplay(rowIds, false);
                 var replay =
                         new ReplayProjection(
-                                new ReplayConfig(false, 0, 0, 0, 0, dispatchMode),
+                                new ReplayConfig(false, 0, 0, 0, 0, dispatchMode, 1, 4096, 60, 1),
                                 true,
                                 model::acceptCommitted);
                 model.accept(TestOps.op(0, 1, 3, 0, 0, 2, 0, 3, 0, 52, 0, 0, 0));
@@ -151,7 +151,7 @@ public class VersionedLookupTest {
                     throws Exception {
         for (boolean rowIds : new boolean[] {false, true}) {
             var model = new IndexReferenceReplay(rowIds, true);
-            var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0), true, model::acceptCommitted);
+            var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 4096, 60, 1), true, model::acceptCommitted);
             org.sibench.capture.TransferIndexFixtures.expandRow(
                     TestOps.op(0, 1, 5, 0, 0, 1, 0, 5, 0, 50, 10, 20, 0), model::accept);
             commit(replay, 100, row(5, 1, 100, 1, 50, 3, 1), row(5, 2, 100, 2, 51, 3, 2));
@@ -184,12 +184,12 @@ public class VersionedLookupTest {
                         snapshot(5, 1, 10, -1, 0))) {
             var rejected =
                     new ReplayProjection(
-                            new ReplayConfig(false, 0, 0, 0, 0), true, o -> {});
+                            new ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 4096, 60, 1), true, o -> {});
             commit(rejected, 100);
             assertThrows(IOException.class, () -> rejected.accept(invalid));
         }
         var replay =
-                new ReplayProjection(new ReplayConfig(false, 0, 0, 0, 0), true, o -> {});
+                new ReplayProjection(new ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 4096, 60, 1), true, o -> {});
         commit(replay, 100);
         replay.accept(snapshot(5, 1, 10, 99, 0));
         replay.accept(IndexOperationTrace.search(0, 3, 0, Range.equal(IndexKey.ofInt(1)), 100, 0, 0));
@@ -232,7 +232,7 @@ public class VersionedLookupTest {
                             ReferenceReplayFixture.run(
                                     baseline,
                                     workload,
-                                    new ReplayConfig(secondary, 0, 0, 0, 0, dispatchMode),
+                                    new ReplayConfig(secondary, 0, 0, 0, 0, dispatchMode, 1, 4096, 60, 1),
                                     directory.resolve(
                                             "report-" + secondary + "-" + dispatchMode + ".json"));
                     var modes = (List<?>) result.get("results");

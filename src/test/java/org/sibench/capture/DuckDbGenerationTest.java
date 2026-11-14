@@ -45,30 +45,13 @@ public class DuckDbGenerationTest {
             assertThrows(IllegalArgumentException.class,()->Generation.requestTarget(Map.of("trace",Map.of("workload_requests",invalid))));
     }
 
-    @Test public void independentQueryExportDefaultsOffWithoutGuessingMixedStageContents() throws Exception {
-        assertFalse(Generation.exportQueries(Map.of()));
-        for(String benchmark:java.util.List.of("ycsb","sysbench","hybench")) {
-            var document=profile(benchmark);
-            assertFalse(Generation.exportQueries(document));
-            document.put("trace",Map.of("secondary_indexes",false,"export_queries",true,"workload_requests",10000000));
-            assertTrue(Generation.exportQueries(document));
-            assertFalse(Generation.secondaryIndexes(document));
-            assertEquals(10000000,Generation.requestTarget(document));
-        }
-        for(Object invalid:java.util.List.of("false",0,1))
-            assertThrows(IllegalArgumentException.class,()->Generation.exportQueries(Map.of("trace",Map.of("export_queries",invalid))));
-        assertTrue(Generation.queryStage("hybench","ap"));
-        assertTrue(Generation.queryStage("sysbench","oltp_point_select"));
-        assertTrue(Generation.queryStage("ycsb","workloadc"));
-        assertFalse(Generation.queryStage("hybench","xp"));
-        assertFalse(Generation.queryStage("hybench","tp"));
-        assertFalse(Generation.queryStage("sysbench","oltp_read_write"));
-        assertFalse(Generation.queryStage("ycsb","workloadf"));
-        for(boolean queries:java.util.List.of(false,true)) {
-            var document=Map.<String,Object>of("trace",Map.of("export_queries",queries));
-            assertFalse(Generation.budgetStage(document,"hybench","ap"));
-            assertTrue(Generation.budgetStage(document,"hybench","xp"));
-            assertEquals(queries,Generation.budgetStage(document,"sysbench","oltp_point_select"));
+    @Test public void hybenchWorkloadConfigurationOwnsTheQueryClientCount() throws Exception {
+        var nativeConfig=object(profile("hybench"),"native");
+        nativeConfig.put("xp_query_clients",0);
+        Generation.validateNative("hybench",nativeConfig);
+        for(Object invalid:java.util.List.of(-1,257,"0",true)) {
+            nativeConfig.put("xp_query_clients",invalid);
+            assertThrows(IllegalArgumentException.class,()->Generation.validateNative("hybench",nativeConfig));
         }
     }
     static Map<String,Object> profile(String benchmark)throws Exception {

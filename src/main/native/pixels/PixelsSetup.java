@@ -75,7 +75,10 @@ public final class PixelsSetup {
                     options.put("consumer_thread_num", args[5]);
                     options.put("encoding_level", "2");
                     options.put("nulls_padding", "false");
-                    new LoadExecutor().execute(new Namespace(options), "LOAD");
+                    // An empty sealed table has no LOAD shards and needs no write transaction.
+                    try (var files = Files.list(Path.of(args[3]).resolve(table))) {
+                        if (files.findAny().isPresent()) new LoadExecutor().execute(new Namespace(options), "LOAD");
+                    }
                     long rows = 0;
                     var metadata = MetadataService.Instance();
                     var layout = metadata.getLatestLayout(args[1], table);

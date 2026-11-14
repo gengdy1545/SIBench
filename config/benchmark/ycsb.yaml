@@ -14,27 +14,25 @@ native:
   fieldlengthdistribution: constant
   insertorder: hashed
   zeropadding: 1
+  seed: 20261019
   threads: 32
   load_threads: 16
   timeout_minutes: 720
   build_directory: build/benchmarks/YCSB
   workloads:
     workloada:
-      operationcount: 4426795
+      operationcount: 10000000
     workloadb:
-      operationcount: 7377990
+      operationcount: 10000000
     workloadc:
-      operationcount: 3688996
+      operationcount: 10000000
     workloadf:
-      operationcount: 2951197
+      operationcount: 10000000
     workloadd:
-      operationcount: 4426795
+      operationcount: 10000000
     workloade:
-      operationcount: 1475599
-      properties:
-        readallfields: false
+      operationcount: 10000000
 trace:
-  export_queries: false
   secondary_indexes: false
   workload_requests: 10000000
 artifacts:

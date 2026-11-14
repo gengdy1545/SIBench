@@ -1,18 +1,13 @@
 package org.sibench.capture;
 
+import org.sibench.adapters.IndexTestSupport;
+
 import static org.junit.Assert.*;
 import java.sql.Connection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 import org.junit.Test;
-import org.sibench.adapters.IndexExecutor;
-import org.sibench.adapters.TraceRequests;
-import org.sibench.adapters.VersionedIndexBackend;
-import org.sibench.adapters.IndexStatus;
-import org.sibench.adapters.proto.TraceRecord;
-import org.sibench.adapters.ValueKind;
 import org.sibench.generation.NativeHistory;
 import org.sibench.generation.DuckDbHostFixture;
 import org.sibench.trace.IndexKey;
@@ -25,7 +20,7 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
     private static long number(Connection db,String text)throws Exception {
         try(var q=db.createStatement();var r=q.executeQuery(text)){assertTrue(r.next());long value=r.getLong(1);assertFalse(r.next());return value;}
     }
-    @Test public void replaysNativeSearchesAndMutationsWithAbortAndHistoricalBaseline()throws Exception {
+    @Test public void nativeSearchesPreserveLocalVisibilityThroughServiceReplay()throws Exception {
         try(var db=connect()) {
             sql(db,"CREATE TABLE items(id BIGINT PRIMARY KEY,k BIGINT)");sql(db,"INSERT INTO items VALUES(10,1),(20,1),(30,2)");
             sql(db,"CREATE INDEX items_k ON items(k)");db.setAutoCommit(false);NativeHistory.initialize(db, org.sibench.config.Engine.DUCKDB);
@@ -77,47 +72,60 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
             }
             assertEquals(7,expected.size());
             var workload=root.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(workload, true);
-            try(writer){assertEquals(30,DuckDbProjection.write(db,true,writer));}
-            try(var backend=VersionedIndexBackend.create(root.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {
-                long[] requests={0},searches={0};
-                var consumer=new IndexOperationTrace.Consumer(){
-                    @Override public void accept(IndexOperationTrace.Operation operation){fail("Missing stored service request");}
-                    @Override public void accept(TraceRecord record,List<IndexOperationTrace.Operation> operations)throws java.io.IOException {
-                        if(record.hasTransactionBegin())return;
-                        if(record.hasTransactionCommit())return;
-                        try {
-                            requests[0]++; var request=record.getOperation();
-                            org.sibench.adapters.IndexResponse response;
-                            if (request.hasReadGroup()) {
-                                var answers = new java.util.ArrayList<List<com.google.protobuf.ByteString>>();
-                                for (var member : request.getReadGroup().getRequestsList()) {
-                                    var answer = index.submit(TraceRequests.read(member)).get(5, TimeUnit.SECONDS);
-                                    assertEquals(answer.message(), IndexStatus.OK, answer.status());
-                                    answers.add(answer.values());
-                                }
-                                response = org.sibench.adapters.IndexResponse.ok(TraceRequests.combine(request.getReadGroup(), answers));
-                            } else response = index.submit(new TraceRequests(ValueKind.ROW_ID).forward(request, operations.get(0))).get(5, TimeUnit.SECONDS);
-                            assertEquals(response.message(), IndexStatus.OK, response.status());
-                            if(request.hasGet() || request.hasScan() || request.hasReadGroup()) {
-                                var wanted=expected.get(operations.get(0).sourceEvent());assertNotNull(wanted);assertEquals(wanted.size(),response.values().size());
-                                for(int i=0;i<wanted.size();i++) {
-                                    var actual=response.values().get(i);var e=wanted.get(i);
-                                    assertEquals(e.longValue(),actual.asReadOnlyByteBuffer().getLong());
-                                }
-                                searches[0]++;
+            var operations=new java.util.ArrayList<IndexOperationTrace.Operation>();
+            assertEquals(30,DuckDbProjection.write(db,true,operations::add));
+            try(var reference=new IndexReferenceReplay(true,true)) {
+                ProtoTrace.read(baseline,baseWriter.sha256(),baseWriter.logicalSha256(),reference::accept);
+                var actual=new java.util.LinkedHashSet<Long>();long reads=0;
+                for(var operation:operations) {
+                    if(IndexOperationTrace.isControl(operation)&&operation.kind()!=IndexOperationTrace.TRANSACTION_ABORT)continue;
+                    reference.accept(operation);
+                    if(operation.kind()!=IndexOperationTrace.SEARCH)continue;
+                    if(!operation.grouped()||operation.expansionPosition()==0)actual.clear();
+                    var member=new java.util.LinkedHashSet<Long>();
+                    for(var row:reference.search(operation.table(),operation.index(),operation.range(),operation.readTimestamp(),
+                            operation.version(),operation.transactionId(),operation.mutationOrdinal()))member.add(row.value());
+                    if((operation.flags()&IndexOperationTrace.INTERSECT_GROUP)!=0&&operation.expansionPosition()>0)actual.retainAll(member);
+                    else actual.addAll(member);
+                    if(!operation.grouped()||operation.expansionPosition()+1==operation.expansionSize()) {
+                        assertEquals(expected.get(operation.sourceEvent()),List.copyOf(actual));reads++;
+                    }
+                }
+                assertEquals(7,reads);
+            }
+            try(writer){for(var operation:operations)writer.accept(operation);}
+            var requests=new org.sibench.adapters.TraceRequests(org.sibench.adapters.ValueKind.ROW_ID);
+            try(var backend=org.sibench.adapters.VersionedIndexBackend.create(root.resolve("index"),org.sibench.adapters.ValueKind.ROW_ID)) {
+                long[] reads={0};
+                var consumer=new IndexOperationTrace.Consumer() {
+                    @Override public void accept(IndexOperationTrace.Operation operation){fail("Missing stored request");}
+                    @Override public void accept(org.sibench.adapters.proto.TraceRecord record,List<IndexOperationTrace.Operation> views)throws java.io.IOException {
+                        if(!record.hasOperation())return;
+                        var request=record.getOperation();var operation=views.get(0);List<com.google.protobuf.ByteString> values;
+                        if(request.hasReadGroup()) {
+                            var answers=new java.util.ArrayList<List<com.google.protobuf.ByteString>>();
+                            for(var member:request.getReadGroup().getRequestsList()) {
+                                var response=IndexTestSupport.execute(backend,org.sibench.adapters.TraceRequests.read(member));
+                                assertEquals(response.message(),org.sibench.adapters.IndexStatus.OK,response.status());answers.add(response.values());
                             }
-                        }catch(Exception failure){throw new java.io.IOException(failure);}
+                            values=org.sibench.adapters.TraceRequests.combine(request.getReadGroup(),answers);
+                        } else {
+                            var response=IndexTestSupport.execute(backend,requests.forward(request,operation));
+                            assertEquals(response.message(),org.sibench.adapters.IndexStatus.OK,response.status());values=response.values();
+                        }
+                        if(operation.kind()==IndexOperationTrace.SEARCH) {
+                            assertEquals(expected.get(operation.sourceEvent()),values.stream().map(v->v.asReadOnlyByteBuffer().getLong()).toList());reads[0]++;
+                        }
                     }
                 };
                 ProtoTrace.read(baseline,baseWriter.sha256(),baseWriter.logicalSha256(),consumer);
                 ProtoTrace.read(workload,writer.sha256(),writer.logicalSha256(),consumer);
-                // Only the committed update lookup, delete lookup and final count survive.
-                assertEquals(3,searches[0]);assertEquals(16,requests[0]);
+                assertEquals(7,reads[0]);
             }
         }
     }
 
-    @Test public void retainsNativeFailedStatementFactsButExportsNoAbortedTransaction()throws Exception {
+    @Test public void failedStatementsDoNotEraseEarlierSuccessfulLocalReads()throws Exception {
         try(var db=connect()) {
             sql(db,"CREATE TABLE items(id BIGINT PRIMARY KEY,k BIGINT)");sql(db,"CREATE INDEX items_k ON items(k)");
             sql(db,"INSERT INTO items VALUES(10,100),(20,200)");
@@ -143,8 +151,19 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
             assertEquals(1,number(db,"SELECT count(*) FROM sibench_source_mutations WHERE statement_outcome='failed' AND event='complete'"));
             assertEquals(2,number(db,"SELECT count(*) FROM items"));
             var trace=root.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(trace, true);
-            try(writer){assertEquals(5,DuckDbProjection.write(db,true,writer));}
-            assertEquals(0, ProtoTrace.read(trace,writer.sha256(),writer.logicalSha256(), ignored -> fail("Aborted transaction leaked")));
+            var operations=new java.util.ArrayList<IndexOperationTrace.Operation>();
+            assertEquals(5,DuckDbProjection.write(db,true,operations::add));
+            assertTrue(operations.stream().anyMatch(o->o.kind()==IndexOperationTrace.SEARCH
+                    &&(o.flags()&IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)!=0&&o.expectedCount()==1));
+            try(writer){for(var operation:operations)writer.accept(operation);}
+            var exported=new java.util.ArrayList<IndexOperationTrace.Operation>();
+            ProtoTrace.read(trace,writer.sha256(),writer.logicalSha256(),exported::add);
+            assertEquals(1,exported.size());assertEquals(IndexOperationTrace.SEARCH,exported.get(0).kind());
+            assertEquals(rowId,exported.get(0).localWrites().get(0).rowId());
+            try(var reference=new IndexReferenceReplay(true,true)) {
+                reference.acceptCommitted(exported.get(0));assertEquals(1,reference.queries());
+                assertNull(reference.lookupPrimary(1,IndexKey.ofInt(1),0));
+            }
         }
     }
 }

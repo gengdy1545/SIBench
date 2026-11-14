@@ -27,7 +27,7 @@ public class NativeBaselineTest {
                     new IndexCatalog.Definition(1,"first",1,"first_k","k","int"),
                     new IndexCatalog.Definition(2,"second",0,"second_primary","id","int"));
             long[] counts=new long[2];
-            var config=new ReplayConfig(true,0,0,0,0,"operation",2,16,2);
+            var config=new ReplayConfig(true,0,0,0,0,"operation",2,16,2, 1);
             try(var replay=new ReplayProjection(config,false,operation->{
                 assertEquals(operation.table()==1?1:2,operation.workUnitId());
                 counts[operation.table()-1]++;

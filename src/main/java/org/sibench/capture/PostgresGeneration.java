@@ -38,7 +38,7 @@ final class PostgresGeneration {
                 else PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,output.resolve("load"),"oltp_read_write",null);
                 timings.put("native_load_seconds",seconds(loadStart));long baselineStart=System.nanoTime();
                 var budget=new RequestBudget(Generation.requestTarget(input.document()),input.timeout());
-                var trace=new PostgresTrace(output.resolve("trace"),input.source(),Generation.secondaryIndexes(input.document()),Generation.exportQueries(input.document()),budget);
+                var trace=new PostgresTrace(output.resolve("trace"),input.source(),Generation.secondaryIndexes(input.document()),budget);
                 try(var setup=database.connect("baseline")) {
                     PostgresDatabase.finishLoad(setup);
                     // Mark loaded pages visible before copying keys, avoiding another wide-table scan.
@@ -59,15 +59,12 @@ final class PostgresGeneration {
                     return null;
                 });
                 long workloadStart=System.nanoTime();var stages=new LinkedHashMap<String,Object>();
-                // HyBench runs AP once, then shares the remaining requests between TP and XP.
-                var workloads=hybench?java.util.List.of("ap","tp","xp"):java.util.List.copyOf(object(input.nativeConfig(),"workloads").keySet());
-                int remaining=(int)workloads.stream().filter(workload->Generation.budgetStage(input.document(),input.selection().benchmark(),workload)).count();
+                var workloads=Generation.workloads(input.document());
+                int remaining=workloads.size();
                 for(String workload:workloads) {
                     Path stage=Files.createDirectory(output.resolve(workload));
-                    boolean supplies=Generation.budgetStage(input.document(),input.selection().benchmark(),workload);
-                    trace.queryStage(Generation.queryStage(input.selection().benchmark(),workload));
-                    Path stop=supplies?stage.resolve("budget.stop"):null;
-                    budget.begin(workload,supplies?remaining--:0,stop);
+                    Path stop=stage.resolve("budget.stop");
+                    budget.begin(workload,remaining--,stop);
                     var batches=new java.util.ArrayList<Map<String,Object>>();
                     do {
                         budget.checkTime();long before=budget.count();
@@ -75,8 +72,12 @@ final class PostgresGeneration {
                         batches.add(hybench?runHybench(plan,input,database,capture,batch,workload,url,stop)
                                 :PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,batch,workload,capture));
                         trace.awaitProjection(capture,input.timeout());
-                        if(budget.enabled()&&supplies)budget.requireProgress(before);
-                    } while(budget.enabled()&&supplies&&!budget.reached());
+                        if(hybench&&workload.equals("xp")) {
+                            json(batch.resolve("query-coverage.json"),trace.queryCoverage());
+                            requireIqCounts(batches,trace.iqQueries());
+                        }
+                        if(budget.enabled())budget.requireProgress(before);
+                    } while(budget.enabled()&&!budget.reached());
                     budget.end();stages.put(workload,batches);
                 }
                 json(output.resolve("request-budget.json"),budget.finish());
@@ -130,22 +131,17 @@ final class PostgresGeneration {
         for(var session:sessions)for(var count:object(session,"counts").entrySet())
             source.merge(count.getKey(),((Number)count.getValue()).longValue(),Math::addExact);
         var client=com.google.gson.JsonParser.parseString(Files.readString(batch.resolve("summary.json"))).getAsJsonObject();
-        if(phase.equals("tp"))requireTpWindow(client.getAsJsonObject("tp"),source,sessions.size(),positive(input.nativeConfig(),"clients"));
         return Map.of("phase",phase,"client",new com.google.gson.Gson().fromJson(client,Map.class),"source",source,"sessions",sessions.size());
     }
 
-    /**
-     * Independent client evidence for a TP window: one session per client, and HyBench samples every
-     * committed or business-rolled-back transaction but not a conflict abort. AP/IQ samples count
-     * statements inside long transactions and XP adds freshness sessions, so only TP has these exact bounds.
-     */
-    static void requireTpWindow(com.google.gson.JsonObject samples,Map<String,Long> source,int sessions,long clients)throws java.io.IOException {
-        long sampled=0;
-        for(var entry:samples.entrySet())sampled=Math.addExact(sampled,entry.getValue().getAsLong());
-        long commits=source.get("commits"),aborts=source.get("aborts");
-        if(sessions!=clients||sampled<commits||sampled>commits+aborts)
-            throw new java.io.IOException("HyBench TP client evidence differs from captured sessions: sessions "+sessions+"/"+clients
-                    +", samples "+sampled+", commits "+commits+", aborts "+aborts);
+    static void requireIqCounts(java.util.List<Map<String,Object>> batches,Map<String,Long> actual)throws java.io.IOException {
+        var expected=new LinkedHashMap<String,Long>();
+        for(int i=1;i<=6;i++)expected.put("IQ-"+i,0L);
+        for(var batch:batches) {
+            var client=object(object(batch,"client"),"xp");
+            for(int i=1;i<=6;i++)expected.merge("IQ-"+i,((Number)client.get("iq"+i)).longValue(),Math::addExact);
+        }
+        if(!expected.equals(actual))throw new java.io.IOException("HyBench IQ client/native coverage counts disagree: "+expected+" / "+actual);
     }
 
     private static double seconds(long start){return (System.nanoTime()-start)/1e9;}

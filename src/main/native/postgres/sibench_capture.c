@@ -66,6 +66,14 @@ static bool sib_committing = false;
 static const char *sib_failure_message = NULL;
 static int	sib_detail_mode = -1;
 
+typedef struct SibSubtransaction
+{
+	SubTransactionId id;
+	int depth;
+	struct SibSubtransaction *parent;
+} SibSubtransaction;
+static SibSubtransaction *sib_subtransactions = NULL;
+
 /* Buffered zstd output ends its frame at backend exit; an incomplete frame fails the audit. */
 static ZSTD_CCtx *sib_zstd = NULL;
 static char *sib_zstd_out = NULL;
@@ -386,6 +394,8 @@ sib_emit_named(const char *event, Oid relid, const char *relname, const char *de
 		sib_append_uint(&message, ++sib_sequence);
 		appendStringInfoString(&message, ",\"cid\":");
 		sib_append_uint(&message, GetCurrentCommandId(false));
+		appendStringInfoString(&message, ",\"subid\":");
+		sib_append_uint(&message, GetCurrentSubTransactionId());
 		appendStringInfoString(&message, ",\"req\":");
 		sib_append_uint(&message, sibench_request);
 		appendStringInfoString(&message, ",\"depth\":");
@@ -658,6 +668,7 @@ typedef struct SibTids
 typedef struct SibUnit
 {
 	void	   *scan;			/* hash key: the live IndexScanDesc, never dereferenced late */
+	SubTransactionId subid;
 	Oid			index_oid;
 	NameData	index_name;
 	void	   *heap;			/* the bitmap heap node the scan feeds, as of its latest binding */
@@ -727,6 +738,7 @@ typedef enum SibCombination
 typedef struct SibHeap
 {
 	void	   *node;			/* hash key: the BitmapHeapScanState */
+	SubTransactionId subid;
 	Oid			heap_oid;
 	NameData	heap_name;
 	int			ninputs;
@@ -758,11 +770,13 @@ sib_tables(void)
 	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(void *);
 	ctl.entrysize = sizeof(SibUnit);
-	sib_units = hash_create("SIBench units", 64, &ctl, HASH_ELEM | HASH_BLOBS);
+	ctl.hcxt = TopMemoryContext;
+	sib_units = hash_create("SIBench units", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(void *);
 	ctl.entrysize = sizeof(SibHeap);
-	sib_heaps = hash_create("SIBench bitmap heaps", 16, &ctl, HASH_ELEM | HASH_BLOBS);
+	ctl.hcxt = TopMemoryContext;
+	sib_heaps = hash_create("SIBench bitmap heaps", 16, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
 static SibUnit *
@@ -793,6 +807,7 @@ sib_unit_entry(IndexScanDesc scan)
 	unit = (SibUnit *) hash_search(sib_units, &key, HASH_ENTER, &found);
 	if (!found)
 	{
+		unit->subid = GetCurrentSubTransactionId();
 		unit->index_oid = RelationGetRelid(scan->indexRelation);
 		namestrcpy(&unit->index_name, RelationGetRelationName(scan->indexRelation));
 		unit->heap = NULL;
@@ -1611,6 +1626,7 @@ sib_bitmap_binding(BitmapHeapScanState *node)
 	heap = (SibHeap *) hash_search(sib_heaps, &key, HASH_ENTER, &found);
 	if (found)
 		sib_heap_flush(heap);
+	heap->subid = GetCurrentSubTransactionId();
 	heap->heap_oid = RelationGetRelid(node->ss.ss_currentRelation);
 	namestrcpy(&heap->heap_name, RelationGetRelationName(node->ss.ss_currentRelation));
 	heap->ninputs = 0;
@@ -1790,6 +1806,48 @@ sib_bitmap_lossy(Relation relation, void *node)
 /* Writes                                                                                     */
 /* ------------------------------------------------------------------------------------------ */
 
+static void
+sib_row_image(StringInfo out, Relation relation, TupleTableSlot *slot, Bitmapset *indexed)
+{
+	int i;
+	bool first = true;
+	if (TupIsNull(slot)) { appendStringInfoString(out, "null"); return; }
+	appendStringInfoChar(out, '{');
+	for (i = 0; i < RelationGetDescr(relation)->natts; i++)
+	{
+		Form_pg_attribute attribute = TupleDescAttr(RelationGetDescr(relation), i);
+		bool isnull;
+		Datum value;
+		if (!bms_is_member(i + 1 - FirstLowInvalidHeapAttributeNumber, indexed)) continue;
+		value = slot_getattr(slot, i + 1, &isnull);
+		if (!first) appendStringInfoChar(out, ',');
+		first = false;
+		escape_json(out, NameStr(attribute->attname));
+		appendStringInfoChar(out, ':');
+		sib_datum(out, attribute->atttypid, value, isnull);
+	}
+	appendStringInfoChar(out, '}');
+}
+
+/* Capture the successful row modification before any AFTER trigger can start another read. */
+void
+sib_row_change(Relation relation, TupleTableSlot *oldslot, TupleTableSlot *newslot, CommandId cid)
+{
+	Bitmapset *indexed;
+	StringInfoData out;
+	if (!sib_relation(relation)) return;
+	indexed = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_ALL);
+	initStringInfo(&out);
+	appendStringInfo(&out, "\"write_cid\":%u,\"operation\":\"%s\",\"old\":", cid,
+		TupIsNull(oldslot) ? "insert" : TupIsNull(newslot) ? "delete" : "update");
+	sib_row_image(&out, relation, oldslot, indexed);
+	appendStringInfoString(&out, ",\"new\":");
+	sib_row_image(&out, relation, newslot, indexed);
+	sib_emit("row_change", relation, out.data);
+	pfree(out.data);
+	bms_free(indexed);
+}
+
 void
 sib_index_insert(Relation relation, Datum *values, bool *isnull, ItemPointer tid, int unique)
 {
@@ -1926,7 +1984,7 @@ sib_wrap_receiver(DestReceiver *original)
 
 /* The number of rows this execution returned. */
 void
-sib_executor_run_end(DestReceiver *dest, uint64 processed)
+sib_executor_run_end(DestReceiver *dest, uint64 processed, bool read_complete)
 {
 	StringInfoData detail;
 
@@ -1934,6 +1992,7 @@ sib_executor_run_end(DestReceiver *dest, uint64 processed)
 		return;
 	initStringInfo(&detail);
 	appendStringInfo(&detail, "\"processed\":%llu", (unsigned long long) processed);
+	appendStringInfo(&detail, ",\"read_complete\":%s", read_complete ? "true" : "false");
 	if (dest && dest->receiveSlot == sib_receive)
 	{
 		SibReceiver *self = (SibReceiver *) dest;
@@ -2059,6 +2118,71 @@ sib_await_room(void)
 			break;
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 1000L, PG_WAIT_EXTENSION);
 		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/* Resource cleanup may free a failed nested executor without calling ExecutorEnd. */
+void
+sib_subtransaction(const char *event, SubTransactionId id, SubTransactionId parent)
+{
+	char detail[96];
+	bool starting = strcmp(event, "subtransaction_begin") == 0;
+	bool aborted = strcmp(event, "subtransaction_abort") == 0;
+	SibSubtransaction *frame;
+	HASH_SEQ_STATUS status;
+	SibUnit *unit;
+	SibHeap *heap;
+
+	if (!sib_enabled()) return;
+	if (starting)
+	{
+		frame = MemoryContextAlloc(TopMemoryContext, sizeof(SibSubtransaction));
+		frame->id = id;
+		frame->depth = sibench_depth;
+		frame->parent = sib_subtransactions;
+		sib_subtransactions = frame;
+	}
+	else
+	{
+		frame = sib_subtransactions;
+		if (!frame || frame->id != id)
+			elog(ERROR, "SIBench subtransaction has no captured beginning");
+		if (sib_units)
+		{
+			hash_seq_init(&status, sib_heaps);
+			while ((heap = hash_seq_search(&status)) != NULL)
+				if (heap->subid == id)
+				{
+					if (aborted) sib_heap_flush(heap);
+					else heap->subid = parent;
+				}
+			hash_seq_init(&status, sib_units);
+			while ((unit = hash_seq_search(&status)) != NULL)
+				if (unit->subid == id)
+				{
+					if (aborted)
+					{
+						char scan[64];
+						sib_unit_flush(unit);
+						snprintf(scan, sizeof(scan), "\"scan\":\"%p\"", unit->scan);
+						sib_emit_named("scan_end", unit->index_oid, NameStr(unit->index_name), scan);
+						sib_unit_remove(unit);
+					}
+					else unit->subid = parent;
+				}
+			hash_seq_init(&status, sib_heaps);
+			while ((heap = hash_seq_search(&status)) != NULL)
+				if (aborted && heap->subid == id)
+					hash_search(sib_heaps, &heap->node, HASH_REMOVE, NULL);
+		}
+	}
+	snprintf(detail, sizeof(detail), "\"parent_subid\":%u", parent);
+	sib_emit(event, NULL, detail);
+	if (!starting)
+	{
+		if (aborted) sibench_depth = frame->depth;
+		sib_subtransactions = frame->parent;
+		pfree(frame);
 	}
 }
 

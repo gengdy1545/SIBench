@@ -16,7 +16,56 @@ import java.util.concurrent.atomic.AtomicLong;
 
 public class ReplayDispatcherTest {
     private static ReplayConfig config(int clients, int inFlight) {
-        return new ReplayConfig(true, 0, 0, 0, 0, "operation", clients, inFlight, 2);
+        return new ReplayConfig(true, 0, 0, 0, 0, "operation", clients, inFlight, 2, 1);
+    }
+
+    private static final class ResponseTiming {
+        final CompletableFuture<Void> response;
+        long earliestStart = System.nanoTime(), latestStart, earliestEnd, latestEnd;
+
+        ResponseTiming() { this(new CompletableFuture<>()); }
+        ResponseTiming(CompletableFuture<Void> response) { this.response = response; }
+
+        ReplayTarget.SendHandle handle() { return handle(response); }
+        ReplayTarget.SendHandle handle(CompletableFuture<Void> validated) {
+            latestStart = System.nanoTime();
+            return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), validated, response);
+        }
+    }
+
+    private static void complete(ResponseTiming... samples) throws InterruptedException {
+        for (var sample : samples) {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+            while (sample.response.getNumberOfDependents() == 0 && System.nanoTime() < deadline)
+                Thread.sleep(1);
+            assertTrue("Dispatcher must observe the business response", sample.response.getNumberOfDependents() > 0);
+        }
+        long before = System.nanoTime();
+        for (var sample : samples) sample.earliestEnd = before;
+        for (var sample : samples) sample.response.complete(null);
+        long after = System.nanoTime();
+        for (var sample : samples) sample.latestEnd = after;
+    }
+
+    private static void assertLatency(Map<?, ?> report, ResponseTiming... samples) {
+        long minimumTotal = 0, maximumTotal = 0, minimumMax = 0, maximumMax = 0;
+        for (var sample : samples) {
+            long minimum = sample.earliestEnd - sample.latestStart;
+            long maximum = sample.latestEnd - sample.earliestStart;
+            minimumTotal += minimum;
+            maximumTotal += maximum;
+            minimumMax = Math.max(minimumMax, minimum);
+            maximumMax = Math.max(maximumMax, maximum);
+        }
+        assertEquals((long) samples.length, report.get("count"));
+        assertBetween((double) report.get("mean_ms"), minimumTotal / 1e6 / samples.length,
+                maximumTotal / 1e6 / samples.length);
+        assertBetween((double) report.get("max_ms"), minimumMax / 1e6, maximumMax / 1e6);
+    }
+
+    private static void assertBetween(double actual, double minimum, double maximum) {
+        assertTrue(actual + " outside [" + minimum + ", " + maximum + "]",
+                actual >= minimum - 1e-9 && actual <= maximum + 1e-9);
     }
 
     private static Operation search(long unit) {
@@ -68,7 +117,7 @@ public class ReplayDispatcherTest {
             }
             @Override public void flush() { events.add("flush-" + client); }
         };
-        try (var dispatcher = new ReplayDispatcher(config(2, 10), factory, 0, System::nanoTime)) {
+        try (var dispatcher = new ReplayDispatcher(config(2, 10), factory)) {
             for (long unit : new long[] {1, 1, 2, 3}) dispatcher.send(baseline(unit).withWorkUnitId(unit));
             assertEquals(List.of("send-0-1", "send-0-1", "flush-0", "send-1-2", "flush-1", "send-0-3"), events);
         }
@@ -76,35 +125,32 @@ public class ReplayDispatcherTest {
 
     @Test
     public void onlyTheFinalBusinessResponseCompletesLatency() throws Exception {
-        var now = new AtomicLong(1_000_000);
-        var response = new CompletableFuture<Void>();
+        var sample = new ResponseTiming();
         try (var dispatcher = new ReplayDispatcher(config(1, 10), client -> (seq, op, stored) -> {
-            now.addAndGet(10_000); // Client serialization and local buffering belong in latency.
-            return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response);
-        }, 0, now::get)) {
+            var handle = sample.handle();
+            // Delay inside the client so moving the latency start past serialization is detectable.
+            java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(20));
+            return handle;
+        })) {
             dispatcher.send(search(1));
             assertEquals(0L, dispatcher.describe().get("completed_operations"));
             assertEquals(0L, ((Map<?, ?>) dispatcher.describe().get("search_latency")).get("count"));
-            now.set(1_050_000);
-            response.complete(null);
+            complete(sample);
             dispatcher.drain();
-            var latency = (Map<?, ?>) dispatcher.describe().get("search_latency");
-            assertEquals(1L, latency.get("count"));
-            assertEquals(0.05, (double) latency.get("mean_ms"), 0);
+            assertLatency((Map<?, ?>) dispatcher.describe().get("search_latency"), sample);
         }
     }
 
     @Test
     public void admissionWaitIsSeparateFromClientCompletionLatency() throws Exception {
-        var now = new AtomicLong(1_000_000);
-        var responses = List.of(new CompletableFuture<Void>(), new CompletableFuture<Void>());
+        var samples = List.of(new ResponseTiming(), new ResponseTiming());
         var firstSent = new CountDownLatch(1);
         var secondSent = new CountDownLatch(1);
         var error = new AtomicReference<Throwable>();
         try (var dispatcher = new ReplayDispatcher(config(1, 1), client -> (seq, op, stored) -> {
             if (seq == 2) secondSent.countDown();
-            return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), responses.get((int) seq - 1));
-        }, 0, now::get)) {
+            return samples.get((int) seq - 1).handle();
+        })) {
             var sender = new Thread(() -> {
                 try {
                     dispatcher.send(search(1));
@@ -114,6 +160,7 @@ public class ReplayDispatcherTest {
                 } catch (Throwable failure) { error.set(failure); }
             });
             sender.start();
+            long waiting, release;
             try {
                 assertTrue(firstSent.await(1, TimeUnit.SECONDS));
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
@@ -121,57 +168,57 @@ public class ReplayDispatcherTest {
                     Thread.sleep(1);
                 assertEquals(Thread.State.TIMED_WAITING, sender.getState());
                 assertEquals(1, secondSent.getCount());
-                now.set(21_000_000);
-                responses.get(0).complete(null);
+                waiting = System.nanoTime();
+                Thread.sleep(20);
+                release = samples.get(1).earliestStart = System.nanoTime();
+                complete(samples.get(0));
                 assertTrue(secondSent.await(1, TimeUnit.SECONDS));
-                now.set(21_050_000);
-                responses.get(1).complete(null);
+                complete(samples.get(1));
             } finally {
-                responses.forEach(response -> response.complete(null));
+                samples.forEach(sample -> sample.response.complete(null));
                 sender.join(3000);
             }
             assertNull(error.get());
             assertFalse(sender.isAlive());
             var report = dispatcher.describe();
-            assertEquals(0.02, (double) report.get("backpressure_seconds"), 0);
-            assertEquals(10.025, (double) ((Map<?, ?>) report.get("search_latency")).get("mean_ms"), 1e-12);
+            assertTrue((double) report.get("backpressure_seconds") >= (release - waiting) / 1e9);
+            assertLatency((Map<?, ?>) report.get("search_latency"), samples.toArray(ResponseTiming[]::new));
         }
     }
 
     @Test
     public void groupValidationWaitDoesNotReplaceIndividualBusinessResponseTimes() throws Exception {
-        var now=new AtomicLong(1_000_000);
-        var validated=new CompletableFuture<Void>();
-        var replies=List.of(new CompletableFuture<Void>(),new CompletableFuture<Void>());
-        try(var dispatcher=new ReplayDispatcher(config(1,4),client -> (sequence, operation, stored) ->
-                new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null),validated,replies.get((int)sequence-1)),0,now::get)) {
-            dispatcher.send(groupMember(0,2)); dispatcher.send(groupMember(1,2));
-            now.set(1_050_000); replies.get(0).complete(null);
-            now.set(1_150_000); replies.get(1).complete(null);
-            assertEquals(0L,dispatcher.describe().get("completed_operations"));
-            now.set(2_000_000); validated.complete(null); dispatcher.drain();
-            var latency=(Map<?,?>)dispatcher.describe().get("search_latency");
-            assertEquals(2L,latency.get("count"));
-            assertEquals(0.1,(double)latency.get("mean_ms"),1e-12);
-            assertEquals(0.15,(double)latency.get("max_ms"),1e-12);
+        var validated = new CompletableFuture<Void>();
+        var samples = List.of(new ResponseTiming(), new ResponseTiming());
+        try (var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation, stored) ->
+                samples.get((int) sequence - 1).handle(validated))) {
+            dispatcher.send(groupMember(0, 2));
+            dispatcher.send(groupMember(1, 2));
+            complete(samples.get(0));
+            complete(samples.get(1));
+            assertEquals(0L, dispatcher.describe().get("completed_operations"));
+            Thread.sleep(20);
+            validated.complete(null);
+            dispatcher.drain();
+            assertLatency((Map<?, ?>) dispatcher.describe().get("search_latency"),
+                    samples.toArray(ResponseTiming[]::new));
         }
     }
 
     @Test
     public void deferredQueriesKeepTheirOriginalWarmupMembership() throws Exception {
-        var now=new AtomicLong(1_000_000);
         var writes=List.of(new CompletableFuture<Void>(),new CompletableFuture<Void>());
         var order=new ArrayList<Long>();
         try(var dispatcher=new ReplayDispatcher(config(1,4),client -> (sequence, operation, stored) -> {
             order.add(operation.sourceEvent());
             return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null),operation.kind()==IndexOperationTrace.SEARCH
                     ?CompletableFuture.completedFuture(null):writes.get((int)operation.version()-1));
-        },2,now::get)) {
+        },2)) {
             dispatcher.send(IndexOperationTrace.write(1,IndexOperationTrace.UPSERT,3,0,IndexKey.ofInt(1),1,0,0,1).withWorkUnitId(1));
             dispatcher.send(IndexOperationTrace.search(2,3,0,Range.equal(IndexKey.ofInt(1)),1,1,0).withWorkUnitId(2));
             dispatcher.send(IndexOperationTrace.write(3,IndexOperationTrace.UPSERT,3,0,IndexKey.ofInt(1),2,0,0,2).withWorkUnitId(3));
             dispatcher.send(IndexOperationTrace.search(4,3,0,Range.equal(IndexKey.ofInt(1)),2,1,0).withWorkUnitId(4));
-            now.set(1_050_000); writes.forEach(reply -> reply.complete(null)); dispatcher.drain();
+            writes.forEach(reply -> reply.complete(null)); dispatcher.drain();
             assertEquals(List.of(1L,3L,2L,4L),order);
             assertEquals(1L,((Map<?,?>)dispatcher.describe().get("write_latency")).get("count"));
             assertEquals(1L,((Map<?,?>)dispatcher.describe().get("search_latency")).get("count"));
@@ -181,32 +228,31 @@ public class ReplayDispatcherTest {
 
     @Test
     public void bufferedReadGroupWaitsForRoomBeforeItsFirstMember() throws Exception {
-        var now = new AtomicLong(1_000_000);
         var ordinary = List.of(new CompletableFuture<Void>(), new CompletableFuture<Void>());
-        var grouped = List.of(new CompletableFuture<Void>(), new CompletableFuture<Void>(),
-                new CompletableFuture<Void>());
+        var grouped = List.of(new ResponseTiming(), new ResponseTiming(), new ResponseTiming());
         var ordinarySent = new CountDownLatch(1);
         var groupSent = new CountDownLatch(1);
         var groupCalls = new AtomicLong();
         var error = new AtomicReference<Throwable>();
         try (var dispatcher = new ReplayDispatcher(config(1, 4), client -> (seq, op, stored) -> {
-            CompletableFuture<Void> response;
             if (op.grouped()) {
-                response = grouped.get(op.expansionPosition());
-                if (groupCalls.incrementAndGet() == 3) groupSent.countDown();
-            } else response = ordinary.get((int) seq - 1);
-            return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response);
-        }, 2, now::get)) {
+                groupCalls.incrementAndGet();
+                return grouped.get(op.expansionPosition()).handle();
+            }
+            return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), ordinary.get((int) seq - 1));
+        }, 2)) {
             var sender = new Thread(() -> {
                 try {
                     dispatcher.send(search(1));
                     dispatcher.send(search(2));
                     ordinarySent.countDown();
                     for (int i = 0; i < 3; i++) dispatcher.send(groupMember(i, 3));
+                    groupSent.countDown();
                     dispatcher.drain();
                 } catch (Throwable failure) { error.set(failure); }
             });
             sender.start();
+            long waiting, release;
             try {
                 assertTrue(ordinarySent.await(1, TimeUnit.SECONDS));
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
@@ -214,16 +260,18 @@ public class ReplayDispatcherTest {
                     Thread.sleep(1);
                 assertEquals(Thread.State.TIMED_WAITING, sender.getState());
                 assertEquals("The first group member must wait for the whole group", 0, groupCalls.get());
-                now.set(21_000_000);
+                waiting = System.nanoTime();
+                Thread.sleep(20);
+                release = System.nanoTime();
+                for (var sample : grouped) sample.earliestStart = release;
                 ordinary.get(0).complete(null);
                 assertTrue("The group must reach its final member without a group response",
                         groupSent.await(1, TimeUnit.SECONDS));
-                now.set(21_050_000);
-                grouped.forEach(response -> response.complete(null));
+                complete(grouped.toArray(ResponseTiming[]::new));
                 ordinary.get(1).complete(null);
             } finally {
                 ordinary.forEach(response -> response.complete(null));
-                grouped.forEach(response -> response.complete(null));
+                grouped.forEach(sample -> sample.response.complete(null));
                 sender.join(3000);
                 if (sender.isAlive()) { sender.interrupt(); sender.join(1000); }
             }
@@ -231,8 +279,8 @@ public class ReplayDispatcherTest {
             assertFalse(sender.isAlive());
             var report = dispatcher.describe();
             assertEquals(5L, report.get("completed_operations"));
-            assertEquals(0.02, (double) report.get("backpressure_seconds"), 0);
-            assertEquals(0.05, (double) ((Map<?, ?>) report.get("search_latency")).get("mean_ms"), 1e-12);
+            assertTrue((double) report.get("backpressure_seconds") >= (release - waiting) / 1e9);
+            assertLatency((Map<?, ?>) report.get("search_latency"), grouped.toArray(ResponseTiming[]::new));
         }
     }
 
@@ -251,10 +299,9 @@ public class ReplayDispatcherTest {
 
     @Test
     public void snapshotWaitsOnlyForRequiredWritesAndExcludesDependencyTime() throws Exception {
-        var now = new AtomicLong(1_000_000);
         var oldWrite = new CompletableFuture<Void>();
         var newWrite = new CompletableFuture<Void>();
-        var readResponse = new CompletableFuture<Void>();
+        var readResponse = new ResponseTiming();
         var independentReadSent = new CountDownLatch(1);
         var dependentReadSent = new CountDownLatch(1);
         var error = new AtomicReference<Throwable>();
@@ -266,11 +313,12 @@ public class ReplayDispatcherTest {
                 independentReadSent.countDown();
                 response = CompletableFuture.completedFuture(null);
             } else {
+                var handle = readResponse.handle();
                 dependentReadSent.countDown();
-                response = readResponse;
+                return handle;
             }
             return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response);
-        }, 3, now::get)) {
+        }, 3)) {
             var sender = new Thread(() -> {
                 try {
                     dispatcher.send(baseline(1).withVersion(1).withWorkUnitId(1));
@@ -282,6 +330,7 @@ public class ReplayDispatcherTest {
                 } catch (Throwable failure) { error.set(failure); }
             });
             sender.start();
+            long waiting, release;
             try {
                 assertTrue(independentReadSent.await(1, TimeUnit.SECONDS));
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
@@ -289,27 +338,28 @@ public class ReplayDispatcherTest {
                     Thread.sleep(1);
                 assertEquals(Thread.State.TIMED_WAITING, sender.getState());
                 assertEquals("Snapshot must wait for its required write response", 1, dependentReadSent.getCount());
-                now.set(21_000_000);
+                waiting = System.nanoTime();
+                Thread.sleep(20);
+                release = readResponse.earliestStart = System.nanoTime();
                 oldWrite.complete(null);
                 assertTrue("A newer pending write must not block the older snapshot",
                         dependentReadSent.await(1, TimeUnit.SECONDS));
                 assertFalse(newWrite.isDone());
-                now.set(21_050_000);
-                readResponse.complete(null);
+                complete(readResponse);
                 newWrite.complete(null);
             } finally {
                 oldWrite.complete(null);
                 newWrite.complete(null);
-                readResponse.complete(null);
+                readResponse.response.complete(null);
                 sender.join(3000);
                 if (sender.isAlive()) { sender.interrupt(); sender.join(1000); }
             }
             assertNull(error.get());
             assertFalse(sender.isAlive());
             var report = dispatcher.describe();
-            assertEquals(0.02, (double) report.get("dependency_wait_seconds"), 0);
+            assertTrue((double) report.get("dependency_wait_seconds") >= (release - waiting) / 1e9);
             assertEquals(0.0, (double) report.get("backpressure_seconds"), 0);
-            assertEquals(0.05, (double) ((Map<?, ?>) report.get("search_latency")).get("mean_ms"), 1e-12);
+            assertLatency((Map<?, ?>) report.get("search_latency"), readResponse);
         }
     }
 
@@ -439,20 +489,18 @@ public class ReplayDispatcherTest {
 
     @Test
     public void sharedBatchKeepsEachMembersClientEntryTime() throws Exception {
-        var now = new AtomicLong(1_000_000);
         var response = new CompletableFuture<Void>();
+        var samples = List.of(new ResponseTiming(response), new ResponseTiming(response));
         try (var dispatcher = new ReplayDispatcher(config(1, 10), client -> (seq, op, stored) ->
-                new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response), 0, now::get)) {
+                samples.get((int) seq - 1).handle())) {
             dispatcher.send(baseline(1));
-            now.addAndGet(4_000);
+            Thread.sleep(20);
+            samples.get(1).earliestStart = System.nanoTime();
             dispatcher.send(baseline(2));
-            now.addAndGet(4_000);
-            response.complete(null);
+            complete(samples.toArray(ResponseTiming[]::new));
             dispatcher.drain();
-            var latency = (Map<?, ?>) dispatcher.describe().get("write_latency");
-            assertEquals(2L, latency.get("count"));
-            assertEquals(0.006, (double) latency.get("mean_ms"), 0);
-            assertEquals(0.008, (double) latency.get("max_ms"), 0);
+            assertLatency((Map<?, ?>) dispatcher.describe().get("write_latency"),
+                    samples.toArray(ResponseTiming[]::new));
         }
     }
 
@@ -769,7 +817,7 @@ public class ReplayDispatcherTest {
             var response = new CompletableFuture<Void>();
             var dispatcher =
                     new ReplayDispatcher(
-                            new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 1, 1),
+                            new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 1, 1, 1),
                             client -> (seq, op, stored) -> new ReplayTarget.SendHandle(sent, response));
             try {
                 if (localTimeout) assertThrows(IOException.class, () -> dispatcher.send(search(1)));
@@ -797,7 +845,7 @@ public class ReplayDispatcherTest {
                         search(3));
         for (boolean secondary : new boolean[] {false, true}) {
             List<Integer> routes = new ArrayList<>();
-            var config = new ReplayConfig(secondary, 0, 0, 0, 0, "operation", 2, 10, 2);
+            var config = new ReplayConfig(secondary, 0, 0, 0, 0, "operation", 2, 10, 2, 1);
             try (var projection =
                     ReplayProjection.withClients(
                             config,
@@ -868,7 +916,7 @@ public class ReplayDispatcherTest {
         var response = new CompletableFuture<Void>();
         try (var dispatcher =
                 new ReplayDispatcher(
-                        new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 10, 1),
+                        new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 10, 1, 1),
                         client ->
                                 (seq, op, stored) ->
                                         new ReplayTarget.SendHandle(
@@ -884,7 +932,7 @@ public class ReplayDispatcherTest {
         var localSend = new CompletableFuture<Void>();
         var dispatcher =
                 new ReplayDispatcher(
-                        new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 10, 1),
+                        new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 10, 1, 1),
                         client ->
                                 (seq, op, stored) ->
                                         new ReplayTarget.SendHandle(

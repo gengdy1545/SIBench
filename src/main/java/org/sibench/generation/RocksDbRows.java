@@ -38,10 +38,14 @@ public final class RocksDbRows implements AutoCloseable {
     private volatile long version;
     private volatile boolean loading = true, closed;
     private volatile Exception failure;
+    private String initialStateIdentity;
 
     public RocksDbRows(Path directory, int fields, Settings settings, Events events) throws IOException, RocksDBException {
+        this(directory,fields,settings,events,-1);
+    }
+    private RocksDbRows(Path directory,int fields,Settings settings,Events events,long initialRows) throws IOException,RocksDBException {
         if (fields < 1 || fields > 1024) throw new IllegalArgumentException("Invalid field count");
-        if (Files.exists(directory)) throw new IOException("RocksDB output already exists: " + directory);
+        if (initialRows<0&&Files.exists(directory)) throw new IOException("RocksDB output already exists: " + directory);
         Files.createDirectories(directory.toAbsolutePath().getParent());
         this.fields = fields; this.events = Objects.requireNonNull(events);
         workloadWriteBufferBytes = Math.min(settings.writeBufferBytes(), 2L << 30);
@@ -53,7 +57,7 @@ public final class RocksDbRows implements AutoCloseable {
                 .setWriteBufferSize(Math.min(settings.writeBufferBytes(), 16L << 20))
                 .setMaxWriteBufferNumber(3).setCompressionType(CompressionType.LZ4_COMPRESSION)
                 .setTableFormatConfig(new BlockBasedTableConfig().setBlockCache(cache).setFilterPolicy(bloom));
-        rowOptions = ColumnFamilyOptions.getColumnFamilyOptionsFromProps(history).setWriteBufferSize(settings.writeBufferBytes())
+        rowOptions = ColumnFamilyOptions.getColumnFamilyOptionsFromProps(history).setWriteBufferSize(initialRows<0?settings.writeBufferBytes():workloadWriteBufferBytes)
                 // A finite, discarded run: skip background merges that would rewrite full rows.
                 .setCompactionStyle(CompactionStyle.NONE)
                 .setLevel0SlowdownWritesTrigger(Integer.MAX_VALUE).setLevel0StopWritesTrigger(Integer.MAX_VALUE)
@@ -62,8 +66,8 @@ public final class RocksDbRows implements AutoCloseable {
                 .setTableFormatConfig(new BlockBasedTableConfig().setBlockCache(cache).setFilterPolicy(bloom));
         try (var compression = new CompressionOptions().setLevel(1)) { rowOptions.setCompressionOptions(compression); }
         RocksDbTimestamps.configure(rowOptions);
-        options = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true)
-                .setErrorIfExists(true).setMaxBackgroundJobs(settings.backgroundJobs())
+        options = new DBOptions().setCreateIfMissing(initialRows<0).setCreateMissingColumnFamilies(initialRows<0)
+                .setErrorIfExists(initialRows<0).setMaxBackgroundJobs(settings.backgroundJobs())
                 .setMaxSubcompactions(settings.backgroundJobs() - 1);
         transactions = new TransactionDBOptions().setTransactionLockTimeout(30000);
         try {
@@ -73,7 +77,34 @@ public final class RocksDbRows implements AutoCloseable {
             writes.close(); transactions.close(); options.close(); rowOptions.close(); metadataOptions.close(); bloom.close(); cache.close();
             throw error;
         }
+        if(initialRows>=0){identities.set(initialRows);loading=false;}
     }
+
+    /** Restore the same closed initial database into a new directory and a fresh block cache. */
+    public static RocksDbRows restore(Path initial,Path directory,int fields,Settings settings,long initialRows,Events events)
+            throws IOException,RocksDBException {
+        if(initialRows<=0)throw new IllegalArgumentException("A restored baseline needs positive row count");
+        if(!Files.isRegularFile(initial.resolve("CURRENT")))throw new IOException("Initial RocksDB database is incomplete");
+        Files.createDirectory(directory);
+        var digest=org.sibench.config.Digests.digest();
+        try(var paths=Files.walk(initial)) {
+            for(Path source:paths.sorted().toList()) {
+                if(source.equals(initial))continue;
+                if(Files.isSymbolicLink(source))throw new IOException("Initial database contains a symbolic link");
+                Path relative=initial.relativize(source),target=directory.resolve(relative);
+                if(Files.isDirectory(source)){Files.createDirectory(target);continue;}
+                var content=org.sibench.config.Digests.digest();
+                try(var input=new java.security.DigestInputStream(Files.newInputStream(source),content)) {
+                    Files.copy(input,target);
+                }
+                digest.update(relative.toString().getBytes(StandardCharsets.UTF_8));digest.update((byte)0);digest.update(content.digest());
+            }
+        }
+        var restored=new RocksDbRows(directory,fields,settings,events,initialRows);
+        restored.initialStateIdentity=HexFormat.of().formatHex(digest.digest());
+        return restored;
+    }
+    public String initialStateIdentity(){return initialStateIdentity;}
 
     static List<ColumnFamilyDescriptor> descriptors(ColumnFamilyOptions metadata, ColumnFamilyOptions rows) {
         return List.of(new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY, metadata),

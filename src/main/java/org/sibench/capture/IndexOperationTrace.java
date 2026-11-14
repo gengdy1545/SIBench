@@ -90,7 +90,7 @@ public final class IndexOperationTrace {
      * scan its consumer stopped early returned among equal indexed values.
      *
      * One canonical index operation. For SEARCH, {@code version} is 0 unless the read is
-     * transaction-local, when it is the source transaction's CommitVersion; writes use it as the
+     * transaction-local in raw capture, when it is the source resolution slot; exported reads use explicit private contexts. Writes use it as the
      * new entry version.
      */
     public record Operation(
@@ -114,7 +114,10 @@ public final class IndexOperationTrace {
             int expansionSize,
             IndexKey lower,
             IndexKey upper,
-            long limit) {
+            long limit,
+            java.util.List<Operation> localWrites) {
+
+        public Operation { localWrites = java.util.List.copyOf(localWrites); }
 
         public Range range() {
             return new Range(
@@ -148,7 +151,7 @@ public final class IndexOperationTrace {
                     expansionSize,
                     lower,
                     upper,
-                    limit);
+                    limit, localWrites);
         }
 
         public Operation withExpansion(int ordinal, int count) {
@@ -173,7 +176,7 @@ public final class IndexOperationTrace {
                     count,
                     lower,
                     upper,
-                    limit);
+                    limit, localWrites);
         }
 
         public Operation withWorkUnitId(long id) {
@@ -198,7 +201,19 @@ public final class IndexOperationTrace {
                     expansionSize,
                     lower,
                     upper,
-                    limit);
+                    limit, localWrites);
+        }
+
+        public Operation withLocalWrites(java.util.List<Operation> writes) {
+            return new Operation(sourceEvent, kind, table, index, flags, key, indexedValue, version, file, position, rowId,
+                    expectedCount, transactionId, mutationOrdinal, readTimestamp, workUnitId, expansionPosition,
+                    expansionSize, lower, upper, limit, writes);
+        }
+
+        public boolean containsWrite(Operation write) {
+            return table == write.table() && index == write.index()
+                    && range().contains(index == 0 ? write.key() : write.indexedValue())
+                    && (key == null || key.equals(write.key()));
         }
 
         public boolean grouped() {
@@ -227,12 +242,12 @@ public final class IndexOperationTrace {
                     expansionSize,
                     lower,
                     upper,
-                    limit);
+                    limit, localWrites);
         }
 
         /**
          * A search's {@code version} is 0 unless it is transaction-local; then it is the
-         * committing transaction's own version. Its {@code readTimestamp} remains the statement
+         * source transaction's resolution version. Its {@code readTimestamp} remains the statement
          * snapshot, so a reader takes that snapshot and overlays this transaction's writes up to
          * {@code mutationOrdinal}.
          */
@@ -258,7 +273,7 @@ public final class IndexOperationTrace {
                     expansionSize,
                     lower,
                     upper,
-                    limit);
+                    limit, localWrites);
         }
     }
 
@@ -275,7 +290,7 @@ public final class IndexOperationTrace {
             long rowId) {
         return new Operation(
                 source, kind, table, 0, flags, key, null, version, file, position, rowId, 0, 0, 0,
-                -1, 0, 0, 0, null, null, 0);
+                -1, 0, 0, 0, null, null, 0, java.util.List.of());
     }
 
     /**
@@ -314,7 +329,7 @@ public final class IndexOperationTrace {
                 groupSize,
                 range.lower(),
                 range.upper(),
-                range.limit());
+                range.limit(), java.util.List.of());
     }
 
     public static Operation search(
@@ -325,7 +340,7 @@ public final class IndexOperationTrace {
     public static Operation transaction(long source, int kind, long id, long version, long rows) {
         return new Operation(
                 source, kind, 0, 0, 0, null, null, version, 0, 0, 0, rows, id, 0, -1, 0, 0, 0,
-                null, null, 0);
+                null, null, 0, java.util.List.of());
     }
 
     public static boolean isMutation(Operation o) {
@@ -358,6 +373,31 @@ public final class IndexOperationTrace {
                                                         && (o.index() == 0)
                                                                 == (o.indexedValue() == null)));
         if (!valid) throw new IOException("Invalid index operation");
+        if (!o.localWrites().isEmpty()) {
+            if (!search || o.localWrites().size() > CommittedOperations.MAX_TRANSACTION_OPERATIONS)
+                throw new IOException("Invalid private read context");
+            com.google.protobuf.ByteString previous = null;
+            for (var write : o.localWrites()) {
+                if (!isMutation(write) || !write.localWrites().isEmpty() || write.version() != 0
+                        || write.transactionId() != 0 || write.mutationOrdinal() != 0 || write.flags() != 0
+                        || write.sourceEvent() != 0 || write.workUnitId() != 0 || write.expectedCount() != 0
+                        || write.rowId() < 0 || write.file() < 0 || write.position() < 0
+                        || write.expansionPosition() != 0 || write.expansionSize() != 1)
+                    throw new IOException("Invalid private write");
+                validate(write);
+                if (!o.containsWrite(write)) throw new IOException("Private write outside its read scope");
+                var encoded = new org.sibench.trace.IndexEntry(write.table(), write.index(), write.indexedValue(), write.key()).bytes();
+                if (previous != null && com.google.protobuf.ByteString.unsignedLexicographicalComparator().compare(previous, encoded) >= 0)
+                    throw new IOException("Private writes must have unique ordered keys");
+                previous = encoded;
+            }
+        }
+    }
+
+    static Operation privateWrite(Operation write) {
+        return write(0, write.kind(), write.table(), 0, write.key(), 0,
+                write.file(), write.position(), write.kind() == LOGICAL_DELETE ? 0 : write.rowId())
+                .withIndex(write.index(), write.indexedValue(), write.kind()).withExpansion(0, 1);
     }
 
     private static boolean validSearch(Operation o) {

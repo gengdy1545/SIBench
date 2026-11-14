@@ -961,11 +961,18 @@ public final class IndexReferenceReplay implements AutoCloseable {
             long transaction,
             long ordinal)
             throws IOException {
+        var results = new ArrayList<LookupResult>();
+        readEntries(table, index, range, timestamp, localVersion, transaction, ordinal,
+                (entry, selected) -> results.add(new LookupResult(entry.key(), selected.version(), selected.value(), selected.position())));
+        return results;
+    }
+
+    private void readEntries(int table, int index, Range range, long timestamp, long localVersion,
+            long transaction, long ordinal, VisibleConsumer consumer) throws IOException {
         if (table < 1 || index < 0 || timestamp < 0 || (index > 0 && !secondaryIndexes))
             throw new IOException("Invalid index search");
-        var results = new ArrayList<LookupResult>();
         Store store = stores.get(new Namespace(table, index));
-        if (store == null) return results;
+        if (store == null) return;
         store.seal();
         byte[] start =
                 range.lower() == null
@@ -979,7 +986,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
                         : range.upperInclusive()
                                 ? range.upper().prefixSuccessor()
                                 : range.upper().bytes();
-        if (end != null && Arrays.compareUnsigned(start, end) >= 0) return results;
+        if (end != null && Arrays.compareUnsigned(start, end) >= 0) return;
         boolean descending = range.descending();
         int step = descending ? -1 : 1;
         try (BaselineScan baseline = store.baseline.scan(start, end, descending);
@@ -993,9 +1000,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
                                 transaction,
                                 ordinal)) {
             try {
-                scan(baseline, overlay, range, (entry, selected) -> results.add(
-                        new LookupResult(entry.key(), selected.version(), selected.value(), selected.position())));
-                return results;
+                scan(baseline, overlay, range, consumer);
             } finally {
                 skippedHistories += overlay.skipped();
             }
@@ -1067,6 +1072,23 @@ public final class IndexReferenceReplay implements AutoCloseable {
 
     /** The entries one search names: a range, or the single entry a pinned search names. */
     private List<LookupResult> results(Operation operation) throws IOException {
+        if (!operation.localWrites().isEmpty()) {
+            var merged = new TreeMap<Composite, LookupResult>();
+            var range = operation.range();
+            var unlimited = new Range(range.lower(), range.lowerInclusive(), range.upper(), range.upperInclusive(), false, 0);
+            readEntries(operation.table(), operation.index(), unlimited, operation.readTimestamp(), 0, 0, 0,
+                    (entry, selected) -> {
+                        if (operation.key() == null || operation.key().equals(entry.key()))
+                            merged.put(entry, new LookupResult(entry.key(), selected.version(), selected.value(), selected.position()));
+                    });
+            for (var write : operation.localWrites()) {
+                var key = Composite.of(write.indexedValue(), write.key());
+                if (write.kind() == IndexOperationTrace.LOGICAL_DELETE) merged.remove(key);
+                else merged.put(key, new LookupResult(write.key(), 0, rowIds ? write.rowId() : write.file(), rowIds ? 0 : write.position()));
+            }
+            var values = range.descending() ? merged.descendingMap().values() : merged.values();
+            return values.stream().limit(range.limit() == 0 ? Long.MAX_VALUE : range.limit()).toList();
+        }
         boolean local = (operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0;
         long localVersion = local ? operation.version() : 0;
         if (operation.key() == null)

@@ -1,0 +1,4 @@
+# Unified patches preserve upstream blank context lines and CRLF source lines.
+scripts/patches/*.patch whitespace=-blank-at-eol,cr-at-eol
+# Native patch context also preserves upstream tab indentation after the diff marker.
+src/main/native/**/*.patch whitespace=-blank-at-eol,-space-before-tab,cr-at-eol

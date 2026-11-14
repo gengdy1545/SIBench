@@ -213,10 +213,11 @@ public final class PixelsBaseline {
         long maximum = number(inventory, "max_timestamp");
         require(maximum < Long.MAX_VALUE / 2 && number(inventory, "index_buckets") > 0, "Invalid baseline timestamp/buckets");
         var actual = new LinkedHashMap<String, Long>(); var uris = new HashSet<String>();
+        rows(document).keySet().forEach(table -> actual.put(table,0L));
         long observedMax = 0;
         for (var item : inventory.getAsJsonArray("files")) {
             var file = item.getAsJsonObject(); String table = file.get("table").getAsString(), uri = file.get("uri").getAsString();
-            require(table.matches("[a-z][a-z0-9_]*") && uri.startsWith(base + "/postgres/" + table + "/v-0-ordered/")
+            require(actual.containsKey(table) && table.matches("[a-z][a-z0-9_]*") && uri.startsWith(base + "/postgres/" + table + "/v-0-ordered/")
                     && uri.matches("cos://[a-z0-9.-]+/[A-Za-z0-9_./-]+") && !uri.contains("..") && uris.add(uri), "Invalid or duplicate baseline file path");
             require(file.get("sha256").getAsString().matches("[a-f0-9]{64}") && number(file, "bytes") > 0
                     && number(file, "row_groups") > 0 && number(file, "rows") > 0, "Invalid baseline file");

@@ -2,7 +2,7 @@
 # applies its committed changes to Pixels Retina, whose primary-index calls form the Trace.
 # generate-pixels selects this engine independently of the native benchmark engine selection.
 # prepare-cdc verifies only this build's source PostgreSQL and sink artifacts, retaining baseline/row-CDC
-# input without reading target storage/properties, starting Pixels or contacting pixels_host. See docs/cdc-input.md.
+# input without reading target storage/properties, starting Pixels or contacting pixels_host. See docs/pixels-experiment.md.
 # Hosts, run directories and semantic switches are assigned by the generator. The property files
 # hold upstream overrides, including optional fixed service ports for a dedicated external Trino.
 schema_version: 1

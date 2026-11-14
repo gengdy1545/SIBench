@@ -41,11 +41,12 @@ extern void sib_datum(StringInfo out, Oid type, Datum datum, bool isnull);
 /* Executor and transaction boundaries. */
 extern void sib_executor_start(QueryDesc *queryDesc);
 extern DestReceiver *sib_wrap_receiver(DestReceiver *original);
-extern void sib_executor_run_end(DestReceiver *dest, uint64 processed);
+extern void sib_executor_run_end(DestReceiver *dest, uint64 processed, bool read_complete);
 extern void sib_executor_end(uint64 processed);
 extern void sib_transaction_commit(void);
 extern void sib_capture_check_failure(void);
 extern void sib_transaction_abort(void);
+extern void sib_subtransaction(const char *event, SubTransactionId id, SubTransactionId parent);
 extern void sib_backend_exit(void);
 extern uint64 sib_capture_watermark(int pid, uint64 sequence, uint64 csn, uint64 consumed);
 extern void sib_capture_hold(bool hold);
@@ -68,6 +69,7 @@ extern void sib_bitmap_verdict(Relation heap, void *node, ItemPointer tid, bool 
 extern void sib_bitmap_lossy(Relation heap, void *node);
 
 /* Writes. */
+extern void sib_row_change(Relation relation, TupleTableSlot *oldslot, TupleTableSlot *newslot, CommandId cid);
 extern void sib_index_insert(Relation relation, Datum *values, bool *isnull, ItemPointer tid, int unique);
 extern void sib_index_build_start(Relation index);
 extern void sib_index_build_end(Relation index, double heap_rows, double index_rows);

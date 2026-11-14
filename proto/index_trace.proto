@@ -12,6 +12,8 @@ message ReadRequest {
     GetRequest get = 1;
     ScanRequest scan = 2;
   }
+  // Alternative Locator values, aligned with the request's private writes.
+  repeated bytes local_locators = 3;
 }
 
 // One source query; the replay client combines the individual RPC results.
@@ -49,6 +51,7 @@ message TraceOperation {
   }
   // Shared by all requests in a read group.
   TraceMetadata metadata = 6;
+  repeated bytes local_locators = 7;
 }
 
 message TraceRecord {

@@ -72,6 +72,7 @@ final class PixelsBaseline {
             schemas.put(fields[0], io.pixelsdb.pixels.core.TypeDescription.fromString("struct<" + fields[2].replace(';', ',') + ">"));
         }
         var rows = new LinkedHashMap<String, Long>();
+        keys.keySet().stream().filter(table -> !table.equals("sibench_marker")).sorted().forEach(table -> rows.put(table,0L));
         long copyNanos = 0, indexNanos = 0;
         for (var item : inventory.getAsJsonArray("files")) {
             var entry = item.getAsJsonObject();

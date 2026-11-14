@@ -482,6 +482,10 @@ public final class PixelsHost {
             for (var value : request.getAsJsonArray("tables")) {
                 String table = value.getAsString();
                 if (!table.matches("[A-Za-z0-9_]+")) throw new IOException("Invalid LOAD table");
+                for (Path directory : List.of(run.resolve("load"),run.resolve("load").resolve(table))) {
+                    if (Files.isSymbolicLink(directory)) throw new IOException("Symbolic LOAD directory: " + directory);
+                    if (!Files.exists(directory)) Files.createDirectory(directory);
+                }
                 tables.add(table);
             }
             setup("load", request.get("schema").getAsString(), String.join(",", tables), run.resolve("load").toString(),

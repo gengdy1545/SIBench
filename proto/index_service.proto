@@ -20,6 +20,8 @@ service IndexService {
 message GetRequest {
   bytes key = 1;
   uint64 read_ts = 2;
+  // Ordered, unique private writes at timestamp zero; never published to the store.
+  repeated Mutation local_writes = 3;
 }
 
 message GetResponse {
@@ -52,6 +54,7 @@ message ScanRequest {
   // Zero means no limit on visible entries.
   uint64 limit = 4;
   bool reverse = 5;
+  repeated Mutation local_writes = 6;
 }
 
 message ScanResponse {

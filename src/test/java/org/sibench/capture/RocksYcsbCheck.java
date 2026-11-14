@@ -61,7 +61,7 @@ public class RocksYcsbCheck {
         var source=SourceSchema.of("ycsb",Path.of("benchmark/YCSB"),Map.of("fieldcount",2));
         assertTrue(source.fingerprints().containsKey("core/src/main/java/site/ycsb/DB.java"));
         assertFalse(source.fingerprints().keySet().stream().anyMatch(p->p.startsWith("jdbc/")));
-        try(var trace=new RocksTrace(root.resolve("trace"),source,true,false,null)) {
+        try(var trace=new RocksTrace(root.resolve("trace"),source,true,null)) {
             var rows=new RocksDbRows(root.resolve("trace/data"),2,settings(),trace::event);
             try(rows) {
                 var binding=new RocksYcsb(rows,trace::baseline,2);binding.stage(true);RocksYcsb.install(binding);
@@ -98,6 +98,6 @@ public class RocksYcsbCheck {
             trace.close();var manifest=trace.publish(Map.of("input","hand-controlled API"));
             assertEquals(1L,manifest.get("aborted_transactions"));
         }
-        org.sibench.replay.ReferenceReplay.run(root.resolve("trace"),new org.sibench.replay.ReplayConfig(true,0,0,0,0,"operation"),root.resolve("reference.json"));
+        org.sibench.replay.ReferenceReplay.run(root.resolve("trace"),new org.sibench.replay.ReplayConfig(true,0,0,0,0,"operation", 1, 4096, 60, 1),root.resolve("reference.json"));
     }
 }

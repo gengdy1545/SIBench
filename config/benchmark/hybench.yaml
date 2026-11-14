@@ -9,15 +9,14 @@ native:
   build_directory: build/benchmarks/HyBench-2024
   sf: 10x
   clients: 32
-  ap_clients: 1
   xp_transaction_clients: 32
+  # Set to zero to disable IQ clients in the source workload.
   xp_query_clients: 32
   duration_minutes: 1
   phase_duration_minutes:
     tp: 5
     xp: 5
 trace:
-  export_queries: false
   secondary_indexes: false
   workload_requests: 10000000
 artifacts:

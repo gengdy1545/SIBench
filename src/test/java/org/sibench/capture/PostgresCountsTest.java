@@ -26,4 +26,15 @@ public class PostgresCountsTest {
         var unfinished=new PostgresCounts();event(unfinished,"executor_start",",\"req\":1,\"sql\":\"SELECT 1\"");
         assertThrows(IOException.class,()->event(unfinished,"transaction_commit",""));
     }
+    @Test public void completeReadSurvivesPortalRollbackButPartialExecutionDoesNot()throws Exception {
+        var counts=new PostgresCounts();
+        event(counts,"executor_start",",\"req\":1,\"sql\":\"SELECT 1\"");
+        event(counts,"executor_run_end",",\"processed\":1,\"read_complete\":true");
+        event(counts,"transaction_abort","");
+        event(counts,"executor_start",",\"req\":2,\"sql\":\"SELECT 1\"");
+        event(counts,"executor_run_end",",\"processed\":1,\"read_complete\":false");
+        event(counts,"transaction_abort","");event(counts,"capture_end","");
+        assertEquals(Long.valueOf(1),counts.report().get("successful_executions"));
+        assertEquals(Long.valueOf(1),counts.report().get("failed_executions"));
+    }
 }

@@ -32,8 +32,6 @@ public final class NativeHistory {
                 + "commit_version BIGINT UNIQUE NOT NULL CHECK(commit_version > 0))");
         execute(database,"CREATE FUNCTION "+SCHEMA+".query_id() RETURNS BIGINT AS '$libdir/row_capture', "
                 +"'sibench_query_id' LANGUAGE C VOLATILE");
-        execute(database,"CREATE FUNCTION "+SCHEMA+".row_change() RETURNS trigger AS '$libdir/row_capture', "
-                +"'sibench_row_capture' LANGUAGE C");
         execute(database,"CREATE FUNCTION "+SCHEMA+".row_identity() RETURNS trigger AS '$libdir/row_capture', "
                 +"'sibench_identity_capture' LANGUAGE C");
     }

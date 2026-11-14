@@ -130,7 +130,7 @@ public class IndexOperationTraceTest {
                                         new Operation(
                                                 1, 2, 3, 0, 0, null, null, 1, 0, 0, 0, 1, 0, 0,
                                                 1, 0, 0, 0, IndexKey.ofInt(1), IndexKey.ofInt(1),
-                                                0)));
+                                                0, java.util.List.of())));
             }
             List<Operation> actual = new ArrayList<>();
             ProtoTrace.read(file, null, null, actual::add);

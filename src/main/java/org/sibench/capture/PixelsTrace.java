@@ -57,13 +57,14 @@ final class PixelsTrace implements AutoCloseable {
     PixelsTrace(Path directory, SourceSchema source, Map<Long, Table> tables, RequestBudget budget) throws IOException {
         this.directory = directory;
         this.tables = new HashMap<>(tables);
+        tables.values().stream().filter(table -> table.id()>0).forEach(table -> baselineCounts.put(table.name(),0L));
         var catalog = IndexCatalog.fromSchema(source);
         manifest = new LinkedHashMap<>(IndexCatalog.provenance(source, catalog.definitions()));
         IndexCatalog.fromManifest(new Gson().toJsonTree(manifest).getAsJsonObject());
         Files.createDirectory(directory);
         Files.writeString(directory.resolve("INCOMPLETE"), "Native generation/publication pending\n", StandardOpenOption.CREATE_NEW);
         baseline = new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"), false);
-        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"), false, false, budget);
+        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"), false, budget);
         units = WorkUnits.create(directory);
         manifest.put("output", "proto");
         manifest.put("value_kinds", List.of("row_id", "locator"));
@@ -80,6 +81,7 @@ final class PixelsTrace implements AutoCloseable {
             if (tables.containsKey(entry.getKey()) || tables.values().stream().anyMatch(t -> t.id() == entry.getValue().id()))
                 throw new IOException("Duplicate Pixels table registration");
             tables.put(entry.getKey(), entry.getValue());
+            if(entry.getValue().id()>0)baselineCounts.put(entry.getValue().name(),0L);
         }
     }
 
@@ -107,7 +109,7 @@ final class PixelsTrace implements AutoCloseable {
             throw new IOException("Pixels baseline entries " + baselineCounts + " differ from source rows " + expected);
         baselineOpen = false;
         baseline.close();
-        manifest.put("baseline_rows", expected.values().stream().mapToLong(Long::longValue).sum());
+        org.sibench.trace.TraceManifest.baselineRows(manifest,expected);
         stream("baseline", baseline);
     }
 

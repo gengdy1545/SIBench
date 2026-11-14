@@ -18,17 +18,16 @@ import org.sibench.schema.SourceSchema;
 final class PostgresTrace {
     private final Path directory;
     private final boolean secondaryIndexes;
-    private final boolean exportQueries;
     private final RequestBudget budget;
-    private volatile boolean queryStage;
     private volatile long projectedTransactions;
     private final IndexCatalog catalog;
     private final Map<String,Object> manifest;
+    private final PostgresQueries coverage;
 
-    PostgresTrace(Path directory,SourceSchema source,boolean secondaryIndexes,boolean exportQueries,RequestBudget budget)throws IOException {
+    PostgresTrace(Path directory,SourceSchema source,boolean secondaryIndexes,RequestBudget budget)throws IOException {
         this.budget=budget;
-        this.exportQueries=exportQueries;
         this.secondaryIndexes=secondaryIndexes;this.directory=directory;catalog=IndexCatalog.fromSchema(source);
+        coverage=new PostgresQueries(source,secondaryIndexes);
         manifest=new LinkedHashMap<>(IndexCatalog.provenance(source,catalog.definitions()));
         IndexCatalog.fromManifest(new Gson().toJsonTree(manifest).getAsJsonObject());
         Files.createDirectory(directory);
@@ -38,28 +37,27 @@ final class PostgresTrace {
         manifest.put("secondary_index_coverage",secondaryIndexes?"all_source_definitions":"primary_only");
     }
 
-    /** The caller drains the previous source window before changing its classification. */
-    void queryStage(boolean value) { queryStage=value; }
+    Map<String,Long> iqQueries(){return coverage.successful();}
+    Map<String,Object> queryCoverage(){return coverage.report();}
 
     void baseline(Connection database,Map<String,Long> expected)throws Exception {
         var writer=new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"),secondaryIndexes);
         try(writer){Generation.requireRows(expected,NativeBaseline.write(database,org.sibench.config.Engine.POSTGRES,catalog.definitions().stream().filter(d->secondaryIndexes||d.indexId()==0).toList(),catalog::postgresKey,writer::accept));}
-        manifest.put("baseline_rows",expected.values().stream().mapToLong(Long::longValue).sum());
+        org.sibench.trace.TraceManifest.baselineRows(manifest,expected);
         stream("baseline",writer);
     }
 
     /** One consumer runs concurrently with native clients; source counts are checked before publication. */
     void workload(Connection database,PostgresCapture capture)throws Exception {
         var units=WorkUnits.create(directory);
-        var writer=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,exportQueries,budget);
+        var writer=new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,budget,coverage::exported);
         try(var lines=units.lines();writer;var versions=new PostgresVersions(database);
-                var projection=new PostgresProjection(database,catalog,directory,versions,units,secondaryIndexes,writer::accept)) {
+                var projection=new PostgresProjection(database,catalog,directory,versions,units,secondaryIndexes,writer::accept,coverage)) {
             for(PostgresTransactions.Chunk next;(next=capture.transactions.next(()->capture.watermark(database)))!=null;)
                 {
                     var chunk=next;
                     try {
                         if(chunk.hasRequests&&!chunk.committed)writer.expectAbort();
-                        if(chunk.hasRequests&&queryStage)writer.expectQuery();
                         if (projection.accept(chunk)) projectedTransactions++;
                         capture.updateHold(database);
                     } catch(Exception|Error failure) {
@@ -80,6 +78,7 @@ final class PostgresTrace {
                     ||aborts!=((Number)counts.get("aborted_transactions")).longValue()
                     ||versions.version()!=commits+aborts)throw new IOException("Incomplete PG source projection");
             manifest.putAll(counts);manifest.put("source_statements",requests);
+            manifest.put("query_coverage",coverage.report());
             manifest.put("last_resolved_version",writer.lastCommittedVersion());
             manifest.put("capture_queue",capture.transactions.metrics());
         }

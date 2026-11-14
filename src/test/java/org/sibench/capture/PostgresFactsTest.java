@@ -17,6 +17,23 @@ public class PostgresFactsTest {
         try(var output=new ZstdOutputStream(Files.newOutputStream(file))){output.write(text.getBytes(StandardCharsets.UTF_8));}return file;
     }
     private String event(String kind,int sequence){return "{\"event\":\""+kind+"\",\"sequence\":"+sequence+",\"pid\":42}\n";}
+    @Test public void eventLimitAppliesAfterDecompressionAndAcrossReadBoundaries()throws Exception {
+        byte[] line=new byte[PostgresFacts.MAX_EVENT_BYTES];java.util.Arrays.fill(line,(byte)'x');
+        try(var input=PostgresFacts.bounded(new java.io.ByteArrayInputStream(line))) {
+            assertEquals(line.length,input.transferTo(java.io.OutputStream.nullOutputStream()));
+        }
+        try(var input=PostgresFacts.bounded(new java.io.SequenceInputStream(new java.io.ByteArrayInputStream(line),
+                new java.io.ByteArrayInputStream(new byte[]{'x'})))) {
+            assertTrue(assertThrows(IOException.class,()->input.transferTo(java.io.OutputStream.nullOutputStream()))
+                    .getMessage().contains("16 MiB"));
+        }
+        try(var input=PostgresFacts.bounded(new java.io.SequenceInputStream(new java.io.ByteArrayInputStream(line),
+                new java.io.ByteArrayInputStream(new byte[]{'\n','x'})))) {
+            assertEquals(line.length+2L,input.transferTo(java.io.OutputStream.nullOutputStream()));
+        }
+        var error=assertThrows(IOException.class,()->PostgresFacts.read(stream("x".repeat(line.length+1)),e->fail()));
+        assertTrue(error.getMessage().contains("16 MiB"));
+    }
     @Test public void requiresContiguousEventsAndCleanNativeClose()throws Exception {
         String start=event("capture_start",0),abort=event("transaction_abort",1),end=event("capture_end",2);
         var seen=new java.util.ArrayList<String>();

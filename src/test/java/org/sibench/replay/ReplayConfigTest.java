@@ -70,14 +70,14 @@ public class ReplayConfigTest {
         var longRun = ReplayConfig.from(longDocument);
         assertEquals(666000000, longRun.requiredOperations());
         assertEquals(128, longRun.clientCount());
-        assertEquals(2, new ReplayConfig(false, 1, 1, 0, 1).requiredOperations());
-        assertEquals(120, new ReplayConfig(false, 1, 100, 0, 20).requiredOperations());
+        assertEquals(2, new ReplayConfig(false, 1, 1, 0, 1, "operation", 1, 4096, 60, 1).requiredOperations());
+        assertEquals(120, new ReplayConfig(false, 1, 100, 0, 20, "operation", 1, 4096, 60, 1).requiredOperations());
         assertThrows(
                 ArithmeticException.class,
-                () -> new ReplayConfig(true, Long.MAX_VALUE, 2, 0, 0));
+                () -> new ReplayConfig(true, Long.MAX_VALUE, 2, 0, 0, "operation", 1, 4096, 60, 1));
         assertThrows(
                 ArithmeticException.class,
-                () -> new ReplayConfig(true, 1, Long.MAX_VALUE, 0, 100));
+                () -> new ReplayConfig(true, 1, Long.MAX_VALUE, 0, 100, "operation", 1, 4096, 60, 1));
     }
 
     @Test
@@ -105,8 +105,8 @@ public class ReplayConfigTest {
         assertThrows(IllegalArgumentException.class, () -> ReplayConfig.from(serviceless));
         assertThrows(
                 IllegalArgumentException.class,
-                () -> new ReplayConfig(true, 0, 300000, 0, 0));
+                () -> new ReplayConfig(true, 0, 300000, 0, 0, "operation", 1, 4096, 60, 1));
         assertThrows(
-                IllegalArgumentException.class, () -> new ReplayConfig(true, 1, 1, -1, 0));
+                IllegalArgumentException.class, () -> new ReplayConfig(true, 1, 1, -1, 0, "operation", 1, 4096, 60, 1));
     }
 }

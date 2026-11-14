@@ -35,7 +35,7 @@ public final class StreamingLatencyCheck {
                 "workload_operations", 600, "workload_rpc_requests", 600,
                 "measured_operations", 584, "measured_writes", 292, "measured_searches", 292,
                 "checked_results", 200));
-        var config = new ReplayConfig(false, 0, 0, WARMUP, 0, "operation", 2, 64, 5);
+        var config = new ReplayConfig(false, 0, 0, WARMUP, 0, "operation", 2, 64, 5, 1);
         var requests = new TraceRequests(ValueKind.ROW_ID);
         requests.baselineBatch(16);
         try (var grpc = new GrpcService(args[0], requests, BINDING, 5)) {

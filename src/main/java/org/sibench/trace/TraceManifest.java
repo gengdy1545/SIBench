@@ -13,6 +13,13 @@ import org.sibench.adapters.ValueKind;
 public final class TraceManifest {
     private TraceManifest() {}
 
+    /** Declare zero-row tables explicitly so absence never stands in for missing source data. */
+    public static void baselineRows(java.util.Map<String,Object> manifest,java.util.Map<String,Long> counts) {
+        manifest.put("baseline_rows",counts.values().stream().reduce(0L,Math::addExact));
+        var empty=counts.entrySet().stream().filter(entry->entry.getValue()==0).map(java.util.Map.Entry::getKey).sorted().toList();
+        if(!empty.isEmpty())manifest.put("empty_baseline_tables",empty);
+    }
+
     public static boolean secondaryIndexes(JsonObject manifest) throws IOException {
         var scope = manifest.get("secondary_index_coverage");
         if (scope == null || !scope.isJsonPrimitive() || !scope.getAsJsonPrimitive().isString())

@@ -9,7 +9,6 @@ import java.io.IOException;
 import java.math.BigInteger;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.function.LongSupplier;
 
 /**
  * One sender, deterministic work-unit routing, and bounded independently completed responses.
@@ -122,7 +121,6 @@ public final class ReplayDispatcher implements AutoCloseable {
 
     private final ReplayConfig config;
     private final ReplayTarget.Factory factory;
-    private final LongSupplier nanoTime;
     /** Basic operations sent before the measured window starts. */
     private final long warmup;
     private long firstSend, measuredStart, lastSend, lastCompletion, measuredLastCompletion, measuredCompleted, drainNanos;
@@ -156,14 +154,9 @@ public final class ReplayDispatcher implements AutoCloseable {
 
     /** {@code warmup}: basic operations before the measured window, 0 to measure from the start. */
     public ReplayDispatcher(ReplayConfig config, ReplayTarget.Factory factory, long warmup) {
-        this(config, factory, warmup, System::nanoTime);
-    }
-
-    ReplayDispatcher(ReplayConfig config, ReplayTarget.Factory factory, long warmup, LongSupplier nanoTime) {
         this.config = config;
         this.factory = Objects.requireNonNull(factory);
         this.warmup = warmup;
-        this.nanoTime = Objects.requireNonNull(nanoTime);
     }
 
     /**
@@ -204,7 +197,7 @@ public final class ReplayDispatcher implements AutoCloseable {
     private void checkFailure() throws IOException {
         if (failure != null) throw failure;
         if (!inFlight.isEmpty()
-                && inFlight.values().iterator().next().deadline() <= nanoTime.getAsLong()) {
+                && inFlight.values().iterator().next().deadline() <= System.nanoTime()) {
             var oldest = inFlight.entrySet().iterator().next();
             recordResponseFailure(oldest.getValue(), true);
             throw fail(
@@ -290,7 +283,7 @@ public final class ReplayDispatcher implements AutoCloseable {
             deferringGroup = size;
             deferredReadLimit = Math.max(deferredReadLimit, operation.readTimestamp());
         }
-        deferred.addLast(new Deferred(operation, stored, nanoTime.getAsLong(), measured));
+        deferred.addLast(new Deferred(operation, stored, System.nanoTime(), measured));
         deferringGroup--;
         peakDeferred = Math.max(peakDeferred, deferred.size());
     }
@@ -301,7 +294,7 @@ public final class ReplayDispatcher implements AutoCloseable {
             var first = deferred.peekFirst().operation();
             int size = first.grouped() ? first.expansionSize() : 1;
             if (deferred.size() < size || needsDeferral(first)) return;
-            long now = nanoTime.getAsLong();
+            long now = System.nanoTime();
             for (int i = 0; i < size; i++) {
                 var item = deferred.pollFirst();
                 deferredNanos += now - item.since();
@@ -315,9 +308,9 @@ public final class ReplayDispatcher implements AutoCloseable {
     /** Blocks the sender, releasing deferred searches as writes complete, until {@code done}. */
     private void awaitDeferred(java.util.function.BooleanSupplier done) throws IOException {
         if (deferred.isEmpty()) return;
-        long start = nanoTime.getAsLong();
+        long start = System.nanoTime();
         flushClients();
-        dependencyWaitNanos += nanoTime.getAsLong() - start;
+        dependencyWaitNanos += System.nanoTime() - start;
         while (true) {
             releaseDeferred();
             if (deferred.isEmpty() || done.getAsBoolean()) return;
@@ -325,9 +318,9 @@ public final class ReplayDispatcher implements AutoCloseable {
                 checkFailure();
                 // A complete head group whose writes finished is released by the next pass.
                 if (!needsDeferral(deferred.peekFirst().operation())) continue;
-                start = nanoTime.getAsLong();
+                start = System.nanoTime();
                 waitForResponse();
-                dependencyWaitNanos += nanoTime.getAsLong() - start;
+                dependencyWaitNanos += System.nanoTime() - start;
             }
         }
     }
@@ -342,12 +335,12 @@ public final class ReplayDispatcher implements AutoCloseable {
             if (admissionSize > config.maxInFlight())
                 throw fail(new IOException("Search group has " + admissionSize
                         + " members, exceeding max_in_flight=" + config.maxInFlight()));
-            long wait = inFlightMembers > config.maxInFlight() - admissionSize ? nanoTime.getAsLong() : 0;
+            long wait = inFlightMembers > config.maxInFlight() - admissionSize ? System.nanoTime() : 0;
             while (inFlightMembers > config.maxInFlight() - admissionSize) {
                 checkFailure();
                 waitForResponse();
             }
-            if (wait != 0) backpressureNanos += nanoTime.getAsLong() - wait;
+            if (wait != 0) backpressureNanos += System.nanoTime() - wait;
             checkFailure();
         }
         try {
@@ -361,8 +354,8 @@ public final class ReplayDispatcher implements AutoCloseable {
             lastClient = client;
             long sequence = sent + 1;
             long deadline =
-                    nanoTime.getAsLong() + TimeUnit.SECONDS.toNanos(config.requestTimeoutSeconds());
-            long started = nanoTime.getAsLong();
+                    System.nanoTime() + TimeUnit.SECONDS.toNanos(config.requestTimeoutSeconds());
+            long started = System.nanoTime();
             beginCall(started, measured);
             ReplayTarget.SendHandle handle =
                     Objects.requireNonNull(client.send(sequence, operation, stored));
@@ -388,7 +381,7 @@ public final class ReplayDispatcher implements AutoCloseable {
             CompletableFuture<Void> validated = response;
             if (pending != null && handle.businessResponse() != handle.response()) {
                 var timed = handle.businessResponse().handle((unused, error) -> {
-                    synchronized (inFlight) { pending.businessCompleted = nanoTime.getAsLong(); }
+                    synchronized (inFlight) { pending.businessCompleted = System.nanoTime(); }
                     return null;
                 });
                 validated = response.thenCombine(timed, (unused, time) -> null);
@@ -411,8 +404,8 @@ public final class ReplayDispatcher implements AutoCloseable {
                                                 error));
                             }
                             else if (error == null && !closed) {
-                                if (pending.businessCompleted < 0) pending.businessCompleted = nanoTime.getAsLong();
-                                if (deadline <= nanoTime.getAsLong()) {
+                                if (pending.businessCompleted < 0) pending.businessCompleted = System.nanoTime();
+                                if (deadline <= System.nanoTime()) {
                                     recordResponseFailure(pending, true);
                                     fail(
                                             new IOException(
@@ -425,7 +418,7 @@ public final class ReplayDispatcher implements AutoCloseable {
                                     completed += pending.members;
                                     completedOperations += pending.members;
                                     measuredCompleted += pending.members - pending.warmupMembers;
-                                    lastCompletion = nanoTime.getAsLong();
+                                    lastCompletion = System.nanoTime();
                                     if (pending.members > pending.warmupMembers) measuredLastCompletion = lastCompletion;
                                     pending.recordLatency(latencyKind == 1 ? searchLatency : writeLatency,
                                             pending.businessCompleted);
@@ -434,13 +427,13 @@ public final class ReplayDispatcher implements AutoCloseable {
                             inFlight.notifyAll();
                         }
                     });
-            long remaining = deadline - nanoTime.getAsLong();
+            long remaining = deadline - System.nanoTime();
             if (remaining <= 0) throw new TimeoutException("Local send timeout");
             localSend.get(remaining, TimeUnit.NANOSECONDS);
             localSend = null;
             sent++;
             operationsSent++;
-            lastSend = nanoTime.getAsLong();
+            lastSend = System.nanoTime();
             if (measured) measuredLastSend = lastSend;
             long[] clientCounts = counts.computeIfAbsent(clientId, key -> new long[4]);
             clientCounts[0]++;
@@ -514,7 +507,7 @@ public final class ReplayDispatcher implements AutoCloseable {
     }
 
     private void waitForResponse() throws IOException {
-        long nanos = inFlight.values().iterator().next().deadline() - nanoTime.getAsLong();
+        long nanos = inFlight.values().iterator().next().deadline() - System.nanoTime();
         if (nanos <= 0) {
             checkFailure();
             return;
@@ -531,7 +524,7 @@ public final class ReplayDispatcher implements AutoCloseable {
         checkSender();
         if (directGroup != 0 || deferringGroup != 0) throw new IOException("Incomplete search group");
         awaitDeferred(() -> false);
-        long start = nanoTime.getAsLong();
+        long start = System.nanoTime();
         flushClients();
         synchronized (inFlight) {
             while (!inFlight.isEmpty()) {
@@ -540,7 +533,7 @@ public final class ReplayDispatcher implements AutoCloseable {
             }
             checkFailure();
         }
-        drainNanos += nanoTime.getAsLong() - start;
+        drainNanos += System.nanoTime() - start;
     }
 
     public void requireClientCoverage() throws IOException {

@@ -18,9 +18,6 @@ public final class IndexExecution {
     static final int MAX_MESSAGE_BYTES = 32 * 1024 * 1024;
     private IndexExecution() {}
 
-    public static IndexResponse execute(IndexBackend backend, Message request) {
-        return execute(backend, request, chunk -> { throw new IllegalStateException("Unexpected partial response"); });
-    }
     public static IndexResponse execute(IndexBackend backend, Message request,
             java.util.function.Consumer<IndexResponse> partial) {
         try {
@@ -58,10 +55,30 @@ public final class IndexExecution {
         else if (mutation.hasDelete()) { known(mutation.getDelete()); ts(mutation.getDelete().getTs()); }
         else throw new IllegalArgumentException("Missing mutation");
     }
-    public static void validateGet(GetRequest get) { known(get); ts(get.getReadTs()); }
+    public static void validateGet(GetRequest get) {
+        known(get); ts(get.getReadTs());
+        validateLocalWrites(get.getLocalWritesList(), get.getKey(), null, true);
+    }
     public static void validateScan(ScanRequest scan) {
         known(scan); ts(scan.getReadTs());
         if (scan.getLimit() < 0) throw new IllegalArgumentException("Limit exceeds int64");
+        validateLocalWrites(scan.getLocalWritesList(), scan.hasStartKey() ? scan.getStartKey() : null,
+                scan.hasEndKey() ? scan.getEndKey() : null, false);
+    }
+    private static void validateLocalWrites(List<Mutation> writes, ByteString start, ByteString end, boolean point) {
+        if (writes.size() > org.sibench.capture.ProtoTrace.MAX_TRANSACTION_OPERATIONS) throw new IllegalArgumentException("Private write context exceeds operation limit");
+        var order = ByteString.unsignedLexicographicalComparator();
+        ByteString previous = null;
+        for (var write : writes) {
+            validateMutation(write);
+            var key = write.hasPut() ? write.getPut().getKey() : write.getDelete().getKey();
+            long timestamp = write.hasPut() ? write.getPut().getTs() : write.getDelete().getTs();
+            if (timestamp != 0 || previous != null && order.compare(previous, key) >= 0)
+                throw new IllegalArgumentException("Private writes require timestamp zero and unique ordered keys");
+            if (point ? !key.equals(start) : start != null && order.compare(key, start) < 0 || end != null && order.compare(key, end) >= 0)
+                throw new IllegalArgumentException("Private write outside read bounds");
+            previous = key;
+        }
     }
     private static void ts(long ts) {
         if (ts < 0) throw new IllegalArgumentException("Timestamp exceeds int64");

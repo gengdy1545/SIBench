@@ -31,7 +31,7 @@ public final class ReplayMatrixValidation {
                     String name = "secondary-" + secondary + "-" + dispatch + "-" + clients;
                     var config =
                             new ReplayConfig(
-                                    secondary, 0, 0, 0, 0, dispatch, clients, 4096, 60);
+                                    secondary, 0, 0, 0, 0, dispatch, clients, 4096, 60, 1);
                     var report =
                             ReferenceReplay.audit(trace, config, output.resolve(name + ".json"));
                     for (var item : (List<?>) report.get("results")) {

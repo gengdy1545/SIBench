@@ -12,29 +12,37 @@ import static org.sibench.capture.IndexOperationTrace.*;
 
 /** Final API Trace output, ordered with native transaction publication. */
 final class RocksTrace implements AutoCloseable {
+    record Baseline(Path file,Map<String,Object> description,long rows,String identity) {}
     private final Path directory;
     private final Map<String, Object> manifest;
     private final ProtoTrace.Writer baseline, workload;
     private final WorkUnits.Output units;
     private long commits, aborts, searches, changes, version;
     private boolean baselineClosed, closed;
-    private boolean independentReads;
 
-    RocksTrace(Path directory, SourceSchema source, boolean secondaryIndexes, boolean exportQueries, RequestBudget budget) throws IOException {
+    RocksTrace(Path directory, SourceSchema source, boolean secondaryIndexes, RequestBudget budget) throws IOException {
+        this(directory,source,secondaryIndexes,budget,null);
+    }
+    RocksTrace(Path directory,SourceSchema source,boolean secondaryIndexes,RequestBudget budget,Baseline initial) throws IOException {
         this.directory = directory;
         var catalog = IndexCatalog.fromSchema(source);
         manifest = new LinkedHashMap<>(IndexCatalog.provenance(source, catalog.definitions()));
         IndexCatalog.fromManifest(new Gson().toJsonTree(manifest).getAsJsonObject());
         Files.createDirectory(directory);
         Files.writeString(directory.resolve("INCOMPLETE"), "Native generation/publication pending\n", StandardOpenOption.CREATE_NEW);
-        baseline = new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"),secondaryIndexes);
-        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,exportQueries,budget);
+        baseline = initial==null?new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"),secondaryIndexes):null;
+        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,budget);
         units = WorkUnits.create(directory);
         manifest.put("output", "proto"); manifest.put("value_kinds", List.of("row_id"));
         manifest.put("mode", "api"); manifest.put("generation", "native_rocksdb");
         manifest.put("secondary_index_coverage", secondaryIndexes ? "all_source_definitions" : "primary_only");
+        if(initial!=null) {
+            Files.copy(initial.file(),directory.resolve("baseline.pb.zst"));baselineClosed=true;
+            manifest.put("baseline_rows",initial.rows());manifest.put("baseline_operations",initial.description().get("operations"));
+            manifest.put("proto_files",new LinkedHashMap<>(Map.of("baseline",List.of(initial.description()))));
+            manifest.put("baseline_trace_sha256",initial.identity());
+        }
     }
-    void independentReads(boolean value) { independentReads=value; }
     void baseline(RocksDbRows.Row row) throws IOException {
         IndexMutation.emit(write(0, INSERT, 1, 0, IndexKey.ofText(row.key()), 0, 0, 0, row.id())
                 .withWorkUnitId(1 + baseline.count() / BLOCK_RECORDS), Map.of(), Map.of(), baseline);
@@ -44,12 +52,16 @@ final class RocksTrace implements AutoCloseable {
         baseline.close(); baselineClosed = true;
         manifest.put("baseline_rows", expected); stream("baseline", baseline);
     }
+    Baseline baseline()throws IOException {
+        if(!baselineClosed||baseline==null)throw new IOException("Initial baseline is not sealed");
+        return new Baseline(directory.resolve("baseline.pb.zst"),Map.copyOf(ProtoTrace.file("baseline.pb.zst",baseline)),
+                ((Number)manifest.get("baseline_rows")).longValue(),(String)manifest.get("baseline_trace_sha256"));
+    }
     void event(RocksDbRows.Event event) throws IOException {
         if (!baselineClosed || event.version() != version + 1 || event.readVersion() > version)
             throw new IOException("Invalid RocksDB source publication order");
         version = event.version();
         units.lines().write("{\"work_unit_id\":" + version + ",\"source_event\":" + version + "}\n");
-        if(independentReads&&(event.kind().equals("read")||event.kind().equals("scan")))workload.expectQuery();
         workload.accept(transaction(0, TRANSACTION_BEGIN, version, version, 0));
         long writes = 0;
         if (event.kind().equals("read") || event.kind().equals("scan")) {

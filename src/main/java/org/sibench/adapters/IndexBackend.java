@@ -37,13 +37,6 @@ public interface IndexBackend extends AutoCloseable {
     /** The visible entries of a half-open byte range, at most its limit. */
     void scan(ScanRequest scan, ValueSink sink) throws IOException;
 
-    /** The visible entries of one search, collected; for searches known to be small. */
-    default List<ByteString> scan(ScanRequest scan) throws IOException {
-        var results = new java.util.ArrayList<ByteString>();
-        scan(scan, results::add);
-        return results;
-    }
-
     /** Every write that returned is durable to the level {@link #describe()} declares. */
     void flush() throws IOException;
 

@@ -25,7 +25,7 @@ import org.sibench.trace.TraceManifest;
 /** Explicit native publication and official consumer check for both input modes. */
 public class DuckDbTraceCheck extends DuckDbHostFixture {
     private Path output;
-    private static final ReplayConfig REPLAY=new ReplayConfig(true,0,0,0,0,"operation",2,16,5);
+    private static final ReplayConfig REPLAY=new ReplayConfig(true,0,0,0,0,"operation",2,16,5, 1);
 
     private void output(String name)throws Exception {
         String parent=System.getProperty("sibench.duckdb.trace.output");
@@ -88,7 +88,7 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
             assertEquals("workload_integrity_and_supply_valid",input.preflight().get("status"));
             assertFalse(input.preflight().containsKey("baseline"));
             assertThrows(IOException.class,()->input.baseline().read(ignored->{}));
-            var shortage=assertThrows(IOException.class,()->ReplayInput.prepare(trace,new ReplayConfig(true,1,1000000,0,0)));
+            var shortage=assertThrows(IOException.class,()->ReplayInput.prepare(trace,new ReplayConfig(true,1,1000000,0,0, "operation", 1, 4096, 60, 1)));
             assertTrue(shortage.getMessage().contains("Insufficient single-pass"));
         }finally {Files.move(held,baseline);}
         var manifest=TraceManifest.read(trace);
@@ -135,7 +135,7 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
             sql(db,"CREATE TABLE sbtest1(id INTEGER PRIMARY KEY,k INTEGER NOT NULL,c VARCHAR NOT NULL,pad VARCHAR NOT NULL)");
             sql(db,"CREATE INDEX k_1 ON sbtest1(k)");sql(db,"INSERT INTO sbtest1 VALUES(10,1,'A',''),(20,1,'B',''),(30,2,'C','')");
             history(db,"sbtest1","id");
-            var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"),true,false,null);
+            var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"),true,null);
             db.setAutoCommit(false);trace.baseline(db,Map.of("sbtest1",3L));db.commit();db.setAutoCommit(true);
             logging(db);
             try(var worker=DuckDbHostDriver.open(socket,receipts);var older=DuckDbHostDriver.open(socket,receipts)) {
@@ -169,7 +169,7 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
             sql(db,"CREATE INDEX k_1 ON sbtest1(k)");
             sql(db,"INSERT INTO sbtest1 VALUES(10,1,'original','')");
             history(db,"sbtest1","id");
-            try(var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"),true,false,null)) {
+            try(var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"),true,null)) {
                 db.setAutoCommit(false);trace.baseline(db,Map.of("sbtest1",1L));db.commit();db.setAutoCommit(true);
                 long rawPrefix=0;
                 for(int window=0;window<2;window++) {

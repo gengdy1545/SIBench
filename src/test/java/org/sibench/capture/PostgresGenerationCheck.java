@@ -26,30 +26,76 @@ public class PostgresGenerationCheck {
         run(false);
     }
     @Test public void sharedOutputBudgetControlsRealSourceAdmission() throws Exception {
-        for(boolean queries:java.util.List.of(false,true))sharedOutputBudget(queries);
+        sharedOutputBudget();
     }
-    private void sharedOutputBudget(boolean queries) throws Exception {
+    @Test public void sysbenchReadWriteCapturesBothIndexScopesAndLocalReads()throws Exception {
+        Path root=Path.of("").toRealPath(),output=Files.createTempDirectory(root.resolve("results/capture"),"sysbench-read-write-");
+        Path configuration=settings(root,output),profile=output.resolve("profile.yaml");
+        var document=parse(Files.readString(profile));var nativeConfig=object(document,"native");
+        nativeConfig.put("workloads",Map.of("oltp_read_write",Map.of("events",256)));document.put("native",nativeConfig);
+        document.put("trace",Map.of("secondary_indexes",true,"workload_requests",2400));
+        Files.writeString(profile,new org.yaml.snakeyaml.Yaml().dump(document));
+        var result=Generation.run(root,configuration).get(0);
+        var file=(Map<String,Object>)((java.util.List<?>)object(result,"proto_files").get("workload")).get(0);
+        var statistics=object(file,"statistics");
+        assertTrue(((Number)object(statistics,"source_projection").get("transaction_local_search_members")).longValue()>0);
+        assertTrue(((Number)object(object(statistics,"index_operations"),"primary").get("get")).longValue()>0);
+        assertTrue(((Number)object(object(statistics,"index_operations"),"secondary").get("put")).longValue()>0);
+        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
+                new org.sibench.replay.ReplayConfig(true,0,0,0,0, "operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
+        assertFalse(Files.exists(output.resolve("generated/database/data")));
+    }
+    @Test(timeout=180000) public void hybenchXpCapturesIqAtAndTransactionLocalReads() throws Exception {
+        Path root=Path.of("").toRealPath();
+        Path output=Files.createTempDirectory(root.resolve("results/capture"),"hybench-query-stages-");
+        Path configuration=settings(root,output);
+        var document=DuckDbGenerationTest.profile("hybench");var n=object(document,"native");
+        String client=System.getProperty("sibench.hybench.build");assertNotNull("Set sibench.hybench.build",client);
+        n.put("build_directory",client);n.put("sf","1x");n.put("timeout_minutes",2);
+        n.put("duration_minutes",1);n.remove("phase_duration_minutes");
+        for(String key:java.util.List.of("clients","xp_transaction_clients","xp_query_clients"))n.put(key,1);
+        n.put("parameters",Map.of("customer_number",300,"company_number",2,"transfer_number",6000,
+                "checking_number",600,"loanapps_number",600,"loantrans_number",600));
+        document.put("native",n);
+        document.put("trace",Map.of("secondary_indexes",true));
+        document.put("artifacts",Map.of("directory",root.relativize(output.resolve("generated")).toString()));
+        Files.writeString(output.resolve("profile.yaml"),new org.yaml.snakeyaml.Yaml().dump(document));
+        var result=Generation.run(root,configuration).get(0);
+        assertEquals(8706L,result.get("baseline_rows"));
+        var coverage=object(result,"query_coverage");
+        for(int i=1;i<=6;i++)assertTrue(((Number)object(object(coverage,"iq"),"IQ-"+i).get("successful_queries")).longValue()>0);
+        assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
+                new org.sibench.replay.ReplayConfig(true,0,0,0,0, "operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
+        assertFalse(Files.exists(output.resolve("generated/database/data")));
+        var properties=new java.util.Properties();
+        try(var file=Files.newInputStream(output.resolve("generated/xp/batch-0/resolved.props"))){properties.load(file);}
+        assertEquals("1",properties.getProperty("xapclient"));
+        assertEquals("1",properties.getProperty("xtpclient"));
+    }
+    private void sharedOutputBudget() throws Exception {
         Path root=Path.of("").toRealPath();
         Path output=Files.createTempDirectory(root.resolve("results/capture"),"postgres-budget-");
         var configuration=settings(root,output);
         var profile=output.resolve("profile.yaml");
         var document=parse(Files.readString(profile));
-        document.put("trace",Map.of("secondary_indexes",false,"export_queries",queries,"workload_requests",600));
+        document.put("trace",Map.of("secondary_indexes",false,"workload_requests",600));
         Files.writeString(profile,new org.yaml.snakeyaml.Yaml().dump(document));
         var result=Generation.run(root,configuration).get(0);
         assertEquals(1024L,result.get("baseline_operations"));
         assertFalse(Files.exists(output.resolve("generated/database/data")));
         var budget=object(object(result,"source_evidence"),"request_budget");
         assertTrue(((Number)budget.get("effective_requests")).longValue()>=600);
-        assertEquals(6,object(budget,"stages").size());
-        var query=object(object(budget,"stages"),"oltp_point_select");
-        assertEquals(queries,((Number)query.get("effective_requests")).longValue()>0);
-        assertEquals(queries,((Number)query.get("target_requests")).longValue()>0);
+        var stages=object(budget,"stages");
+        assertEquals(5,stages.size());
+        assertTrue(stages.containsKey("oltp_point_select"));
+        assertTrue(Files.exists(output.resolve("generated/oltp_point_select")));
+        var query=object(stages,"oltp_point_select");
+        assertTrue(((Number)query.get("effective_requests")).longValue()>0);
+        assertTrue(((Number)query.get("target_requests")).longValue()>0);
         assertTrue(Files.isRegularFile(output.resolve("generated/oltp_point_select/batch-0/summary.json")));
-        assertFalse(Files.exists(output.resolve("generated/oltp_point_select/batch-1"))&&!queries);
-        assertTrue(Files.exists(output.resolve("generated/oltp_read_write/budget.stop")));
+        assertTrue(Files.exists(output.resolve("generated/oltp_update_index/budget.stop")));
         assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("generated/trace"),
-                new org.sibench.replay.ReplayConfig(false,0,0,0,0,"operation"),output.resolve("reference.json")).get("status"));
+                new org.sibench.replay.ReplayConfig(false,0,0,0,0,"operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
     }
     @Test public void failedPublicationRetainsTheClosedDatabase() throws Exception {
         Path root=Path.of("").toRealPath();
@@ -76,7 +122,7 @@ public class PostgresGenerationCheck {
         config.put("tables",2);config.put("table-size",512);config.put("threads",2);config.put("prepare_threads",2);
         config.put("build_directory",client);
         var workloads=new LinkedHashMap<String,Object>();
-        for(String workload:object(config,"workloads").keySet()) workloads.put(workload,Map.of("events",32));
+        for(String workload:java.util.List.of("oltp_update_index","oltp_update_non_index","oltp_delete","oltp_insert","oltp_point_select")) workloads.put(workload,Map.of("events",32));
         config.put("workloads",workloads);document.put("native",config);
         document.put("trace",Map.of("secondary_indexes",false,"workload_requests",600));
         document.put("artifacts",Map.of("directory",root.relativize(output.resolve("generated")).toString()));
@@ -98,14 +144,14 @@ public class PostgresGenerationCheck {
         config.put("tables",2L);config.put("table-size",512L);config.put("threads",2L);config.put("prepare_threads",2L);
         config.put("timeout_minutes",1L);
         var workloads=new LinkedHashMap<String,Object>();
-        for(String workload:object(config,"workloads").keySet())workloads.put(workload,Map.of("events",256L));
+        for(String workload:java.util.List.of("oltp_update_index"))workloads.put(workload,Map.of("events",256L));
         config.put("workloads",workloads);document.put("native",config);
         var source=SourceSchema.read(root,document);var executor=Executors.newSingleThreadExecutor();
         try(var capture=new PostgresCapture(sockets.resolve("capture.sock"),output.resolve("pending"),64L<<20,4096);
                 var database=PostgresDatabase.create(Path.of(runtime),output.resolve("source"),sockets.resolve("capture.sock"),org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=database.connect("load-schema")){PostgresDatabase.unloggedTables(setup);}
             PostgresSysbench.run(root,root.resolve(client),config,database,output.resolve("load"),"oltp_read_write",null);
-            var trace=new PostgresTrace(output.resolve("trace"),source,secondaryIndexes,false,null);
+            var trace=new PostgresTrace(output.resolve("trace"),source,secondaryIndexes,null);
             try(var setup=database.connect("load")) {
                 PostgresDatabase.finishLoad(setup);
                 setup.setAutoCommit(false);NativeHistory.initialize(setup,Engine.POSTGRES);int id=0;
@@ -126,9 +172,9 @@ public class PostgresGenerationCheck {
             try(var control=database.connect("finish")){capture.finishSources(control);}
             projected.get(30,TimeUnit.SECONDS);
             var manifest=trace.publish(Map.of("stages",stages));
-            assertEquals(1024L,manifest.get("baseline_rows"));assertEquals(secondaryIndexes?2048L:1024L,manifest.get("baseline_operations"));assertEquals(1536L,manifest.get("committed_transactions"));
+            assertEquals(1024L,manifest.get("baseline_rows"));assertEquals(secondaryIndexes?2048L:1024L,manifest.get("baseline_operations"));assertEquals(256L,manifest.get("committed_transactions"));
             assertFalse(Files.exists(output.resolve("trace/INCOMPLETE")));
-            org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),new org.sibench.replay.ReplayConfig(secondaryIndexes,0,0,0,0,"operation"),output.resolve("reference.json"));
+            org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),new org.sibench.replay.ReplayConfig(secondaryIndexes,0,0,0,0,"operation", 1, 4096, 60, 1),output.resolve("reference.json"));
             assertFalse(Files.exists(output.resolve("trace/data")));
         }finally{executor.shutdownNow();Files.deleteIfExists(sockets.resolve("capture.sock"));Files.delete(sockets);}
     }

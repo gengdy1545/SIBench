@@ -184,7 +184,7 @@ final class PostgresAccessUnits {
          * GetSnapshotData() saw it, plus the running XIDs it reported. Absent (-1) for snapshots
          * that are not MVCC, such as the planner's endpoint probes.
          */
-        long snapshotCsn = -1, snapshotXmin = -1, snapshotXmax = -1;
+        long snapshotCsn = -1, snapshotXmin = -1, snapshotXmax = -1, snapshotCid = -1;
         long[] snapshotXip;
         boolean snapshotSuboverflowed;
         /** The bitmap combination this scan feeds, and its BitmapAnd group when it has one. */
@@ -663,6 +663,7 @@ final class PostgresAccessUnits {
         // A copied or imported snapshot leaves the counter at zero, which is not a position.
         if (e.has("csn") && e.get("csn").getAsLong() > 0) {
             unit.snapshotCsn = e.get("csn").getAsLong();
+            unit.snapshotCid = e.has("snapshot_cid") ? e.get("snapshot_cid").getAsLong() : -1;
             unit.snapshotXmin = e.get("xmin").getAsLong();
             unit.snapshotXmax = e.get("xmax").getAsLong();
             unit.snapshotSuboverflowed =

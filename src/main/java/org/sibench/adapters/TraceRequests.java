@@ -52,8 +52,7 @@ public final class TraceRequests {
         };
         if (operation.grouped() || !matches) throw new IOException("Stored operation shape mismatch");
         return switch (stored.getRequestCase()) {
-            case GET -> stored.getGet();
-            case SCAN -> stored.getScan();
+            case GET, SCAN -> forwardRead(stored.hasGet() ? stored.getGet() : stored.getScan(), stored.getLocalLocatorsList());
             case DELETE -> stored.getDelete();
             case PUT -> valueKind == ValueKind.LOCATOR
                     ? stored.getPut().toBuilder().setValue(value(operation)).build() : stored.getPut();
@@ -83,6 +82,7 @@ public final class TraceRequests {
             var request = query(member);
             var read = ReadRequest.newBuilder();
             if (request instanceof GetRequest get) read.setGet(get); else read.setScan((ScanRequest) request);
+            read.addAllLocalLocators(localLocators(member));
             group.addRequests(read);
         }
         return group.build();
@@ -92,6 +92,42 @@ public final class TraceRequests {
         if (read.hasScan()) return read.getScan();
         throw new IOException("Missing query member");
     }
+    Message forwardRead(ReadRequest read) throws IOException {
+        return forwardRead(read(read), read.getLocalLocatorsList());
+    }
+    private Message forwardRead(Message request, List<ByteString> locators) throws IOException {
+        var writes = request instanceof GetRequest get ? get.getLocalWritesList() : ((ScanRequest) request).getLocalWritesList();
+        if (locators.size() != writes.size()) throw new IOException("Private locator count mismatch");
+        if (valueKind != ValueKind.LOCATOR || writes.isEmpty()) return request;
+        var converted = new java.util.ArrayList<Mutation>(writes.size());
+        for (int i = 0; i < writes.size(); i++) {
+            var write = writes.get(i);
+            if (write.hasPut()) {
+                var locator = locators.get(i).isEmpty() ? IndexEntry.locator(0, 0) : locators.get(i);
+                if (locator.size() != 16) throw new IOException("Invalid private Locator");
+                write = write.toBuilder().setPut(write.getPut().toBuilder().setValue(locator)).build();
+            }
+            converted.add(write);
+        }
+        return request instanceof GetRequest get ? get.toBuilder().clearLocalWrites().addAllLocalWrites(converted).build()
+                : ((ScanRequest) request).toBuilder().clearLocalWrites().addAllLocalWrites(converted).build();
+    }
+
+    public static List<ByteString> localLocators(Operation operation) {
+        return operation.localWrites().stream().map(write -> write.kind() == IndexOperationTrace.LOGICAL_DELETE
+                || write.file() == 0 && write.position() == 0 ? ByteString.EMPTY : IndexEntry.locator(write.file(), write.position())).toList();
+    }
+
+    private List<Mutation> localWrites(Operation operation) throws IOException {
+        var writes = new java.util.ArrayList<Mutation>();
+        for (var local : operation.localWrites()) {
+            var request = request(local);
+            var write = Mutation.newBuilder();
+            if (request instanceof PutRequest put) write.setPut(put); else write.setDelete((DeleteRequest) request);
+            writes.add(write.build());
+        }
+        return writes;
+    }
     private Message query(Operation operation) throws IOException {
         if ((operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0)
             throw new IOException("Transaction-local read cannot reach the service");
@@ -99,7 +135,8 @@ public final class TraceRequests {
         if (exact) {
             var key = new IndexEntry(operation.table(), operation.index(), operation.index() == 0 ? null : operation.lower(),
                     operation.index() == 0 ? operation.lower() : operation.key()).bytes();
-            return GetRequest.newBuilder().setKey(key).setReadTs(operation.readTimestamp()).build();
+            return GetRequest.newBuilder().setKey(key).setReadTs(operation.readTimestamp())
+                    .addAllLocalWrites(localWrites(operation)).build();
         }
         var scan = ScanRequest.newBuilder().setReadTs(operation.readTimestamp()).setLimit(operation.limit())
                 .setReverse((operation.flags() & IndexOperationTrace.DESCENDING) != 0)
@@ -107,7 +144,7 @@ public final class TraceRequests {
                         operation.lower() != null && !operation.range().lowerInclusive()))
                 .setEndKey(IndexEntry.bound(operation.table(), operation.index(), operation.upper(),
                         operation.upper() == null || operation.range().upperInclusive()));
-        return scan.build();
+        return scan.addAllLocalWrites(localWrites(operation)).build();
     }
     private ByteString value(Operation operation) {
         return valueKind == ValueKind.ROW_ID ? IndexEntry.rowId(operation.rowId())

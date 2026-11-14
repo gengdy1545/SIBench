@@ -52,7 +52,7 @@ public final class TraceAccesses {
         String identity = Digests.sha256(trace.resolve("manifest.json"));
         TraceManifest.requireValue(trace, ValueKind.ROW_ID);
         var input = ReplayInput.prepare(trace,
-                new ReplayConfig(TraceManifest.secondaryIndexes(manifest), 0, 0, 0, 0));
+                new ReplayConfig(TraceManifest.secondaryIndexes(manifest), 0, 0, 0, 0, "operation", 1, 4096, 60, 1));
         Files.createDirectories(output);
         Files.deleteIfExists(output.resolve("summary.json"));
         var workingRoot = Path.of("build/sibench/analysis");
@@ -125,7 +125,7 @@ public final class TraceAccesses {
         for (Operation local : operation.localWrites()) collect(local, keys);
     }
 
-    /** Sources have already passed replay preflight; kept separate for hand-checked fixtures. */
+    /** Analyzes baseline and workload sources that have already passed replay preflight. */
     static Map<String, Object> analyze(IndexOperationTrace.Source baseline,
             IndexOperationTrace.Source workload, Path working, Path output,
             long windowRequests, int bins, long sortBytes) throws IOException {

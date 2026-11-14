@@ -42,7 +42,33 @@ public class PixelsTraceTest {
         return operations;
     }
 
-    @Test public void exportsInBeginOrderWithSnapshotReadsLocatorsAndExcludedLocalReads() throws Exception {
+    @Test public void zeroRowBaselineStillRequiresARegisteredTable()throws Exception {
+        try(var trace=trace(null)) {trace.finishBaseline(Map.of("sbtest1",0L));trace.finish();}
+        try(var trace=trace(null)) {
+            assertThrows(IOException.class,()->trace.finishBaseline(Map.of("missing_table",0L)));
+        }
+    }
+
+    @Test public void emptyTraceTablesRequireAnExplicitValidDeclaration()throws Exception {
+        try(var trace=trace(null)) {
+            trace.finishBaseline(Map.of("sbtest1",0L));trace.finish();trace.publish(Map.of());
+        }
+        Path directory=temporary.getRoot().toPath().resolve(temporary.getRoot().list()[0]).resolve("trace");
+        var config=new org.sibench.replay.ReplayConfig(false,0,0,0,0, "operation", 1, 4096, 60, 1);
+        org.sibench.replay.ReplayInput.check(directory,config);
+        var document=org.sibench.trace.TraceManifest.read(directory);
+        for(String declaration:List.of("[]","[\"unknown\"]","[\"sbtest1\",\"sbtest1\"]","123")) {
+            var changed=document.deepCopy();
+            changed.add("empty_baseline_tables",com.google.gson.JsonParser.parseString(declaration));
+            java.nio.file.Files.writeString(directory.resolve("manifest.json"),changed.toString());
+            assertThrows(IOException.class,()->org.sibench.replay.ReplayInput.check(directory,config));
+        }
+        document.remove("empty_baseline_tables");
+        java.nio.file.Files.writeString(directory.resolve("manifest.json"),document.toString());
+        assertThrows(IOException.class,()->org.sibench.replay.ReplayInput.check(directory,config));
+    }
+
+    @Test public void exportsInBeginOrderWithSnapshotReadsLocatorsAndCoalescedWrites() throws Exception {
         var trace = trace(null);
         Path directory = temporary.getRoot().toPath().resolve(temporary.getRoot().list()[0]).resolve("trace");
         // LOAD: two baseline rows at the LOAD timestamp; the count must match the source exactly.
@@ -60,9 +86,8 @@ public class PixelsTraceTest {
         assertEquals(0, trace.version());
         trace.fact(fact(PixelsTrace.LOOKUP, 10, 1, 100));
         trace.fact(fact(PixelsTrace.UPDATE, 10, 1, 201));
-        // Insert, read back and update of one key inside one transaction: the read saw its own write.
+        // Multiple writes of one key keep its final committed identity.
         trace.fact(fact(PixelsTrace.PUT, 12, 7, 300));
-        trace.fact(fact(PixelsTrace.LOOKUP, 12, 7, 300));
         trace.fact(fact(PixelsTrace.UPDATE, 12, 7, 301));
         trace.fact(new PixelsTrace.Fact(PixelsTrace.PUT, MARKER, 10, 13, ByteBuffer.allocate(8).putLong(4).array(), 1, 1, 0, 0));
         for (long timestamp : List.of(10L, 12L, 13L)) trace.commit(timestamp);
@@ -90,13 +115,34 @@ public class PixelsTraceTest {
         assertEquals(41, update.file());
         assertEquals((2L << 32) | 5, update.position());
         assertEquals(IndexKey.ofInt(5), operations.get(5).key());
-        // The local read is excluded and the intermediate insert of key 7 is coalesced into its update.
+        // The intermediate insert of key 7 is coalesced into its update.
         assertEquals(301, operations.get(8).rowId());
         @SuppressWarnings("unchecked")
         var projection = (Map<String, Object>) ((Map<String, Object>) ((Map<String, Object>) ((List<?>) ((Map<String, Object>)
                 manifest.get("proto_files")).get("workload")).get(0)).get("statistics")).get("source_projection");
-        assertEquals(1L, projection.get("excluded_local_search_members"));
         assertEquals(1L, projection.get("coalesced_writes"));
+    }
+
+    @Test public void aReadOfAnEarlierLocalWriteRetainsItsIntermediateIdentity() throws Exception {
+        var trace = trace(null);
+        trace.fact(fact(PixelsTrace.PUT, 3, 1, 100));
+        trace.finishBaseline(Map.of("sbtest1", 1L));
+        trace.begin(10);
+        trace.fact(fact(PixelsTrace.PUT, 10, 7, 300));
+        trace.fact(fact(PixelsTrace.LOOKUP, 10, 7, 300));
+        trace.fact(fact(PixelsTrace.UPDATE, 10, 7, 301));
+        trace.commit(10);
+        trace.covered(trace.committedSnapshot());
+        trace.finish();
+        var manifest = new java.util.LinkedHashMap<>(trace.publish(Map.of()));
+        Path directory = temporary.getRoot().toPath().resolve(temporary.getRoot().list()[0]).resolve("trace");
+        manifest.put("trace_directory", directory.toString());
+        var operations = workload(manifest);
+        var read = operations.stream().filter(o -> o.kind() == SEARCH).findFirst().orElseThrow();
+        assertEquals(300, read.localWrites().get(0).rowId());
+        assertEquals(301, operations.stream().filter(IndexOperationTrace::isMutation).findFirst().orElseThrow().rowId());
+        assertEquals("passed", org.sibench.replay.ReferenceReplay.run(directory,
+                new org.sibench.replay.ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 4096, 60, 1), directory.resolve("reference.json")).get("status"));
     }
 
     @Test public void rejectsIncompleteBaselineUnsupportedCallsAndUnresolvedTransactions() throws Exception {
@@ -108,7 +154,7 @@ public class PixelsTraceTest {
                 "purgeEntries".getBytes(java.nio.charset.StandardCharsets.UTF_8), -1, 0, 0, 0)));
 
         var workload = trace(null);
-        workload.finishBaseline(Map.of());
+        workload.finishBaseline(Map.of("sbtest1",0L));
         workload.begin(5);
         assertThrows(IOException.class, () -> workload.begin(5));
         assertThrows(IOException.class, () -> workload.commit(6));
@@ -141,7 +187,7 @@ public class PixelsTraceTest {
 
     @Test public void mixedMarkerTransactionIsRejected() throws Exception {
         var trace = trace(null);
-        trace.finishBaseline(Map.of());
+        trace.finishBaseline(Map.of("sbtest1",0L));
         trace.begin(4);
         trace.fact(fact(PixelsTrace.PUT, 4, 1, 10));
         trace.fact(new PixelsTrace.Fact(PixelsTrace.PUT, MARKER, 10, 4, ByteBuffer.allocate(8).putLong(1).array(), 1, 1, 0, 0));
@@ -174,7 +220,7 @@ public class PixelsTraceTest {
         assertEquals(7, operations.get(6).rowId());
         assertEquals(2, operations.get(6).version());
         var report = org.sibench.replay.ReferenceReplay.run(directory,
-                new org.sibench.replay.ReplayConfig(false, 0, 0, 0, 0, "operation"), temporary.newFolder().toPath().resolve("report.json"));
+                new org.sibench.replay.ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 4096, 60, 1), temporary.newFolder().toPath().resolve("report.json"));
         assertEquals("passed", report.get("status"));
         assertEquals(2, ((List<?>) report.get("results")).size());
     }

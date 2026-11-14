@@ -17,7 +17,7 @@ import org.sibench.trace.IndexEntry;
 public class IndexExecutorTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
-    @Test(timeout=10000)
+    @Test(timeout=15000)
     public void persistenceRunsWithoutAClientFlushAndItsFailureRejectsFurtherCalls() throws Exception {
         var flushed=new java.util.concurrent.CountDownLatch(1);
         try(var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("maintenance"),ValueKind.ROW_ID)) {
@@ -25,10 +25,10 @@ public class IndexExecutorTest {
                 if(method.getName().equals("flush")) { flushed.countDown(); throw new IOException("storage unavailable"); }
                 try { return method.invoke(backend,args); } catch(java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
             });
-            var executor=new IndexExecutor(failing,20);
+            var executor=new IndexExecutor(failing);
             var write=IndexServerTest.put(7,1,70);
             assertEquals(IndexStatus.OK,executor.submit(write).get(2,TimeUnit.SECONDS).status());
-            assertTrue(flushed.await(2,TimeUnit.SECONDS));
+            assertTrue(flushed.await(8,TimeUnit.SECONDS));
             var error=assertThrows(IOException.class,executor::close);
             assertTrue(error.getMessage().contains("Background persistence"));
             assertEquals("storage unavailable",error.getCause().getMessage());
@@ -92,7 +92,7 @@ public class IndexExecutorTest {
                 release.countDown();
                 assertEquals(IndexStatus.UNAVAILABLE, written.get(3, TimeUnit.SECONDS).status());
                 closed.get(3, TimeUnit.SECONDS);
-                assertEquals(70, backend.scan(ScanRequest.getDefaultInstance()).get(0).asReadOnlyByteBuffer().getLong());
+                assertEquals(70, IndexTestSupport.scan(backend, ScanRequest.getDefaultInstance()).get(0).asReadOnlyByteBuffer().getLong());
             }
         } finally { release.countDown(); pool.shutdownNow(); }
     }

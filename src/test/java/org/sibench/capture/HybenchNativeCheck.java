@@ -14,12 +14,6 @@ import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import org.junit.Test;
 import org.junit.After;
-import org.sibench.adapters.IndexExecutor;
-import org.sibench.adapters.InProcessService;
-import org.sibench.adapters.TraceRequests;
-import org.sibench.adapters.VersionedIndexBackend;
-import org.sibench.adapters.proto.TraceRecord;
-import org.sibench.adapters.ValueKind;
 import org.sibench.generation.DuckDbDatabase;
 import org.sibench.generation.NativeHistory;
 import org.sibench.generation.DuckDbHostDriver;
@@ -157,7 +151,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             assertTrue(number(observer,"SELECT count(*) FROM "+DuckDbFacts.table("transaction")+" WHERE event='rollback'")>0);
         }
     }
-    @Test public void generatesLoadsAndRunsAllBusinessMethodsThroughCaptureAndReplay()throws Exception {
+    @Test public void validatesAllNativeBusinessMethodsAndReplaysLocalReads()throws Exception {
         Path repository=Path.of("").toRealPath();
         String configured=System.getProperty("sibench.hybench.build");assertNotNull("Set sibench.hybench.build",configured);
         Path build=Path.of(configured).toRealPath(),source=repository.resolve("benchmark/HyBench-2024");
@@ -197,8 +191,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             record Observed(long record,int table,long read,long local,long query,String key) {}
             var observed=new ArrayList<Observed>();
             try(var q=observer.createStatement();var rows=q.executeQuery("SELECT a.raw_record,a.table_id,a.read_version,a.version,a.query_id,r.key_sql FROM sibench_accesses a "
-                    +"LEFT JOIN sibench_access_keys r USING(access_id) WHERE NOT EXISTS (SELECT 1 FROM sibench_changes c "
-                    +"WHERE c.transaction_id=a.transaction_id AND c.query_id<a.query_id) ORDER BY a.raw_record")) {
+                    +"LEFT JOIN sibench_access_keys r USING(access_id) ORDER BY a.raw_record")) {
                 while(rows.next()) {
                     observed.add(new Observed(rows.getLong(1),rows.getInt(2),rows.getLong(3),
                             rows.getLong(4),rows.getLong(5),rows.getString(6)));
@@ -210,54 +203,39 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
                         row.read(),row.local(),row.query())));
             }
             var trace=output.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(trace, true);
-            try(writer){DuckDbProjection.write(observer,true,writer);}
-            long[] ids={0},searches={0},matched={0};
-            try(var backend=VersionedIndexBackend.create(output.resolve("index"),ValueKind.ROW_ID);var index=new IndexExecutor(backend)) {
-                var answers=new ArrayList<java.util.concurrent.CompletableFuture<List<com.google.protobuf.ByteString>>>();
-                try(var client=InProcessService.factory((request,partial)->{
-                    assertFalse("Groups must not reach the service",request instanceof org.sibench.adapters.proto.ReadGroup);
-                    var items=new ArrayList<com.google.protobuf.ByteString>();
-                    var response=index.submit(request,chunk->{items.addAll(chunk.values());partial.accept(chunk);});
-                    answers.add(response.thenApply(reply->{items.addAll(reply.values());return List.copyOf(items);}));
-                    return response;
-                },new TraceRequests(ValueKind.ROW_ID)).open(0)) {
-                var consumer=new IndexOperationTrace.Consumer(){
-                    @Override public void accept(IndexOperationTrace.Operation operation){fail("Missing stored request");}
-                    @Override public void accept(TraceRecord record,List<IndexOperationTrace.Operation> operations)throws java.io.IOException {
-                        if(record.hasTransactionBegin())return;
-                        if(record.hasTransactionCommit())return;
-                        try {
-                            answers.clear();
-                            var request=record.getOperation();
-                            var completions=new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
-                            for(var operation:operations)
-                                completions.add(client.send(++ids[0],operation,request).response().toCompletableFuture());
-                            java.util.concurrent.CompletableFuture.allOf(completions.toArray(java.util.concurrent.CompletableFuture[]::new))
-                                    .get(5,TimeUnit.SECONDS);
-                            if((request.hasGet() || request.hasScan())||request.hasReadGroup()) {
-                                var wanted=expected.get(operations.get(0).sourceEvent());assertNotNull(wanted);
-                                HashSet<Long> actual=null;
-                                for(var answer:answers) {
-                                    var member=new HashSet<Long>();
-                                    for(var row:answer.get(5,TimeUnit.SECONDS))assertTrue(member.add(row.asReadOnlyByteBuffer().getLong()));
-                                    if(actual==null)actual=member;
-                                    else if(request.getReadGroup().getCombineMode()==org.sibench.adapters.proto.ReadGroup.CombineMode.INTERSECTION)
-                                        actual.retainAll(member);
-                                    else actual.addAll(member);
-                                }
-                                assertEquals(wanted,actual);searches[0]++;matched[0]+=actual.size();
-                            }
-                        }catch(Exception failure){throw new java.io.IOException(failure);}
+            var operations=new ArrayList<IndexOperationTrace.Operation>();
+            DuckDbProjection.write(observer,true,operations::add);
+            long searches=0,matched=0;
+            try(var reference=new IndexReferenceReplay(true,true)) {
+                ProtoTrace.read(baseline,baseWriter.sha256(),baseWriter.logicalSha256(),reference::accept);
+                var actual=new HashSet<Long>();
+                for(var operation:operations) {
+                    if(IndexOperationTrace.isControl(operation)&&operation.kind()!=IndexOperationTrace.TRANSACTION_ABORT)continue;
+                    reference.accept(operation);
+                    if(operation.kind()!=IndexOperationTrace.SEARCH)continue;
+                    if(!operation.grouped()||operation.expansionPosition()==0)actual.clear();
+                    var member=new HashSet<Long>();
+                    for(var row:reference.search(operation.table(),operation.index(),operation.range(),operation.readTimestamp(),
+                            operation.version(),operation.transactionId(),operation.mutationOrdinal()))member.add(row.value());
+                    if((operation.flags()&IndexOperationTrace.INTERSECT_GROUP)!=0&&operation.expansionPosition()>0)actual.retainAll(member);
+                    else actual.addAll(member);
+                    if(!operation.grouped()||operation.expansionPosition()+1==operation.expansionSize()) {
+                        assertEquals(expected.get(operation.sourceEvent()),actual);searches++;matched+=actual.size();
                     }
-                };
-                ProtoTrace.read(baseline,baseWriter.sha256(),baseWriter.logicalSha256(),consumer);
-                ProtoTrace.read(trace,writer.sha256(),writer.logicalSha256(),consumer);
                 }
             }
-            assertEquals(expected.size(),searches[0]);
+            assertEquals(expected.size(),searches);
+            try(writer){for(var operation:operations)writer.accept(operation);}
+            try(var reference=new IndexReferenceReplay(true,true)) {
+                ProtoTrace.read(baseline,baseWriter.sha256(),baseWriter.logicalSha256(),reference::acceptCommitted);
+                ProtoTrace.read(trace,writer.sha256(),writer.logicalSha256(),operation->{
+                    if(!IndexOperationTrace.isControl(operation))reference.acceptCommitted(operation);
+                });
+                assertEquals(expected.size(),reference.queries());
+            }
             Files.writeString(output.resolve("summary.json"),new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(
-                    Map.of("rows",8706,"business_methods",43,"searches",searches[0],"verified_row_ids",matched[0],"requests",ids[0],
-                            "baseline_sha256",baseWriter.sha256(),"workload_sha256",writer.sha256())));
+                    Map.of("rows",8706,"business_methods",43,"source_searches",searches,"verified_source_row_ids",matched,
+                            "export","complete","baseline_sha256",baseWriter.sha256(),"workload_sha256",writer.sha256())));
         }
     }
 

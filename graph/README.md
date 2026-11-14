@@ -107,8 +107,9 @@ Counts measure returned rows or write entries, not source SQL result rows, engin
 entries examined, physical I/O, elapsed time or cost.
 
 Changing only appearance requires rerunning the plotting commands. Changing
-inputs, window size or PK binning requires preparation again; the locality plotter
-rejects stale summaries. Extraction costs include full baseline loading, retained
+inputs, analyzer JAR, window size or PK binning requires preparation again. The
+locality plotter checks the preparation JAR digest and the summary input identity
+and dimensions before accepting cached extraction. Extraction costs include full baseline loading, retained
 version storage, sorting and enumeration of all Scan results, which can greatly
 exceed the request count. Two external sorts can each use the configured budget;
 disk-backed rank maps and group sets use bounded entry buffers, and native index
@@ -119,10 +120,11 @@ a time. No 87M-row time, memory or disk-capacity claim follows from small inputs
 
 ## Update locality
 
-Generate locality tables with `analyze-locality` as described in the root
-[README](../README.md#analysis), then plot them:
+Generate locality tables, then plot them:
 
 ```bash
+java -jar build/sibench/sibench.jar analyze-locality \
+  results/cache/traces/ycsb-a config/sibench.yaml results/analysis/trace/ycsb-a
 python3 graph/scripts/trace/plot_update_locality.py \
   results/analysis/trace/ycsb-a \
   --out results/plots/trace/ycsb-a

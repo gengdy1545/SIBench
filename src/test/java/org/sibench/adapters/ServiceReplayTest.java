@@ -40,7 +40,7 @@ public class ServiceReplayTest {
         Path report = root.resolve("report.json");
         var service = new ServiceConfig("rocksdb", null, index, 0, ValueKind.ROW_ID, null, false, true);
         var error = assertThrows(IOException.class, () -> ServiceReplay.run(
-                root.resolve("missing-trace"), new ReplayConfig(true, 0, 0, 0, 0), service, report));
+                root.resolve("missing-trace"), new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 4096, 60, 1), service, report));
         assertTrue(error.getMessage().contains("Incomplete Trace"));
         assertFalse(Files.exists(index));
         assertFalse(Files.exists(report));

@@ -77,16 +77,11 @@ public final class Generation {
             var document=parse(Files.readString(selection.config()));
             keys(document,Set.of("schema_version","purpose","benchmark","source","native","trace","artifacts"));
             secondaryIndexes(document);
-            exportQueries(document);
             requestTarget(document);
             require(integer(document,"schema_version")==1&&string(document,"purpose").equals("native_capture"),"Expected native_capture profile");
             keys(object(document,"source"),Set.of("path","commit"));keys(object(document,"artifacts"),Set.of("directory"));
             var source=SourceSchema.read(root,document);var nativeConfig=object(document,"native");
             validateNative(selection.benchmark(),nativeConfig);
-            var stages=selection.benchmark().equals("hybench")?List.of("ap","tp","xp"):
-                    List.copyOf(object(nativeConfig,"workloads").keySet());
-            require(requestTarget(document)==0||stages.stream().anyMatch(stage->budgetStage(document,selection.benchmark(),stage)),
-                    "The selected workloads cannot supply the exported request target with independent queries disabled");
             var parameters=selection.benchmark().equals("hybench")?HybenchParameters.read(source.source(),nativeConfig):Map.<String,Object>of();
             var baselineRows=parameters.isEmpty()?ScaleInspector.nativeRows(root,document):HybenchParameters.rows(parameters);
             Path client=root.resolve(string(nativeConfig,"build_directory")).toRealPath();
@@ -113,29 +108,14 @@ public final class Generation {
     static boolean secondaryIndexes(Map<String,Object> document) {
         if (!document.containsKey("trace")) return false;
         var trace = object(document,"trace");
-        keys(trace,Set.of("secondary_indexes", "export_queries", "workload_requests"));
+        keys(trace,Set.of("secondary_indexes", "workload_requests"));
         return bool(trace,"secondary_indexes");
     }
 
-    static boolean exportQueries(Map<String,Object> document) {
-        return document.containsKey("trace") && object(document,"trace").containsKey("export_queries")
-                && bool(object(document,"trace"),"export_queries");
-    }
-
-    /** These pinned client stages contain only independent queries; mixed stages stay unclassified. */
-    static boolean queryStage(String benchmark,String stage) {
-        return switch(benchmark) {
-            case "hybench" -> stage.equals("ap");
-            case "sysbench" -> stage.equals("oltp_point_select");
-            case "ycsb" -> stage.equals("workloadc");
-            default -> throw new IllegalArgumentException("Unknown benchmark: "+benchmark);
-        };
-    }
-
-    static boolean budgetStage(Map<String,Object> document,String benchmark,String stage) {
-        // HyBench AP ends with rollback and cannot supply committed operations even with queries enabled.
-        return !(benchmark.equals("hybench")&&stage.equals("ap"))
-                && (exportQueries(document)||!queryStage(benchmark,stage));
+    static List<String> workloads(Map<String,Object> document) {
+        String benchmark=string(document,"benchmark");
+        return benchmark.equals("hybench")?List.of("xp"):
+                List.copyOf(object(object(document,"native"),"workloads").keySet());
     }
 
     static long requestTarget(Map<String,Object> document) {
@@ -149,10 +129,10 @@ public final class Generation {
         var allowed=new java.util.HashSet<>(common);
         allowed.addAll(switch(benchmark) {
             case "ycsb"->Set.of("table","recordcount","insertstart","insertcount","fieldcount","fieldlength",
-                    "fieldlengthdistribution","insertorder","zeropadding","threads","load_threads","workloads");
+                    "fieldlengthdistribution","insertorder","zeropadding","threads","load_threads","workloads","seed");
             case "sysbench"->Set.of("tables","table-size","secondary","create-secondary","auto-inc","skip-trx",
                     "rand-seed","rand-type","threads","prepare_threads","binary","workloads");
-            case "hybench"->Set.of("sf","clients","ap_clients","xp_transaction_clients","xp_query_clients",
+            case "hybench"->Set.of("sf","clients","xp_transaction_clients","xp_query_clients",
                     "duration_minutes","phase_duration_minutes","parameters");
             default->throw new IllegalArgumentException("Unknown benchmark");
         });keys(n,allowed);
@@ -160,17 +140,19 @@ public final class Generation {
         if(benchmark.equals("hybench")) {
             require(string(n,"sf").matches("[1-9][0-9]*x"),"Invalid HyBench scale");
             HybenchParameters.validate(n);
-            for(String key:List.of("clients","ap_clients","xp_transaction_clients","xp_query_clients"))
+            for(String key:List.of("clients","xp_transaction_clients"))
                 require(positive(n,key)<=256,"Invalid HyBench client count");
+            require(integer(n,"xp_query_clients")>=0&&integer(n,"xp_query_clients")<=256,"Invalid HyBench query client count");
             require(positive(n,"duration_minutes")<=1440,"Invalid HyBench duration");
             if(n.containsKey("phase_duration_minutes")) {
-                var phases=object(n,"phase_duration_minutes");keys(phases,Set.of("ap","tp","xp"));
+                var phases=object(n,"phase_duration_minutes");keys(phases,Set.of("tp","xp"));
                 for(String phase:phases.keySet())require(positive(phases,phase)<=1440,"Invalid phase duration");
             }
             return;
         }
         require(positive(n,"threads")<=256,"Client threads exceeds 256");
         if(benchmark.equals("ycsb")) {
+            require(integer(n,"seed")>=0,"Negative YCSB seed");
             require(string(n,"table").equals("usertable"),"YCSB table must be usertable");
             require(positive(n,"recordcount")==positive(n,"insertcount"),"YCSB insertcount must equal recordcount");
             require(integer(n,"insertstart")>=0&&integer(n,"zeropadding")>=1,"Invalid YCSB key range");
@@ -203,12 +185,14 @@ public final class Generation {
 
     public static List<Map<String,Object>> run(Path root,Path configuration)throws Exception {
         Plan plan=plan(root,configuration);var reports=new ArrayList<Map<String,Object>>();
-        for(Input input:plan.inputs())reports.add(switch(input.selection().engine()) {
-            case POSTGRES -> PostgresGeneration.generate(plan,input);
-            case ROCKSDB -> RocksGeneration.generate(plan,input);
-            case DUCKDB -> generate(plan,input);
+        for(Input input:plan.inputs()) {
+            switch(input.selection().engine()) {
+            case POSTGRES -> reports.add(PostgresGeneration.generate(plan,input));
+            case ROCKSDB -> reports.addAll(RocksGeneration.generate(plan,input));
+            case DUCKDB -> reports.add(generate(plan,input));
             case PIXELS -> throw new IllegalArgumentException("Use generate-pixels for PG-to-Pixels generation");
-        });
+            }
+        }
         return List.copyOf(reports);
     }
 
@@ -258,19 +242,17 @@ public final class Generation {
                         table.indexes().stream().filter(SourceSchema.Index::primary).findFirst().orElseThrow().column());
                 database.commit();
                 var budget=new RequestBudget(requestTarget(input.document()),input.timeout());
-                try(var trace=new DuckDbTrace(input.selection().mode(),input.source(),out.resolve("trace"),secondaryIndexes(input.document()),exportQueries(input.document()),budget)) {
+                try(var trace=new DuckDbTrace(input.selection().mode(),input.source(),out.resolve("trace"),secondaryIndexes(input.document()),budget)) {
                     trace.baseline(database,expected);database.commit();database.setAutoCommit(true);
                     timings.put("baseline_indexes_seconds",seconds(baselineStart));long workloadStart=System.nanoTime();
                     boolean hybench=input.selection().benchmark().equals("hybench");
-                    var names=hybench?List.of("ap","tp","xp"):List.copyOf(object(input.nativeConfig(),"workloads").keySet());
-                    int remaining=(int)names.stream().filter(name->budgetStage(input.document(),input.selection().benchmark(),name)).count();
+                    var names=workloads(input.document());
+                    int remaining=names.size();
                     long rawPrefix=0;double projectionSeconds=0;
                     Path workloads=Files.createDirectory(out.resolve("workload"));
                     for(String name:names) {
                         Path stageRoot=Files.createDirectory(workloads.resolve(name));
-                        boolean supplies=budgetStage(input.document(),input.selection().benchmark(),name);
-                        trace.queryStage(queryStage(input.selection().benchmark(),name));
-                        budget.begin(name,supplies?remaining--:0,null);
+                        budget.begin(name,remaining--,null);
                         int batch=0;
                         do {
                             budget.checkTime();long before=budget.count();
@@ -293,8 +275,8 @@ public final class Generation {
                             projectionSeconds+=seconds(projectionStart);
                             // The window's facts and receipts are projected and checked; they are not retained.
                             Files.delete(raw);deleteTree(window.resolve("clients"));deleteTree(window.resolve("receipts"));
-                            if(budget.enabled()&&supplies)budget.requireProgress(before);
-                        } while(budget.enabled()&&supplies&&!budget.reached());
+                            if(budget.enabled())budget.requireProgress(before);
+                        } while(budget.enabled()&&!budget.reached());
                         budget.end();
                     }
                     timings.put("workload_and_projection_seconds",seconds(workloadStart));
@@ -334,7 +316,7 @@ public final class Generation {
         var benchmark=new LinkedHashMap<>(input.document());
         var trace=new LinkedHashMap<>(input.document().containsKey("trace")?object(input.document(),"trace"):Map.<String,Object>of());
         trace.put("secondary_indexes",secondaryIndexes(input.document()));
-        trace.put("export_queries",exportQueries(input.document()));benchmark.put("trace",trace);
+        benchmark.put("trace",trace);
         return Map.of("runtime",plan.runtime(),"engine_settings",plan.engines().get(input.selection().engine()).settings(),
                 "benchmark",benchmark,"mode",input.selection().mode(),"engine",input.selection().engine());
     }
@@ -389,9 +371,9 @@ public final class Generation {
             Files.createDirectory(parameters);Files.writeString(parameterFile,parameterText,StandardOpenOption.CREATE_NEW);
         }else require(Files.readString(parameterFile).equals(parameterText),"HyBench effective parameters changed after load");
         properties.setProperty("url",url);properties.setProperty("url_ap",url);
-        boolean cdc=input.selection().mode()==Mode.CDC;
-        properties.setProperty("tpclient",Long.toString(positive(n,"clients")));properties.setProperty("apclient",cdc?"0":Long.toString(positive(n,"ap_clients")));
-        properties.setProperty("xtpclient",Long.toString(positive(n,"xp_transaction_clients")));properties.setProperty("xapclient",cdc?"0":Long.toString(positive(n,"xp_query_clients")));
+        boolean queries=input.selection().mode()!=Mode.CDC;
+        properties.setProperty("tpclient",Long.toString(positive(n,"clients")));properties.setProperty("apclient","0");
+        properties.setProperty("xtpclient",Long.toString(positive(n,"xp_transaction_clients")));properties.setProperty("xapclient",queries?Long.toString(integer(n,"xp_query_clients")):"0");
         for(String phase:List.of("ap","tp","xp"))properties.setProperty(phase+"RunMins",Long.toString(n.containsKey("phase_duration_minutes")&&object(n,"phase_duration_minutes").containsKey(phase)?positive(object(n,"phase_duration_minutes"),phase):positive(n,"duration_minutes")));
         if(selectedPhase!=null)properties.setProperty("sibench.phase",selectedPhase);
         Path receipts=engine==Engine.DUCKDB?Files.createDirectory(stage.resolve("clients")):null;
@@ -419,6 +401,5 @@ public final class Generation {
     private static void json(Path file,Object value)throws IOException {Files.writeString(file,new GsonBuilder().setPrettyPrinting().create().toJson(value),StandardOpenOption.CREATE_NEW);}
     private static void sql(Connection db,String text)throws Exception {try(var q=db.createStatement()){q.execute(text);}}
     private static long number(Connection db,String text)throws Exception {try(var q=db.createStatement();var r=q.executeQuery(text)){if(!r.next())throw new IOException("Missing native count");return r.getLong(1);}}
-    private static String quote(String value){return "\""+value.replace("\"","\"\"")+"\"";}
     private static String literal(String value){return "'"+value.replace("'","''")+"'";}
 }

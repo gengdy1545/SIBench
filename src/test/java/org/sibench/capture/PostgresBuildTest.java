@@ -48,7 +48,7 @@ public class PostgresBuildTest {
         Files.copy(header.resolveSibling("row_capture.c"),build.resolve("row_capture.c"));
         action("postgres-prepared");
         Files.createDirectories(build.resolve("src"));
-        for (String name : List.of("runtime/bin/postgres","runtime/bin/pg_ctl","runtime/bin/initdb","runtime/lib/row_capture.so","source/config.status","compiler-version.txt"))
+        for (String name : List.of("runtime/bin/postgres","runtime/bin/pg_ctl","runtime/bin/initdb","runtime/lib/postgresql/row_capture.so","source/config.status","compiler-version.txt"))
             {Files.createDirectories(build.resolve(name).getParent());Files.writeString(build.resolve(name),"test artifact "+name+"\n");}
         
     }
@@ -60,7 +60,7 @@ public class PostgresBuildTest {
     @Test public void generationRequiresReceiptAndRejectsChangedExecutableOrBuildSettings() throws Exception {
         assertThrows(IOException.class,()->NativeBuildCheck.verifyPostgres(root,build));
         action("postgres-record"); var original=NativeBuildCheck.verifyPostgres(root,build);
-        for (String name : List.of("runtime/bin/postgres","runtime/lib/row_capture.so","source/config.status","source-files.json")) {
+        for (String name : List.of("runtime/bin/postgres","runtime/lib/postgresql/row_capture.so","source/config.status","source-files.json")) {
             Path file=build.resolve(name);byte[] before=Files.readAllBytes(file);
             Files.writeString(file,"changed\n");
             assertThrows(IOException.class,()->NativeBuildCheck.verifyPostgres(root,build));

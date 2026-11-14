@@ -52,10 +52,10 @@ public class ReferenceReplayTest {
                             ReferenceReplayFixture.run(
                                     baseline,
                                     workload,
-                                    new ReplayConfig(false, 1, 3, 0, 0),
+                                    new ReplayConfig(false, 1, 3, 0, 0, "operation", 1, 4096, 60, 1),
                                     report));
             assertFalse(Files.exists(report));
-            var config = new ReplayConfig(false, 1, 2, 0, 0);
+            var config = new ReplayConfig(false, 1, 2, 0, 0, "operation", 1, 4096, 60, 1);
             var checked = ReferenceReplayFixture.check(baseline, workload, config);
             assertEquals("trace_integrity_and_supply_valid", checked.get("status"));
             assertEquals(7L, ((Map<?, ?>) checked.get("workload")).get("last_resolved_version"));
@@ -109,8 +109,8 @@ public class ReferenceReplayTest {
                 writer.append(TestOps.op(12, 2, 5, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0));
             }
             for (boolean secondary : new boolean[] {true, false}) {
-                var groupedConfig = new ReplayConfig(secondary, 0, 0, 0, 0, "transaction");
-                var rawConfig = new ReplayConfig(secondary, 0, 0, 0, 0, "operation");
+                var groupedConfig = new ReplayConfig(secondary, 0, 0, 0, 0, "transaction", 1, 4096, 60, 1);
+                var rawConfig = new ReplayConfig(secondary, 0, 0, 0, 0, "operation", 1, 4096, 60, 1);
                 var grouped =
                         ReferenceReplayFixture.run(
                                 baseline,
@@ -146,7 +146,7 @@ public class ReferenceReplayTest {
                                                 secondary ? 9 : 5,
                                                 0,
                                                 0,
-                                                "transaction")));
+                                                "transaction", 1, 4096, 60, 1)));
             }
         } finally {
             try (var paths = Files.walk(directory)) {

@@ -270,6 +270,12 @@ final class PostgresTransactions implements AutoCloseable {
         long csn, bytes, memoryBytes, lines, transaction, firstRequest,lastRequest,lastCompletedRequest,captureSequence;
         boolean hasRequests;
         boolean writer, committed;
+        private final NavigableMap<Long,Long> completedRequests = new TreeMap<>();
+        private final Map<Long,Subtransaction> subtransactions = new LinkedHashMap<>();
+        private final ArrayDeque<Execution> executions = new ArrayDeque<>();
+        private final Set<Long> completedExecutions = new HashSet<>();
+        private final Map<Long,Long> lastCompletedAccess = new HashMap<>();
+        private long currentSubtransaction = 1;
         private List<JsonObject> events = new ArrayList<>();
         private Segment segment;
         private long offset, length;
@@ -278,15 +284,94 @@ final class PostgresTransactions implements AutoCloseable {
 
         Chunk(int pid, long sequence) { this.pid = pid; this.sequence = sequence; }
 
+        private final class Subtransaction {
+            final long parent;
+            final int executorDepth = executions.size();
+            boolean ended;
+            long rollback = Long.MAX_VALUE;
+            Subtransaction(long parent) { this.parent = parent; }
+        }
+
+        private final class Execution {
+            final long start, request;
+            boolean accessed;
+            Execution(JsonObject event) { start=event.get("sequence").getAsLong();request=event.get("req").getAsLong(); }
+        }
+
+        private void execution(JsonObject event, String type) throws IOException {
+            if (type.equals("executor_start")) executions.push(new Execution(event));
+            else if (type.equals("scan_rescan") && !executions.isEmpty()) executions.peek().accessed=true;
+            else if (type.equals("executor_end") || type.equals("executor_run_end") && event.get("read_complete").getAsBoolean()) {
+                if (executions.isEmpty()) throw new IOException("PG executor completion has no beginning");
+                var executor=executions.peek();
+                completedExecutions.add(executor.start);
+                if (completedExecutions.size()>ProtoTrace.MAX_TRANSACTION_OPERATIONS)
+                    throw new IOException("PG executor completion history exceeds the operation limit");
+                if (executor.accessed) lastCompletedAccess.merge(executor.request,event.get("sequence").getAsLong(),Math::max);
+                if (type.equals("executor_end")) executions.pop();
+            }
+            if (type.equals("transaction_abort")) executions.clear();
+        }
+
+        boolean executionCompleted(long start) { return completedExecutions.contains(start); }
+        boolean neededForRead(JsonObject write) {
+            return completed(write.get("req").getAsLong()) || lastCompletedAccess.getOrDefault(write.get("req").getAsLong(),0L)
+                    > write.get("sequence").getAsLong();
+        }
+
+        private void subtransaction(JsonObject event, String type) throws IOException {
+            if (type.equals("capture_start")) return;
+            long id;
+            try { id = event.get("subid").getAsBigDecimal().longValueExact(); }
+            catch (RuntimeException invalid) { throw new IOException("PG event lacks its native subtransaction", invalid); }
+            if (id <= 0) throw new IOException("Invalid PG subtransaction identity");
+            if (type.equals("subtransaction_begin")) {
+                long parent = event.get("parent_subid").getAsLong();
+                if (id == 1 || parent != currentSubtransaction || subtransactions.containsKey(id)
+                        || subtransactions.size() >= ProtoTrace.MAX_TRANSACTION_OPERATIONS)
+                    throw new IOException("Invalid PG subtransaction beginning");
+                subtransactions.put(id, new Subtransaction(parent));
+                currentSubtransaction = id;
+            } else if (id != currentSubtransaction) throw new IOException("PG event has no active subtransaction");
+            if (type.equals("subtransaction_commit") || type.equals("subtransaction_abort")) {
+                var sub = subtransactions.get(id);
+                if (sub == null || sub.ended || sub.parent != event.get("parent_subid").getAsLong())
+                    throw new IOException("Invalid PG subtransaction outcome");
+                sub.ended = true;
+                if (type.equals("subtransaction_abort")) sub.rollback = event.get("sequence").getAsLong();
+                if (type.equals("subtransaction_abort"))
+                    while (executions.size()>sub.executorDepth) executions.pop();
+                currentSubtransaction = sub.parent;
+            }
+            if ((type.equals("transaction_commit") || type.equals("transaction_abort")) && currentSubtransaction != 1)
+                throw new IOException("PG transaction ends with unresolved subtransactions");
+        }
+
+        long rollbackAt(JsonObject write) {
+            var sub = subtransactions.get(write.get("subid").getAsLong());
+            return sub == null ? Long.MAX_VALUE : sub.rollback;
+        }
+
+        boolean survived(JsonObject write) { return rollbackAt(write) == Long.MAX_VALUE; }
+
         /** Reuses the receiver's UTF-8 byte count, including the newline. */
         void append(String line, com.google.gson.JsonObject event, int cost) throws IOException {
             if (sealed) throw new IOException("Source transaction is already complete");
             String type=event.get("event").getAsString();
+            subtransaction(event, type);
+            execution(event, type);
             if(type.equals("executor_start")&&event.get("depth").getAsInt()==1) {
                 hasRequests=true;lastRequest=event.get("req").getAsLong();if(firstRequest==0)firstRequest=lastRequest;
             }
-            if(type.equals("executor_end")&&event.get("depth").getAsInt()==1)
-                lastCompletedRequest=event.get("req").getAsLong();
+            if((type.equals("executor_end")||type.equals("executor_run_end")&&event.has("read_complete")
+                    &&event.get("read_complete").getAsBoolean())&&event.get("depth").getAsInt()==1) {
+                long request=event.get("req").getAsLong();
+                if(request<lastCompletedRequest)throw new IOException("PG request completion order moved backwards");
+                var previous=completedRequests.lastEntry();
+                if(previous!=null&&(previous.getValue()==request||previous.getValue()==request-1))completedRequests.put(previous.getKey(),request);
+                else completedRequests.put(request,request);
+                lastCompletedRequest=request;
+            }
             if(type.equals("transaction_commit")||type.equals("transaction_abort"))transaction=event.get("xid").getAsLong();
             reserve(cost);
             bytes += cost;
@@ -306,8 +391,18 @@ final class PostgresTransactions implements AutoCloseable {
             else { output.write(line); output.newLine(); }
         }
 
+        boolean completed(long request) {
+            var range=completedRequests.floorEntry(request);
+            return range!=null&&request<=range.getValue();
+        }
+
         private void seal() throws IOException {
             if (sealed) throw new IOException("Repeated source transaction completion");
+            for (var sub : subtransactions.values()) {
+                if (!sub.ended) throw new IOException("Unresolved PG subtransaction");
+                var parent = subtransactions.get(sub.parent);
+                if (parent != null) sub.rollback = Math.min(sub.rollback, parent.rollback);
+            }
             if (output != null) {
                 try { output.flush(); }
                 finally {
@@ -323,9 +418,9 @@ final class PostgresTransactions implements AutoCloseable {
             if (segment == null) { for (JsonObject event : events) consumer.accept(event); }
             else try (var channel = FileChannel.open(segment.file, StandardOpenOption.READ);
                     var input = new BufferedReader(new InputStreamReader(
-                            new com.github.luben.zstd.ZstdInputStream(new FrameInput(
+                            PostgresFacts.bounded(new com.github.luben.zstd.ZstdInputStream(new FrameInput(
                                     Channels.newInputStream(channel.position(offset)), length),
-                                    com.github.luben.zstd.RecyclingBufferPool.INSTANCE), StandardCharsets.UTF_8))) {
+                                    com.github.luben.zstd.RecyclingBufferPool.INSTANCE)), StandardCharsets.UTF_8))) {
                 for (String line; (line = input.readLine()) != null;) consumer.accept(PostgresFacts.parse(line));
             }
         }

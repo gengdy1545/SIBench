@@ -12,7 +12,7 @@ public final class DispatcherCapacityCheck {
     public static void main(String[] args) throws Exception {
         long count = Long.parseLong(args[0]);
         Path report = Path.of(args[1]);
-        var config = new ReplayConfig(true, 0, 0, 0, 0, "operation", 64, 4096, 60);
+        var config = new ReplayConfig(true, 0, 0, 0, 0, "operation", 64, 4096, 60, 1);
         long[] received = {0};
         long start = System.nanoTime();
         Map<String, Object> result;
@@ -25,7 +25,7 @@ public final class DispatcherCapacityCheck {
             for (long i = 1; i <= count; i++) {
                 var operation = new IndexOperationTrace.Operation(i, IndexOperationTrace.INSERT,
                         1, 0, 0, IndexKey.ofInt(i), null, 0, 1, i - 1, i, 0, 0, 0, -1,
-                        1 + (i - 1) / IndexOperationTrace.BLOCK_RECORDS, 0, 1, null, null, 0);
+                        1 + (i - 1) / IndexOperationTrace.BLOCK_RECORDS, 0, 1, null, null, 0, java.util.List.of());
                 dispatcher.send(operation);
             }
             dispatcher.drain();

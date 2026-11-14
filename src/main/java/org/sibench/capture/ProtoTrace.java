@@ -114,17 +114,23 @@ public final class ProtoTrace {
         private final Map<String, Long> requestTypes = new LinkedHashMap<>();
         private final Map<String, Long> controls = new LinkedHashMap<>();
         private final Map<String, Long> writeOrigins = new LinkedHashMap<>();
+        private final Map<String,Long> primaryRequests=new LinkedHashMap<>(),secondaryRequests=new LinkedHashMap<>();
+        private final java.util.function.Consumer<TraceRecord> observer;
 
-        /** A baseline or fixture stream: no request budget and no query filtering. */
+        /** A baseline stream without a workload request budget. */
         public Writer(Path file, boolean secondaryIndexes) throws IOException {
-            this(file, secondaryIndexes, false, null);
+            this(file, secondaryIndexes, null);
         }
 
-        /** Export filtering leaves source execution unchanged and keeps query groups indivisible. */
-        Writer(Path file, boolean secondaryIndexes, boolean exportQueries, RequestBudget budget) throws IOException {
+        Writer(Path file, boolean secondaryIndexes, RequestBudget budget) throws IOException {
+            this(file,secondaryIndexes,budget,null);
+        }
+        Writer(Path file, boolean secondaryIndexes, RequestBudget budget,
+                java.util.function.Consumer<TraceRecord> observer) throws IOException {
+            this.observer=observer;
             this.budget = budget;
             this.secondaryIndexes = secondaryIndexes;
-            projection = new CommittedOperations(this::appendExported, exportQueries);
+            projection = new CommittedOperations(this::appendExported);
             output = new DataOutputStream(new BufferedOutputStream(new DigestOutputStream(
                     Files.newOutputStream(file, StandardOpenOption.CREATE_NEW), physical)));
             output.writeInt(MAGIC);
@@ -141,7 +147,6 @@ public final class ProtoTrace {
         }
 
         void expectAbort() throws IOException { projection.expectAbort(); }
-        void expectQuery() throws IOException { projection.expectQuery(); }
 
         private void appendExported(Operation operation) throws IOException {
             if (operation.grouped()) {
@@ -177,7 +182,8 @@ public final class ProtoTrace {
                 transaction = 0;
             } else {
                 var request = requests.request(operation);
-                var data = TraceOperation.newBuilder().setMetadata(metadata(operation));
+                var data = TraceOperation.newBuilder().setMetadata(metadata(operation))
+                        .addAllLocalLocators(TraceRequests.localLocators(operation));
                 if (request instanceof GetRequest get) data.setGet(get);
                 else if (request instanceof ScanRequest scan) data.setScan(scan);
                 else if (request instanceof PutRequest put) data.setPut(put);
@@ -221,6 +227,19 @@ public final class ProtoTrace {
                 type = request.hasGet() ? "get" : "scan";
             }
             requestTypes.merge(type, 1L, Long::sum);
+            if(request.hasReadGroup()) {
+                for(var member:request.getReadGroup().getRequestsList())
+                    countRequest(queryKey(member),member.hasGet()?"get":"scan");
+            } else {
+                ByteString key=request.hasGet()?request.getGet().getKey():request.hasScan()?request.getScan().getStartKey():
+                        request.hasPut()?request.getPut().getKey():request.getDelete().getKey();
+                countRequest(key,type);
+            }
+            if(observer!=null)observer.accept(record);
+        }
+
+        private void countRequest(ByteString key,String type) {
+            (key.asReadOnlyByteBuffer().getInt(4)==0?primaryRequests:secondaryRequests).merge(type,1L,Long::sum);
         }
 
         private void flush() throws IOException {
@@ -246,6 +265,7 @@ public final class ProtoTrace {
             return Map.of("effective_requests", effectiveRequests,
                     "primary_entries", primaryEntries, "secondary_entries", effectiveRequests - primaryEntries,
                     "request_types", Map.copyOf(requestTypes), "transaction_markers", Map.copyOf(controls),
+                    "index_operations",Map.of("primary",Map.copyOf(primaryRequests),"secondary",Map.copyOf(secondaryRequests)),
                     "write_origins", Map.copyOf(writeOrigins), "uncompressed_message_bytes", uncompressedBytes,
                     "source_projection", projection.statistics());
         }
@@ -262,14 +282,12 @@ public final class ProtoTrace {
         public void close() throws IOException {
             if (closed) return;
             closed = true;
-            try {
+            try (output) {
                 projection.finish();
                 if (!group.isEmpty() || transaction != 0) throw new IOException("Incomplete proto transaction or search group");
                 flush();
                 for (int i = 0; i < 4; i++) output.writeInt(0);
                 bytesWritten += 4L * Integer.BYTES;
-            } finally {
-                output.close();
             }
             sha256 = HexFormat.of().formatHex(physical.digest());
             logicalSha256 = HexFormat.of().formatHex(logical.digest());
@@ -382,6 +400,7 @@ public final class ProtoTrace {
                 if (operations > MAX_TRANSACTION_OPERATIONS) throw new IOException("Source group exceeds operation buffer limit");
             }
             if (request.hasReadGroup()) {
+                if (request.getLocalLocatorsCount() != 0) throw new IOException("Group locators belong to individual members");
                 var group = request.getReadGroup(); known(group);
                 if (count < 2 || group.getCombineMode() != ReadGroup.CombineMode.INTERSECTION && group.getCombineMode() != ReadGroup.CombineMode.UNION)
                     throw new IOException("Invalid query group");
@@ -389,15 +408,18 @@ public final class ProtoTrace {
                 int table = 0; long readTs = -1;
                 for (int i = 0; i < count; i++) {
                     var member = group.getRequests(i); known(member);
-                    var operation = query(TraceRequests.read(member), transaction, p, flag, i, count);
+                    var operation = query(TraceRequests.read(member), transaction, p, flag, i, count, member.getLocalLocatorsList());
                     if (i > 0 && (table != operation.table() || readTs != operation.readTimestamp()))
                         throw new IOException("Query group spans tables or read points");
                     table = operation.table(); readTs = operation.readTimestamp();
                     consumer.accept(operation);
                 }
             } else if (request.hasGet() || request.hasScan()) {
-                consumer.accept(query(request.hasGet() ? request.getGet() : request.getScan(), transaction, p, 0, 0, 0));
-            } else if (request.hasPut() || request.hasDelete()) consumer.accept(write(request, transaction, p));
+                consumer.accept(query(request.hasGet() ? request.getGet() : request.getScan(), transaction, p, 0, 0, 0, request.getLocalLocatorsList()));
+            } else if (request.hasPut() || request.hasDelete()) {
+                if (request.getLocalLocatorsCount() != 0) throw new IOException("Write carries private read locators");
+                consumer.accept(write(request, transaction, p));
+            }
             else throw new IOException("Unsupported persisted operation");
         }
     }
@@ -427,10 +449,11 @@ public final class ProtoTrace {
         return new Operation(p.getSourceEvent(), baseline ? IndexOperationTrace.INSERT : put ? IndexOperationTrace.UPSERT
                 : IndexOperationTrace.LOGICAL_DELETE, key.table(), key.index(), p.getWriteOrigin(), key.primaryKey(),
                 key.indexedValue(), ts, file, position, rowId, 0, transaction, p.getMutationOrdinal(), -1, p.getWorkUnitId(),
-                baseline ? p.getBaselinePosition() : 0, baseline ? p.getBaselineSize() : 1, null, null, 0);
+                baseline ? p.getBaselinePosition() : 0, baseline ? p.getBaselineSize() : 1, null, null, 0, java.util.List.of());
     }
 
-    private static Operation query(com.google.protobuf.Message read, long transaction, TraceMetadata p, int group, int member, int count) throws IOException {
+    private static Operation query(com.google.protobuf.Message read, long transaction, TraceMetadata p, int group, int member, int count,
+            List<ByteString> locators) throws IOException {
         if (p.getWriteOrigin() != 0 || p.getBaselinePosition() != 0 || p.getBaselineSize() != 0 || !p.getLocator().isEmpty())
             throw new IOException("Query carries write metadata");
         int table, index, flags = IndexOperationTrace.SNAPSHOT_SEARCH | group;
@@ -456,9 +479,23 @@ public final class ProtoTrace {
                 if (scan.getReverse()) flags |= IndexOperationTrace.DESCENDING;
             } else throw new IOException("Missing read operation");
         } catch (IllegalArgumentException error) { throw new IOException(error); }
+        var context = read instanceof GetRequest get ? get.getLocalWritesList() : ((ScanRequest) read).getLocalWritesList();
+        if (locators.size() != context.size()) throw new IOException("Private locator count mismatch");
+        var local = new ArrayList<Operation>(context.size());
+        for (int i = 0; i < context.size(); i++) {
+            var mutation = context.get(i);
+            var metadata = TraceMetadata.newBuilder().setBaselineSize(0).setLocator(locators.get(i));
+            var data = TraceOperation.newBuilder().setMetadata(metadata);
+            if (mutation.hasPut()) data.setPut(mutation.getPut()); else data.setDelete(mutation.getDelete());
+            // Context writes have no committed version or source boundary.
+            var decoded = write(data.build(), 0, metadata.build());
+            if (decoded.kind() == IndexOperationTrace.INSERT)
+                decoded = decoded.withIndex(decoded.index(), decoded.indexedValue(), IndexOperationTrace.UPSERT);
+            local.add(decoded.withExpansion(0, 1));
+        }
         return new Operation(p.getSourceEvent(), IndexOperationTrace.SEARCH, table, index, flags, pinned, null,
                 0, 0, 0, 0, p.getExpectedCount(), transaction, p.getMutationOrdinal(), ts, p.getWorkUnitId(), member, count,
-                lower, upper, limit);
+                lower, upper, limit, local);
     }
 
     private static void known(com.google.protobuf.Message message) throws IOException {

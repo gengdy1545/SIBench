@@ -75,8 +75,8 @@ public class TraceExportTest {
             Path directory = trace(secondary, 1, false);
             Path path = directory.resolve("manifest.json");
             var manifest = com.google.gson.JsonParser.parseString(Files.readString(path)).getAsJsonObject();
-            var primary = new ReplayConfig(false, 0, 0, 0, 0, "operation");
-            var all = new ReplayConfig(true, 0, 0, 0, 0, "operation");
+            var primary = new ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 4096, 60, 1);
+            var all = new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 4096, 60, 1);
             assertEquals("trace_integrity_and_supply_valid", ReplayInput.check(directory, primary).get("status"));
             if (secondary) assertEquals("trace_integrity_and_supply_valid", ReplayInput.check(directory, all).get("status"));
             else assertTrue(assertThrows(IOException.class, () -> ReplayInput.prepare(directory, all))
@@ -91,13 +91,13 @@ public class TraceExportTest {
     @Test public void acceptsGapsLeftByExcludedAbortedTransactions() throws Exception {
         Path directory = trace(false, 2, false);
         assertEquals("trace_integrity_and_supply_valid",
-                ReplayInput.check(directory, new ReplayConfig(false, 0, 0, 0, 0)).get("status"));
+                ReplayInput.check(directory, new ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 4096, 60, 1)).get("status"));
     }
 
     @Test public void baselineContainsOnlyInserts() throws Exception {
         Path directory = trace(false, 1, true);
         assertTrue(assertThrows(IOException.class,
-                () -> ReplayInput.check(directory, new ReplayConfig(false, 0, 0, 0, 0)))
+                () -> ReplayInput.check(directory, new ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 4096, 60, 1)))
                 .getMessage().contains("Baseline"));
     }
 
@@ -116,7 +116,7 @@ public class TraceExportTest {
         manifest.addProperty("last_resolved_version", 2);
         Files.writeString(path, manifest.toString());
         assertTrue(assertThrows(IOException.class,
-                () -> ReplayInput.prepare(directory, new ReplayConfig(false, 0, 0, 0, 0)))
+                () -> ReplayInput.prepare(directory, new ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 4096, 60, 1)))
                 .getMessage().contains("watermark"));
     }
 }

@@ -218,10 +218,26 @@ public final class ReplayInput {
         void finish(com.google.gson.JsonObject manifest) throws IOException {
             if (primary != null) throw new IOException("Unfinished index maintenance unit");
             if (group > 0) throw new IOException("Unfinished search group");
-            if (name.equals("baseline")
-                    && (manifest.get("baseline_rows").getAsLong() != rows
-                            || !loadedTables.equals(catalog.keySet())))
-                throw new IOException("Baseline row/table coverage mismatch");
+            if (name.equals("baseline")) {
+                var required=new java.util.HashSet<>(catalog.keySet());
+                if(manifest.has("empty_baseline_tables")) {
+                    var declared=manifest.get("empty_baseline_tables");
+                    if(!declared.isJsonArray())throw new IOException("Invalid empty baseline table declaration");
+                    var names=new java.util.HashMap<String,Integer>();
+                    for(var item:manifest.getAsJsonArray("index_definitions")) {
+                        var definition=item.getAsJsonObject();
+                        if(definition.get("index_id").getAsInt()==0)
+                            names.put(definition.get("table").getAsString(),definition.get("table_id").getAsInt());
+                    }
+                    for(var table:declared.getAsJsonArray()) {
+                        if(!table.isJsonPrimitive()||!table.getAsJsonPrimitive().isString()
+                                ||!required.remove(names.get(table.getAsString())))
+                            throw new IOException("Unknown or repeated empty baseline table");
+                    }
+                }
+                if(manifest.get("baseline_rows").getAsLong()!=rows||!loadedTables.equals(required))
+                    throw new IOException("Baseline row/table coverage mismatch");
+            }
         }
     }
 
