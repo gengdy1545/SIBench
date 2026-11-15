@@ -24,9 +24,14 @@ def count(value):
 
 def phase(files):
     counts = {scope: dict.fromkeys(KINDS, 0) for scope in SCOPES}
+    origins = dict.fromkeys(("business_insert", "business_update"), 0)
     total = 0
     for file in files:
         stats = file["statistics"]
+        if set(stats["write_origins"]) - set(origins):
+            raise ValueError("Unknown write origin")
+        for origin, value in stats["write_origins"].items():
+            origins[origin] += count(value)
         recorded = stats["index_operations"]
         if set(recorded) != set(SCOPES):
             raise ValueError("Missing or unknown index scope")
@@ -51,7 +56,7 @@ def phase(files):
         result[scope] = {"operations": values, "reads": reads, "writes": writes,
                         "total": reads + writes, "share": (reads + writes) / total if total else 0,
                         "operation_shares": {k: v / total if total else 0 for k, v in values.items()}}
-    return {"total": total, **result}
+    return {"total": total, "write_origins": origins, **result}
 
 
 def summarize(path):

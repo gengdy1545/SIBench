@@ -200,6 +200,9 @@ class PlotStyleTest(unittest.TestCase):
             self.assertEqual(["01", "1", "NA", 'a,"b'], [tick.get_text() for tick in axes.get_yticklabels()])
             self.assertEqual(4, len(axes.collections[0].get_offsets()))
             self.assertEqual(["No hits"], [text.get_text() for text in captured[("table-4", "access_get")].axes[0].texts])
+            empty_label = captured[("table-4", "access_get")].axes[0].texts[0]
+            self.assertEqual(global_config.ANNOTATION_FONT_SIZE, empty_label.get_fontsize())
+            self.assertEqual(access_locality_config.EMPTY_TEXT_POSITION, empty_label.get_position())
 
     def test_operation_mix_stacks_hand_checked_shares_and_preserves_empty_workloads(self):
         import matplotlib.pyplot as plt
@@ -208,13 +211,15 @@ class PlotStyleTest(unittest.TestCase):
             root = Path(temporary)
             traces = []
             workloads = [
-                [{"statistics": {"effective_requests": 10, "primary_entries": 6, "secondary_entries": 4,
-                   "index_operations": {"primary": {"get": 2, "put": 3, "delete": 1},
-                                        "secondary": {"scan": 3, "put": 1}}}}],
+                [{"statistics": {"effective_requests": 10, "primary_entries": 10, "secondary_entries": 0,
+                   "write_origins": {"business_insert": 4, "business_update": 1},
+                   "index_operations": {"primary": {"get": 2, "scan": 3, "put": 5}, "secondary": {}}}}],
                 [{"statistics": {"effective_requests": 1, "primary_entries": 1, "secondary_entries": 0,
+                   "write_origins": {},
                    "index_operations": {"primary": {"get": 1}, "secondary": {}}}}],
                 [],
                 [{"statistics": {"effective_requests": 10000, "primary_entries": 10000, "secondary_entries": 0,
+                   "write_origins": {"business_insert": 1},
                    "index_operations": {"primary": {"get": 9999, "put": 1}, "secondary": {}}}}],
             ]
             for name, workload in zip(("mixed", "get_only", "empty", "thin"), workloads):
@@ -224,6 +229,7 @@ class PlotStyleTest(unittest.TestCase):
                     "status": "complete_for_declared_projection", "baseline_rows": 100,
                     "proto_files": {"workload": workload, "baseline": [
                         {"statistics": {"effective_requests": 100, "primary_entries": 100, "secondary_entries": 0,
+                         "write_origins": {},
                          "index_operations": {"primary": {"put": 100}, "secondary": {}}}}]}}))
                 traces.append({"name": name, "label": name, "directory": directory})
             captured = []
@@ -248,13 +254,22 @@ class PlotStyleTest(unittest.TestCase):
             self.assertTrue(axes.yaxis_inverted())
             self.assertEqual([t["label"] for t in traces], [t.get_text() for t in axes.get_yticklabels()])
             self.assertTrue(all(t.get_rotation() == 0 for t in axes.get_yticklabels()))
-            self.assertEqual(["Get", "Scan", "Put", "Delete"],
+            self.assertEqual(["Get", "Scan", "Update", "Insert"],
                              [container.get_label() for container in axes.containers])
+            self.assertEqual(["Get", "Scan", "Update", "Insert"],
+                             [text.get_text() for text in axes.get_legend().get_texts()])
+            from matplotlib.colors import to_rgba
+            for container, color_index in zip(axes.containers, (0, 1, 3, 2)):
+                self.assertEqual(to_rgba(global_config.COLOR_PALETTE[color_index]), container[0].get_facecolor())
+            self.assertTrue(all(text.get_fontsize() == operation_mix_config.LEGEND_FONT_SIZE
+                                for text in axes.get_legend().get_texts()))
+            self.assertTrue(all(text.get_fontsize() == operation_mix_config.ANNOTATION_FONT_SIZE
+                                for text in axes.texts))
             for index, (widths, lefts) in enumerate((
-                    ((0.2, 0.3, 0.4, 0.1), (0, 0.2, 0.5, 0.9)),
+                    ((0.2, 0.3, 0.1, 0.4), (0, 0.2, 0.5, 0.6)),
                     ((1, 0, 0, 0), (0, 1, 1, 1)),
                     ((0, 0, 0, 0), (0, 0, 0, 0)),
-                    ((0.9999, 0, 0.0001, 0), (0, 0.9999, 0.9999, 1)))):
+                    ((0.9999, 0, 0, 0.0001), (0, 0.9999, 0.9999, 0.9999)))):
                 for container, width, left in zip(axes.containers, widths, lefts):
                     bar = container[index]
                     self.assertAlmostEqual(width, bar.get_width())
@@ -265,7 +280,7 @@ class PlotStyleTest(unittest.TestCase):
             self.assertLess(operation_mix_config.BAR_HEIGHT, 1)
             self.assertAlmostEqual(global_config.SINGLE_COLUMN_WIDTH, figure.get_figwidth())
             self.assertLessEqual(figure.get_figheight(), 3)
-            self.assertEqual(["20%", "100%", "99.99%", "30%", "40%", "0.01%", "10%"],
+            self.assertEqual(["20%", "100%", "99.99%", "30%", "10%", "40%", "0.01%"],
                              [text.get_text() for text in axes.texts if text.get_text()])
             self.assertEqual(1, len(axes.lines))
             marker = axes.lines[0]
@@ -279,7 +294,7 @@ class PlotStyleTest(unittest.TestCase):
             import csv
             from matplotlib.colors import to_rgba
 
-            for selected, labels in ((traces[1:], ["Get", "Put"]), (traces[2:3], [])):
+            for selected, labels in ((traces[1:], ["Get", "Insert"]), (traces[2:3], [])):
                 with self.subTest(labels=labels), patch.dict(sys.modules, {"_common": COMMON}), \
                         patch.object(sys, "argv", [str(script)]), \
                         patch.object(COMMON, "load_inputs", return_value={"traces": selected, "plot_directory": root}), \
@@ -296,9 +311,90 @@ class PlotStyleTest(unittest.TestCase):
                 with (root / "operation_mix.csv").open() as stream:
                     rows = list(csv.DictReader(stream))
                 self.assertEqual(4 * len(selected), len(rows))
-                self.assertEqual({"get", "scan", "put", "delete"}, {row["operation"] for row in rows})
-                self.assertTrue(all(int(row["count"]) == 0 for row in rows if row["operation"] == "delete"))
+                self.assertEqual({"get", "scan", "insert", "update"}, {row["operation"] for row in rows})
+                self.assertTrue(all(int(row["count"]) == 0 for row in rows if row["operation"] == "update"))
                 plt.close(captured[-1])
+
+    def test_operation_mix_rejects_unsupported_or_unclassified_requests(self):
+        script = ROOT / "graph/scripts/trace/plot_operation_mix.py"
+        cases = (
+            ({"get": 1}, {"get": 1}, {}, "primary-only"),
+            ({"delete": 1}, {}, {}, "Delete"),
+            ({"put": 1}, {}, {}, "Put origin count mismatch"),
+            ({"put": 1}, {}, {"business_insert": 1, "business_update": 1}, "Put origin count mismatch"),
+        )
+        for primary, secondary, origins, message in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                stats = {"primary_entries": sum(primary.values()), "secondary_entries": sum(secondary.values()),
+                         "effective_requests": sum(primary.values()) + sum(secondary.values()),
+                         "index_operations": {"primary": primary, "secondary": secondary}, "write_origins": origins}
+                (root / "manifest.json").write_text(json.dumps({
+                    "status": "complete_for_declared_projection", "baseline_rows": 0,
+                    "proto_files": {"baseline": [], "workload": [{"statistics": stats}]}}))
+                traces = [{"name": "invalid", "label": "Invalid", "directory": root}]
+                with patch.dict(sys.modules, {"_common": COMMON}), \
+                        patch.object(sys, "argv", [str(script)]), \
+                        patch.object(COMMON, "load_inputs", return_value={"traces": traces, "plot_directory": root}):
+                    with self.assertRaisesRegex(ValueError, message):
+                        runpy.run_path(str(script))["main"]()
+                self.assertFalse((root / "operation_mix.csv").exists())
+                self.assertFalse((root / "operation_mix.png").exists())
+
+    def test_operation_mix_separates_adjacent_small_write_labels(self):
+        import matplotlib.pyplot as plt
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            traces = []
+            for name, get, insert, update in (("tiny", 9996, 1, 3), ("middle", 85, 5, 10)):
+                directory = root / name
+                directory.mkdir()
+                total = get + insert + update
+                stats = {"effective_requests": total, "primary_entries": total, "secondary_entries": 0,
+                         "index_operations": {"primary": {"get": get, "put": insert + update}, "secondary": {}},
+                         "write_origins": {"business_insert": insert, "business_update": update}}
+                (directory / "manifest.json").write_text(json.dumps({
+                    "status": "complete_for_declared_projection", "baseline_rows": 0,
+                    "proto_files": {"baseline": [], "workload": [{"statistics": stats}]}}))
+                traces.append({"name": name, "label": name, "directory": directory})
+            captured = []
+            script = ROOT / "graph/scripts/trace/plot_operation_mix.py"
+            overrides = {
+                "MIN_INSIDE_LABEL_SHARE": 0.11, "PERCENT_LABEL_DECIMALS": 0,
+                "OUTSIDE_LABEL_GAP_PT": 3, "OUTSIDE_MARKER_OFFSET_PT": 4, "OUTSIDE_LABEL_OFFSET_PT": 7,
+                "PERCENT_LABEL_STYLE": {**operation_mix_config.PERCENT_LABEL_STYLE, "fontsize": 5},
+                "LEGEND_STYLE": {**operation_mix_config.LEGEND_STYLE, "fontsize": 11},
+            }
+            for settings, markers in (({}, 3), (overrides, 4)):
+                with self.subTest(settings=settings), patch.dict(sys.modules, {"_common": COMMON}), \
+                        patch.object(sys, "argv", [str(script)]), \
+                        patch.dict(operation_mix_config.__dict__, settings), \
+                        patch.object(COMMON, "load_inputs", return_value={"traces": traces, "plot_directory": root}), \
+                        patch.object(COMMON, "save_figure", side_effect=lambda figure, path: captured.append(figure)):
+                    runpy.run_path(str(script))["main"]()
+                    figure = captured[-1]
+                    self.addCleanup(plt.close, figure)
+                    figure.canvas.draw()
+                    axes = figure.axes[0]
+                    boxes = [text.get_window_extent(figure.canvas.get_renderer()) for text in axes.texts]
+                    for index, box in enumerate(boxes):
+                        self.assertTrue(all(figure.bbox.contains(x, y) for x, y in box.get_points()))
+                        self.assertFalse(any(box.overlaps(other) for other in boxes[index + 1:]))
+                    self.assertEqual(markers, len(axes.lines))
+                    self.assertTrue(all(list(marker.get_xdata()) == [1] for marker in axes.lines))
+                    if settings:
+                        self.assertEqual(["100%", "85%", "<1%", "10%", "<1%", "5%"],
+                                         [text.get_text() for text in axes.texts])
+                        self.assertTrue(all(text.get_fontsize() == 5 for text in axes.texts))
+                        self.assertTrue(all(text.get_fontsize() == 11 for text in axes.get_legend().get_texts()))
+                        external = [text for text in axes.texts if hasattr(text, "xyann")]
+                        self.assertEqual([(7, 4), (7, 4), (7, -4), (7, -4)], [t.xyann for t in external])
+                        marker = axes.lines[0]
+                        original = axes.transData.transform((1, 0))
+                        shifted = marker.get_transform().transform((1, 0))
+                        self.assertAlmostEqual(4, (shifted[0] - original[0]) * 72 / figure.dpi)
+                        self.assertAlmostEqual(4, (shifted[1] - original[1]) * 72 / figure.dpi)
 
     def test_figure_exports_preserve_configured_dimensions_and_shared_typography(self):
         import matplotlib
@@ -316,19 +412,31 @@ class PlotStyleTest(unittest.TestCase):
                     global_config.apply_style()
                     fig, ax = plt.subplots(figsize=(width, height), layout="constrained")
                     try:
-                        fig.suptitle("Figure title")
-                        fig.supxlabel("Figure label")
+                        title = fig.suptitle("Figure title")
+                        label = fig.supxlabel("Figure label")
                         ax.plot([0, 1], [1, 10], label="Series")
                         ax.set_yscale("log")
                         ax.set(title="Axes title", xlabel="X label", ylabel="Y label")
-                        ax.legend(title="Legend title")
-                        ax.text(0.5, 2.5, "Annotation")
+                        legend = ax.legend(title="Legend title")
+                        annotation = ax.text(0.5, 2.5, "Annotation", fontsize=global_config.ANNOTATION_FONT_SIZE)
                         fig.canvas.draw()
+                        expected_sizes = {
+                            title: global_config.FIGURE_TITLE_FONT_SIZE,
+                            label: global_config.FIGURE_LABEL_FONT_SIZE,
+                            ax.title: global_config.AXES_TITLE_FONT_SIZE,
+                            ax.xaxis.label: global_config.AXES_LABEL_FONT_SIZE,
+                            ax.yaxis.label: global_config.AXES_LABEL_FONT_SIZE,
+                            annotation: global_config.ANNOTATION_FONT_SIZE,
+                            legend.get_title(): global_config.LEGEND_TITLE_FONT_SIZE,
+                        }
+                        expected_sizes.update({t: global_config.X_TICK_FONT_SIZE for t in ax.get_xticklabels()})
+                        expected_sizes.update({t: global_config.Y_TICK_FONT_SIZE for t in ax.get_yticklabels()})
+                        expected_sizes.update({t: global_config.LEGEND_FONT_SIZE for t in legend.get_texts()})
                         for text in fig.findobj(Text):
                             if text.get_text():
-                                self.assertEqual(10, text.get_fontsize())
+                                self.assertEqual(expected_sizes.get(text, global_config.BASE_FONT_SIZE), text.get_fontsize())
                                 font = font_manager.findfont(text.get_fontproperties(), fallback_to_default=False)
-                                self.assertEqual("Linux Libertine O", font_manager.FontProperties(fname=font).get_name())
+                                self.assertEqual(global_config.FONT_FAMILY, font_manager.FontProperties(fname=font).get_name())
                         output = Path(temporary) / "figure"
                         COMMON.save_figure(fig, output)
                         png = plt.imread(output.with_suffix(".png"))
@@ -355,11 +463,32 @@ class PlotStyleTest(unittest.TestCase):
             pd.DataFrame({"table": [1], "index": [1], "window": [1], "category": ["business"],
                           "cumulative_block_ratio": [0.5], "hit_blocks": [1], "blocks": [2]}).to_csv(
                               directory / "windows.csv", index=False)
+            pd.DataFrame({"table": [1, 1], "index": [1, 1], "batch": [1, 2],
+                          "hit_files": [2, 3], "span_files": [3, 4], "l1_files": [5, 5]}).to_csv(
+                              directory / "l0-batches.csv", index=False)
+            captured = {}
+            save = COMMON.save_figure
+
+            def capture(figure, path):
+                captured[path.name] = figure
+                save(figure, path)
+
             script = ROOT / "graph/scripts/trace/plot_update_locality.py"
             with patch.dict(sys.modules, {"_common": COMMON}), \
                     patch.object(sys, "argv", [str(script), str(directory), "--out", str(directory / "plots")]), \
+                    patch.object(COMMON, "save_figure", side_effect=capture), \
                     patch.object(update_locality_config, "HEATMAP_FIGURE_SIZE", (4.1, 2.6)):
                 self.assertEqual(0, runpy.run_path(str(script))["main"]())
+            image = captured["heatmap-pk"].axes[0].images[0]
+            self.assertEqual(update_locality_config.HEATMAP_STYLE["origin"], image.origin)
+            self.assertEqual(update_locality_config.HEATMAP_STYLE["interpolation"], image.get_interpolation())
+            for ax, template in zip(captured["coverage-pk"].axes, update_locality_config.COVERAGE_LABELS):
+                self.assertEqual(template.format(category="business"), ax.lines[0].get_label())
+            l0 = captured["l0-overlap-pk"].axes[0].lines
+            self.assertEqual(["files with actual hits", "files in min..max range", "all L1 files"],
+                             [line.get_label() for line in l0])
+            self.assertEqual([[2, 3], [3, 4], [5, 5]], [list(line.get_ydata()) for line in l0])
+            self.assertEqual(update_locality_config.L0_SERIES["l1_files"]["linestyle"], l0[2].get_linestyle())
             heatmap = plt.imread(directory / "plots/heatmap-pk.png")
             coverage = plt.imread(directory / "plots/coverage-pk.png")
             self.assertLessEqual(abs(heatmap.shape[1] - 4.1 * 300), 1)

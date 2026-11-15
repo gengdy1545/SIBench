@@ -7,6 +7,7 @@ HEATMAP_TITLE = "{name}: update count by window and ordered block bin"
 HEATMAP_X_LABEL = "block bin (0..{last_bin})"
 HEATMAP_Y_LABEL = "business-change window"
 HEATMAP_COLORBAR_LABEL = "modifications (log scale)"
+HEATMAP_STYLE = {"aspect": "auto", "origin": "lower", "interpolation": "nearest"}
 
 COVERAGE_FIGURE_SIZE = (DOUBLE_COLUMN_WIDTH, 4.2)
 COVERAGE_TITLES = ("{name}\nCumulative block coverage", "{name}\nBlocks touched in each window")
@@ -14,6 +15,7 @@ COVERAGE_X_LABEL = "window"
 COVERAGE_Y_LABEL = "fraction of baseline blocks"
 COVERAGE_Y_LIMITS = (0, 1.02)
 COVERAGE_LINE_STYLES = {"business": "-", "index": "--"}
+COVERAGE_LABELS = ("{category} cumulative blocks", "{category} window blocks")
 COVERAGE_LEGEND_STYLE = {}
 
 BUSINESS_FIGURE_SIZE = (DOUBLE_COLUMN_WIDTH, 4.5)
@@ -25,3 +27,8 @@ L0_TITLE = "{name}: assumed L0 file overlap with static L1"
 L0_X_LABEL = "assumed L0 batch"
 L0_Y_LABEL = "files"
 L0_LEGEND_STYLE = {}
+L0_SERIES = {
+    "hit_files": {"label": "files with actual hits"},
+    "span_files": {"label": "files in min..max range"},
+    "l1_files": {"label": "all L1 files", "linestyle": "--"},
+}

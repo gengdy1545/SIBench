@@ -87,7 +87,7 @@ java -jar build/sibench/sibench.jar replay-service config/sibench.yaml \
 
 Client and service must agree on value mode and secondary-index selection. The same immutable Trace can be reused across backends and client settings. Replay validates input integrity, response completion and expected result counts; matching counts do not certify values or order. Write acknowledgment guarantees same-instance visibility; durability depends on the backend. See the [Index Service contract](docs/index-service.md).
 
-RocksDB-Cloud and SlateDB are comparison targets. Local RocksDB supports generation and test fixtures; Relive has no replay adapter on this branch.
+RocksDB-Cloud and SlateDB are comparison targets. Local RocksDB supports generation and test fixtures; Relive has no replay adapter on this branch. Its independent [service](index/relive/README.md) uses [CFS/COS settings](config/index/relive.json), referencing the same runtime object-storage connections. Supply the actual CFS mount path before starting it; local disk state is rejected.
 
 ## Analysis
 

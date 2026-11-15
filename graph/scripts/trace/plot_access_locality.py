@@ -51,14 +51,14 @@ def main():
                 ax.xaxis.set_major_formatter(EngFormatter())
                 if len(y):
                     low, high = y.min(), y.max()
-                    pad = max(0.5, (high - low) * 0.02)
+                    pad = max(style.MIN_Y_PADDING, (high - low) * style.Y_PADDING_FRACTION)
                     ax.set_ylim(low - pad, high + pad)
                 if ticks is not None:
                     ax.set_yticks([positions[key] for key in ticks["key"]], ticks["pk"])
                 else:
-                    ax.ticklabel_format(axis="y", style="plain", useOffset=False)
+                    ax.ticklabel_format(axis="y", **style.Y_TICK_FORMAT)
                 if not active.any():
-                    ax.text(0.5, 0.5, "No hits", transform=ax.transAxes, **style.EMPTY_TEXT_STYLE)
+                    ax.text(*style.EMPTY_TEXT_POSITION, style.EMPTY_TEXT, transform=ax.transAxes, **style.EMPTY_TEXT_STYLE)
                 fig.colorbar(points, ax=ax, **style.COLORBAR_STYLE)
                 output = config["plot_directory"] / trace["name"] / f"table-{table['id']}" / f"access_{operation}"
                 save_figure(fig, output)

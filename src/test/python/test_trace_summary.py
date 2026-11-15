@@ -12,6 +12,7 @@ class TraceSummaryTest(unittest.TestCase):
         # A union group with one PK Get and two secondary Scans, plus one Put.
         return [{"statistics": {"effective_requests": 4, "primary_entries": 2, "secondary_entries": 2,
                   "request_types": {"union_query": 1, "put": 1},
+                  "write_origins": {"business_update": 1},
                   "index_operations": {"primary": {"get": 1, "put": 1}, "secondary": {"scan": 2}}}}]
 
     def test_counts_group_members_and_keeps_scope_denominators(self):
@@ -21,6 +22,12 @@ class TraceSummaryTest(unittest.TestCase):
         self.assertEqual(0.25, result["primary"]["operation_shares"]["get"])
         self.assertEqual(0.5, result["secondary"]["share"])
         self.assertEqual(dict.fromkeys(summary.KINDS, 0), summary.phase([])["primary"]["operations"])
+
+    def test_write_origins_accumulate_across_files(self):
+        files = self.fixture() + self.fixture()
+        files[1]["statistics"]["write_origins"] = {"business_insert": 1}
+        self.assertEqual({"business_insert": 1, "business_update": 1}, summary.phase(files)["write_origins"])
+        self.assertEqual({"business_insert": 0, "business_update": 0}, summary.phase([])["write_origins"])
 
     def test_rejects_wrong_counts_instead_of_printing_plausible_ratios(self):
         for key in ("effective_requests", "primary_entries"):
@@ -33,6 +40,14 @@ class TraceSummaryTest(unittest.TestCase):
             fixture[0]["statistics"]["index_operations"]["primary"]["get"] = value
             with self.assertRaises(ValueError):
                 summary.phase(fixture)
+            fixture = self.fixture()
+            fixture[0]["statistics"]["write_origins"]["business_update"] = value
+            with self.assertRaises(ValueError):
+                summary.phase(fixture)
+        fixture = self.fixture()
+        fixture[0]["statistics"]["write_origins"]["unknown"] = 1
+        with self.assertRaisesRegex(ValueError, "Unknown write origin"):
+            summary.phase(fixture)
 
 
 if __name__ == "__main__":

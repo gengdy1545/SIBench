@@ -58,10 +58,8 @@ def main() -> int:
         fig, ax = plt.subplots(figsize=style.HEATMAP_FIGURE_SIZE)
         image = ax.imshow(
             pivot.to_numpy(),
-            aspect="auto",
-            origin="lower",
-            interpolation="nearest",
             norm=LogNorm(vmin=1, vmax=max(2, int(pivot.to_numpy().max()))),
+            **style.HEATMAP_STYLE,
         )
         ax.set_title(style.HEATMAP_TITLE.format(name=name))
         ax.set_xlabel(style.HEATMAP_X_LABEL.format(last_bin=len(pivot.columns) - 1))
@@ -81,13 +79,13 @@ def main() -> int:
                 part["window"],
                 part["cumulative_block_ratio"],
                 line_style,
-                label=f"{category} cumulative blocks",
+                label=style.COVERAGE_LABELS[0].format(category=category),
             )
             axes[1].plot(
                 part["window"],
                 part["hit_blocks"] / part["blocks"].where(part["blocks"] > 0),
                 line_style,
-                label=f"{category} window blocks",
+                label=style.COVERAGE_LABELS[1].format(category=category),
             )
         for ax, title in zip(axes, style.COVERAGE_TITLES):
             ax.set_title(title.format(name=name))
@@ -119,9 +117,8 @@ def main() -> int:
         for (table, index), part in l0.groupby(["table", "index"], sort=True):
             name = names.get((int(table), int(index)), f"t{int(table)}-i{int(index)}")
             fig, ax = plt.subplots(figsize=style.L0_FIGURE_SIZE)
-            ax.plot(part["batch"], part["hit_files"], label="files with actual hits")
-            ax.plot(part["batch"], part["span_files"], label="files in min..max range")
-            ax.plot(part["batch"], part["l1_files"], "--", label="all L1 files")
+            for column, line_style in style.L0_SERIES.items():
+                ax.plot(part["batch"], part[column], **line_style)
             ax.set_title(style.L0_TITLE.format(name=name))
             ax.set_xlabel(style.L0_X_LABEL)
             ax.set_ylabel(style.L0_Y_LABEL)

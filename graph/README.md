@@ -53,12 +53,15 @@ Edit `TRACES` in each figure's configuration to select benchmark names and displ
 labels. Common paths and extraction settings live in `config/global_config.py`;
 paths resolve from the repository root even when scripts run from another directory.
 Trace list order controls the benchmarks from top to bottom on the vertical axis.
-Each benchmark has one horizontal 100% stacked bar: Get, Scan, Put and
-Delete from left to right, with consistent solid colors. The single-column figure
+Each benchmark has one horizontal 100% stacked bar: Get, Scan, Update and
+Insert from left to right. `OPERATION_ORDER` in the figure configuration controls
+stacking, legend and external-label order while preserving each operation's color
+and the CSV row order. The single-column figure
 uses horizontal benchmark names and percentage labels with up to two decimal
 places and no trailing zeros. Labels sit inside the segments; shares below 6%
-use percentages to the right of their segment beside a 2.5 pt square in the
-operation's color, without enlarging or removing the segment, with
+use percentages to the right of the whole bar beside a 2.5 pt square in the
+operation's color, stacking multiple small labels vertically without enlarging
+or removing their segments, with
 values below 0.01% marked `<0.01%`. Empty workloads have no filled bar.
 Operations absent from every selected workload are omitted from the bars and
 legend; the remaining operations keep their assigned colors.
@@ -82,13 +85,16 @@ python3 graph/scripts/trace/plot_access_locality.py
 ```
 
 The operation mix chart reuses `scripts/summarize_trace.py` to read recorded
-Get/Scan/Put/Delete counts. Each Trace's shares sum to 100% when its workload is
+request counts and business write origins. It splits Put into Insert and Update
+using those origins, and keeps all Scans together. Workloads must contain only
+primary-index requests, no Deletes, and Insert + Update must equal Put;
+unsupported inputs or inconsistent counts fail instead of dropping requests.
+Each Trace's shares sum to 100% when its workload is
 nonempty. These are exported Trace requests: [transaction-local intermediate
 writes are coalesced](../docs/trace.md#operations-and-index-expansion), so the shares
 do not represent original SQL statement proportions. Baseline loading,
 transaction markers and replay-assembled WriteBatch
-RPCs are excluded; ReadGroup members count individually. All exported indexes
-count, so inputs with different index scopes are not a matched-scope comparison.
+RPCs are excluded; ReadGroup members count individually.
 Manifest counts alone do not independently validate Trace payloads. Output is
 `results/plots/trace/operation_mix.{pdf,png,csv}`; CSV retains all four operation
 types, including zero counts, fractions and input manifest identities.
@@ -222,6 +228,18 @@ their values into each figure. Heights do not change automatically with input si
 separately. Titles, labels and legends belong alongside those
 dimensions; plotting scripts consume them directly.
 
+Operation mix also owns percentage precision, the threshold for outside labels,
+their point offsets and vertical spacing. Access locality owns key-axis padding
+and empty-state text; update locality owns image rendering and series labels/styles.
+Keep these appearance settings in the figure configuration. Data normalization,
+coordinate calculations and positive-count bounds for logarithmic scales stay
+in the plotting scripts.
+
+A local constant takes effect only when its consumer uses it. For example,
+`LEGEND_STYLE` must include `"fontsize": LEGEND_FONT_SIZE` to apply a local
+legend-size override; simply declaring a same-named constant does not override
+the global Matplotlib settings. Plot checks verify the resulting text objects.
+
 `FIGURE_MARGIN_MM` sets equal outer layout padding on all four sides (default:
 1 mm). `apply_style()` enables constrained layout for all figures and converts
 this value to Matplotlib's inch-based horizontal and vertical padding. Labels,
@@ -237,11 +255,13 @@ in the global configuration control export; defaults are PDF and 300-DPI PNG.
 Execute scripts directly with `python3 graph/scripts/<domain>/<script>.py`;
 the shared entry-point helper resolves imports and paths from the repository location.
 
-The global configuration uses Linux Libertine O and separately defines the base text,
-figure titles/labels, axes titles/labels, x/y tick labels and legend text/titles
-at 10 pt. `ANNOTATION_FONT_SIZE` separately controls operation-mix percentage
-labels; colorbars inherit the axes and tick settings. Keep typography in this
-file rather than overriding it in scripts.
+The global configuration uses Linux Libertine O and separately defines base text,
+figure titles/labels, axes titles/labels and x/y tick labels at 10 pt, with legend
+text/titles at 9 pt. The shared `ANNOTATION_FONT_SIZE` is 9 pt and applies to
+access-locality empty-state labels. Operation mix defines its local annotation
+and legend-size overrides in `operation_mix_config.py`. Colorbars inherit
+the axes and tick settings. Keep shared typography in the global configuration
+and figure-specific overrides in the corresponding figure configuration.
 The shared categorical palette uses Morandi-inspired blue, sand, sage, rose,
 mauve, taupe and warm gray, with unframed legends and white backgrounds.
 Use line styles or markers as well as color when distinguishing series. Heatmaps
