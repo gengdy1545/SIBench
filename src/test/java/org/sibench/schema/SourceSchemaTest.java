@@ -114,30 +114,12 @@ public class SourceSchemaTest {
     }
 
     @Test
-    public void unsupportedSourceOptionsAndPinsFailExplicitly() throws Exception {
-        for (var option :
-                Map.<String, Object>of(
-                                "secondary",
-                                true,
-                                "create-secondary",
-                                false,
-                                "pgsql-variant",
-                                "redshift",
-                                "create-table-options",
-                                "WITH (fillfactor=50)")
-                        .entrySet()) {
-            var config = config("src/test/resources/config/sysbench_2k.yaml");
-            var nativeConfig = ConfigValues.object(config, "native");
-            nativeConfig.put(option.getKey(), option.getValue());
-            config.put("native", nativeConfig);
-            assertThrows(
-                    IllegalArgumentException.class, () -> SourceSchema.read(Path.of(""), config));
-        }
+    public void sourcesOutsideTheirGitlinkFailExplicitly() throws Exception {
         var config = config("src/test/resources/config/ycsb_1k.yaml");
         var source = ConfigValues.object(config, "source");
-        source.put("commit", "unreviewed");
+        source.put("path", "benchmark");
         config.put("source", source);
-        assertThrows(IllegalArgumentException.class, () -> SourceSchema.read(Path.of(""), config));
+        assertThrows(Exception.class, () -> SourceSchema.read(Path.of(""), config));
     }
 
     @Test

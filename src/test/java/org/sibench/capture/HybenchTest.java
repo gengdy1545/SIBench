@@ -4,15 +4,12 @@ import static org.junit.Assert.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.Map;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.sibench.generation.DuckDbHostFixture;
 
-public class HybenchTest {
-    @Rule public TemporaryFolder temporary=new TemporaryFolder();
+public class HybenchTest extends DuckDbHostFixture {
     static Path source(){return Path.of("benchmark/HyBench-2024");}
     static void fixture(Path data)throws Exception {
         Map<String,String> rows=Map.of(
@@ -33,7 +30,7 @@ public class HybenchTest {
     }
     @Test public void loadsEightTablesPreservesNullsAndStartsSequencesAfterLoadedKeys()throws Exception {
         Path data=temporary.newFolder().toPath();fixture(data);
-        try(var db=DriverManager.getConnection("jdbc:duckdb:")) {
+        try(var db=connect()) {
             var counts=Hybench.load(db,source(),data);
             assertEquals(8,counts.size());assertTrue(counts.values().stream().allMatch(n->n==1));
             for(var count:counts.entrySet())
@@ -48,7 +45,7 @@ public class HybenchTest {
             }
             assertEquals(1,number(db,"SELECT count(*) FROM transfer WHERE id=11 AND fresh_ts IS NOT NULL"));
             assertEquals(13,number(db,"SELECT count(*) FROM duckdb_indexes()"));
-            var catalog=IndexCatalog.duckDbDefinitions(org.sibench.schema.SourceSchema.hybench(source()));assertEquals(21,catalog.size());
+            var catalog=IndexCatalog.fromSchema(org.sibench.schema.SourceSchema.hybench(source())).definitions();assertEquals(21,catalog.size());
             var type=catalog.stream().filter(i->i.name().equals("idx_transfer_3")).findFirst().orElseThrow();
             assertEquals("varchar",type.type());assertFalse(type.encode("salary").equals(type.encode("salary ")));
             assertTrue(db.getAutoCommit());
@@ -57,7 +54,7 @@ public class HybenchTest {
     @Test public void malformedCsvRollsBackTheLoadWithoutDroppingInput()throws Exception {
         Path data=temporary.newFolder().toPath();fixture(data);
         Files.writeString(data.resolve("loanTrans.csv"),"40,1,30,100,accept,2023-01-01 00:00:00,30,,0,extra\n");
-        try(var db=DriverManager.getConnection("jdbc:duckdb:")) {
+        try(var db=connect()) {
             assertThrows(SQLException.class,()->Hybench.load(db,source(),data));
             assertEquals(0,number(db,"SELECT count(*) FROM duckdb_tables() WHERE NOT internal"));
             assertTrue(db.getAutoCommit());assertTrue(Files.exists(data.resolve("customer.csv")));

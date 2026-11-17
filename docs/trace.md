@@ -1,16 +1,15 @@
 # Trace contract
 
-A Trace is an immutable baseline plus workload for isolated index replay. Native `generate`, live `generate-pixels` and Trace-enabled [Pixels experiments](pixels-experiment.md) publish the same format. Workload configuration controls source execution; export keeps the supported accesses and does not promise a deterministic concurrent order.
+A Trace is an immutable baseline plus workload for isolated index replay. Native `generate` and Trace-enabled [Pixels experiments](pixels-experiment.md) publish the same format. Workload configuration controls source execution; export keeps the supported accesses and does not promise a deterministic concurrent order.
 
 ## Selection and storage
 
-`config/sibench.yaml` holds the named benchmark entries and the object-storage connections. Each entry references one source configuration and engine; scale and workload parameters stay in `config/benchmark/`. HyBench entries set `workload: tp` or `xp`, YCSB entries pick one workload of their shared configuration, and a sysbench entry without `workload` keeps the source configuration's whole workload sequence.
+`config/sibench.yaml` holds the named benchmark entries and the object-storage connections. Each entry references one source configuration and engine, which also fixes the generation mode (RocksDB records YCSB API calls; PostgreSQL and DuckDB capture SQL); scale and workload parameters stay in `config/benchmark/`. HyBench entries set `workload: tp` or `xp`, and YCSB entries pick one workload of their shared configuration. A sysbench workload is a named run of one script with its own zipfian exponent, so the public profile yields two Traces of `oltp_read_write` (`sysbench-zipf080`, `sysbench-zipf099`); each loads a fresh database. An entry names its workload unless the profile has only one.
 
 ```yaml
 benchmarks:
   ycsb-a:
     config: config/benchmark/ycsb.yaml
-    mode: api
     engine: rocksdb
     workload: workloada
     trace:
@@ -59,7 +58,7 @@ Every catalog table needs baseline entries unless it is listed in `empty_baselin
 
 ### Pixels host
 
-A remote host runs `pixels-host ADDRESS:PORT BUILD_DIRECTORY WORK_ROOT TOKEN_FILE`. Configure `pixels_host: HOST:PORT` and give the client `SIBENCH_PIXELS_HOST_TOKEN`; PostgreSQL and the live sink stay on the generator. Local Pixels is the default.
+A remote host runs `pixels-host ADDRESS:PORT BUILD_DIRECTORY WORK_ROOT TOKEN_FILE`. Configure `pixels_host: HOST:PORT` and give the client `SIBENCH_PIXELS_HOST_TOKEN`; the file-applying sink stays on the controller, and CDC preparation never contacts the host. Local Pixels is the default.
 
 The host authenticates requests, checks Java/native source identities and records the actual host artifacts. Uploads have deadlines, reject escapes and overwrites, and are limited to 4 GiB per shard. Each session owns fresh directories and child processes; only stopped, session-owned state can be deleted. Failed sessions keep diagnostics.
 
@@ -75,7 +74,7 @@ The host authenticates requests, checks Java/native source identities and record
 | Bounds | Target 1 MiB per block; at most 4096 messages; one delimited request at most 32 MiB. |
 | Terminator | Four zero int32s; a missing terminator or trailing bytes fail. |
 
-File descriptors bind path, physical SHA-256, logical SHA-256 of the uncompressed delimited messages, bytes and counts. A baseline or workload identity hashes the 32-byte logical digest followed by the big-endian int64 semantic operation count. Semantic counts include read members and boundary markers; `effective_requests` excludes markers.
+`proto_files.baseline` and `proto_files.workload` each describe one stream, stored as `baseline.pb.zst` and `workload.pb.zst`: physical SHA-256, logical SHA-256 of the uncompressed delimited messages, bytes, operation count and statistics. A baseline or workload identity hashes the 32-byte logical digest followed by the big-endian int64 semantic operation count. Semantic counts include read members and boundary markers; `effective_requests` excludes markers.
 
 Manifest statistics separate primary and secondary entries, primitive operations, request types, markers, source projection, business write origins and uncompressed message bytes. Source counts can exceed exported counts. Statistics do not replace consumer validation of digests, accounting, positions and source coverage.
 
@@ -154,7 +153,7 @@ Only clean pinned sources and supported schemas are accepted. Generation creates
 | Source | Scope and limits |
 | --- | --- |
 | YCSB | UTF-8 keys, binary fields, one primary index; independent official A–F workloads. F stays separate Read and Update calls. |
-| sysbench | `sbtest` tables with `id` primary and `k` secondary indexes; configured supported scripts, including native conflict retries. |
+| sysbench | `sbtest` tables with `id` primary and `k` secondary indexes; configured supported scripts, including native conflict retries. Skewed ids are not scrambled, so each table's hottest rows are its smallest ids. |
 | HyBench native | Eight tables, eight primary and thirteen secondary indexes; TP runs TP-1–TP-18, XP runs AT/IQ. Native transaction conflicts roll back and continue; other SQL errors fail. |
 | HyBench CDC | Same CSV baseline in uninstrumented PostgreSQL and Pixels; TP/AT only, one Pixels transaction per committed source transaction. SQL reads, read-only or aborted transactions and secondary indexes are outside the exported scope. |
 

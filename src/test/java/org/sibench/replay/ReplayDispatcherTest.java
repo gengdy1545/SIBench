@@ -121,8 +121,8 @@ public class ReplayDispatcherTest {
             }
             @Override public void flush() { events.add("flush-" + client); }
         };
-        try (var dispatcher = new ReplayDispatcher(config(2, 10), factory)) {
-            for (long unit : new long[] {1, 1, 2, 3}) dispatcher.send(baseline(unit).withWorkUnitId(unit));
+        try (var dispatcher = new ReplayDispatcher(config(2, 10), factory, 0)) {
+            for (long unit : new long[] {1, 1, 2, 3}) dispatcher.send(baseline(unit).withWorkUnitId(unit), null);
             assertEquals(List.of("send-0-1", "send-0-1", "flush-0", "send-1-2", "flush-1", "send-0-3"), events);
         }
     }
@@ -135,8 +135,8 @@ public class ReplayDispatcherTest {
             // Delay inside the client so moving the latency start past serialization is detectable.
             java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(20));
             return handle;
-        })) {
-            dispatcher.send(search(1));
+        }, 0)) {
+            dispatcher.send(search(1), null);
             assertEquals(0L, dispatcher.describe().get("completed_operations"));
             assertEquals(0L, ((Map<?, ?>) dispatcher.describe().get("search_latency")).get("count"));
             complete(sample);
@@ -154,12 +154,12 @@ public class ReplayDispatcherTest {
         try (var dispatcher = new ReplayDispatcher(config(2, 1), client -> (seq, op, stored) -> {
             if (seq == 2) secondSent.countDown();
             return samples.get((int) seq - 1).handle();
-        })) {
+        }, 0)) {
             var sender = new Thread(() -> {
                 try {
-                    dispatcher.send(search(1));
+                    dispatcher.send(search(1), null);
                     firstSent.countDown();
-                    dispatcher.send(search(2));
+                    dispatcher.send(search(2), null);
                     dispatcher.drain();
                 } catch (Throwable failure) { error.set(failure); }
             });
@@ -197,9 +197,9 @@ public class ReplayDispatcherTest {
         var validated = new CompletableFuture<Void>();
         var samples = List.of(new ResponseTiming(), new ResponseTiming());
         try (var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation, stored) ->
-                samples.get((int) sequence - 1).handle(validated))) {
-            dispatcher.send(groupMember(0, 2));
-            dispatcher.send(groupMember(1, 2));
+                samples.get((int) sequence - 1).handle(validated), 0)) {
+            dispatcher.send(groupMember(0, 2), null);
+            dispatcher.send(groupMember(1, 2), null);
             complete(samples.get(0));
             complete(samples.get(1));
             assertEquals(0L, dispatcher.describe().get("completed_operations"));
@@ -220,10 +220,10 @@ public class ReplayDispatcherTest {
             return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null),operation.kind()==IndexOperationTrace.SEARCH
                     ?CompletableFuture.completedFuture(null):writes.get((int)operation.version()-1));
         },2)) {
-            dispatcher.send(IndexOperationTrace.write(1,IndexOperationTrace.UPSERT,3,0,IndexKey.ofInt(1),1,0,0,1).withWorkUnitId(1));
-            dispatcher.send(IndexOperationTrace.search(2,3,0,Range.equal(IndexKey.ofInt(1)),1,1,0).withWorkUnitId(2));
-            dispatcher.send(IndexOperationTrace.write(3,IndexOperationTrace.UPSERT,3,0,IndexKey.ofInt(1),2,0,0,2).withWorkUnitId(3));
-            dispatcher.send(IndexOperationTrace.search(4,3,0,Range.equal(IndexKey.ofInt(1)),2,1,0).withWorkUnitId(4));
+            dispatcher.send(IndexOperationTrace.write(1,IndexOperationTrace.UPSERT,3,0,IndexKey.ofInt(1),1,0,0,1).withWorkUnitId(1), null);
+            dispatcher.send(IndexOperationTrace.search(2,3,0,Range.equal(IndexKey.ofInt(1)),1,1,0).withWorkUnitId(2), null);
+            dispatcher.send(IndexOperationTrace.write(3,IndexOperationTrace.UPSERT,3,0,IndexKey.ofInt(1),2,0,0,2).withWorkUnitId(3), null);
+            dispatcher.send(IndexOperationTrace.search(4,3,0,Range.equal(IndexKey.ofInt(1)),2,1,0).withWorkUnitId(4), null);
             writes.forEach(reply -> reply.complete(null)); dispatcher.drain();
             assertEquals(List.of(1L,3L,2L,4L),order);
             assertEquals(1L,((Map<?,?>)dispatcher.describe().get("write_latency")).get("count"));
@@ -249,10 +249,10 @@ public class ReplayDispatcherTest {
         }, 2)) {
             var sender = new Thread(() -> {
                 try {
-                    dispatcher.send(search(1));
-                    dispatcher.send(search(2));
+                    dispatcher.send(search(1), null);
+                    dispatcher.send(search(2), null);
                     ordinarySent.countDown();
-                    for (int i = 0; i < 3; i++) dispatcher.send(groupMember(i, 3));
+                    for (int i = 0; i < 3; i++) dispatcher.send(groupMember(i, 3), null);
                     groupSent.countDown();
                     dispatcher.drain();
                 } catch (Throwable failure) { error.set(failure); }
@@ -295,8 +295,8 @@ public class ReplayDispatcherTest {
         try (var dispatcher = new ReplayDispatcher(config(1, 2), client -> {
             fail("An oversized group must be rejected before opening a client");
             return null;
-        })) {
-            IOException error = assertThrows(IOException.class, () -> dispatcher.send(groupMember(0, 3)));
+        }, 0)) {
+            IOException error = assertThrows(IOException.class, () -> dispatcher.send(groupMember(0, 3), null));
             assertTrue(error.getMessage().contains("3 members, exceeding max_in_flight=2"));
             assertEquals(0L, dispatcher.describe().get("basic_operations"));
             assertSame(error, assertThrows(IOException.class, dispatcher::drain));
@@ -327,11 +327,11 @@ public class ReplayDispatcherTest {
         }, 3)) {
             var sender = new Thread(() -> {
                 try {
-                    dispatcher.send(baseline(1, 1).withWorkUnitId(1));
-                    dispatcher.send(baseline(2, 2).withWorkUnitId(2));
-                    dispatcher.send(search(3)); // Timestamp zero is independent of both writes.
+                    dispatcher.send(baseline(1, 1).withWorkUnitId(1), null);
+                    dispatcher.send(baseline(2, 2).withWorkUnitId(2), null);
+                    dispatcher.send(search(3), null); // Timestamp zero is independent of both writes.
                     dispatcher.send(IndexOperationTrace.search(4, 3, 0,
-                            Range.equal(IndexKey.ofInt(1)), 1, 0, 0).withWorkUnitId(4));
+                            Range.equal(IndexKey.ofInt(1)), 1, 0, 0).withWorkUnitId(4), null);
                     dispatcher.drain();
                 } catch (Throwable failure) { error.set(failure); }
             });
@@ -400,12 +400,12 @@ public class ReplayDispatcherTest {
     public void laterWritesProceedWhileASnapshotWaitsForItsOlderWrite() throws Exception {
         var order = new ArrayList<String>();
         var first = new CompletableFuture<Void>();
-        try (var dispatcher = new ReplayDispatcher(config(4, 8), recording(order, Map.of(1L, first)))) {
-            dispatcher.send(write(1, 1));
-            dispatcher.send(read(2, 1));
+        try (var dispatcher = new ReplayDispatcher(config(4, 8), recording(order, Map.of(1L, first)), 0)) {
+            dispatcher.send(write(1, 1), null);
+            dispatcher.send(read(2, 1), null);
             // The previous single blocking sender could not reach these writes before first completed.
-            dispatcher.send(write(3, 2));
-            dispatcher.send(write(4, 3));
+            dispatcher.send(write(3, 2), null);
+            dispatcher.send(write(4, 3), null);
             assertEquals(List.of("W1", "W2", "W3"), order);
             first.complete(null);
             dispatcher.drain();
@@ -421,12 +421,12 @@ public class ReplayDispatcherTest {
         var order = new ArrayList<String>();
         var first = new CompletableFuture<Void>();
         var error = new AtomicReference<Throwable>();
-        try (var dispatcher = new ReplayDispatcher(config(4, 8), recording(order, Map.of(1L, first)))) {
+        try (var dispatcher = new ReplayDispatcher(config(4, 8), recording(order, Map.of(1L, first)), 0)) {
             var sender = new Thread(() -> {
                 try {
-                    dispatcher.send(write(1, 1));
-                    dispatcher.send(read(2, 5));
-                    dispatcher.send(write(3, 5));
+                    dispatcher.send(write(1, 1), null);
+                    dispatcher.send(read(2, 5), null);
+                    dispatcher.send(write(3, 5), null);
                     dispatcher.drain();
                 } catch (Throwable failure) { error.set(failure); }
             });
@@ -445,14 +445,14 @@ public class ReplayDispatcherTest {
     public void deferredGroupsLeaveWholeAndNeverInterleaveASentGroup() throws Exception {
         var order = new ArrayList<String>();
         var first = new CompletableFuture<Void>();
-        try (var dispatcher = new ReplayDispatcher(config(4, 8), recording(order, Map.of(2L, first)))) {
-            dispatcher.send(write(1, 2));
-            dispatcher.send(groupMember(2, 2, 0, 2));
+        try (var dispatcher = new ReplayDispatcher(config(4, 8), recording(order, Map.of(2L, first)), 0)) {
+            dispatcher.send(write(1, 2), null);
+            dispatcher.send(groupMember(2, 2, 0, 2), null);
             first.complete(null);
-            dispatcher.send(groupMember(2, 2, 1, 2));
+            dispatcher.send(groupMember(2, 2, 1, 2), null);
             // The deferred group became ready mid-group; it must not split itself or this sent group.
-            dispatcher.send(groupMember(3, 0, 0, 2));
-            dispatcher.send(groupMember(3, 0, 1, 2));
+            dispatcher.send(groupMember(3, 0, 0, 2), null);
+            dispatcher.send(groupMember(3, 0, 1, 2), null);
             dispatcher.drain();
             assertEquals(List.of("W2", "S2.0", "S2.1", "S0.0", "S0.1"), order);
             assertEquals(2L, dispatcher.describe().get("deferred_search_operations"));
@@ -477,15 +477,15 @@ public class ReplayDispatcherTest {
                     else response.complete(null);
                 }
             };
-            try (var dispatcher = new ReplayDispatcher(config(1, 8), factory)) {
-                dispatcher.send(baseline(1));
+            try (var dispatcher = new ReplayDispatcher(config(1, 8), factory, 0)) {
+                dispatcher.send(baseline(1), null);
                 if (rejected) {
-                    IOException failure = assertThrows(IOException.class, () -> dispatcher.send(search(2)));
+                    IOException failure = assertThrows(IOException.class, () -> dispatcher.send(search(2), null));
                     assertSame(failure, assertThrows(IOException.class, dispatcher::drain));
                     assertEquals(0, readCalls.get());
                     assertEquals(1L, dispatcher.describe().get("failed_response_operations"));
                 } else {
-                    dispatcher.send(search(2));
+                    dispatcher.send(search(2), null);
                     dispatcher.drain();
                     assertEquals(1, readCalls.get());
                 }
@@ -498,11 +498,11 @@ public class ReplayDispatcherTest {
         var response = new CompletableFuture<Void>();
         var samples = List.of(new ResponseTiming(response), new ResponseTiming(response));
         try (var dispatcher = new ReplayDispatcher(config(1, 10), client -> (seq, op, stored) ->
-                samples.get((int) seq - 1).handle())) {
-            dispatcher.send(baseline(1));
+                samples.get((int) seq - 1).handle(), 0)) {
+            dispatcher.send(baseline(1), null);
             Thread.sleep(20);
             samples.get(1).earliestStart = System.nanoTime();
-            dispatcher.send(baseline(2));
+            dispatcher.send(baseline(2), null);
             complete(samples.toArray(ResponseTiming[]::new));
             dispatcher.drain();
             assertLatency((Map<?, ?>) dispatcher.describe().get("write_latency"),
@@ -521,13 +521,13 @@ public class ReplayDispatcherTest {
             if (sequence == 3) thirdCalled.countDown();
             return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null),
                     sequence <= 2 ? batch : next);
-        })) {
+        }, 0)) {
             var sender = new Thread(() -> {
                 try {
-                    dispatcher.send(baseline(1));
-                    dispatcher.send(baseline(2));
+                    dispatcher.send(baseline(1), null);
+                    dispatcher.send(baseline(2), null);
                     twoReturned.countDown();
-                    dispatcher.send(baseline(3));
+                    dispatcher.send(baseline(3), null);
                     dispatcher.drain();
                 } catch (Throwable failure) { error.set(failure); }
             });
@@ -561,9 +561,9 @@ public class ReplayDispatcherTest {
         try (var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation, stored) -> {
             if (sequence == 2) response.complete(null);
             return new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response);
-        })) {
-            dispatcher.send(baseline(1));
-            dispatcher.send(baseline(2));
+        }, 0)) {
+            dispatcher.send(baseline(1), null);
+            dispatcher.send(baseline(2), null);
             dispatcher.drain();
             var report = dispatcher.describe();
             assertEquals(2L, report.get("completed_responses"));
@@ -577,9 +577,9 @@ public class ReplayDispatcherTest {
     public void sharedBaselineFailureDoesNotCountAnyMemberAsSuccessful() throws Exception {
         var response = new CompletableFuture<Void>();
         try (var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation, stored) ->
-                new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response))) {
-            dispatcher.send(baseline(1));
-            dispatcher.send(baseline(2));
+                new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response), 0)) {
+            dispatcher.send(baseline(1), null);
+            dispatcher.send(baseline(2), null);
             response.completeExceptionally(new IOException("injected batch failure"));
             var failure = assertThrows(IOException.class, dispatcher::drain);
             assertTrue(failure.getMessage(), failure.getMessage().contains("dispatch 1"));
@@ -595,9 +595,9 @@ public class ReplayDispatcherTest {
     public void closingSharedBaselineCompletionCancelsAndClearsAllMembers() throws Exception {
         var response = new CompletableFuture<Void>();
         var dispatcher = new ReplayDispatcher(config(1, 4), client -> (sequence, operation, stored) ->
-                new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response));
-        dispatcher.send(baseline(1));
-        dispatcher.send(baseline(2));
+                new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response), 0);
+        dispatcher.send(baseline(1), null);
+        dispatcher.send(baseline(2), null);
         dispatcher.close();
         assertTrue(response.isCancelled());
         assertEquals(0L, dispatcher.describe().get("pending_responses"));
@@ -610,8 +610,8 @@ public class ReplayDispatcherTest {
             var response = new CompletableFuture<Void>();
             try (var dispatcher = new ReplayDispatcher(config(1, 10), client -> (sequence, operation, stored) ->
                     new ReplayTarget.SendHandle(CompletableFuture.completedFuture(null), response), 1)) {
-                dispatcher.send(batch ? baseline(1) : search(1));
-                dispatcher.send(batch ? baseline(2) : search(2));
+                dispatcher.send(batch ? baseline(1) : search(1), null);
+                dispatcher.send(batch ? baseline(2) : search(2), null);
                 response.complete(null);
                 dispatcher.drain();
                 var report = dispatcher.describe();
@@ -630,7 +630,7 @@ public class ReplayDispatcherTest {
                         config(1, 10),
                         client -> (sequence, operation, stored) -> ReplayTarget.SendHandle.completed(),
                         2)) {
-            for (long unit = 1; unit <= 5; unit++) dispatcher.send(search(unit));
+            for (long unit = 1; unit <= 5; unit++) dispatcher.send(search(unit), null);
             dispatcher.drain();
             var report = dispatcher.describe();
             var measurement = (Map<?, ?>) report.get("measurement");
@@ -667,15 +667,15 @@ public class ReplayDispatcherTest {
                                                     ? firstSent
                                                     : CompletableFuture.completedFuture(null),
                                             responses.get((int) sequence - 1));
-                                })) {
+                                }, 0)) {
             Thread sender =
                     new Thread(
                             () -> {
                                 try {
-                                    dispatcher.send(search(1));
-                                    dispatcher.send(search(2));
-                                    dispatcher.send(search(2));
-                                    dispatcher.send(search(3));
+                                    dispatcher.send(search(1), null);
+                                    dispatcher.send(search(2), null);
+                                    dispatcher.send(search(2), null);
+                                    dispatcher.send(search(3), null);
                                     dispatcher.drain();
                                 } catch (Throwable error) {
                                     failure.set(error);
@@ -724,14 +724,14 @@ public class ReplayDispatcherTest {
                                     public void close() {
                                         closed.add(client);
                                     }
-                                });
-        dispatcher.send(search(1));
+                                }, 0);
+        dispatcher.send(search(1), null);
         response.completeExceptionally(new IOException("Rejected"));
-        assertThrows(IOException.class, () -> dispatcher.send(search(2)));
+        assertThrows(IOException.class, () -> dispatcher.send(search(2), null));
         assertThrows(IOException.class, dispatcher::drain);
         dispatcher.close();
         assertEquals(List.of(0), closed);
-        assertThrows(IOException.class, () -> dispatcher.send(search(1)));
+        assertThrows(IOException.class, () -> dispatcher.send(search(1), null));
         try (var failedSend =
                 new ReplayDispatcher(
                         config(1, 10),
@@ -740,19 +740,19 @@ public class ReplayDispatcherTest {
                                         new ReplayTarget.SendHandle(
                                                 CompletableFuture.failedFuture(
                                                         new IOException("send")),
-                                                CompletableFuture.completedFuture(null)))) {
-            assertThrows(IOException.class, () -> failedSend.send(search(1)));
-            assertThrows(IOException.class, () -> failedSend.send(search(2)));
+                                                CompletableFuture.completedFuture(null)), 0)) {
+            assertThrows(IOException.class, () -> failedSend.send(search(1), null));
+            assertThrows(IOException.class, () -> failedSend.send(search(2), null));
         }
     }
 
     @Test
-    public void supportsManyClientsAndRejectsMissingIdentityOrCoverage() throws Exception {
+    public void supportsManyClientsAndRejectsMissingCoverage() throws Exception {
         // 128 is an experiment setting, not a limit: 256 clients work when units cover them.
         for (int clients : new int[] {128, 256}) {
             try (var dispatcher =
-                    new ReplayDispatcher(config(clients, 10), ReplayTarget.immediate(op -> {}))) {
-                for (int i = 1; i <= clients; i++) dispatcher.send(search(i));
+                    new ReplayDispatcher(config(clients, 10), ReplayTarget.immediate(op -> {}), 0)) {
+                for (int i = 1; i <= clients; i++) dispatcher.send(search(i), null);
                 dispatcher.drain();
                 dispatcher.requireClientCoverage();
                 assertEquals(clients, dispatcher.describe().get("used_clients"));
@@ -760,10 +760,9 @@ public class ReplayDispatcherTest {
             }
         }
         try (var dispatcher =
-                new ReplayDispatcher(config(128, 10), ReplayTarget.immediate(op -> {}))) {
-            dispatcher.send(search(1));
+                new ReplayDispatcher(config(128, 10), ReplayTarget.immediate(op -> {}), 0)) {
+            dispatcher.send(search(1), null);
             assertThrows(IOException.class, dispatcher::requireClientCoverage);
-            assertThrows(IOException.class, () -> dispatcher.send(search(0)));
         }
     }
 
@@ -779,15 +778,15 @@ public class ReplayDispatcherTest {
             var dispatcher =
                     new ReplayDispatcher(
                             new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 1, 1, 1),
-                            client -> (seq, op, stored) -> new ReplayTarget.SendHandle(sent, response));
+                            client -> (seq, op, stored) -> new ReplayTarget.SendHandle(sent, response), 0);
             try {
-                if (localTimeout) assertThrows(IOException.class, () -> dispatcher.send(search(1)));
+                if (localTimeout) assertThrows(IOException.class, () -> dispatcher.send(search(1), null));
                 else {
-                    dispatcher.send(search(1));
+                    dispatcher.send(search(1), null);
                     var error = assertThrows(IOException.class, dispatcher::drain);
                     assertTrue(error.getMessage(), error.getMessage().contains("source event 1, search, transaction 0, version 0"));
                 }
-                assertThrows(IOException.class, () -> dispatcher.send(search(2)));
+                assertThrows(IOException.class, () -> dispatcher.send(search(2), null));
             } finally {
                 dispatcher.close();
             }
@@ -840,12 +839,12 @@ public class ReplayDispatcherTest {
                                     sent.countDown();
                                     return new ReplayTarget.SendHandle(
                                             CompletableFuture.completedFuture(null), response);
-                                })) {
+                                }, 0)) {
             Thread sender =
                     new Thread(
                             () -> {
                                 try {
-                                    dispatcher.send(search(1));
+                                    dispatcher.send(search(1), null);
                                     dispatcher.drain();
                                 } catch (IOException failure) {
                                     error.set(failure);
@@ -882,13 +881,13 @@ public class ReplayDispatcherTest {
                                 (seq, op, stored) ->
                                         new ReplayTarget.SendHandle(
                                                 CompletableFuture.completedFuture(null),
-                                                response))) {
-            dispatcher.send(search(1));
+                                                response), 0)) {
+            dispatcher.send(search(1), null);
             Thread.sleep(1100);
             response.complete(null);
             assertThrows(IOException.class, dispatcher::drain);
             assertEquals(1L, dispatcher.describe().get("timed_out_operations"));
-            assertThrows(IOException.class, () -> dispatcher.send(search(2)));
+            assertThrows(IOException.class, () -> dispatcher.send(search(2), null));
         }
         var localSend = new CompletableFuture<Void>();
         var dispatcher =
@@ -898,9 +897,9 @@ public class ReplayDispatcherTest {
                                 (seq, op, stored) ->
                                         new ReplayTarget.SendHandle(
                                                 localSend,
-                                                CompletableFuture.completedFuture(null)));
+                                                CompletableFuture.completedFuture(null)), 0);
         try {
-            assertThrows(IOException.class, () -> dispatcher.send(search(1)));
+            assertThrows(IOException.class, () -> dispatcher.send(search(1), null));
         } finally {
             dispatcher.close();
         }

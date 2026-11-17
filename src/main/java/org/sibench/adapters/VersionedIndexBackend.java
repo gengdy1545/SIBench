@@ -128,7 +128,6 @@ public final class VersionedIndexBackend implements IndexBackend {
 
     @Override
     public void write(Mutation mutation) throws IOException {
-        IndexExecution.validateMutation(mutation);
         boolean put = mutation.hasPut();
         ByteString key = put ? mutation.getPut().getKey() : mutation.getDelete().getKey();
         long ts = put ? mutation.getPut().getTs() : mutation.getDelete().getTs();
@@ -140,7 +139,6 @@ public final class VersionedIndexBackend implements IndexBackend {
         var keys = new ArrayList<byte[]>(mutations.size());
         var values = new ArrayList<byte[]>(mutations.size());
         for (var mutation : mutations) {
-            IndexExecution.validateMutation(mutation);
             boolean put = mutation.hasPut();
             keys.add(versioned(entry(put ? mutation.getPut().getKey() : mutation.getDelete().getKey()),
                     put ? mutation.getPut().getTs() : mutation.getDelete().getTs()));
@@ -151,7 +149,6 @@ public final class VersionedIndexBackend implements IndexBackend {
 
     @Override
     public ByteString get(GetRequest get) throws IOException {
-        IndexExecution.validateGet(get);
         if (get.getLocalWritesCount() != 0) {
             var write = get.getLocalWrites(0);
             return write.hasPut() ? write.getPut().getValue() : null;
@@ -163,7 +160,6 @@ public final class VersionedIndexBackend implements IndexBackend {
 
     @Override
     public void scan(ScanRequest scan, ValueSink sink) throws IOException {
-        IndexExecution.validateScan(scan);
         if (scan.getLocalWritesCount() == 0) {
             scanEntries(scan, (key, value) -> { sink.accept(value); return true; });
             return;

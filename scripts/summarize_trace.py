@@ -22,33 +22,29 @@ def count(value):
     return value
 
 
-def phase(files):
+def phase(file):
     counts = {scope: dict.fromkeys(KINDS, 0) for scope in SCOPES}
     origins = dict.fromkeys(("business_insert", "business_update"), 0)
+    stats = file["statistics"]
+    if set(stats["write_origins"]) - set(origins):
+        raise ValueError("Unknown write origin")
+    for origin, value in stats["write_origins"].items():
+        origins[origin] += count(value)
+    recorded = stats["index_operations"]
+    if set(recorded) != set(SCOPES):
+        raise ValueError("Missing or unknown index scope")
     total = 0
-    for file in files:
-        stats = file["statistics"]
-        if set(stats["write_origins"]) - set(origins):
-            raise ValueError("Unknown write origin")
-        for origin, value in stats["write_origins"].items():
-            origins[origin] += count(value)
-        recorded = stats["index_operations"]
-        if set(recorded) != set(SCOPES):
-            raise ValueError("Missing or unknown index scope")
-        subtotal = 0
-        for scope in SCOPES:
-            if set(recorded[scope]) - set(KINDS):
-                raise ValueError("Unknown primitive operation")
-            values = {kind: count(recorded[scope].get(kind, 0)) for kind in KINDS}
-            size = sum(values.values())
-            if size != count(stats[scope + "_entries"]):
-                raise ValueError("Index scope count mismatch")
-            subtotal += size
-            for kind, value in values.items():
-                counts[scope][kind] += value
-        if subtotal != count(stats["effective_requests"]):
-            raise ValueError("Effective request count mismatch")
-        total += subtotal
+    for scope in SCOPES:
+        if set(recorded[scope]) - set(KINDS):
+            raise ValueError("Unknown primitive operation")
+        values = {kind: count(recorded[scope].get(kind, 0)) for kind in KINDS}
+        size = sum(values.values())
+        if size != count(stats[scope + "_entries"]):
+            raise ValueError("Index scope count mismatch")
+        total += size
+        counts[scope] = values
+    if total != count(stats["effective_requests"]):
+        raise ValueError("Effective request count mismatch")
     result = {}
     for scope, values in counts.items():
         reads = values["get"] + values["scan"]

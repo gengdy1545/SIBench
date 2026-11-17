@@ -18,12 +18,11 @@ public class GenerationTest {
         Files.writeString(root.resolve("hybench.yaml"),"benchmark: hybench\n");
         var trace=InputStoreTest.traceFixture(root.resolve("trace"));
         byte[] before=Files.readAllBytes(trace.resolve("manifest.json"));
-        var entry=org.sibench.config.BenchmarkFixtures.entry(root.resolve("hybench.yaml"),"capture","postgres",trace,"xp");
+        var entry=org.sibench.config.BenchmarkFixtures.entry(root.resolve("hybench.yaml"),"postgres",trace,"xp");
         entry.put("trace",Map.of("generate",false,"directory",trace.toString(),"upload",Map.of("enabled",true,"path","cos://bucket/traces/hybench")));
         var config=root.resolve("runtime.yaml");
         Files.writeString(config,new org.yaml.snakeyaml.Yaml().dump(Map.of("schema_version",1,"purpose","sibench","benchmarks",Map.of("hybench",entry))));
         assertTrue(Generation.run(root,config).isEmpty());
-        assertEquals("skipped",PixelsGeneration.run(root,config).get("status"));
         assertArrayEquals(before,Files.readAllBytes(trace.resolve("manifest.json")));
     }
 
@@ -95,39 +94,28 @@ public class GenerationTest {
     @Test public void preparationSelectsHybenchWithoutRequiringItsNativeOrPixelsEngine()throws Exception {
         var root=temporary.getRoot().toPath();
         Files.writeString(root.resolve("hybench.yaml"),"benchmark: hybench\n");
-        var selected=Generation.hybenchSelection(root,Map.of("benchmarks",Map.of("hybench",org.sibench.config.BenchmarkFixtures.entry(java.nio.file.Path.of("hybench.yaml"),"capture","postgres",root.resolve("trace"),"xp"))));
+        var selected=Generation.hybenchSelection(root,Map.of("benchmarks",Map.of("hybench",org.sibench.config.BenchmarkFixtures.entry(java.nio.file.Path.of("hybench.yaml"),"postgres",root.resolve("trace"),"xp"))));
         assertEquals("hybench",selected.benchmark());
         assertEquals(org.sibench.config.Engine.POSTGRES,selected.engine());
     }
 
-    @Test public void configuredQueryAndMixedStagesAreAlwaysRetained() throws Exception {
-        for(String benchmark:java.util.List.of("hybench","sysbench","ycsb")) {
-            var document=DuckDbGenerationTest.profile(benchmark);
-            var expected=switch(benchmark) {
-                case "hybench"->java.util.List.of("xp");
-                case "sysbench"->java.util.List.of("oltp_read_write");
-                default->java.util.List.of("workloada","workloadb","workloadc","workloadf","workloadd","workloade");
-            };
-            assertEquals(expected,Generation.workloads(input(benchmark,"xp",document)));
-            document.remove("trace");
-            assertEquals(expected,Generation.workloads(input(benchmark,"xp",document)));
-        }
+    @Test public void ycsbRunsEveryConfiguredWorkloadWithOrWithoutARequestTarget() throws Exception {
+        var document=DuckDbGenerationTest.profile("ycsb");
+        var expected=java.util.List.of("workloada","workloadb","workloadc","workloadf","workloadd","workloade");
+        assertEquals(expected,RocksGeneration.workloads(input("ycsb","workloada",document)));
+        document.remove("trace");
+        assertEquals(expected,RocksGeneration.workloads(input("ycsb","workloada",document)));
     }
 
     @Test public void queryOnlyWorkloadsRemainEligibleForTheRequestTarget() throws Exception {
         var document=DuckDbGenerationTest.profile("sysbench");
         var nativeConfig=org.sibench.config.ConfigValues.object(document,"native");
-        nativeConfig.put("workloads",Map.of("oltp_point_select",Map.of("events",10)));
+        nativeConfig.put("rand-type","uniform");
+        nativeConfig.put("workloads",Map.of("oltp_point_select",Map.of("script","oltp_point_select","events",10)));
         document.put("native",nativeConfig);
         document.put("trace",Map.of("secondary_indexes",false,"workload_requests",10));
-        assertEquals(java.util.List.of("oltp_point_select"),Generation.workloads(input("sysbench","",document)));
+        Generation.validateNative("sysbench",nativeConfig);
         assertEquals(10,Generation.requestTarget(document));
-    }
-
-    @Test public void hybenchRunsOnlyItsSelectedNativeStage() throws Exception {
-        var document=DuckDbGenerationTest.profile("hybench");
-        assertEquals(java.util.List.of("tp"),Generation.workloads(input("hybench","tp",document)));
-        assertEquals(java.util.List.of("xp"),Generation.workloads(input("hybench","xp",document)));
     }
 
     private Generation.Input input(String benchmark,String workload,Map<String,Object> document) {

@@ -38,7 +38,7 @@ import java.util.TreeSet;
  *       group's count is the intersection's visible rows, and its members are the inputs' ranges.
  *   <li>Rejections remain only where a fact is missing: lossy bitmap pages carry no TIDs, a heap
  *       scan stopped early never checked some candidates, an all-visible index-only row carries no
- *       primary key. Text intervals keep PG order only under the C collation.
+ *       primary key. Text intervals keep PG order: the generator's cluster uses the C collation.
  * </ul>
  */
 final class PostgresAccessProjection {
@@ -94,8 +94,7 @@ final class PostgresAccessProjection {
     }
 
 
-    static Decision decide(Unit unit, IndexCatalog catalog, boolean cCollation)
-            throws IOException {
+    static Decision decide(Unit unit, IndexCatalog catalog) throws IOException {
         if (unit.source == Source.PLANNER_PROBE) return Decision.exclude("planner_endpoint_probe");
         IndexCatalog.Definition definition = catalog.named(unit.scan.index);
         String kind = unit.kind();
@@ -106,12 +105,12 @@ final class PostgresAccessProjection {
             if (!unit.bitmapEnded) return Decision.exclude("rescan_without_fetch");
             if (unit.bitmapLossy) return Decision.reject("bitmap_heap_lossy_page");
             // A heap scan stopped early never checks some candidates.
-            if (unit.unresolvedCount() > 0) return Decision.reject("bitmap_heap_stopped_early");
+            if (unit.summarizedUnresolved > 0) return Decision.reject("bitmap_heap_stopped_early");
         } else if (kind.equals("index") || kind.equals("index_only")) {
             if (unit.calls == 0) return Decision.exclude("rescan_without_fetch");
             if (unit.forward && unit.backward) return Decision.reject("scan_direction_changed");
         } else return Decision.reject("unbound_scan_kind");
-        Intervals intervals = intervals(unit, catalog, definition, cCollation);
+        Intervals intervals = intervals(unit, catalog, definition);
         if (intervals.reason != null)
             return intervals.excluded
                     ? Decision.exclude(intervals.reason)
@@ -144,8 +143,7 @@ final class PostgresAccessProjection {
     }
 
     /** The decision of a BitmapAnd group: one intersection of its inputs' ranges. */
-    static Decision decideGroup(BitmapGroup group, IndexCatalog catalog, boolean cCollation)
-            throws IOException {
+    static Decision decideGroup(BitmapGroup group, IndexCatalog catalog) throws IOException {
         if (group.lossy) return Decision.reject("bitmap_heap_lossy_page");
         if (group.verdictOutsideIntersection)
             return Decision.reject("bitmap_and_verdict_outside_intersection");
@@ -167,7 +165,7 @@ final class PostgresAccessProjection {
         var parts = new ArrayList<Part>();
         for (Unit unit : members.subList(0, ran)) {
             IndexCatalog.Definition definition = catalog.named(unit.scan.index);
-            Intervals intervals = intervals(unit, catalog, definition, cCollation);
+            Intervals intervals = intervals(unit, catalog, definition);
             if (intervals.reason != null) return Decision.reject(intervals.reason);
             if (intervals.ranges.size() != 1)
                 return Decision.reject("bitmap_and_input_with_array_key");
@@ -315,7 +313,7 @@ final class PostgresAccessProjection {
     private record Intervals(List<Range> ranges, String reason, boolean excluded) {}
 
     private static Intervals intervals(
-            Unit unit, IndexCatalog catalog, IndexCatalog.Definition definition, boolean cCollation) throws IOException {
+            Unit unit, IndexCatalog catalog, IndexCatalog.Definition definition) throws IOException {
         Bounds bounds = new Bounds();
         TreeSet<IndexKey> points = null;
         for (JsonElement item : unit.keys) {
@@ -350,11 +348,8 @@ final class PostgresAccessProjection {
         Range interval =
                 new Range(
                         bounds.lower, bounds.lowerInclusive, bounds.upper, bounds.upperInclusive, false, 0);
-        if (points == null) {
-            if (!interval.point() && definition.textual() && !cCollation)
-                return new Intervals(null, "text_interval_requires_c_collation", false);
-            return new Intervals(List.of(interval), null, false);
-        }
+        // initdb --no-locale makes C the database collation and the pinned DDL names no other.
+        if (points == null) return new Intervals(List.of(interval), null, false);
         var ranges = new ArrayList<Range>();
         for (IndexKey point : points) if (interval.contains(point)) ranges.add(Range.equal(point));
         // PostgreSQL proves such keys can never match and does not search at all.

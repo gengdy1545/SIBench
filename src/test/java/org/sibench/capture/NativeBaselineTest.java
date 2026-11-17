@@ -3,19 +3,16 @@ package org.sibench.capture;
 import static org.junit.Assert.*;
 import java.sql.Connection;
 import java.util.List;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
-import org.sibench.generation.DuckDbDatabase;
+import org.sibench.generation.DuckDbHostFixture;
 import org.sibench.generation.NativeHistory;
 import org.sibench.replay.ReplayConfig;
 import org.sibench.replay.ReplayProjection;
 
-public class NativeBaselineTest {
-    @Rule public TemporaryFolder temporary=new TemporaryFolder();
+public class NativeBaselineTest extends DuckDbHostFixture {
     private static void sql(Connection db,String text)throws Exception {try(var query=db.createStatement()){query.execute(text);}}
     @Test public void keepsEachRowsIndexesTogetherAcrossTablesAndClientBlocks()throws Exception {
-        try(var db=DuckDbDatabase.create(temporary.getRoot().toPath().resolve("data"))) {
+        try(var db=connect()) {
             sql(db,"CREATE TABLE first(id BIGINT PRIMARY KEY,k BIGINT)");
             sql(db,"INSERT INTO first SELECT range,range%3 FROM range(1,4097)");
             sql(db,"CREATE INDEX first_k ON first(k)");

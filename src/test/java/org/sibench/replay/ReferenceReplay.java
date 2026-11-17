@@ -54,7 +54,7 @@ public final class ReferenceReplay {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
         var manifest = TraceManifest.read(directory);
         for (boolean rowIds : rowIdModes)
-            TraceManifest.requireValue(directory, rowIds ? org.sibench.adapters.ValueKind.ROW_ID
+            TraceManifest.requireValue(manifest, rowIds ? org.sibench.adapters.ValueKind.ROW_ID
                     : org.sibench.adapters.ValueKind.LOCATOR);
         var input = prepare(directory, config);
         return runChecked(

@@ -58,7 +58,7 @@ public class PixelsBuildTest {
                 "etcd","etcd/etcd");
         for (var entry:paths.entrySet()) nativeFiles.put(entry.getKey(),file(build,entry.getValue(),entry.getKey()));
         var configs=new LinkedHashMap<String,String>();
-        for (String name:java.util.List.of("defaults/pixels.properties","home/etc/pixels.properties",
+        for (String name:java.util.List.of("defaults/pixels.properties",
                 "source/pixels/scripts/etc/coordinator-jvm.config","source/pixels/scripts/etc/retina-jvm.config"))
             configs.put(name,file(build,name,name.endsWith(".properties")?"retina.tile.visibility.capacity=64\n":"-ea\n"));
         file(build,"source/pixels/cpp/pixels-retina/lib.cpp","source");

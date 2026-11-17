@@ -34,8 +34,8 @@ public class InputStoreTest {
         for (String stream : java.util.List.of("baseline", "workload")) {
             var writer = new ProtoTrace.Writer(directory.resolve(stream + ".pb.zst"), false);
             writer.close();
-            var files = new com.google.gson.Gson().toJsonTree(java.util.List.of(ProtoTrace.file(stream + ".pb.zst", writer))).getAsJsonArray();
-            streams.add(stream, files); manifest.addProperty(stream + "_trace_sha256", ProtoTrace.identity(files));
+            streams.add(stream, new com.google.gson.Gson().toJsonTree(ProtoTrace.file(writer)));
+            manifest.addProperty(stream + "_trace_sha256", ProtoTrace.identity(writer.logicalSha256(), writer.count()));
         }
         manifest.add("proto_files", streams);
         try (var units = new com.github.luben.zstd.ZstdOutputStream(Files.newOutputStream(directory.resolve(WorkUnits.FILE)))) { }
@@ -91,7 +91,7 @@ public class InputStoreTest {
                 var inventory = com.google.gson.JsonParser.parseString(new String(objects.get("inputs/manifests/"
                         + receipt.get("manifest_sha256") + ".json"), java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();
                 var manifest = com.google.gson.JsonParser.parseString(Files.readString(trace.resolve("manifest.json"))).getAsJsonObject();
-                var payload = manifest.getAsJsonObject("proto_files").getAsJsonArray("workload").get(0).getAsJsonObject();
+                var payload = manifest.getAsJsonObject("proto_files").getAsJsonObject("workload");
                 if (resize) payload.addProperty("bytes", payload.get("bytes").getAsLong() + 1);
                 else payload.addProperty("sha256", "0".repeat(64));
                 byte[] changed = manifest.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);

@@ -5,9 +5,9 @@ SIBench captures native benchmark index operations into reusable Traces and repl
 | Benchmark | Native engine | Workload |
 | --- | --- | --- |
 | YCSB | RocksDB (`api`) | A–F, each restored from the same initial files. |
-| sysbench | PostgreSQL or DuckDB (`capture`) | `oltp_read_write`. |
+| sysbench | PostgreSQL or DuckDB (`capture`) | `oltp_read_write` under zipfian exponents 0.8 and 0.99, one Trace each. |
 | HyBench | PostgreSQL or DuckDB (`capture`) | Separate TP (TP-1–TP-18) and XP (concurrent AT/IQ) Traces. TP includes reads. |
-| HyBench → Pixels | PostgreSQL → pixels-sink → Pixels (`cdc`) | TP/AT changes and Pixels primary-index calls; AP/IQ disabled. |
+| HyBench → Pixels | Recorded PostgreSQL CDC files → pixels-sink → Pixels (`cdc`) | TP/AT changes captured once with AP/IQ disabled; a [Pixels experiment](docs/pixels-experiment.md) with `trace: true` exports Pixels primary-index calls. |
 
 ## Build
 
@@ -16,12 +16,12 @@ Use Linux/glibc x86-64, JDK 17 (`JAVA_HOME`), Maven and Git. Builds need fresh d
 | Component | Additional prerequisites |
 | --- | --- |
 | RocksDB and DuckDB | Python 3.9+, C++17, CMake 3.16+, make, patch; RocksDB also needs LZ4, Zstd, zlib, Snappy and bzip2 development libraries. |
-| PostgreSQL | C compiler, make, patch, Perl, Bison, Flex and libzstd headers; run as an unprivileged user. |
+| PostgreSQL | C compiler, make, patch, Perl, Bison and Flex; run as an unprivileged user. |
 | Benchmark clients | sysbench needs autotools, pkg-config, libtool, libaio and libpq headers; HyBench/YCSB use Maven. |
 | Pixels | C/C++, CMake, make, curl, PostgreSQL build tools and network access to Maven Central/GitHub. |
 | Cloud backends | RocksDB-Cloud: yum-based build host, root for dependency installation and C/C++ tools. SlateDB: Python 3, C/C++ linker and rustup with its pinned toolchain. |
 
-Build both embedded runtimes, then the application:
+Build the embedded RocksDB runtime and the DuckDB host, then the application:
 
 ```bash
 git submodule update --init --recursive
@@ -42,7 +42,7 @@ scripts/build-pixels.sh java build/services/pixels
 scripts/build-pixels.sh native build/services/pixels
 ```
 
-Set each engine's `build_directory` in `config/engine/`. For custom embedded-runtime locations, also pass absolute `-Drocksdb.build.directory=PATH` and `-Dduckdb.build.directory=PATH` to Maven. `JOBS` controls compilation parallelism. Run native builds on hosts ABI-compatible with execution hosts; upstream licenses remain in their submodules and embedded runtime JARs.
+Set each engine's `build_directory` in `config/engine/`. For custom locations, also pass absolute `-Drocksdb.build.directory=PATH` (the packaged RocksDB JNI runtime) and `-Dduckdb.build.directory=PATH` (the `duckdb_host` used by tests) to Maven. `JOBS` controls compilation parallelism. Run native builds on hosts ABI-compatible with execution hosts; upstream licenses remain in their submodules and the packaged RocksDB JNI JAR.
 
 For Index Service backends, build the selected JNI library:
 
@@ -64,7 +64,7 @@ java -jar build/sibench/sibench.jar inspect-scale
 java -jar build/sibench/sibench.jar generate config/sibench.yaml
 ```
 
-`generate` runs the entries with `trace.generate: true` and stops on the first failure. Each named entry (`hybench-tp`, `hybench-xp`, `ycsb-a`, ...) owns its local `trace.directory` and optional upload URI; see [Trace selection and storage](docs/trace.md#selection-and-storage). HyBench entries each load a fresh database; YCSB entries share one initial load. `generate-pixels CONFIG` captures live PostgreSQL → Pixels into a separate fresh output. There is no engine fallback.
+`generate` runs the entries with `trace.generate: true` and stops on the first failure. Each named entry (`hybench-tp`, `hybench-xp`, `ycsb-a`, ...) owns its local `trace.directory` and optional upload URI; see [Trace selection and storage](docs/trace.md#selection-and-storage). HyBench entries each load a fresh database; YCSB entries share one initial load. There is no engine fallback.
 
 A successful run publishes after normal shutdown and deletes its working databases. A failed run keeps diagnostics and cannot resume. Existing or overlapping outputs and mismatched source/build inputs are rejected. [Trace](docs/trace.md) defines visibility, index coverage and supported accesses.
 
@@ -97,7 +97,7 @@ Trace selection, `--runtime`/`--jar` overrides, outputs and update-layout analys
 
 ## Tests
 
-After building both embedded runtimes, run the default suites with Python 3.9+ and local socket access:
+After building the RocksDB runtime and the DuckDB host, run the default suites with Python 3.9+ and local socket access:
 
 ```bash
 mvn test

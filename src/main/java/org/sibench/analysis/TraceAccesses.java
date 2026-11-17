@@ -57,8 +57,8 @@ public final class TraceAccesses {
         var tables = IndexCatalog.fromManifest(manifest).definitions().stream()
                 .filter(d -> d.indexId() == 0).toList();
         String identity = Digests.sha256(trace.resolve("manifest.json"));
-        TraceManifest.requireValue(trace, ValueKind.ROW_ID);
-        var input = ReplayInput.prepare(trace,
+        TraceManifest.requireValue(manifest, ValueKind.ROW_ID);
+        var input = ReplayInput.prepare(trace, manifest,
                 new ReplayConfig(TraceManifest.secondaryIndexes(manifest), 0, 0, 0, 0, "operation", 1, 4096, 60, 1));
         Files.createDirectories(output);
         Files.deleteIfExists(output.resolve("summary.json"));
@@ -78,12 +78,11 @@ public final class TraceAccesses {
             var counts = (Map<?, ?>) result.get("operation_counts");
             for (String kind : List.of("get", "scan", "put", "delete")) {
                 long recorded = 0;
-                for (var file : manifest.getAsJsonObject("proto_files").getAsJsonArray("workload")) {
-                    var stats = file.getAsJsonObject().getAsJsonObject("statistics").getAsJsonObject("index_operations");
-                    for (String scope : List.of("primary", "secondary")) {
-                        var value = stats.getAsJsonObject(scope).get(kind);
-                        if (value != null) recorded = Math.addExact(recorded, value.getAsLong());
-                    }
+                var stats = manifest.getAsJsonObject("proto_files").getAsJsonObject("workload")
+                        .getAsJsonObject("statistics").getAsJsonObject("index_operations");
+                for (String scope : List.of("primary", "secondary")) {
+                    var value = stats.getAsJsonObject(scope).get(kind);
+                    if (value != null) recorded = Math.addExact(recorded, value.getAsLong());
                 }
                 if (!Long.valueOf(recorded).equals(counts.get(kind)))
                     throw new IOException("Manifest operation count mismatch: " + kind);

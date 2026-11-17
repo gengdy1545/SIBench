@@ -4,7 +4,8 @@ from graph.config.global_config import ANNOTATION_FONT_SIZE, DOUBLE_COLUMN_WIDTH
 
 TRACES = [{'name': 'hybench-tp', 'label': 'HyBench-TP'},
  {'name': 'hybench-xp', 'label': 'HyBench-XP'},
- {'name': 'sysbench', 'label': 'sysbench'},
+ {'name': 'sysbench-zipf080', 'label': 'sysbench-0.8'},
+ {'name': 'sysbench-zipf099', 'label': 'sysbench-0.99'},
  {'name': 'ycsb-a', 'label': 'YCSB-A'},
  {'name': 'ycsb-b', 'label': 'YCSB-B'},
  {'name': 'ycsb-c', 'label': 'YCSB-C'},

@@ -32,12 +32,12 @@ public class DuckDbAccessesCheck extends DuckDbHostFixture {
         db.setAutoCommit(false);NativeHistory.initialize(db, org.sibench.config.Engine.DUCKDB);NativeHistory.install(db, org.sibench.config.Engine.DUCKDB,1,"main","items","id");db.commit();db.setAutoCommit(true);
         Path raw=root.resolve("native.csv");
         sql(db,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
-                +"'SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path='"+raw+"')");
+                +"'SibenchIndex','SibenchIndexRows'],storage_path='"+raw+"')");
         return raw;
     }
     private void bind(Connection db,Path raw,DuckDbStatements.Session session)throws Exception {
-        sql(db,"CALL disable_logging()");DuckDbFacts.load(db,raw);DuckDbStatements.bind(db,List.of(session));
-        DuckDbTransactions.bind(db,"data");DuckDbIdentities.bind(db);
+        sql(db,"CALL disable_logging()");DuckDbFacts.load(db,raw,0);DuckDbStatements.bind(db,List.of(session));
+        DuckDbTransactions.bind(db,"data",0);DuckDbIdentities.bind(db);
     }
     @Test public void bindsPrimarySecondaryAndLocalRowsBeforeAbortWithoutUsingSqlAggregateCounts()throws Exception {
         try(var observer=connect()) {
@@ -59,7 +59,7 @@ public class DuckDbAccessesCheck extends DuckDbHostFixture {
                 assertTrue(r.next());assertEquals(1,r.getLong(1));assertEquals(4,r.getLong(2));assertEquals(100,r.getLong(3));
                 assertTrue(r.next());assertEquals(2,r.getLong(1));assertEquals(2,r.getLong(2));assertEquals(30,r.getLong(3));assertFalse(r.next());
             }
-            assertEquals(local,DuckDbIdentities.observedRow(observer,1,"40",0,1,Long.MAX_VALUE));
+            assertEquals(local,DuckDbIdentitiesTest.observedRow(observer,1,"40",0,1,Long.MAX_VALUE));
             assertEquals(1,number(observer,"SELECT count(*) FROM sibench_accesses WHERE index_id=0"));
             assertEquals(1,number(observer,"SELECT count(*) FROM sibench_transactions WHERE outcome='rollback'"));
         }
@@ -99,7 +99,6 @@ public class DuckDbAccessesCheck extends DuckDbHostFixture {
                 session=marker(worker,1);assertEquals(0,number(worker,"SELECT id FROM items WHERE id<2048 LIMIT 1"));
             }
             bind(observer,raw,session);
-            assertTrue(number(observer,"SELECT count(*) FROM sibench_consumption WHERE stage='limit' AND input_rows=1")>0);
             DuckDbAccesses.bind(observer,CATALOG);
             assertEquals(2048,number(observer,"SELECT count(*) FROM sibench_access_keys"));
             assertEquals(2047L*2048/2,number(observer,"SELECT sum(CAST(key_sql AS BIGINT)) FROM sibench_access_keys"));
@@ -136,8 +135,8 @@ public class DuckDbAccessesCheck extends DuckDbHostFixture {
                 }
                 worker.rollback();blocker.rollback();
             }
-            sql(observer,"CALL disable_logging()");DuckDbFacts.load(observer,raw);
-            DuckDbStatements.bind(observer,List.of(first,second));DuckDbTransactions.bind(observer,"data");DuckDbIdentities.bind(observer);
+            sql(observer,"CALL disable_logging()");DuckDbFacts.load(observer,raw,0);
+            DuckDbStatements.bind(observer,List.of(first,second));DuckDbTransactions.bind(observer,"data",0);DuckDbIdentities.bind(observer);
             assertTrue(number(observer,"SELECT count(*) FROM sibench_index_rows WHERE phase='closed' AND NOT source_drained")>0);
             DuckDbAccesses.bind(observer,List.of(CATALOG.get(0)));
             assertEquals(2,number(observer,"SELECT count(*) FROM sibench_access_keys WHERE key_sql='10'"));

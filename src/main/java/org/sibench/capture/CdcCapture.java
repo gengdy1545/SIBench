@@ -5,10 +5,7 @@ import static org.sibench.config.ConfigValues.*;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
-import java.net.InetAddress;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -17,7 +14,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 /** Source-writer completion reports; no Index Trace or target visibility queries are involved. */
@@ -32,37 +28,9 @@ final class CdcCapture implements AutoCloseable {
     private long transactions, changes, markerChanges;
 
     static CdcCapture start(Path build, Map<String, Object> settings, Path root, Path schema, int port) throws Exception {
-        java.nio.file.Files.createDirectory(root);
-        Path properties = java.nio.file.Files.writeString(root.resolve("sink.properties"),
-                PixelsGeneration.sinkProperties(object(settings, "sink_properties"), root, port, "proto"));
-        Path logging = PixelsGeneration.sinkLogging(root);
-        String token = UUID.randomUUID().toString();
-        Process process = null;
-        try (var listener = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
-            listener.setSoTimeout(30_000);
-            var command = List.of(Path.of(System.getProperty("java.home"), "bin/java").toString(),
-                    "-Xmx" + string(object(settings, "memory"), "sink_heap"), "-Dlog4j2.configurationFile=" + logging,
-                    "-Dsibench.report.endpoint=127.0.0.1:" + listener.getLocalPort(), "-Dsibench.report.token=" + token,
-                    "-cp", build.resolve("jars/sibench-pixels.jar") + ":" + build.resolve("jars/pixels-sink.jar"),
-                    "org.sibench.pixels.ProtoCapture", properties.toString(), schema.toString(), root.getParent().resolve("cdc").toString());
-            process = new ProcessBuilder(command).directory(root.toFile()).redirectErrorStream(true)
-                    .redirectOutput(root.resolve("sink.log").toFile()).start();
-            Socket socket = listener.accept();
-            try {
-                socket.setSoTimeout(30_000);
-                var input = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-                if (!("T " + token).equals(input.readLine()) || !"R".equals(input.readLine()))
-                    throw new IOException("Invalid CDC capture handshake; see " + root.resolve("sink.log"));
-                socket.setSoTimeout(0);
-                return new CdcCapture(process, socket, input);
-            } catch (Exception | Error failure) {
-                socket.close();
-                throw failure;
-            }
-        } catch (Exception | Error failure) {
-            if (process != null) process.destroyForcibly();
-            throw failure;
-        }
+        var sink = PixelsSink.start(build, settings, root, PixelsSink.properties(object(settings, "sink_properties"), root, port),
+                List.of(), Map.of(), "org.sibench.pixels.ProtoCapture", schema.toString(), root.getParent().resolve("cdc").toString());
+        return new CdcCapture(sink.process(), sink.socket(), sink.reports());
     }
 
     private CdcCapture(Process process, Socket socket, BufferedReader input) throws IOException {

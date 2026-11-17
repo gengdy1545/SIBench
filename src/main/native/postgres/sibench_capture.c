@@ -1,8 +1,8 @@
 /*
  * PostgreSQL 14.24 capture instrumentation, linked into the backend (see sibench_capture.h).
  *
- * Production streams facts directly to Java; explicit diagnostic runs write zstd files.
- * Streams have explicit opening/closing records; failed or truncated output cannot be published.
+ * Facts stream directly to Java over SIBENCH_CAPTURE_SOCKET. Streams have explicit opening and
+ * closing records; failed or truncated output cannot be published.
  *
  * An index access unit starts with a scan_rescan and ends before the next rescan, the scan's end,
  * a transaction abort or backend exit. Its facts are accumulated here and written as one
@@ -17,11 +17,9 @@
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include "storage/lwlock.h"
-#include <zstd.h>
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -64,7 +62,6 @@ static uint64 sib_sequence = 0;
 static bool sib_failed = false;
 static bool sib_committing = false;
 static const char *sib_failure_message = NULL;
-static int	sib_detail_mode = -1;
 
 typedef struct SibSubtransaction
 {
@@ -73,12 +70,6 @@ typedef struct SibSubtransaction
 	struct SibSubtransaction *parent;
 } SibSubtransaction;
 static SibSubtransaction *sib_subtransactions = NULL;
-
-/* Buffered zstd output ends its frame at backend exit; an incomplete frame fails the audit. */
-static ZSTD_CCtx *sib_zstd = NULL;
-static char *sib_zstd_out = NULL;
-static size_t sib_zstd_out_size = 0;
-static bool sib_zstd_open_frame = false;
 
 /* ------------------------------------------------------------------------------------------ */
 /* Output stream                                                                              */
@@ -96,25 +87,9 @@ sib_relation(Relation relation)
 	static Oid history_namespace = InvalidOid;
 	if (!sib_enabled() || !relation || RelationGetRelid(relation) < FirstNormalObjectId)
 		return false;
-	/* API projection uses explicit intent; executor snapshots and row changes remain captured. */
-	if (strcmp(application_name, "sibench:api") == 0)
-		return false;
 	if (!OidIsValid(history_namespace))
 		history_namespace = get_namespace_oid("sibench_history", true);
 	return RelationGetNamespace(relation) != history_namespace;
-}
-
-/* Per-row events are kept only on request: they are what makes a capture large and slow. */
-static bool
-sib_detail(void)
-{
-	if (sib_detail_mode < 0)
-	{
-		const char *value = getenv("SIBENCH_CAPTURE_DETAIL");
-
-		sib_detail_mode = value && strcmp(value, "rows") == 0;
-	}
-	return sib_detail_mode == 1;
 }
 
 static void sib_flush_all(void);
@@ -126,8 +101,8 @@ sib_capture_check_failure(void)
 {
     if (sib_failed)
         ereport(FATAL, (errmsg_internal("%s", sib_failure_message)));
-    /* Called after transaction completion; API receipts provide their own bounded flow control. */
-    if (sib_direct && strcmp(application_name, "sibench:api") != 0)
+    /* Called after transaction completion: the consumer bounds how far a source runs ahead. */
+    if (sib_direct)
     {
         for (;;)
         {
@@ -156,56 +131,18 @@ sib_output_error(const char *message)
     if (!sib_committing) sib_capture_check_failure();
 }
 
-/* Feeds input to the zstd stream with the given directive and writes what it produced. */
-static bool
-sib_zstd_feed(const char *data, size_t length, ZSTD_EndDirective directive)
-{
-	ZSTD_inBuffer input = {data, length, 0};
-	size_t		remaining;
-
-	do
-	{
-		ZSTD_outBuffer output = {sib_zstd_out, sib_zstd_out_size, 0};
-
-		remaining = ZSTD_compressStream2(sib_zstd, &output, &input, directive);
-		if (ZSTD_isError(remaining))
-			return false;
-		if (output.pos > 0 && fwrite(sib_zstd_out, 1, output.pos, sib_stream) != output.pos)
-			return false;
-	} while (directive == ZSTD_e_continue ? input.pos < input.size : remaining != 0);
-	return true;
-}
-
 static void
 sib_write(const char *data, size_t length)
 {
-    if (sib_direct)
-    {
-        if (fwrite(data, 1, length, sib_stream) != length)
-            sib_output_error("SIBench direct capture write failed");
-        return;
-    }
-	sib_zstd_open_frame = true;
-	if (!sib_zstd_feed(data, length, ZSTD_e_continue))
-		sib_output_error("SIBench trace write failed");
+	if (fwrite(data, 1, length, sib_stream) != length)
+		sib_output_error("SIBench direct capture write failed");
 }
 
-/* Ends the zstd frame; anything written later starts a new frame of the same stream. */
+/* Hands every buffered fact to the consumer. */
 static void
-sib_finish(void)
+sib_flush_stream(void)
 {
-	if (!sib_stream)
-		return;
-	if (sib_zstd && sib_zstd_open_frame)
-	{
-		if (!sib_zstd_feed(NULL, 0, ZSTD_e_end))
-        {
-            sib_output_error("SIBench trace finalization failed");
-            return;
-        }
-		sib_zstd_open_frame = false;
-	}
-	if (fflush(sib_stream) != 0)
+	if (sib_stream && fflush(sib_stream) != 0)
 		sib_output_error("SIBench trace flush failed");
 }
 
@@ -220,7 +157,7 @@ sib_backend_exit(void)
 		sib_emit("capture_end", NULL, NULL);
 		sib_ended = true;
 	}
-	sib_finish();
+	sib_flush_stream();
     if (sib_direct)
     {
         char acknowledgement;
@@ -233,28 +170,19 @@ sib_backend_exit(void)
     }
 }
 
-static void
-sib_proc_exit(int code, Datum arg)
-{
-	sib_finish();
-}
-
 static bool
 sib_open(void)
 {
-	const char *directory = getenv("SIBENCH_CAPTURE_DIR");
-	char		path[MAXPGPATH];
+	const char *endpoint = getenv("SIBENCH_CAPTURE_SOCKET");
 	StringInfoData header;
 
 	if (sib_stream)
 		return true;
-	if ((!directory || !directory[0]) && !getenv("SIBENCH_CAPTURE_SOCKET"))
+	if (!endpoint)
 		return false;
-	if (getenv("SIBENCH_CAPTURE_SOCKET"))
 	{
 		struct sockaddr_un address;
 		int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-		const char *endpoint = getenv("SIBENCH_CAPTURE_SOCKET");
 		memset(&address, 0, sizeof(address));
 		address.sun_family = AF_UNIX;
 		if (fd < 0 || strlen(endpoint) >= sizeof(address.sun_path))
@@ -286,33 +214,15 @@ sib_open(void)
 		MyProc->sibenchCaptureDirect = true;
 		LWLockRelease(ProcArrayLock);
 		setvbuf(sib_stream, NULL, _IOFBF, 1 << 20);
-		fprintf(sib_stream, "pg-%d.jsonl.zst\n", MyProcPid);
+		fprintf(sib_stream, "pg-%d.jsonl\n", MyProcPid);
 	}
-	else
-	{
-		int fd;
-		snprintf(path, sizeof(path), "%s/pg-%d.jsonl.zst", directory, MyProcPid);
-		fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
-		if (fd < 0) elog(ERROR, "SIBench cannot create trace file %s", path);
-		sib_stream = fdopen(fd, "w");
-		if (!sib_stream) { close(fd); elog(ERROR, "SIBench cannot open trace stream %s", path); }
-		sib_zstd = ZSTD_createCCtx();
-		if (!sib_zstd || ZSTD_isError(ZSTD_CCtx_setParameter(sib_zstd, ZSTD_c_compressionLevel, 1))
-			|| ZSTD_isError(ZSTD_CCtx_setParameter(sib_zstd, ZSTD_c_checksumFlag, 1)))
-			elog(ERROR, "SIBench cannot start zstd for %s", path);
-		sib_zstd_out_size = ZSTD_CStreamOutSize();
-		sib_zstd_out = MemoryContextAlloc(TopMemoryContext, sib_zstd_out_size);
-	}
-	if (!sib_direct) setvbuf(sib_stream, NULL, _IOFBF, 1 << 20);
-	on_proc_exit(sib_proc_exit, (Datum) 0);
 	initStringInfo(&header);
 	appendStringInfo(&header,
 					 "{\"event\":\"capture_start\",\"sequence\":0,\"pid\":%d,\"xid\":0,\"cid\":0,\"req\":%llu,\"depth\":%d,"
 					 "\"application\":",
 					 MyProcPid, (unsigned long long) sibench_request, sibench_depth);
 	escape_json(&header, application_name);
-	appendStringInfo(&header, ",\"detail\":\"%s\"}\n",
-					 sib_detail() ? "rows" : "summary");
+	appendStringInfoString(&header, "}\n");
 	sib_write(header.data, header.len);
 	pfree(header.data);
 	return !sib_failed;
@@ -468,7 +378,7 @@ sib_datum_with(StringInfo out, FmgrInfo *output, Datum datum, bool isnull)
 }
 
 /* ------------------------------------------------------------------------------------------ */
-/* Per-row detail events (SIBENCH_CAPTURE_DETAIL=rows) and scan lifecycle events               */
+/* Scan lifecycle events                                                                      */
 /* ------------------------------------------------------------------------------------------ */
 
 /*
@@ -518,46 +428,32 @@ sib_scan_key(StringInfo out, ScanKey k, Oid type)
 	appendStringInfoChar(out, ']');
 }
 
-/* The fields every index scan event shares: scan identity, snapshot, TID and scan keys. */
+/* A rescan's scan identity, MVCC snapshot and scan keys. */
 static void
-sib_scan_detail(StringInfo out, IndexScanDesc scan, ScanKey keys, int nkeys,
-				ItemPointer tid, int direction, bool found)
+sib_scan_detail(StringInfo out, IndexScanDesc scan, ScanKey keys, int nkeys)
 {
 	int			i;
 
-	appendStringInfo(out, "\"scan\":\"%p\",\"heap_oid\":%u,\"direction\":%d,\"found\":%s,\"recheck\":%s",
-					 scan, scan->indexRelation->rd_index->indrelid, direction,
-					 found ? "true" : "false", scan->xs_recheck ? "true" : "false");
-	if (scan->xs_snapshot)
+	appendStringInfo(out, "\"scan\":\"%p\"", scan);
+	/*
+	 * Only MVCC snapshots are read points; others (e.g. planner endpoint probes use a
+	 * stack-allocated SnapshotNonVacuumable) leave their fields uninitialized. csn is the
+	 * transaction completion count GetSnapshotData() read under ProcArrayLock together with
+	 * xmin, xmax and xip: the counter is incremented under that lock exactly when a transaction
+	 * stops counting as running, so a commit is visible to a snapshot iff the snapshot's counter
+	 * is at or after the commit's. The snapshot carries it (sibenchCsn), so every copy a scan uses
+	 * keeps it; a backend-wide "last snapshot built" would also follow catalog snapshots built
+	 * after the statement's. An unknown counter is left out.
+	 */
+	if (scan->xs_snapshot && scan->xs_snapshot->snapshot_type == SNAPSHOT_MVCC)
 	{
 		Snapshot	s = scan->xs_snapshot;
 
-		/*
-		 * Only MVCC snapshots carry xmin/xmax/xip; others (e.g. planner endpoint probes use a
-		 * stack-allocated SnapshotNonVacuumable) leave those fields uninitialized. csn is the
-		 * transaction completion count GetSnapshotData() read under ProcArrayLock together with
-		 * xmin, xmax and xip: the counter is incremented under that lock exactly when a
-		 * transaction stops counting as running, so a commit is visible to a snapshot iff the
-		 * snapshot's counter is at or after the commit's. The snapshot carries it (sibenchCsn), so
-		 * every copy a scan uses keeps it; a backend-wide "last snapshot built" would also follow
-		 * catalog snapshots built after the statement's. An unknown counter is left out.
-		 */
-		if (s->snapshot_type == SNAPSHOT_MVCC)
-		{
-			appendStringInfo(out, ",\"snapshot_type\":%d", s->snapshot_type);
-			if (s->sibenchCsn != 0)
-				appendStringInfo(out, ",\"csn\":%llu", (unsigned long long) s->sibenchCsn);
-			appendStringInfo(out, ",\"xmin\":%u,\"xmax\":%u,\"snapshot_cid\":%u,\"xip\":[",
-							 s->xmin, s->xmax, s->curcid);
-			for (i = 0; i < s->xcnt; i++)
-				appendStringInfo(out, "%s%u", i ? "," : "", s->xip[i]);
-			appendStringInfo(out, "],\"suboverflowed\":%s", s->suboverflowed ? "true" : "false");
-		}
-		else
-			appendStringInfo(out, ",\"snapshot_type\":%d", s->snapshot_type);
+		if (s->sibenchCsn != 0)
+			appendStringInfo(out, ",\"csn\":%llu", (unsigned long long) s->sibenchCsn);
+		appendStringInfo(out, ",\"snapshot_cid\":%u,\"suboverflowed\":%s",
+						 s->curcid, s->suboverflowed ? "true" : "false");
 	}
-	if (tid && ItemPointerIsValid(tid))
-		appendStringInfo(out, ",\"tid\":\"(%u,%u)\"", ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid));
 	appendStringInfoString(out, ",\"keys\":[");
 	for (i = 0; i < nkeys; i++)
 	{
@@ -570,43 +466,6 @@ sib_scan_detail(StringInfo out, IndexScanDesc scan, ScanKey keys, int nkeys,
 						 i ? "," : "", k->sk_attno, k->sk_strategy, k->sk_flags, type);
 		sib_scan_key(out, k, type);
 		appendStringInfoChar(out, '}');
-	}
-	appendStringInfoChar(out, ']');
-}
-
-static void
-sib_scan(const char *event, IndexScanDesc scan, ScanKey keys, int nkeys,
-		 ItemPointer tid, int direction, bool found)
-{
-	StringInfoData out;
-
-	initStringInfo(&out);
-	sib_scan_detail(&out, scan, keys, nkeys, tid, direction, found);
-	sib_emit(event, scan->indexRelation, out.data);
-	pfree(out.data);
-}
-
-/* Appends the text of the given heap columns of a fetched row as a JSON array. */
-static void
-sib_row_columns(StringInfo out, TupleTableSlot *slot, const AttrNumber *columns, int count)
-{
-	int			i;
-	bool		isnull;
-	Datum		value;
-
-	appendStringInfoChar(out, '[');
-	for (i = 0; i < count; i++)
-	{
-		if (i)
-			appendStringInfoChar(out, ',');
-		if (columns[i] <= 0)
-		{
-			appendStringInfoString(out, "null");
-			continue;
-		}
-		value = slot_getattr(slot, columns[i], &isnull);
-		sib_datum(out, TupleDescAttr(slot->tts_tupleDescriptor, columns[i] - 1)->atttypid,
-				  value, isnull);
 	}
 	appendStringInfoChar(out, ']');
 }
@@ -624,30 +483,6 @@ sib_primary_columns(Relation heap, AttrNumber *columns)
 		columns[count++] = member + FirstLowInvalidHeapAttributeNumber;
 	bms_free(primary);
 	return count;
-}
-
-/* The per-row heap verdict of one index entry, with the visible row's identity. */
-static void
-sib_heap_visibility_detail(IndexScanDesc scan, TupleTableSlot *slot, bool found)
-{
-	StringInfoData out;
-	AttrNumber	columns[INDEX_MAX_KEYS];
-	int			count;
-
-	initStringInfo(&out);
-	sib_scan_detail(&out, scan, NULL, 0, found ? &slot->tts_tid : &scan->xs_heaptid, 0, found);
-	if (found)
-	{
-		appendStringInfoString(&out, ",\"row\":{\"indexed\":");
-		sib_row_columns(&out, slot, scan->indexRelation->rd_index->indkey.values,
-						scan->indexRelation->rd_index->indnkeyatts);
-		count = sib_primary_columns(scan->heapRelation, columns);
-		appendStringInfoString(&out, ",\"pk\":");
-		sib_row_columns(&out, slot, columns, count);
-		appendStringInfoChar(&out, '}');
-	}
-	sib_emit("heap_visibility", scan->indexRelation, out.data);
-	pfree(out.data);
 }
 
 /* ------------------------------------------------------------------------------------------ */
@@ -695,11 +530,8 @@ typedef struct SibUnit
 	int16		pk_len;
 	FmgrInfo	value_output;
 	FmgrInfo	pk_output;
-	/* Counters, exactly as the ledger accumulates them from per-row events. */
+	/* Counters the unit's summary reports. */
 	int64		calls;
-	int64		found;
-	int64		recheck;
-	int64		heap_fetches;
 	int64		heap_visible;
 	int64		vm_visible;
 	int64		bitmap_tids;
@@ -880,7 +712,7 @@ sib_unit_start(SibUnit *unit, ScanKey keys, int nkeys)
 			unit->array_keys = true;
 }
 
-/* Reports an index event for a scan with no unit; the ledger rejects it, as for per-row input. */
+/* Reports an index event for a scan with no unit; the ledger rejects it. */
 static SibUnit *
 sib_unit_current(IndexScanDesc scan, const char *event)
 {
@@ -1083,15 +915,13 @@ sib_unit_flush(SibUnit *unit)
 	sib_tids_seal(unit);
 	initStringInfo(&out);
 	appendStringInfo(&out,
-					 "\"scan\":\"%p\",\"calls\":%lld,\"found\":%lld,\"last_found\":%s,\"forward\":%s,"
-					 "\"backward\":%s,\"recheck\":%lld,\"heap_fetches\":%lld,\"heap_visible\":%lld,"
-					 "\"vm_visible\":%lld,\"bitmap_tids\":%lld,\"bitmap_distinct\":%lld,"
+					 "\"scan\":\"%p\",\"calls\":%lld,\"last_found\":%s,\"forward\":%s,"
+					 "\"backward\":%s,\"heap_visible\":%lld,\"vm_visible\":%lld,\"bitmap_tids\":%lld,"
 					 "\"bitmap_unresolved\":%lld,\"bitmap_ended\":%s,\"identity_missing\":%s",
-					 unit->scan, (long long) unit->calls, (long long) unit->found,
+					 unit->scan, (long long) unit->calls,
 					 SIB_BOOL(unit->last_found), SIB_BOOL(unit->forward), SIB_BOOL(unit->backward),
-					 (long long) unit->recheck, (long long) unit->heap_fetches,
 					 (long long) unit->heap_visible, (long long) unit->vm_visible,
-					 (long long) unit->bitmap_tids, (long long) unit->tids.distinct,
+					 (long long) unit->bitmap_tids,
 					 (long long) sib_tids_unresolved(unit), SIB_BOOL(unit->bitmap_ended),
 					 SIB_BOOL(unit->identity_missing));
 	if (unit->fetched_before_binding)
@@ -1230,7 +1060,7 @@ sib_index_rescan(IndexScanDesc scan, ScanKey keys, int nkeys)
 	if (heap && unit->position >= 0)
 		cycle = sib_cycle_join(heap, unit->position);
 	initStringInfo(&out);
-	sib_scan_detail(&out, scan, keys, nkeys, NULL, 0, false);
+	sib_scan_detail(&out, scan, keys, nkeys);
 	if (cycle > 0)
 		appendStringInfo(&out, ",\"cycle\":%llu", (unsigned long long) cycle);
 	sib_emit("scan_rescan", scan->indexRelation, out.data);
@@ -1244,6 +1074,7 @@ sib_index_end(IndexScanDesc scan)
 {
 	SibUnit    *unit;
 	SibHeap    *heap;
+	char		detail[64];
 
 	if (!sib_relation(scan->indexRelation))
 		return;
@@ -1258,7 +1089,8 @@ sib_index_end(IndexScanDesc scan)
 		if (heap && heap->cycle_open)
 			heap->cycle_sealed = true;
 	}
-	sib_scan("scan_end", scan, NULL, 0, NULL, 0, false);
+	snprintf(detail, sizeof(detail), "\"scan\":\"%p\"", (void *) scan);
+	sib_emit("scan_end", scan->indexRelation, detail);
 	if (unit)
 		sib_unit_remove(unit);
 }
@@ -1270,8 +1102,6 @@ sib_index_next(IndexScanDesc scan, ScanDirection direction, bool found)
 
 	if (!sib_relation(scan->indexRelation))
 		return;
-	if (sib_detail())
-		sib_scan("scan_next", scan, NULL, 0, found ? &scan->xs_heaptid : NULL, direction, found);
 	unit = sib_unit_current(scan, "scan_next");
 	if (!unit)
 		return;
@@ -1281,12 +1111,6 @@ sib_index_next(IndexScanDesc scan, ScanDirection direction, bool found)
 		unit->forward = true;
 	else if (direction < 0)
 		unit->backward = true;
-	if (found)
-	{
-		unit->found++;
-		if (scan->xs_recheck)
-			unit->recheck++;
-	}
 }
 
 /* Resolves the identity columns once per scan; anything but one column each has no identity. */
@@ -1429,12 +1253,9 @@ sib_heap_visibility(IndexScanDesc scan, TupleTableSlot *slot, bool found)
 
 	if (!sib_relation(scan->indexRelation))
 		return;
-	if (sib_detail())
-		sib_heap_visibility_detail(scan, slot, found);
 	unit = sib_unit_current(scan, "heap_visibility");
 	if (!unit)
 		return;
-	unit->heap_fetches++;
 	if (found)
 	{
 		unit->heap_visible++;
@@ -1444,14 +1265,12 @@ sib_heap_visibility(IndexScanDesc scan, TupleTableSlot *slot, bool found)
 
 /* Count all-visible entries without fetching their heap tuples. */
 void
-sib_vm_visible(IndexScanDesc scan, ItemPointer tid)
+sib_vm_visible(IndexScanDesc scan)
 {
 	SibUnit    *unit;
 
 	if (!sib_relation(scan->indexRelation))
 		return;
-	if (sib_detail())
-		sib_scan("vm_visible", scan, NULL, 0, tid, 0, true);
 	unit = sib_unit_current(scan, "vm_visible");
 	if (!unit)
 		return;
@@ -1472,9 +1291,6 @@ sib_bitmap_candidates(IndexScanDesc scan, const ItemPointer tids, int ntids)
 
 	if (!scan || !sib_relation(scan->indexRelation))
 		return;
-	if (sib_detail())
-		for (i = 0; i < ntids; i++)
-			sib_scan("bitmap_candidate", scan, NULL, 0, (ItemPointer) (tids + i), 0, true);
 	unit = sib_unit_current(scan, "bitmap_candidate");
 	if (!unit)
 		return;
@@ -1507,8 +1323,6 @@ sib_bitmap_end(IndexScanDesc scan)
 
 	if (!sib_relation(scan->indexRelation))
 		return;
-	if (sib_detail())
-		sib_scan("bitmap_end", scan, NULL, 0, NULL, 0, false);
 	unit = sib_unit_current(scan, "bitmap_end");
 	if (!unit)
 		return;
@@ -1723,14 +1537,6 @@ sib_bitmap_verdict(Relation relation, void *node, ItemPointer tid, bool found)
 
 	if (!sib_relation(relation))
 		return;
-	if (sib_detail())
-	{
-		char		detail[160];
-
-		snprintf(detail, sizeof(detail), "\"heap\":\"%p\",\"tid\":\"(%u,%u)\",\"found\":%s", node,
-				 ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid), found ? "true" : "false");
-		sib_emit("bitmap_heap_candidate", relation, detail);
-	}
 	heap = sib_heap_find(node);
 	if (heap)
 		sib_heap_verdict(heap,
@@ -1788,13 +1594,6 @@ sib_bitmap_lossy(Relation relation, void *node)
 
 	if (!sib_relation(relation))
 		return;
-	if (sib_detail())
-	{
-		char		detail[64];
-
-		snprintf(detail, sizeof(detail), "\"heap\":\"%p\"", node);
-		sib_emit("bitmap_heap_lossy", relation, detail);
-	}
 	heap = sib_heap_find(node);
 	if (heap)
 		heap->lossy_pages++;
@@ -1848,46 +1647,6 @@ sib_row_change(Relation relation, TupleTableSlot *oldslot, TupleTableSlot *newsl
 	bms_free(indexed);
 }
 
-void
-sib_index_insert(Relation relation, Datum *values, bool *isnull, ItemPointer tid, int unique)
-{
-	StringInfoData out;
-	int			i;
-
-	if (!sib_relation(relation))
-		return;
-	initStringInfo(&out);
-	appendStringInfo(&out, "\"heap_oid\":%u,\"tid\":\"(%u,%u)\",\"unique_check\":%d,\"values\":[",
-					 relation->rd_index->indrelid, ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid), unique);
-	for (i = 0; i < RelationGetDescr(relation)->natts; i++)
-	{
-		if (i)
-			appendStringInfoChar(&out, ',');
-		sib_datum(&out, TupleDescAttr(RelationGetDescr(relation), i)->atttypid, values[i], isnull[i]);
-	}
-	appendStringInfoChar(&out, ']');
-	sib_emit("index_insert_attempt", relation, out.data);
-	pfree(out.data);
-}
-
-void
-sib_index_build_start(Relation index)
-{
-	if (sib_relation(index))
-		sib_emit("index_build_start", index, NULL);
-}
-
-void
-sib_index_build_end(Relation index, double heap_rows, double index_rows)
-{
-	char		detail[160];
-
-	if (!sib_relation(index))
-		return;
-	snprintf(detail, sizeof(detail), "\"heap_rows\":%.0f,\"index_rows\":%.0f", heap_rows, index_rows);
-	sib_emit("index_build_end", index, detail);
-}
-
 /* ------------------------------------------------------------------------------------------ */
 /* Executor, results and transactions                                                         */
 /* ------------------------------------------------------------------------------------------ */
@@ -1903,8 +1662,6 @@ sib_executor_start(QueryDesc *queryDesc)
 	initStringInfo(&detail);
 	appendStringInfoString(&detail, "\"sql\":");
 	escape_json(&detail, queryDesc->sourceText ? queryDesc->sourceText : "");
-	/* Core query jumbling (compute_query_id = on): constants do not change the identity. */
-	appendStringInfo(&detail, ",\"query_id\":%lld", (long long) queryDesc->plannedstmt->queryId);
 	appendStringInfo(&detail, ",\"snapshot_csn\":%llu",
 		(unsigned long long)(queryDesc->snapshot && queryDesc->snapshot->snapshot_type == SNAPSHOT_MVCC
 			? queryDesc->snapshot->sibenchCsn : 0));
@@ -1913,78 +1670,15 @@ sib_executor_start(QueryDesc *queryDesc)
 }
 
 void
-sib_executor_end(uint64 processed)
+sib_executor_end(void)
 {
-	char		detail[128];
-
-	if (!sib_enabled())
-		return;
-	snprintf(detail, sizeof(detail), "\"processed\":%llu", (unsigned long long) processed);
-	sib_emit("executor_end", NULL, detail);
+	if (sib_enabled())
+		sib_emit("executor_end", NULL, NULL);
 }
 
-/* Count delivered rows without inspecting or retaining their values. */
-typedef struct SibReceiver
-{
-	DestReceiver pub;
-	DestReceiver *original;
-	uint64		returned;
-} SibReceiver;
-
-static bool
-sib_receive(TupleTableSlot *slot, DestReceiver *receiver)
-{
-	SibReceiver *self = (SibReceiver *) receiver;
-
-	self->returned++;
-	return self->original->receiveSlot(slot, self->original);
-}
-
-static void
-sib_start(DestReceiver *receiver, int operation, TupleDesc typeinfo)
-{
-	SibReceiver *self = (SibReceiver *) receiver;
-
-	self->original->rStartup(self->original, operation, typeinfo);
-}
-
-static void
-sib_shutdown(DestReceiver *receiver)
-{
-	SibReceiver *self = (SibReceiver *) receiver;
-
-	self->original->rShutdown(self->original);
-}
-
-static void
-sib_destroy(DestReceiver *receiver)
-{
-	SibReceiver *self = (SibReceiver *) receiver;
-
-	self->original->rDestroy(self->original);
-	pfree(self);
-}
-
-DestReceiver *
-sib_wrap_receiver(DestReceiver *original)
-{
-	SibReceiver *receiver;
-
-	if (!sib_enabled())
-		return original;
-	receiver = palloc0(sizeof(SibReceiver));
-	receiver->original = original;
-	receiver->pub.receiveSlot = sib_receive;
-	receiver->pub.rStartup = sib_start;
-	receiver->pub.rShutdown = sib_shutdown;
-	receiver->pub.rDestroy = sib_destroy;
-	receiver->pub.mydest = original->mydest;
-	return (DestReceiver *) receiver;
-}
-
-/* The number of rows this execution returned. */
+/* The number of rows this execution processed, and whether a read ran to its end. */
 void
-sib_executor_run_end(DestReceiver *dest, uint64 processed, bool read_complete)
+sib_executor_run_end(uint64 processed, bool read_complete)
 {
 	StringInfoData detail;
 
@@ -1993,14 +1687,6 @@ sib_executor_run_end(DestReceiver *dest, uint64 processed, bool read_complete)
 	initStringInfo(&detail);
 	appendStringInfo(&detail, "\"processed\":%llu", (unsigned long long) processed);
 	appendStringInfo(&detail, ",\"read_complete\":%s", read_complete ? "true" : "false");
-	if (dest && dest->receiveSlot == sib_receive)
-	{
-		SibReceiver *self = (SibReceiver *) dest;
-
-		appendStringInfo(&detail, ",\"returned\":%llu",
-						 (unsigned long long) self->returned);
-		self->returned = 0;
-	}
 	sib_emit("executor_run_end", NULL, detail.data);
 	pfree(detail.data);
 }
@@ -2101,11 +1787,10 @@ sib_capture_hold(bool hold)
 static void
 sib_await_room(void)
 {
-	if (!sib_direct || sibench_depth != 0 || strcmp(application_name, "sibench:api") == 0
-		|| TransactionIdIsValid(GetTopTransactionIdIfAny()))
+	if (!sib_direct || sibench_depth != 0 || TransactionIdIsValid(GetTopTransactionIdIfAny()))
 		return;
 	/* Everything already produced, including the last completion, reaches the consumer first. */
-	sib_finish();
+	sib_flush_stream();
 	for (;;)
 	{
 		bool		hold;
@@ -2199,7 +1884,7 @@ sib_transaction_commit(void)
         snprintf(detail, sizeof(detail), "\"csn\":%llu,\"capture_sequence\":%llu", (unsigned long long) csn,
                  (unsigned long long) (sib_direct ? MyProc->sibenchCaptureProduced : 0));
         sib_emit("transaction_commit", NULL, detail);
-        if (sib_direct) sib_finish();
+        if (sib_direct) sib_flush_stream();
     }
     sib_committing = false;
 }
@@ -2233,5 +1918,5 @@ sib_transaction_abort(void)
                  (unsigned long long) (sib_direct ? MyProc->sibenchCaptureProduced : 0));
 	}
 	sib_emit("transaction_abort", NULL, detail);
-    if (sib_direct) sib_finish();
+    if (sib_direct) sib_flush_stream();
 }

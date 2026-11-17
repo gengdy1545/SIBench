@@ -24,7 +24,7 @@ public final class PostgresDatabase implements AutoCloseable {
         return create(runtime,root,null,settings);
     }
 
-    /** Settings come from the engine configuration; the endpoint and query identifiers stay generator-owned. */
+    /** Settings come from the engine configuration; the endpoint stays generator-owned. Without a socket nothing is captured. */
     public static PostgresDatabase create(Path runtime,Path root,Path captureSocket,Map<String,String> settings)throws IOException,InterruptedException {
         return new PostgresDatabase(runtime.toRealPath(),root.toAbsolutePath().normalize(),captureSocket,settings);
     }
@@ -41,14 +41,12 @@ public final class PostgresDatabase implements AutoCloseable {
             // Only the private loopback port accepts the dedicated local benchmark role.
             Files.writeString(data.resolve("pg_hba.conf"),"local all sibench trust\nhost all sibench 127.0.0.1/32 trust\n"
                     +"local replication sibench trust\nhost replication sibench 127.0.0.1/32 trust\n");
-            Files.createDirectory(root.resolve("capture"));
             var conf=new StringBuilder("listen_addresses = '127.0.0.1'\nport = "+port
-                    +"\nunix_socket_directories = '"+quote(socket.toString())+"'\ncompute_query_id = on\n");
+                    +"\nunix_socket_directories = '"+quote(socket.toString())+"'\n");
             for(var setting:settings.entrySet())conf.append(setting.getKey()).append(" = '").append(quote(setting.getValue())).append("'\n");
             Files.writeString(data.resolve("postgresql.auto.conf"),conf);
             command("pg_ctl",List.of("-D",data.toString(),"-l",root.resolve("server.log").toString(),"-w","-t","30","start"),
-                    captureSocket==null?Map.of("SIBENCH_CAPTURE_DIR",root.resolve("capture").toString())
-                            :Map.of("SIBENCH_CAPTURE_SOCKET",captureSocket.toAbsolutePath().toString()),35);
+                    captureSocket==null?Map.of():Map.of("SIBENCH_CAPTURE_SOCKET",captureSocket.toAbsolutePath().toString()),35);
         }catch(IOException|InterruptedException|RuntimeException failure) {
             // pg_ctl may time out after the server starts; preserve the first setup error.
             if(Files.exists(data.resolve("postmaster.pid")))try {
@@ -99,7 +97,6 @@ public final class PostgresDatabase implements AutoCloseable {
     }
 
     public Path data(){return data;}
-    public Path capture(){return root.resolve("capture");}
     public int port(){return port;}
 
     private void command(String executable,List<String> arguments,Map<String,String> environment,int seconds)
@@ -108,7 +105,6 @@ public final class PostgresDatabase implements AutoCloseable {
         var builder=new ProcessBuilder(command).redirectErrorStream(true)
                 .redirectOutput(ProcessBuilder.Redirect.appendTo(root.resolve(executable+".log").toFile()));
         builder.environment().remove("LD_PRELOAD");builder.environment().remove("LD_LIBRARY_PATH");
-        builder.environment().remove("SIBENCH_CAPTURE_DIR");builder.environment().remove("SIBENCH_CAPTURE_DETAIL");
         builder.environment().remove("SIBENCH_CAPTURE_SOCKET");
         builder.environment().putAll(environment);
         var process=builder.start();

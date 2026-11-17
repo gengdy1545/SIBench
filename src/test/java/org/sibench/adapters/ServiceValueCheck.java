@@ -164,8 +164,7 @@ public final class ServiceValueCheck implements IndexBackend {
             throw new IllegalArgumentException("CONFIG BENCHMARK FRESH_REFERENCE REPORT");
         Path root = Path.of("").toAbsolutePath();
         var runtime = org.sibench.config.SibenchConfig.read(Path.of(args[0]));
-        var service = ServiceConfig.ofReplay(root, runtime);
-        if (!service.adapter().equals("grpc")) throw new IllegalArgumentException("Value acceptance requires a gRPC endpoint");
+        var service = ServiceTarget.of(runtime);
         var replay = org.sibench.replay.ReplayConfig.from(runtime);
         Path trace = org.sibench.config.BenchmarkSelection.directory(root, runtime, args[1]);
         Path referencePath = Path.of(args[2]).toAbsolutePath(), report = Path.of(args[3]).toAbsolutePath();
@@ -174,8 +173,9 @@ public final class ServiceValueCheck implements IndexBackend {
                 report.resolveSibling(report.getFileName() + ".baseline.json"),
                 report.resolveSibling(report.getFileName() + ".index-manifest.json")))
             if (Files.exists(path)) throw new IOException("Fresh reference and report paths required: " + path);
-        org.sibench.trace.TraceManifest.requireValue(trace, service.value());
-        String binding = ServiceReplay.binding(trace, replay, service.value());
+        var manifest = org.sibench.trace.TraceManifest.read(trace);
+        org.sibench.trace.TraceManifest.requireValue(manifest, service.value());
+        String binding = org.sibench.replay.ReplayInput.binding(manifest, replay);
         var evidence = new java.util.LinkedHashMap<String, Object>();
         evidence.put("configuration", runtime);
         evidence.put("index_binding", binding);
@@ -190,8 +190,7 @@ public final class ServiceValueCheck implements IndexBackend {
             reference = VersionedIndexBackend.create(referencePath, service.value());
             checker = new ServiceValueCheck(actual, reference);
             server = IndexServer.start(0, checker);
-            var checkedService = new ServiceConfig("grpc", "127.0.0.1:" + server.port(), null, 0,
-                    service.value(), null, false, true);
+            var checkedService = new ServiceTarget("127.0.0.1:" + server.port(), service.value());
             ServiceReplay.run(trace, replay, checkedService, report);
         } catch (Exception | Error error) {
             failure = error;

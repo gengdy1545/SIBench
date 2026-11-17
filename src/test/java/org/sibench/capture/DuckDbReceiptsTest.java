@@ -4,16 +4,13 @@ import static org.junit.Assert.*;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.sibench.generation.DuckDbHostFixture;
 
-public class DuckDbReceiptsTest {
-    @Rule public TemporaryFolder temporary=new TemporaryFolder();
+public class DuckDbReceiptsTest extends DuckDbHostFixture {
     private static final String HEADER="event,operation,kind,connection_id,after_query,error_code,rows\n";
     private static final String OPEN="open,0,session,9007199254740993,10,0,0\n";
     private static final String CALLS="begin,1,query,,,0,0\nend,1,query,,,0,5\n"
@@ -46,7 +43,7 @@ public class DuckDbReceiptsTest {
         }
     }
     private Connection fixture() throws Exception {
-        var db=DriverManager.getConnection("jdbc:duckdb:");
+        var db=connect();
         DuckDbReceipts.load(db,List.of(file(HEADER+OPEN+CALLS+CLOSE)),temporary.newFolder().toPath().resolve("receipts"));
         sql(db,"CREATE TEMP TABLE sibench_statements(connection_id UBIGINT,root_query BIGINT,query_id BIGINT,"
                 +"submission_end BOOLEAN,outcome VARCHAR,sql_text VARCHAR)");
@@ -60,11 +57,14 @@ public class DuckDbReceiptsTest {
     @Test public void bindsWholeSubmissionsWithoutDroppingEarlierSuccessfulStatements() throws Exception {
         try(var db=fixture()) {
             DuckDbReceipts.bind(db);
-            try(var q=db.createStatement();var r=q.executeQuery("SELECT query_id,operation,outcome,error_code FROM sibench_sql_statements ORDER BY query_id")) {
-                assertTrue(r.next());assertEquals(1,r.getLong(2));assertEquals(0,r.getInt(4));
-                assertTrue(r.next());assertEquals(12,r.getLong(1));assertEquals(2,r.getLong(2));assertEquals("completed",r.getString(3));assertEquals(18,r.getInt(4));
-                assertTrue(r.next());assertEquals("failed",r.getString(3));
-                assertTrue(r.next());assertEquals(3,r.getLong(2));assertFalse(r.next());
+            // The failed second submission keeps its earlier completed statement in sibench_statements.
+            try(var q=db.createStatement();var r=q.executeQuery("SELECT root_query,operation,outcome,error_code,kind FROM sibench_sql_submissions ORDER BY operation")) {
+                assertTrue(r.next());assertEquals(11,r.getLong(1));assertEquals(1,r.getLong(2));assertEquals("completed",r.getString(3));assertEquals(0,r.getInt(4));
+                assertTrue(r.next());assertEquals(12,r.getLong(1));assertEquals(2,r.getLong(2));assertEquals("failed",r.getString(3));assertEquals(18,r.getInt(4));
+                assertTrue(r.next());assertEquals(14,r.getLong(1));assertEquals(3,r.getLong(2));assertEquals("rollback",r.getString(5));assertFalse(r.next());
+            }
+            try(var q=db.createStatement();var r=q.executeQuery("SELECT outcome FROM sibench_statements WHERE root_query=12 ORDER BY query_id")) {
+                assertTrue(r.next());assertEquals("completed",r.getString(1));assertTrue(r.next());assertEquals("failed",r.getString(1));assertFalse(r.next());
             }
         }
     }
@@ -86,14 +86,14 @@ public class DuckDbReceiptsTest {
         try(var db=fixture()) {
             sql(db,"UPDATE sibench_statements SET outcome='abandoned' WHERE query_id=11");
             DuckDbReceipts.bind(db);
-            try(var q=db.createStatement();var r=q.executeQuery("SELECT outcome FROM sibench_sql_statements WHERE query_id=11")) {
+            try(var q=db.createStatement();var r=q.executeQuery("SELECT outcome FROM sibench_sql_submissions WHERE root_query=11")) {
                 assertTrue(r.next());assertEquals("abandoned",r.getString(1));assertFalse(r.next());
             }
         }
     }
     @Test public void acceptsIdleSessionButRejectsDuplicateConnectionBeforeImport() throws Exception {
         var empty=file(HEADER+OPEN+"close,0,session,,,0,0\n");
-        try(var db=DriverManager.getConnection("jdbc:duckdb:")) {
+        try(var db=connect()) {
             assertThrows(IOException.class,()->DuckDbReceipts.load(db,List.of(empty,empty),temporary.getRoot().toPath().resolve("duplicate")));
             assertEquals(0,DuckDbReceipts.load(db,List.of(empty),temporary.getRoot().toPath().resolve("empty")).get(0).submissions());
         }

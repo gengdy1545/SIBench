@@ -32,7 +32,7 @@ public class CommittedTraceTest {
     @Test public void allCompletedSnapshotReadsContributeToTheRequestBudget() throws Exception {
         var file=temporary.getRoot().toPath().resolve("reads.pb.zst");
         var budget=new RequestBudget(7,Duration.ofSeconds(10));
-        budget.begin("workload",1,null);
+        budget.begin(null);
         var writer=new ProtoTrace.Writer(file,true,budget);
         try(writer) {
             writer.accept(transaction(0,TRANSACTION_BEGIN,1,1,0));
@@ -82,7 +82,7 @@ public class CommittedTraceTest {
     @Test public void committedWritesAndRollbackReadsReachTheTraceAndRequestBudget() throws Exception {
         Path file = temporary.getRoot().toPath().resolve("committed.pb.zst");
         var budget = new RequestBudget(6, Duration.ofSeconds(10));
-        budget.begin("committed", 1, file.resolveSibling("stop"));
+        budget.begin(file.resolveSibling("stop"));
         var writer = new ProtoTrace.Writer(file, true, budget);
         try (writer) {
             writer.accept(transaction(0, TRANSACTION_BEGIN, 1, 1, 0));

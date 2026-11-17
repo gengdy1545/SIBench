@@ -39,16 +39,16 @@ public class ServiceReplayTest {
         }
     }
 
+    /** Nothing listens on port 1: a supply failure must surface before any service call. */
+    private static final ServiceTarget UNREACHABLE = new ServiceTarget("127.0.0.1:1", ValueKind.ROW_ID);
+
     @Test
-    public void missingTraceDoesNotCreateIndex() {
+    public void missingTraceFailsBeforeContactingTheService() {
         Path root = temporary.getRoot().toPath();
-        Path index = root.resolve("index");
         Path report = root.resolve("report.json");
-        var service = new ServiceConfig("rocksdb", null, index, 0, ValueKind.ROW_ID, null, false, true);
         var error = assertThrows(IOException.class, () -> ServiceReplay.run(
-                root.resolve("missing-trace"), new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 4096, 60, 1), service, report));
+                root.resolve("missing-trace"), new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 4096, 60, 1), UNREACHABLE, report));
         assertTrue(error.getMessage().contains("Incomplete Trace"));
-        assertFalse(Files.exists(index));
         assertFalse(Files.exists(report));
         assertEquals(0, temporary.getRoot().list().length);
     }
@@ -81,11 +81,9 @@ public class ServiceReplayTest {
         manifest.put("workload_operations", workload.count());
         manifest.put("last_resolved_version", 0);
         var gson = new com.google.gson.Gson();
-        var base = List.of(ProtoTrace.file("baseline.pb.zst", baseline));
-        var work = List.of(ProtoTrace.file("workload.pb.zst", workload));
-        manifest.put("proto_files", Map.of("baseline", base, "workload", work));
-        manifest.put("baseline_trace_sha256", ProtoTrace.identity(gson.toJsonTree(base).getAsJsonArray()));
-        manifest.put("workload_trace_sha256", ProtoTrace.identity(gson.toJsonTree(work).getAsJsonArray()));
+        manifest.put("proto_files", Map.of("baseline", ProtoTrace.file(baseline), "workload", ProtoTrace.file(workload)));
+        manifest.put("baseline_trace_sha256", ProtoTrace.identity(baseline.logicalSha256(), baseline.count()));
+        manifest.put("workload_trace_sha256", ProtoTrace.identity(workload.logicalSha256(), workload.count()));
         Files.writeString(directory.resolve("manifest.json"), gson.toJson(manifest));
         return directory;
     }
@@ -109,8 +107,7 @@ public class ServiceReplayTest {
             };
             Path input = trace(temporary.newFolder().toPath()), report = input.resolve("replay.json");
             try (var server = IndexServer.start(0, backend)) {
-                var service = new ServiceConfig("grpc", "127.0.0.1:" + server.port(), null, 0,
-                        ValueKind.ROW_ID, null, false, true);
+                var service = new ServiceTarget("127.0.0.1:" + server.port(), ValueKind.ROW_ID);
                 var config = new ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 2, 5, 1);
                 if (outcome.equals("passed")) assertEquals("passed", ServiceReplay.run(input, config, service, report).get("status"));
                 else assertThrows(IOException.class, () -> ServiceReplay.run(input, config, service, report));
@@ -126,21 +123,22 @@ public class ServiceReplayTest {
                 assertEquals(2, saved.getAsJsonObject("result").getAsJsonObject("dispatch")
                         .get("completed_operations").getAsInt());
                 assertTrue(saved.get("scope").getAsString().contains("not certified"));
-                assertTrue(saved.get("index_binding").getAsString().contains("mode=rowid"));
+                var trace = com.google.gson.JsonParser.parseString(Files.readString(input.resolve("manifest.json"))).getAsJsonObject();
+                assertEquals("workload=" + trace.get("workload_trace_sha256").getAsString() + " baseline="
+                        + trace.get("baseline_trace_sha256").getAsString() + " secondary=false",
+                        saved.get("index_binding").getAsString());
                 assertEquals("trace_integrity_and_supply_valid", saved.getAsJsonObject("preflight").get("status").getAsString());
             }
         }
     }
 
-    @Test public void existingBaselineReportRejectsReplayBeforeCreatingIndex() throws Exception {
-        Path root = temporary.getRoot().toPath(), report = root.resolve("replay.json"), index = root.resolve("index");
+    @Test public void existingBaselineReportRejectsReplayBeforeReadingTheTrace() throws Exception {
+        Path root = temporary.getRoot().toPath(), report = root.resolve("replay.json");
         Path completed = root.resolve("replay.json.baseline.json");
         Files.writeString(completed, "retained evidence");
-        var service = new ServiceConfig("rocksdb", null, index, 0, ValueKind.ROW_ID, null, false, true);
         var error = assertThrows(IOException.class, () -> ServiceReplay.run(root.resolve("missing"),
-                new ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 2, 5, 1), service, report));
+                new ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 2, 5, 1), UNREACHABLE, report));
         assertTrue(error.getMessage().contains("Baseline report already exists"));
-        assertFalse(Files.exists(index));
         assertEquals("retained evidence", Files.readString(completed));
     }
 }

@@ -17,7 +17,7 @@ public final class DuckDbAccesses {
                     +"index_name VARCHAR,column_name VARCHAR,key_type VARCHAR,PRIMARY KEY(table_id,index_id),UNIQUE(table_id,index_name))");
             try(var insert=database.prepareStatement("INSERT INTO temp.main.sibench_index_catalog VALUES(?,?,?,?,?,?)")) {
                 for(var index:catalog) {
-                    if(index.tableId()<1||index.tableId()>65535||index.indexId()<0||index.indexId()>1024)
+                    if(!org.sibench.trace.IndexEntry.validNamespace(index.tableId(),index.indexId()))
                         throw new SQLException("Invalid canonical index identity");
                     insert.setInt(1,index.tableId());insert.setInt(2,index.indexId());insert.setString(3,index.table());
                     insert.setString(4,index.name());insert.setString(5,index.column());insert.setString(6,index.type());insert.executeUpdate();
@@ -57,19 +57,18 @@ public final class DuckDbAccesses {
                     +"AND index_columns[1].type=d.data_type,false) LIMIT 1","Adopted ART does not match canonical index");
             execute(database,"CREATE TEMP VIEW sibench_access_batches AS SELECT r.* FROM temp.main.sibench_index_rows r "
                     +"JOIN temp.main.sibench_accesses a USING(access_id,connection_id,transaction_id,query_id)");
-            for(String kind:List.of("index_rows","consumption")) {
-                reject(database,"SELECT 1 FROM temp.main.sibench_"+kind+" r JOIN temp.main.sibench_statements s "
-                        +"USING(connection_id,transaction_id,query_id) LEFT JOIN temp.main.sibench_index i "
-                        +"USING(access_id,connection_id,transaction_id,query_id) LEFT JOIN temp.main.sibench_accesses a "
-                        +"USING(access_id,connection_id,transaction_id,query_id) WHERE a.access_id IS NULL "
-                        +"AND (i.schema_name IS NULL OR i.schema_name<>'sibench_history') LIMIT 1",
-                        "Unmatched adopted ART "+kind);
-            }
+            reject(database,"SELECT 1 FROM temp.main.sibench_index_rows r JOIN temp.main.sibench_statements s "
+                    +"USING(connection_id,transaction_id,query_id) LEFT JOIN temp.main.sibench_index i "
+                    +"USING(access_id,connection_id,transaction_id,query_id) LEFT JOIN temp.main.sibench_accesses a "
+                    +"USING(access_id,connection_id,transaction_id,query_id) WHERE a.access_id IS NULL "
+                    +"AND (i.schema_name IS NULL OR i.schema_name<>'sibench_history') LIMIT 1",
+                    "Unmatched adopted ART index_rows");
+            // Visible primary keys are the only per-row facts; an empty key type means no single-column primary key.
             reject(database,"SELECT 1 FROM temp.main.sibench_access_batches WHERE phase NOT IN ('storage','local','closed') "
-                    +"OR len(physical_rows)<>len(primary_keys_sql) OR len(candidate_rows)<>candidates_read "
-                    +"OR (phase='closed' AND (batch_id<>0 OR len(physical_rows)<>0 OR candidates_read<>0 OR candidate_offset<>0)) "
+                    +"OR primary_key_type='' "
+                    +"OR (phase='closed' AND (batch_id<>0 OR len(primary_keys_sql)<>0 OR candidates_read<>0 OR candidate_offset<>0)) "
                     +"OR (phase<>'closed' AND (batch_id=0 OR source_drained)) "
-                    +"OR (phase='storage' AND (candidates_read=0 OR len(physical_rows)>candidates_read)) "
+                    +"OR (phase='storage' AND (candidates_read=0 OR len(primary_keys_sql)>candidates_read)) "
                     +"OR (phase='local' AND (candidates_read<>0 OR candidate_offset<>0)) LIMIT 1",
                     "Invalid ART row batch");
             reject(database,"SELECT 1 FROM temp.main.sibench_access_batches GROUP BY access_id,batch_id HAVING count(*)<>1 LIMIT 1",
@@ -78,12 +77,6 @@ public final class DuckDbAccesses {
                     +"ORDER BY candidate_offset ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),0) AS preceding "
                     +"FROM temp.main.sibench_access_batches WHERE phase='storage') WHERE candidate_offset<>preceding LIMIT 1",
                     "Incomplete ART candidate coverage");
-            // A direct LIMIT can revisit the same input after shortening it; adjacency does not imply equal cardinality.
-            reject(database,"SELECT 1 FROM temp.main.sibench_consumption c JOIN temp.main.sibench_accesses a "
-                    +"USING(access_id,connection_id,transaction_id,query_id) LEFT JOIN temp.main.sibench_access_batches b "
-                    +"USING(access_id,connection_id,transaction_id,query_id,batch_id) WHERE b.batch_id IS NULL OR b.phase='closed' "
-                    +"OR c.consumed_prefix>c.input_rows OR (c.direct_from_scan AND c.input_rows>len(b.physical_rows)) LIMIT 1",
-                    "Consumption disagrees with its ART source batch");
             reject(database,"SELECT 1 FROM temp.main.sibench_accesses a LEFT JOIN temp.main.sibench_access_batches r "
                     +"ON a.access_id=r.access_id AND r.phase='closed' WHERE r.access_id IS NULL LIMIT 1","Missing ART closing record");
             // A conflict can interrupt the final empty fetch after the sole primary-key match was already emitted.
@@ -96,9 +89,6 @@ public final class DuckDbAccesses {
                     +"AND EXISTS (SELECT 1 FROM temp.main.sibench_access_batches b WHERE b.access_id=a.access_id "
                     +"AND b.primary_keys_sql[1]=a.probes[1].predicates[1].value_sql),false) LIMIT 1",
                     "Unsupported ART early stop: the source was not fully drained");
-            reject(database,"SELECT 1 FROM temp.main.sibench_consumption c JOIN temp.main.sibench_accesses a "
-                    +"USING(access_id,connection_id,transaction_id,query_id) WHERE c.stage NOT IN ('stop','limit') LIMIT 1",
-                    "Unknown ART downstream diagnostic stage");
             reject(database,"SELECT 1 FROM (SELECT access_id,count(*) AS batches,max(batch_id) AS last_batch,"
                     +"sum(candidates_read) AS candidates FROM temp.main.sibench_access_batches GROUP BY access_id) r "
                     +"JOIN temp.main.sibench_accesses a USING(access_id) WHERE r.batches<>r.last_batch+1 "
@@ -111,8 +101,7 @@ public final class DuckDbAccesses {
             // Verify source identity coverage without constructing per-query RowID answers.
             reject(database,"SELECT 1 FROM temp.main.sibench_access_keys k JOIN temp.main.sibench_accesses a USING(access_id) "
                     +"WHERE NOT EXISTS(SELECT 1 FROM temp.main.sibench_identities i WHERE i.table_id=a.table_id "
-                    +"AND i.primary_key_sql=k.key_sql AND ((i.outcome='commit' AND i.version<=a.read_version) "
-                    +"OR (i.version=a.version AND i.query_id<a.query_id))) LIMIT 1",
+                    +"AND i.primary_key_sql=k.key_sql AND sibench_visible(i.outcome,i.version,i.query_id,a.read_version,a.version,a.query_id)) LIMIT 1",
                     "Missing visible native identity for ART result");
             database.commit();
         } catch(SQLException|RuntimeException failure) {

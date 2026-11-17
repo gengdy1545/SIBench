@@ -63,6 +63,11 @@ public class ServiceClientTest {
                 values.add(IndexEntry.rowId(i));
             return java.util.concurrent.CompletableFuture.completedFuture(IndexResponse.ok(values));
         }
+
+        @Override
+        java.util.concurrent.CompletableFuture<Void> localSend() {
+            return java.util.concurrent.CompletableFuture.completedFuture(null);
+        }
     }
 
     private static Operation member(int position, int size, long count, int flags) {
@@ -126,21 +131,6 @@ public class ServiceClientTest {
                 .getMessage().contains("Read group interrupted"));
         assertThrows(IOException.class, () -> send(client, 3, insert(12, 1, 1)));
         assertEquals(1, client.sent.size());
-    }
-
-    @Test
-    public void malformedStoredReadGroupsFailBeforeTransmission() throws IOException {
-        var requests = new TraceRequests(ValueKind.ROW_ID);
-        var client = new Recorder(requests);
-        var members = List.of(member(0, 2, 0, IndexOperationTrace.UNION_GROUP),
-                member(1, 2, 0, IndexOperationTrace.UNION_GROUP));
-        var stored = TraceOperation.newBuilder().setReadGroup(requests.group(members)).build();
-        for (var invalid : List.of(TraceOperation.getDefaultInstance(), stored.toBuilder()
-                .setReadGroup(stored.getReadGroup().toBuilder().removeRequests(1)).build())) {
-            assertThrows(IOException.class, () -> client.send(1, members.get(0), invalid));
-        }
-        assertThrows(IOException.class, () -> client.send(1, members.get(1), stored));
-        assertTrue(client.sent.isEmpty());
     }
 
     private static Operation insert(long event, long key, long unit) {
@@ -243,8 +233,11 @@ public class ServiceClientTest {
             @Override
             java.util.concurrent.CompletableFuture<IndexResponse> transmit(
                     Message request, java.util.function.Consumer<IndexResponse> partial) {
-                return java.util.concurrent.CompletableFuture.completedFuture(
-                        IndexResponse.error(IndexStatus.UNAVAILABLE, ""));
+                // As GrpcService completes a failed call.
+                return java.util.concurrent.CompletableFuture.failedFuture(new IOException("UNAVAILABLE"));
+            }
+            @Override java.util.concurrent.CompletableFuture<Void> localSend() {
+                return java.util.concurrent.CompletableFuture.completedFuture(null);
             }
         };
         var first = send(client, 1, insert(1, 1, 1)).response().toCompletableFuture();

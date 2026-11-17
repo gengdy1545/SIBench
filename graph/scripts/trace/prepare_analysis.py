@@ -24,8 +24,7 @@ def main():
         output = config["analysis_directory"] / trace["name"] / "accesses"
         output.mkdir(parents=True, exist_ok=True)
         command = ["java", "-Xmx2g", "-jar", str(jar), "analyze-accesses", str(config["runtime"]), trace["name"],
-                   str(output), str(config["window_requests"]),
-                   str(config["sort_memory_bytes"])]
+                   str(output)]
         print(f"Analyzing {trace['label']} ...", flush=True)
         (output / "summary.json").unlink(missing_ok=True)
         (output / "preparation.json").unlink(missing_ok=True)

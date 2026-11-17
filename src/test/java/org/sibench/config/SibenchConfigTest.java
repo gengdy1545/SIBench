@@ -8,7 +8,7 @@ import java.util.Map;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.sibench.adapters.ServiceConfig;
+import org.sibench.adapters.ServiceTarget;
 import org.sibench.analysis.UpdateLocality;
 import org.sibench.replay.ReplayConfig;
 import org.yaml.snakeyaml.Yaml;
@@ -57,20 +57,20 @@ public class SibenchConfigTest {
         Path root = Path.of("").toAbsolutePath();
         Path config = root.resolve("config/sibench.yaml");
         var document = SibenchConfig.read(config);
-        ReplayConfig.read(root, config);
-        ServiceConfig.ofReplay(root, document);
-        UpdateLocality.Config.read(config);
+        ReplayConfig.from(document);
+        ServiceTarget.of(document);
+        UpdateLocality.Config.from(document);
         document.put("replay", Map.of("dispatch_mode", "operation", "client_count", 3,
                 "max_in_flight", 16, "baseline_batch_operations", 4, "request_timeout_seconds", 5));
         document.put("target", Map.of("secondary_indexes", Map.of("enabled", false),
-                "service", Map.of("adapter", "grpc", "endpoint", "test-host:50599", "value", "row_id")));
+                "service", Map.of("endpoint", "test-host:50599", "value", "row_id")));
         document.put("analysis", Map.of("layout", Map.of("entries_per_block", 4, "blocks_per_file", 8, "sort_memory_bytes", 1024),
                 "window", Map.of("business_changes", 3, "heatmap_bins", 16, "l0_index_modifications", 5)));
         config = temporary.newFile("runtime.yaml").toPath();
         Files.writeString(config, new Yaml().dump(document));
-        assertEquals(3, ReplayConfig.read(root, config).clientCount());
-        assertEquals("test-host:50599", ServiceConfig.ofReplay(root, SibenchConfig.read(config)).endpoint());
-        var analysis = UpdateLocality.Config.read(config);
+        assertEquals(3, ReplayConfig.from(SibenchConfig.read(config)).clientCount());
+        assertEquals("test-host:50599", ServiceTarget.of(SibenchConfig.read(config)).endpoint());
+        var analysis = UpdateLocality.Config.from(SibenchConfig.read(config));
         assertEquals(4, analysis.entriesPerBlock());
         assertEquals(8, analysis.blocksPerFile());
         assertEquals(3, analysis.businessChangesPerWindow());
@@ -81,10 +81,14 @@ public class SibenchConfigTest {
         Path root = Path.of("").toAbsolutePath();
         var document = SibenchConfig.read(root.resolve("config/sibench.yaml"));
         var selected = BenchmarkSelection.read(root, document);
-        assertEquals(java.util.List.of("hybench-tp", "hybench-xp", "sysbench", "ycsb-a", "ycsb-b", "ycsb-c", "ycsb-d", "ycsb-e", "ycsb-f"),
+        assertEquals(java.util.List.of("hybench-tp", "hybench-xp", "sysbench-zipf080", "sysbench-zipf099", "ycsb-a", "ycsb-b", "ycsb-c", "ycsb-d", "ycsb-e", "ycsb-f"),
                 selected.stream().map(BenchmarkSelection::name).toList());
         assertEquals(6, selected.stream().filter(s -> s.engine() == Engine.ROCKSDB).count());
-        assertEquals(3, selected.stream().filter(s -> s.engine() == Engine.POSTGRES).count());
+        assertEquals(4, selected.stream().filter(s -> s.engine() == Engine.POSTGRES).count());
+        // The two sysbench Traces replay one script with different zipfian exponents from one profile.
+        var sysbench = selected.stream().filter(s -> s.benchmark().equals("sysbench")).toList();
+        assertEquals(java.util.List.of("oltp_read_write_zipf080", "oltp_read_write_zipf099"), sysbench.stream().map(BenchmarkSelection::workload).toList());
+        assertEquals(sysbench.get(0).config(), sysbench.get(1).config());
         var postgres = SibenchConfig.engine(root, document, Engine.POSTGRES);
         assertEquals("build/services/postgres", ConfigValues.string(postgres, "build_directory"));
         SibenchConfig.postgresSettings(ConfigValues.object(postgres, "settings"));

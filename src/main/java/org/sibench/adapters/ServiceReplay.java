@@ -2,14 +2,13 @@ package org.sibench.adapters;
 
 import org.sibench.replay.ReplayInput;
 import com.google.gson.GsonBuilder;
-import com.google.gson.JsonParser;
+import com.google.gson.JsonObject;
 
-import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.RunTiming;
 
 import org.sibench.replay.ReplayConfig;
 import org.sibench.replay.ReplayProjection;
-import org.sibench.replay.ReplayTarget;
+import org.sibench.trace.TraceManifest;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -26,41 +25,38 @@ import java.util.Map;
 public final class ServiceReplay {
     private ServiceReplay() {}
 
+    /** The validated Trace manifest and inputs a replay shares with its target. */
+    private record Session(JsonObject manifest, ReplayInput.Input input, String binding, TraceRequests requests) {
+        GrpcService connect(ServiceTarget service, ReplayConfig config) {
+            return new GrpcService(service.endpoint(), requests, binding, config.requestTimeoutSeconds());
+        }
+    }
+
+    /** Reads the manifest once and checks supply before the service is contacted. */
+    private static Session prepare(Path directory, ReplayConfig config, ServiceTarget service) throws IOException {
+        var manifest = TraceManifest.read(directory);
+        // The declared value kinds come from the manifest; check them before decoding the workload.
+        TraceManifest.requireValue(manifest, service.value());
+        return new Session(manifest, ReplayInput.prepare(directory, manifest, config),
+                ReplayInput.binding(manifest, config), new TraceRequests(service.value()));
+    }
+
     public static Map<String, Object> run(
-            Path directory, ReplayConfig config, ServiceConfig service, Path report)
+            Path directory, ReplayConfig config, ServiceTarget service, Path report)
             throws IOException {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
         Path baselineReport = report.resolveSibling(report.getFileName() + ".baseline.json");
         if (Files.exists(baselineReport)) throw new IOException("Baseline report already exists: " + baselineReport);
-        // The declared value kinds come from the manifest; check them before decoding the workload.
-        org.sibench.trace.TraceManifest.requireValue(directory,service.value());
-        var input = ReplayInput.prepare(directory, config);
+        var session = prepare(directory, config, service);
+        var input = session.input();
         var preflight = input.preflight();
-        String binding = binding(directory, config, service.value());
-        var requests = new TraceRequests(service.value());
-        IndexDescription description;
-        ReplayTarget.Factory factory;
-        GrpcService remote = null;
-        VersionedIndexBackend local = null;
-        IndexExecutor executor = null;
-        Throwable failure = null;
-        try {
-            if (service.adapter().equals("grpc")) {
-                remote = new GrpcService(service.endpoint(), requests, binding, config.requestTimeoutSeconds());
-                description = null;
-                factory = remote.factory();
-            } else {
-                local = VersionedIndexBackend.create(service.path(), service.value());
-                RunTiming.current().measure(service.path());
-                description = local.describe();
-                executor = new IndexExecutor(local);
-                local.bind(binding);
-                factory = InProcessService.factory(executor, requests);
-            }
-            if (description != null) description.require(service.value());
+        String binding = session.binding();
+        var requests = session.requests();
+        try (var remote = session.connect(service, config)) {
+            var factory = remote.factory();
             requests.baselineBatch(config.baselineBatchOperations());
             var result = new LinkedHashMap<String, Object>();
-            String location = null;
+            IndexDescription description = null;
             for (boolean runtime : new boolean[] {false, true}) {
                 String phase = runtime ? "workload" : "baseline";
                 RunTiming.current().phase(phase);
@@ -79,9 +75,7 @@ public final class ServiceReplay {
                     projection.finish();
                     if (runtime) projection.requireClientCoverage();
                     double seconds = (System.nanoTime() - start) / 1e9;
-                    if (remote != null) description = remote.description();
-                    else executor.requireHealthy();
-                    location = description.location();
+                    description = remote.description();
                     var phaseReport = new LinkedHashMap<String, Object>();
                     phaseReport.put("operations", projection.dispatched());
                     phaseReport.put("rpc_requests", requests.rpcRequests() - rpcRequestsBefore);
@@ -141,16 +135,9 @@ public final class ServiceReplay {
                     + " and order were not compared; single sending thread,"
                     + " concurrent individual RPCs; not a sustained-rate, recovery or cross-client"
                     + " visibility test");
-            close(null, remote, executor, local);
-            remote = null; executor = null; local = null;
-            writeIndexManifest(report, directory, binding, description, location, lastVersion(preflight), config);
+            writeIndexManifest(report, session.manifest(), binding, description, lastVersion(preflight), config);
             Files.writeString(report, new GsonBuilder().setPrettyPrinting().create().toJson(output), StandardOpenOption.CREATE_NEW);
             return output;
-        } catch (IOException | RuntimeException | Error error) {
-            failure = error;
-            throw error;
-        } finally {
-            close(failure, remote, executor, local);
         }
     }
 
@@ -160,48 +147,24 @@ public final class ServiceReplay {
      * result count. Writes are not sent; the Trace contains only committed-snapshot searches.
      */
     public static Map<String, Object> verify(
-            Path directory, ReplayConfig config, ServiceConfig service, Path report)
+            Path directory, ReplayConfig config, ServiceTarget service, Path report)
             throws IOException {
         if (Files.exists(report)) throw new IOException("Verification report already exists: " + report);
-        // The declared value kinds come from the manifest; check them before decoding the workload.
-        org.sibench.trace.TraceManifest.requireValue(directory,service.value());
-        var input = ReplayInput.prepare(directory, config);
-        var preflight = input.preflight();
-        String binding = binding(directory, config, service.value());
-        var requests = new TraceRequests(service.value());
-        IndexDescription description;
-        ReplayTarget.Factory factory;
-        GrpcService remote = null;
-        VersionedIndexBackend local = null;
-        IndexExecutor executor = null;
-        Throwable failure = null;
-        try {
-            if (service.adapter().equals("grpc")) {
-                remote = new GrpcService(service.endpoint(), requests, binding, config.requestTimeoutSeconds());
-                description = null;
-                factory = remote.factory();
-            } else {
-                local = VersionedIndexBackend.open(service.path(), service.value());
-                executor = new IndexExecutor(local);
-                description = local.describe();
-                local.bind(binding);
-                factory = InProcessService.factory(executor, requests);
-            }
-            if (description != null) description.require(service.value());
+        var session = prepare(directory, config, service);
+        var requests = session.requests();
+        try (var remote = session.connect(service, config)) {
             RunTiming.current().phase("verify");
             long start = System.nanoTime();
             Map<String, Object> dispatch;
-            try (var projection = ReplayProjection.snapshotSearches(config, factory)) {
-                input.workload().read(projection);
+            try (var projection = ReplayProjection.snapshotSearches(config, remote.factory())) {
+                session.input().workload().read(projection);
                 projection.finish();
                 dispatch = projection.describe();
             }
             double seconds = (System.nanoTime() - start) / 1e9;
             var result = new LinkedHashMap<String, Object>();
             if (requests.queries() == 0) throw new IOException("Trace has no snapshot queries to verify");
-            if (remote != null) description = remote.description();
-            else executor.requireHealthy();
-            result.put("service", description);
+            result.put("service", remote.description());
             result.put("seconds", seconds);
             result.put("queries", requests.queries());
             result.put("checked_result_items", requests.checkedResults());
@@ -209,33 +172,14 @@ public final class ServiceReplay {
             result.put("dispatch", dispatch);
             var output = new LinkedHashMap<String, Object>();
             output.put("status", "passed");
-            output.put("preflight", preflight);
+            output.put("preflight", session.input().preflight());
             output.put("result", result);
             output.put("scope", "every snapshot search of the trace at its read version matched its"
                     + " native result count on an index that already held the whole trace; writes were"
                     + " not sent");
-            close(null, remote, executor, local);
-            remote = null; executor = null; local = null;
             Files.writeString(report, new GsonBuilder().setPrettyPrinting().create().toJson(output),
                     StandardOpenOption.CREATE_NEW);
             return output;
-        } catch (IOException | RuntimeException | Error error) {
-            failure = error;
-            throw error;
-        } finally {
-            close(failure, remote, executor, local);
-        }
-    }
-
-    private static void close(Throwable failure, GrpcService remote, IndexExecutor executor, VersionedIndexBackend local)
-            throws IOException {
-        try {
-            if (remote != null) remote.close();
-            if (executor != null) executor.close();
-            if (local != null) local.close();
-        } catch (IOException | RuntimeException close) {
-            if (failure == null) throw close;
-            if (failure != close) failure.addSuppressed(close);
         }
     }
 
@@ -250,14 +194,12 @@ public final class ServiceReplay {
      */
     private static void writeIndexManifest(
             Path report,
-            Path directory,
+            JsonObject trace,
             String binding,
             IndexDescription description,
-            String location,
             long lastVersion,
             ReplayConfig config)
             throws IOException {
-        var trace = JsonParser.parseString(Files.readString(directory.resolve("manifest.json"))).getAsJsonObject();
         var manifest = new LinkedHashMap<String, Object>();
         manifest.put("index_binding", binding);
         manifest.put("workload_trace_sha256", trace.get("workload_trace_sha256").getAsString());
@@ -266,7 +208,7 @@ public final class ServiceReplay {
         manifest.put("index_definitions", trace.get("index_definitions"));
         manifest.put("value_kind", description.valueKind().name().toLowerCase(java.util.Locale.ROOT));
         manifest.put("backend", description.name());
-        manifest.put("index_location", location);
+        manifest.put("index_location", description.location());
         manifest.put("write_ack", description.writeAck().name());
         manifest.put("wal", description.wal());
         manifest.put("durability", description.durability());
@@ -282,10 +224,6 @@ public final class ServiceReplay {
                 report.resolveSibling(report.getFileName() + ".index-manifest.json"),
                 new GsonBuilder().setPrettyPrinting().create().toJson(manifest),
                 StandardOpenOption.CREATE_NEW);
-    }
-
-    static String binding(Path directory, ReplayConfig config, ValueKind value) throws IOException {
-        return ReplayInput.binding(directory, config) + " mode=" + (value == ValueKind.ROW_ID ? "rowid" : "locator");
     }
 
     private static String buildIdentity() throws IOException {

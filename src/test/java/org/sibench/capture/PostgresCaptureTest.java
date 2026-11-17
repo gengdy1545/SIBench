@@ -17,7 +17,7 @@ public class PostgresCaptureTest {
         try(var capture=new PostgresCapture(endpoint,root.resolve("pending"),1<<20,8)) {
             try(var socket=SocketChannel.open(StandardProtocolFamily.UNIX)) {
                 socket.connect(UnixDomainSocketAddress.of(endpoint));
-                var bytes=ByteBuffer.wrap(("pg-123.jsonl.zst\n"
+                var bytes=ByteBuffer.wrap(("pg-123.jsonl\n"
                         +"{\"event\":\"capture_start\",\"pid\":123,\"sequence\":0}\n").getBytes(StandardCharsets.UTF_8));
                 while(bytes.hasRemaining())socket.write(bytes);
             }

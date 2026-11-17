@@ -3,6 +3,7 @@ package org.sibench.trace;
 import static org.junit.Assert.*;
 
 import org.junit.Test;
+import org.sibench.generation.DuckDbHostFixture;
 
 import java.sql.*;
 import java.util.*;
@@ -10,11 +11,11 @@ import java.util.*;
 /**
  * Differential check against DuckDB SQL ordering, independent of the Trace projection.
  */
-public class IndexKeyOrderTest {
+public class IndexKeyOrderTest extends DuckDbHostFixture {
     @Test
     public void encodedOrderMatchesDuckDbOrder() throws Exception {
         var random = new Random(20261022);
-        try (Connection connection = DriverManager.getConnection("jdbc:duckdb:");
+        try (Connection connection = connect();
                 Statement statement = connection.createStatement()) {
             statement.execute(
                     "CREATE TEMP TABLE sibench_key_order (id int, i int8, t timestamp, v varchar"
@@ -48,9 +49,8 @@ public class IndexKeyOrderTest {
                     if (random.nextInt(4) == 0) text.append("  ");
                     insert.setString(4, id % 23 == 0 ? null : text.toString());
                     insert.setString(5, id % 29 == 0 ? null : text.toString());
-                    insert.addBatch();
+                    insert.executeUpdate();
                 }
-                insert.executeBatch();
             }
             for (String[] column :
                     new String[][] {

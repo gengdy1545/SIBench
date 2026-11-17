@@ -8,8 +8,15 @@ import java.util.Arrays;
 
 /** SIBench's key/value encoding; the index service treats these bytes as opaque. */
 public record IndexEntry(int table, int index, IndexKey indexedValue, IndexKey primaryKey) {
+    /** Encoded namespace bounds shared by catalogs, native identity tables and Trace validation. */
+    public static final int MAX_TABLE = 65535, MAX_INDEX = 1024;
+
+    public static boolean validNamespace(int table, int index) {
+        return table >= 1 && table <= MAX_TABLE && index >= 0 && index <= MAX_INDEX;
+    }
+
     public static byte[] prefix(int table, int index) {
-        if (table < 1 || table > 65535 || index < 0 || index > 1024)
+        if (!validNamespace(table, index))
             throw new IllegalArgumentException("Invalid index namespace");
         return ByteBuffer.allocate(8).putInt(table).putInt(index).array();
     }

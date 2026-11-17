@@ -21,11 +21,12 @@ public class PixelsTraceTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
     private static final long TABLE = 7, INDEX = 9, MARKER = 8;
 
-    private PixelsTrace trace(RequestBudget budget) throws IOException {
+    private PixelsTrace trace() throws IOException {
         var source = SourceSchema.of("sysbench", Path.of("benchmark/sysbench"), Map.of("tables", 1L));
-        return new PixelsTrace(temporary.newFolder().toPath().resolve("trace"), source, Map.of(
-                TABLE, new PixelsTrace.Table("sbtest1", 1, INDEX, "int"),
-                MARKER, new PixelsTrace.Table("sibench_marker", 0, 10, "bigint")), budget);
+        var trace = new PixelsTrace(temporary.newFolder().toPath().resolve("trace"), source);
+        trace.register(Map.of(TABLE, new PixelsTrace.Table("sbtest1", 1, INDEX, "int"),
+                MARKER, new PixelsTrace.Table("sibench_marker", 0, 10, "bigint")));
+        return trace;
     }
 
     private static PixelsTrace.Fact fact(int kind, long timestamp, int key, long rowId) {
@@ -35,7 +36,7 @@ public class PixelsTraceTest {
 
     private static List<Operation> workload(Map<String, Object> manifest) throws IOException {
         @SuppressWarnings("unchecked")
-        var file = ((List<Map<String, Object>>) ((Map<String, Object>) manifest.get("proto_files")).get("workload")).get(0);
+        var file = (Map<String, Object>) ((Map<String, Object>) manifest.get("proto_files")).get("workload");
         var operations = new ArrayList<Operation>();
         ProtoTrace.read(Path.of((String) manifest.get("trace_directory")).resolve("workload.pb.zst"), (String) file.get("sha256"),
                 (String) file.get("logical_sha256"), operations::add);
@@ -43,14 +44,14 @@ public class PixelsTraceTest {
     }
 
     @Test public void zeroRowBaselineStillRequiresARegisteredTable()throws Exception {
-        try(var trace=trace(null)) {trace.finishBaseline(Map.of("sbtest1",0L));trace.finish();}
-        try(var trace=trace(null)) {
+        try(var trace=trace()) {trace.finishBaseline(Map.of("sbtest1",0L));trace.finish();}
+        try(var trace=trace()) {
             assertThrows(IOException.class,()->trace.finishBaseline(Map.of("missing_table",0L)));
         }
     }
 
     @Test public void emptyTraceTablesRequireAnExplicitValidDeclaration()throws Exception {
-        try(var trace=trace(null)) {
+        try(var trace=trace()) {
             trace.finishBaseline(Map.of("sbtest1",0L));trace.finish();trace.publish(Map.of());
         }
         Path directory=temporary.getRoot().toPath().resolve(temporary.getRoot().list()[0]).resolve("trace");
@@ -69,7 +70,7 @@ public class PixelsTraceTest {
     }
 
     @Test public void exportsInBeginOrderWithSnapshotReadsLocatorsAndCoalescedWrites() throws Exception {
-        var trace = trace(null);
+        var trace = trace();
         Path directory = temporary.getRoot().toPath().resolve(temporary.getRoot().list()[0]).resolve("trace");
         // LOAD: two baseline rows at the LOAD timestamp; the count must match the source exactly.
         trace.fact(fact(PixelsTrace.PUT, 3, 1, 100));
@@ -93,9 +94,9 @@ public class PixelsTraceTest {
         for (long timestamp : List.of(10L, 12L, 13L)) trace.commit(timestamp);
         trace.covered(trace.committedSnapshot());
         assertEquals(3, trace.version());
-        assertEquals(List.of(4L), trace.markers());
         trace.finish();
         var manifest = new java.util.LinkedHashMap<>(trace.publish(Map.of()));
+        assertEquals(1L, ((Number) manifest.get("window_markers")).longValue());
         manifest.put("trace_directory", directory.toString());
         assertEquals(List.of("row_id", "locator"), manifest.get("value_kinds"));
         assertEquals(3L, manifest.get("last_resolved_version"));
@@ -118,13 +119,13 @@ public class PixelsTraceTest {
         // The intermediate insert of key 7 is coalesced into its update.
         assertEquals(301, operations.get(8).rowId());
         @SuppressWarnings("unchecked")
-        var projection = (Map<String, Object>) ((Map<String, Object>) ((Map<String, Object>) ((List<?>) ((Map<String, Object>)
-                manifest.get("proto_files")).get("workload")).get(0)).get("statistics")).get("source_projection");
+        var projection = (Map<String, Object>) ((Map<String, Object>) ((Map<String, Object>) ((Map<String, Object>)
+                manifest.get("proto_files")).get("workload")).get("statistics")).get("source_projection");
         assertEquals(1L, projection.get("coalesced_writes"));
     }
 
     @Test public void aReadOfAnEarlierLocalWriteRetainsItsIntermediateIdentity() throws Exception {
-        var trace = trace(null);
+        var trace = trace();
         trace.fact(fact(PixelsTrace.PUT, 3, 1, 100));
         trace.finishBaseline(Map.of("sbtest1", 1L));
         trace.begin(10);
@@ -146,14 +147,14 @@ public class PixelsTraceTest {
     }
 
     @Test public void rejectsIncompleteBaselineUnsupportedCallsAndUnresolvedTransactions() throws Exception {
-        var trace = trace(null);
+        var trace = trace();
         trace.fact(fact(PixelsTrace.PUT, 3, 1, 100));
         assertThrows(IOException.class, () -> trace.finishBaseline(Map.of("sbtest1", 2L)));
         assertThrows(IOException.class, () -> trace.fact(fact(PixelsTrace.LOOKUP, 3, 1, 100)));
         assertThrows(IOException.class, () -> trace.fact(new PixelsTrace.Fact(PixelsTrace.UNSUPPORTED, 0, 0, 0,
                 "purgeEntries".getBytes(java.nio.charset.StandardCharsets.UTF_8), -1, 0, 0, 0)));
 
-        var workload = trace(null);
+        var workload = trace();
         workload.finishBaseline(Map.of("sbtest1",0L));
         workload.begin(5);
         assertThrows(IOException.class, () -> workload.begin(5));
@@ -173,7 +174,7 @@ public class PixelsTraceTest {
                 List.of(fact(PixelsTrace.LOOKUP, 10, 1, 100), fact(PixelsTrace.PUT, 10, 1, 201)),
                 List.of(fact(PixelsTrace.LOOKUP, 10, 1, 100), fact(PixelsTrace.LOOKUP, 10, 1, 100), fact(PixelsTrace.DELETE, 10, 1, 100)));
         for (var facts : divergent) {
-            var trace = trace(null);
+            var trace = trace();
             trace.fact(fact(PixelsTrace.PUT, 3, 1, 100));
             trace.finishBaseline(Map.of("sbtest1", 1L));
             trace.begin(10);
@@ -186,7 +187,7 @@ public class PixelsTraceTest {
     }
 
     @Test public void mixedMarkerTransactionIsRejected() throws Exception {
-        var trace = trace(null);
+        var trace = trace();
         trace.finishBaseline(Map.of("sbtest1",0L));
         trace.begin(4);
         trace.fact(fact(PixelsTrace.PUT, 4, 1, 10));
@@ -197,7 +198,7 @@ public class PixelsTraceTest {
     }
 
     @Test public void deleteAndReinsertKeepTheTombstoneAndNewRowIdentityInBothValueModes() throws Exception {
-        var trace = trace(null);
+        var trace = trace();
         trace.fact(fact(PixelsTrace.PUT, 3, 1, 0));
         trace.finishBaseline(Map.of("sbtest1", 1L));
         trace.begin(10);

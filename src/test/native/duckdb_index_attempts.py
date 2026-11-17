@@ -204,7 +204,7 @@ class IndexAttemptsTest(unittest.TestCase):
             {before}
             CREATE TEMP TABLE answer AS {query};
         """, """
-            SELECT r.phase, r.candidate_rows, r.physical_rows, r.primary_keys_sql, r.primary_key_type,
+            SELECT r.phase, r.primary_keys_sql, r.primary_key_type,
                    r.candidates_read, r.source_drained, a.adopted,
                    (SELECT string_agg(payload, ',' ORDER BY payload) FROM answer) AS answer
             FROM duckdb_logs_parsed('SibenchIndexRows') r
@@ -217,7 +217,6 @@ class IndexAttemptsTest(unittest.TestCase):
         storage = [row for row in rows if row["phase"] == "storage"]
         self.assertEqual(len(storage), 1, rows)
         self.assertEqual(storage[0]["primary_keys_sql"], "[30, 20]")
-        self.assertEqual(storage[0]["physical_rows"], "[0, 2]")
         self.assertEqual(storage[0]["primary_key_type"], "INTEGER")
         self.assertEqual(storage[0]["candidates_read"], "2")
         self.assertEqual(storage[0]["answer"], "thirty,twenty")
@@ -234,13 +233,11 @@ class IndexAttemptsTest(unittest.TestCase):
         storage = [r for r in rows if r["phase"] == "storage"]
         local = [r for r in rows if r["phase"] == "local" and r["primary_keys_sql"] != "[]"]
         self.assertEqual(len(storage), 1, rows)
+        # Two ART candidates were read; the transaction's own delete hides one of them.
         self.assertEqual(storage[0]["primary_keys_sql"], "[20]")
-        self.assertEqual(storage[0]["physical_rows"], "[2]")
-        self.assertEqual(storage[0]["candidate_rows"], "[0, 2]")
         self.assertEqual(storage[0]["candidates_read"], "2")
         self.assertEqual(len(local), 1, rows)
         self.assertEqual(local[0]["primary_keys_sql"], "[30]")
-        self.assertGreater(int(local[0]["physical_rows"].strip("[]")), 2)
         self.assertEqual(local[0]["answer"], "replacement,twenty")
 
     def test_limit_does_not_turn_a_fetched_batch_into_consumed_rows(self):
@@ -254,26 +251,6 @@ class IndexAttemptsTest(unittest.TestCase):
         rows = self.row_batches("BEGIN; INSERT INTO items VALUES(40,4,'forty');",
                                 query="SELECT payload FROM items WHERE k>=2 LIMIT 1")
         self.assertEqual(rows[-1]["source_drained"], "false")
-
-    def test_limit_consumption_is_bound_to_the_actual_batch(self):
-        for suffix, prefix in (("LIMIT 1", 1), ("LIMIT 1 OFFSET 1", 2)):
-            with self.subTest(suffix=suffix):
-                rows = self.query(f"""
-                    SET threads=1;
-                    CREATE TABLE items(id INTEGER PRIMARY KEY, k INTEGER);
-                    INSERT INTO items VALUES(30,3),(10,1),(20,2);
-                    CREATE INDEX items_k ON items(k);
-                    CALL enable_logging(['SibenchIndex','SibenchIndexRows','SibenchConsumption']);
-                    SELECT id FROM items WHERE k>=2 {suffix};
-                """, """
-                    SELECT c.direct_from_scan, c.input_rows, c.consumed_prefix,
-                           r.primary_keys_sql
-                    FROM duckdb_logs_parsed('SibenchConsumption') c
-                    JOIN duckdb_logs_parsed('SibenchIndexRows') r USING(access_id,batch_id)
-                    WHERE c.stage='limit' AND c.consumed_prefix>0;
-                """)
-                self.assertEqual(rows, [{"direct_from_scan": "true", "input_rows": "2",
-                                        "consumed_prefix": str(prefix), "primary_keys_sql": "[30, 20]"}])
 
     def test_multi_batch_count_keeps_each_visible_primary_key_once(self):
         rows = self.query("""
@@ -290,24 +267,6 @@ class IndexAttemptsTest(unittest.TestCase):
             FROM duckdb_logs_parsed('SibenchIndexRows'), UNNEST(primary_keys_sql) AS keys(pk);
         """)
         self.assertEqual(rows, [{"captured": "8000", "distinct_keys": "8000", "answer": "8000"}])
-
-    def test_limit_after_residual_filter_does_not_claim_a_direct_scan_prefix(self):
-        rows = self.query("""
-            SET threads=1;
-            CREATE TABLE items(id INTEGER PRIMARY KEY, k INTEGER);
-            INSERT INTO items VALUES(30,3),(10,1),(20,2);
-            CREATE INDEX items_k ON items(k);
-            CALL enable_logging(['SibenchIndex','SibenchIndexRows','SibenchConsumption']);
-            SELECT id FROM items WHERE k>=2 AND (id+k)%2=1 LIMIT 1;
-        """, """
-            SELECT c.direct_from_scan, c.input_rows, c.consumed_prefix, r.primary_keys_sql
-            FROM duckdb_logs_parsed('SibenchConsumption') c
-            JOIN duckdb_logs_parsed('SibenchIndexRows') r USING(access_id,batch_id)
-            WHERE c.stage='limit' AND c.consumed_prefix>0;
-        """)
-        self.assertEqual(rows, [{"direct_from_scan": "false", "input_rows": "1",
-                                "consumed_prefix": "1", "primary_keys_sql": "[30, 20]"}])
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)

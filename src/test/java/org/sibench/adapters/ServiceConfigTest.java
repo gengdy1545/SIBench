@@ -44,12 +44,19 @@ public class ServiceConfigTest {
     }
 
     @Test
-    public void replayRejectsUnknownServiceFields() {
-        var document = Map.<String, Object>of("target", Map.of("service", Map.of(
-                "adapter", "rocksdb", "path", "index", "value", "row_id", "unknown_option", false)));
-        var error = assertThrows(IllegalArgumentException.class,
-                () -> ServiceConfig.ofReplay(temporary.getRoot().toPath(), document));
-        assertTrue(error.getMessage().contains("Unknown key: unknown_option"));
+    public void replayTargetIsOnlyAnEndpointAndValueKind() {
+        var target = ServiceTarget.of(Map.of("target", Map.of("service", Map.of(
+                "endpoint", "127.0.0.1:50551", "value", "locator"))));
+        assertEquals(new ServiceTarget("127.0.0.1:50551", ValueKind.LOCATOR), target);
+        // Backends, local paths and the removed adapter selector belong to the index server.
+        for (String key : new String[] {"adapter", "backend", "path", "unknown_option"}) {
+            var document = Map.<String, Object>of("target", Map.of("service", Map.of(
+                    "endpoint", "127.0.0.1:50551", "value", "row_id", key, "grpc")));
+            var error = assertThrows(IllegalArgumentException.class, () -> ServiceTarget.of(document));
+            assertTrue(error.getMessage().contains("Unknown key: " + key));
+        }
+        assertThrows(IllegalArgumentException.class, () -> ServiceTarget.of(Map.of("target", Map.of("service",
+                Map.of("value", "row_id")))));
     }
 
     @Test
@@ -91,14 +98,6 @@ public class ServiceConfigTest {
     }
 
     @Test
-    public void objectBackendsAreRemoteReplayTargets() {
-        var document = Map.<String, Object>of("target", Map.of("service", Map.of(
-                "adapter", "slatedb", "path", "index", "value", "row_id")));
-        assertThrows(IllegalArgumentException.class,
-                () -> ServiceConfig.ofReplay(temporary.getRoot().toPath(), document));
-    }
-
-    @Test
     public void reliveBridgeOwnsNoLocalStorageOrWalPolicy() throws Exception {
         Path root = temporary.getRoot().toPath(), config = root.resolve("relive.yaml");
         String base = """
@@ -121,8 +120,5 @@ public class ServiceConfigTest {
             Files.writeString(config, base + "  " + forbidden + "\n");
             assertThrows(IllegalArgumentException.class, () -> ServiceConfig.ofServer(root, config, Map.of()));
         }
-        var replay = Map.<String, Object>of("target", Map.of("service", Map.of(
-                "adapter", "relive", "endpoint", "http://127.0.0.1:7001", "value", "row_id")));
-        assertThrows(IllegalArgumentException.class, () -> ServiceConfig.ofReplay(root, replay));
     }
 }

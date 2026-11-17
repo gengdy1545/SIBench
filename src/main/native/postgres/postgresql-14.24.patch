@@ -50,15 +50,7 @@
  
  #include "access/amapi.h"
  #include "access/heapam.h"
-@@ -232,6 +233,7 @@
- 									   (ItemPointer) NULL,
- 									   InvalidBlockNumber);
- 
-+	sib_index_insert(indexRelation, values, isnull, heap_t_ctid, checkUnique);
- 	return indexRelation->rd_indam->aminsert(indexRelation, values, isnull,
- 											 heap_t_ctid, heapRelation,
- 											 checkUnique, indexUnchanged,
-@@ -342,6 +344,7 @@
+@@ -342,6 +343,7 @@
  {
  	SCAN_CHECKS;
  	CHECK_SCAN_PROCEDURE(amrescan);
@@ -66,7 +58,7 @@
  
  	Assert(nkeys == scan->numberOfKeys);
  	Assert(norderbys == scan->numberOfOrderBys);
-@@ -366,6 +369,7 @@
+@@ -366,6 +368,7 @@
  {
  	SCAN_CHECKS;
  	CHECK_SCAN_PROCEDURE(amendscan);
@@ -74,7 +66,7 @@
  
  	/* Release resources (like buffer pins) from table accesses */
  	if (scan->xs_heapfetch)
-@@ -573,6 +577,7 @@
+@@ -573,6 +576,7 @@
  	 * pay no attention to those fields here.
  	 */
  	found = scan->indexRelation->rd_indam->amgettuple(scan, direction);
@@ -82,7 +74,7 @@
  
  	/* Reset kill flag immediately for safety */
  	scan->kill_prior_tuple = false;
-@@ -623,6 +628,7 @@
+@@ -623,6 +627,7 @@
  									scan->xs_snapshot, slot,
  									&scan->xs_heap_continue, &all_dead);
  
@@ -90,7 +82,7 @@
  	if (found)
  		pgstat_count_heap_fetch(scan->indexRelation);
  
-@@ -713,7 +719,17 @@
+@@ -713,7 +718,17 @@
  	/*
  	 * have the am's getbitmap proc do all the work.
  	 */
@@ -173,28 +165,6 @@
  		CallSubXactCallbacks(SUBXACT_EVENT_ABORT_SUB, s->subTransactionId,
  							 s->parent->subTransactionId);
  
---- a/src/backend/catalog/index.c
-+++ b/src/backend/catalog/index.c
-@@ -20,6 +20,7 @@
-  *-------------------------------------------------------------------------
-  */
- #include "postgres.h"
-+#include "sibench_capture.h"
- 
- #include <unistd.h>
- 
-@@ -3042,9 +3043,11 @@
- 	/*
- 	 * Call the access method's build procedure
- 	 */
-+	sib_index_build_start(indexRelation);
- 	stats = indexRelation->rd_indam->ambuild(heapRelation, indexRelation,
- 											 indexInfo);
- 	Assert(PointerIsValid(stats));
-+	sib_index_build_end(indexRelation, stats->heap_tuples, stats->index_tuples);
- 
- 	/*
- 	 * If this is an unlogged index, we may need to write out an init fork for
 --- a/src/backend/executor/execMain.c
 +++ b/src/backend/executor/execMain.c
 @@ -36,6 +36,7 @@
@@ -213,31 +183,23 @@
  	/* sanity checks: queryDesc must not be started already */
  	Assert(queryDesc != NULL);
  	Assert(queryDesc->estate == NULL);
-@@ -340,6 +342,7 @@
- 	 */
- 	operation = queryDesc->operation;
- 	dest = queryDesc->dest;
-+	dest = sib_wrap_receiver(dest);
- 
- 	/*
- 	 * startup tuple receiver, if we will be emitting tuples
-@@ -372,6 +375,10 @@
+@@ -372,6 +374,10 @@
  	if (queryDesc->totaltime)
  		InstrStopNode(queryDesc->totaltime, estate->es_processed);
  
-+	sib_executor_run_end(dest, estate->es_processed,
++	sib_executor_run_end(estate->es_processed,
 +		queryDesc->operation == CMD_SELECT && !queryDesc->plannedstmt->hasModifyingCTE &&
 +		ScanDirectionIsForward(direction) && (count == 0 || estate->es_processed < count));
 +
  	MemoryContextSwitchTo(oldcontext);
  }
  
-@@ -463,6 +470,8 @@
+@@ -463,6 +469,8 @@
  {
  	EState	   *estate;
  	MemoryContext oldcontext;
 +
-+	sib_executor_end(queryDesc->estate->es_processed);
++	sib_executor_end();
  
  	/* sanity checks */
  	Assert(queryDesc != NULL);
@@ -335,7 +297,7 @@
  			tuple_from_heap = true;
  		}
 +		else
-+			sib_vm_visible(scandesc, tid);
++			sib_vm_visible(scandesc);
  
  		/* Fill the scan tuple slot with data from the index */
  		StoreIndexTuple(node, slot, scandesc);
@@ -365,18 +327,6 @@
  
  		/*
  		 * If no run-time keys to calculate or they are ready, go ahead and
---- a/src/backend/Makefile
-+++ b/src/backend/Makefile
-@@ -49,6 +49,9 @@
- 
- # The backend doesn't need everything that's in LIBS, however
- LIBS := $(filter-out -lz -lreadline -ledit -ltermcap -lncurses -lcurses, $(LIBS))
-+
-+# SIBench capture traces can be written as zstd streams (access/index/sibench_capture.c).
-+LIBS += -lzstd
- 
- ifeq ($(with_systemd),yes)
- LIBS += -lsystemd
 --- a/src/backend/nodes/tidbitmap.c
 +++ b/src/backend/nodes/tidbitmap.c
 @@ -37,6 +37,7 @@

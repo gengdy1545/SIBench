@@ -24,9 +24,10 @@ import java.util.concurrent.TimeUnit;
 import org.sibench.config.PixelsConfig;
 
 /**
- * The Pixels side of CDC generation: etcd, coordinator and Retina for one run, schema setup and
- * LOAD. The generator drives it over one authenticated connection, also when Pixels runs locally.
- * A failed run keeps its directory and logs; only an explicit delete after publication removes it.
+ * The Pixels side of baseline preparation and experiments: etcd, coordinator and Retina for one run,
+ * schema setup, LOAD, baseline export/import and optional Trino. The controller drives it over one
+ * authenticated connection, also when Pixels runs locally. A failed run keeps its directory and
+ * logs; only an explicit delete after publication removes it.
  */
 public final class PixelsHost {
     private static final Gson GSON = new Gson();
@@ -35,7 +36,7 @@ public final class PixelsHost {
 
     private PixelsHost() {}
 
-    /** {@code pixels-host ADDRESS:PORT BUILD WORK_ROOT TOKEN_FILE}: serves generator sessions one at a time. */
+    /** {@code pixels-host ADDRESS:PORT BUILD WORK_ROOT TOKEN_FILE}: serves controller sessions one at a time. */
     public static void serve(String listen, Path build, Path workRoot, Path tokenFile) throws Exception {
         int colon = listen.lastIndexOf(':');
         var address = InetAddress.getByName(listen.substring(0, colon));
@@ -50,20 +51,24 @@ public final class PixelsHost {
                 socket.setOption(jdk.net.ExtendedSocketOptions.TCP_KEEPIDLE, 60);
                 socket.setOption(jdk.net.ExtendedSocketOptions.TCP_KEEPINTERVAL, 10);
                 socket.setOption(jdk.net.ExtendedSocketOptions.TCP_KEEPCOUNT, 6);
-                new Session(build, workRoot, token, socket).run();
+                // Each session re-verifies this host's own build: its files may change between sessions.
+                new Session(build, workRoot, token, socket, null).run();
             } catch (Exception failure) {
                 failure.printStackTrace();
             }
         }
     }
 
-    /** Starts a session server on loopback for a local deployment; the run directory is {@code run}. */
+    /**
+     * Starts a session server on loopback for a local deployment; the run directory is {@code run}. The
+     * caller has just verified {@code expected} from this same build, so the session reports it unchanged.
+     */
     static Client local(Path build, Path run, JsonObject expected) throws IOException {
         var server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
         String token = java.util.UUID.randomUUID().toString();
         var thread = new Thread(() -> {
             try (server; var socket = server.accept()) {
-                new Session(build, run.getParent(), token, socket).run();
+                new Session(build, run.getParent(), token, socket, expected).run();
             } catch (Exception failure) {
                 failure.printStackTrace();
             }
@@ -73,7 +78,7 @@ public final class PixelsHost {
         return Client.connect(server.getInetAddress().getHostAddress() + ":" + server.getLocalPort(), token, expected);
     }
 
-    /** The generator's view of one Pixels host session. */
+    /** The controller's view of one Pixels host session. */
     static final class Client implements AutoCloseable {
         private static final java.util.concurrent.ScheduledThreadPoolExecutor DEADLINES = deadlines();
         private final Socket socket;
@@ -98,10 +103,7 @@ public final class PixelsHost {
         }
 
         static Client connect(String endpoint, String token, JsonObject expected) throws IOException {
-            return connect(endpoint, token, expected, Duration.ofSeconds(30));
-        }
-
-        static Client connect(String endpoint, String token, JsonObject expected, Duration timeout) throws IOException {
+            Duration timeout = Duration.ofSeconds(30);
             int colon = endpoint.lastIndexOf(':');
             var socket = new Socket();
             try {
@@ -120,14 +122,13 @@ public final class PixelsHost {
 
         JsonObject identity() { return identity.deepCopy(); }
 
-        /** The address of this host as Pixels sees the generator, used for the trace endpoint. */
+        /** The address of this host as Pixels sees the controller, used for the trace endpoint. */
         String localAddress() { return socket.getLocalAddress().getHostAddress(); }
 
         synchronized JsonObject call(Map<String, ?> request) throws IOException {
             Duration timeout = switch (request.get("op").toString()) {
                 case "start" -> Duration.ofMinutes(30);
                 case "stop" -> STOP.multipliedBy(4);
-                case "check" -> Duration.ofSeconds(30);
                 default -> SETUP;
             };
             return call(request, timeout);
@@ -198,8 +199,10 @@ public final class PixelsHost {
         private boolean stopped;
         private String dataUri, storageUri;
         private boolean retainData;
+        private JsonObject identity;
 
-        Session(Path build, Path workRoot, String token, Socket socket) throws IOException {
+        Session(Path build, Path workRoot, String token, Socket socket, JsonObject identity) throws IOException {
+            this.identity = identity;
             this.build = build;
             this.workRoot = workRoot;
             this.token = token;
@@ -209,7 +212,7 @@ public final class PixelsHost {
         }
 
         void run() throws Exception {
-            // A terminated generator or agent JVM must not leave Pixels daemons behind.
+            // A terminated controller or agent JVM must not leave Pixels daemons behind.
             var cleanup = new Thread(() -> processes.values().forEach(Process::destroyForcibly), "sibench-pixels-host-cleanup");
             Runtime.getRuntime().addShutdownHook(cleanup);
             try {
@@ -217,7 +220,8 @@ public final class PixelsHost {
                 var hello = request();
                 if (!MessageDigest.isEqual(hello.get("token").getAsString().getBytes(StandardCharsets.UTF_8),
                         token.getBytes(StandardCharsets.UTF_8))) throw new IOException("Invalid Pixels host token");
-                reply(Map.of("build", PixelsBuild.identity(build)));
+                if (identity == null) identity = PixelsBuild.identity(build);
+                reply(Map.of("build", identity));
                 socket.setSoTimeout(0);
                 while (true) {
                     JsonObject request;
@@ -228,6 +232,8 @@ public final class PixelsHost {
                     }
                     long timeout = request.get("timeout_ms").getAsLong();
                     if (timeout <= 0 || timeout > TimeUnit.HOURS.toMillis(24)) throw new IOException("Invalid host request timeout");
+                    requestTimeout = Duration.ofMillis(timeout);
+                    requestDeadline = System.nanoTime() + requestTimeout.toNanos();
                     var deadline = Client.DEADLINES.schedule(() -> {
                         try { socket.close(); } catch (IOException ignored) { }
                     }, timeout, TimeUnit.MILLISECONDS);
@@ -251,11 +257,8 @@ public final class PixelsHost {
             }
         }
 
+        /** Only {@link #run} calls this, after setting the request deadline. */
         private Map<String, ?> handle(JsonObject request) throws Exception {
-            long timeout = request.get("timeout_ms").getAsLong();
-            if (timeout <= 0 || timeout > TimeUnit.HOURS.toMillis(24)) throw new IOException("Invalid host request timeout");
-            requestTimeout = Duration.ofMillis(timeout);
-            requestDeadline = System.nanoTime() + requestTimeout.toNanos();
             return switch (request.get("op").getAsString()) {
                 case "start" -> start(request);
                 case "create" -> create(request);
@@ -263,7 +266,6 @@ public final class PixelsHost {
                 case "load" -> load(request);
                 case "export-baseline", "import-baseline" -> baseline(request);
                 case "start-query" -> startQuery(request);
-                case "check" -> check();
                 case "stop" -> stop();
                 case "delete" -> delete();
                 default -> throw new IOException("Unknown Pixels host operation");
@@ -291,6 +293,8 @@ public final class PixelsHost {
             String address = socket.getLocalAddress().getHostAddress();
             Map<String, String> overlay = new LinkedHashMap<>();
             for (var entry : request.getAsJsonObject("overlay").entrySet()) overlay.put(entry.getKey(), entry.getValue().getAsString());
+            // The controller is authenticated but remote; its overrides are checked here once, before ports or files use them.
+            PixelsConfig.pixelsProperties(overlay);
             var ports = ports(address, overlay);
             Path home = Files.createDirectories(run.resolve("home/etc"));
             Files.createSymbolicLink(run.resolve("home/lib"), build.resolve("home/lib"));
@@ -407,19 +411,20 @@ public final class PixelsHost {
             if (run == null || stopped || processes.containsKey("trino")) throw new IOException("No fresh Pixels query session");
             var settings = org.sibench.config.ConfigValues.parse(request.get("settings").toString());
             Path deployment = Path.of(org.sibench.config.ConfigValues.string(settings, "deployment_directory")).toRealPath();
-            var pixelsIdentity = PixelsBuild.identity(build).getAsJsonObject("java");
-            var identity = TrinoHost.verify(deployment, pixelsIdentity.get("pixels_commit").getAsString());
-            if (!identity.get("pixels_patch_sha256").equals(pixelsIdentity.get("pixels_patch_sha256")))
+            // The session identity was verified at its handshake (or by the local caller) from this build.
+            var pixelsIdentity = identity.getAsJsonObject("java");
+            var trino = TrinoHost.verify(deployment, pixelsIdentity.get("pixels_commit").getAsString());
+            if (!trino.get("pixels_patch_sha256").equals(pixelsIdentity.get("pixels_patch_sha256")))
                 throw new IOException("Trino connector and Pixels patches differ");
             String address = socket.getLocalAddress().getHostAddress();
             int port = freePort(address);
             Path query = Files.createDirectory(run.resolve("trino"));
-            String javaHome = deployment.resolve(identity.get("java_home").getAsString()).toString();
-            launch("trino", TrinoHost.command(deployment, query, address, port, settings, identity),
+            String javaHome = deployment.resolve(trino.get("java_home").getAsString()).toString();
+            launch("trino", TrinoHost.command(deployment, query, address, port, settings, trino),
                     Map.of("JAVA_HOME", javaHome, "PATH", javaHome + "/bin:" + System.getenv("PATH")));
             String server = "http://" + address + ":" + port;
             var readiness = TrinoHost.await(server, processes.get("trino"), requestTimeout);
-            return Map.of("server", server, "deployment", identity, "settings", settings, "readiness", readiness,
+            return Map.of("server", server, "deployment", trino, "settings", settings, "readiness", readiness,
                     "jvm_options", Files.readAllLines(query.resolve("etc/jvm.config")),
                     "server_properties", Files.readString(query.resolve("etc/config.properties")));
         }
@@ -603,7 +608,6 @@ public final class PixelsHost {
      * name an upstream key, so a misspelled setting fails instead of being ignored.
      */
     static String properties(String defaults, Map<String, String> overrides, Map<String, String> generated) {
-        PixelsConfig.pixelsProperties(overrides);
         var pending = new LinkedHashMap<>(generated);
         var unknown = new LinkedHashMap<>(overrides);
         var text = new StringBuilder();
@@ -622,7 +626,6 @@ public final class PixelsHost {
     }
 
     static Map<String, Integer> ports(String address, Map<String, String> overrides) throws IOException {
-        PixelsConfig.pixelsProperties(overrides);
         var ports = new LinkedHashMap<String, Integer>();
         for (var entry : PixelsConfig.SERVICE_PORTS.entrySet()) if (overrides.containsKey(entry.getKey())) {
             int port = Integer.parseInt(overrides.get(entry.getKey()));

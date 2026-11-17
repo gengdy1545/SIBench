@@ -30,13 +30,8 @@ def load_inputs(traces, arguments):
         "runtime": arguments.runtime.resolve() if arguments.runtime else global_config.RUNTIME_CONFIG,
         "analysis_directory": global_config.ANALYSIS_DIRECTORY,
         "plot_directory": global_config.PLOT_DIRECTORY,
-        "window_requests": global_config.WINDOW_REQUESTS,
-        "sort_memory_bytes": global_config.SORT_MEMORY_BYTES,
         "traces": deepcopy(traces),
     }
-    for key in ("window_requests", "sort_memory_bytes"):
-        if type(config[key]) is not int or config[key] < 1:
-            raise ValueError(f"{key} must be a positive integer")
     for key in ("jar", "analysis_directory", "plot_directory", "runtime"):
         config[key] = ROOT / config[key]
     if not isinstance(config["traces"], list) or not config["traces"]:
@@ -73,9 +68,7 @@ def load_analysis(config, trace):
     identity = hashlib.sha256((trace["directory"] / "manifest.json").read_bytes()).hexdigest()
     if (summary.get("status") != "complete" or summary["manifest_sha256"] != identity
             or preparation["jar_sha256"] != hashlib.sha256(config["jar"].read_bytes()).hexdigest()
-            or summary["window_requests"] != config["window_requests"]
-            or "requested_pk_bins" in summary
-            or summary["sort_memory_bytes"] != config["sort_memory_bytes"]):
+            or preparation["runtime_sha256"] != hashlib.sha256(config["runtime"].read_bytes()).hexdigest()):
         raise ValueError(f"Stale analysis for {trace['name']}; run prepare_analysis.py")
     return directory, summary
 

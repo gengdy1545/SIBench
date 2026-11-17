@@ -1,9 +1,3 @@
-diff --git a/src/main/java/io/pixelsdb/pixels/sink/PixelsSinkApp.java b/src/main/java/io/pixelsdb/pixels/sink/PixelsSinkApp.java
---- a/src/main/java/io/pixelsdb/pixels/sink/PixelsSinkApp.java
-+++ b/src/main/java/io/pixelsdb/pixels/sink/PixelsSinkApp.java
-@@ -76,0 +77,2 @@
-+        Thread.setDefaultUncaughtExceptionHandler((thread, error) ->
-+                io.pixelsdb.pixels.sink.SibenchReport.fail("Uncaught exception in " + thread.getName(), error));
 diff --git a/src/main/java/io/pixelsdb/pixels/sink/SibenchReport.java b/src/main/java/io/pixelsdb/pixels/sink/SibenchReport.java
 new file mode 100644
 --- /dev/null
@@ -1211,7 +1205,7 @@ diff --git a/src/main/java/io/pixelsdb/pixels/sink/freshness/FreshnessClient.jav
 --- a/src/main/java/io/pixelsdb/pixels/sink/freshness/FreshnessClient.java
 +++ b/src/main/java/io/pixelsdb/pixels/sink/freshness/FreshnessClient.java
 @@ -55,0 +56,10 @@
-+    private final String measuredColumn = System.getProperty("sibench.freshness.column", "freshness_ts");
++    private final String measuredColumn = System.getProperty("sibench.freshness.column");
 +    private final String measuredTable = System.getProperty("sibench.freshness.table");
 +    private final java.util.concurrent.atomic.AtomicLong samples = new java.util.concurrent.atomic.AtomicLong();
 +    private volatile Throwable sampleFailure;
@@ -1223,7 +1217,7 @@ diff --git a/src/main/java/io/pixelsdb/pixels/sink/freshness/FreshnessClient.jav
 +    }
 @@ -216 +226 @@
 -        monitoredTables.add(tableName);
-+        if (measuredTable == null || measuredTable.equals(tableName)) monitoredTables.add(tableName);
++        if (measuredTable.equals(tableName)) monitoredTables.add(tableName);
 @@ -259 +269,10 @@
 -        connectionExecutor.shutdownNow();
 +        connectionExecutor.shutdown();

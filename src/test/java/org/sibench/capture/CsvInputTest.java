@@ -2,7 +2,6 @@ package org.sibench.capture;
 
 import static org.junit.Assert.*;
 
-import com.google.gson.JsonParser;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
@@ -28,8 +27,8 @@ public class CsvInputTest {
             var first = pool.submit(() -> { CsvInput.materialize(csv, capture); return capture; });
             var second = pool.submit(() -> { CsvInput.materialize(csv, pixels); return pixels; });
             for (Path consumer : java.util.List.of(first.get(), second.get())) {
-                var binding = JsonParser.parseString(Files.readString(consumer.resolve("csv-input.json"))).getAsJsonObject();
-                assertEquals(csv.sha256(), binding.get("manifest_sha256").getAsString());
+                // Consumers bind the CSV identity in their own published manifest, not in a side file.
+                assertFalse(Files.exists(consumer.resolve("csv-input.json")));
                 CsvInput.validateBaseline(consumer, csv.manifest(), true);
                 assertFalse(Files.exists(consumer.resolve("database")));
                 assertFalse(Files.exists(consumer.resolve("cdc")));
@@ -52,6 +51,20 @@ public class CsvInputTest {
         Files.delete(file);
         Files.createSymbolicLink(file, outside);
         assertThrows(java.io.IOException.class, () -> CsvInput.open(fixture.output()));
+    }
+
+    @Test public void publicationRejectsInspectedTableBytesThatDifferFromTheLoadInventory() throws Exception {
+        Path output = temporary.newFolder("changed").toPath();
+        var input = fixture(output);
+        var inspected = new java.util.HashMap<>(PixelsInputs.inspect(input.source(), output.resolve("native/Data_1x")).sha256());
+        Files.delete(output.resolve("manifest.json"));
+        CsvInput.publish(output, input, inspected, Map.of("benchmark_source", Map.of("commit", input.source().sourceCommit(), "files", input.source().fingerprints())));
+        // A table changed between the inventory and inspection reads produces another digest.
+        Files.delete(output.resolve("manifest.json"));
+        inspected.put("customer", "0".repeat(64));
+        var failure = assertThrows(java.io.IOException.class, () -> CsvInput.publish(output, input, inspected, Map.of()));
+        assertTrue(failure.getMessage(), failure.getMessage().contains("changed after source loading"));
+        assertFalse(Files.exists(output.resolve("manifest.json")));
     }
 
     @Test public void captureParametersMustMatchTheGenerator() throws Exception {
@@ -84,7 +97,8 @@ public class CsvInputTest {
         Files.createDirectory(output.resolve("load"));
         HybenchInputs.record(data, source.source().resolve("conf/load_data_pg.sql"), output.resolve("load/inputs.json"));
         Files.copy(source.source().resolve("conf/ddl_pg.sql"), output.resolve("schema.sql"));
-        Files.writeString(output.resolve("pixels-schema.tsv"), PixelsInputs.inspect(source, data).schema().text());
+        var inspected = PixelsInputs.inspect(source, data);
+        Files.writeString(output.resolve("pixels-schema.tsv"), inspected.schema().text());
         var rows = new LinkedHashMap<String, Long>();
         source.tables().forEach(table -> rows.put(table.name(), 1L));
         Map<String, Object> parameters = Map.of("customer_number", 1L);
@@ -93,7 +107,7 @@ public class CsvInputTest {
                 new com.moandjiezana.toml.TomlWriter().write(Map.of("1x", parameters)));
         var selection = new BenchmarkSelection(root.resolve("config/benchmark/hybench.yaml"), "hybench", BenchmarkSelection.Mode.CDC, Engine.PIXELS, "hybench", "xp", root.resolve("unused-trace"), false, null);
         var input = new Generation.Input(selection, Map.of("native", Map.of("sf", "1x")), source, root, output, Map.of(), rows, parameters);
-        CsvInput.publish(output, input, Map.of("benchmark_source", Map.of("commit", source.sourceCommit(), "files", source.fingerprints())));
+        CsvInput.publish(output, input, inspected.sha256(), Map.of("benchmark_source", Map.of("commit", source.sourceCommit(), "files", source.fingerprints())));
         return input;
     }
 }

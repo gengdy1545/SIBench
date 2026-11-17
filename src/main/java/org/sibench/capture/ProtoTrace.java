@@ -31,65 +31,43 @@ public final class ProtoTrace {
 
     private ProtoTrace() {}
 
+    /** The stream's descriptor in {@code proto_files}; its payload is always {@code NAME.pb.zst}. */
     public static IndexOperationTrace.Source source(Path directory, com.google.gson.JsonObject manifest,
             String name) throws IOException {
-        if (!manifest.has("proto_files")) throw new IOException("Missing proto Trace file inventory");
-        if (!manifest.get("proto_files").isJsonObject()) throw new IOException("Invalid proto Trace file inventory");
+        if (!manifest.has("proto_files") || !manifest.get("proto_files").isJsonObject())
+            throw new IOException("Missing proto Trace file inventory");
         var inventory = manifest.getAsJsonObject("proto_files");
-        if (!inventory.has(name) || !inventory.get(name).isJsonArray())
+        if (!inventory.has(name) || !inventory.get(name).isJsonObject())
             throw new IOException("Invalid proto Trace file inventory: " + name);
-        var files = inventory.getAsJsonArray(name);
-        if (files.size() != 1) throw new IOException("Expected one canonical proto Trace file: " + name);
-        for (var item : files) {
-            if (!item.isJsonObject()) throw new IOException("Invalid proto Trace inventory entry");
-            var file = item.getAsJsonObject();
-            for (String field : List.of("sha256", "logical_sha256"))
-                if (!file.has(field) || !file.get(field).getAsString().matches("[0-9a-f]{64}"))
-                    throw new IOException("Invalid proto Trace digest: " + field);
-            if (!file.has("operations") || file.get("operations").getAsLong() < 0 || !file.has("path"))
-                throw new IOException("Invalid proto Trace count or path");
-        }
-        String identity = identity(files);
-        if (!identity.equals(manifest.get(name + "_trace_sha256").getAsString()))
+        var file = inventory.getAsJsonObject(name);
+        for (String field : List.of("sha256", "logical_sha256"))
+            if (!file.has(field) || !file.get(field).getAsString().matches("[0-9a-f]{64}"))
+                throw new IOException("Invalid proto Trace digest: " + field);
+        if (!file.has("operations") || file.get("operations").getAsLong() < 0)
+            throw new IOException("Invalid proto Trace count");
+        long operations = file.get("operations").getAsLong();
+        String logical = file.get("logical_sha256").getAsString();
+        if (!identity(logical, operations).equals(manifest.get(name + "_trace_sha256").getAsString()))
             throw new IOException("Proto Trace inventory identity mismatch: " + name);
-        var paths = new HashSet<Path>();
-        for (var item : files) {
-            var file = item.getAsJsonObject();
-            Path relative = Path.of(file.get("path").getAsString());
-            if (relative.isAbsolute() || !relative.normalize().equals(relative) || relative.startsWith("..")
-                    || !relative.toString().equals(name + ".pb.zst")
-                    || !paths.add(relative))
-                throw new IOException("Invalid proto Trace file path: " + relative);
-        }
+        String physical = file.get("sha256").getAsString();
         return consumer -> {
-            long count = 0;
-            for (var item : files) {
-                var file = item.getAsJsonObject();
-                long actual = read(directory.resolve(file.get("path").getAsString()),
-                        file.get("sha256").getAsString(), file.get("logical_sha256").getAsString(), consumer);
-                if (actual != file.get("operations").getAsLong())
-                    throw new IOException("Proto Trace file operation count mismatch");
-                count = Math.addExact(count, actual);
-            }
-            return count;
+            long actual = read(directory.resolve(name + ".pb.zst"), physical, logical, consumer);
+            if (actual != operations) throw new IOException("Proto Trace file operation count mismatch");
+            return actual;
         };
     }
 
-    /** Binds shard order and semantic counts without decoding and re-encoding requests. */
-    public static String identity(com.google.gson.JsonArray files) {
+    /** Binds the decoded messages and their semantic count without re-encoding requests. */
+    public static String identity(String logicalSha256, long operations) {
         var digest = org.sibench.config.Digests.digest();
-        for (var item : files) {
-            var file = item.getAsJsonObject();
-            digest.update(HexFormat.of().parseHex(file.get("logical_sha256").getAsString()));
-            digest.update(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(file.get("operations").getAsLong()).array());
-        }
+        digest.update(HexFormat.of().parseHex(logicalSha256));
+        digest.update(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(operations).array());
         return HexFormat.of().formatHex(digest.digest());
     }
 
-    public static Map<String, Object> file(String path, Writer writer) {
-        return Map.of("path", path, "sha256", writer.sha256(),
-                "logical_sha256", writer.logicalSha256(), "operations", writer.count(),
-                "bytes", writer.bytesWritten(), "statistics", writer.statistics());
+    public static Map<String, Object> file(Writer writer) {
+        return Map.of("sha256", writer.sha256(), "logical_sha256", writer.logicalSha256(),
+                "operations", writer.count(), "bytes", writer.bytesWritten(), "statistics", writer.statistics());
     }
 
     public static final class Writer implements Closeable, IndexOperationTrace.Consumer {
@@ -349,7 +327,7 @@ public final class ProtoTrace {
                             com.google.protobuf.ExtensionRegistryLite.getEmptyRegistry());
                     var views = new ArrayList<Operation>(operationCount(record));
                     decoder.accept(record, views::add);
-                    for (Operation operation : views) IndexOperationTrace.validate(operation);
+                    for (Operation operation : views) IndexOperationTrace.validateShape(operation);
                     consumer.accept(record, List.copyOf(views));
                     count = Math.addExact(count, views.size());
                 }
@@ -427,30 +405,41 @@ public final class ProtoTrace {
 
     private static Operation write(TraceOperation request, long transaction, TraceMetadata p) throws IOException {
         boolean put = request.hasPut();
-        var mutation = Mutation.newBuilder();
-        if (put) mutation.setPut(request.getPut()); else mutation.setDelete(request.getDelete());
-        try { IndexExecution.validateMutation(mutation.build()); }
+        var mutation = put ? Mutation.newBuilder().setPut(request.getPut()).build()
+                : Mutation.newBuilder().setDelete(request.getDelete()).build();
+        try { IndexExecution.validateMutation(mutation); }
         catch (IllegalArgumentException error) { throw new IOException(error); }
-        var key = IndexEntry.decode(put ? request.getPut().getKey() : request.getDelete().getKey());
         long ts = put ? request.getPut().getTs() : request.getDelete().getTs();
         boolean baseline = transaction == 0 && ts == 0 && put;
-        if (p.getExpectedCount() != 0 || !put && !p.getLocator().isEmpty()
+        if (p.getExpectedCount() != 0
                 || !baseline && (p.getBaselinePosition() != 0 || p.getBaselineSize() != 0))
             throw new IOException("Invalid write metadata");
-        long rowId = 0, file = 0, position = 0;
+        return entry(mutation, p.getLocator(), p.getSourceEvent(),
+                baseline ? IndexOperationTrace.INSERT : put ? IndexOperationTrace.UPSERT : IndexOperationTrace.LOGICAL_DELETE,
+                p.getWriteOrigin(), transaction, p.getMutationOrdinal(), p.getWorkUnitId(),
+                baseline ? p.getBaselinePosition() : 0, baseline ? p.getBaselineSize() : 1);
+    }
+
+    /** The index entry a validated Put or Delete names, with its RowID and optional source locator. */
+    private static Operation entry(Mutation mutation, ByteString locator, long sourceEvent, int kind, int flags,
+            long transaction, long ordinal, long workUnit, int position, int size) throws IOException {
+        boolean put = mutation.hasPut();
+        if (!put && !locator.isEmpty()) throw new IOException("Invalid write metadata");
+        var key = IndexEntry.decode(put ? mutation.getPut().getKey() : mutation.getDelete().getKey());
+        long ts = put ? mutation.getPut().getTs() : mutation.getDelete().getTs();
+        long rowId = 0, file = 0, offset = 0;
         if (put) {
-            if (request.getPut().getValue().size() != 8) throw new IOException("Trace Put must carry an encoded RowID");
-            rowId = request.getPut().getValue().asReadOnlyByteBuffer().getLong();
+            if (mutation.getPut().getValue().size() != 8) throw new IOException("Trace Put must carry an encoded RowID");
+            rowId = mutation.getPut().getValue().asReadOnlyByteBuffer().getLong();
             if (rowId < 0) throw new IOException("Negative source RowID");
-            if (!p.getLocator().isEmpty()) {
-                if (p.getLocator().size() != 16) throw new IOException("Invalid source locator");
-                var bytes = p.getLocator().asReadOnlyByteBuffer(); file = bytes.getLong(); position = bytes.getLong();
+            if (!locator.isEmpty()) {
+                if (locator.size() != 16) throw new IOException("Invalid source locator");
+                var bytes = locator.asReadOnlyByteBuffer(); file = bytes.getLong(); offset = bytes.getLong();
             }
         }
-        return new Operation(p.getSourceEvent(), baseline ? IndexOperationTrace.INSERT : put ? IndexOperationTrace.UPSERT
-                : IndexOperationTrace.LOGICAL_DELETE, key.table(), key.index(), p.getWriteOrigin(), key.primaryKey(),
-                key.indexedValue(), ts, file, position, rowId, 0, transaction, p.getMutationOrdinal(), -1, p.getWorkUnitId(),
-                baseline ? p.getBaselinePosition() : 0, baseline ? p.getBaselineSize() : 1, null, null, 0, java.util.List.of());
+        return new Operation(sourceEvent, kind, key.table(), key.index(), flags, key.primaryKey(),
+                key.indexedValue(), ts, file, offset, rowId, 0, transaction, ordinal, -1, workUnit,
+                position, size, null, null, 0, java.util.List.of());
     }
 
     private static Operation query(com.google.protobuf.Message read, long transaction, TraceMetadata p, int group, int member, int count,
@@ -482,17 +471,15 @@ public final class ProtoTrace {
         } catch (IllegalArgumentException error) { throw new IOException(error); }
         var context = read instanceof GetRequest get ? get.getLocalWritesList() : ((ScanRequest) read).getLocalWritesList();
         if (locators.size() != context.size()) throw new IOException("Private locator count mismatch");
+        // validateGet/validateScan already bound each private write to the encoded read key or range,
+        // with timestamp zero and unique ordered keys.
         var local = new ArrayList<Operation>(context.size());
         for (int i = 0; i < context.size(); i++) {
             var mutation = context.get(i);
-            var metadata = TraceMetadata.newBuilder().setBaselineSize(0).setLocator(locators.get(i));
-            var data = TraceOperation.newBuilder().setMetadata(metadata);
-            if (mutation.hasPut()) data.setPut(mutation.getPut()); else data.setDelete(mutation.getDelete());
-            // Context writes have no committed version or source boundary.
-            var decoded = write(data.build(), 0, metadata.build());
-            if (decoded.kind() == IndexOperationTrace.INSERT)
-                decoded = decoded.withIndex(decoded.index(), decoded.indexedValue(), IndexOperationTrace.UPSERT);
-            local.add(decoded.withExpansion(0, 1));
+            var decoded = entry(mutation, locators.get(i), 0,
+                    mutation.hasPut() ? IndexOperationTrace.UPSERT : IndexOperationTrace.LOGICAL_DELETE, 0, 0, 0, 0, 0, 1);
+            if (decoded.file() < 0 || decoded.position() < 0) throw new IOException("Invalid private write locator");
+            local.add(decoded);
         }
         return new Operation(p.getSourceEvent(), IndexOperationTrace.SEARCH, table, index, flags, pinned, null,
                 0, 0, 0, 0, p.getExpectedCount(), transaction, p.getMutationOrdinal(), ts, p.getWorkUnitId(), member, count,

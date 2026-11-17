@@ -20,9 +20,9 @@ An ACK guarantees visibility to other clients of the same instance, not remote d
 
 ## Harness identity and deployment description
 
-Replay attaches `sibench-index-binding` and `sibench-value-kind` metadata. The server binds a fresh index to its first Trace, value mode and secondary-index selection and refuses mismatches. Ordinary callers may omit the headers; they are guards, not authentication.
+Replay attaches `sibench-index-binding` (the workload and baseline Trace identities plus the secondary-index selection) and `sibench-value-kind` metadata. The server binds a fresh index to its first binding and refuses mismatches; it compares the value kind with its own and persists it with the index. Ordinary callers may omit the headers; they are guards, not authentication.
 
-The server returns a JSON IndexDescription in binary `sibench-service-bin` metadata: backend, value mode, ACK level, WAL setting, durability and storage location. Replay requires a complete, consistent description on every response, including empty Scans. Reports bind input, build, configuration and backend location. `last_source_version` describes consumed input, not a durability watermark.
+The server returns a JSON IndexDescription in binary `sibench-service-bin` metadata: backend, value mode, ACK level, WAL setting, durability and storage location. Replay validates the first response's description, and every later response, including empty Scans, must repeat its exact bytes. Reports bind input, build, configuration and backend location. `last_source_version` describes consumed input, not a durability watermark.
 
 ## Replay and measurement
 
@@ -88,12 +88,11 @@ target:
   secondary_indexes:
     enabled: false
   service:
-    adapter: grpc
     endpoint: 127.0.0.1:50551
     value: row_id
 ```
 
-`endpoint` is a gRPC target, not a backend HTTP URL. Engine, storage and WAL settings stay in the server configuration. Keep each run's effective CONFIG and service description, and keep variants outside `config/`.
+`target.service` holds only `endpoint` and `value`. `endpoint` is a gRPC target, not a backend HTTP URL. Engine, storage and WAL settings stay in the server configuration. Keep each run's effective CONFIG and service description, and keep variants outside `config/`.
 
 These explicit checks sit outside normal generation and performance replay. Build the application and tests ([prerequisites](../README.md#build)), then:
 
@@ -131,7 +130,7 @@ service:
   value: row_id
 ```
 
-Replay still selects `adapter: grpc`. The bridge reuses the existing request validation, private-write merge, binding metadata, flow control and completion checks, and preserves each write's `ts` and each read's `read_ts`. Private writes stay in the Java request context and never reach Relive's write endpoint; ReadGroup composition and snapshot ACK dependencies stay in the replay client. No source transaction is re-executed.
+Replay targets the bridge's gRPC endpoint like any other service. The bridge reuses the existing request validation, private-write merge, binding metadata, flow control and completion checks, and preserves each write's `ts` and each read's `read_ts`. Private writes stay in the Java request context and never reach Relive's write endpoint; ReadGroup composition and snapshot ACK dependencies stay in the replay client. No source transaction is re-executed.
 
 **Encoding.** A key is the lowercase hex of `00 ++ full opaque key`. The fixed prefix keeps unsigned order, prefix keys and the empty key without changing Relive's nonempty-key protocol, and needs a fresh store. Values are plain hex, with null reserved for a tombstone. Keys are limited to 65,535 bytes and values to 65,536 bytes, and larger input fails. A batch is validated in full, then split at Relive's 10,000-row/8 MiB JSON limits; a failed later chunk can leave earlier chunks applied, and nothing is retried.
 

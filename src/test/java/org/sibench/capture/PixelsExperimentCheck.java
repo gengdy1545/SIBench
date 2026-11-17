@@ -129,7 +129,7 @@ public class PixelsExperimentCheck {
         // Baseline preparation takes its bound from the selected HyBench profile, as CDC preparation does.
         var runtime = Map.of("schema_version", 1, "purpose", "sibench",
                 "object_storage", object(org.sibench.config.SibenchConfig.read(root.resolve(storage)), "object_storage"), "engines", Map.of("pixels", engineConfig.toString()), "pixels_experiment", experiment,
-                "benchmarks", Map.of("hybench",org.sibench.config.BenchmarkFixtures.entry(Path.of("config/benchmark/hybench.yaml"),"capture","postgres",directory.resolve("trace"),"xp")));
+                "benchmarks", Map.of("hybench",org.sibench.config.BenchmarkFixtures.entry(Path.of("config/benchmark/hybench.yaml"),"postgres",directory.resolve("trace"),"xp")));
         Path config = Files.writeString(directory.resolve("runtime.json"), gson.toJson(runtime));
         Path output = directory.resolve("run");
         Path baseline = baselines.get(input);
@@ -154,17 +154,26 @@ public class PixelsExperimentCheck {
     private static void verifyTrace(Path directory, int versions) throws Exception {
         var manifest = read(directory.resolve("manifest.json"));
         int table = 1 + SourceSchema.hybench(Path.of("benchmark/HyBench-2024")).tables().stream().map(SourceSchema.Table::name).toList().indexOf("savingaccount");
-        try (var index = new IndexReferenceReplay(true, false)) {
+        // Source observations are the oracle: present, updated, deleted, reinserted and updated again.
+        for (boolean rowIds : new boolean[] {true, false}) try (var index = new IndexReferenceReplay(rowIds, false)) {
             for (String stream : List.of("baseline", "workload")) ProtoTrace.source(directory, manifest, stream).read(op -> {
                 if (!isControl(op)) index.acceptCommitted(op);
             });
-            assertNotNull(index.lookupPrimary(table, IndexKey.ofInt(1), 0));
-            assertNotNull(index.lookupPrimary(table, IndexKey.ofInt(1), 2));
+            var baseline = index.lookupPrimary(table, IndexKey.ofInt(1), 0);
+            var update = index.lookupPrimary(table, IndexKey.ofInt(1), 2);
+            assertNotNull(baseline); assertNotNull(update);
+            assertEquals(2, update.commitVersion());
+            if (rowIds) assertNotEquals(baseline.value(), update.value());
             if (versions == 5) {
                 assertNull(index.lookupPrimary(table, IndexKey.ofInt(1), 3));
-                assertNotNull(index.lookupPrimary(table, IndexKey.ofInt(1), 4));
+                var reinsert = index.lookupPrimary(table, IndexKey.ofInt(1), 4);
+                assertNotNull(reinsert);
+                assertEquals(4, reinsert.commitVersion());
+                if (rowIds) assertNotEquals(update.value(), reinsert.value());
+                else assertFalse(update.value() == reinsert.value() && update.position() == reinsert.position());
                 assertEquals(5, index.lookupPrimary(table, IndexKey.ofInt(1), 5).commitVersion());
             }
+            assertEquals(baseline, index.lookupPrimary(table, IndexKey.ofInt(1), 0));
         }
     }
 

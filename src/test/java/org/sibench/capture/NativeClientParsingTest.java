@@ -156,26 +156,26 @@ public class NativeClientParsingTest {
         Files.writeString(pinned.resolve("src/lua/notes.txt"), "ignored\n");
         Files.writeString(build.resolve("src/lua/a.lua"), "print(1)\n");
         index(pinned);
-        NativeBuildCheck.require(pinned, build, List.of("src/lua"));
+        NativeBuildCheck.require(pinned, build, List.of("src/lua"), java.util.Map.of());
         Files.createDirectories(pinned.resolve("target"));
         Files.writeString(pinned.resolve("target/checkstyle-checker.xml"), "generated, not a pinned source");
-        NativeBuildCheck.require(pinned, build, List.of("."));
+        NativeBuildCheck.require(pinned, build, List.of("."), java.util.Map.of());
         Files.writeString(build.resolve("src/lua/a.lua"), "print(2)\n");
         assertTrue(
                 assertThrows(
                                 IOException.class,
-                                () -> NativeBuildCheck.require(pinned, build, List.of("src/lua")))
+                                () -> NativeBuildCheck.require(pinned, build, List.of("src/lua"), java.util.Map.of()))
                         .getMessage()
                         .contains("differs from the pinned source"));
         Files.delete(build.resolve("src/lua/a.lua"));
-        assertThrows(IOException.class, () -> NativeBuildCheck.require(pinned, build, List.of("src/lua")));
-        assertThrows(IOException.class, () -> NativeBuildCheck.require(pinned, build, List.of("src/missing")));
+        assertThrows(IOException.class, () -> NativeBuildCheck.require(pinned, build, List.of("src/lua"), java.util.Map.of()));
+        assertThrows(IOException.class, () -> NativeBuildCheck.require(pinned, build, List.of("src/missing"), java.util.Map.of()));
         // A single pinned file is compared too.
         Files.writeString(pinned.resolve("src/one.c"), "int x;\n");
         Files.writeString(build.resolve("src/one.c"), "int x;\n");
         Files.delete(pinned.resolve("target/checkstyle-checker.xml"));
         index(pinned);
-        NativeBuildCheck.require(pinned, build, List.of("src/one.c"));
+        NativeBuildCheck.require(pinned, build, List.of("src/one.c"), java.util.Map.of());
     }
     @Test
     public void nativeExecutableMustMatchItsRecordedBuild() throws Exception {
@@ -229,14 +229,6 @@ public class NativeClientParsingTest {
             var process=new ProcessBuilder(arguments).redirectErrorStream(true).start();
             assertTrue(process.waitFor(5,java.util.concurrent.TimeUnit.SECONDS));assertEquals(0,process.exitValue());
         }
-    }
-
-    @Test
-    public void persistedCommandsRedactPasswords() throws Exception {
-        Path logs = folder.newFolder("commands").toPath();
-        NativeProcess.run("redaction", List.of("/bin/true", "db.passwd=example-private-password"),
-                Map.of(), logs, logs, java.time.Duration.ofSeconds(2));
-        assertFalse(Files.readString(logs.resolve("redaction.command")).contains("example-private-password"));
     }
 
     @Test

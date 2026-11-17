@@ -36,36 +36,12 @@ class DuckDbBuildTest(unittest.TestCase):
         (native / "duckdb_host.cpp").write_text("host\n")
         self.bin = self.root / "test bin"
         self.bin.mkdir()
-        jdbc = self.root / "third_party/duckdb-java"
-        (jdbc / "src/main/java").mkdir(parents=True)
-        (jdbc / "src/main/java/Driver.java").write_text("driver\n")
-        for name in ("LICENSE",):
-            (source / name).write_text("license\n")
-            (jdbc / name).write_text("license\n")
-        self.git(source, "add", ".")
-        self.git(source, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                 "-c", "commit.gpgsign=false", "commit", "-qm", "license")
-        self.git(source, "tag", "-f", "v2.0.0")
-        self.git(self.root, "update-index", "--cacheinfo", f"160000,{self.git(source, 'rev-parse', 'HEAD')},third_party/duckdb")
-        self.git(jdbc, "init", "-q")
-        self.git(jdbc, "add", ".")
-        self.git(jdbc, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                 "-c", "commit.gpgsign=false", "commit", "-qm", "jdbc")
-        self.git(jdbc, "tag", "v2.0.0.1")
-        self.git(self.root, "update-index", "--add", "--cacheinfo",
-                 f"160000,{self.git(jdbc, 'rev-parse', 'HEAD')},third_party/duckdb-java")
-        (native / "duckdb-java-2.0.0.1.patch").write_text(
-            "--- a/src/main/java/Driver.java\n+++ b/src/main/java/Driver.java\n@@ -1 +1 @@\n-driver\n+source driver\n")
-        (native / "jdbc.cmake").write_text("jdbc build\n")
-        self.executable("javac", "#!/bin/sh\nexit 0\n")
-        self.executable("jar", '#!/bin/sh\necho jar > "$3"\n')
         self.executable("cmake", '''#!/bin/sh
 if [ "$1" = --build ]; then
   [ "${FIXTURE_BUILD_EXIT:-0}" = 0 ] || exit "$FIXTURE_BUILD_EXIT"
   mkdir -p "$2/src"
   echo library > "$2/src/libduckdb.so"
   echo shell > "$2/duckdb"
-  echo jdbc > "$2/libduckdb_java.so_linux_amd64"
   if [ "${FIXTURE_MUTATE:-}" = yes ]; then
     echo changed > "$FIXTURE_ROOT/build/services/custom/source/src/include/upstream.hpp"
   fi
@@ -86,9 +62,6 @@ echo host > "$output"
         path = self.bin / name
         path.write_text(contents)
         path.chmod(0o755)
-        if name in ("javac", "jar"):
-            (self.root / "jdk/bin").mkdir(parents=True, exist_ok=True)
-            (self.root / "jdk/bin" / name).symlink_to(path)
 
     @staticmethod
     def git(directory, *args):
@@ -96,8 +69,7 @@ echo host > "$output"
 
     def run_build(self, exit_code=0, mutate=False):
         return subprocess.run(["bash", str(self.root / "scripts/build-duckdb.sh"), "build/services/custom"],
-            env={**os.environ, "JAVA_HOME": str(self.root / "jdk"),
-                 "PATH": f"{self.bin}:{os.environ['PATH']}", "FIXTURE_ROOT": str(self.root),
+            env={**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "FIXTURE_ROOT": str(self.root),
                  "FIXTURE_BUILD_EXIT": str(exit_code), "FIXTURE_MUTATE": "yes" if mutate else "no"}, capture_output=True, text=True, timeout=10)
 
     def test_build_uses_selected_path_and_preserves_source_and_existing_output(self):
@@ -108,8 +80,8 @@ echo host > "$output"
         self.assertEqual("upstream\n", (self.root / "third_party/duckdb/src/include/upstream.hpp").read_text())
         self.assertTrue((build / "duckdb_host").is_file())
         receipt = json.loads((build / "engine-build.json").read_text())
-        self.assertIn("jdbc_source_commit", receipt["inputs"])
-        self.assertIn("duckdb_jdbc.jar", receipt["artifacts"])
+        self.assertEqual({"source_commit", "native_sources", "build_script_sha256"}, set(receipt["inputs"]))
+        self.assertIn("duckdb_host", receipt["artifacts"])
         self.assertEqual("host\n", (build / "duckdb_host.cpp").read_text())
         before = (build / "duckdb_host").read_bytes()
         result = self.run_build()
@@ -132,11 +104,11 @@ echo host > "$output"
         self.assertIn("inputs changed during compilation", result.stderr)
         self.assertFalse((self.root / "build/services/custom/engine-build.json").exists())
 
-    def test_dirty_jdbc_is_rejected_before_build(self):
-        (self.root / "third_party/duckdb-java/src/main/java/Driver.java").write_text("changed\n")
+    def test_dirty_source_is_rejected_before_build(self):
+        (self.root / "third_party/duckdb/src/include/upstream.hpp").write_text("changed\n")
         result = self.run_build()
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("duckdb-java source must be clean", result.stderr)
+        self.assertIn("duckdb source must be clean", result.stderr)
         self.assertFalse((self.root / "build/services/custom").exists())
 
 

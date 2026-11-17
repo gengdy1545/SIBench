@@ -31,7 +31,6 @@ public class DuckDbGenerationTest {
             assertFalse(Generation.secondaryIndexes(document));
             document.put("trace", Map.of("secondary_indexes", true));
             assertTrue(Generation.secondaryIndexes(document));
-            if (benchmark.equals("sysbench")) assertTrue(bool(object(document,"native"),"create-secondary"));
         }
         for (var trace : java.util.List.of(Map.of("secondary_indexes","false"),
                 Map.of("secondary_indexes",false,"export_queries",true), Map.of()))
@@ -112,5 +111,48 @@ public class DuckDbGenerationTest {
         assertThrows(IllegalArgumentException.class,()->Generation.validateNative("ycsb",n));
         n.put("workloads",Map.of("workloada",Map.of("operationcount",1)));n.put("insertcount",1);
         assertThrows(IllegalArgumentException.class,()->Generation.validateNative("ycsb",n));
+        // The primary key and k indexes are fixed by the Trace schema, not selectable sysbench options.
+        for(var option:Map.<String,Object>of("secondary",true,"create-secondary",false,"pgsql-variant","redshift",
+                "create-table-options","WITH (fillfactor=50)","binary","src/sysbench").entrySet()) {
+            var sysbench=object(profile("sysbench"),"native");sysbench.put(option.getKey(),option.getValue());
+            assertThrows(option.getKey(),IllegalArgumentException.class,()->Generation.validateNative("sysbench",sysbench));
+        }
+        // A workload is a named run of one script; each zipfian run carries its own exponent.
+        var base=object(profile("sysbench"),"native");
+        var workloads=object(base,"workloads");
+        assertEquals(java.util.Set.of("oltp_read_write_zipf080","oltp_read_write_zipf099"),workloads.keySet());
+        assertEquals(java.util.List.of("--secondary=off","--create-secondary=on"),Generation.sysbenchOptions(base,"oltp_read_write_zipf080",true).subList(0,2));
+        var low=Generation.sysbenchOptions(base,"oltp_read_write_zipf080",false);
+        var high=Generation.sysbenchOptions(base,"oltp_read_write_zipf099",false);
+        assertTrue(low.containsAll(java.util.List.of("--rand-type=zipfian","--rand-zipfian-exp=0.8")));
+        assertTrue(high.contains("--rand-zipfian-exp=0.99")&&!high.contains("--rand-zipfian-exp=0.8"));
+        assertFalse("Loading draws no skewed values",Generation.sysbenchOptions(base,"oltp_read_write_zipf080",true).stream().anyMatch(o->o.startsWith("--rand-zipfian-exp")));
+        assertEquals("oltp_read_write",Generation.sysbenchScript(base,"oltp_read_write_zipf099",false));
+        assertEquals("oltp_read_write",Generation.sysbenchScript(base,"anything",true));
+        // Upstream rejects "special" at run time, an exponent must not be silently omitted or ignored, and scripts are pinned.
+        var mutations=java.util.List.<java.util.function.Consumer<Map<String,Object>>>of(
+                cfg->cfg.put("rand-type","special"),
+                cfg->cfg.put("rand-type","uniform"),
+                cfg->cfg.put("rand-zipfian-exp",0.8),
+                cfg->live(cfg,"oltp_read_write_zipf080").remove("rand-zipfian-exp"),
+                cfg->live(cfg,"oltp_read_write_zipf080").put("rand-zipfian-exp",-0.1),
+                cfg->live(cfg,"oltp_read_write_zipf080").put("rand-zipfian-exp","0.8"),
+                cfg->live(cfg,"oltp_read_write_zipf080").put("rand-zipfian-exp",Double.NaN),
+                cfg->live(cfg,"oltp_read_write_zipf080").put("script","oltp_unknown"),
+                cfg->live(cfg,"oltp_read_write_zipf080").remove("script"),
+                cfg->{var all=(Map<String,Object>)cfg.get("workloads");all.put("Bad-Name",all.remove("oltp_read_write_zipf080"));});
+        for(int i=0;i<mutations.size();i++) {
+            var invalid=object(profile("sysbench"),"native");
+            mutations.get(i).accept(invalid);
+            assertThrows("mutation "+i,IllegalArgumentException.class,()->Generation.validateNative("sysbench",invalid));
+        }
+        var uniform=object(profile("sysbench"),"native");uniform.put("rand-type","uniform");
+        for(var workload:((Map<String,Map<String,Object>>)uniform.get("workloads")).values())workload.remove("rand-zipfian-exp");
+        Generation.validateNative("sysbench",uniform);
+        assertFalse(Generation.sysbenchOptions(uniform,"oltp_read_write_zipf080",false).stream().anyMatch(o->o.startsWith("--rand-zipfian-exp")));
+    }
+    @SuppressWarnings("unchecked")
+    private static Map<String,Object> live(Map<String,Object> native_,String workload) {
+        return (Map<String,Object>)((Map<String,Object>)native_.get("workloads")).get(workload);
     }
 }

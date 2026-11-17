@@ -17,9 +17,7 @@ final class PostgresVersions implements AutoCloseable {
         this.database=database;
         // Empty-table statistics must not cache full scans as the private mapping tables grow.
         sql("SET enable_seqscan=off");
-        sql("ALTER TABLE sibench_history.commits ADD COLUMN source_csn BIGINT");
-        sql("CREATE UNIQUE INDEX sibench_commit_csn ON sibench_history.commits(source_csn)");
-        // An XID held across the workload would stop native pruning of every benchmark table.
+        // The session setting persists once its transaction commits.
         database.commit();
         commit=database.prepareStatement("INSERT INTO sibench_history.commits VALUES(?,?,?)");
         older=database.prepareStatement("SELECT commit_version FROM sibench_history.commits WHERE source_csn<=? ORDER BY source_csn DESC LIMIT 1");

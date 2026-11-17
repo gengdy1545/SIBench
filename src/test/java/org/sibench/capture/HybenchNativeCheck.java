@@ -14,7 +14,6 @@ import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import org.junit.Test;
 import org.junit.After;
-import org.sibench.generation.DuckDbDatabase;
 import org.sibench.generation.NativeHistory;
 import org.sibench.generation.DuckDbHostDriver;
 import org.sibench.generation.DuckDbHostFixture;
@@ -28,7 +27,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
         stop();host=null;
         Files.copy(errors,retainedOutput.resolve("host.log"));
         Path data=Files.createDirectory(retainedOutput.resolve("data"));
-        Files.move(DuckDbDatabase.file(root.resolve("data")),DuckDbDatabase.file(data));
+        Files.move(root.resolve("data").resolve("data.duckdb"),data.resolve("data.duckdb"));
     }
     private static void sql(Connection database,String text)throws Exception {
         try(var query=database.createStatement()){query.execute(text);}
@@ -57,7 +56,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
         try(var observer=connect()) {
             Path raw=output.resolve("native.csv");
             sql(observer,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
-                    +"'SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path='"+raw+"')");
+                    +"'SibenchIndex','SibenchIndexRows'],storage_path='"+raw+"')");
             var command=List.of(Path.of(System.getProperty("java.home"),"bin/java").toString(),"-Xmx256m","-cp",
                     classpath(build,output),getClass().getName(),"failure",repository.toString(),build.toString(),socket.toString());
             var result=NativeProcess.run("failure",command,Map.of("SIBENCH_BUDGET_STOP",output.resolve("stop").toString()),
@@ -66,7 +65,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             sql(observer,"CALL disable_logging()");
             List<Path> receipts;try(var files=Files.list(output.resolve("clients"))){receipts=files.sorted().toList();}
             var sessions=DuckDbReceipts.load(observer,receipts,output.resolve("receipts"));
-            DuckDbFacts.load(observer,raw);DuckDbStatements.bind(observer,sessions);DuckDbReceipts.bind(observer);
+            DuckDbFacts.load(observer,raw,0);DuckDbStatements.bind(observer,sessions);DuckDbReceipts.bind(observer);
             assertEquals(1,number(observer,"SELECT count(*) FROM sibench_statements WHERE outcome='failed'"));
             assertEquals(1,number(observer,"SELECT count(*) FROM "+DuckDbFacts.table("transaction")+" WHERE event='rollback'"));
         }
@@ -89,11 +88,11 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
         try(var observer=connect()) {
             Path raw=output.resolve("native.csv");
             sql(observer,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
-                    +"'SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path='"+raw+"')");
+                    +"'SibenchIndex','SibenchIndexRows'],storage_path='"+raw+"')");
             var result=NativeProcess.run("conflict",command,Map.of(),output,output,Duration.ofSeconds(10));
             assertEquals(Files.readString(result.err())+result.stdout(),0,result.exit());
             sql(observer,"CALL disable_logging()");
-            DuckDbFacts.load(observer,raw);
+            DuckDbFacts.load(observer,raw,0);
             assertEquals(1,number(observer,"SELECT count(*) FROM "+DuckDbFacts.table("transaction")+" WHERE event='rollback'"));
             assertTrue(number(observer,"SELECT count(*) FROM "+DuckDbFacts.table("mutation")+" m JOIN "
                     +DuckDbFacts.table("transaction")+" t USING(connection_id,transaction_id) WHERE t.event='rollback'")>0);
@@ -129,12 +128,12 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
         try(var observer=connect()) {
             assertEquals(8706,Hybench.load(observer,source,output.resolve("Data_1x")).values().stream().mapToLong(Long::longValue).sum());
             observer.setAutoCommit(false);NativeHistory.initialize(observer, org.sibench.config.Engine.DUCKDB);
-            for(var index:IndexCatalog.duckDbDefinitions(org.sibench.schema.SourceSchema.hybench(source)))if(index.indexId()==0)
+            for(var index:IndexCatalog.fromSchema(org.sibench.schema.SourceSchema.hybench(source)).definitions())if(index.indexId()==0)
                 NativeHistory.install(observer, org.sibench.config.Engine.DUCKDB,index.tableId(),"main",index.table(),index.column());
             observer.commit();observer.setAutoCommit(true);
             Path raw=output.resolve("native.csv");
             sql(observer,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
-                    +"'SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path='"+raw+"')");
+                    +"'SibenchIndex','SibenchIndexRows'],storage_path='"+raw+"')");
             base.addAll(List.of("phases",repository.toString(),build.toString(),socket.toString()));
             var result=NativeProcess.run("phases",base,Map.of("SIBENCH_BUDGET_STOP",output.resolve("stop").toString()),
                     output,output,Duration.ofSeconds(50));
@@ -144,8 +143,8 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             assertEquals(4,receipts.size());
             for(Path receipt:receipts)DuckDbReceipts.read(receipt,(connection,call)->assertEquals("Failed SQL submission "+call,0,call.errorCode()));
             var sessions=DuckDbReceipts.load(observer,receipts,output.resolve("receipts"));
-            DuckDbFacts.load(observer,raw);DuckDbStatements.bind(observer,sessions);DuckDbReceipts.bind(observer);
-            DuckDbTransactions.bind(observer,"data");DuckDbIdentities.bind(observer);
+            DuckDbFacts.load(observer,raw,0);DuckDbStatements.bind(observer,sessions);DuckDbReceipts.bind(observer);
+            DuckDbTransactions.bind(observer,"data",0);DuckDbIdentities.bind(observer);
             assertEquals(0,number(observer,"SELECT count(*) FROM sibench_statements WHERE outcome<>'completed'"));
             assertTrue(number(observer,"SELECT count(*) FROM "+DuckDbFacts.table("transaction")+" WHERE event='commit'")>0);
             assertTrue(number(observer,"SELECT count(*) FROM "+DuckDbFacts.table("transaction")+" WHERE event='rollback'")>0);
@@ -163,7 +162,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             var loaded=Hybench.load(observer,source,output.resolve("Data_1x"));
             assertEquals(8706,loaded.values().stream().mapToLong(Long::longValue).sum());
             Files.writeString(output.resolve("loaded.json"),new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(loaded));
-            var catalog=IndexCatalog.duckDbDefinitions(org.sibench.schema.SourceSchema.hybench(source));
+            var catalog=IndexCatalog.fromSchema(org.sibench.schema.SourceSchema.hybench(source)).definitions();
             observer.setAutoCommit(false);NativeHistory.initialize(observer, org.sibench.config.Engine.DUCKDB);
             for(var index:catalog)if(index.indexId()==0)NativeHistory.install(observer, org.sibench.config.Engine.DUCKDB,index.tableId(),"main",index.table(),index.column());
             observer.commit();observer.setAutoCommit(true);
@@ -173,7 +172,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             observer.commit();observer.setAutoCommit(true);
             Path raw=output.resolve("native.csv");
             sql(observer,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
-                    +"'SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path='"+raw+"')");
+                    +"'SibenchIndex','SibenchIndexRows'],storage_path='"+raw+"')");
             Files.createDirectory(output.resolve("clients"));
             var workload=new ArrayList<>(base);workload.addAll(List.of("workload",repository.toString(),build.toString(),socket.toString()));
             var result=NativeProcess.run("workload",workload,Map.of(),output,output,Duration.ofSeconds(20));
@@ -182,8 +181,8 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             List<Path> receipts;try(var files=Files.list(output.resolve("clients"))){receipts=files.sorted().toList();}
             for(Path receipt:receipts)DuckDbReceipts.read(receipt,(connection,call)->assertEquals("Failed SQL submission "+call,0,call.errorCode()));
             var sessions=DuckDbReceipts.load(observer,receipts,output.resolve("receipts"));
-            DuckDbFacts.load(observer,raw);DuckDbStatements.bind(observer,sessions);DuckDbReceipts.bind(observer);
-            DuckDbTransactions.bind(observer,"data");DuckDbIdentities.bind(observer);DuckDbAccesses.bind(observer,catalog);DuckDbMutations.bind(observer);
+            DuckDbFacts.load(observer,raw,0);DuckDbStatements.bind(observer,sessions);DuckDbReceipts.bind(observer);
+            DuckDbTransactions.bind(observer,"data",0);DuckDbIdentities.bind(observer);DuckDbAccesses.bind(observer,catalog);DuckDbMutations.bind(observer);
             assertEquals(0,number(observer,"SELECT count(*) FROM sibench_statements WHERE outcome<>'completed'"));
             assertTrue(number(observer,"SELECT count(*) FROM sibench_accesses")>0);
             assertTrue(number(observer,"SELECT count(*) FROM sibench_changes")>0);
@@ -199,7 +198,7 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
             }
             for(var row:observed) {
                 var ids=expected.computeIfAbsent(row.record(),ignored->new HashSet<>());
-                if(row.key()!=null)assertTrue(ids.add(DuckDbIdentities.observedRow(observer,row.table(),row.key(),
+                if(row.key()!=null)assertTrue(ids.add(DuckDbIdentitiesTest.observedRow(observer,row.table(),row.key(),
                         row.read(),row.local(),row.query())));
             }
             var trace=output.resolve("workload.pb.zst");var writer=new ProtoTrace.Writer(trace, true);
@@ -242,8 +241,8 @@ public class HybenchNativeCheck extends DuckDbHostFixture {
     /** Separate JVM keeps upstream global configuration and its relative data paths isolated. */
     public static void main(String[] args)throws Exception {
         Path repository=Path.of(args[1]),build=Path.of(args[2]),socket=Path.of(args[3]);
-        String commit=org.sibench.config.ConfigValues.string(org.sibench.config.ConfigValues.object(
-                org.sibench.config.ConfigValues.parse(Files.readString(repository.resolve("config/benchmark/hybench.yaml"))),"source"),"commit");
+        String commit=org.sibench.schema.SourceSchema.read(repository,org.sibench.config.ConfigValues.parse(
+                Files.readString(repository.resolve("config/benchmark/hybench.yaml")))).sourceCommit();
         NativeBuildCheck.verify(repository,"hybench",repository.resolve("benchmark/HyBench-2024"),build,commit);
         var properties=new Properties();properties.setProperty("sf","1x");properties.setProperty("db","duckdb");
         properties.setProperty("contention_num","4");properties.setProperty("risk_rate","0.1");

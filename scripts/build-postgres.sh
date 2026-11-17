@@ -16,14 +16,10 @@ jobs=${JOBS:-4}
 mkdir -p "$(dirname "$BUILD")"
 mkdir "$BUILD" "$BUILD/source"
 check postgres-inputs
-pin=$(git -C "$root" ls-files --stage -- third_party/postgresql | awk '$1 == "160000" && $3 == "0" {print $2}')
-[[ -n "$pin" && $(git -C "$source_dir" rev-parse HEAD) == "$pin" ]] || {
-  echo 'Initialize third_party/postgresql at its repository gitlink before building' >&2; exit 1;
-}
-version=$(git -C "$source_dir" describe --tags --exact-match "$pin")
+version=$(git -C "$source_dir" describe --tags --exact-match "$PIN")
 version=${version#REL_}
 version=${version//_/.}
-git -C "$source_dir" archive "$pin" | tar -x -C "$BUILD/source"
+git -C "$source_dir" archive "$PIN" | tar -x -C "$BUILD/source"
 patch --batch --forward -d "$BUILD/source" -p1 < "$native_dir/postgresql-$version.patch"
 cp "$native_dir/sibench_capture.c" "$BUILD/source/src/backend/access/index/"
 cp "$native_dir/sibench_capture.h" "$BUILD/source/src/include/"

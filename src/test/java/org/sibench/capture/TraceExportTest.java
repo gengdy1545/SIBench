@@ -59,12 +59,10 @@ public class TraceExportTest {
             manifest.put("baseline_operations", baseline.count());
             manifest.put("workload_operations", workload.count());
             manifest.put("last_resolved_version", version);
-            var baseFiles = List.of(ProtoTrace.file("baseline.pb.zst", baseline));
-            var workFiles = List.of(ProtoTrace.file("workload.pb.zst", workload));
             var gson = new Gson();
-            manifest.put("proto_files", Map.of("baseline", baseFiles, "workload", workFiles));
-            manifest.put("baseline_trace_sha256", ProtoTrace.identity(gson.toJsonTree(baseFiles).getAsJsonArray()));
-            manifest.put("workload_trace_sha256", ProtoTrace.identity(gson.toJsonTree(workFiles).getAsJsonArray()));
+            manifest.put("proto_files", Map.of("baseline", ProtoTrace.file(baseline), "workload", ProtoTrace.file(workload)));
+            manifest.put("baseline_trace_sha256", ProtoTrace.identity(baseline.logicalSha256(), baseline.count()));
+            manifest.put("workload_trace_sha256", ProtoTrace.identity(workload.logicalSha256(), workload.count()));
             Path path = directory.resolve("manifest.json");
             Files.writeString(path, gson.toJson(manifest));
             return directory;

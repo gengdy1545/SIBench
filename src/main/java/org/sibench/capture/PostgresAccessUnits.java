@@ -9,7 +9,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Groups one backend's raw PG index events into access units: one unit per index rescan of one
@@ -21,23 +20,13 @@ import java.util.Set;
  * <p>The index scans of one BitmapAnd that ran in the same cycle form a {@link BitmapGroup}: the
  * heap checks only their intersection, so the group, not a single scan, carries the visible count.
  *
- * <p>A trace records a unit's facts either per row (every fetch, heap verdict and result row) or
- * as one {@code scan_summary} written right before the event that settles the unit, with bitmap
- * verdicts aggregated by the inputs that produced each TID ({@code bitmap_verdicts}). A capture
- * with {@code detail = rows} carries both, and every summary must equal what its rows add up to.
+ * <p>A unit's facts arrive as one {@code scan_summary} written right before the event that settles
+ * the unit, with bitmap verdicts aggregated by the inputs that produced each TID
+ * ({@code bitmap_verdicts}).
  */
 final class PostgresAccessUnits {
     static final int SK_ISNULL = 0x01, SK_SEARCHARRAY = 0x20;
     static final int SK_SEARCHNULL = 0x40, SK_SEARCHNOTNULL = 0x80;
-
-    /** How a backend trace records its index accesses, from its {@code capture_start} line. */
-    enum Detail {
-        /** Per-row events and summaries; the summaries are checked against the rows. */
-        ROWS,
-        /** Summaries only. */
-        SUMMARY
-    }
-
 
     enum Source {
         EXECUTOR("executor"),
@@ -90,42 +79,14 @@ final class PostgresAccessUnits {
         long visible;
         int settled;
         boolean sealed, lossy, verdictOutsideIntersection, reported;
-        /** Without per-row candidates, the instrumentation's verdict on the intersection. */
-        final boolean perRow;
+        /** The instrumentation's verdict on the intersection. */
         Boolean summarizedIntersection;
-
-        BitmapGroup(boolean perRow) {
-            this.perRow = perRow;
-        }
 
         /** A candidate every input produced but the heap never checked: the heap stopped early. */
         boolean unresolvedIntersection() throws IOException {
-            if (!perRow) {
-                if (summarizedIntersection == null)
-                    throw new IOException("BitmapAnd group without its intersection verdict");
-                return summarizedIntersection;
-            }
-            return intersectionFromRows();
-        }
-
-        private boolean intersectionFromRows() {
-            Unit smallest = null;
-            for (Unit unit : members)
-                if (smallest == null
-                        || (unit.unresolved == null ? 0 : unit.unresolved.size())
-                                < (smallest.unresolved == null ? 0 : smallest.unresolved.size()))
-                    smallest = unit;
-            if (smallest == null || smallest.unresolved == null) return false;
-            for (String tid : smallest.unresolved) {
-                boolean everywhere = true;
-                for (Unit unit : members)
-                    if (unit != smallest && (unit.unresolved == null || !unit.unresolved.contains(tid))) {
-                        everywhere = false;
-                        break;
-                    }
-                if (everywhere) return true;
-            }
-            return false;
+            if (summarizedIntersection == null)
+                throw new IOException("BitmapAnd group without its intersection verdict");
+            return summarizedIntersection;
         }
     }
 
@@ -136,16 +97,12 @@ final class PostgresAccessUnits {
         final long ordinal;
         final String application;
         final String sql;
-        final Long queryId;
         final StringBuilder plan = new StringBuilder();
-        long units, candidates, visible, returned, writes, rowChanges;
-        long processed = -1;
 
-        Request(long ordinal, String application, String sql, Long queryId) {
+        Request(long ordinal, String application, String sql) {
             this.ordinal = ordinal;
             this.application = application;
             this.sql = sql;
-            this.queryId = queryId;
         }
 
         /** The plan nodes, scan kinds and indexes the request bound, in binding order. */
@@ -172,28 +129,23 @@ final class PostgresAccessUnits {
         final JsonArray keys;
         final Request request;
         final int depth;
-        long events = 1, calls, found, heapFetches, heapVisible, vmVisible, recheck, bitmapTids;
+        long calls, heapVisible, vmVisible, bitmapTids;
         long bitmapHeapVisible;
-        /** Bitmap candidate TIDs still waiting for their heap visibility verdict; null for non-bitmap units. */
-        java.util.Set<String> unresolved;
-        /** The same count, from a summary that carries no TIDs. */
+        /** Bitmap candidate TIDs the heap never checked. */
         long summarizedUnresolved;
         boolean bitmapEnded, bitmapLossy, lastFound, forward, backward;
         /**
          * The MVCC snapshot the scan runs under: PostgreSQL's transaction completion counter as
-         * GetSnapshotData() saw it, plus the running XIDs it reported. Absent (-1) for snapshots
-         * that are not MVCC, such as the planner's endpoint probes.
+         * GetSnapshotData() saw it, with its command ID. Absent (-1) for snapshots that are not
+         * MVCC, such as the planner's endpoint probes.
          */
-        long snapshotCsn = -1, snapshotXmin = -1, snapshotXmax = -1, snapshotCid = -1;
-        long[] snapshotXip;
+        long snapshotCsn = -1, snapshotCid = -1;
         boolean snapshotSuboverflowed;
         /** The bitmap combination this scan feeds, and its BitmapAnd group when it has one. */
         Combination combination = Combination.SINGLE;
         BitmapGroup group;
         /** The scan's position among its bitmap heap node's inputs, in plan order. */
         int position = -1;
-        /** The ledger's decision label, held from the unit's decision until its request finishes. */
-        String decision;
         /**
          * The identities of the visible rows, in scan order, kept as runs of equal indexed values:
          * completed runs (only for array keys, whose elements each need their own count), the
@@ -208,36 +160,20 @@ final class PostgresAccessUnits {
         List<JsonElement> lastPks;
         boolean identityMissing;
 
-        /** Whether a scan key is an array; the keys are fixed when the scan starts. */
-        private final boolean arrayKeys;
-
         Unit(Scan scan, Source source, JsonArray keys, Request request, int depth) {
             this.scan = scan;
             this.source = source;
             this.keys = keys;
             this.request = request;
             this.depth = depth;
-            boolean array = false;
-            for (JsonElement key : keys) array |= key.getAsJsonObject().has("array");
-            this.arrayKeys = array;
         }
 
         boolean bitmap() {
             return scan.kind.equals("bitmap") || bitmapTids > 0 || bitmapEnded;
         }
 
-        /** Candidate TIDs the heap never checked. */
-        long unresolvedCount() {
-            return (unresolved == null ? 0 : unresolved.size()) + summarizedUnresolved;
-        }
-
         String kind() {
             return bitmap() ? "bitmap" : scan.kind;
-        }
-
-        /** Index tuples returned by the access method, or TIDs placed in a bitmap. */
-        long candidates() {
-            return bitmap() ? bitmapTids : found;
         }
 
         /** Rows the index result made visible: heap-checked, all-visible or bitmap candidates. */
@@ -250,46 +186,6 @@ final class PostgresAccessUnits {
             return calls > 0 && !lastFound;
         }
 
-        /**
-         * Passes over the index: a bitmap fills once; a tuple scan starts a pass on its first call
-         * and on the first call after reporting the end ({@code btgettuple} finds no valid
-         * position), so the passes are the end reports plus an unfinished last pass.
-         */
-        long passes() {
-            if (bitmap()) return bitmapEnded ? 1 : 0;
-            return calls == 0 ? 0 : calls - found + (lastFound ? 1 : 0);
-        }
-
-        /**
-         * Tree descents ({@code _bt_first}, PG14's {@code idx_scan}) this unit can have made. A
-         * scan without array keys descends exactly once per pass. Array keys descend once per
-         * element combination, never for an unsatisfiable array, and fewer when the consumer
-         * stops early, so they only bound the count.
-         */
-        long descentsMin() {
-            return arrayKeys() ? 0 : passes();
-        }
-
-        long descentsMax() {
-            if (!arrayKeys()) return passes();
-            long combinations = 1;
-            for (JsonElement key : keys) {
-                JsonElement array = key.getAsJsonObject().get("array");
-                if (array != null && array.isJsonArray())
-                    combinations = Math.multiplyExact(combinations, array.getAsJsonArray().size());
-            }
-            return Math.multiplyExact(passes(), combinations);
-        }
-
-        boolean arrayKeys() {
-            return arrayKeys;
-        }
-
-        java.util.Set<String> unresolved() {
-            if (unresolved == null) unresolved = new java.util.HashSet<>();
-            return unresolved;
-        }
-
         List<Run> runs() {
             if (runs == null) runs = new ArrayList<>();
             return runs;
@@ -299,17 +195,6 @@ final class PostgresAccessUnits {
             if (lastPks == null) lastPks = new ArrayList<>();
             return lastPks;
         }
-
-        /** One visible row, in scan order: extends the last run or starts the next. */
-        void row(JsonElement value, JsonElement pk) {
-            if (lastValue != null && !lastValue.equals(value)) {
-                if (arrayKeys()) runs().add(new Run(lastValue, lastPks == null ? 0 : lastPks.size()));
-                rowsBeforeLastRun += lastPks == null ? 0 : lastPks.size();
-                if (lastPks != null) lastPks.clear();
-            }
-            lastValue = value;
-            lastPks().add(pk);
-        }
     }
 
     /** One bitmap heap node: the scans it checks, how they combine, and its current group. */
@@ -317,9 +202,6 @@ final class PostgresAccessUnits {
         final List<String> inputs = new ArrayList<>();
         Combination combination;
         BitmapGroup current;
-        /** Per-row verdicts since the last summary, by the input positions that claimed them. */
-        final Map<Long, long[]> pending = new HashMap<>();
-        long pendingLossy;
     }
 
     private static final class Session {
@@ -329,26 +211,11 @@ final class PostgresAccessUnits {
         final Map<String, BitmapHeap> feeds = new HashMap<>();
         Request current;
         boolean currentEnded;
-        long pendingProbes;
-        Detail detail;
         boolean seenEvent;
     }
 
-    /** Events a summary capture records only in aggregate. */
-    static final Set<String> PER_ROW =
-            Set.of(
-                    "scan_next",
-                    "heap_visibility",
-                    "vm_visible",
-                    "bitmap_candidate",
-                    "bitmap_end",
-                    "bitmap_heap_candidate",
-                    "bitmap_heap_lossy");
-
     private final Listener listener;
     private Session session;
-    private long requests, nestedExecutors, nestedRows, probesAssigned, probesUnassigned;
-    private long openAtClose, abortedOpen;
 
     PostgresAccessUnits(Listener listener) {
         this.listener = listener;
@@ -358,10 +225,9 @@ final class PostgresAccessUnits {
         session = new Session();
     }
 
-    /** A completed transaction is compiled independently, retaining its source's declared detail. */
-    void continueSession(Detail detail) {
+    /** A completed transaction is compiled independently; its source already opened the stream. */
+    void continueSession() {
         session = new Session();
-        session.detail = detail;
         session.seenEvent = true;
     }
 
@@ -369,12 +235,8 @@ final class PostgresAccessUnits {
         return session.current;
     }
 
-    Detail detail() {
-        return session.detail;
-    }
-
-    /** Routes one event; returns false for events that are not part of request/scan tracking. */
-    boolean accept(JsonObject e) throws IOException {
+    /** Routes one event; events that are not part of request/scan tracking are ignored. */
+    void accept(JsonObject e) throws IOException {
         if (!e.has("req") || !e.has("depth"))
             throw new IOException("Trace lacks request ordinals and executor depth");
         String type = e.get("event").getAsString();
@@ -384,17 +246,9 @@ final class PostgresAccessUnits {
         state.seenEvent = true;
         if (first && !type.equals("capture_start"))
             throw new IOException("Trace does not start with capture_start");
-        if (state.detail == Detail.SUMMARY && PER_ROW.contains(type))
-            throw new IOException("Per-row event in a summary capture: " + type);
         switch (type) {
             case "capture_start" -> {
                 if (!first) throw new IOException("capture_start is not the first event of its trace");
-                state.detail =
-                        switch (e.get("detail").getAsString()) {
-                            case "rows" -> Detail.ROWS;
-                            case "summary" -> Detail.SUMMARY;
-                            default -> throw new IOException("Unknown capture detail " + e.get("detail"));
-                        };
             }
             case "scan_summary" -> summary(e);
             case "bitmap_verdicts" -> verdicts(e);
@@ -407,28 +261,17 @@ final class PostgresAccessUnits {
                 if (depth <= 1) startRequest(e);
                 else if (state.current == null)
                     throw new IOException("Nested executor without a parent request");
-                else nestedExecutors++;
             }
             case "executor_run_end" -> {
                 if (state.current == null)
                     throw new IOException("Executor return without a started request");
-                if (depth <= 1) state.current.processed = e.get("processed").getAsLong();
-                returned(e, depth);
             }
             case "executor_end" -> {
                 if (state.current == null)
                     throw new IOException("Executor end without a started request");
                 if (depth <= 1) state.currentEnded = true;
             }
-            case "transaction_abort" -> {
-                abandonFailedScans();
-            }
-            case "row_change" -> {
-                if (state.current != null) state.current.rowChanges++;
-            }
-            case "index_insert_attempt" -> {
-                if (state.current != null) state.current.writes++;
-            }
+            case "transaction_abort" -> abandonFailedScans();
             case "plan_scan" -> {
                 String id = e.get("scan").getAsString();
                 if (state.scans.containsKey(id))
@@ -460,22 +303,11 @@ final class PostgresAccessUnits {
                 var heap = new BitmapHeap();
                 for (var scan : e.getAsJsonArray("scans")) heap.inputs.add(scan.getAsString());
                 heap.combination = combination(e.get("tree"));
-                BitmapHeap previous = state.heaps.put(e.get("heap").getAsString(), heap);
-                if (previous != null) requireVerdictsSummarized(previous);
+                state.heaps.put(e.get("heap").getAsString(), heap);
                 for (String id : heap.inputs) state.feeds.put(id, heap);
                 bindStarted(heap, e.has("cycle") ? e.get("cycle").getAsLong() : 0);
             }
-            case "bitmap_heap_candidate" -> verdict(e);
-            case "bitmap_heap_lossy" -> {
-                BitmapHeap heap = heap(e);
-                if (heap.combination == Combination.AND && heap.current != null)
-                    heap.current.lossy = true;
-                for (Unit unit : bitmapUnits(heap)) unit.bitmapLossy = true;
-                if (state.detail == Detail.ROWS) heap.pendingLossy++;
-            }
             case "scan_rescan" -> rescan(e, depth);
-            case "scan_next", "heap_visibility", "vm_visible", "bitmap_candidate", "bitmap_end" ->
-                    fetch(e, type);
             case "scan_end" -> {
                 String id = e.get("scan").getAsString();
                 Scan scan = state.scans.remove(id);
@@ -485,17 +317,13 @@ final class PostgresAccessUnits {
                 if (heap != null && heap.current != null) heap.current.sealed = true;
                 if (scan.current != null) settle(scan.current);
             }
-            default -> {
-                return false;
-            }
+            default -> {}
         }
-        return true;
     }
 
     /** Scans can stay open only while the last request is still executing at connection close. */
     void endSession() throws IOException {
         Session state = session;
-        for (BitmapHeap heap : state.heaps.values()) requireVerdictsSummarized(heap);
         sealGroups();
         for (Scan scan : state.scans.values()) {
             Unit unit = scan.current;
@@ -503,11 +331,9 @@ final class PostgresAccessUnits {
             if (unit.source != Source.PLANNER_PROBE
                     && (unit.request != state.current || state.currentEnded))
                 throw new IOException("Index scan left open before its request ended");
-            openAtClose++;
             settle(unit);
         }
         finishRequest();
-        probesUnassigned += state.pendingProbes;
         session = null;
     }
 
@@ -528,7 +354,6 @@ final class PostgresAccessUnits {
             if (unit.source != Source.PLANNER_PROBE
                     && (unit.request != state.current || state.currentEnded))
                 throw new IOException("Index scan of a completed request survived the abort");
-            abortedOpen++;
             settle(unit);
             iterator.remove();
         }
@@ -542,14 +367,14 @@ final class PostgresAccessUnits {
             if (scan == null || scan.current == null || scan.current.source == Source.PLANNER_PROBE)
                 continue;
             Unit unit = scan.current;
-            if (unit.group != null || unit.events > 1)
+            if (unit.group != null)
                 throw new IOException("Bitmap input ran before its heap node bound it: " + id);
             unit.combination = heap.combination;
             unit.position = heap.inputs.indexOf(id);
             if (heap.combination != Combination.AND) continue;
             if (group == null) {
                 if (cycle <= 0) throw new IOException("BitmapAnd binding without its first cycle");
-                group = new BitmapGroup(session.detail != Detail.SUMMARY);
+                group = new BitmapGroup();
                 group.cycle = cycle;
             }
             group.members.add(unit);
@@ -585,12 +410,8 @@ final class PostgresAccessUnits {
                 new Request(
                         e.get("req").getAsLong(),
                         e.get("application").getAsString(),
-                        e.has("sql") ? e.get("sql").getAsString() : "",
-                        e.has("query_id") ? e.get("query_id").getAsLong() : null);
-        probesAssigned += state.pendingProbes;
-        state.pendingProbes = 0;
+                        e.has("sql") ? e.get("sql").getAsString() : "");
         state.currentEnded = false;
-        requests++;
         listener.requestStarted(state.current, e);
     }
 
@@ -652,25 +473,19 @@ final class PostgresAccessUnits {
             unit.position = heap.inputs.indexOf(id);
             if (heap.combination == Combination.AND) {
                 if (heap.current == null || heap.current.sealed) {
-                    heap.current = new BitmapGroup(state.detail != Detail.SUMMARY);
+                    heap.current = new BitmapGroup();
                     heap.current.cycle = cycle;
                 }
                 heap.current.members.add(unit);
                 unit.group = heap.current;
             }
         }
-        if (source == Source.PLANNER_PROBE) state.pendingProbes++;
         // A copied or imported snapshot leaves the counter at zero, which is not a position.
         if (e.has("csn") && e.get("csn").getAsLong() > 0) {
             unit.snapshotCsn = e.get("csn").getAsLong();
             unit.snapshotCid = e.has("snapshot_cid") ? e.get("snapshot_cid").getAsLong() : -1;
-            unit.snapshotXmin = e.get("xmin").getAsLong();
-            unit.snapshotXmax = e.get("xmax").getAsLong();
             unit.snapshotSuboverflowed =
                     e.has("suboverflowed") && e.get("suboverflowed").getAsBoolean();
-            var running = e.getAsJsonArray("xip");
-            unit.snapshotXip = new long[running.size()];
-            for (int i = 0; i < running.size(); i++) unit.snapshotXip[i] = running.get(i).getAsLong();
         }
         listener.unitStarted(unit, e);
     }
@@ -681,58 +496,6 @@ final class PostgresAccessUnits {
         JsonObject key = keys.get(0).getAsJsonObject();
         return key.get("strategy").getAsInt() == 0
                 && (key.get("flags").getAsInt() & SK_SEARCHNOTNULL) != 0;
-    }
-
-    private void fetch(JsonObject e, String type) throws IOException {
-        Scan scan = session.scans.get(e.get("scan").getAsString());
-        if (scan == null || scan.current == null)
-            throw new IOException("Index event without an access unit: " + type);
-        Unit unit = scan.current;
-        boolean found = e.get("found").getAsBoolean();
-        unit.events++;
-        switch (type) {
-            case "scan_next" -> {
-                unit.calls++;
-                unit.lastFound = found;
-                int direction = e.get("direction").getAsInt();
-                if (direction > 0) unit.forward = true;
-                else if (direction < 0) unit.backward = true;
-                if (found) unit.found++;
-                if (found && e.get("recheck").getAsBoolean()) unit.recheck++;
-            }
-            case "heap_visibility" -> {
-                unit.heapFetches++;
-                if (found) {
-                    unit.heapVisible++;
-                    identity(unit, e);
-                }
-            }
-            case "vm_visible" -> {
-                unit.vmVisible++;
-                unit.identityMissing = true;
-            }
-            case "bitmap_candidate" -> {
-                unit.bitmapTids++;
-                unit.unresolved().add(e.get("tid").getAsString());
-            }
-            default -> unit.bitmapEnded = true;
-        }
-    }
-
-    /** The identity of one visible heap row: the scanning index's value and the table's PK. */
-    private static void identity(Unit unit, JsonObject e) throws IOException {
-        if (!e.has("row"))
-            throw new IOException(
-                    "Visible heap row without its identity; recapture with the current"
-                            + " instrumentation");
-        JsonObject row = e.getAsJsonObject("row");
-        JsonArray indexed = row.getAsJsonArray("indexed"), pk = row.getAsJsonArray("pk");
-        // The source layouts index one column and key one column; anything else has no identity.
-        if (indexed.size() != 1 || pk.size() != 1) {
-            unit.identityMissing = true;
-            return;
-        }
-        unit.row(indexed.get(0), pk.get(0));
     }
 
     private BitmapHeap heap(JsonObject e) throws IOException {
@@ -749,39 +512,6 @@ final class PostgresAccessUnits {
             if (scan != null && scan.current != null) result.add(scan.current);
         }
         return result;
-    }
-
-    /**
-     * PostgreSQL's heap verdict for one candidate TID of an exact bitmap page. Every index scan
-     * that produced the TID (both sides of a BitmapOr, say) gets it, so each index counts its own
-     * visible matches. A BitmapAnd checks only the intersection of its group's inputs: every
-     * input of the cycle must have produced the TID, and the group counts it once.
-     */
-    private void verdict(JsonObject e) throws IOException {
-        BitmapHeap heap = heap(e);
-        String tid = e.get("tid").getAsString();
-        boolean found = e.get("found").getAsBoolean(), claimed = false;
-        long inputs = 0;
-        if (heap.combination == Combination.AND) {
-            BitmapGroup group = heap.current;
-            if (group == null) throw new IOException("BitmapAnd verdict without a cycle: " + tid);
-            for (Unit unit : group.members)
-                if (unit.unresolved != null && unit.unresolved.remove(tid)) {
-                    claimed = true;
-                    inputs |= 1L << heap.inputs.indexOf(unit.scan.id);
-                    if (found) unit.bitmapHeapVisible++;
-                } else group.verdictOutsideIntersection = true;
-            if (found) group.visible++;
-        } else
-            for (Unit unit : bitmapUnits(heap))
-                if (unit.unresolved != null && unit.unresolved.remove(tid)) {
-                    claimed = true;
-                    inputs |= 1L << heap.inputs.indexOf(unit.scan.id);
-                    if (found) unit.bitmapHeapVisible++;
-                }
-        if (!claimed) throw new IOException("Bitmap heap verdict without its candidate: " + tid);
-        if (session.detail == Detail.ROWS)
-            heap.pending.computeIfAbsent(inputs, ignored -> new long[2])[found ? 0 : 1]++;
     }
 
     /**
@@ -805,15 +535,6 @@ final class PostgresAccessUnits {
             long[] counts = sets.computeIfAbsent(inputs, ignored -> new long[2]);
             counts[0] += set.get("visible").getAsLong();
             counts[1] += set.get("invisible").getAsLong();
-        }
-        if (session.detail == Detail.ROWS) {
-            if (lossy != heap.pendingLossy || !sameCounts(sets, heap.pending))
-                throw new IOException(
-                        "Bitmap verdict summary differs from per-row verdicts of heap "
-                                + e.get("heap").getAsString());
-            heap.pending.clear();
-            heap.pendingLossy = 0;
-            return;
         }
         if (lossy > 0) {
             if (heap.combination == Combination.AND && heap.current != null)
@@ -849,31 +570,13 @@ final class PostgresAccessUnits {
         }
     }
 
-    private static boolean sameCounts(Map<Long, long[]> a, Map<Long, long[]> b) {
-        var left = new HashMap<Long, List<Long>>();
-        var right = new HashMap<Long, List<Long>>();
-        a.forEach((k, v) -> { if (v[0] + v[1] > 0) left.put(k, List.of(v[0], v[1])); });
-        b.forEach((k, v) -> { if (v[0] + v[1] > 0) right.put(k, List.of(v[0], v[1])); });
-        return left.equals(right);
-    }
-
-    /** Every per-row verdict and lossy page reached a summary before the node was rebound. */
-    private void requireVerdictsSummarized(BitmapHeap heap) throws IOException {
-        if (session.detail == Detail.ROWS && (!heap.pending.isEmpty() || heap.pendingLossy != 0))
-            throw new IOException("Per-row bitmap verdicts without their summary");
-    }
-
-    /**
-     * The facts of the scan's current unit, written right before the event that settles it. In a
-     * ROWS capture every fact must equal what the unit's per-row events added up to.
-     */
+    /** The facts of the scan's current unit, written right before the event that settles it. */
     private void summary(JsonObject e) throws IOException {
         String id = e.get("scan").getAsString();
         Scan scan = session.scans.get(id);
         if (scan == null || scan.current == null)
             throw new IOException("Scan summary without an access unit: " + id);
         Unit unit = scan.current;
-        unit.events++;
         if (e.has("fetched_before_binding"))
             throw new IOException("Bitmap input ran before its heap node bound it: " + id);
         if (e.has("candidates_after_verdict"))
@@ -896,46 +599,10 @@ final class PostgresAccessUnits {
                         : null;
         if (intersection != null && unit.group == null)
             throw new IOException("Intersection verdict for a unit outside any BitmapAnd: " + id);
-        if (session.detail == Detail.ROWS) {
-            var differences = new ArrayList<String>();
-            same(differences, "calls", e, unit.calls);
-            same(differences, "found", e, unit.found);
-            same(differences, "last_found", e, unit.lastFound);
-            same(differences, "forward", e, unit.forward);
-            same(differences, "backward", e, unit.backward);
-            same(differences, "recheck", e, unit.recheck);
-            same(differences, "heap_fetches", e, unit.heapFetches);
-            same(differences, "heap_visible", e, unit.heapVisible);
-            same(differences, "vm_visible", e, unit.vmVisible);
-            same(differences, "bitmap_tids", e, unit.bitmapTids);
-            same(differences, "bitmap_unresolved", e, unit.unresolved == null ? 0L : (long) unit.unresolved.size());
-            same(differences, "bitmap_ended", e, unit.bitmapEnded);
-            same(differences, "identity_missing", e, unit.identityMissing);
-            if (limited) {
-                same(differences, "rows_before_last_run", e, unit.rowsBeforeLastRun);
-                if (!runs.equals(unit.runs == null ? List.of() : unit.runs)) differences.add("runs");
-                if (!java.util.Objects.equals(last, unit.lastValue)) differences.add("last_value");
-                if (!pks.equals(unit.lastPks == null ? List.of() : unit.lastPks)) differences.add("last_pks");
-            }
-            if (intersection != null && intersection != unit.group.intersectionFromRows())
-                differences.add("group_unresolved_intersection");
-            if (!differences.isEmpty())
-                throw new IOException(
-                        "Scan summary differs from per-row events of "
-                                + scan.index
-                                + " request r"
-                                + (unit.request == null ? "-" : unit.request.ordinal)
-                                + ": "
-                                + differences);
-            return;
-        }
         unit.calls = e.get("calls").getAsLong();
-        unit.found = e.get("found").getAsLong();
         unit.lastFound = e.get("last_found").getAsBoolean();
         unit.forward = e.get("forward").getAsBoolean();
         unit.backward = e.get("backward").getAsBoolean();
-        unit.recheck = e.get("recheck").getAsLong();
-        unit.heapFetches = e.get("heap_fetches").getAsLong();
         unit.heapVisible = e.get("heap_visible").getAsLong();
         unit.vmVisible = e.get("vm_visible").getAsLong();
         unit.bitmapTids = e.get("bitmap_tids").getAsLong();
@@ -951,32 +618,7 @@ final class PostgresAccessUnits {
         if (intersection != null) unit.group.summarizedIntersection = intersection;
     }
 
-    private static void same(List<String> differences, String field, JsonObject e, long value) {
-        if (e.get(field).getAsLong() != value)
-            differences.add(field + " " + e.get(field) + " != " + value);
-    }
-
-    private static void same(List<String> differences, String field, JsonObject e, boolean value) {
-        if (e.get(field).getAsBoolean() != value)
-            differences.add(field + " " + e.get(field) + " != " + value);
-    }
-
-    /** Count returned rows; access detail never contains query-result values. */
-    private void returned(JsonObject e, int depth) throws IOException {
-        if (!e.has("returned") || e.get("returned").getAsLong() < 0)
-            throw new IOException("Executor return without a nonnegative result count");
-        long returned = e.get("returned").getAsLong();
-        if (depth <= 1) session.current.returned += returned;
-        else nestedRows += returned;
-    }
-
     private void settle(Unit unit) throws IOException {
-        Request request = unit.request;
-        if (request != null) {
-            request.units++;
-            request.candidates += unit.candidates();
-            request.visible += unit.visible();
-        }
         unit.scan.current = null;
         listener.unitSettled(unit);
         BitmapGroup group = unit.group;
@@ -1001,33 +643,5 @@ final class PostgresAccessUnits {
         if (request == null) return;
         listener.requestFinished(request);
         state.current = null;
-    }
-
-    long requests() {
-        return requests;
-    }
-
-    long nestedExecutors() {
-        return nestedExecutors;
-    }
-
-    long nestedRows() {
-        return nestedRows;
-    }
-
-    long probesAssigned() {
-        return probesAssigned;
-    }
-
-    long probesUnassigned() {
-        return probesUnassigned;
-    }
-
-    long openAtClose() {
-        return openAtClose;
-    }
-
-    long abortedOpen() {
-        return abortedOpen;
     }
 }

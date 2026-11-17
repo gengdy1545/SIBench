@@ -20,8 +20,7 @@ resolve Trace paths.
 | Path | Contents |
 | --- | --- |
 | `scripts/trace/` | Operation mix, access locality and update locality. |
-| `scripts/index/`, `scripts/pixels/` | Reserved for Index Service and Pixels plots; none yet. |
-| `config/global_config.py` | Paths, window and sort settings, widths, typography, colors, export. |
+| `config/global_config.py` | Paths, widths, typography, colors, export. |
 | `config/*_config.py` | One file per figure: `TRACES` selection, size, labels and local overrides. |
 
 Run scripts from any directory; paths resolve from the repository root. Outputs use
@@ -66,7 +65,7 @@ python3 graph/scripts/trace/plot_access_locality.py
 
 Preparation runs `analyze-accesses` (below) for each selected Trace; plotting reads its
 output. Rerun plotting after appearance changes, and preparation after a change of
-Trace, analyzer or window. Plotting rejects stale or mismatched analyses.
+Trace, analyzer or runtime configuration. Plotting rejects stale or mismatched analyses.
 
 `analyze-accesses` validates the full Trace, loads the baseline and committed history
 into the local versioned RocksDB backend, and executes each read at its snapshot with
@@ -74,16 +73,15 @@ its private writes. It rejects result-count mismatches.
 
 ```bash
 java -jar build/sibench/sibench.jar analyze-accesses \
-  config/sibench.yaml ycsb-a results/analysis/trace/ycsb-a/accesses \
-  10000 134217728
+  config/sibench.yaml ycsb-a results/analysis/trace/ycsb-a/accesses
 ```
 
-The last two arguments are requests per window and the byte budget of each external
-sort.
+The runtime configuration's `analysis.accesses` sets requests per window
+(`window_requests`) and the byte budget of each external sort (`sort_memory_bytes`).
 
 **Counting.** Hits are kept per exact `(table, primary key)` per window; there are no
-bins or ranks. A window holds `WINDOW_REQUESTS` exported workload requests (default
-10,000; shorter inputs give one window). A Scan returning N rows adds N hits to its
+bins or ranks. A window holds `window_requests` exported workload requests (10,000 in
+the public configuration; shorter inputs give one window). A Scan returning N rows adds N hits to its
 window; every exported Put or Delete adds one write hit, including secondary
 maintenance. Counts are returned rows and write entries, not entries examined,
 physical I/O or compaction cost.

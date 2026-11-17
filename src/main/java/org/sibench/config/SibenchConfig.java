@@ -84,7 +84,7 @@ public final class SibenchConfig {
         var result = new java.util.LinkedHashMap<String, String>();
         for (var entry : settings.entrySet()) {
             require(entry.getKey().matches("[a-z_][a-z0-9_.]*"), "Invalid PostgreSQL setting name: " + entry.getKey());
-            require(!Set.of("listen_addresses", "port", "unix_socket_directories", "compute_query_id", "data_directory",
+            require(!Set.of("listen_addresses", "port", "unix_socket_directories", "data_directory",
                     "hba_file", "ident_file", "external_pid_file", "session_replication_role").contains(entry.getKey()),
                     "PostgreSQL setting is assigned by the generator: " + entry.getKey());
             Object value = entry.getValue();

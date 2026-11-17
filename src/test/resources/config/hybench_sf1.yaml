@@ -4,7 +4,6 @@ purpose: native_capture
 benchmark: hybench
 source:
   path: benchmark/HyBench-2024
-  commit: eaad91b52956fddd3d48ce49f792928056b7b360
 native:
   build_directory: build/benchmarks/HyBench-2024
   sf: 1x

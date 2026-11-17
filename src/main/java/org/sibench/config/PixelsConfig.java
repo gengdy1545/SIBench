@@ -14,9 +14,9 @@ import java.util.Set;
 import java.util.TreeMap;
 
 /**
- * Pixels CDC generation settings. The property files hold overrides of the pinned upstream
- * defaults, including optional fixed service ports. Hosts, run directories and switches that define
- * the generated Trace's semantics belong to the generator and are rejected here.
+ * Pixels engine settings for CDC preparation, baseline preparation and experiments. The property files
+ * hold overrides of the pinned upstream defaults, including optional fixed service ports. Hosts, run
+ * directories and switches that define the produced artifacts' semantics belong to SIBench and are rejected here.
  */
 public final class PixelsConfig {
     private PixelsConfig() {}
@@ -26,6 +26,9 @@ public final class PixelsConfig {
             "retina.server.port", "retina", "node.server.port", "node", "query.schedule.server.port", "query",
             "index.server.port", "index", "scaling.metrics.server.port", "scaling", "worker.coordinate.server.port", "worker");
 
+    private static final Set<String> OPTIONS = Set.of("build_directory", "pixels_host", "memory", "load", "source",
+            "properties", "sink_properties", "data_storage");
+    private static final String HEAP = "[1-9][0-9]*[mg]";
     private static final Set<String> PIXELS_OWNED = Set.of("pixels.var.dir", "etcd.hosts", "retina.enable",
             "index.server.enabled", "enabled.single.point.index.schemes", "enabled.main.index.scheme",
             "retina.storage.gc.enabled", "retina.upsert-mode.enabled", "retina.tile.visibility.capacity");
@@ -39,8 +42,9 @@ public final class PixelsConfig {
     static Map<String, Object> read(Path directory, Map<String, Object> settings, Map<String, Object> runtime) throws IOException {
         var required = new LinkedHashMap<>(settings);
         required.remove("data_storage");
-        SibenchConfig.keys(required, Set.of("build_directory", "pixels_host", "memory", "load", "source",
-                "properties", "sink_properties"), "pixels");
+        var keys = new java.util.HashSet<>(OPTIONS);
+        keys.remove("data_storage");
+        SibenchConfig.keys(required, keys, "pixels");
         String host = string(settings, "pixels_host");
         require(host.equals("local") || host.matches("[A-Za-z0-9.-]+:[1-9][0-9]{0,4}"),
                 "pixels_host must be local or HOST:PORT");
@@ -48,7 +52,7 @@ public final class PixelsConfig {
                 "Invalid Pixels host port");
         var memory = object(settings, "memory");
         SibenchConfig.keys(memory, Set.of("coordinator_heap", "retina_heap", "sink_heap"), "pixels memory");
-        for (String key : memory.keySet()) require(string(memory, key).matches("[1-9][0-9]*[mg]"), "Invalid JVM heap: " + key);
+        for (String key : memory.keySet()) require(string(memory, key).matches(HEAP), "Invalid JVM heap: " + key);
         var load = object(settings, "load");
         SibenchConfig.keys(load, Set.of("rows_per_file", "threads"), "pixels load");
         positive(load, "rows_per_file");
@@ -70,12 +74,10 @@ public final class PixelsConfig {
     }
 
     static Map<String,Object> readSource(Path directory,Map<String,Object> settings)throws IOException {
-        for(String key:settings.keySet())
-            require(Set.of("build_directory","pixels_host","memory","load","source","properties","sink_properties","data_storage")
-                    .contains(key),"Unknown pixels engine option: "+key);
+        for(String key:settings.keySet())require(OPTIONS.contains(key),"Unknown pixels engine option: "+key);
         var source=object(settings,"source");sourceSettings(source);
         String heap=string(object(settings,"memory"),"sink_heap");
-        require(heap.matches("[1-9][0-9]*[mg]"),"Invalid JVM heap: sink_heap");
+        require(heap.matches(HEAP),"Invalid JVM heap: sink_heap");
         return Map.of("build_directory",string(settings,"build_directory"),"source",source,
                 "memory",Map.of("sink_heap",heap),
                 "sink_properties",sinkProperties(properties(directory.resolve(string(settings,"sink_properties")))));
@@ -109,7 +111,7 @@ public final class PixelsConfig {
         for (String key : overrides.keySet()) {
             require(SINK_OVERRIDES.contains(key), "Unsupported or generator-owned pixels-sink property: " + key);
             require(!key.equals("sink.monitor.freshness.level") || overrides.get(key).equals("none"),
-                    "Pixels CDC generation disables freshness query workloads");
+                    "Sink freshness is enabled only by pixels_experiment.freshness");
             require(!key.equals("sink.proto.maxRecords") || Integer.parseInt(overrides.get(key)) > 0,
                     "sink.proto.maxRecords must be a positive transaction count");
             require(overrides.get(key).indexOf('\n') < 0 && overrides.get(key).indexOf('\r') < 0,

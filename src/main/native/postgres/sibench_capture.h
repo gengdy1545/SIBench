@@ -2,10 +2,9 @@
  * PostgreSQL 14.24 capture instrumentation: declarations shared by the patched backend files and
  * the row trigger module. The implementation is sibench_capture.c, linked into the backend.
  *
- * By default an index access is recorded as one summary when it ends, not one event per row:
- * the counters, last-run identities and bitmap verdict attributions the access ledger needs, all
- * accumulated from the same executor hooks. SIBENCH_CAPTURE_DETAIL=rows additionally keeps every
- * per-row event, so one native run carries both and the ledger checks that they agree.
+ * An index access is recorded as one summary when it ends, not one event per row: the counters,
+ * last-run identities and bitmap verdict attributions the access ledger needs, all accumulated
+ * from the executor hooks.
  */
 #ifndef SIBENCH_CAPTURE_H
 #define SIBENCH_CAPTURE_H
@@ -16,7 +15,6 @@
 #include "lib/stringinfo.h"
 #include "nodes/execnodes.h"
 #include "nodes/tidbitmap.h"
-#include "tcop/dest.h"
 #include "utils/rel.h"
 
 extern char *application_name;
@@ -40,9 +38,8 @@ extern void sib_datum(StringInfo out, Oid type, Datum datum, bool isnull);
 
 /* Executor and transaction boundaries. */
 extern void sib_executor_start(QueryDesc *queryDesc);
-extern DestReceiver *sib_wrap_receiver(DestReceiver *original);
-extern void sib_executor_run_end(DestReceiver *dest, uint64 processed, bool read_complete);
-extern void sib_executor_end(uint64 processed);
+extern void sib_executor_run_end(uint64 processed, bool read_complete);
+extern void sib_executor_end(void);
 extern void sib_transaction_commit(void);
 extern void sib_capture_check_failure(void);
 extern void sib_transaction_abort(void);
@@ -57,7 +54,7 @@ extern void sib_index_rescan(IndexScanDesc scan, ScanKey keys, int nkeys);
 extern void sib_index_end(IndexScanDesc scan);
 extern void sib_index_next(IndexScanDesc scan, ScanDirection direction, bool found);
 extern void sib_heap_visibility(IndexScanDesc scan, TupleTableSlot *slot, bool found);
-extern void sib_vm_visible(IndexScanDesc scan, ItemPointer tid);
+extern void sib_vm_visible(IndexScanDesc scan);
 
 /* Bitmap scans. */
 extern void sib_bitmap_candidates(IndexScanDesc scan, const ItemPointer tids, int ntids);
@@ -70,8 +67,5 @@ extern void sib_bitmap_lossy(Relation heap, void *node);
 
 /* Writes. */
 extern void sib_row_change(Relation relation, TupleTableSlot *oldslot, TupleTableSlot *newslot, CommandId cid);
-extern void sib_index_insert(Relation relation, Datum *values, bool *isnull, ItemPointer tid, int unique);
-extern void sib_index_build_start(Relation index);
-extern void sib_index_build_end(Relation index, double heap_rows, double index_rows);
 
 #endif

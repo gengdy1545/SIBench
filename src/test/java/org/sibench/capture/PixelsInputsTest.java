@@ -14,6 +14,23 @@ import org.sibench.schema.SourceSchema;
 public class PixelsInputsTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
+    @Test public void postgresTypesMapToPixelsTypesOrFail() throws Exception {
+        assertEquals("int", PixelsSchema.type("integer"));
+        assertEquals("float", PixelsSchema.type("real"));
+        assertEquals("char(6)", PixelsSchema.type("character(6)"));
+        assertEquals("varchar", PixelsSchema.type("character varying"));
+        assertEquals("varchar(64)", PixelsSchema.type("character varying(64)"));
+        assertEquals("timestamp(6)", PixelsSchema.type("timestamp without time zone"));
+        assertEquals("timestamp(3)", PixelsSchema.type("timestamp(3) without time zone"));
+        assertEquals("decimal(15,2)", PixelsSchema.type("numeric(15,2)"));
+        assertEquals(256, PixelsSchema.bound(0));
+        assertEquals(256, PixelsSchema.bound(256));
+        assertEquals(512, PixelsSchema.bound(257));
+        assertThrows(IllegalArgumentException.class, () -> PixelsSchema.bound(70000));
+        for (String unsupported : new String[] {"numeric(10)", "numeric", "text", "timestamp with time zone", "boolean"})
+            assertThrows(unsupported, IOException.class, () -> PixelsSchema.type(unsupported));
+    }
+
     @Test public void csvDistinguishesNullQuotedEmptyCommasAndEscapedQuotes() throws Exception {
         assertEquals(Arrays.asList("1", null, "", "a,b", "a\"b", null), PixelsInputs.csv("1,,\"\",\"a,b\",\"a\"\"b\","));
         for (String bad : List.of("\"unclosed", "a\"b", "\"a\"b"))

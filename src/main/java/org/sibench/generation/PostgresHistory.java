@@ -21,14 +21,14 @@ final class PostgresHistory {
         }
         String identities="sibench_history.identities_"+id;
         sql(database,"CREATE UNLOGGED TABLE "+identities+" AS SELECT nextval('sibench_history.row_ids') AS _sib_row_id,"
-                +pk+",0::BIGINT AS _sib_tx,0::BIGINT AS _sib_query FROM "+source);
+                +pk+",0::BIGINT AS _sib_tx FROM "+source);
         sql(database,"CREATE UNIQUE INDEX identity_row_"+id+" ON "+identities+"(_sib_row_id)");
         sql(database,"CREATE INDEX identity_key_"+id+" ON "+identities+"("+pk+")");
         sql(database,"CREATE TRIGGER sibench_row_identity AFTER INSERT ON "+identities
                 +" FOR EACH ROW EXECUTE FUNCTION sibench_history.row_identity('"+id+"')");
         // An insert allocates the new row's RowID; the projection resolves later writes by key.
         function(database,"insert_"+id,"INSERT INTO "+identities+" SELECT nextval('sibench_history.row_ids'),"+pk
-                +",txid_current(),sibench_history.query_id() FROM new_rows; RETURN NULL;");
+                +",txid_current() FROM new_rows; RETURN NULL;");
         trigger(database,"insert_"+id,"AFTER INSERT",source,"REFERENCING NEW TABLE AS new_rows");
         function(database,"primary_key_"+id,"RAISE EXCEPTION 'Primary key assignments are unsupported by RowID identities';");
         trigger(database,"primary_key_"+id,"BEFORE UPDATE OF "+pk,source,"");

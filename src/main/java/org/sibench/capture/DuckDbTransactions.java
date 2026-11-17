@@ -29,16 +29,7 @@ public final class DuckDbTransactions {
         } finally {database.setAutoCommit(true);}
     }
 
-    public static void finish(Connection database) throws SQLException {
-        reject(database,"SELECT 1 FROM sibench_history.transactions HAVING coalesce(max(version),0)<>count(*)",
-                "Incomplete native resolution sequence");
-    }
-
     /** Bind statements first. Empty statements without a native storage transaction need no replay transaction. */
-    public static void bind(Connection database, String databaseName) throws SQLException {
-        bind(database,databaseName,0);
-    }
-
     public static void bind(Connection database, String databaseName, long prefix) throws SQLException {
         if(prefix<0)throw new IllegalArgumentException("Negative resolved prefix");
         if (!database.getAutoCommit()) throw new SQLException("Transaction binding requires an idle connection");
@@ -105,10 +96,6 @@ public final class DuckDbTransactions {
                     + "JOIN temp.main.sibench_statements s USING(connection_id, transaction_id, query_id) "
                     + "JOIN temp.main.sibench_transactions t USING(connection_id, transaction_id) "
                     + "WHERE f.snapshot_start<>t.snapshot_start LIMIT 1", "Index access disagrees with native snapshot");
-            execute(database, "CREATE TEMP VIEW sibench_read_points AS SELECT s.*, t.engine_transaction, t.version, "
-                    + "t.read_version, t.snapshot_start, t.outcome AS transaction_outcome "
-                    + "FROM temp.main.sibench_statements s JOIN temp.main.sibench_transactions t "
-                    + "USING(connection_id, transaction_id)");
             database.commit();
         } catch (SQLException | RuntimeException failure) {
             try { database.rollback(); } catch (SQLException rollback) { failure.addSuppressed(rollback); }

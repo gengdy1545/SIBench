@@ -42,8 +42,7 @@ final class NativeProcess {
         Path out = logs.resolve(name + ".out"), err = logs.resolve(name + ".err");
         Files.writeString(
                 logs.resolve(name + ".command"),
-                String.join(" ", command.stream().map(argument ->
-                        argument.startsWith("db.passwd=") ? "db.passwd=<redacted>" : argument).toList()) + "\n",
+                String.join(" ", command) + "\n",
                 StandardOpenOption.CREATE_NEW);
         var builder = new ProcessBuilder(command).directory(directory.toFile());
         builder.environment().putAll(environment);

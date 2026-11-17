@@ -2,19 +2,19 @@ package org.sibench.capture;
 
 import static org.junit.Assert.*;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.Test;
+import org.sibench.generation.DuckDbHostFixture;
 
-public class DuckDbTransactionsTest {
+public class DuckDbTransactionsTest extends DuckDbHostFixture {
     private static void execute(Connection database, String sql) throws SQLException {
         try (var statement = database.createStatement()) { statement.execute(sql); }
     }
 
     private Connection fixture() throws Exception {
-        var database = DriverManager.getConnection("jdbc:duckdb:");
+        var database = connect();
         execute(database, "CREATE TEMP TABLE sibench_statements(connection_id BIGINT, transaction_id BIGINT, query_id BIGINT)");
         execute(database, "INSERT INTO sibench_statements VALUES(1,1,1),(2,2,2),(1,3,3),(2,4,4),(1,5,5)");
         execute(database, "CREATE TEMP TABLE sibench_transaction(database_name VARCHAR, connection_id BIGINT, "
@@ -40,7 +40,7 @@ public class DuckDbTransactionsTest {
 
     @Test public void mapsNativeCommitOrderAndSnapshotsWhilePreservingAbortSlots() throws Exception {
         try (var database = fixture()) {
-            DuckDbTransactions.bind(database, "data");
+            DuckDbTransactions.bind(database, "data",0);
             var actual = new ArrayList<String>();
             try (var statement = database.createStatement(); var rows = statement.executeQuery(
                     "SELECT transaction_id,version,read_version,outcome FROM sibench_transactions ORDER BY version")) {
@@ -63,7 +63,7 @@ public class DuckDbTransactionsTest {
                 "DELETE FROM sibench_transaction WHERE transaction_id=2")) {
             try (var database = fixture()) {
                 execute(database, corrupt);
-                assertThrows(corrupt, SQLException.class, () -> DuckDbTransactions.bind(database, "data"));
+                assertThrows(corrupt, SQLException.class, () -> DuckDbTransactions.bind(database, "data",0));
                 assertTrue(database.getAutoCommit());
                 try (var statement = database.createStatement(); var rows = statement.executeQuery(
                         "SELECT count(*) FROM duckdb_tables() WHERE table_name='sibench_transactions'")) {
@@ -76,8 +76,8 @@ public class DuckDbTransactionsTest {
     @Test public void statementsWithoutStorageTransactionsDoNotInventResolutions() throws Exception {
         try (var database = fixture()) {
             execute(database, "DELETE FROM sibench_transaction"); execute(database, "DELETE FROM sibench_index");
-            DuckDbTransactions.bind(database, "data");
-            try (var statement = database.createStatement(); var rows = statement.executeQuery("SELECT count(*) FROM sibench_read_points")) {
+            DuckDbTransactions.bind(database, "data",0);
+            try (var statement = database.createStatement(); var rows = statement.executeQuery("SELECT count(*) FROM sibench_transactions")) {
                 assertTrue(rows.next()); assertEquals(0, rows.getLong(1));
             }
         }

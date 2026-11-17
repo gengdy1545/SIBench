@@ -14,6 +14,10 @@ import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.junit.Test;
+import org.sibench.config.ConfigValues;
+import org.sibench.config.Engine;
+import org.sibench.config.PixelsConfig;
+import org.sibench.config.SibenchConfig;
 
 public class PixelsHostTest {
     @org.junit.Rule public org.junit.rules.TemporaryFolder temporary = new org.junit.rules.TemporaryFolder();
@@ -37,6 +41,56 @@ public class PixelsHostTest {
                 Map.of("metadata.server.port", "18801"), Map.of("metadata.server.port", "18801")));
     }
 
+    @Test public void sinkOverridesCannotFilterOrRewriteSourceEventsOrHideTypos() {
+        var accepted=new java.util.ArrayList<String>();
+        for (String key:java.util.List.of("debezium.skipped.operations","debezium.column.exclude.list", "debezium.unknown",
+                "sink.unknown", "debezium.column.truncate.to.1.chars")) {
+            try { PixelsConfig.sinkProperties(Map.of(key,"x")); accepted.add(key); }
+            catch (IllegalArgumentException expected) { }
+        }
+        assertEquals(java.util.List.of(),accepted);
+    }
+
+    @Test public void pixelsPropertiesReplaceUpstreamValuesAndRejectUnknownOrOwnedKeys() {
+        String defaults = "a.x=1\n#b.x=2\nc.x=3\n";
+        assertEquals("a.x=5\n#b.x=2\nc.x=9\nd.x=7\n",
+                PixelsHost.properties(defaults, Map.of("c.x", "9"), new java.util.LinkedHashMap<>(Map.of("a.x", "5", "d.x", "7"))));
+        assertThrows(IllegalArgumentException.class, () -> PixelsHost.properties(defaults, Map.of("z.x", "1"), Map.of()));
+        for (String owned : new String[] {"retina.enable", "index.rocksdb.data.path", "metadata.server.port", "etcd.hosts",
+                "retina.buffer.object.storage.folder", "retina.tile.visibility.capacity"})
+            assertThrows(owned, IllegalArgumentException.class, () -> PixelsConfig.pixelsProperties(Map.of(owned, "x")));
+        for (String owned : new String[] {"debezium.snapshot.mode", "debezium.database.port", "sink.query.url", "sink.trans.mode",
+                "debezium.offset.storage.file.filename", "bootstrap.servers"})
+            assertThrows(owned, IllegalArgumentException.class, () -> PixelsConfig.sinkProperties(Map.of(owned, "x")));
+        assertEquals(Map.of("sink.retina.client", "8"), PixelsConfig.sinkProperties(Map.of("sink.retina.client", "8")));
+        assertThrows(IllegalArgumentException.class,
+                () -> PixelsConfig.sinkProperties(Map.of("sink.retina.client", "8\ndebezium.skipped.operations=u")));
+        assertThrows(IllegalArgumentException.class,
+                () -> PixelsConfig.pixelsProperties(Map.of("node.virtual.num", "1\nretina.storage.gc.enabled=true")));
+    }
+
+    @Test public void publicEngineConfigInlinesItsOverridesForTheRunSnapshot() throws Exception {
+        java.nio.file.Path root = java.nio.file.Path.of("").toAbsolutePath();
+        var settings = SibenchConfig.engine(root, SibenchConfig.read(root.resolve("config/sibench.yaml")), Engine.PIXELS);
+        assertEquals("local", ConfigValues.string(settings, "pixels_host"));
+        assertEquals("false", ConfigValues.object(settings, "properties").get("index.rocksdb.multicf"));
+        assertEquals("none", ConfigValues.object(settings, "sink_properties").get("sink.monitor.freshness.level"));
+        assertTrue(SibenchConfig.postgresSettings(ConfigValues.object(ConfigValues.object(settings, "source"), "settings")).containsKey("fsync"));
+        // Every public override names an upstream Pixels key, so none is silently ignored.
+        String upstream = java.nio.file.Files.readString(root.resolve("third_party/pixels/pixels-common/src/main/resources/pixels.properties"));
+        PixelsHost.properties(upstream, PixelsConfig.properties(root.resolve("config/engine/pixels/pixels.properties")), Map.of());
+    }
+
+    @Test public void fileApplicationGetsNoPostgresSourceSettings() {
+        var root = java.nio.file.Path.of("/run/sink");
+        String apply = PixelsSink.properties(Map.of("sink.retina.client", "8"), root, null);
+        assertTrue(apply.contains("sink.mode=retina\n") && apply.contains("sink.retina.client=8\n"));
+        assertFalse(apply.contains("debezium.") || apply.contains("sink.datasource"));
+        String capture = PixelsSink.properties(Map.of(), root, 15432);
+        assertTrue(capture.contains("sink.mode=proto\n") && capture.contains("debezium.database.port=15432\n")
+                && capture.contains("debezium.offset.storage.file.filename=/run/sink/offsets.dat\n"));
+    }
+
     @Test public void occupiedFixedPortsFailBeforeAnyServiceStarts() throws Exception {
         try (var occupied = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
             assertThrows(IOException.class, () -> PixelsHost.ports("127.0.0.1",
@@ -51,7 +105,7 @@ public class PixelsHostTest {
         constructor.setAccessible(true);
         try (var listener = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
              var client = new java.net.Socket("127.0.0.1", listener.getLocalPort())) {
-            return constructor.newInstance(root, root, "test-token", listener.accept());
+            return constructor.newInstance(root, root, "test-token", listener.accept(), null);
         }
     }
 
@@ -165,7 +219,7 @@ public class PixelsHostTest {
                 try {
                     var peer = worker.submit(() -> {
                         try (var socket = server.accept()) {
-                            socket.setSoTimeout(5000);
+                            socket.setSoTimeout(handshake ? 35_000 : 5000);
                             var input = new DataInputStream(socket.getInputStream());
                             input.readNBytes(input.readInt());
                             if (!handshake) {
@@ -180,15 +234,17 @@ public class PixelsHostTest {
                     });
                     long start = System.nanoTime();
                     IOException failure = assertThrows(IOException.class, () -> {
-                        try (var client = PixelsHost.Client.connect("127.0.0.1:" + server.getLocalPort(), "token", identity(),
-                                Duration.ofMillis(handshake ? 200 : 2000))) {
+                        try (var client = PixelsHost.Client.connect("127.0.0.1:" + server.getLocalPort(), "token", identity())) {
                             assertEquals(identity(), client.identity());
-                            client.call(Map.of("op", "check"), Duration.ofMillis(200));
+                            client.call(Map.of("op", "stop"), Duration.ofMillis(200));
                         }
                     });
                     assertTrue(failure.getMessage(), failure.getMessage().contains("timed out"));
-                    assertTrue(System.nanoTime() - start < TimeUnit.SECONDS.toNanos(4));
-                    peer.get(5, TimeUnit.SECONDS);
+                    // The handshake has the production 30-second bound; the request its own 200 ms.
+                    long elapsed = System.nanoTime() - start;
+                    assertTrue(elapsed < TimeUnit.SECONDS.toNanos(handshake ? 34 : 4));
+                    if (handshake) assertTrue(elapsed >= TimeUnit.SECONDS.toNanos(29));
+                    peer.get(handshake ? 35 : 5, TimeUnit.SECONDS);
                 } finally { worker.shutdownNow(); }
             }
         }

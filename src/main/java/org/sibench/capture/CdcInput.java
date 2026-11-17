@@ -69,9 +69,15 @@ public final class CdcInput {
         return new Counts(transactions, changes, business, markers);
     }
 
-    static Map<String, Object> publish(Path output, Generation.Input input, Counts expected,
+    /**
+     * Binds the materialized CSV copies by the sealed CSV descriptors. Validation hashes and counts them once, after
+     * PostgreSQL has loaded them, so a changed copy (or its hard-linked original) prevents publication.
+     */
+    static Map<String, Object> publish(Path output, CsvInput.Verified csv, Counts expected,
             Map<String, Object> evidence) throws Exception {
-        var document = CsvInput.baseline(output, input);
+        var document = new JsonObject();
+        for (String field : java.util.List.of("baseline_rows", "schema", "source_ddl", "baseline_files"))
+            document.add(field, csv.manifest().get(field).deepCopy());
         document.addProperty("kind", "pixels_cdc_input");
         document.addProperty("status", "complete");
         var inventory = JsonParser.parseString(Files.readString(output.resolve("cdc/files.json"))).getAsJsonArray();
@@ -83,8 +89,10 @@ public final class CdcInput {
         }
         document.add("cdc_files", files);
         document.add("counts", new Gson().toJsonTree(expected));
-        document.add("source_evidence", new Gson().toJsonTree(evidence));
-        Counts actual = validate(output, document, false);
+        var source = new Gson().toJsonTree(evidence).getAsJsonObject();
+        source.addProperty("csv_manifest_sha256", csv.sha256());
+        document.add("source_evidence", source);
+        Counts actual = validate(output, document, true);
         require(expected.equals(actual), "Capture report/file counts differ: " + expected + " / " + actual);
         // Publication is last; a failed verification leaves diagnostics and the closed source database.
         Files.writeString(output.resolve("manifest.json"), new GsonBuilder().setPrettyPrinting().create().toJson(document),

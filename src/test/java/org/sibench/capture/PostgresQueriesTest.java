@@ -12,7 +12,7 @@ import org.sibench.schema.SourceSchema;
 public class PostgresQueriesTest {
     private static PostgresAccessUnits.Request request(int iq) {
         var sql=new com.moandjiezana.toml.Toml().read(Path.of("benchmark/HyBench-2024/conf/stmt_postgres.toml").toFile());
-        return new PostgresAccessUnits.Request(iq,"source",sql.getString("IQ-"+iq+".sql").replace("?","$1"),null);
+        return new PostgresAccessUnits.Request(iq,"source",sql.getString("IQ-"+iq+".sql").replace("?","$1"));
     }
     private static TraceRecord lookup(long unit) {
         return TraceRecord.newBuilder().setOperation(TraceOperation.newBuilder().setGet(GetRequest.getDefaultInstance())

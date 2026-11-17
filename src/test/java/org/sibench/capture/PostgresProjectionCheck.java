@@ -86,8 +86,8 @@ public class PostgresProjectionCheck {
                     new ReplayConfig(true,0,0,0,0,"operation", 1, 4096, 60, 1),root.resolve("reference.json")).get("status"));
             var operations=new ArrayList<IndexOperationTrace.Operation>();
             var file=org.sibench.trace.TraceManifest.read(root.resolve("trace")).getAsJsonObject("proto_files")
-                    .getAsJsonArray("workload").get(0).getAsJsonObject();
-            ProtoTrace.read(root.resolve("trace").resolve(file.get("path").getAsString()),file.get("sha256").getAsString(),
+                    .getAsJsonObject("workload");
+            ProtoTrace.read(root.resolve("trace").resolve("workload.pb.zst"),file.get("sha256").getAsString(),
                     file.get("logical_sha256").getAsString(),operations::add);
             assertEquals(2,operations.stream().filter(o->IndexOperationTrace.isMutation(o)&&o.index()==0).count());
             for(long key:new long[]{20,25,30,40,50}) {
@@ -206,8 +206,8 @@ public class PostgresProjectionCheck {
                     new ReplayConfig(true,0,0,0,0,"operation", 1, 4096, 60, 1),root.resolve("reference.json")).get("status"));
             var operations=new ArrayList<IndexOperationTrace.Operation>();
             var manifest=org.sibench.trace.TraceManifest.read(root.resolve("trace"));
-            var file=manifest.getAsJsonObject("proto_files").getAsJsonArray("workload").get(0).getAsJsonObject();
-            ProtoTrace.read(root.resolve("trace").resolve(file.get("path").getAsString()),file.get("sha256").getAsString(),file.get("logical_sha256").getAsString(),operations::add);
+            var file=manifest.getAsJsonObject("proto_files").getAsJsonObject("workload");
+            ProtoTrace.read(root.resolve("trace").resolve("workload.pb.zst"),file.get("sha256").getAsString(),file.get("logical_sha256").getAsString(),operations::add);
             var reads=operations.stream().filter(o->o.kind()==IndexOperationTrace.SEARCH).toList();
             assertTrue(reads.size()>=25);assertTrue(reads.stream().anyMatch(o->!o.localWrites().isEmpty()));
             assertTrue(reads.stream().anyMatch(o->o.transactionId()==0&&!o.localWrites().isEmpty()));
@@ -262,8 +262,8 @@ public class PostgresProjectionCheck {
             future.get(15,TimeUnit.SECONDS);trace.publish(Map.of());
             var operations=new ArrayList<IndexOperationTrace.Operation>();
             var manifest=org.sibench.trace.TraceManifest.read(root.resolve("trace"));
-            var file=manifest.getAsJsonObject("proto_files").getAsJsonArray("workload").get(0).getAsJsonObject();
-            ProtoTrace.read(root.resolve("trace").resolve(file.get("path").getAsString()),file.get("sha256").getAsString(),file.get("logical_sha256").getAsString(),operations::add);
+            var file=manifest.getAsJsonObject("proto_files").getAsJsonObject("workload");
+            ProtoTrace.read(root.resolve("trace").resolve("workload.pb.zst"),file.get("sha256").getAsString(),file.get("logical_sha256").getAsString(),operations::add);
             var secondary=operations.stream().filter(o->o.kind()==IndexOperationTrace.SEARCH&&o.index()>0).toList();
             assertEquals(java.util.List.of(2L,3L,3L),secondary.stream().map(IndexOperationTrace.Operation::expectedCount).toList());
             assertTrue(secondary.get(0).readTimestamp()<secondary.get(1).readTimestamp());
@@ -574,7 +574,8 @@ public class PostgresProjectionCheck {
         var catalog=IndexCatalog.fromSchema(SourceSchema.of("sysbench",Path.of("benchmark/sysbench"),Map.of("tables",1L)));
         var baseline=new ArrayList<IndexOperationTrace.Operation>();
         var sourceClosed=new java.util.concurrent.CountDownLatch(1);
-        long budget=Long.getLong("sibench.test.queue_bytes",4L<<20);
+        // Sized to the 100 writer transactions below: their sealed facts must reach half the budget.
+        long budget=Long.getLong("sibench.test.queue_bytes",1L<<20);
         try(var capture=new PostgresCapture(socketRoot.resolve("capture.sock"),root.resolve("pending"),budget,4096);
                 var cluster=PostgresDatabase.create(Path.of(runtime),root.resolve("source"),socketRoot.resolve("capture.sock"),org.sibench.generation.PostgresTestSettings.SETTINGS)) {
             try(var setup=cluster.connect("setup")) {

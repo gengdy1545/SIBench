@@ -4,12 +4,9 @@ purpose: native_capture
 benchmark: ycsb
 source:
   path: benchmark/YCSB
-  commit: 66302f301b13f60d4bcb2f29f478586bb1d6f2e0
 native:
-  table: usertable
   recordcount: 1000
   insertstart: 0
-  insertcount: 1000
   fieldcount: 10
   fieldlength: 100
   fieldlengthdistribution: constant

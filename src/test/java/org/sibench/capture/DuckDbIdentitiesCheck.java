@@ -44,12 +44,12 @@ public class DuckDbIdentitiesCheck extends DuckDbHostFixture {
     private Path logging(Connection observer) throws Exception {
         Path file=root.resolve("native.csv");
         execute(observer,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
-                + "'SibenchIndex','SibenchIndexRows','SibenchConsumption'], storage_path='"+file+"')");
+                + "'SibenchIndex','SibenchIndexRows'], storage_path='"+file+"')");
         return file;
     }
     private void compile(Connection observer, Path file, List<DuckDbStatements.Session> sessions) throws Exception {
-        execute(observer,"CALL disable_logging()"); DuckDbFacts.load(observer,file);
-        DuckDbStatements.bind(observer,sessions); DuckDbTransactions.bind(observer,"data");
+        execute(observer,"CALL disable_logging()"); DuckDbFacts.load(observer,file,0);
+        DuckDbStatements.bind(observer,sessions); DuckDbTransactions.bind(observer,"data",0);
         DuckDbIdentities.bind(observer);
     }
 
@@ -77,11 +77,11 @@ public class DuckDbIdentitiesCheck extends DuckDbHostFixture {
             assertNotEquals(baseline,replacement); assertNotEquals(replacement,aborted);
             assertEquals(12,number(observer,"SELECT k FROM items WHERE id=1"));
             compile(observer,raw,List.of(receipt));
-            assertEquals(baseline,DuckDbIdentities.observedRow(observer,1,"1",0,0,0));
-            assertEquals(baseline,DuckDbIdentities.observedRow(observer,1,"1",1,0,0));
-            assertEquals(replacement,DuckDbIdentities.observedRow(observer,1,"1",2,0,0));
-            assertEquals(aborted,DuckDbIdentities.observedRow(observer,1,"1",2,3,afterInsert));
-            assertEquals(replacement,DuckDbIdentities.observedRow(observer,1,"1",3,0,0));
+            assertEquals(baseline,DuckDbIdentitiesTest.observedRow(observer,1,"1",0,0,0));
+            assertEquals(baseline,DuckDbIdentitiesTest.observedRow(observer,1,"1",1,0,0));
+            assertEquals(replacement,DuckDbIdentitiesTest.observedRow(observer,1,"1",2,0,0));
+            assertEquals(aborted,DuckDbIdentitiesTest.observedRow(observer,1,"1",2,3,afterInsert));
+            assertEquals(replacement,DuckDbIdentitiesTest.observedRow(observer,1,"1",3,0,0));
             assertEquals(2,number(observer,"SELECT count(*) FROM sibench_insert_identities"));
             assertEquals(1,number(observer,"SELECT count(*) FROM sibench_insert_identities WHERE outcome='rollback'"));
             assertEquals(0,number(observer,"SELECT count(*) FROM sibench_history.identities_1 WHERE _sib_row_id="+aborted));
@@ -110,9 +110,9 @@ public class DuckDbIdentitiesCheck extends DuckDbHostFixture {
                 try (var query=observer.prepareStatement("SELECT max(_sib_row_id) FROM sibench_history.identities_1 WHERE id=?")) {
                     query.setString(1,key); try(var rows=query.executeQuery()){assertTrue(rows.next());expected=rows.getLong(1);}
                 }
-                assertEquals(expected,DuckDbIdentities.observedRow(observer,1,DuckDbIdentities.textKey(key),1,0,0));
+                assertEquals(expected,DuckDbIdentitiesTest.observedRow(observer,1,DuckDbIdentities.textKey(key),1,0,0));
             }
-            assertThrows(SQLException.class,()->DuckDbIdentities.observedRow(observer,1,"'absent'",1,0,0));
+            assertThrows(SQLException.class,()->DuckDbIdentitiesTest.observedRow(observer,1,"'absent'",1,0,0));
             assertEquals(5,number(observer,"SELECT count(*) FROM items"));
         }
     }
@@ -125,7 +125,7 @@ public class DuckDbIdentitiesCheck extends DuckDbHostFixture {
             Path raw=logging(observer);
             try (var client=new Client(connect())) { client.insertKey("x\0y"); client.database.commit(); }
             execute(observer,"CALL disable_logging()");
-            assertThrows(SQLException.class,()->DuckDbFacts.load(observer,raw));
+            assertThrows(SQLException.class,()->DuckDbFacts.load(observer,raw,0));
             assertThrows(IllegalArgumentException.class,()->DuckDbIdentities.textKey("x\0y"));
             assertEquals(1,number(observer,"SELECT count(*) FROM items WHERE id='x'||chr(0)||'y'"));
         }
@@ -155,7 +155,7 @@ public class DuckDbIdentitiesCheck extends DuckDbHostFixture {
             assertEquals(1,number(observer,"SELECT count(*) FROM sibench_insert_identities WHERE row_id="+first+" AND outcome='rollback'"));
             assertEquals(1,number(observer,"SELECT count(*) FROM sibench_insert_identities"));
             assertEquals(0,number(observer,"SELECT count(*) FROM items"));
-            assertThrows(SQLException.class,()->DuckDbIdentities.observedRow(observer,1,"2",0,1,Long.MAX_VALUE));
+            assertThrows(SQLException.class,()->DuckDbIdentitiesTest.observedRow(observer,1,"2",0,1,Long.MAX_VALUE));
         }
     }
 }

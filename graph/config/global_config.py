@@ -4,8 +4,6 @@ SIBENCH_JAR = "build/sibench/sibench.jar"
 RUNTIME_CONFIG = "config/sibench.yaml"
 ANALYSIS_DIRECTORY = "results/analysis/trace"
 PLOT_DIRECTORY = "results/plots/trace"
-WINDOW_REQUESTS = 10000
-SORT_MEMORY_BYTES = 134217728
 
 # Figure widths in inches, following retina-graph's layout constants.
 SINGLE_COLUMN_WIDTH = 3.3374

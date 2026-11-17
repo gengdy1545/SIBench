@@ -2,13 +2,26 @@ package org.sibench.capture;
 
 import static org.junit.Assert.*;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.List;
 import org.junit.Test;
+import org.sibench.generation.DuckDbHostFixture;
 import org.sibench.generation.NativeHistory;
 
-public class DuckDbIdentitiesTest {
+public class DuckDbIdentitiesTest extends DuckDbHostFixture {
+    /** The latest identity that the production sibench_visible rule admits; own version 0 means no own writes. */
+    static long observedRow(Connection database,int table,String primaryKeySql,long readVersion,long ownVersion,long beforeQuery)
+            throws SQLException {
+        try(var query=database.prepareStatement("SELECT row_id FROM temp.main.sibench_identities WHERE table_id=? "
+                +"AND primary_key_sql=? AND sibench_visible(outcome,version,query_id,?,?,?) ORDER BY version DESC,query_id DESC LIMIT 1")) {
+            query.setInt(1,table);query.setString(2,primaryKeySql);query.setLong(3,readVersion);
+            query.setLong(4,ownVersion);query.setLong(5,beforeQuery);
+            try(var rows=query.executeQuery()) {
+                if(!rows.next())throw new SQLException("No visible native identity for key "+primaryKeySql);
+                return rows.getLong(1);
+            }
+        }
+    }
     private static void sql(Connection database,String text) throws Exception {
         try(var query=database.createStatement()){query.execute(text);}
     }
@@ -16,7 +29,7 @@ public class DuckDbIdentitiesTest {
         @Override public void close() throws SQLException { database.close(); }
     }
     private Fixture fixture() throws Exception {
-        var database=DriverManager.getConnection("jdbc:duckdb:");
+        var database=isolated();
         sql(database,"CREATE TABLE items(id BIGINT PRIMARY KEY)"); sql(database,"INSERT INTO items VALUES(1)");
         database.setAutoCommit(false); NativeHistory.initialize(database, org.sibench.config.Engine.DUCKDB);
         NativeHistory.install(database, org.sibench.config.Engine.DUCKDB,1,"main","items","id"); database.commit();
@@ -55,20 +68,18 @@ public class DuckDbIdentitiesTest {
     @Test public void onlyOwnPriorStatementsCanResolveAnAbortedInsert() throws Exception {
         try(var fixture=fixture()) {
             var database=fixture.database(); DuckDbIdentities.bind(database);
-            assertEquals(fixture.baseline(),DuckDbIdentities.observedRow(database,1,"1",0,0,0));
-            assertEquals(fixture.inserted(),DuckDbIdentities.observedRow(database,1,"2",1,0,0));
-            assertEquals(fixture.aborted(),DuckDbIdentities.observedRow(database,1,"3",1,2,fixture.beforeQuery()+1));
-            assertThrows(SQLException.class,()->DuckDbIdentities.observedRow(database,1,"3",2,0,0));
-            assertThrows(SQLException.class,()->DuckDbIdentities.observedRow(database,1,"3",1,2,fixture.beforeQuery()));
+            assertEquals(fixture.baseline(),observedRow(database,1,"1",0,0,0));
+            assertEquals(fixture.inserted(),observedRow(database,1,"2",1,0,0));
+            assertEquals(fixture.aborted(),observedRow(database,1,"3",1,2,fixture.beforeQuery()+1));
+            assertThrows(SQLException.class,()->observedRow(database,1,"3",2,0,0));
+            assertThrows(SQLException.class,()->observedRow(database,1,"3",1,2,fixture.beforeQuery()));
         }
     }
 
     @Test public void refusesIncompleteScopesAndDisagreementWithNativeIdentities() throws Exception {
         for(String corrupt:List.of(
-                "DELETE FROM sibench_mutation_statements WHERE mutation_id=1 AND event='complete'",
                 "DELETE FROM sibench_mutation_statements WHERE mutation_id=1",
                 "UPDATE sibench_mutation_statements SET statement_outcome='failed' WHERE mutation_id=1",
-                "UPDATE sibench_mutation_statements SET affected_rows=0 WHERE mutation_id=1 AND event='complete'",
                 "UPDATE sibench_mutation_statements SET columns=[] WHERE mutation_id=1",
                 "UPDATE sibench_mutation_statements SET rows=[{'physical_row':100,'values_sql':['1','3']}] WHERE mutation_id=2 AND event='begin'",
                 "UPDATE sibench_mutation_statements SET rows=[{'physical_row':100,'values_sql':['999','bad key']}] WHERE mutation_id=2 AND event='begin'")) {
@@ -92,8 +103,8 @@ public class DuckDbIdentitiesTest {
             sql(database,"UPDATE sibench_mutation_statements SET rows=[] WHERE event='begin'");
             sql(database,"UPDATE sibench_mutation_statements SET kind='merge'");
             DuckDbIdentities.bind(database);
-            assertEquals(fixture.inserted(),DuckDbIdentities.observedRow(database,1,"2",1,0,0));
-            assertEquals(fixture.aborted(),DuckDbIdentities.observedRow(database,1,"3",1,2,fixture.beforeQuery()+1));
+            assertEquals(fixture.inserted(),observedRow(database,1,"2",1,0,0));
+            assertEquals(fixture.aborted(),observedRow(database,1,"3",1,2,fixture.beforeQuery()+1));
         }
     }
 

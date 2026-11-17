@@ -22,46 +22,39 @@ final class PixelsBuild {
     static Map<String,Object> verifySource(Path root,Path build)throws IOException {
         var java=read(build.resolve("java-build.json"));
         var nativeBuild=read(build.resolve("native-build.json"));
-        require(java.get("pixels_commit").getAsString().equals(gitlink(root,"third_party/pixels"))
-                &&java.get("pixels_sink_commit").getAsString().equals(gitlink(root,"third_party/pixels-sink"))
-                &&nativeBuild.get("postgresql_commit").getAsString().equals(gitlink(root,"third_party/postgresql")),
-                "CDC source build differs from the repository gitlinks");
-        require(java.get("pixels_patch_sha256").getAsString().equals(Digests.sha256(
-                root.resolve("src/main/native/pixels/pixels-0.2.0-SNAPSHOT.patch")))
-                &&java.get("pixels_sink_patch_sha256").getAsString().equals(Digests.sha256(
-                root.resolve("src/main/native/pixels-sink/pixels-sink-0.2.0-SNAPSHOT.patch")))
-                &&java.get("tracer_sources_sha256").getAsString().equals(treeSha256(root.resolve("src/main/native/pixels")))
-                &&java.get("build_script_sha256").getAsString().equals(Digests.sha256(root.resolve("scripts/build-pixels.sh"))),
-                "CDC source build inputs changed");
+        requireInputs(root,java,nativeBuild);
         for(String jar:List.of("pixels-sink.jar","sibench-pixels.jar"))
             require(Digests.sha256(build.resolve("jars").resolve(jar)).equals(java.getAsJsonObject("jars").get(jar).getAsString()),
                     "CDC source build file changed: "+jar);
         for(String binary:List.of("postgres","pg_ctl","initdb"))
             require(Digests.sha256(build.resolve("postgres/runtime/bin").resolve(binary)).equals(
                     nativeBuild.getAsJsonObject("files").get(binary).getAsString()),"CDC source build file changed: "+binary);
-        return Map.of("java",new com.google.gson.Gson().fromJson(java,Map.class),
-                "native",new com.google.gson.Gson().fromJson(nativeBuild,Map.class));
+        return identity(java,nativeBuild);
     }
 
     static Map<String, Object> verify(Path root, Path build) throws IOException {
         var java = read(build.resolve("java-build.json"));
         var nativeBuild = read(build.resolve("native-build.json"));
-        String pixels = gitlink(root, "third_party/pixels"), sink = gitlink(root, "third_party/pixels-sink");
-        require(java.get("pixels_commit").getAsString().equals(pixels) && nativeBuild.get("pixels_commit").getAsString().equals(pixels)
-                && java.get("pixels_sink_commit").getAsString().equals(sink), "Pixels build differs from the repository gitlinks");
-        require(nativeBuild.get("postgresql_commit").getAsString().equals(gitlink(root, "third_party/postgresql")),
-                "Source PostgreSQL build differs from its gitlink");
-        require(java.get("pixels_patch_sha256").getAsString().equals(
-                Digests.sha256(root.resolve("src/main/native/pixels/pixels-0.2.0-SNAPSHOT.patch"))),
-                "Pixels LOAD patch changed after the build");
-        require(java.get("pixels_sink_patch_sha256").getAsString().equals(
-                Digests.sha256(root.resolve("src/main/native/pixels-sink/pixels-sink-0.2.0-SNAPSHOT.patch"))),
-                "pixels-sink patch changed after the build");
-        require(java.get("tracer_sources_sha256").getAsString().equals(treeSha256(root.resolve("src/main/native/pixels"))),
-                "Pixels tracer sources changed after the build");
-        require(java.has("build_script_sha256") && java.get("build_script_sha256").getAsString()
-                .equals(Digests.sha256(root.resolve("scripts/build-pixels.sh"))), "Pixels build recipe changed after the Java build");
+        requireInputs(root, java, nativeBuild);
         verifyFiles(build);
+        return identity(java, nativeBuild);
+    }
+
+    /** Both phases come from the repository gitlinks, and the patches, tracer sources and recipe are unchanged. */
+    private static void requireInputs(Path root, JsonObject java, JsonObject nativeBuild) throws IOException {
+        require(java.get("pixels_commit").getAsString().equals(gitlink(root, "third_party/pixels"))
+                && java.get("pixels_sink_commit").getAsString().equals(gitlink(root, "third_party/pixels-sink"))
+                && nativeBuild.get("postgresql_commit").getAsString().equals(gitlink(root, "third_party/postgresql")),
+                "Pixels build differs from the repository gitlinks");
+        require(java.get("pixels_patch_sha256").getAsString().equals(Digests.sha256(root.resolve("src/main/native/pixels/pixels-0.2.0-SNAPSHOT.patch")))
+                && java.get("pixels_sink_patch_sha256").getAsString().equals(
+                        Digests.sha256(root.resolve("src/main/native/pixels-sink/pixels-sink-0.2.0-SNAPSHOT.patch")))
+                && java.get("tracer_sources_sha256").getAsString().equals(treeSha256(root.resolve("src/main/native/pixels")))
+                && java.get("build_script_sha256").getAsString().equals(Digests.sha256(root.resolve("scripts/build-pixels.sh"))),
+                "Pixels build inputs changed after the build");
+    }
+
+    private static Map<String, Object> identity(JsonObject java, JsonObject nativeBuild) {
         var identity = new LinkedHashMap<String, Object>();
         identity.put("java", new com.google.gson.Gson().fromJson(java, Map.class));
         identity.put("native", new com.google.gson.Gson().fromJson(nativeBuild, Map.class));
@@ -86,7 +79,7 @@ final class PixelsBuild {
             require(files.has(file.getKey()) && Digests.sha256(build.resolve(file.getValue())).equals(files.get(file.getKey()).getAsString()),
                     "Pixels native file changed: " + file.getKey());
         var configs = nativeBuild.getAsJsonObject("runtime_configs");
-        require(configs != null && configs.keySet().equals(Set.of("defaults/pixels.properties", "home/etc/pixels.properties",
+        require(configs != null && configs.keySet().equals(Set.of("defaults/pixels.properties",
                 "source/pixels/scripts/etc/coordinator-jvm.config", "source/pixels/scripts/etc/retina-jvm.config")), "Missing Pixels runtime input identities");
         for (var config : configs.entrySet())
             require(Digests.sha256(build.resolve(config.getKey())).equals(config.getValue().getAsString()), "Pixels runtime input changed: " + config.getKey());

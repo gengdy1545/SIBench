@@ -30,13 +30,6 @@
       <version>42.7.8</version>
     </dependency>
     <dependency>
-      <groupId>org.sibench.native</groupId>
-      <artifactId>duckdb_jdbc</artifactId>
-      <version>source</version>
-      <scope>system</scope>
-      <systemPath>${duckdb.build.directory}/duckdb_jdbc.jar</systemPath>
-    </dependency>
-    <dependency>
       <groupId>com.moandjiezana.toml</groupId>
       <artifactId>toml4j</artifactId>
       <version>0.7.2</version>
@@ -146,6 +139,12 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
+        <configuration>
+          <systemPropertyVariables>
+            <!-- Default DuckDB tests exercise the instrumented engine through its socket host. -->
+            <sibench.duckdb.host>${duckdb.build.directory}/duckdb_host</sibench.duckdb.host>
+          </systemPropertyVariables>
+        </configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -163,7 +162,6 @@
             <configuration>
               <createDependencyReducedPom>false</createDependencyReducedPom>
               <extraJars>
-                <extraJar>${duckdb.build.directory}/duckdb_jdbc.jar</extraJar>
                 <extraJar>${rocksdb.build.directory}/rocksdbjni.jar</extraJar>
               </extraJars>
               <filters>

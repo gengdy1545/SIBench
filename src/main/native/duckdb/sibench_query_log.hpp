@@ -18,19 +18,16 @@ public:
 		                            {"event", LogicalType::VARCHAR},
 		                            {"outcome", LogicalType::VARCHAR},
 		                            {"submission_end", LogicalType::BOOLEAN},
-		                            {"invalidates_transaction", LogicalType::BOOLEAN},
 		                            {"sql_text", LogicalType::VARCHAR},
 		                            {"error", LogicalType::VARCHAR}});
 	}
 
 	static string ConstructLogMessage(idx_t root_query, const char *event, const char *outcome,
-	                                  bool submission_end, bool invalidates_transaction, const string &sql,
-	                                  const string &error) {
+	                                  bool submission_end, const string &sql, const string &error) {
 		return Value::STRUCT({{"root_query", Value::UBIGINT(root_query)},
 		                      {"event", Value(event)},
 		                      {"outcome", Value(outcome)},
 		                      {"submission_end", Value::BOOLEAN(submission_end)},
-		                      {"invalidates_transaction", Value::BOOLEAN(invalidates_transaction)},
 		                      {"sql_text", Value(sql)},
 		                      {"error", Value(error)}})
 		    .ToString();

@@ -3,7 +3,9 @@ package org.sibench.capture;
 import static org.junit.Assert.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import com.google.gson.JsonObject;
 import java.sql.Connection;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executors;
@@ -97,8 +99,94 @@ public class PostgresCaptureCheck {
             assertEquals("transaction_abort",outcomes.get(1).get("event").getAsString());
             assertEquals(2,capture.reports().size());
             assertEquals(0L,capture.transactions.metrics().get("pending_encoded_bytes"));
-            try(var files=Files.list(cluster.capture())){assertEquals(0,files.count());}
+            try(var files=Files.walk(temporary.getRoot().toPath())) {
+                assertFalse("Facts are never written as raw stream files",files.anyMatch(f->f.getFileName().toString().matches("pg-[0-9]+\\.jsonl.*")));
+            }
         }finally{executor.shutdownNow();Files.deleteIfExists(endpoint);Files.delete(socketRoot);}
         assertFalse(Files.exists(source.resolve("data/postmaster.pid")));
+    }
+    @Test public void identitiesAndCapturePreserveAbortsAndReinsertions()throws Exception {
+        String runtime=System.getProperty("sibench.postgres.runtime");
+        assertNotNull("Set sibench.postgres.runtime to a freshly built instrumented runtime",runtime);
+        Path root=temporary.getRoot().toPath().resolve("source"),socketRoot=Files.createTempDirectory("pg-history-"),endpoint=socketRoot.resolve("capture.sock");
+        var executor=Executors.newSingleThreadExecutor();long aborted,original,replacement;List<JsonObject> events;
+        try(var capture=new PostgresCapture(endpoint,temporary.getRoot().toPath().resolve("pending"),16L<<20,1024);
+                var cluster=PostgresDatabase.create(Path.of(runtime),root,endpoint,org.sibench.generation.PostgresTestSettings.SETTINGS)) {
+            try(var setup=cluster.connect("setup")) {
+                assertEquals(1,number(setup,"SELECT (current_setting('wal_level')='minimal' "
+                        +"AND current_setting('max_wal_senders')='0' AND current_setting('max_parallel_maintenance_workers')='0' "
+                        +"AND current_setting('fsync')='off' "
+                        +"AND current_setting('synchronous_commit')='off' AND current_setting('full_page_writes')='off')::int"));
+                PostgresDatabase.unloggedTables(setup);
+                sql(setup,"CREATE TABLE items(id BIGINT PRIMARY KEY,value BIGINT)");
+                assertEquals(1,number(setup,"SELECT (relpersistence='u')::int FROM pg_class WHERE oid='items'::regclass"));
+                sql(setup,"INSERT INTO items VALUES(1,10),(2,20)");
+                PostgresDatabase.finishLoad(setup);
+                assertEquals(0,number(setup,"SELECT count(*) FROM pg_event_trigger WHERE evtname='sibench_unlogged_tables'"));
+                setup.setAutoCommit(false);NativeHistory.initialize(setup,Engine.POSTGRES);
+                NativeHistory.install(setup,Engine.POSTGRES,1,"public","items","id");PostgresCapture.install(setup);setup.commit();
+                assertEquals(0,number(setup,"SELECT count(*) FROM pg_class c JOIN pg_namespace n ON c.relnamespace=n.oid WHERE n.nspname='sibench_history' AND c.relkind='r' AND c.relpersistence<>'u'"));
+                original=number(setup,"SELECT _sib_row_id FROM sibench_history.identities_1 WHERE id=1");
+                // An uncaptured insertion would be missing from the Trace.
+                setup.setAutoCommit(true);
+                assertTrue(assertThrows(SQLException.class,()->sql(setup,"INSERT INTO items VALUES(9,90)"))
+                        .getMessage().contains("captured source session"));
+            }
+            var future=executor.submit(()->{
+                var received=new ArrayList<JsonObject>();
+                try(var control=cluster.connect("capture-consumer")) {
+                    for(PostgresTransactions.Chunk next;(next=capture.transactions.next(()->capture.watermark(control)))!=null;)
+                        try(var chunk=next){chunk.read(received::add);}
+                }catch(Throwable error){capture.fail(error);throw error;}
+                return received;
+            });
+            try(var writer=cluster.connect("sibench:writer");var observer=cluster.connect("observer")) {
+                sql(writer,"SET enable_seqscan=off");writer.setAutoCommit(false);
+                sql(writer,"UPDATE items SET value=11 WHERE id=1");
+                aborted=number(writer,"SELECT txid_current()");
+                assertEquals(11,number(writer,"SELECT value FROM items WHERE id=1"));
+                assertEquals(10,number(observer,"SELECT value FROM items WHERE id=1"));
+                sql(writer,"INSERT INTO items VALUES(3,30)");
+                assertEquals(30,number(writer,"SELECT value FROM items WHERE id=3"));
+                assertEquals(0,number(observer,"SELECT count(*) FROM items WHERE id=3"));
+                assertThrows(SQLException.class,()->sql(writer,"INSERT INTO items VALUES(4,40),(1,99)"));
+                writer.rollback();
+                assertEquals(0,number(observer,"SELECT count(*) FROM items WHERE id=3"));
+                sql(writer,"UPDATE items SET value=12 WHERE id=1");writer.commit();
+                sql(writer,"DELETE FROM items WHERE id=1");writer.commit();
+                sql(writer,"INSERT INTO items VALUES(1,14)");writer.commit();
+                // Updates keep the RowID; a deleted and reinserted key gets a new one.
+                assertEquals(original,number(observer,"SELECT _sib_row_id FROM sibench_history.identities_1 WHERE id=1 AND _sib_tx=0"));
+                replacement=number(observer,"SELECT _sib_row_id FROM sibench_history.identities_1 WHERE id=1 AND _sib_tx<>0");
+                assertNotEquals(original,replacement);
+                assertThrows(SQLException.class,()->sql(writer,"UPDATE items SET id=3-id"));writer.rollback();
+                // Only RowID identities are kept; no before-image history table exists.
+                assertEquals(0,number(observer,"SELECT count(*) FROM pg_class c JOIN pg_namespace n ON c.relnamespace=n.oid "
+                        +"WHERE n.nspname='sibench_history' AND c.relname LIKE 'rows%'"));
+            }
+            try(var control=cluster.connect("capture-close")){capture.finishSources(control);}
+            events=future.get(10,TimeUnit.SECONDS);
+        }finally{executor.shutdownNow();Files.deleteIfExists(endpoint);Files.delete(socketRoot);}
+        assertTrue(events.stream().anyMatch(e->"row_change".equals(e.get("event").getAsString())&&e.get("xid").getAsLong()==aborted));
+        for(var event:events)if(event.get("event").getAsString().equals("row_change"))
+            for(String image:List.of("old","new"))if(!event.get(image).isJsonNull())
+                assertEquals(java.util.Set.of("id"),event.getAsJsonObject(image).keySet());
+        assertTrue(events.stream().anyMatch(e->"transaction_abort".equals(e.get("event").getAsString())&&e.get("xid").getAsLong()==aborted));
+        assertTrue(events.stream().anyMatch(e->"row_identity".equals(e.get("event").getAsString())&&e.get("xid").getAsLong()==aborted
+                &&e.get("primary_key").getAsString().equals("3")));
+        assertFalse(events.stream().anyMatch(e->"row_identity".equals(e.get("event").getAsString())&&e.get("xid").getAsLong()==aborted
+                &&e.get("primary_key").getAsString().equals("4")));
+        assertTrue(events.stream().anyMatch(e->"scan_summary".equals(e.get("event").getAsString())&&e.get("xid").getAsLong()==aborted));
+        long failedRequest=events.stream().filter(e->"executor_start".equals(e.get("event").getAsString())
+                &&e.get("depth").getAsInt()==1&&e.get("sql").getAsString().contains("VALUES(4,40),(1,99)"))
+                .findFirst().orElseThrow().get("req").getAsLong();
+        // The failed statement wrote row 4 before its duplicate key; that write has no RowID allocation.
+        assertTrue(events.stream().anyMatch(e->"row_change".equals(e.get("event").getAsString())&&e.get("req").getAsLong()==failedRequest
+                &&!e.get("new").isJsonNull()&&e.getAsJsonObject("new").get("id").getAsString().equals("4")));
+        assertFalse(events.stream().anyMatch(e->"executor_end".equals(e.get("event").getAsString())
+                &&e.get("depth").getAsInt()==1&&e.get("req").getAsLong()==failedRequest));
+        assertFalse(events.stream().anyMatch(e->"scan_summary".equals(e.get("event").getAsString())&&e.get("relation").getAsString().startsWith("identity_")));
+        assertFalse(Files.exists(root.resolve("data/postmaster.pid")));
+        assertThrows(java.io.IOException.class,()->PostgresDatabase.create(Path.of(runtime),root,org.sibench.generation.PostgresTestSettings.SETTINGS));
     }
 }

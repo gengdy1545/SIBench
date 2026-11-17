@@ -3,25 +3,22 @@ package org.sibench.capture;
 import static org.junit.Assert.*;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.sql.DriverManager;
 import java.sql.SQLException;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.sibench.generation.DuckDbHostFixture;
 
-public class DuckDbFactsTest {
-    @Rule public TemporaryFolder temporary = new TemporaryFolder();
+public class DuckDbFactsTest extends DuckDbHostFixture {
 
     @Test public void rejectsWrongHeadersAndAnActiveCallerTransaction() throws Exception {
         var file = temporary.newFile("capture.csv").toPath();
-        try (var database = DriverManager.getConnection("jdbc:duckdb:")) {
+        try (var database = connect()) {
             for (String header : new String[] {"", "message,type\n", "context_id,scope,connection_id\n"}) {
                 Files.writeString(file, header);
-                assertThrows(IOException.class, () -> DuckDbFacts.load(database, file));
+                assertThrows(IOException.class, () -> DuckDbFacts.load(database, file,0));
                 assertTrue(database.getAutoCommit());
             }
             database.setAutoCommit(false);
-            assertThrows(SQLException.class, () -> DuckDbFacts.load(database, file));
+            assertThrows(SQLException.class, () -> DuckDbFacts.load(database, file,0));
             assertFalse(database.getAutoCommit());
             database.rollback();
         }
@@ -30,14 +27,14 @@ public class DuckDbFactsTest {
     @Test public void sourceRuntimeRejectsMalformedFactsWithoutLeavingPartialTables() throws Exception {
         var file = temporary.newFile("capture.csv").toPath();
         String header = "context_id,scope,connection_id,transaction_id,query_id,thread_id,timestamp,type,log_level,message\n";
-        try (var database = DriverManager.getConnection("jdbc:duckdb:")) {
+        try (var database = connect()) {
             for (String message : new String[] {
                     row("Unexpected", "anything"), row("SibenchTransaction", "{'event': begin}"),
                     row("SibenchTransaction", "{'engine_transaction': invalid}"),
                     "1,CONNECTION,1,1,1,,2026-11-04 00:00:00+00,SibenchQuery,INFO,\"unterminated",
                     "1,CONNECTION,1,1,1,,2026-11-04 00:00:00+00,SibenchQuery,INFO,\"unterminated\n"}) {
                 Files.writeString(file, header + message);
-                var error = assertThrows(message, SQLException.class, () -> DuckDbFacts.load(database, file));
+                var error = assertThrows(message, SQLException.class, () -> DuckDbFacts.load(database, file,0));
                 if (message.contains(",Unexpected,"))
                     assertTrue(error.getMessage(), error.getMessage().contains("Unexpected capture scope, level or log type"));
                 assertTrue(database.getAutoCommit());
@@ -47,8 +44,8 @@ public class DuckDbFactsTest {
                 }
             }
             Files.writeString(file, header);
-            var counts = DuckDbFacts.load(database, file);
-            assertEquals(java.util.Set.of("query", "transaction", "mutation", "index", "index_rows", "consumption"), counts.keySet());
+            var counts = DuckDbFacts.load(database, file,0);
+            assertEquals(java.util.Set.of("query", "transaction", "mutation", "index", "index_rows"), counts.keySet());
             assertTrue(counts.values().stream().allMatch(count -> count == 0));
         }
     }

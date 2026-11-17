@@ -14,7 +14,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 /** Concurrent index calls; a successful response follows visible application, without transactions. */
-public final class IndexExecutor implements AutoCloseable, IndexExecution.Executor {
+public final class IndexExecutor implements AutoCloseable {
     private final IndexBackend backend;
     private final ExecutorService writers, readers;
     private final java.util.concurrent.ScheduledExecutorService maintenance;
@@ -46,7 +46,6 @@ public final class IndexExecutor implements AutoCloseable, IndexExecution.Execut
         return submit(request, chunk -> { throw new IllegalStateException("Unexpected partial response"); });
     }
 
-    @Override
     public CompletableFuture<IndexResponse> submit(Message request, Consumer<IndexResponse> partial) {
         var response = new CompletableFuture<IndexResponse>();
         synchronized (this) {

@@ -35,10 +35,6 @@
 	path = third_party/duckdb
 	url = https://github.com/duckdb/duckdb.git
 	branch = main
-[submodule "third_party/duckdb-java"]
-	path = third_party/duckdb-java
-	url = https://github.com/duckdb/duckdb-java.git
-	branch = main
 [submodule "third_party/pixels"]
 	path = third_party/pixels
 	url = https://github.com/pixelsdb/pixels.git

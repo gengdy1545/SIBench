@@ -7,13 +7,8 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Validates and executes opaque versioned KV requests for local and remote services. */
+/** Validates and executes opaque versioned KV requests: the service trust boundary, ahead of every backend. */
 public final class IndexExecution {
-    @FunctionalInterface
-    public interface Executor {
-        java.util.concurrent.CompletableFuture<IndexResponse> submit(Message request,
-                java.util.function.Consumer<IndexResponse> partial);
-    }
     static final int CHUNK_RESULTS = 16_384;
     static final int MAX_MESSAGE_BYTES = 32 * 1024 * 1024;
     private IndexExecution() {}

@@ -7,7 +7,6 @@ import java.sql.SQLException;
 import java.util.List;
 import org.junit.Test;
 import org.sibench.generation.DuckDbHostFixture;
-import org.sibench.generation.DuckDbDatabase;
 import org.sibench.generation.NativeHistory;
 
 /** Explicit integration with the instrumented engine's registered message types. */
@@ -30,8 +29,8 @@ public class DuckDbFactsCheck extends DuckDbHostFixture {
             execute(observer, "CREATE TABLE items(id BIGINT PRIMARY KEY, k BIGINT UNIQUE)");
             execute(observer, "INSERT INTO items SELECT range, range FROM range(512)");
             execute(observer, "CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
-                    + "'SibenchIndex','SibenchIndexRows','SibenchConsumption'], storage_path='" + capture + "')");
-            assertThrows(SQLException.class, () -> DuckDbFacts.load(observer, capture));
+                    + "'SibenchIndex','SibenchIndexRows'], storage_path='" + capture + "')");
+            assertThrows(SQLException.class, () -> DuckDbFacts.load(observer, capture,0));
             try (var writer = connect()) {
                 writer.setAutoCommit(false);
                 try (var query = writer.createStatement(); var row = query.executeQuery(
@@ -46,8 +45,8 @@ public class DuckDbFactsCheck extends DuckDbHostFixture {
                 writer.rollback();
             }
             execute(observer, "CALL disable_logging()");
-            var counts = DuckDbFacts.load(observer, capture);
-            assertEquals(6, counts.size());
+            var counts = DuckDbFacts.load(observer, capture,0);
+            assertEquals(5, counts.size());
             assertTrue(counts.get("query") > 0);
             assertTrue(counts.get("index") > 0);
             assertEquals(1, number(observer, "SELECT count(*) FROM " + DuckDbFacts.table("transaction")
@@ -79,7 +78,7 @@ public class DuckDbFactsCheck extends DuckDbHostFixture {
                     List.of(new DuckDbStatements.Session(connection, marker, 4))));
             execute(observer, "UPDATE " + DuckDbFacts.table("mutation") + " SET query_id=query_id-1000000");
             DuckDbStatements.bind(observer, List.of(new DuckDbStatements.Session(connection, marker, 4)));
-            DuckDbTransactions.bind(observer, "data");
+            DuckDbTransactions.bind(observer, "data",0);
             assertEquals(1, number(observer, "SELECT count(*) FROM temp.main.sibench_transactions "
                     + "WHERE outcome='rollback' AND version=1 AND read_version=0"));
             assertEquals(4, number(observer, "SELECT count(*) FROM temp.main.sibench_statements"));
@@ -87,7 +86,7 @@ public class DuckDbFactsCheck extends DuckDbHostFixture {
                     + "WHERE event='failed' AND statement_outcome='failed' AND affected_rows=-1"));
             assertEquals(1, number(observer, "SELECT count(*) FROM temp.main.sibench_mutation_statements "
                     + "WHERE event='complete' AND statement_outcome='completed' AND affected_rows=1"));
-            assertThrows(SQLException.class, () -> DuckDbFacts.load(observer, capture));
+            assertThrows(SQLException.class, () -> DuckDbFacts.load(observer, capture,0));
             assertEquals((long) counts.get("query"), number(observer, "SELECT count(*) FROM " + DuckDbFacts.table("query")));
             try (var other = connect()) {
                 assertThrows(SQLException.class, () -> number(other, "SELECT count(*) FROM " + DuckDbFacts.table("query")));
@@ -110,7 +109,7 @@ public class DuckDbFactsCheck extends DuckDbHostFixture {
             observer.setAutoCommit(false); NativeHistory.initialize(observer, org.sibench.config.Engine.DUCKDB);
             NativeHistory.install(observer, org.sibench.config.Engine.DUCKDB, 1, "main", "items", "id"); observer.commit(); observer.setAutoCommit(true);
             execute(observer, "CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
-                    + "'SibenchIndex','SibenchIndexRows','SibenchConsumption'], storage_path='" + capture + "')");
+                    + "'SibenchIndex','SibenchIndexRows'], storage_path='" + capture + "')");
             long[] a, b, c;
             try (var old = connect(); var committed = connect(); var aborted = connect()) {
                 a = marker(old); b = marker(committed); c = marker(aborted);
@@ -126,10 +125,10 @@ public class DuckDbFactsCheck extends DuckDbHostFixture {
                 assertEquals(31, number(committed, "SELECT sum(k) FROM items"));
             }
             execute(observer, "CALL disable_logging()");
-            DuckDbFacts.load(observer, capture);
+            DuckDbFacts.load(observer, capture,0);
             DuckDbStatements.bind(observer, List.of(new DuckDbStatements.Session(a[0],a[1],4),
                     new DuckDbStatements.Session(b[0],b[1],2), new DuckDbStatements.Session(c[0],c[1],2)));
-            DuckDbTransactions.bind(observer, "data");
+            DuckDbTransactions.bind(observer, "data",0);
             assertEquals(4, number(observer, "SELECT count(*) FROM sibench_transactions"));
             assertEquals(1, number(observer, "SELECT count(*) FROM sibench_transactions WHERE connection_id=" + a[0]
                     + " AND version=3 AND read_version=0 AND outcome='commit'"));
@@ -159,7 +158,7 @@ public class DuckDbFactsCheck extends DuckDbHostFixture {
                 writer.rollback();
             }
             execute(observer, "CALL disable_logging()");
-            DuckDbFacts.load(observer, capture);
+            DuckDbFacts.load(observer, capture,0);
             DuckDbStatements.bind(observer, List.of(new DuckDbStatements.Session(connection, marker, 2)));
             String failed = "FROM temp.main.sibench_mutation_statements WHERE statement_outcome='failed' AND schema_name<>'sibench_history'";
             assertEquals(5000, number(observer, "SELECT sum(requested_rows) FILTER(WHERE event='begin') " + failed));

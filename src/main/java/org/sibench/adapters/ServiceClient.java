@@ -6,6 +6,7 @@ import org.sibench.adapters.proto.Mutation;
 import org.sibench.adapters.proto.PutRequest;
 import org.sibench.adapters.proto.TraceOperation;
 import org.sibench.adapters.proto.WriteBatchRequest;
+import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.IndexOperationTrace.Operation;
 import org.sibench.replay.ReplayTarget;
 
@@ -41,10 +42,8 @@ abstract class ServiceClient implements ReplayTarget {
     abstract CompletableFuture<IndexResponse> transmit(
             Message request, Consumer<IndexResponse> partial) throws IOException;
 
-    /** The last request reached its local transport; in-process targets execute immediately. */
-    CompletableFuture<Void> localSend() {
-        return CompletableFuture.completedFuture(null);
-    }
+    /** The last request reached its local transport. */
+    abstract CompletableFuture<Void> localSend();
 
     @Override
     public final void flush() throws IOException {
@@ -82,7 +81,7 @@ abstract class ServiceClient implements ReplayTarget {
         if (groupRequest != null) throw new IOException("Read group interrupted on its client");
         var request = requests.forward(stored, operation);
         int limit = requests.baselineBatch();
-        if (limit > 1 && TraceRequests.baselineInsert(operation)) {
+        if (limit > 1 && IndexOperationTrace.isBaselineInsert(operation)) {
             if (!batch.isEmpty() && batchWorkUnit != operation.workUnitId()) sendBatch();
             if (batch.isEmpty()) {
                 batchWorkUnit = operation.workUnitId();
@@ -108,10 +107,7 @@ abstract class ServiceClient implements ReplayTarget {
     }
 
     private SendHandle sendGroup(Operation operation, TraceOperation stored) throws IOException {
-        if (!stored.hasReadGroup() || stored.getReadGroup().getRequestsCount() != operation.expansionSize())
-            throw new IOException("Incomplete stored read group");
-        if (groupRequest != null && groupRequest != stored) throw new IOException("Stored read group interrupted");
-        if (operation.expansionPosition() != groupResults.size()) throw new IOException("Read group request out of order");
+        // ProtoTrace decodes the group whole from one stored record; ReplayDispatcher sends its members contiguously.
         if (groupRequest == null) {
             groupRequest = stored;
             groupResponse = new CompletableFuture<>();
@@ -119,13 +115,7 @@ abstract class ServiceClient implements ReplayTarget {
         var checked = groupResponse;
         var request = requests.forwardRead(stored.getReadGroup().getRequests(operation.expansionPosition()));
         var items = new ArrayList<ByteString>();
-        var answer = transmit(request, chunk -> {
-            if (!chunk.more() || chunk.status() != IndexStatus.OK)
-                throw new IllegalArgumentException("Invalid read-group result chunk");
-            items.addAll(chunk.values());
-        }).thenApply(result -> {
-            if (result.more() || result.status() != IndexStatus.OK)
-                throw new CompletionException(new IOException("Read-group request failed"));
+        var answer = transmit(request, chunk -> items.addAll(chunk.values())).thenApply(result -> {
             items.addAll(result.values());
             return List.copyOf(items);
         });

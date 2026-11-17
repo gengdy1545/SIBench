@@ -78,7 +78,7 @@ public final class DriverCapacityCheck {
 
     private static void plan(Path trace, long wanted, Path report) throws Exception {
         var candidates = new ArrayList<Map<String, Object>>();
-        var routing = new ReplayDispatcher(config(trace, 128), client -> { throw new IOException("Planning cannot send"); });
+        var routing = new ReplayDispatcher(config(trace, 128), client -> { throw new IOException("Planning cannot send"); }, 0);
         var clients = new BitSet();
         long[] records = {0}, queries = {0}, items = {0}, largest = {0};
         long[] next = {1000};
@@ -133,7 +133,7 @@ public final class DriverCapacityCheck {
                 if (records[0] >= wanted && operation.kind() == IndexOperationTrace.TRANSACTION_COMMIT) throw new EndPrefix();
             });
         } catch (EndPrefix expected) {}
-        String binding = ReplayInput.binding(trace, config(trace, 128)) + " mode=rowid";
+        String binding = ReplayInput.binding(org.sibench.trace.TraceManifest.read(trace), config(trace, 128));
         // The serialized-byte cap is not an object-heap bound; setup also needs its external heap/deadline limits.
         var recorded = new ConcurrentHashMap<Message, List<IndexResponse>>();
         var bytes = new AtomicLong();
@@ -146,7 +146,7 @@ public final class DriverCapacityCheck {
             baselineRequests.baselineBatch(64);
             System.out.println("phase=baseline");
             try (var load = ReplayProjection.withClients(config(trace, 64), false,
-                    InProcessService.factory(executor, baselineRequests))) {
+                    InProcessService.factory(executor::submit, baselineRequests))) {
                 inputTrace.baseline().read(load);
                 load.finish();
             }
@@ -170,6 +170,7 @@ public final class DriverCapacityCheck {
                                 return response;
                             });
                 }
+                @Override CompletableFuture<Void> localSend() { return CompletableFuture.completedFuture(null); }
             };
             try (var replay = ReplayProjection.withClients(config(trace, 128), true, factory)) {
                 prefix(trace, records[0], replay);

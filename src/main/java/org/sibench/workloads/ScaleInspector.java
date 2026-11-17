@@ -32,7 +32,7 @@ public final class ScaleInspector {
                 Path source = root.resolve(string(object(config, "source"), "path"));
                 rows.putAll(HybenchParameters.rows(HybenchParameters.read(source, nativeConfig)));
             }
-            case "ycsb" -> rows.put(string(nativeConfig, "table"), positive(nativeConfig, "recordcount"));
+            case "ycsb" -> rows.put("usertable", positive(nativeConfig, "recordcount"));
             case "sysbench" -> {
                 long count = positive(nativeConfig, "tables"), perTable = positive(nativeConfig, "table-size");
                 for (long table = 1; table <= count; table++) rows.put("sbtest" + table, perTable);
@@ -54,9 +54,7 @@ public final class ScaleInspector {
         long rows = 0;
         for (long count : nativeRows(root, config).values()) rows = Math.addExact(rows, count);
         return new LinkedHashMap<>(Map.of(
-                "benchmark", schema.benchmark(), "baseline_rows", rows,
-                "generation_mode", "native", "generation_verified", false,
-                "capacity_calibrated", false, "source_commit", string(object(config, "source"), "commit"),
+                "benchmark", schema.benchmark(), "baseline_rows", rows, "source_commit", schema.sourceCommit(),
                 "profile", root.relativize(path).toString(), "profile_sha256", sha256(bytes)));
     }
 

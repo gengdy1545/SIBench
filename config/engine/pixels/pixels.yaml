@@ -1,15 +1,15 @@
-# Pixels CDC generation engine. HyBench runs on an uninstrumented source PostgreSQL; pixels-sink
-# applies its committed changes to Pixels Retina, whose primary-index calls form the Trace.
-# generate-pixels selects this engine independently of the native benchmark engine selection.
-# prepare-cdc verifies only this build's source PostgreSQL and sink artifacts, retaining baseline/row-CDC
-# input without reading target storage/properties, starting Pixels or contacting pixels_host. See docs/pixels-experiment.md.
-# Hosts, run directories and semantic switches are assigned by the generator. The property files
-# hold upstream overrides, including optional fixed service ports for a dedicated external Trino.
+# Pixels engine for the file-based CDC workflow, selected independently of the native benchmark engine.
+# prepare-cdc records HyBench changes from an uninstrumented source PostgreSQL with pixels-sink and
+# verifies only this build's source PostgreSQL and sink artifacts, without reading target storage/properties,
+# starting Pixels or contacting pixels_host. prepare-pixels-baseline and pixels-experiment use the whole
+# engine; an experiment's sink applies CDC files to Retina, whose primary-index calls can form a Trace.
+# See docs/pixels-experiment.md. Hosts, run directories and semantic switches are assigned by SIBench.
+# The property files hold upstream overrides, including optional fixed service ports for a dedicated external Trino.
 schema_version: 1
 purpose: engine
 engine: pixels
 build_directory: build/services/pixels
-# "local" runs Pixels next to the generator; HOST:PORT names a `sibench pixels-host` agent.
+# "local" runs Pixels next to the controller; HOST:PORT names a `sibench pixels-host` agent.
 pixels_host: local
 # Required for reusable columnar baselines; connection comes from the runtime CONFIG.
 # data_storage: cos://YOUR-BUCKET/sibench/baselines/pixels

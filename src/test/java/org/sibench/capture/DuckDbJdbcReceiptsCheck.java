@@ -34,8 +34,8 @@ public class DuckDbJdbcReceiptsCheck extends DuckDbHostFixture {
         var calls=new ArrayList<DuckDbReceipts.Call>();
         for(Path file:files)DuckDbReceipts.read(file,(connection,call)->calls.add(call));
         var sessions=DuckDbReceipts.load(db,files,root.resolve("staged"));
-        DuckDbFacts.load(db,raw);DuckDbStatements.bind(db,sessions);DuckDbReceipts.bind(db);
-        DuckDbTransactions.bind(db,"data");
+        DuckDbFacts.load(db,raw,0);DuckDbStatements.bind(db,sessions);DuckDbReceipts.bind(db);
+        DuckDbTransactions.bind(db,"data",0);
         return calls;
     }
     @Test public void recordsSqlIndependentlyOfNativeCommitAndAbort()throws Exception {

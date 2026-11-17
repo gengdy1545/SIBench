@@ -33,7 +33,7 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
             try(baseWriter){assertEquals(java.util.Map.of("items",3L),NativeBaseline.write(db,org.sibench.config.Engine.DUCKDB,CATALOG,baseWriter));}
             assertEquals(6,baseWriter.count());db.commit();db.setAutoCommit(true);
             var raw=root.resolve("native.csv");sql(db,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
-                    +"'SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path='"+raw+"')");
+                    +"'SibenchIndex','SibenchIndexRows'],storage_path='"+raw+"')");
             DuckDbStatements.Session session;long id40;
             try(var worker=connect()) {
                 try(var q=worker.createStatement();var r=q.executeQuery("SELECT current_connection_id(),current_query_id()")) {
@@ -50,8 +50,8 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
                 sql(worker,"INSERT INTO items VALUES(20,5)");worker.commit();
                 assertEquals(0,number(worker,"SELECT count(*) FROM items WHERE k=1"));worker.commit();
             }
-            sql(db,"CALL disable_logging()");DuckDbFacts.load(db,raw);DuckDbStatements.bind(db,List.of(session));
-            DuckDbTransactions.bind(db,"data");DuckDbIdentities.bind(db);DuckDbAccesses.bind(db,CATALOG);DuckDbMutations.bind(db);
+            sql(db,"CALL disable_logging()");DuckDbFacts.load(db,raw,0);DuckDbStatements.bind(db,List.of(session));
+            DuckDbTransactions.bind(db,"data",0);DuckDbIdentities.bind(db);DuckDbAccesses.bind(db,CATALOG);DuckDbMutations.bind(db);
             assertEquals(5,number(db,"SELECT count(*) FROM sibench_changes"));
             assertEquals(2,number(db,"SELECT count(*) FROM sibench_changes WHERE version=1"));
             var expected=new HashMap<Long,List<Long>>();
@@ -83,8 +83,10 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
                     if(operation.kind()!=IndexOperationTrace.SEARCH)continue;
                     if(!operation.grouped()||operation.expansionPosition()==0)actual.clear();
                     var member=new java.util.LinkedHashSet<Long>();
+                    // Searches carry no version; a transaction-local search reads its own writes at the transaction's slot.
+                    long local=(operation.flags()&IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)!=0?operation.transactionId():0;
                     for(var row:reference.search(operation.table(),operation.index(),operation.range(),operation.readTimestamp(),
-                            operation.version(),operation.transactionId(),operation.mutationOrdinal()))member.add(row.value());
+                            local,operation.transactionId(),operation.mutationOrdinal()))member.add(row.value());
                     if((operation.flags()&IndexOperationTrace.INTERSECT_GROUP)!=0&&operation.expansionPosition()>0)actual.retainAll(member);
                     else actual.addAll(member);
                     if(!operation.grouped()||operation.expansionPosition()+1==operation.expansionSize()) {
@@ -134,7 +136,7 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
             sql(db,"CREATE TRIGGER z_reject AFTER INSERT ON items REFERENCING NEW TABLE AS inserted "
                     +"FOR EACH STATEMENT INSERT INTO guard SELECT CASE WHEN id=2 THEN error('late failure') ELSE id END FROM inserted");
             var raw=root.resolve("native.csv");sql(db,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
-                    +"'SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path='"+raw+"')");
+                    +"'SibenchIndex','SibenchIndexRows'],storage_path='"+raw+"')");
             DuckDbStatements.Session session;long rowId;
             try(var worker=connect()) {
                 try(var q=worker.createStatement();var r=q.executeQuery("SELECT current_connection_id(),current_query_id()")) {
@@ -145,8 +147,8 @@ public class DuckDbProjectionCheck extends DuckDbHostFixture {
                 assertEquals(10,number(worker,"SELECT k FROM items WHERE id=1"));
                 assertThrows(java.sql.SQLException.class,()->sql(worker,"INSERT INTO items VALUES(2,20)"));worker.rollback();
             }
-            sql(db,"CALL disable_logging()");DuckDbFacts.load(db,raw);DuckDbStatements.bind(db,List.of(session));
-            DuckDbTransactions.bind(db,"data");DuckDbIdentities.bind(db);DuckDbAccesses.bind(db,CATALOG);DuckDbMutations.bind(db);
+            sql(db,"CALL disable_logging()");DuckDbFacts.load(db,raw,0);DuckDbStatements.bind(db,List.of(session));
+            DuckDbTransactions.bind(db,"data",0);DuckDbIdentities.bind(db);DuckDbAccesses.bind(db,CATALOG);DuckDbMutations.bind(db);
             assertEquals(1,number(db,"SELECT count(*) FROM sibench_changes"));
             assertEquals(1,number(db,"SELECT count(*) FROM sibench_source_mutations WHERE statement_outcome='failed' AND event='complete'"));
             assertEquals(2,number(db,"SELECT count(*) FROM items"));

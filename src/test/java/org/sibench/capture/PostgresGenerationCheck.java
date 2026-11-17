@@ -32,18 +32,18 @@ public class PostgresGenerationCheck {
         Path root=Path.of("").toRealPath(),output=Files.createTempDirectory(root.resolve("results/capture"),"sysbench-read-write-");
         Path configuration=settings(root,output),profile=output.resolve("profile.yaml");
         var document=parse(Files.readString(profile));var nativeConfig=object(document,"native");
-        nativeConfig.put("workloads",Map.of("oltp_read_write",Map.of("events",256)));document.put("native",nativeConfig);
+        nativeConfig.put("rand-type","zipfian");nativeConfig.put("workloads",Map.of("oltp_read_write",Map.of("script","oltp_read_write","events",256,"rand-zipfian-exp",0.99)));document.put("native",nativeConfig);
         document.put("trace",Map.of("secondary_indexes",true,"workload_requests",2400));
         Files.writeString(profile,new org.yaml.snakeyaml.Yaml().dump(document));
         var result=Generation.run(root,configuration).get(0);
-        var file=(Map<String,Object>)((java.util.List<?>)object(result,"proto_files").get("workload")).get(0);
+        var file=object(object(result,"proto_files"),"workload");
         var statistics=object(file,"statistics");
         assertTrue(((Number)object(statistics,"source_projection").get("transaction_local_search_members")).longValue()>0);
         assertTrue(((Number)object(object(statistics,"index_operations"),"primary").get("get")).longValue()>0);
         assertTrue(((Number)object(object(statistics,"index_operations"),"secondary").get("put")).longValue()>0);
         assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),
                 new org.sibench.replay.ReplayConfig(true,0,0,0,0, "operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
-        assertFalse(Files.exists(output.resolve("generated/database/data")));
+        assertFalse(Files.exists(output.resolve("generated/oltp_read_write/database/data")));
     }
     @Test(timeout=360000) public void hybenchTpAndXpPublishIndependentTracesAndReplay() throws Exception {
         Path root=Path.of("").toRealPath();
@@ -62,7 +62,7 @@ public class PostgresGenerationCheck {
         Files.writeString(output.resolve("profile.yaml"),new org.yaml.snakeyaml.Yaml().dump(document));
         var runtime=parse(Files.readString(configuration));var selections=new LinkedHashMap<String,Object>();
         for(String phase:java.util.List.of("tp","xp"))selections.put("hybench-"+phase,
-                org.sibench.config.BenchmarkFixtures.entry(output.resolve("profile.yaml"),"capture","postgres",
+                org.sibench.config.BenchmarkFixtures.entry(output.resolve("profile.yaml"),"postgres",
                         output.resolve("traces/hybench-"+phase),phase));
         runtime.put("benchmarks",selections);
         Files.writeString(configuration,new org.yaml.snakeyaml.Yaml().dump(runtime));
@@ -70,9 +70,7 @@ public class PostgresGenerationCheck {
         for(int index=0;index<2;index++) {
             String phase=index==0?"tp":"xp";var result=results.get(index);
             assertEquals(8706L,result.get("baseline_rows"));
-            var stages=object(object(result,"source_evidence"),"stages");
-            assertEquals(java.util.Set.of(phase),stages.keySet());
-            var batch=(Map<String,Object>)((java.util.List<?>)stages.get(phase)).get(0);
+            var batch=(Map<String,Object>)((java.util.List<?>)object(result,"source_evidence").get("batches")).get(0);
             var counts=object(object(batch,"client"),phase);
             assertEquals(phase.equals("tp")?18:12,counts.size());
             for(var count:counts.values())assertTrue(((Number)count).longValue()>0);
@@ -84,7 +82,7 @@ public class PostgresGenerationCheck {
                     new org.sibench.replay.ReplayConfig(true,0,0,0,0, "operation", 1, 4096, 60, 1),generated.resolve("reference.json")).get("status"));
             assertFalse(Files.exists(generated.resolve("database/data")));
             var properties=new java.util.Properties();
-            try(var file=Files.newInputStream(generated.resolve(phase+"/batch-0/resolved.props"))){properties.load(file);}
+            try(var file=Files.newInputStream(generated.resolve("workload/batch-0/resolved.props"))){properties.load(file);}
             assertEquals(phase,properties.getProperty("sibench.phase"));
         }
     }
@@ -98,25 +96,20 @@ public class PostgresGenerationCheck {
         Files.writeString(profile,new org.yaml.snakeyaml.Yaml().dump(document));
         var result=Generation.run(root,configuration).get(0);
         assertEquals(1024L,result.get("baseline_operations"));
-        assertFalse(Files.exists(output.resolve("generated/database/data")));
+        assertFalse(Files.exists(output.resolve("generated/oltp_point_select/database/data")));
         var budget=object(object(result,"source_evidence"),"request_budget");
         assertTrue(((Number)budget.get("effective_requests")).longValue()>=600);
-        var stages=object(budget,"stages");
-        assertEquals(5,stages.size());
-        assertTrue(stages.containsKey("oltp_point_select"));
-        assertTrue(Files.exists(output.resolve("generated/oltp_point_select")));
-        var query=object(stages,"oltp_point_select");
-        assertTrue(((Number)query.get("effective_requests")).longValue()>0);
-        assertTrue(((Number)query.get("target_requests")).longValue()>0);
-        assertTrue(Files.isRegularFile(output.resolve("generated/oltp_point_select/batch-0/summary.json")));
-        assertTrue(Files.exists(output.resolve("generated/oltp_update_index/budget.stop")));
+        assertFalse(budget.containsKey("stages"));
+        assertTrue(((Number)budget.get("effective_requests")).longValue()>0);
+        assertTrue(((Number)budget.get("target_requests")).longValue()>0);
+        assertTrue(Files.isRegularFile(output.resolve("generated/oltp_point_select/workload/batch-0/summary.json")));
         assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),
                 new org.sibench.replay.ReplayConfig(false,0,0,0,0,"operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
     }
     @Test public void failedPublicationRetainsTheClosedDatabase() throws Exception {
         Path root=Path.of("").toRealPath();
         Path output=Files.createTempDirectory(root.resolve("results/capture"),"postgres-publication-");
-        Path trace=output.resolve("generated/trace"),settings=settings(root,output);
+        Path trace=output.resolve("generated/oltp_point_select/trace"),settings=settings(root,output);
         var executor=Executors.newSingleThreadExecutor();
         try {
             // An occupied partial-manifest path makes publication fail after normal shutdown.
@@ -128,8 +121,8 @@ public class PostgresGenerationCheck {
             assertTrue(occupied.isDone());assertTrue(failure.getMessage().contains("manifest.json.partial"));
         }finally{executor.shutdownNow();}
         assertTrue(Files.exists(trace.resolve("INCOMPLETE")));assertFalse(Files.exists(trace.resolve("manifest.json")));
-        assertTrue(Files.isRegularFile(output.resolve("generated/database/data/PG_VERSION")));
-        assertTrue(Files.isRegularFile(output.resolve("generated/failure.txt")));
+        assertTrue(Files.isRegularFile(output.resolve("generated/oltp_point_select/database/data/PG_VERSION")));
+        assertTrue(Files.isRegularFile(output.resolve("generated/oltp_point_select/failure.txt")));
     }
     private static Path settings(Path root,Path output) throws Exception {
         String runtime=System.getProperty("sibench.postgres.runtime"),client=System.getProperty("sibench.sysbench.build");
@@ -137,9 +130,8 @@ public class PostgresGenerationCheck {
         var document=DuckDbGenerationTest.profile("sysbench");var config=object(document,"native");
         config.put("tables",2);config.put("table-size",512);config.put("threads",2);config.put("prepare_threads",2);
         config.put("build_directory",client);
-        var workloads=new LinkedHashMap<String,Object>();
-        for(String workload:java.util.List.of("oltp_update_index","oltp_update_non_index","oltp_delete","oltp_insert","oltp_point_select")) workloads.put(workload,Map.of("events",32));
-        config.put("workloads",workloads);document.put("native",config);
+        config.put("rand-type","uniform");
+        config.put("workloads",Map.of("oltp_point_select",Map.of("script","oltp_point_select","events",32)));document.put("native",config);
         document.put("trace",Map.of("secondary_indexes",false,"workload_requests",600));
         document.put("artifacts",Map.of("directory",root.relativize(output.resolve("generated")).toString()));
         var yaml=new org.yaml.snakeyaml.Yaml();Path profile=output.resolve("profile.yaml"),settings=output.resolve("runtime.yaml");
@@ -148,7 +140,7 @@ public class PostgresGenerationCheck {
         Files.writeString(engine,yaml.dump(Map.of("schema_version",1,"purpose","engine","engine","postgres",
                 "build_directory",Path.of(runtime).getParent().toString(),"settings",org.sibench.generation.PostgresTestSettings.SETTINGS)));
         Files.writeString(settings,yaml.dump(Map.of("schema_version",1,"purpose","sibench",
-                "benchmarks",Map.of("sysbench", org.sibench.config.BenchmarkFixtures.entry(profile,"capture","postgres",output.resolve("trace"))),
+                "benchmarks",Map.of("sysbench", org.sibench.config.BenchmarkFixtures.entry(profile,"postgres",output.resolve("trace"))),
                 "engines",Map.of("postgres",engine.toString()))));
         return settings;
     }
@@ -160,7 +152,7 @@ public class PostgresGenerationCheck {
         config.put("tables",2L);config.put("table-size",512L);config.put("threads",2L);config.put("prepare_threads",2L);
         config.put("timeout_minutes",1L);
         var workloads=new LinkedHashMap<String,Object>();
-        for(String workload:java.util.List.of("oltp_update_index"))workloads.put(workload,Map.of("events",256L));
+        workloads.put("oltp_update_index",Map.of("script","oltp_update_index","events",256L,"rand-zipfian-exp",0.8));
         config.put("workloads",workloads);document.put("native",config);
         var source=SourceSchema.read(root,document);var executor=Executors.newSingleThreadExecutor();
         try(var capture=new PostgresCapture(sockets.resolve("capture.sock"),output.resolve("pending"),64L<<20,4096);

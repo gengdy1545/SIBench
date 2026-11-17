@@ -77,7 +77,7 @@ public class ValueResultsTest {
         return rowIds ? IndexEntry.rowId(row.value()) : IndexEntry.locator(row.value(), row.position());
     }
 
-    @Test public void mixedGroupsKeepFirstOccurrenceOrderAndRequireOneTableAndSnapshot() throws Exception {
+    @Test public void mixedGroupsKeepFirstOccurrenceOrder() throws Exception {
         var first = ReadRequest.newBuilder().setGet(GetRequest.newBuilder().setReadTs(9)
                 .setKey(new IndexEntry(5, 0, null, IndexKey.ofInt(2)).bytes())).build();
         var scan = ScanRequest.newBuilder().setReadTs(9).setStartKey(IndexEntry.bound(5, 1, null, false));
@@ -86,10 +86,6 @@ public class ValueResultsTest {
         var answers = List.of(List.of(two), List.of(three, two, one));
         assertEquals(List.of(two), TraceRequests.combine(group.setCombineMode(ReadGroup.CombineMode.INTERSECTION).build(), answers));
         assertEquals(List.of(two, three, one), TraceRequests.combine(group.setCombineMode(ReadGroup.CombineMode.UNION).build(), answers));
-        for (var invalid : List.of(scan.clone().setReadTs(10), scan.clone().setStartKey(IndexEntry.bound(6, 1, null, false)))) {
-            var bad = group.clone().setRequests(1, ReadRequest.newBuilder().setScan(invalid)).build();
-            assertThrows(java.io.IOException.class, () -> TraceRequests.combine(bad, answers));
-        }
     }
 
     private static void checkGroup(ReadGroup group, List<LookupResult> first, List<LookupResult> second,

@@ -21,7 +21,7 @@ public final class DuckDbMutations {
                     "Unsupported index probe after writes in the same SQL statement");
             reject(database,"SELECT 1 FROM temp.main.sibench_access_batches b JOIN temp.main.sibench_accesses a "
                     +"USING(access_id,connection_id,transaction_id,query_id) JOIN temp.main.sibench_source_mutations m "
-                    +"USING(connection_id,transaction_id,query_id) WHERE len(b.physical_rows)>0 "
+                    +"USING(connection_id,transaction_id,query_id) WHERE len(b.primary_keys_sql)>0 "
                     +"AND m.event='begin' AND b.raw_record>=m.raw_record LIMIT 1",
                     "Unsupported index read overlapping writes in the same SQL statement");
             // A delayed empty drain is safe only if writes cannot remove/change an old row this access has not read.
@@ -32,25 +32,10 @@ public final class DuckDbMutations {
                     +"r.values_sql[list_position(list_transform(m.columns,lambda c: c.name),m.primary_key)]) "
                     +"AND EXISTS(SELECT 1 FROM temp.main.sibench_access_batches b JOIN temp.main.sibench_source_mutations w "
                     +"USING(connection_id,transaction_id,query_id) WHERE b.access_id=a.access_id AND b.phase<>'closed' "
-                    +"AND len(b.physical_rows)=0 AND w.event='begin' AND b.raw_record>=w.raw_record) LIMIT 1",
+                    +"AND len(b.primary_keys_sql)=0 AND w.event='begin' AND b.raw_record>=w.raw_record) LIMIT 1",
                     "Unsupported empty index drain overlapping changes to unread rows");
             execute(database,"CREATE TEMP VIEW sibench_completed_mutations AS SELECT * FROM temp.main.sibench_source_mutations "
                     +"WHERE statement_outcome='completed'");
-            reject(database,"SELECT 1 FROM temp.main.sibench_completed_mutations WHERE kind NOT IN ('append','merge','update','delete') "
-                    +"OR event NOT IN ('begin','rows','complete') OR requested_rows=0 "
-                    +"OR (event='complete' AND affected_rows<>requested_rows) OR (event<>'complete' AND affected_rows<>-1) "
-                    +"OR (event='rows' AND kind<>'merge') "
-                    +"OR (kind='merge' AND event='begin' AND len(rows)<>0) "
-                    +"OR (event='complete' AND kind<>'update' AND len(rows)<>0) LIMIT 1",
-                    "Invalid or unsupported successful native mutation scope");
-            reject(database,"SELECT 1 FROM temp.main.sibench_completed_mutations GROUP BY mutation_id HAVING "
-                    +"count(*) FILTER(WHERE event='begin')<>1 OR count(*) FILTER(WHERE event='complete')<>1 "
-                    +"OR min(connection_id)<>max(connection_id) OR min(transaction_id)<>max(transaction_id) "
-                    +"OR min(query_id)<>max(query_id) OR min(table_id)<>max(table_id) OR min(kind)<>max(kind) "
-                    +"OR min(requested_rows)<>max(requested_rows) OR count(DISTINCT columns)<>1 "
-                    +"OR sum(len(rows))<>max(requested_rows)*CASE WHEN min(kind)='update' THEN 2 ELSE 1 END "
-                    +"OR min(raw_record) FILTER(WHERE event='begin')>=max(raw_record) FILTER(WHERE event='complete') LIMIT 1",
-                    "Incomplete or inconsistent successful native mutation scope");
             reject(database,"SELECT 1 FROM temp.main.sibench_completed_mutations m JOIN temp.main.sibench_index_catalog c USING(table_id) "
                     +"LEFT JOIN duckdb_columns() d ON d.database_name=current_database() AND d.schema_name=m.schema_name "
                     +"AND d.table_name=m.table_name AND d.column_name=c.column_name WHERE NOT coalesce("
@@ -81,7 +66,7 @@ public final class DuckDbMutations {
             execute(database,"CREATE TEMP TABLE sibench_resolved_changes AS SELECT c.*,i.row_id FROM temp.main.sibench_row_changes c "
                     +"LEFT JOIN temp.main.sibench_identities i ON i.table_id=c.table_id AND i.primary_key_sql=c.primary_key_sql AND "
                     +"((c.kind='insert' AND i.version=c.version AND i.query_id=c.query_id) OR (c.kind<>'insert' AND "
-                    +"((i.outcome='commit' AND i.version<=c.read_version) OR (i.version=c.version AND i.query_id<c.query_id)))) "
+                    +"sibench_visible(i.outcome,i.version,i.query_id,c.read_version,c.version,c.query_id))) "
                     +"QUALIFY row_number() OVER(PARTITION BY c.table_id,c.transaction_id,c.query_id,c.primary_key_sql "
                     +"ORDER BY (i.version=c.version) DESC,i.version DESC,i.query_id DESC)=1");
             reject(database,"SELECT 1 FROM temp.main.sibench_resolved_changes WHERE row_id IS NULL LIMIT 1",

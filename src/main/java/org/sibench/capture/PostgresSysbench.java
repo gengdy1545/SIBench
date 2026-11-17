@@ -20,14 +20,12 @@ final class PostgresSysbench {
         Path stop=logs.getParent().resolve("budget.stop");
         var previous=load?List.<Map<String,Object>>of():capture.completedSessions();
         long events=load?0:positive(object(object(config,"workloads"),workload),"events");
-        Path script=build.resolve("src/lua/"+workload+".lua");
+        Path script=build.resolve("src/lua/"+Generation.sysbenchScript(config,workload,load)+".lua");
         var command=new ArrayList<>(List.of(build.resolve("src/sysbench").toString(),script.toString(),
                 "--db-driver=pgsql","--pgsql-host=127.0.0.1","--pgsql-port="+database.port(),
                 "--pgsql-user=sibench","--pgsql-db=postgres","--report-interval=0","--time=0","--events="+events,
                 "--threads="+positive(config,load?"prepare_threads":"threads")));
-        for(String key:List.of("tables","table-size","secondary","create-secondary","auto-inc","skip-trx","rand-seed","rand-type")) {
-            Object value=config.get(key);command.add("--"+key+"="+(value instanceof Boolean flag?(flag?"on":"off"):value));
-        }
+        command.addAll(Generation.sysbenchOptions(config,workload,load));
         command.add(load?"prepare":"run");
         var result=NativeProcess.run(load?"prepare":"run",command,
                 Map.of("LUA_PATH",build.resolve("src/lua")+"/?.lua;;","PGAPPNAME",load?"sibench-load":"sibench:sysbench",

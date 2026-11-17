@@ -45,9 +45,9 @@ final class PostgresGeneration {
                     try(var query=setup.createStatement()) {
                         for(var table:input.source().tables())query.execute("VACUUM ANALYZE "+"\""+table.name().replace("\"","\"\"")+"\"");
                     }
-                    setup.setAutoCommit(false);NativeHistory.initialize(setup,Engine.POSTGRES);int id=0;
-                    for(var table:input.source().tables())NativeHistory.install(setup,Engine.POSTGRES,++id,"public",table.name(),
-                            table.indexes().stream().filter(org.sibench.schema.SourceSchema.Index::primary).findFirst().orElseThrow().column());
+                    setup.setAutoCommit(false);NativeHistory.initialize(setup,Engine.POSTGRES);
+                    for(var index:IndexCatalog.fromSchema(input.source()).definitions())
+                        if(index.indexId()==0)NativeHistory.install(setup,Engine.POSTGRES,index.tableId(),"public",index.table(),index.column());
                     PostgresCapture.install(setup);setup.commit();trace.baseline(setup,input.baselineRows());setup.commit();
                     setup.setAutoCommit(true);try(var query=setup.createStatement()){query.execute("ANALYZE");}
                 }
@@ -58,28 +58,25 @@ final class PostgresGeneration {
                     }catch(Exception failure){capture.fail(failure);throw failure;}
                     return null;
                 });
-                long workloadStart=System.nanoTime();var stages=new LinkedHashMap<String,Object>();
-                var workloads=Generation.workloads(input);
-                int remaining=workloads.size();
-                for(String workload:workloads) {
-                    Path stage=Files.createDirectory(output.resolve(workload));
-                    Path stop=stage.resolve("budget.stop");
-                    budget.begin(workload,remaining--,stop);
-                    var batches=new java.util.ArrayList<Map<String,Object>>();
-                    do {
-                        budget.checkTime();long before=budget.count();
-                        Path batch=stage.resolve("batch-"+batches.size());
-                        batches.add(hybench?runHybench(plan,input,database,capture,batch,workload,url,stop)
-                                :PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,batch,workload,capture));
-                        trace.awaitProjection(capture,input.timeout());
-                        if(hybench&&workload.equals("xp")) {
-                            json(batch.resolve("query-coverage.json"),trace.queryCoverage());
-                            requireIqCounts(batches,trace.iqQueries());
-                        }
-                        if(budget.enabled())budget.requireProgress(before);
-                    } while(budget.enabled()&&!budget.reached());
-                    budget.end();stages.put(workload,batches);
-                }
+                long workloadStart=System.nanoTime();
+                String workload=input.selection().workload();
+                Path stage=Files.createDirectory(output.resolve("workload"));
+                Path stop=stage.resolve("budget.stop");
+                budget.begin(stop);
+                var batches=new java.util.ArrayList<Map<String,Object>>();
+                do {
+                    budget.checkTime();long before=budget.count();
+                    Path batch=stage.resolve("batch-"+batches.size());
+                    batches.add(hybench?runHybench(plan,input,database,capture,batch,workload,url,stop)
+                            :PostgresSysbench.run(plan.root(),input.build(),input.nativeConfig(),database,batch,workload,capture));
+                    trace.awaitProjection(capture,input.timeout());
+                    if(hybench&&workload.equals("xp")) {
+                        json(batch.resolve("query-coverage.json"),trace.queryCoverage());
+                        requireIqCounts(batches,trace.iqQueries());
+                    }
+                    if(budget.enabled())budget.requireProgress(before);
+                } while(budget.enabled()&&!budget.reached());
+                budget.end();
                 json(output.resolve("request-budget.json"),budget.finish());
 
                 try(var control=database.connect("source-drain")){capture.finishSources(control);}
@@ -88,7 +85,7 @@ final class PostgresGeneration {
                 // The Trace is complete without native rows: stop the cluster normally, publish, then discard its data.
                 long closeStart=System.nanoTime();database.close();
                 timings.put("native_close_seconds",seconds(closeStart));
-                var evidence=Map.<String,Object>of("engine",build.identity(),"client",input.buildIdentity(),"stages",stages,
+                var evidence=Map.<String,Object>of("engine",build.identity(),"client",input.buildIdentity(),"batches",batches,
                         "request_budget",budget.finish(),"effective_config_sha256",Digests.sha256(output.resolve("effective-config.json")),"baseline_rows",input.baselineRows());
                 var manifest=Generation.publishThenDiscard(()->trace.publish(evidence),database.data(),timings);
                 timings.put("total_seconds",seconds(started));

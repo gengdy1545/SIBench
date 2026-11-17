@@ -1,5 +1,5 @@
 # Native PostgreSQL generation engine: source build and server settings.
-# Listen address, port, socket directory and compute_query_id are assigned by the generator.
+# Listen address, port and socket directory are assigned by the generator.
 schema_version: 1
 purpose: engine
 engine: postgres

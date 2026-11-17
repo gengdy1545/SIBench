@@ -9,11 +9,9 @@ import java.util.List;
 import java.util.Map;
 import org.junit.After;
 import org.junit.Test;
-import org.sibench.adapters.ServiceConfig;
+import org.sibench.adapters.ServiceTarget;
 import org.sibench.adapters.ServiceReplay;
 import org.sibench.adapters.ValueKind;
-import org.sibench.config.BenchmarkSelection.Mode;
-import org.sibench.generation.DuckDbDatabase;
 import org.sibench.generation.NativeHistory;
 import org.sibench.generation.DuckDbHostDriver;
 import org.sibench.generation.DuckDbHostFixture;
@@ -26,6 +24,7 @@ import org.sibench.trace.TraceManifest;
 public class DuckDbTraceCheck extends DuckDbHostFixture {
     private Path output;
     private static final ReplayConfig REPLAY=new ReplayConfig(true,0,0,0,0,"operation",2,16,5, 1);
+    private static final org.sibench.analysis.UpdateLocality.Config LOCALITY=new org.sibench.analysis.UpdateLocality.Config(256,4096,10000,1000,1<<30,10000);
 
     private void output(String name)throws Exception {
         String parent=System.getProperty("sibench.duckdb.trace.output");
@@ -45,7 +44,7 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
     }
     private void logging(Connection db)throws Exception {
         sql(db,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
-                +"'SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path='"+output.resolve("native.csv")+"')");
+                +"'SibenchIndex','SibenchIndexRows'],storage_path='"+output.resolve("native.csv")+"')");
     }
     private static List<Path> files(Path directory)throws Exception {
         try(var files=Files.list(directory)){return files.sorted().toList();}
@@ -63,12 +62,12 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
         manifest.addProperty("source_directory","/missing/generation-checkout");
         Files.writeString(moved.resolve("manifest.json"),new com.google.gson.Gson().toJson(manifest));
         assertEquals("trace_integrity_and_supply_valid",ReplayInput.check(moved,REPLAY).get("status"));
-        var unsupported=new ServiceConfig("rocksdb",null,output.resolve("unsupported-index"),0,ValueKind.LOCATOR,null,false,true);
+        // Nothing listens on port 1: the unsupported value kind is refused before any service call.
+        var unsupported=new ServiceTarget("127.0.0.1:1",ValueKind.LOCATOR);
         var failure=assertThrows(IOException.class,()->ServiceReplay.run(moved,REPLAY,unsupported,output.resolve("unsupported.json")));
         assertTrue(failure.getMessage(),failure.getMessage().contains("does not provide LOCATOR"));
-        assertFalse(Files.exists(unsupported.path()));
-        var service=new ServiceConfig("rocksdb",null,output.resolve("index"),0,ValueKind.ROW_ID,null,false,true);
-        assertEquals("passed",ServiceReplay.run(moved,REPLAY,service,output.resolve("replay.json")).get("status"));
+        assertEquals("passed",org.sibench.adapters.IndexTestSupport.replay(moved,REPLAY,output.resolve("index"),
+                ValueKind.ROW_ID,output.resolve("replay.json")).get("status"));
         var reference=org.sibench.replay.ReferenceReplay.run(moved,REPLAY,output.resolve("reference.json"));
         assertEquals("passed",reference.get("status"));
         assertEquals(1,((List<?>)reference.get("results")).size());
@@ -112,7 +111,7 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
             Files.writeString(path,missingCount.toString());
             Path invalidAnalysis=output.resolve("invalid-locality");
             assertTrue(assertThrows(IOException.class,()->org.sibench.analysis.UpdateLocality.run(trace,
-                    Path.of("config/sibench.yaml"),invalidAnalysis)).getMessage().contains("baseline_rows"));
+                    LOCALITY,invalidAnalysis)).getMessage().contains("baseline_rows"));
             assertTrue(Files.exists(invalidAnalysis.resolve("INCOMPLETE")));
             assertFalse(Files.exists(invalidAnalysis.resolve("summary.json")));
             for(String name:List.of("output","baseline_trace_sha256","index_definitions")) {
@@ -127,7 +126,7 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
             Files.writeString(path,unsupported.toString());
             assertThrows(IOException.class,()->TraceManifest.read(trace));
         }finally {Files.writeString(path,original);}
-        Path analysis=output.resolve("locality");org.sibench.analysis.UpdateLocality.run(trace,Path.of("config/sibench.yaml"),analysis);
+        Path analysis=output.resolve("locality");org.sibench.analysis.UpdateLocality.run(trace,LOCALITY,analysis);
         var summary=com.google.gson.JsonParser.parseString(Files.readString(analysis.resolve("summary.json"))).getAsJsonObject();
         assertEquals(1,summary.getAsJsonObject("analysis").getAsJsonObject("business_changes").get("update").getAsInt());
     }
@@ -140,7 +139,7 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
             sql(db,"CREATE TABLE sbtest1(id INTEGER PRIMARY KEY,k INTEGER NOT NULL,c VARCHAR NOT NULL,pad VARCHAR NOT NULL)");
             sql(db,"CREATE INDEX k_1 ON sbtest1(k)");sql(db,"INSERT INTO sbtest1 VALUES(10,1,'A',''),(20,1,'B',''),(30,2,'C','')");
             history(db,"sbtest1","id");
-            var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"),true,null);
+            var trace=new DuckDbTrace(source,output.resolve("trace"),true,null);
             db.setAutoCommit(false);trace.baseline(db,Map.of("sbtest1",3L));db.commit();db.setAutoCommit(true);
             logging(db);
             try(var worker=DuckDbHostDriver.open(socket,receipts);var older=DuckDbHostDriver.open(socket,receipts)) {
@@ -153,11 +152,11 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
                 assertEquals(30,number(worker,"SELECT sum(id) FROM sbtest1 WHERE k=1"));worker.commit();
                 older.commit();
             }
-            sql(db,"CALL disable_logging()");DuckDbFacts.load(db,output.resolve("native.csv"));
+            sql(db,"CALL disable_logging()");DuckDbFacts.load(db,output.resolve("native.csv"),0);
             var sessions=DuckDbReceipts.load(db,files(receipts),output.resolve("receipts"));
-            DuckDbStatements.bind(db,sessions);DuckDbReceipts.bind(db);DuckDbTransactions.bind(db,"data");
-            DuckDbIdentities.bind(db);DuckDbAccesses.bind(db,IndexCatalog.duckDbDefinitions(source));DuckDbMutations.bind(db);
-            try(trace){trace.append(db);draft=trace.finish(db,Map.of("input","hand-controlled capture"));}
+            DuckDbStatements.bind(db,sessions);DuckDbReceipts.bind(db);DuckDbTransactions.bind(db,"data",0);
+            DuckDbIdentities.bind(db);DuckDbAccesses.bind(db,IndexCatalog.fromSchema(source).definitions());DuckDbMutations.bind(db);
+            try(trace){trace.append(db);draft=trace.finish(Map.of("input","hand-controlled capture"));}
             assertEquals(1L,draft.manifest().get("aborted_transactions"));
         }
         Path moved=publish(draft);
@@ -174,14 +173,14 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
             sql(db,"CREATE INDEX k_1 ON sbtest1(k)");
             sql(db,"INSERT INTO sbtest1 VALUES(10,1,'original','')");
             history(db,"sbtest1","id");
-            try(var trace=new DuckDbTrace(Mode.CAPTURE,source,output.resolve("trace"),true,null)) {
+            try(var trace=new DuckDbTrace(source,output.resolve("trace"),true,null)) {
                 db.setAutoCommit(false);trace.baseline(db,Map.of("sbtest1",1L));db.commit();db.setAutoCommit(true);
                 long rawPrefix=0;
                 for(int window=0;window<2;window++) {
                     Path directory=Files.createDirectory(output.resolve("window-"+window));
                     Path receipts=Files.createDirectory(directory.resolve("clients")), raw=directory.resolve("native.csv");
                     sql(db,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
-                            +"'SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path='"+raw+"')");
+                            +"'SibenchIndex','SibenchIndexRows'],storage_path='"+raw+"')");
                     try(var worker=DuckDbHostDriver.open(socket,receipts)) {
                         worker.setAutoCommit(false);
                         assertEquals(1,number(worker,"SELECT count(*) FROM sbtest1 WHERE id=10"));
@@ -204,12 +203,12 @@ public class DuckDbTraceCheck extends DuckDbHostFixture {
                         DuckDbStatements.bind(capture,sessions);DuckDbReceipts.bind(capture);
                         DuckDbTransactions.bind(capture,"data",trace.lastVersion());
                         if(window==1) assertEquals(1,number(capture,"SELECT min(read_version) FROM sibench_transactions"));
-                        DuckDbIdentities.bind(capture);DuckDbAccesses.bind(capture,IndexCatalog.duckDbDefinitions(source));
+                        DuckDbIdentities.bind(capture);DuckDbAccesses.bind(capture,IndexCatalog.fromSchema(source).definitions());
                         DuckDbMutations.bind(capture);trace.append(capture);
                     }
                 }
                 assertEquals(4,trace.lastVersion());
-                draft=trace.finish(db,Map.of("input","two drained native windows"));
+                draft=trace.finish(Map.of("input","two drained native windows"));
             }
         }
         Path moved=publish(draft);

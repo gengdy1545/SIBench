@@ -1,7 +1,5 @@
 package org.sibench.capture;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
 import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
@@ -25,22 +23,14 @@ final class RocksTrace implements AutoCloseable {
     }
     RocksTrace(Path directory,SourceSchema source,boolean secondaryIndexes,RequestBudget budget,Baseline initial) throws IOException {
         this.directory = directory;
-        var catalog = IndexCatalog.fromSchema(source);
-        manifest = new LinkedHashMap<>(IndexCatalog.provenance(source, catalog.definitions()));
-        IndexCatalog.fromManifest(new Gson().toJsonTree(manifest).getAsJsonObject());
-        Files.createDirectory(directory);
-        Files.writeString(directory.resolve("INCOMPLETE"), "Native generation/publication pending\n", StandardOpenOption.CREATE_NEW);
+        manifest = TraceDirectory.create(directory, source, IndexCatalog.fromSchema(source).definitions(),
+                "api", "native_rocksdb", secondaryIndexes, List.of("row_id"));
         baseline = initial==null?new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"),secondaryIndexes):null;
         workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"),secondaryIndexes,budget);
         units = WorkUnits.create(directory);
-        manifest.put("output", "proto"); manifest.put("value_kinds", List.of("row_id"));
-        manifest.put("mode", "api"); manifest.put("generation", "native_rocksdb");
-        manifest.put("secondary_index_coverage", secondaryIndexes ? "all_source_definitions" : "primary_only");
         if(initial!=null) {
             Files.copy(initial.file(),directory.resolve("baseline.pb.zst"));baselineClosed=true;
-            manifest.put("baseline_rows",initial.rows());manifest.put("baseline_operations",initial.description().get("operations"));
-            manifest.put("proto_files",new LinkedHashMap<>(Map.of("baseline",List.of(initial.description()))));
-            manifest.put("baseline_trace_sha256",initial.identity());
+            manifest.put("baseline_rows",initial.rows());TraceDirectory.stream(manifest,"baseline",initial.description());
         }
     }
     void baseline(RocksDbRows.Row row) throws IOException {
@@ -50,11 +40,11 @@ final class RocksTrace implements AutoCloseable {
     void finishBaseline(long expected) throws IOException {
         if (baseline.count() != expected) throw new IOException("RocksDB baseline count differs from source configuration");
         baseline.close(); baselineClosed = true;
-        manifest.put("baseline_rows", expected); stream("baseline", baseline);
+        manifest.put("baseline_rows", expected); TraceDirectory.stream(manifest, "baseline", ProtoTrace.file(baseline));
     }
     Baseline baseline()throws IOException {
         if(!baselineClosed||baseline==null)throw new IOException("Initial baseline is not sealed");
-        return new Baseline(directory.resolve("baseline.pb.zst"),Map.copyOf(ProtoTrace.file("baseline.pb.zst",baseline)),
+        return new Baseline(directory.resolve("baseline.pb.zst"),ProtoTrace.file(baseline),
                 ((Number)manifest.get("baseline_rows")).longValue(),(String)manifest.get("baseline_trace_sha256"));
     }
     void event(RocksDbRows.Event event) throws IOException {
@@ -80,13 +70,6 @@ final class RocksTrace implements AutoCloseable {
         workload.accept(transaction(0, event.committed() ? TRANSACTION_COMMIT : TRANSACTION_ABORT, version, version, writes));
         if (event.committed()) commits++; else aborts++;
     }
-    private void stream(String name, ProtoTrace.Writer writer) {
-        manifest.put(name + "_operations", writer.count());
-        var files = List.of(ProtoTrace.file(name + ".pb.zst", writer));
-        @SuppressWarnings("unchecked") var streams = (Map<String, Object>) manifest.computeIfAbsent("proto_files", ignored -> new LinkedHashMap<>());
-        streams.put(name, files);
-        manifest.put(name + "_trace_sha256", ProtoTrace.identity(new Gson().toJsonTree(files).getAsJsonArray()));
-    }
     @Override public void close() throws IOException {
         if (closed) return;
         try (baseline; workload; var lines = units.lines()) { }
@@ -94,17 +77,13 @@ final class RocksTrace implements AutoCloseable {
     }
     Map<String, Object> publish(Map<String, Object> evidence) throws Exception {
         if (!closed || !baselineClosed) throw new IOException("RocksDB streams have not finished");
-        stream("workload", workload);
-        manifest.put("source_work_units", version); manifest.put("source_statements", version);
+        TraceDirectory.stream(manifest, "workload", ProtoTrace.file(workload));
+        manifest.put("source_work_units", version);
         manifest.put("committed_transactions", commits); manifest.put("aborted_transactions", aborts);
         manifest.put("searched_accesses", searches); manifest.put("logical_row_changes", changes);
         manifest.put("last_resolved_version", workload.lastCommittedVersion());
         manifest.put("work_units_sha256", HexFormat.of().formatHex(units.digest().digest()));
         manifest.put("work_unit_rule", "one YCSB API call; numbered in native publication order");
-        manifest.put("source_evidence", evidence); manifest.put("status", "complete_for_declared_projection");
-        Path partial = directory.resolve("manifest.json.partial");
-        Files.writeString(partial, new GsonBuilder().setPrettyPrinting().create().toJson(manifest), StandardOpenOption.CREATE_NEW);
-        Files.move(partial, directory.resolve("manifest.json"), StandardCopyOption.ATOMIC_MOVE);
-        Files.delete(directory.resolve("INCOMPLETE")); return Map.copyOf(manifest);
+        return TraceDirectory.publish(directory, manifest, evidence);
     }
 }

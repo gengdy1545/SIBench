@@ -10,7 +10,7 @@ Set `data_storage` in [the Pixels engine YAML](../config/engine/pixels/pixels.ya
 data_storage: cos://YOUR-BUCKET/sibench/baselines/pixels
 ```
 
-The connection comes from `object_storage.cos` in the runtime CONFIG. Use virtual-hosted addressing and provide its credential variables on the Pixels host and external Trino workers. Pixels data paths require `cos://` (`s3://` is rejected); reusable baselines need COS, while live `generate-pixels` can use local files.
+The connection comes from `object_storage.cos` in the runtime CONFIG. Use virtual-hosted addressing and provide its credential variables on the Pixels host and external Trino workers. Pixels data paths require `cos://` (`s3://` is rejected); reusable baselines need COS.
 
 ```bash
 java -jar build/sibench/sibench.jar prepare-csv config/sibench.yaml results/capture/hybench-csv
@@ -29,7 +29,7 @@ CSV preparation needs the built HyBench client; CDC also needs the Pixels build'
 
 CDC captures committed row changes from TP and XP once, with AP/IQ disabled, using the configured durations and transaction-client counts; `trace.workload_requests` does not bound it. Primary-key changes are rejected and FULL replica identity is required. Each phase waits up to two minutes for a committed marker at the file writer, then 60 seconds for normal shutdown. Missing or incomplete source data, or a failed shutdown, prevents publication and keeps the diagnostics and database; success deletes the working database. A marker proves capture progress, not target visibility or durability.
 
-Inputs are immutable, including CDC's hard-linked baseline copies. Manifests bind relative paths, sizes, SHA-256, schemas, counts and source/build identities. Validation rejects symbolic links, traversal and aliases, missing, unlisted or reordered files, malformed counts, hash or schema mismatches, and incomplete or unsupported transactions. Manifests and single CDC frames are limited to 16 MiB; files hold whole transactions, with the positive int32 `sink.proto.maxRecords` limiting transactions per file. CDC totals include markers; `businessChanges` excludes marker rows and `markers` counts marker transactions. None of these are distinct-row or index-operation counts.
+Inputs are immutable, including CDC's hard-linked baseline copies. Preparation binds the sealed CSV by descriptors and sizes; CDC hashes its copies once at publication, after the PostgreSQL load, and the Pixels branch hashes them during conversion. Manifests bind relative paths, sizes, SHA-256, schemas, counts and source/build identities. Validation rejects symbolic links, traversal and aliases, missing, unlisted or reordered files, malformed counts, hash or schema mismatches, and incomplete or unsupported transactions. Manifests and single CDC frames are limited to 16 MiB; files hold whole transactions, with the positive int32 `sink.proto.maxRecords` limiting transactions per file. CDC totals include markers; `businessChanges` excludes marker rows and `markers` counts marker transactions. None of these are distinct-row or index-operation counts.
 
 The baseline manifest also binds COS paths, row groups, hidden timestamps and the index bucket count. Empty tables keep their schema and zero counts without files. `check-pixels-baseline` checks the local descriptors and import verifies remote content. Finished CSV/CDC inputs can move without the preparation database; keep local capture diagnostics separately if source reproduction matters.
 
@@ -63,7 +63,7 @@ Files over 64 MiB use multipart upload, aborted on failure. API calls are bounde
 | Setting | Behavior |
 | --- | --- |
 | `updates` | Defaults true; requires CDC. False rejects a CDC argument, update prefix and freshness. |
-| `trace` | Defaults false. True exports index reconstruction and actual calls from this run; rejects queries/freshness. |
+| `trace` | Defaults false. True exports index reconstruction and actual calls from this run; rejects queries/freshness and a HyBench profile with `trace.secondary_indexes: true` (Pixels exports primary indexes only). |
 | `max_transactions` | 0 applies all input once; positive values select a complete transaction prefix, including markers, within the input count. |
 | `queries.enabled` | Defaults false; `timing` is `after` updates or `during` application. |
 | `freshness.enabled` | Defaults false; independent of business queries, requires updates. |
@@ -128,15 +128,14 @@ Managed heap, query memory, total query memory, heap headroom and thread count a
 
 ## Bounded integration checks
 
-After both Pixels build phases and the root Maven prerequisites, run the local LOAD and live sink checks explicitly:
+After both Pixels build phases and the root Maven prerequisites, run the local LOAD checks explicitly:
 
 ```bash
 mkdir -p results/capture
 mvn -Dsibench.pixels.build=build/services/pixels -Dtest=PixelsLoadLeaseCheck test
-mvn -Dsibench.pixels.build=build/services/pixels -Dtest=PixelsCdcCheck test
 ```
 
-The lease check holds a four-row FIFO input open for 340 seconds, beyond the coordinator's 300-second lease, and requires a successful commit. The CDC check uses eight baseline rows and source-observed update/delete/reinsert/rollback results, and separately rejects failed visibility publication. Neither check requires COS or Trino.
+The lease check holds a four-row FIFO input open for 340 seconds, beyond the coordinator's 300-second lease, and requires a successful commit; a second case rejects failed visibility publication. Neither requires COS or Trino. Delete/reinsert RowID and Locator results of applied CDC are checked by `PixelsExperimentCheck`, which needs COS.
 
 For a service-free check of renewal completion and rejection, compile and run the test probe against the built Pixels CLI:
 

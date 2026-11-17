@@ -4,18 +4,15 @@ purpose: native_capture
 benchmark: sysbench
 source:
   path: benchmark/sysbench
-  commit: 3ceba0b1e115f8c50d1d045a4574d8ed643bd497
 native:
   tables: 2
   table-size: 1000
-  secondary: false
-  create-secondary: true
   auto-inc: true
   skip-trx: false
   rand-seed: 7
   rand-type: uniform
   threads: 1
   workloads:
-    oltp_read_write: {events: 1}
+    oltp_read_write: {script: oltp_read_write, events: 1}
 artifacts:
   directory: results/capture/tests/sysbench_2k

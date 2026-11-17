@@ -6,7 +6,6 @@ import static org.sibench.config.ConfigValues.parse;
 
 import org.junit.Test;
 
-import java.nio.file.Path;
 import java.util.Map;
 
 public class ReplayConfigTest {
@@ -15,7 +14,7 @@ public class ReplayConfigTest {
             purpose: sibench
             target:
               secondary_indexes: {enabled: false}
-              service: {adapter: grpc, endpoint: 'test-host:50599', value: row_id}
+              service: {endpoint: 'test-host:50599', value: row_id}
             replay:
               dispatch_mode: operation
               client_count: 64
@@ -26,7 +25,6 @@ public class ReplayConfigTest {
 
     @Test
     public void validatesProfilesAndComputesOverflowCheckedBudget() throws Exception {
-        Path root = Path.of("").toAbsolutePath();
         String template = TEMPLATE;
         var simple = ReplayConfig.from(parse(template));
         assertFalse(simple.secondaryIndexes());
@@ -36,9 +34,9 @@ public class ReplayConfigTest {
         withSecondary.put("target", target);
         assertTrue(ReplayConfig.from(withSecondary).secondaryIndexes());
         assertEquals(org.sibench.adapters.ValueKind.ROW_ID,
-                org.sibench.adapters.ServiceConfig.ofReplay(root, parse(template)).value());
+                org.sibench.adapters.ServiceTarget.of(parse(template)).value());
         assertEquals(org.sibench.adapters.ValueKind.LOCATOR,
-                org.sibench.adapters.ServiceConfig.ofReplay(root, parse(template.replace("value: row_id", "value: locator"))).value());
+                org.sibench.adapters.ServiceTarget.of(parse(template.replace("value: row_id", "value: locator"))).value());
         assertEquals(64, simple.clientCount());
         assertEquals(4096, simple.maxInFlight());
         assertEquals(600, simple.requestTimeoutSeconds());

@@ -4,7 +4,6 @@ import static org.sibench.config.ConfigValues.*;
 
 import java.io.*;
 import java.net.*;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.time.Duration;
 import java.util.*;
@@ -25,11 +24,12 @@ final class PixelsApply implements AutoCloseable {
 
     static PixelsApply start(Path build, Map<String, Object> settings, Path root, Path pixelsConfig,
             PixelsCapture capture, Map<String, Object> freshness, Map<String, Object> trino) throws Exception {
-        Files.createDirectory(root);
-        String properties = PixelsGeneration.sinkProperties(object(settings, "sink_properties"), root, 1, "retina");
+        // File application never connects to PostgreSQL; it gets no Debezium source settings.
+        String properties = PixelsSink.properties(object(settings, "sink_properties"), root, null);
+        var options = new ArrayList<String>();
         if (bool(freshness, "enabled")) {
+            // PixelsExperimentConfig requires HTTP for external servers; a managed server is http:// on the Pixels host.
             var server = URI.create(string(trino, "server"));
-            if (!server.getScheme().equals("http")) throw new IOException("Sink freshness currently requires an HTTP Trino JDBC endpoint");
             properties += "\nsink.monitor.enable=true\nsink.monitor.report.enable=true\nsink.monitor.report.interval=100\n"
                     + "sink.monitor.report.file=" + root.resolve("metrics.csv") + "\n"
                     + "sink.monitor.freshness.level=embed\nsink.monitor.freshness.embed.warmup=0\n"
@@ -37,39 +37,14 @@ final class PixelsApply implements AutoCloseable {
                     + "sink.monitor.freshness.verbose=true\nsink.monitor.freshness.file=" + root.resolve("freshness.csv") + "\n"
                     + "sink.query.url=jdbc:trino://" + server.getRawAuthority() + "/" + string(trino, "catalog") + "/" + string(trino, "schema") + "\n"
                     + "sink.query.user=" + string(trino, "user") + "\nsink.query.password=\nsink.query.parallel=1\n";
-        }
-        Path config = Files.writeString(root.resolve("sink.properties"), properties);
-        Path logging = PixelsGeneration.sinkLogging(root);
-        String token = UUID.randomUUID().toString();
-        Process process = null;
-        try (var listener = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
-            listener.setSoTimeout(30_000);
-            var command = new ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin/java").toString(),
-                    "-Xmx" + string(object(settings, "memory"), "sink_heap"), "-Dlog4j2.configurationFile=" + logging,
-                    "-Dsibench.report.endpoint=127.0.0.1:" + listener.getLocalPort(), "-Dsibench.report.token=" + token,
-                    "-cp", build.resolve("jars/sibench-pixels.jar") + ":" + build.resolve("jars/pixels-sink.jar"),
-                    "org.sibench.pixels.ProtoApply", config.toString()));
-            if (bool(freshness, "enabled")) command.addAll(1, List.of("-Dsibench.freshness.table=" + string(freshness, "table"),
-                    "-Dsibench.freshness.column=" + string(freshness, "column"),
-                    "-Duser.timezone=UTC",
+            options.addAll(List.of("-Dsibench.freshness.table=" + string(freshness, "table"),
+                    "-Dsibench.freshness.column=" + string(freshness, "column"), "-Duser.timezone=UTC",
                     "-Dsibench.freshness.sample_ms=" + positive(freshness, "sample_seconds") * 1000));
-            var builder = new ProcessBuilder(command).directory(root.toFile()).redirectErrorStream(true)
-                    .redirectOutput(root.resolve("sink.log").toFile());
-            builder.environment().put("PIXELS_CONFIG", pixelsConfig.toString());
-            process = builder.start();
-            Socket socket = listener.accept();
-            try {
-                socket.setSoTimeout(30_000);
-                var lines = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-                if (!("T " + token).equals(lines.readLine()) || !"R".equals(lines.readLine()))
-                    throw new IOException("Invalid file sink handshake; see " + root);
-                socket.setSoTimeout(0);
-                return new PixelsApply(process, socket, lines, capture, bool(freshness, "enabled") ? root.resolve("freshness.csv") : null);
-            } catch (Exception | Error error) { socket.close(); throw error; }
-        } catch (Exception | Error error) {
-            if (process != null) process.destroyForcibly();
-            throw error;
         }
+        var sink = PixelsSink.start(build, settings, root, properties, options, Map.of("PIXELS_CONFIG", pixelsConfig.toString()),
+                "org.sibench.pixels.ProtoApply");
+        return new PixelsApply(sink.process(), sink.socket(), sink.reports(), capture,
+                bool(freshness, "enabled") ? root.resolve("freshness.csv") : null);
     }
 
     private PixelsApply(Process process, Socket socket, BufferedReader lines, PixelsCapture capture, Path freshnessReport) {

@@ -19,6 +19,8 @@ Datum sibench_identity_capture(PG_FUNCTION_ARGS)
     Datum row_id, key;
     StringInfoData output;
     if (!CALLED_AS_TRIGGER(fcinfo)) elog(ERROR,"sibench_identity_capture requires trigger context");
+    /* An uncaptured insertion would leave its RowID and row change out of the Trace. */
+    if (!sib_enabled()) elog(ERROR, "SIBench history writes require a captured source session");
     trigger=(TriggerData *)fcinfo->context;
     if (!TRIGGER_FIRED_BY_INSERT(trigger->tg_event) || trigger->tg_trigger->tgnargs!=1)
         elog(ERROR,"sibench_identity_capture requires an insert and a table ID");
@@ -33,14 +35,6 @@ Datum sibench_identity_capture(PG_FUNCTION_ARGS)
     sib_emit("row_identity",trigger->tg_relation,output.data);
     pfree(output.data);
     PG_RETURN_POINTER(trigger->tg_trigtuple);
-}
-
-PG_FUNCTION_INFO_V1(sibench_query_id);
-Datum sibench_query_id(PG_FUNCTION_ARGS)
-{
-    if (!sib_enabled() || !sibench_request)
-        elog(ERROR, "SIBench history writes require a captured source session");
-    PG_RETURN_INT64((int64) sibench_request);
 }
 
 PG_FUNCTION_INFO_V1(sibench_capture_watermark);

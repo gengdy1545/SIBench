@@ -23,9 +23,9 @@ public record BenchmarkSelection(Path config, String benchmark, Mode mode, Engin
         for (String name : selections.keySet()) {
             require(name.matches("[a-z0-9][a-z0-9_-]*"), "Invalid benchmark entry name: " + name);
             var item = object(selections, name);
-            for (String key : item.keySet()) require(Set.of("config", "mode", "engine", "workload", "trace").contains(key), "Unknown benchmark option: " + key);
+            for (String key : item.keySet()) require(Set.of("config", "engine", "workload", "trace").contains(key), "Unknown benchmark option: " + key);
             require(!string(item, "config").isBlank(), "Benchmark config must not be blank");
-            mode(item); engine(item);
+            engine(item);
             if (item.containsKey("workload")) require(!string(item, "workload").isBlank(), "Empty workload selection");
             var trace = object(item, "trace");
             SibenchConfig.keys(trace, Set.of("generate", "directory", "upload"), "benchmark trace");
@@ -70,32 +70,25 @@ public record BenchmarkSelection(Path config, String benchmark, Mode mode, Engin
             var profile = parse(Files.readString(path));
             String benchmark = string(profile, "benchmark");
             require(Set.of("ycsb", "sysbench", "hybench").contains(benchmark), "Unsupported benchmark: " + benchmark);
-            Mode mode = mode(item); Engine engine = engine(item);
-            boolean supported = mode == Mode.API ? benchmark.equals("ycsb") && engine == Engine.ROCKSDB
-                    : !benchmark.equals("ycsb") && (engine == Engine.DUCKDB || engine == Engine.POSTGRES);
-            require(supported, "Unsupported benchmark/mode/engine combination: " + benchmark + "/" + mode + "/" + engine);
+            Engine engine = engine(item);
+            // The engine fixes the generation mode: RocksDB records YCSB API calls, SQL engines capture.
+            boolean supported = benchmark.equals("ycsb") ? engine == Engine.ROCKSDB
+                    : engine == Engine.DUCKDB || engine == Engine.POSTGRES;
+            require(supported, "Unsupported benchmark/engine combination: " + benchmark + "/" + engine);
+            Mode mode = engine == Engine.ROCKSDB ? Mode.API : Mode.CAPTURE;
             String source = path + ":" + mode + ":" + engine;
             String previous = sources.putIfAbsent(benchmark, source);
             require(previous == null || previous.equals(source), "Conflicting source configurations for " + benchmark);
             var workloads = benchmark.equals("hybench") ? Set.of("tp", "xp") : object(object(profile, "native"), "workloads").keySet();
-            require(benchmark.equals("sysbench") || item.containsKey("workload") || workloads.size() == 1, "Select one workload for " + name);
-            String workload = item.containsKey("workload") ? string(item, "workload")
-                    : benchmark.equals("sysbench") ? "" : workloads.iterator().next();
-            require(workload.isEmpty() || workloads.contains(workload), "Unknown workload for " + name + ": " + workload);
+            require(item.containsKey("workload") || workloads.size() == 1, "Select one workload for " + name);
+            String workload = item.containsKey("workload") ? string(item, "workload") : workloads.iterator().next();
+            require(workloads.contains(workload), "Unknown workload for " + name + ": " + workload);
             require(identities.add(benchmark + ":" + workload), "Duplicate benchmark workload: " + benchmark + "/" + workload);
             var trace = object(item, "trace"); var upload = object(trace, "upload");
             result.add(new BenchmarkSelection(path, benchmark, mode, engine, name, workload, directories.get(name),
                     bool(trace, "generate"), bool(upload, "enabled") ? string(upload, "path") : null));
         }
         return List.copyOf(result);
-    }
-
-    private static Mode mode(Map<String, Object> item) {
-        return switch (string(item, "mode")) {
-            case "api" -> Mode.API;
-            case "capture" -> Mode.CAPTURE;
-            default -> throw new IllegalArgumentException("Benchmark mode must be api or capture; use generate-pixels or prepare-cdc for CDC");
-        };
     }
 
     private static Engine engine(Map<String, Object> item) { return Engine.of(string(item, "engine")); }

@@ -12,7 +12,7 @@ import java.util.List;
  * A KV index service implementation behind the SIBench index protocol (proto). It owns
  * its physical layout; the semantics are docs/index-service.md. Implementations may be
  * called concurrently and must be thread-safe; replay establishes required write/read
- * dependencies before dispatch.
+ * dependencies before dispatch. Requests arrive validated by {@link IndexExecution}.
  */
 public interface IndexBackend extends AutoCloseable {
     IndexDescription describe();

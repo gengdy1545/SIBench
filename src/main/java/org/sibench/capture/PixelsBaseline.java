@@ -18,14 +18,15 @@ public final class PixelsBaseline {
     /** Both consumers finish independently; one failure does not discard the other's published input. */
     public static Map<String, Object> prepareInputs(Path root, Path configuration, Path csvDirectory, Path baselineOutput) throws Exception {
         root = root.toRealPath();
-        var plan = PixelsGeneration.plan(root, configuration, false);
-        var csv = CsvInput.open(root.resolve(csvDirectory));
+        var plan = CdcPreparation.plan(root, configuration);
+        // Each branch hashes the CSV bytes it consumes: CDC after PostgreSQL loads its copies, Pixels while converting.
+        var csv = CsvInput.bind(root.resolve(csvDirectory));
         CsvInput.requireCompatible(csv, plan.inputs().get(0));
         Path output = root.resolve(baselineOutput).toAbsolutePath().normalize(), cdcOutput = plan.inputs().get(0).output();
         require(!Files.exists(output), "Preparation outputs must be fresh");
         InputFiles.requireSeparate(output, cdcOutput, csv.directory());
         InputFiles.requireSeparate(cdcOutput, csv.directory());
-        requireStorage(plan.engines().get(Engine.PIXELS).settings());
+        requireStorage(SibenchConfig.engine(root, plan.runtime(), Engine.PIXELS));
         var pool = java.util.concurrent.Executors.newFixedThreadPool(2);
         Path project = root;
         try {

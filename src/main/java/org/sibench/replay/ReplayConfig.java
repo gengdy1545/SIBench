@@ -41,10 +41,6 @@ public record ReplayConfig(
                 durationSeconds, plannedOperationsPerSecond, warmupOperations, reservePercent);
     }
 
-    public static ReplayConfig read(Path root, Path path) throws java.io.IOException {
-        return from(parse(Files.readString(root.resolve(path))));
-    }
-
     public static ReplayConfig from(Map<String, Object> document) {
         SibenchConfig.validate(document);
         var target = object(document, "target");

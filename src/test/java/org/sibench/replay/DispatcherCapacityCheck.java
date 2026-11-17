@@ -21,12 +21,12 @@ public final class DispatcherCapacityCheck {
                     || operation.rowId() != sequence || operation.key().intValue() != sequence)
                 throw new IOException("Generated operation was lost, reordered or changed");
             return ReplayTarget.SendHandle.completed();
-        })) {
+        }, 0)) {
             for (long i = 1; i <= count; i++) {
                 var operation = new IndexOperationTrace.Operation(i, IndexOperationTrace.INSERT,
                         1, 0, 0, IndexKey.ofInt(i), null, 0, 1, i - 1, i, 0, 0, 0, -1,
                         1 + (i - 1) / IndexOperationTrace.BLOCK_RECORDS, 0, 1, null, null, 0, java.util.List.of());
-                dispatcher.send(operation);
+                dispatcher.send(operation, null);
             }
             dispatcher.drain();
             result = dispatcher.describe();

@@ -13,7 +13,6 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.junit.Test;
-import org.sibench.generation.DuckDbDatabase;
 import org.sibench.generation.NativeHistory;
 import org.sibench.generation.DuckDbHostFixture;
 
@@ -23,8 +22,9 @@ public class SysbenchNativeCheck extends DuckDbHostFixture {
         String configured = System.getProperty("sibench.sysbench.build");
         assertNotNull("Set sibench.sysbench.build", configured);
         Path repository = Path.of("").toRealPath(), build = Path.of(configured).toRealPath();
-        var source = object(parse(Files.readString(repository.resolve("config/benchmark/sysbench.yaml"))), "source");
-        NativeBuildCheck.verify(repository, "sysbench", repository.resolve(string(source, "path")), build, string(source, "commit"));
+        var profile = parse(Files.readString(repository.resolve("config/benchmark/sysbench.yaml")));
+        NativeBuildCheck.verify(repository, "sysbench", repository.resolve(string(object(profile, "source"), "path")), build,
+                org.sibench.schema.SourceSchema.read(repository, profile).sourceCommit());
         return build;
     }
 
@@ -45,7 +45,7 @@ public class SysbenchNativeCheck extends DuckDbHostFixture {
 
     private void enable(Connection database, Path output) throws Exception {
         execute(database, "CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation',"
-                + "'SibenchIndex','SibenchIndexRows','SibenchConsumption'], storage_path='"
+                + "'SibenchIndex','SibenchIndexRows'], storage_path='"
                 + output.resolve("native.csv").toString().replace("'", "''") + "')");
     }
 

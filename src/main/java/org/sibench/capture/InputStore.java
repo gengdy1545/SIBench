@@ -242,11 +242,13 @@ public final class InputStore implements AutoCloseable {
         if (manifest.has("output")) {
             for (String stream : java.util.List.of("baseline", "workload")) {
                 ProtoTrace.source(input, manifest, stream);
-                for (var file : manifest.getAsJsonObject("proto_files").getAsJsonArray(stream)) {
-                    var descriptor = file.getAsJsonObject();
-                    InputFiles.resolve(input, name(descriptor.get("path").getAsString()));
-                    add(payloads, descriptor);
-                }
+                var stored = manifest.getAsJsonObject("proto_files").getAsJsonObject(stream);
+                var descriptor = new JsonObject();
+                descriptor.addProperty("path", stream + ".pb.zst");
+                descriptor.add("bytes", stored.get("bytes"));
+                descriptor.add("sha256", stored.get("sha256"));
+                InputFiles.resolve(input, stream + ".pb.zst");
+                add(payloads, descriptor);
             }
             Path units = InputFiles.resolve(input, WorkUnits.FILE);
             var physical = Digests.digest(); var logical = Digests.digest();
@@ -261,9 +263,7 @@ public final class InputStore implements AutoCloseable {
             add(payloads, file);
             return payloads;
         }
-        for (String field : java.util.List.of("schema", "source_ddl", "parameter_file", "load_inventory"))
-            if (manifest.has(field)) add(payloads, manifest.getAsJsonObject(field));
-        if (manifest.has("baseline_files")) manifest.getAsJsonObject("baseline_files").entrySet().forEach(e -> add(payloads, e.getValue().getAsJsonObject()));
+        for (var file : CsvInput.files(manifest)) add(payloads, file);
         if (manifest.has("cdc_files")) manifest.getAsJsonArray("cdc_files").forEach(e -> add(payloads, e.getAsJsonObject()));
         return payloads;
     }

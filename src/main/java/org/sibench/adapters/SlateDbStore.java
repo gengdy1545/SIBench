@@ -23,7 +23,10 @@ final class SlateDbStore implements OrderedStore {
 
     private static synchronized void load() throws IOException {
         if (loaded) return;
-        Path library = Path.of(System.getProperty("sibench.slatedb.library", "build/index/libslatedb_jni.so"));
+        String configured = System.getProperty("sibench.slatedb.library");
+        // build-slatedb.sh always writes into a fresh subdirectory, so there is no fixed default location.
+        if (configured == null) throw new IOException("Set -Dsibench.slatedb.library to the built libslatedb_jni.so");
+        Path library = Path.of(configured);
         if (!Files.isRegularFile(library)) throw new IOException("SlateDB JNI library not found: " + library);
         try {
             System.load(library.toAbsolutePath().toString());

@@ -26,8 +26,7 @@ class PixelsBuildTest(unittest.TestCase):
                                    "cpp/pixels-retina/CMakeLists.txt": "fixture\n",
                                    "scripts/etc/coordinator-jvm.config": "-Xmx1g\n",
                                    "scripts/etc/retina-jvm.config": "-Xmx1g\n"},
-            "third_party/pixels-sink": {"src/main/resources/pixels-sink.properties": "sink.mode=none\n",
-                                        "App.java": "original\n"},
+            "third_party/pixels-sink": {"App.java": "original\n"},
             "third_party/postgresql": {"configure": "#!/bin/sh\necho \"$1\" > prefix\n"},
         }
         for path, files in self.pins.items():
@@ -100,6 +99,9 @@ if [ "$1" = "install" ]; then p=$(sed 's/--prefix=//' prefix); mkdir -p "$p/bin"
         self.assertEqual(self.git(self.root / "third_party/pixels-sink", "rev-parse", "HEAD"), identity["pixels_sink_commit"])
         self.assertEqual({"pixels-cli.jar", "pixels-daemon.jar", "pixels-sink.jar", "sibench-pixels.jar"}, set(identity["jars"]))
         self.assertIn("retina.tile.visibility.capacity=256", (self.build / "defaults/pixels.properties").read_text())
+        # Only the Maven-time PIXELS_HOME used the copied defaults; runs never read sink defaults from the build.
+        self.assertFalse((self.build / "home/etc").exists())
+        self.assertFalse((self.build / "defaults/pixels-sink.properties").exists())
         self.assertEqual("patched\n", (self.build / "source/pixels-sink/App.java").read_text())
         self.assertEqual("original\n", (self.root / "third_party/pixels-sink/App.java").read_text())
         self.assertEqual("patched\n", (self.build / "source/pixels/Load.java").read_text())

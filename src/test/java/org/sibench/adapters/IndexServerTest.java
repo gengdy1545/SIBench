@@ -131,6 +131,33 @@ public class IndexServerTest {
         } finally { server.shutdownNow(); }
     }
 
+    @Test(timeout=10000) public void aChangedDeploymentDescriptionFailsTheReplayClient() throws Exception {
+        var calls=new java.util.concurrent.atomic.AtomicInteger();
+        var service=new IndexServiceGrpc.IndexServiceImplBase() {
+            @Override public void put(PutRequest request,StreamObserver<PutResponse> out) { out.onNext(PutResponse.getDefaultInstance()); out.onCompleted(); }
+        };
+        var described=ServerInterceptors.intercept(service,new ServerInterceptor() {
+            @Override public <Q,S> ServerCall.Listener<Q> interceptCall(ServerCall<Q,S> call,Metadata headers,ServerCallHandler<Q,S> next) {
+                String location=calls.getAndIncrement()==0?"first":"second";
+                byte[] description=new com.google.gson.Gson().toJson(new IndexDescription("fixture",ValueKind.ROW_ID,
+                        Acknowledgement.ACK_MEMORY,false,"test",location)).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                return next.startCall(new ForwardingServerCall.SimpleForwardingServerCall<Q,S>(call) {
+                    @Override public void sendHeaders(Metadata response) { response.put(GrpcService.DESCRIPTION,description); super.sendHeaders(response); }
+                },headers);
+            }
+        });
+        var server=ServerBuilder.forPort(0).addService(described).build().start();
+        try(var grpc=new GrpcService("127.0.0.1:"+server.getPort(),new TraceRequests(ValueKind.ROW_ID),"changed",2)) {
+            var target=grpc.factory().open(0);
+            var row=IndexOperationTrace.write(1,IndexOperationTrace.UPSERT,1,0,IndexKey.ofInt(7),1,0,0,70);
+            send(target,1,row).response().toCompletableFuture().get(3,TimeUnit.SECONDS);
+            assertEquals("first",grpc.description().location());
+            var changed=send(target,2,row).response().toCompletableFuture();
+            var error=assertThrows(ExecutionException.class,()->changed.get(3,TimeUnit.SECONDS));
+            assertTrue(error.getCause().getMessage().contains("changed during replay"));
+        } finally { server.shutdownNow(); }
+    }
+
     @Test(timeout=10000) public void closeCancelsAnUnresponsiveCall() throws Exception {
         var server=ServerBuilder.forPort(0).addService(new IndexServiceGrpc.IndexServiceImplBase() {
             @Override public void put(PutRequest request,StreamObserver<PutResponse> out) {}

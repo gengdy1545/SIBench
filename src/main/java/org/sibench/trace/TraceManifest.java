@@ -31,8 +31,7 @@ public final class TraceManifest {
         };
     }
 
-    public static void requireValue(Path directory,ValueKind kind)throws IOException {
-        var manifest=read(directory);
+    public static void requireValue(JsonObject manifest,ValueKind kind)throws IOException {
         if(!manifest.getAsJsonArray("value_kinds").contains(new com.google.gson.JsonPrimitive(kind.name().toLowerCase(java.util.Locale.ROOT))))
             throw new IOException("Trace does not provide "+kind+" values");
     }

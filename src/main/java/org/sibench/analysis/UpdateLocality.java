@@ -48,8 +48,8 @@ public final class UpdateLocality {
             int heatmapBins,
             long sortBytes,
             int l0IndexModifications) {
-        public static Config read(Path path) throws IOException {
-            var document = ConfigValues.object(org.sibench.config.SibenchConfig.read(path), "analysis");
+        public static Config from(Map<String, Object> runtime) {
+            var document = ConfigValues.object(runtime, "analysis");
             var layout = ConfigValues.object(document, "layout");
             var window = ConfigValues.object(document, "window");
             int entries = Math.toIntExact(ConfigValues.positive(layout, "entries_per_block"));
@@ -125,11 +125,10 @@ public final class UpdateLocality {
     private UpdateLocality() {}
 
     /** Builds the static layout and writes the analysis into a new output directory. */
-    public static void run(Path trace, Path configFile, Path output) throws IOException {
+    public static void run(Path trace, Config config, Path output) throws IOException {
         if (Files.exists(output)) throw new IOException("Locality output already exists: " + output);
         Files.createDirectories(output);
         Files.writeString(output.resolve("INCOMPLETE"), "analysis not committed\n");
-        var config = Config.read(configFile);
         var manifest = TraceManifest.read(trace);
         var catalog = IndexCatalog.fromManifest(manifest);
         long baselineRows = manifest.get("baseline_rows").getAsLong();

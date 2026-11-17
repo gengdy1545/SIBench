@@ -107,7 +107,6 @@ public final class SourceSchema {
         require(Set.of("hybench", "ycsb", "sysbench").contains(benchmark), "Unsupported benchmark");
         root = root.toRealPath();
         String pin = git(root, "rev-parse", ":" + string(declared, "path"));
-        require(pin.equals(string(declared, "commit")), "Source assertion differs from its submodule gitlink");
         Path source = root.resolve(string(declared, "path")).toRealPath();
         require(
                 source.startsWith(root.resolve("benchmark").toRealPath()),
@@ -152,9 +151,7 @@ public final class SourceSchema {
             throws IOException {
         int fields = Math.toIntExact(positive(nativeConfig, "fieldcount"));
         require(fields <= 1024, "YCSB schema fieldcount exceeds 1024");
-        String table =
-                nativeConfig.containsKey("table") ? string(nativeConfig, "table") : "usertable";
-        require(table.equals("usertable"), "Current YCSB layout requires usertable");
+        String table = "usertable";
         var columns = new ArrayList<Column>();
         columns.add(new Column("ycsb_key", "character varying", false, DefaultValue.none()));
         for (int i = 0; i < fields; i++)
@@ -178,20 +175,6 @@ public final class SourceSchema {
             throws IOException {
         int count = Math.toIntExact(positive(nativeConfig, "tables"));
         require(count <= 10000, "sysbench schema table count exceeds 10000");
-        require(
-                !nativeConfig.containsKey("secondary") || !bool(nativeConfig, "secondary"),
-                "sysbench secondary=true replaces the primary key and is unsupported");
-        require(
-                !nativeConfig.containsKey("create-secondary")
-                        || bool(nativeConfig, "create-secondary"),
-                "sysbench source must create all k secondary indexes");
-        require(
-                !nativeConfig.containsKey("pgsql-variant"),
-                "sysbench pgsql-variant is unsupported by the DuckDB driver");
-        require(
-                !nativeConfig.containsKey("create-table-options")
-                        || string(nativeConfig, "create-table-options").isEmpty(),
-                "Custom sysbench table options are unsupported");
         boolean auto = !nativeConfig.containsKey("auto-inc") || bool(nativeConfig, "auto-inc");
         var tables = new ArrayList<Table>();
         for (int i = 1; i <= count; i++) {

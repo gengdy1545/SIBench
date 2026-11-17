@@ -102,7 +102,7 @@ public class TransactionLocalTraceTest {
             var answers = new ArrayList<List<com.google.protobuf.ByteString>>();
             var requests = new TraceRequests(mode);
             try (var backend = VersionedIndexBackend.create(directory.resolve("index"), mode)) {
-                org.sibench.adapters.IndexExecution.Executor executor = (request, partial) -> {
+                org.sibench.adapters.InProcessService.Executor executor = (request, partial) -> {
                     var response = IndexExecution.execute(backend, request, partial);
                     if (request instanceof org.sibench.adapters.proto.GetRequest || request instanceof org.sibench.adapters.proto.ScanRequest)
                         answers.add(response.values());

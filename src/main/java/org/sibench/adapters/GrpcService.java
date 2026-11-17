@@ -21,6 +21,7 @@ public final class GrpcService implements AutoCloseable {
     private final long timeoutSeconds;
     private final Set<Client> clients = ConcurrentHashMap.newKeySet();
     private volatile IndexDescription description;
+    private byte[] descriptionBytes;
 
     public GrpcService(String endpoint, TraceRequests requests, String binding, long timeoutSeconds) {
         if (binding == null || binding.isBlank()) throw new IllegalArgumentException("A replay needs its trace binding");
@@ -93,12 +94,15 @@ public final class GrpcService implements AutoCloseable {
                             try {
                                 byte[] value=headers.get(DESCRIPTION);
                                 if (value==null) throw new IOException("Missing index service deployment description");
-                                var actual=new com.google.gson.Gson().fromJson(new String(value,java.nio.charset.StandardCharsets.UTF_8),IndexDescription.class);
-                                if (actual==null) throw new IOException("Empty index service deployment description");
-                                actual.require(requests.valueKind());
                                 synchronized (GrpcService.this) {
-                                    if (description!=null && !description.equals(actual)) throw new IOException("Index service description changed during replay");
-                                    description=actual;
+                                    // The first description is parsed and checked; later ones must repeat its bytes.
+                                    if (descriptionBytes==null) {
+                                        var actual=new com.google.gson.Gson().fromJson(new String(value,java.nio.charset.StandardCharsets.UTF_8),IndexDescription.class);
+                                        if (actual==null) throw new IOException("Empty index service deployment description");
+                                        actual.require(requests.valueKind());
+                                        description=actual; descriptionBytes=value;
+                                    } else if (!java.util.Arrays.equals(descriptionBytes,value))
+                                        throw new IOException("Index service description changed during replay");
                                 }
                                 described=true;
                                 super.onHeaders(headers);

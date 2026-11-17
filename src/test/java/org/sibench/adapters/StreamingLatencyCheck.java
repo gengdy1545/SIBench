@@ -39,7 +39,7 @@ public final class StreamingLatencyCheck {
         var requests = new TraceRequests(ValueKind.ROW_ID);
         requests.baselineBatch(16);
         try (var grpc = new GrpcService(args[0], requests, BINDING, 5)) {
-            try (var baseline = new ReplayDispatcher(config, grpc.factory())) {
+            try (var baseline = new ReplayDispatcher(config, grpc.factory(), 0)) {
                 for (int key = 0; key < BASELINE_ROWS; key++) {
                     var operation = IndexOperationTrace.write(key + 1L, IndexOperationTrace.INSERT,
                             1, 0, IndexKey.ofInt(key), 0, 0, 0, key + 1L)

@@ -2,15 +2,15 @@ package org.sibench.capture;
 
 import static org.junit.Assert.*;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.List;
 import org.junit.Test;
+import org.sibench.generation.DuckDbHostFixture;
 
-public class DuckDbMutationsTest {
+public class DuckDbMutationsTest extends DuckDbHostFixture {
     private static void sql(Connection db,String text)throws SQLException {try(var q=db.createStatement()){q.execute(text);}}
     private Connection fixture()throws Exception {
-        var db=DriverManager.getConnection("jdbc:duckdb:");sql(db,"CREATE TABLE items(id BIGINT PRIMARY KEY,k BIGINT)");
+        var db=isolated();sql(db,"CREATE TABLE items(id BIGINT PRIMARY KEY,k BIGINT)");
         sql(db,"CREATE SCHEMA sibench_history");
         sql(db,"CREATE TABLE sibench_history.tables AS SELECT 1 AS table_id,'main' AS schema_name,'items' AS table_name,'id' AS primary_key");
         sql(db,"CREATE TEMP TABLE sibench_transactions AS SELECT 1 AS connection_id,1 AS transaction_id,1 AS version,0 AS read_version");
@@ -32,7 +32,8 @@ public class DuckDbMutationsTest {
         sql(db,"CREATE TEMP TABLE sibench_identities AS SELECT 1 AS table_id,'10' AS primary_key_sql,100 AS row_id,0 AS transaction_id,"
                 +"0 AS query_id,0 AS version,'commit' AS outcome UNION ALL SELECT 1,'20',200,1,2,1,'rollback'");
         sql(db,"CREATE TEMP TABLE sibench_insert_identities AS SELECT * FROM sibench_identities WHERE version>0");
-        sql(db,"CREATE TEMP TABLE sibench_access_batches(access_id BIGINT,connection_id BIGINT,transaction_id BIGINT,query_id BIGINT,raw_record BIGINT,physical_rows BIGINT[],phase VARCHAR)");
+        sql(db,DuckDbIdentities.VISIBLE);
+        sql(db,"CREATE TEMP TABLE sibench_access_batches(access_id BIGINT,connection_id BIGINT,transaction_id BIGINT,query_id BIGINT,raw_record BIGINT,primary_keys_sql VARCHAR[],phase VARCHAR)");
         sql(db,"CREATE TEMP TABLE sibench_accesses(access_id BIGINT,connection_id BIGINT,transaction_id BIGINT,query_id BIGINT,table_id INTEGER,raw_record BIGINT)");
         sql(db,"CREATE TEMP TABLE sibench_access_keys(access_id BIGINT,key_sql VARCHAR)");
         return db;
@@ -46,10 +47,8 @@ public class DuckDbMutationsTest {
             }
         }
     }
-    @Test public void rejectsIncompleteScopesIdentitiesColumnsAndRepeatedRowChanges()throws Exception {
-        for(String corrupt:List.of("DELETE FROM sibench_mutation_statements WHERE mutation_id=1 AND event='begin'",
-                "UPDATE sibench_mutation_statements SET affected_rows=0 WHERE event='complete' AND mutation_id=1",
-                "DELETE FROM sibench_identities WHERE row_id=200",
+    @Test public void rejectsMissingIdentitiesColumnsAndRepeatedRowChanges()throws Exception {
+        for(String corrupt:List.of("DELETE FROM sibench_identities WHERE row_id=200",
                 "UPDATE sibench_mutation_statements SET columns=[{'name':'id','type':'BIGINT'}] WHERE mutation_id=1",
                 "UPDATE sibench_mutation_statements SET rows=[{'physical_row':0,'values_sql':['10']}] WHERE mutation_id=1 AND event='begin'",
                 "INSERT INTO sibench_mutation_statements SELECT mutation_id+10,connection_id,transaction_id,query_id,raw_record+20,"
@@ -62,7 +61,7 @@ public class DuckDbMutationsTest {
         }
     }
     @Test public void refusesAReadThatCouldObserveStatementInternalWrites()throws Exception {
-        for(String visible:List.of("[0]","[]"))try(var db=fixture()) {
+        for(String visible:List.of("['10']","[]"))try(var db=fixture()) {
             sql(db,"INSERT INTO sibench_accesses VALUES(1,1,1,1,1,0)");sql(db,"INSERT INTO sibench_access_batches VALUES(1,1,1,1,5,"+visible+",'storage')");
             var error=assertThrows(SQLException.class,()->DuckDbMutations.bind(db));
             assertTrue(error.getMessage(),error.getMessage().contains("overlapping"));

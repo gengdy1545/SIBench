@@ -10,6 +10,10 @@ public final class DuckDbIdentities {
     private record Table(int id, String key, String type) {
         String identities() { return "sibench_history.\"identities_" + id + "\""; }
     }
+    /** The one identity visibility rule: committed by the read snapshot, or born earlier in the reader's transaction. */
+    static final String VISIBLE = "CREATE TEMP MACRO sibench_visible(outcome,version,query_id,read_version,own_version,before_query) AS "
+            + "(outcome='commit' AND version<=read_version) OR (version=own_version AND query_id<before_query)";
+
     private DuckDbIdentities() {}
 
     /** Import and bind statements/transactions first, on the same database that owns the native history. */
@@ -22,7 +26,7 @@ public final class DuckDbIdentities {
                 + "AND c.table_name=t.table_name AND c.column_name=t.primary_key ORDER BY t.table_id")) {
             while (rows.next()) {
                 var table = new Table(rows.getInt(1), rows.getString(2), rows.getString(3));
-                if (table.id()<1 || table.id()>65535 || table.type()==null
+                if (!org.sibench.trace.IndexEntry.validNamespace(table.id(),0) || table.type()==null
                         || !List.of("TINYINT","SMALLINT","INTEGER","BIGINT","VARCHAR").contains(table.type()))
                     throw new SQLException("Unsupported native identity table or primary key type: " + table);
                 tables.add(table);
@@ -54,6 +58,7 @@ public final class DuckDbIdentities {
             }
             execute(database, "CREATE TEMP VIEW sibench_identities AS " + String.join(" UNION ALL ", baseline)
                     + " UNION ALL SELECT * FROM temp.main.sibench_insert_identities");
+            execute(database, VISIBLE);
             database.commit();
         } catch (SQLException | RuntimeException failure) {
             try { database.rollback(); } catch (SQLException rollback) { failure.addSuppressed(rollback); }
@@ -67,19 +72,9 @@ public final class DuckDbIdentities {
                 + "' AND statement_outcome='completed'");
         String columns = "len(columns)=2 AND columns[1].name='_sib_row_id' AND columns[1].type='BIGINT' "
                 + "AND columns[2].name=" + textKey(table.key()) + " AND columns[2].type=" + textKey(table.type());
+        // DuckDbStatements has validated the scope grammar; identity births are appends or merges of these columns.
         reject(database, "SELECT 1 FROM sibench_identity_events WHERE kind NOT IN ('append','merge') "
-                + "OR event NOT IN ('begin','rows','complete') OR NOT coalesce(" + columns + ",false) "
-                + "OR (event='complete' AND (len(rows)<>0 OR affected_rows<>requested_rows)) "
-                + "OR (event<>'complete' AND affected_rows<>-1) OR (kind='append' AND event='rows') "
-                + "OR (kind='merge' AND event='begin' AND len(rows)<>0) LIMIT 1",
-                "Unexpected native identity mutation or columns");
-        reject(database, "SELECT 1 FROM sibench_identity_events GROUP BY mutation_id HAVING "
-                + "count(*) FILTER(WHERE event='begin')<>1 OR count(*) FILTER(WHERE event='complete')<>1 "
-                + "OR min(connection_id)<>max(connection_id) OR min(transaction_id)<>max(transaction_id) "
-                + "OR min(query_id)<>max(query_id) OR min(kind)<>max(kind) "
-                + "OR min(requested_rows)<>max(requested_rows) OR max(requested_rows)=0 "
-                + "OR max(affected_rows)<>max(requested_rows) OR sum(len(rows))<>max(affected_rows) LIMIT 1",
-                "Incomplete or inconsistent native identity scope");
+                + "OR NOT coalesce(" + columns + ",false) LIMIT 1", "Unexpected native identity mutation or columns");
         execute(database, "CREATE TEMP TABLE sibench_identity_rows AS SELECT e.transaction_id,e.query_id, "
                 + "t.version,t.outcome,unnest(e.rows) AS r FROM sibench_identity_events e "
                 + "JOIN temp.main.sibench_transactions t USING(connection_id,transaction_id)");
@@ -103,24 +98,6 @@ public final class DuckDbIdentities {
                 "Captured committed identities disagree with native history");
         execute(database, "DROP TABLE sibench_identity_rows");
         execute(database, "DROP TABLE sibench_identity_events");
-    }
-
-    /** The source already observed this key. This lookup does not infer whether a row exists after a delete. */
-    public static long observedRow(Connection database, int table, String primaryKeySql, long readVersion,
-            long localVersion, long beforeQuery) throws SQLException {
-        if (table<1 || primaryKeySql==null || readVersion<0 || localVersion<0 || beforeQuery<0
-                || localVersion==0 && beforeQuery!=0 || localVersion>0 && localVersion<=readVersion)
-            throw new IllegalArgumentException("Invalid observed-row read point");
-        try (var query = database.prepareStatement("SELECT row_id FROM temp.main.sibench_identities "
-                + "WHERE table_id=? AND primary_key_sql=? AND ((outcome='commit' AND version<=?) "
-                + "OR (version=? AND query_id<?)) ORDER BY (version=? AND version>0) DESC,version DESC,query_id DESC LIMIT 1")) {
-            query.setInt(1,table); query.setString(2,primaryKeySql); query.setLong(3,readVersion);
-            query.setLong(4,localVersion); query.setLong(5,beforeQuery); query.setLong(6,localVersion);
-            try (var rows = query.executeQuery()) {
-                if (!rows.next()) throw new SQLException("No native identity for observed key in table " + table);
-                long rowId = rows.getLong(1); rows.next(); return rowId;
-            }
-        }
     }
 
     /** Canonical VARCHAR token used by the pinned native Value::ToSQLString; never executed as SQL. */

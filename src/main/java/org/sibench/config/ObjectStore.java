@@ -50,7 +50,7 @@ public record ObjectStore(
             require(Set.of("aws", "cos").contains(name), "Unknown object-storage connection: " + name);
             var store = object(stores, name);
             for (String key : store.keySet())
-                require(Set.of("endpoint", "region", "addressing", "versioning", "access_key_env",
+                require(Set.of("endpoint", "region", "addressing", "access_key_env",
                         "secret_key_env", "session_token_env").contains(key), "Unknown storage key: " + key);
             URI endpoint = URI.create(string(store, "endpoint"));
             require(endpoint.getScheme() != null && Set.of("https", "http").contains(endpoint.getScheme()) && endpoint.getHost() != null
@@ -62,7 +62,6 @@ public record ObjectStore(
             for (String key : Set.of("access_key_env", "secret_key_env", "session_token_env"))
                 if (!key.equals("session_token_env") || store.containsKey(key))
                     require(string(store, key).matches("[A-Za-z_][A-Za-z0-9_]*"), "Invalid credential variable: " + key);
-            if (store.containsKey("versioning")) require(string(store, "versioning").equals("disabled"), "Expected disabled bucket versioning");
         }
     }
 

@@ -306,10 +306,11 @@ public class DuckDbHostCheck extends DuckDbHostFixture {
             Thread.sleep(100);
             stop(); host = null;
             assertTrue(running.get(5, TimeUnit.SECONDS));
-            var readOnly = new java.util.Properties(); readOnly.setProperty("duckdb.read_only", "true");
-            try (var reader = java.sql.DriverManager.getConnection("jdbc:duckdb:" + DuckDbDatabase.file(root.resolve("data")), readOnly)) {
-                assertEquals(0, number(reader, "SELECT count(*) FROM items"));
-            }
+            Path shell = Path.of(System.getProperty("sibench.duckdb.host")).resolveSibling("duckdb");
+            var reader = new ProcessBuilder(shell.toString(), "-readonly", "-noheader", "-csv",
+                    root.resolve("data/data.duckdb").toString(), "-c", "SELECT count(*) FROM items").redirectErrorStream(true).start();
+            assertTrue(reader.waitFor(10, TimeUnit.SECONDS));
+            assertEquals("0", new String(reader.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).strip());
             assertFalse(Files.exists(socket));
         } finally {
             for (var connection : List.of(writer, worker)) {

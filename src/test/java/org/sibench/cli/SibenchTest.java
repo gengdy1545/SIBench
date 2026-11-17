@@ -58,8 +58,6 @@ public class SibenchTest {
             {"inspect-scale", "--root"},
             {"inspect-scale", "--unknown"},
             {"generate"},
-            {"generate-pixels"},
-            {"generate-pixels", "missing-config.yaml"},
             {"generate", "missing-config.yaml"},
             {"check-replay", "config/sibench.yaml", "missing-trace"},
             {"inspect-scale", "src/test/resources/config/ycsb_1k.yaml", "missing.yaml"}
@@ -80,7 +78,8 @@ public class SibenchTest {
 
     @Test
     public void rejectsUnknownCommandsEvenForHelp() {
-        for (String[] args : new String[][] {{"no-such-command"}, {"no-such-command", "--help"}}) {
+        // generate-pixels was the removed live Pixels workflow; file-based CDC replaces it.
+        for (String[] args : new String[][] {{"no-such-command"}, {"no-such-command", "--help"}, {"generate-pixels", "config/sibench.yaml"}}) {
             var output = new ByteArrayOutputStream();
             var errors = new ByteArrayOutputStream();
             try (var out = new PrintStream(output); var err = new PrintStream(errors)) {

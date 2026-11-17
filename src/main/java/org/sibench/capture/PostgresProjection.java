@@ -27,14 +27,15 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
     private final Path scratch;
     private final boolean secondaryIndexes;
     private final PostgresQueries coverage;
-    private final Map<Integer,PostgresAccessUnits.Detail> details=new HashMap<>();
+    /** Backends whose capture_start an earlier transaction already consumed. */
+    private final java.util.Set<Integer> sessions=new java.util.HashSet<>();
     private final Map<Integer,PreparedStatement> identities=new HashMap<>();
     private final Map<PostgresAccessUnits.Unit,Search> live=new IdentityHashMap<>();
     private final Map<PostgresAccessUnits.BitmapGroup,Search> groups=new IdentityHashMap<>();
     private final ArrayDeque<Object> pending=new ArrayDeque<>();
     private final ArrayList<CommandWrite> ownWrites=new ArrayList<>();
-    private final ArrayDeque<Long> executors=new ArrayDeque<>();
-    private final ArrayDeque<Integer> subtransactionDepths=new ArrayDeque<>();
+    /** Active executors by their executor_start sequence. */
+    private PostgresTransactions.ExecutorStack<Long> executors;
     private PostgresTransactions.Chunk chunk;
     private SpillingMap local,allocated;
     private long version,event,workUnits,currentUnit,unitEvent,writes,allocations,insertions;
@@ -79,15 +80,13 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
         try(var rowIds=new SpillingMap(localDirectory,65536,4);
                 var abortIds=new SpillingMap(allocationDirectory,65536,4)) {
             local=rowIds;allocated=abortIds;
-            var tracker=new PostgresAccessUnits(this);
-            if(details.containsKey(source.pid))tracker.continueSession(details.get(source.pid));else tracker.beginSession();
+            var tracker=new PostgresAccessUnits(this);executors=new PostgresTransactions.ExecutorStack<>();
+            if(sessions.contains(source.pid))tracker.continueSession();else tracker.beginSession();
             if(version>0)output.accept(IndexOperationTrace.transaction(0,IndexOperationTrace.TRANSACTION_BEGIN,version,version,0));
             source.read(e->{
                 event++;
                 if(e.get("event").getAsString().equals("executor_start")&&e.get("depth").getAsInt()==1)drain();
                 String type=e.get("event").getAsString();
-                if(type.equals("executor_start"))executors.push(e.get("sequence").getAsLong());
-                if(type.equals("subtransaction_begin"))subtransactionDepths.push(executors.size());
                 tracker.accept(e);
                 byte[] allocation=type.equals("row_change")?allocation(e):null;
                 // Successful statements of an aborted transaction stay visible to its later reads.
@@ -98,17 +97,12 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
                     if(source.completed(e.get("req").getAsLong())&&source.survived(e))writes++;
                     pending.add(new Change(e,unitEvent,currentUnit,writes,allocation));
                 }
-                if(type.equals("executor_end"))executors.pop();
-                if(type.equals("subtransaction_commit")||type.equals("subtransaction_abort")) {
-                    int depth=subtransactionDepths.pop();
-                    if(type.equals("subtransaction_abort"))while(executors.size()>depth)executors.pop();
-                }
-                if(type.equals("transaction_abort"))executors.clear();
+                executors.accept(type,()->e.get("sequence").getAsLong());
                 drain();
                 if(pending.size()>ProtoTrace.MAX_TRANSACTION_OPERATIONS)
                     throw new IOException("Unsettled PG operation prefix exceeds the buffer limit");
             });
-            details.put(source.pid,tracker.detail());tracker.endSession();drain();
+            sessions.add(source.pid);tracker.endSession();drain();
             if(pending.peekFirst() instanceof Change)throw new IOException("PG insertion lacks its native RowID");
             if(!pending.isEmpty()||!live.isEmpty()||!groups.isEmpty())throw new IOException("PG transaction has unsettled accesses");
             if(allocations!=insertions)throw new IOException("PG native RowID allocations do not match insertions");
@@ -118,7 +112,7 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
                 versions.finish(source);if(source.committed)commits++;else aborts++;
             }
             if(coverage!=null)coverage.endTransaction();
-        }finally{ownWrites.clear();executors.clear();subtransactionDepths.clear();local=null;allocated=null;chunk=null;}
+        }finally{ownWrites.clear();executors=null;local=null;allocated=null;chunk=null;}
         for(Path directory:List.of(localDirectory,allocationDirectory))
             if(java.nio.file.Files.exists(directory))Generation.deleteTree(directory);
         return version>0;
@@ -156,8 +150,8 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
                 throw new IOException("PG bitmap inputs have different visibility");
             return;
         }
-        if(executors.isEmpty())throw new IOException("PG access lacks an executor origin");
-        var search=new Search(unitEvent,currentUnit,readVersion,writes,unit.snapshotCid,event.get("sequence").getAsLong(),executors.peek(),unit.request);pending.add(search);
+        if(executors.current()==null)throw new IOException("PG access lacks an executor origin");
+        var search=new Search(unitEvent,currentUnit,readVersion,writes,unit.snapshotCid,event.get("sequence").getAsLong(),executors.current(),unit.request);pending.add(search);
         if(unit.group==null)live.put(unit,search);else groups.put(unit.group,search);
     }
     @Override public void unitSettled(PostgresAccessUnits.Unit unit)throws IOException {
@@ -166,7 +160,7 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
         if(unit.group!=null)return;
         var search=live.remove(unit);
         if(search!=null&&!chunk.executionCompleted(search.execution)){pending.remove(search);return;}
-        var decision=PostgresAccessProjection.decide(unit,catalog,true);
+        var decision=PostgresAccessProjection.decide(unit,catalog);
         if(decision.excluded()){if(search!=null)pending.remove(search);return;}
         settle(search,decision,unit.request);
     }
@@ -185,7 +179,7 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
     @Override public void groupSettled(PostgresAccessUnits.BitmapGroup group)throws IOException {
         var search=groups.remove(group);
         if(search!=null&&!chunk.executionCompleted(search.execution)){pending.remove(search);return;}
-        var decision=PostgresAccessProjection.decideGroup(group,catalog,true);
+        var decision=PostgresAccessProjection.decideGroup(group,catalog);
         if(decision.excluded()){if(search!=null)pending.remove(search);return;}
         settle(search,decision,group.members.get(0).request);
     }
@@ -240,7 +234,7 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
         IndexKey key=catalog.postgresKey(primary,text((after==null?before:after).get(primary.column())));
         if(key.equals(IndexKey.NULL)||before!=null&&!catalog.postgresKey(primary,text(before.get(primary.column()))).equals(key))
             throw new IOException("PG row change has a missing or changed primary key");
-        byte[] identity=identityKey(table,key,0);long rowId;
+        byte[] identity=identityKey(table,key);long rowId;
         try {
             if(action.equals("insert")){rowId=allocated.get(change.allocation());insertions++;}
             else {
@@ -312,8 +306,8 @@ final class PostgresProjection implements PostgresAccessUnits.Listener,AutoClose
         }
         return keys;
     }
-    private static byte[] identityKey(int table,IndexKey key,long query) {
-        byte[] bytes=key.bytes();return ByteBuffer.allocate(12+bytes.length).putInt(table).putLong(query).put(bytes).array();
+    private static byte[] identityKey(int table,IndexKey key) {
+        byte[] bytes=key.bytes();return ByteBuffer.allocate(4+bytes.length).putInt(table).put(bytes).array();
     }
     private byte[] allocationKey(int table,IndexKey key,JsonObject row,boolean insertion)throws IOException {
         byte[] bytes=key.bytes();

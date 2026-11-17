@@ -1,7 +1,5 @@
 package org.sibench.replay;
 
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonParser;
 
 import org.sibench.capture.IndexCatalog;
 import org.sibench.capture.IndexOperationTrace;
@@ -10,10 +8,7 @@ import org.sibench.capture.RunTiming;
 import org.sibench.trace.TraceManifest;
 
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,9 +28,16 @@ public final class ReplayInput {
         return input.preflight();
     }
 
-    /** Checks supply before a backend is touched; baseline verification is fused with its load. */
     public static Input prepare(Path directory, ReplayConfig config) throws IOException {
-        var manifest = TraceManifest.read(directory);
+        return prepare(directory, TraceManifest.read(directory), config);
+    }
+
+    /**
+     * Checks supply before a backend is touched; baseline verification is fused with its load.
+     * {@code manifest} is the document {@link TraceManifest#read} validated for {@code directory}.
+     */
+    public static Input prepare(Path directory, com.google.gson.JsonObject manifest, ReplayConfig config)
+            throws IOException {
         boolean secondary = TraceManifest.secondaryIndexes(manifest);
         if (config.secondaryIndexes() && !secondary)
             throw new IOException("Trace does not provide secondary indexes; disable secondary consumption or regenerate with secondary export");
@@ -81,8 +83,8 @@ public final class ReplayInput {
         private final java.util.Set<Integer> seen = new java.util.HashSet<>();
         private final java.util.Set<Integer> loadedTables = new java.util.HashSet<>();
         private IndexOperationTrace.Operation primary, previous;
-        private int position, group;
-        private long rows, groupEvent;
+        private int position;
+        private long rows;
 
         Coverage(
                 String name,
@@ -106,38 +108,16 @@ public final class ReplayInput {
                         throw new IOException(
                                 "Operation not bound to its source SQL request");
                 }
-                if (operation.kind() == IndexOperationTrace.SEARCH
-                        || IndexOperationTrace.isControl(operation)) {
-                    if (primary != null)
-                        throw new IOException("Interrupted index maintenance unit");
-                    if (!operation.grouped()
-                            && (operation.expansionSize() != 0
-                                    || operation.expansionPosition() != 0))
-                        throw new IOException("Unexpected search/control expansion");
-                    if (group > 0 && !operation.grouped())
-                        throw new IOException("Interrupted search group");
-                }
+                // ProtoTrace decodes each read group whole from one record, and baseline holds only Inserts.
                 if (operation.kind() == IndexOperationTrace.SEARCH) {
                     if (!catalog.getOrDefault(operation.table(), java.util.Set.of())
                             .contains(operation.index()))
                         throw new IOException("Search outside source catalog");
-                    // Group members are consecutive: positions 0..size-1, one source access.
-                    if (operation.grouped()) {
-                        if (operation.expansionPosition() != group
-                                || group > 0 && operation.sourceEvent() != groupEvent)
-                            throw new IOException("Search group out of order");
-                        groupEvent = operation.sourceEvent();
-                        group = operation.expansionPosition() + 1 == operation.expansionSize()
-                                ? 0
-                                : group + 1;
-                    }
                     return;
                 }
-                if (group > 0) throw new IOException("Interrupted search group");
                 if (IndexOperationTrace.isControl(operation)) return;
+                // Workload writes are final singleton entries; ReplayProjection.validateMutation enforces it.
                 if (name.equals("workload")) {
-                    if (operation.expansionSize() != 1 || operation.expansionPosition() != 0)
-                        throw new IOException("Workload requires final singleton index writes");
                     if (!catalog.getOrDefault(operation.table(), java.util.Set.of()).contains(operation.index()))
                         throw new IOException("Write outside source catalog");
                     return;
@@ -217,7 +197,6 @@ public final class ReplayInput {
 
         void finish(com.google.gson.JsonObject manifest) throws IOException {
             if (primary != null) throw new IOException("Unfinished index maintenance unit");
-            if (group > 0) throw new IOException("Unfinished search group");
             if (name.equals("baseline")) {
                 var required=new java.util.HashSet<>(catalog.keySet());
                 if(manifest.has("empty_baseline_tables")) {
@@ -312,12 +291,8 @@ public final class ReplayInput {
         return report;
     }
 
-    /** Binds an index to its Trace and replay settings. */
-    public static String binding(Path directory, ReplayConfig config) throws IOException {
-        var manifest =
-                JsonParser.parseString(
-                                Files.readString(directory.resolve("manifest.json")))
-                        .getAsJsonObject();
+    /** Binds an index to its Trace and replay settings, from the manifest {@link TraceManifest#read} validated. */
+    public static String binding(com.google.gson.JsonObject manifest, ReplayConfig config) {
         return "workload="
                 + manifest.get("workload_trace_sha256").getAsString()
                 + " baseline="

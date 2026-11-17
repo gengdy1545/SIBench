@@ -9,7 +9,6 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
@@ -19,7 +18,7 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.sibench.schema.SourceSchema;
 
-/** Drives PixelsCapture through real sockets with a scripted tracer and sink. */
+/** Drives PixelsCapture through a real tracer socket with scripted facts and file-sink reports. */
 public class PixelsCaptureTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
@@ -42,9 +41,9 @@ public class PixelsCaptureTest {
         var source = SourceSchema.of("sysbench", Path.of("benchmark/sysbench"), Map.of("tables", 1L));
         var loopback = InetAddress.getLoopbackAddress();
         for (int length : new int[] {-1, 32 * 1024 * 1024 + 1}) {
-            var trace = new PixelsTrace(temporary.newFolder().toPath().resolve("trace"), source, Map.of(), null);
+            var trace = new PixelsTrace(temporary.newFolder().toPath().resolve("trace"), source);
             var listener = new ServerSocket(0, 1, loopback);
-            try (var capture = new PixelsCapture(trace, listener, "token", new ServerSocket(0, 1, loopback), "sink")) {
+            try (var capture = new PixelsCapture(trace, listener, "token")) {
                 capture.acceptTracer(Duration.ofSeconds(2));
                 try (var socket = new Socket(loopback, listener.getLocalPort())) {
                     var out = new DataOutputStream(socket.getOutputStream());
@@ -63,12 +62,11 @@ public class PixelsCaptureTest {
 
     @Test public void barrierAcknowledgementRunsSyncedStepsAndExportsCommittedTransactions() throws Exception {
         var source = SourceSchema.of("sysbench", Path.of("benchmark/sysbench"), Map.of("tables", 1L));
-        var trace = new PixelsTrace(temporary.getRoot().toPath().resolve("trace"), source, Map.of(
-                7L, new PixelsTrace.Table("sbtest1", 1, 9, "int"), 8L, new PixelsTrace.Table("sibench_marker", 0, 10, "bigint")), null);
+        var trace = new PixelsTrace(temporary.getRoot().toPath().resolve("trace"), source);
+        trace.register(Map.of(7L, new PixelsTrace.Table("sbtest1", 1, 9, "int"), 8L, new PixelsTrace.Table("sibench_marker", 0, 10, "bigint")));
         var loopback = InetAddress.getLoopbackAddress();
         var traceListener = new ServerSocket(0, 1, loopback);
-        var reportListener = new ServerSocket(0, 1, loopback);
-        try (var capture = new PixelsCapture(trace, traceListener, "trace-token", reportListener, "sink-token")) {
+        try (var capture = new PixelsCapture(trace, traceListener, "trace-token")) {
             capture.acceptTracer(Duration.ofSeconds(10));
             try (var tracer = new Socket(loopback, traceListener.getLocalPort())) {
                 var out = new DataOutputStream(tracer.getOutputStream());
@@ -94,52 +92,46 @@ public class PixelsCaptureTest {
                 capture.synced(() -> trace.finishBaseline(Map.of("sbtest1", 1L)), Duration.ofSeconds(10));
                 assertTrue(answered.get());
 
-                try (var sink = new Socket(loopback, reportListener.getLocalPort())) {
-                    var reports = sink.getOutputStream();
-                    reports.write("T sink-token\nB 5\nB 6\n".getBytes(StandardCharsets.UTF_8));
-                    reports.flush();
-                    capture.acceptSink(Duration.ofSeconds(10));
-                    synchronized (out) {
-                        fact(out, PixelsTrace.LOOKUP, 5, 1, 100);
-                        fact(out, PixelsTrace.UPDATE, 5, 1, 101);
-                        out.writeByte(PixelsTrace.PUT);
-                        out.writeLong(8);
-                        out.writeLong(10);
-                        out.writeLong(6);
-                        out.writeInt(8);
-                        out.write(ByteBuffer.allocate(8).putLong(1).array());
-                        out.writeLong(1);
-                        out.writeLong(1);
-                        out.writeInt(0);
-                        out.writeInt(0);
-                        out.flush();
-                    }
-                    reports.write("C 6\nC 5\n".getBytes(StandardCharsets.UTF_8));
-                    reports.flush();
-                    capture.awaitMarker(1, Duration.ofSeconds(10));
-                    capture.call(trace::finish, false, Duration.ofSeconds(10));
-                    assertEquals(1, trace.version());
-                    // Stopping the sink after its last marker is not a failure.
-                    capture.sinkStopping();
-                    // A reported failure surfaces at the next check.
-                    reports.write("F Retina write failed\n".getBytes(StandardCharsets.UTF_8));
-                    reports.flush();
-                    long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-                    IOException failure = null;
-                    while (failure == null && System.nanoTime() < deadline) {
-                        try {
-                            capture.check();
-                            Thread.sleep(10);
-                        } catch (IOException error) {
-                            failure = error;
-                        }
-                    }
-                    assertNotNull(failure);
-                    // A step submitted after a failure reports it instead of waiting for the timeout.
-                    long start = System.nanoTime();
-                    assertThrows(IOException.class, () -> capture.call(() -> {}, false, Duration.ofMinutes(5)));
-                    assertTrue(System.nanoTime() - start < Duration.ofSeconds(5).toNanos());
+                // The file sink reports BEGIN in source order and commits possibly out of order.
+                capture.begin(5);
+                capture.begin(6);
+                synchronized (out) {
+                    fact(out, PixelsTrace.LOOKUP, 5, 1, 100);
+                    fact(out, PixelsTrace.UPDATE, 5, 1, 101);
+                    out.writeByte(PixelsTrace.PUT);
+                    out.writeLong(8);
+                    out.writeLong(10);
+                    out.writeLong(6);
+                    out.writeInt(8);
+                    out.write(ByteBuffer.allocate(8).putLong(1).array());
+                    out.writeLong(1);
+                    out.writeLong(1);
+                    out.writeInt(0);
+                    out.writeInt(0);
+                    out.flush();
                 }
+                capture.commit(6);
+                capture.commit(5);
+                capture.synced(trace::finish, Duration.ofSeconds(10));
+                // The marker-only transaction closes a phase and is not a Trace version.
+                assertEquals(1, trace.version());
+                // A lost tracer connection surfaces at the next check.
+                tracer.close();
+                long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+                IOException failure = null;
+                while (failure == null && System.nanoTime() < deadline) {
+                    try {
+                        capture.check();
+                        Thread.sleep(10);
+                    } catch (IOException error) {
+                        failure = error;
+                    }
+                }
+                assertNotNull(failure);
+                // A step submitted after a failure reports it instead of waiting for the timeout.
+                long start = System.nanoTime();
+                assertThrows(IOException.class, () -> capture.call(() -> {}, false, Duration.ofMinutes(5)));
+                assertTrue(System.nanoTime() - start < Duration.ofSeconds(5).toNanos());
             }
         }
     }

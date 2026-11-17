@@ -16,10 +16,11 @@ public final class DuckDbPredicates {
 
     public static List<IndexOperationTrace.Range> ranges(String family,List<Probe> probes) throws IOException {
         var ranges=new ArrayList<IndexOperationTrace.Range>();List<Predicate> base=null;
+        // DuckDbAccesses admits only base, deleted_rows and checkpoint_added probes with one or two predicates.
         for(var probe:probes) {
             if(probe.origin().equals("base")) {
                 base=probe.predicates();ranges.add(range(family,base));
-            } else if(!List.of("deleted_rows","checkpoint_added").contains(probe.origin())||base==null||!base.equals(probe.predicates())) {
+            } else if(base==null||!base.equals(probe.predicates())) {
                 throw new IOException("Delta ART predicate differs from its base probe");
             }
         }
@@ -36,7 +37,6 @@ public final class DuckDbPredicates {
     }
 
     private static IndexOperationTrace.Range range(String family,List<Predicate> predicates) throws IOException {
-        if(predicates.isEmpty()||predicates.size()>2)throw new IOException("Invalid ART predicate count");
         IndexKey lower=null,upper=null;boolean lowerInclusive=false,upperInclusive=false;
         for(var predicate:predicates) {
             String actual=DuckDbKeys.family(predicate.type());

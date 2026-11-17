@@ -67,7 +67,7 @@ public final class SpillingMap implements AutoCloseable {
     private ByteBuffer scratch = ByteBuffer.allocate(0).order(ByteOrder.LITTLE_ENDIAN);
     private boolean directoryCreated;
     private Path resolved;
-    private long nextRun, merges, flushes, lookups, runReads;
+    private long nextRun;
 
     public SpillingMap(Path directory, int memoryEntries, int fanout) {
         this(() -> directory, memoryEntries, fanout);
@@ -104,7 +104,6 @@ public final class SpillingMap implements AutoCloseable {
 
     /** The last value written for the key, or null. */
     public byte[] getBytes(byte[] key) throws IOException {
-        lookups++;
         byte[] value = table.get(key);
         if (value != null) return value;
         for (int i = runs.size() - 1; i >= 0; i--) {
@@ -116,7 +115,6 @@ public final class SpillingMap implements AutoCloseable {
 
     /** The entry with the greatest key at or below {@code key}, or null. */
     public Map.Entry<byte[], byte[]> floor(byte[] key) throws IOException {
-        lookups++;
         byte[] bestKey = null, bestValue = null;
         // Oldest first, so a newer source wins a tie on the same key.
         for (Run run : runs) {
@@ -192,7 +190,6 @@ public final class SpillingMap implements AutoCloseable {
         for (var entry : table.entrySet()) writer.append(entry.getKey(), entry.getValue());
         runs.add(writer.finish());
         table.clear();
-        flushes++;
         compact();
     }
 
@@ -241,28 +238,10 @@ public final class SpillingMap implements AutoCloseable {
             Files.delete(old.path);
         }
         runs.add(first, merged);
-        merges++;
     }
 
     public int runCount() {
         return runs.size();
-    }
-
-    public long merges() {
-        return merges;
-    }
-
-    public long flushes() {
-        return flushes;
-    }
-
-    /** Disk reads that were needed to answer lookups, for the report of a run. */
-    public long runReads() {
-        return runReads;
-    }
-
-    public long lookups() {
-        return lookups;
     }
 
     public int memoryEntries() {
@@ -496,7 +475,6 @@ public final class SpillingMap implements AutoCloseable {
                 return null;
             if (bloom != null && !mayContain(bloom, key)) return null;
             int at = blockAtOrBelow(key);
-            owner.runReads++;
             var reader = new EntryReader(channel(), indexOffsets[at], blockEnd(at), owner.scratch);
             try {
                 while (reader.next()) {
@@ -514,7 +492,6 @@ public final class SpillingMap implements AutoCloseable {
         Map.Entry<byte[], byte[]> floor(byte[] key, SpillingMap owner) throws IOException {
             if (Arrays.compareUnsigned(key, min) < 0) return null;
             int at = blockAtOrBelow(key);
-            owner.runReads++;
             var reader = new EntryReader(channel(), indexOffsets[at], blockEnd(at), owner.scratch);
             Map.Entry<byte[], byte[]> best = null;
             try {

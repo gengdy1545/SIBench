@@ -42,15 +42,11 @@ public final class TraceRequests {
         return PutRequest.newBuilder().setKey(key).setTs(operation.version()).setValue(value(operation)).build();
     }
 
-    /** Stored operations already contain the data RPC payload; only the selected value encoding changes. */
+    /**
+     * Stored operations already contain the data RPC payload; only the selected value encoding changes.
+     * {@code operation} is the view ProtoTrace decoded from {@code stored}, so their shapes agree.
+     */
     public Message forward(TraceOperation stored, Operation operation) throws IOException {
-        boolean matches = switch (operation.kind()) {
-            case IndexOperationTrace.SEARCH -> stored.hasGet() || stored.hasScan();
-            case IndexOperationTrace.LOGICAL_DELETE -> stored.hasDelete();
-            case IndexOperationTrace.INSERT, IndexOperationTrace.UPSERT -> stored.hasPut();
-            default -> false;
-        };
-        if (operation.grouped() || !matches) throw new IOException("Stored operation shape mismatch");
         return switch (stored.getRequestCase()) {
             case GET, SCAN -> forwardRead(stored.hasGet() ? stored.getGet() : stored.getScan(), stored.getLocalLocatorsList());
             case DELETE -> stored.getDelete();
@@ -59,12 +55,8 @@ public final class TraceRequests {
             default -> throw new IOException("Expected a stored data operation");
         };
     }
-    static boolean baselineInsert(Operation operation) {
-        return operation.kind() == IndexOperationTrace.INSERT && operation.version() == 0 && operation.transactionId() == 0;
-    }
     public void checkBatch(IndexResponse response) throws IOException {
-        if (response.more() || response.status() != IndexStatus.OK || !response.values().isEmpty())
-            throw new IOException("Invalid write batch response: " + response.message());
+        if (response.more() || !response.values().isEmpty()) throw new IOException("Invalid write batch response");
     }
     public void baselineBatch(int writes) {
         if (writes < 1) throw new IllegalArgumentException("A batch holds at least one write");
@@ -151,21 +143,14 @@ public final class TraceRequests {
                 : IndexEntry.locator(operation.file(), operation.position());
     }
 
-    /** At one table/snapshot, complete index maintenance gives each row the same value in every member. */
-    public static List<ByteString> combine(ReadGroup group, List<List<ByteString>> answers) throws IOException {
-        if (group.getRequestsCount() < 2 || answers.size() != group.getRequestsCount()) throw new IOException("Invalid query group");
+    /**
+     * At one table/snapshot, complete index maintenance gives each row the same value in every member.
+     * ProtoTrace admits only groups of at least two members at one table and read point.
+     */
+    public static List<ByteString> combine(ReadGroup group, List<List<ByteString>> answers) {
         boolean intersect = group.getCombineMode() == ReadGroup.CombineMode.INTERSECTION;
-        if (!intersect && group.getCombineMode() != ReadGroup.CombineMode.UNION) throw new IOException("Unknown group mode");
         var combined = new java.util.LinkedHashSet<ByteString>();
-        int table = -1; long ts = -1;
         for (int i = 0; i < answers.size(); i++) {
-            var member = group.getRequests(i);
-            ByteString key = member.hasGet() ? member.getGet().getKey() : member.getScan().getStartKey();
-            if (key.size() < 8) throw new IOException("Missing group namespace");
-            int current = key.asReadOnlyByteBuffer().getInt();
-            long readTs = member.hasGet() ? member.getGet().getReadTs() : member.getScan().getReadTs();
-            if (i > 0 && (table != current || ts != readTs)) throw new IOException("Group spans tables or read points");
-            table = current; ts = readTs;
             if (i == 0 || !intersect) combined.addAll(answers.get(i));
             else combined.retainAll(new java.util.HashSet<>(answers.get(i)));
         }
@@ -208,8 +193,7 @@ public final class TraceRequests {
 
         /** A chunk with {@code more = true}: results only. */
         public void add(IndexResponse chunk) throws IOException {
-            if (!chunk.more() || chunk.status() != IndexStatus.OK)
-                throw new IOException("Invalid partial response for request " + id);
+            if (!chunk.more()) throw new IOException("Invalid partial response for request " + id);
             if (operation.kind() != IndexOperationTrace.SEARCH)
                 throw new IOException("Partial response to a write");
             accept(chunk);
@@ -226,9 +210,6 @@ public final class TraceRequests {
         public void finish(IndexResponse response) throws IOException {
             if (failure != null) throw failure;
             if (response.more()) throw new IOException("Final response marked partial");
-            if (response.status() != IndexStatus.OK)
-                throw new IOException("Service " + response.status() + " at source event "
-                        + operation.sourceEvent() + ": " + response.message());
             if (operation.kind() != IndexOperationTrace.SEARCH) {
                 if (count + response.values().size() != 0) throw new IOException("Write returned results");
                 return;

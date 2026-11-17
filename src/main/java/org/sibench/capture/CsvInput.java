@@ -48,7 +48,7 @@ public final class CsvInput {
             evidence.put("core_sha256", Files.isDirectory(code) ? PixelsBuild.treeSha256(code) : Digests.sha256(code));
             Files.writeString(output.resolve("effective-config.json"), new GsonBuilder().setPrettyPrinting().create()
                     .toJson(Map.of("benchmark", input.document())), StandardOpenOption.CREATE_NEW);
-            return publish(output, input, evidence);
+            return publish(output, input, inspected.sha256(), evidence);
         } catch (Exception | Error failure) {
             var stack = new java.io.StringWriter();
             failure.printStackTrace(new java.io.PrintWriter(stack));
@@ -58,8 +58,10 @@ public final class CsvInput {
         }
     }
 
-    static Map<String, Object> publish(Path output, Generation.Input input, Map<String, Object> evidence) throws IOException {
-        var document = baseline(output, input);
+    /** {@code tableHashes} are the digests of exactly the table bytes inspected for the schema and row counts. */
+    static Map<String, Object> publish(Path output, Generation.Input input, Map<String, String> tableHashes,
+            Map<String, Object> evidence) throws IOException {
+        var document = baseline(output, input, tableHashes);
         document.addProperty("kind", "hybench_csv_input");
         document.addProperty("status", "complete");
         document.addProperty("sf", string(input.nativeConfig(), "sf"));
@@ -141,7 +143,8 @@ public final class CsvInput {
         }
     }
 
-    static JsonObject baseline(Path output, Generation.Input input) throws IOException {
+    /** Descriptors take the load inventory's digests; inspected table digests must match them. */
+    private static JsonObject baseline(Path output, Generation.Input input, Map<String, String> tableHashes) throws IOException {
         var document = new JsonObject();
         document.add("baseline_rows", new Gson().toJsonTree(input.baselineRows()));
         document.add("schema", file(output, output.resolve("pixels-schema.tsv")));
@@ -157,11 +160,16 @@ public final class CsvInput {
             require(copy != null, "Invalid baseline load mapping");
             csvTables.put(copy[1], copy[0].toLowerCase(java.util.Locale.ROOT));
         }
+        require(tableHashes.keySet().equals(new java.util.HashSet<>(csvTables.values())), "Inspected tables differ from the load mapping");
         for (var entry : original.entrySet()) {
-            var value = file(output, data.resolve(entry.getKey()));
-            require(value.get("sha256").equals(entry.getValue()), "Baseline input changed after source loading: " + entry.getKey());
+            var value = new JsonObject();
+            Path path = data.resolve(entry.getKey());
+            value.addProperty("path", output.relativize(path).toString());
+            value.addProperty("bytes", Files.size(path));
+            value.add("sha256", entry.getValue());
             if (csvTables.containsKey(entry.getKey())) {
                 String table = csvTables.get(entry.getKey());
+                require(entry.getValue().getAsString().equals(tableHashes.get(table)), "Baseline input changed after source loading: " + entry.getKey());
                 value.addProperty("table", table);
                 value.addProperty("rows", input.baselineRows().get(table));
             }
@@ -240,21 +248,25 @@ public final class CsvInput {
                 && source.get("files").equals(new Gson().toJsonTree(input.source().fingerprints())), "CSV benchmark source differs");
     }
 
-    /** Materializes an independently publishable input; same-filesystem immutable payloads share disk blocks. */
-    static void materialize(Verified csv, Path output) throws IOException {
+    /** Every local payload descriptor a CSV-derived manifest binds; consumers without a field simply lack those files. */
+    static java.util.List<JsonObject> files(JsonObject manifest) {
         var files = new java.util.ArrayList<JsonObject>();
         for (String key : java.util.List.of("schema", "source_ddl", "parameter_file", "load_inventory"))
-            files.add(csv.manifest().getAsJsonObject(key));
-        csv.manifest().getAsJsonObject("baseline_files").entrySet().forEach(e -> files.add(e.getValue().getAsJsonObject()));
-        for (var file : files) {
+            if (manifest.has(key)) files.add(manifest.getAsJsonObject(key));
+        if (manifest.has("baseline_files"))
+            manifest.getAsJsonObject("baseline_files").entrySet().forEach(e -> files.add(e.getValue().getAsJsonObject()));
+        return files;
+    }
+
+    /** Materializes an independently publishable input; same-filesystem immutable payloads share disk blocks. */
+    static void materialize(Verified csv, Path output) throws IOException {
+        for (var file : files(csv.manifest())) {
             String name = file.get("path").getAsString();
             Path from = resolve(csv.directory(), name), to = output.resolve(name);
             Files.createDirectories(to.getParent());
             if (Files.getFileStore(from).equals(Files.getFileStore(to.getParent()))) Files.createLink(to, from);
             else Files.copy(from, to);
         }
-        Files.writeString(output.resolve("csv-input.json"), new GsonBuilder().setPrettyPrinting().create().toJson(
-                Map.of("manifest_sha256", csv.sha256(), "manifest", csv.manifest())), StandardOpenOption.CREATE_NEW);
     }
 
     private static void require(boolean valid, String message) throws IOException {

@@ -2,16 +2,11 @@ package org.sibench.capture;
 
 import static org.sibench.capture.IndexOperationTrace.*;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -25,11 +20,11 @@ import org.sibench.schema.SourceSchema;
 import org.sibench.trace.IndexKey;
 
 /**
- * Projects Pixels primary-index facts into the Trace. LOAD facts form the version-0 baseline. A
- * workload transaction is the set of facts carrying one Pixels timestamp; it is exported once the
- * sink reported its commit and a tracer barrier sent afterwards came back, and only after every
+ * Projects Pixels primary-index facts into the Trace. Baseline facts form version 0. A workload
+ * transaction is the set of facts carrying one Pixels timestamp; it is exported once the sink
+ * reported its commit and a tracer barrier sent afterwards came back, and only after every
  * transaction begun before it. Versions follow begin order, which is the source commit order.
- * Transactions writing only the marker table are window barriers and are not exported.
+ * The CDC input's marker-only transactions are phase barriers and are not exported.
  */
 final class PixelsTrace implements AutoCloseable {
     static final int LOOKUP = 1, PUT = 2, UPDATE = 3, DELETE = 4, UNSUPPORTED = 9;
@@ -43,38 +38,27 @@ final class PixelsTrace implements AutoCloseable {
 
     private final Path directory;
     private final Map<String, Object> manifest;
-    private final Map<Long, Table> tables;
     private final ProtoTrace.Writer baseline, workload;
     private final WorkUnits.Output units;
     private final Map<String, Long> baselineCounts = new LinkedHashMap<>();
     private final ArrayDeque<Long> begun = new ArrayDeque<>();
     private final Set<Long> committed = new HashSet<>(), complete = new HashSet<>();
     private final Map<Long, List<Fact>> pending = new HashMap<>();
-    private final List<Long> markers = new ArrayList<>();
+    private final Map<Long, Table> tables = new HashMap<>();
     private boolean baselineOpen = true, closed;
-    private long version, sourceEvent, searches, changes, lastBegin, lastLoadTimestamp = -1;
+    private long version, sourceEvent, searches, changes, markers, lastBegin, lastLoadTimestamp = -1;
 
-    PixelsTrace(Path directory, SourceSchema source, Map<Long, Table> tables, RequestBudget budget) throws IOException {
+    PixelsTrace(Path directory, SourceSchema source) throws IOException {
         this.directory = directory;
-        this.tables = new HashMap<>(tables);
-        tables.values().stream().filter(table -> table.id()>0).forEach(table -> baselineCounts.put(table.name(),0L));
-        var catalog = IndexCatalog.fromSchema(source);
-        manifest = new LinkedHashMap<>(IndexCatalog.provenance(source, catalog.definitions()));
-        IndexCatalog.fromManifest(new Gson().toJsonTree(manifest).getAsJsonObject());
-        Files.createDirectory(directory);
-        Files.writeString(directory.resolve("INCOMPLETE"), "Native generation/publication pending\n", StandardOpenOption.CREATE_NEW);
+        manifest = TraceDirectory.create(directory, source, IndexCatalog.fromSchema(source).definitions(),
+                "cdc", "pixels", false, List.of("row_id", "locator"));
         baseline = new ProtoTrace.Writer(directory.resolve("baseline.pb.zst"), false);
-        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"), false, budget);
+        workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"), false);
         units = WorkUnits.create(directory);
-        manifest.put("output", "proto");
-        manifest.put("value_kinds", List.of("row_id", "locator"));
-        manifest.put("mode", "cdc");
-        manifest.put("generation", "pixels");
-        manifest.put("secondary_index_coverage", "primary_only");
         manifest.put("locator_encoding", "file=Pixels fileId; position=(rgId << 32) | rgRowOffset");
     }
 
-    /** Called on the projection thread before LOAD starts for each newly created table. */
+    /** Called on the projection thread for the created tables before any baseline fact arrives. */
     void register(Map<Long, Table> created) throws IOException {
         if (!baselineOpen) throw new IOException("Pixels tables registered after LOAD");
         for (var entry : created.entrySet()) {
@@ -85,13 +69,13 @@ final class PixelsTrace implements AutoCloseable {
         }
     }
 
-    /** A tracer fact; LOAD facts while the baseline is open, workload facts afterwards. */
+    /** A tracer fact; baseline facts while the baseline is open, workload facts afterwards. */
     void fact(Fact fact) throws IOException {
         if (fact.kind() == UNSUPPORTED)
             throw new IOException("Pixels called an unsupported index method: " + new String(fact.key(), StandardCharsets.UTF_8));
         Table table = table(fact);
         if (baselineOpen) {
-            if (fact.kind() != PUT || table.id() == 0) throw new IOException("Unexpected Pixels index call during LOAD");
+            if (fact.kind() != PUT || table.id() == 0) throw new IOException("Unexpected Pixels index call during baseline import");
             IndexMutation.emit(write(0, INSERT, table.id(), 0, key(fact, table), 0, fact.fileId(), position(fact), fact.rowId())
                     .withWorkUnitId(1 + baseline.count() / BLOCK_RECORDS), Map.of(), Map.of(), baseline);
             baselineCounts.merge(table.name(), 1L, Long::sum);
@@ -102,7 +86,7 @@ final class PixelsTrace implements AutoCloseable {
         pending.computeIfAbsent(fact.timestamp(), ignored -> new ArrayList<>()).add(fact);
     }
 
-    /** Closes the baseline after a barrier covered every LOAD; counts must match the source tables. */
+    /** Closes the baseline after a barrier covered every baseline fact; counts must match the source tables. */
     void finishBaseline(Map<String, Long> expected) throws IOException {
         if (!baselineOpen) throw new IOException("Pixels baseline already finished");
         if (!baselineCounts.equals(expected))
@@ -110,7 +94,7 @@ final class PixelsTrace implements AutoCloseable {
         baselineOpen = false;
         baseline.close();
         org.sibench.trace.TraceManifest.baselineRows(manifest,expected);
-        stream("baseline", baseline);
+        TraceDirectory.stream(manifest, "baseline", ProtoTrace.file(baseline));
     }
 
     void begin(long timestamp) throws IOException {
@@ -137,9 +121,6 @@ final class PixelsTrace implements AutoCloseable {
         while (!begun.isEmpty() && complete.remove(begun.peekFirst())) export(begun.removeFirst());
     }
 
-    /** Marker identities exported so far, in source commit order. */
-    List<Long> markers() { return List.copyOf(markers); }
-
     boolean hasUncoveredCommits() { return !committed.isEmpty(); }
 
     private void export(long timestamp) throws IOException {
@@ -149,7 +130,7 @@ final class PixelsTrace implements AutoCloseable {
         if (markerFacts > 0) {
             if (markerFacts != facts.size() || facts.size() != 1 || facts.get(0).kind() != PUT)
                 throw new IOException("Marker transaction changed source tables");
-            markers.add(key(facts.get(0), tables.get(facts.get(0).table())).intValue());
+            markers++;
             return;
         }
         version++;
@@ -196,36 +177,23 @@ final class PixelsTrace implements AutoCloseable {
             throw new IOException("Unresolved Pixels transactions: begun=" + begun.size() + " committed=" + committed.size()
                     + " facts=" + pending.size());
         close();
-        stream("workload", workload);
+        TraceDirectory.stream(manifest, "workload", ProtoTrace.file(workload));
         manifest.put("source_work_units", version);
-        manifest.put("source_statements", version);
         manifest.put("committed_transactions", version);
         manifest.put("aborted_transactions", 0L);
         manifest.put("searched_accesses", searches);
         manifest.put("logical_row_changes", changes);
         manifest.put("last_resolved_version", workload.lastCommittedVersion());
-        manifest.put("window_markers", markers.size());
+        manifest.put("window_markers", markers);
         manifest.put("work_units_sha256", HexFormat.of().formatHex(units.digest().digest()));
         manifest.put("work_unit_rule", "one source transaction applied by Pixels; numbered in Pixels timestamp order");
     }
 
     Map<String, Object> publish(Map<String, Object> evidence) throws IOException {
-        if (!manifest.containsKey("workload_trace_sha256")) throw new IOException("Pixels workload did not finish");
-        manifest.put("source_evidence", evidence);
-        manifest.put("status", "complete_for_declared_projection");
-        Path partial = directory.resolve("manifest.json.partial");
-        Files.writeString(partial, new GsonBuilder().setPrettyPrinting().create().toJson(manifest), StandardOpenOption.CREATE_NEW);
-        Files.move(partial, directory.resolve("manifest.json"), StandardCopyOption.ATOMIC_MOVE);
-        Files.delete(directory.resolve("INCOMPLETE"));
-        return Map.copyOf(manifest);
+        return TraceDirectory.publish(directory, manifest, evidence);
     }
 
     long version() { return version; }
-
-    Map<String, Object> progress() {
-        return Map.of("baseline_entries", baseline.count(), "version", version,
-                "workload", workload.statistics(), "pending_transactions", pending.size());
-    }
 
     @Override
     public void close() throws IOException {
@@ -238,14 +206,6 @@ final class PixelsTrace implements AutoCloseable {
         Table table = tables.get(fact.table());
         if (table == null || fact.index() != table.primaryIndex()) throw new IOException("Fact outside the Pixels primary indexes");
         return table;
-    }
-
-    private void stream(String name, ProtoTrace.Writer writer) {
-        manifest.put(name + "_operations", writer.count());
-        var files = List.of(ProtoTrace.file(name + ".pb.zst", writer));
-        @SuppressWarnings("unchecked") var streams = (Map<String, Object>) manifest.computeIfAbsent("proto_files", ignored -> new LinkedHashMap<>());
-        streams.put(name, files);
-        manifest.put(name + "_trace_sha256", ProtoTrace.identity(new Gson().toJsonTree(files).getAsJsonArray()));
     }
 
     /** Pixels keeps the row group in the high and the row offset in the low half of the position. */

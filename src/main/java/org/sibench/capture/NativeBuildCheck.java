@@ -39,11 +39,7 @@ public final class NativeBuildCheck {
     private NativeBuildCheck() {}
 
     /** Each entry is a pinned source file or a directory searched recursively. */
-    static void require(Path pinned, Path build, List<String> entries) throws IOException {
-        require(pinned, build, entries, java.util.Map.of());
-    }
-
-    private static void require(Path pinned, Path build, List<String> entries,
+    static void require(Path pinned, Path build, List<String> entries,
             java.util.Map<String, String> patched) throws IOException {
         for (String directory : entries) {
             Path expected = pinned.resolve(directory);
@@ -129,14 +125,14 @@ public final class NativeBuildCheck {
 
     private static Build build(Path root, Path profile) throws Exception {
         var document = org.sibench.config.ConfigValues.parse(Files.readString(root.resolve(profile)));
-        org.sibench.schema.SourceSchema.read(root, document);
+        var schema = org.sibench.schema.SourceSchema.read(root, document);
         String benchmark = org.sibench.config.ConfigValues.string(document, "benchmark");
         var source = org.sibench.config.ConfigValues.object(document, "source");
         Path directory = root.resolve(org.sibench.config.ConfigValues.string(
                         org.sibench.config.ConfigValues.object(document, "native"), "build_directory"));
         requireDirectory(root, directory);
         return new Build(root, benchmark, root.resolve(org.sibench.config.ConfigValues.string(source, "path")),
-                directory.toAbsolutePath().normalize(), org.sibench.config.ConfigValues.string(source, "commit"));
+                directory.toAbsolutePath().normalize(), schema.sourceCommit());
     }
 
     private static void requireDirectory(Path root, Path directory) throws IOException {
@@ -195,13 +191,6 @@ public final class NativeBuildCheck {
                     "third_party/duckdb/src/include/duckdb/common/exception.hpp")));
         }
         return identity;
-    }
-
-    static java.util.Map<String, Object> verify(Path root, Path profile) throws Exception {
-        Build build = build(root, profile);
-        var result = verify(build);
-        if (build.benchmark().equals("hybench")) requireLoadedHybench(build.directory());
-        return result;
     }
 
     private static java.util.Map<String, Object> verify(Build build) throws IOException {
@@ -269,12 +258,6 @@ public final class NativeBuildCheck {
         return hashes;
     }
 
-    private static java.util.Map<String, Object> engineInputs(Path root) throws IOException {
-        var inputs = new java.util.LinkedHashMap<>(engineInputs(root,"duckdb","duckdb"));
-        inputs.put("jdbc_source_commit", sourcePin(root, "duckdb-java"));
-        return inputs;
-    }
-
     private static java.util.Map<String,Object> engineInputs(Path root,String engine,String sourceName)throws IOException {
         return java.util.Map.of("source_commit", sourcePin(root, sourceName),
                 "native_sources", tree(root.resolve("src/main/native/"+engine)),
@@ -304,8 +287,7 @@ public final class NativeBuildCheck {
     private static java.util.Map<String, String> engineArtifacts(Path build) throws IOException {
         var hashes = new java.util.TreeMap<String, String>();
         for (String name : List.of("duckdb_host", "src/libduckdb.so", "duckdb", "CMakeCache.txt",
-                "compile_commands.json", "compiler-version.txt", "source-files.json", "duckdb_jdbc.jar",
-                "libduckdb_java.so_linux_amd64", "jdbc/build/CMakeCache.txt", "jdbc/build/compile_commands.json"))
+                "compile_commands.json", "compiler-version.txt", "source-files.json"))
             hashes.put(name, Digests.sha256(build.resolve(name)));
         if (!Files.isExecutable(build.resolve("duckdb_host"))) throw new IOException("DuckDB host is not executable");
         return hashes;
@@ -314,17 +296,8 @@ public final class NativeBuildCheck {
     /** Generation verifies immutable build inputs and the artifacts it will actually execute. */
     static java.util.Map<String, Object> verifyEngine(Path root, Path build) throws IOException {
         var artifacts = engineArtifacts(build);
-        var identity = java.util.Map.<String, Object>of("inputs", engineInputs(root), "artifacts", artifacts);
+        var identity = java.util.Map.<String, Object>of("inputs", engineInputs(root, "duckdb", "duckdb"), "artifacts", artifacts);
         requireRecord(build.resolve("engine-build.json"), identity, "DuckDB engine");
-        try (var runtime = org.duckdb.DuckDBDriver.class.getResourceAsStream("/libduckdb_java.so_linux_amd64")) {
-            if (runtime == null) throw new IOException("Missing source-built DuckDB runtime");
-            var digest = Digests.digest();
-            byte[] block = new byte[1 << 20];
-            for (int count; (count = runtime.read(block)) != -1;) digest.update(block, 0, count);
-            if (!java.util.HexFormat.of().formatHex(digest.digest()).equals(
-                    artifacts.get("libduckdb_java.so_linux_amd64")))
-                throw new IOException("Packaged DuckDB runtime differs from the capture source build");
-        }
         return identity;
     }
 
@@ -345,10 +318,12 @@ public final class NativeBuildCheck {
 
     private static void postgresBuild(String action,Path root,Path build)throws IOException {
         switch(action) {
-            case "postgres-path" -> NativeProcess.assignment("BUILD",build);
+            case "postgres-path" -> {
+                NativeProcess.assignment("BUILD",build);
+                NativeProcess.assignment("PIN",sourcePin(root,"postgresql"));
+            }
             case "postgres-inputs" -> record(build.resolve("engine-inputs.json"),engineInputs(root,"postgres","postgresql"));
             case "postgres-prepared" -> record(build.resolve("source-files.json"),tree(build.resolve("source")));
-            case "postgres-verify" -> verifyPostgres(root,build);
             case "postgres-record" -> {
                 requireRecord(build.resolve("engine-inputs.json"),engineInputs(root,"postgres","postgresql"),"PostgreSQL inputs");
                 var sources=com.google.gson.JsonParser.parseString(Files.readString(build.resolve("source-files.json"))).getAsJsonObject();
@@ -365,7 +340,7 @@ public final class NativeBuildCheck {
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 3) throw new IllegalArgumentException("NativeBuildCheck paths|record|verify|postgres-path|postgres-inputs|postgres-prepared|postgres-record|postgres-verify ROOT CONFIG");
+        if (args.length != 3) throw new IllegalArgumentException("NativeBuildCheck paths|record|postgres-path|postgres-inputs|postgres-prepared|postgres-record ROOT CONFIG");
         Path root = Path.of(args[1]).toRealPath();
         if(args[0].startsWith("postgres-")) {
             var runtime=org.sibench.config.SibenchConfig.read(root.resolve(args[2]));
@@ -383,7 +358,6 @@ public final class NativeBuildCheck {
             case "record" -> Files.writeString(build.directory().resolve("native-build.json"),
                     new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(identity(build)) + "\n",
                     java.nio.file.StandardOpenOption.CREATE_NEW);
-            case "verify" -> verify(build);
             default -> throw new IllegalArgumentException("Unknown build action: " + args[0]);
         }
     }

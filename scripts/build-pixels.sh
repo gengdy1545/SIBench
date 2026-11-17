@@ -42,8 +42,8 @@ if [[ "$phase" == java ]]; then
   patch --batch --forward -d "$build/source/pixels" -p1 < "$pixels_patch"
   patch --batch --forward -d "$build/source/pixels-sink" -p1 < "$patch_file"
   cp "$build/source/pixels/pixels-common/src/main/resources/pixels.properties" "$build/defaults/pixels.properties"
-  cp "$build/source/pixels-sink/src/main/resources/pixels-sink.properties" "$build/defaults/pixels-sink.properties"
-  # The Retina native build reads the visibility capacity from PIXELS_HOME; upstream defaults set it.
+  # The pixels-retina Maven module reads the visibility capacity from PIXELS_HOME; upstream defaults set it.
+  # Runs write their own PIXELS_HOME/etc, so this copy is removed with the discarded Maven-built library below.
   cp "$build/defaults/pixels.properties" "$build/home/etc/pixels.properties"
   maven=(mvn -B -T "$jobs" "-Dmaven.repo.local=$build/m2" "-Dmaven.repo.local.tail=$HOME/.m2/repository"
          -DskipTests -Dmaven.javadoc.skip=true)
@@ -68,7 +68,7 @@ json.dump({"pixels_commit": "$pixels", "pixels_patch_sha256": "$pixels_patch_sha
            "jars": {name: sha for name, sha in [$(for jar in "$build"/jars/*.jar; do printf '("%s", "%s"),' "$(basename "$jar")" "$(sha "$jar")"; done)]}},
           open(sys.argv[1], "x"), indent=2)
 PY
-  rm -rf "$build/source/pixels/cpp/pixels-retina/build" "$build/home/lib"
+  rm -rf "$build/source/pixels/cpp/pixels-retina/build" "$build/home/lib" "$build/home/etc"
   printf '\nPixels Java build: %s\n' "$build"
   exit 0
 fi
@@ -95,11 +95,10 @@ for entry in filter(None, entries):
     if hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest() != expected:
         raise SystemExit("Pixels native input differs from its pin: " + name)
 original = (build / "source/pixels/pixels-common/src/main/resources/pixels.properties").read_bytes()
-for name in ["defaults/pixels.properties", "home/etc/pixels.properties"]:
-    if (build / name).read_bytes() != original:
-        raise SystemExit("Pixels capacity/defaults differ from their pin: " + name)
+if (build / "defaults/pixels.properties").read_bytes() != original:
+    raise SystemExit("Pixels capacity/defaults differ from their pin: defaults/pixels.properties")
 PY
-runtime_configs=(defaults/pixels.properties home/etc/pixels.properties source/pixels/scripts/etc/coordinator-jvm.config source/pixels/scripts/etc/retina-jvm.config)
+runtime_configs=(defaults/pixels.properties source/pixels/scripts/etc/coordinator-jvm.config source/pixels/scripts/etc/retina-jvm.config)
 runtime_sha() { (cd "$build" && sha256sum "${runtime_configs[@]}") | sha256sum | cut -c1-64; }
 native_sources_sha=$(tree_sha "$build/source/pixels/cpp/pixels-retina")
 runtime_inputs_sha=$(runtime_sha)

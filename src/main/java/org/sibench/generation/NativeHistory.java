@@ -27,11 +27,9 @@ public final class NativeHistory {
                     + "UNIQUE(schema_name, table_name))");
             return;
         }
-        // PostgreSQL maps native commits to Trace versions in its projection; DuckDB binds per window.
+        // PostgreSQL maps native commits and completion counters to Trace versions in its projection; DuckDB binds per window.
         execute(database, "CREATE UNLOGGED TABLE " + SCHEMA + ".commits(transaction_id BIGINT PRIMARY KEY, "
-                + "commit_version BIGINT UNIQUE NOT NULL CHECK(commit_version > 0))");
-        execute(database,"CREATE FUNCTION "+SCHEMA+".query_id() RETURNS BIGINT AS '$libdir/row_capture', "
-                +"'sibench_query_id' LANGUAGE C VOLATILE");
+                + "commit_version BIGINT UNIQUE NOT NULL CHECK(commit_version > 0), source_csn BIGINT UNIQUE NOT NULL)");
         execute(database,"CREATE FUNCTION "+SCHEMA+".row_identity() RETURNS trigger AS '$libdir/row_capture', "
                 +"'sibench_identity_capture' LANGUAGE C");
     }
@@ -40,7 +38,7 @@ public final class NativeHistory {
     public static void install(Connection database, Engine engine, int tableId, String schema, String table, String primaryKey)
             throws SQLException {
         requireTransaction(database);
-        if (tableId < 1 || tableId > 65535) throw new IllegalArgumentException("Invalid table ID");
+        if (!org.sibench.trace.IndexEntry.validNamespace(tableId, 0)) throw new IllegalArgumentException("Invalid table ID");
         String source = quote(schema) + "." + quote(table);
         if (columns(database, source).stream().anyMatch(c -> c.toLowerCase(java.util.Locale.ROOT).startsWith("_sib_")))
             throw new SQLException("Source columns must not use the reserved _sib_ prefix");

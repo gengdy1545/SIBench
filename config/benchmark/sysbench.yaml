@@ -3,24 +3,28 @@ purpose: native_capture
 benchmark: sysbench
 source:
   path: benchmark/sysbench
-  commit: 3ceba0b1e115f8c50d1d045a4574d8ed643bd497
 native:
   tables: 8
   table-size: 10882500
-  secondary: false
-  create-secondary: true
   auto-inc: true
   skip-trx: false
   rand-seed: 20261019
-  rand-type: uniform
+  # Skewed ids are not scrambled: each table's hottest rows are its smallest ids.
+  rand-type: zipfian
   threads: 8
   prepare_threads: 8
   timeout_minutes: 720
   build_directory: build/benchmarks/sysbench
-  binary: src/sysbench
+  # One Trace per workload: a named run of one script with its own zipfian exponent (0.8 is sysbench's default, 0.99 YCSB's).
   workloads:
-    oltp_read_write:
+    oltp_read_write_zipf080:
+      script: oltp_read_write
       events: 10000000
+      rand-zipfian-exp: 0.8
+    oltp_read_write_zipf099:
+      script: oltp_read_write
+      events: 10000000
+      rand-zipfian-exp: 0.99
 trace:
   secondary_indexes: false
   workload_requests: 10000000

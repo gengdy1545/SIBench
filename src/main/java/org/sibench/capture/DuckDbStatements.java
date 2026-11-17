@@ -55,7 +55,7 @@ public final class DuckDbStatements {
                     + "FROM temp.main.sibench_statements GROUP BY connection_id) q USING(connection_id) "
                     + "WHERE coalesce(q.roots,0)<>s.submissions OR coalesce(q.endings,0)<>s.submissions "
                     + "OR coalesce(q.ended_roots,0)<>s.submissions LIMIT 1", "Source submissions disagree with client receipts");
-            for (String kind : List.of("mutation", "index", "index_rows", "consumption")) {
+            for (String kind : List.of("mutation", "index", "index_rows")) {
                 reject(database, "SELECT 1 FROM " + DuckDbFacts.table(kind)
                         + " f JOIN temp.main.sibench_sessions c USING(connection_id) "
                         + "LEFT JOIN temp.main.sibench_statements s USING(connection_id, transaction_id, query_id) "
@@ -66,6 +66,21 @@ public final class DuckDbStatements {
             execute(database, "CREATE TEMP VIEW sibench_mutation_statements AS SELECT m.*, s.outcome AS statement_outcome "
                     + "FROM " + DuckDbFacts.table("mutation") + " m JOIN temp.main.sibench_statements s "
                     + "USING(connection_id, transaction_id, query_id)");
+            // One grammar for every successful mutation scope; identity and row-change binding only filter it.
+            reject(database, "SELECT 1 FROM temp.main.sibench_mutation_statements WHERE statement_outcome='completed' AND ("
+                    + "kind NOT IN ('append','merge','update','delete') OR event NOT IN ('begin','rows','complete') OR requested_rows=0 "
+                    + "OR (event='complete' AND affected_rows<>requested_rows) OR (event<>'complete' AND affected_rows<>-1) "
+                    + "OR (event='rows' AND kind<>'merge') OR (kind='merge' AND event='begin' AND len(rows)<>0) "
+                    + "OR (event='complete' AND kind<>'update' AND len(rows)<>0)) LIMIT 1",
+                    "Invalid or unsupported successful native mutation scope");
+            reject(database, "SELECT 1 FROM temp.main.sibench_mutation_statements WHERE statement_outcome='completed' "
+                    + "GROUP BY mutation_id HAVING count(*) FILTER(WHERE event='begin')<>1 OR count(*) FILTER(WHERE event='complete')<>1 "
+                    + "OR min(connection_id)<>max(connection_id) OR min(transaction_id)<>max(transaction_id) "
+                    + "OR min(query_id)<>max(query_id) OR min(schema_name)<>max(schema_name) OR min(table_name)<>max(table_name) "
+                    + "OR min(kind)<>max(kind) OR min(requested_rows)<>max(requested_rows) OR count(DISTINCT columns)<>1 "
+                    + "OR sum(len(rows))<>max(requested_rows)*CASE WHEN min(kind)='update' THEN 2 ELSE 1 END "
+                    + "OR min(raw_record) FILTER(WHERE event='begin')>=max(raw_record) FILTER(WHERE event='complete') LIMIT 1",
+                    "Incomplete or inconsistent successful native mutation scope");
             database.commit();
         } catch (SQLException | RuntimeException failure) {
             try { database.rollback(); } catch (SQLException rollback) { failure.addSuppressed(rollback); }

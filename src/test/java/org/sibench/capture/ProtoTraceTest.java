@@ -188,7 +188,7 @@ public class ProtoTraceTest {
         Path file = temporary.getRoot().toPath().resolve("primitive-count.pb.zst");
         Path stop = file.resolveSibling("primitive-count.stop");
         var budget = new RequestBudget(4, java.time.Duration.ofSeconds(10));
-        budget.begin("mixed", 1, stop);
+        budget.begin(stop);
         var writer = new ProtoTrace.Writer(file, false, budget);
         try (writer) {
             writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
@@ -272,7 +272,7 @@ public class ProtoTraceTest {
             Path file = temporary.getRoot().toPath().resolve("scope-" + secondary + ".pb.zst");
             var budget = new RequestBudget(2, java.time.Duration.ofSeconds(10));
             Path stop = file.resolveSibling("stop-" + secondary);
-            budget.begin("mixed", 1, stop);
+            budget.begin(stop);
             var writer = new ProtoTrace.Writer(file, secondary, budget);
             try (writer) {
                 writer.accept(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
@@ -472,7 +472,7 @@ public class ProtoTraceTest {
     public void abortedSourceRetainsItsSnapshotAndWholeReadGroup() throws Exception {
         var file = temporary.getRoot().toPath().resolve("aborted-snapshots.pb.zst");
         var budget = new RequestBudget(0, java.time.Duration.ofSeconds(10));
-        budget.begin("snapshot", 1, file.resolveSibling("stop"));
+        budget.begin(file.resolveSibling("stop"));
         var writer = new ProtoTrace.Writer(file, true, budget);
         try (writer) {
             writer.append(IndexOperationTrace.transaction(0, IndexOperationTrace.TRANSACTION_BEGIN, 1, 1, 0));
@@ -572,6 +572,52 @@ public class ProtoTraceTest {
         }
     }
 
+    /** Read groups and private writes are checked against the encoded requests they arrive in. */
+    @Test public void readGroupsAndPrivateWritesMustStayWithinTheirEncodedRequest() throws Exception {
+        var metadata = TraceMetadata.newBuilder().setSourceEvent(1).setWorkUnitId(1).setExpectedCount(1).build();
+        java.util.function.BiFunction<Integer, Long, ReadRequest> primaryGet = (table, ts) -> ReadRequest.newBuilder()
+                .setGet(GetRequest.newBuilder().setKey(new IndexEntry(table, 0, null, IndexKey.ofInt(ts)).bytes()).setReadTs(ts)).build();
+        java.util.function.Function<ByteString, Mutation> put = key -> Mutation.newBuilder()
+                .setPut(PutRequest.newBuilder().setKey(key).setValue(IndexEntry.rowId(3))).build();
+        var pinned = new IndexEntry(1, 1, IndexKey.ofInt(10), IndexKey.ofInt(3)).bytes();
+        var scan = ScanRequest.newBuilder().setReadTs(5)
+                .setStartKey(IndexEntry.bound(1, 1, IndexKey.ofInt(10), false))
+                .setEndKey(IndexEntry.bound(1, 1, IndexKey.ofInt(20), true)).build();
+        var inside = new IndexEntry(1, 1, IndexKey.ofInt(20), IndexKey.ofInt(3)).bytes();
+        var valid = new LinkedHashMap<String, TraceOperation>();
+        valid.put("group", TraceOperation.newBuilder().setMetadata(metadata).setReadGroup(ReadGroup.newBuilder()
+                .setCombineMode(ReadGroup.CombineMode.UNION).addRequests(primaryGet.apply(1, 5L))
+                .addRequests(primaryGet.apply(1, 5L))).build());
+        valid.put("pinned private write", TraceOperation.newBuilder().setMetadata(metadata).addLocalLocators(ByteString.EMPTY)
+                .setGet(GetRequest.newBuilder().setKey(pinned).setReadTs(5).addLocalWrites(put.apply(pinned))).build());
+        valid.put("scan private write", TraceOperation.newBuilder().setMetadata(metadata).addLocalLocators(ByteString.EMPTY)
+                .setScan(scan.toBuilder().addLocalWrites(put.apply(inside))).build());
+        var invalid = new LinkedHashMap<String, TraceOperation>();
+        invalid.put("single-member group", valid.get("group").toBuilder().setReadGroup(
+                valid.get("group").getReadGroup().toBuilder().removeRequests(1)).build());
+        invalid.put("group across read points", valid.get("group").toBuilder().setReadGroup(
+                valid.get("group").getReadGroup().toBuilder().setRequests(1, primaryGet.apply(1, 6L))).build());
+        invalid.put("group across tables", valid.get("group").toBuilder().setReadGroup(
+                valid.get("group").getReadGroup().toBuilder().setRequests(1, primaryGet.apply(2, 5L))).build());
+        // Same table, index and indexed value as the pinned entry, but another primary key.
+        invalid.put("pinned write of another row", valid.get("pinned private write").toBuilder().setGet(
+                valid.get("pinned private write").getGet().toBuilder().setLocalWrites(0,
+                        put.apply(new IndexEntry(1, 1, IndexKey.ofInt(10), IndexKey.ofInt(4)).bytes()))).build());
+        invalid.put("scan write outside range", valid.get("scan private write").toBuilder().setScan(
+                scan.toBuilder().addLocalWrites(put.apply(new IndexEntry(1, 1, IndexKey.ofInt(21), IndexKey.ofInt(3)).bytes()))).build());
+        invalid.put("scan write of another index", valid.get("scan private write").toBuilder().setScan(
+                scan.toBuilder().addLocalWrites(put.apply(new IndexEntry(1, 0, null, IndexKey.ofInt(15)).bytes()))).build());
+        invalid.put("negative private locator", valid.get("scan private write").toBuilder().setLocalLocators(0,
+                IndexEntry.locator(-1, 0)).build());
+        for (var cases : List.of(valid, invalid))
+            for (var entry : cases.entrySet()) {
+                Path file = temporary.getRoot().toPath().resolve(entry.getKey().replace(' ', '-') + ".pb.zst");
+                unchecked(file, List.of(TraceRecord.newBuilder().setOperation(entry.getValue()).build()));
+                if (cases == valid) assertTrue(entry.getKey(), ProtoTrace.read(file, null, null, ignored -> {}) > 0);
+                else assertThrows(entry.getKey(), IOException.class, () -> ProtoTrace.read(file, null, null, ignored -> {}));
+            }
+    }
+
     @Test public void transactionBoundariesRejectUnsupportedFields() throws Exception {
         var unknown = com.google.protobuf.UnknownFieldSet.newBuilder().addField(99,
                 com.google.protobuf.UnknownFieldSet.Field.newBuilder().addVarint(1).build()).build();
@@ -622,30 +668,26 @@ public class ProtoTraceTest {
     }
 
     @Test
-    public void inventoryRequiresCanonicalFileAndBindsItsCountAndIdentity() throws Exception {
+    public void inventoryBindsTheCanonicalFileCountAndIdentity() throws Exception {
         Path root = temporary.getRoot().toPath();
         var writer = new ProtoTrace.Writer(root.resolve("baseline.pb.zst"), true);
         try (writer) { writer.append(write(IndexOperationTrace.INSERT, 1, 0, 0)); }
-        var files = new com.google.gson.JsonArray();
-        files.add(new com.google.gson.Gson().toJsonTree(ProtoTrace.file("baseline.pb.zst", writer)));
+        var file = new com.google.gson.Gson().toJsonTree(ProtoTrace.file(writer)).getAsJsonObject();
         var manifest = new com.google.gson.JsonObject();
         var inventory = new com.google.gson.JsonObject();
-        inventory.add("baseline", files);
+        inventory.add("baseline", file);
         manifest.add("proto_files", inventory);
-        manifest.addProperty("baseline_trace_sha256", ProtoTrace.identity(files));
+        manifest.addProperty("baseline_trace_sha256", ProtoTrace.identity(writer.logicalSha256(), 1));
         assertEquals(1, ProtoTrace.source(root, manifest, "baseline").read(operation -> {}));
-        var file = files.get(0).getAsJsonObject();
         file.addProperty("operations", 2);
         assertThrows(IOException.class, () -> ProtoTrace.source(root, manifest, "baseline"));
-        manifest.addProperty("baseline_trace_sha256", ProtoTrace.identity(files));
+        manifest.addProperty("baseline_trace_sha256", ProtoTrace.identity(writer.logicalSha256(), 2));
         assertThrows(IOException.class, () -> ProtoTrace.source(root, manifest, "baseline").read(operation -> {}));
-        for (String name : List.of("../outside.pb.zst", "baseline/table1.pb.zst")) {
-            file.addProperty("path", name);
-            assertThrows(IOException.class, () -> ProtoTrace.source(root, manifest, "baseline"));
-        }
-        file.addProperty("path", "baseline.pb.zst");
-        files.add(file.deepCopy());
-        manifest.addProperty("baseline_trace_sha256", ProtoTrace.identity(files));
+        file.addProperty("operations", 1);
+        manifest.addProperty("baseline_trace_sha256", ProtoTrace.identity(writer.logicalSha256(), 1));
+        Files.move(root.resolve("baseline.pb.zst"), root.resolve("moved.pb.zst"));
+        assertThrows(IOException.class, () -> ProtoTrace.source(root, manifest, "baseline").read(operation -> {}));
+        inventory.add("baseline", new com.google.gson.JsonArray());
         assertThrows(IOException.class, () -> ProtoTrace.source(root, manifest, "baseline"));
     }
 

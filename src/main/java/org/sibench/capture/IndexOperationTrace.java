@@ -1,5 +1,6 @@
 package org.sibench.capture;
 
+import org.sibench.trace.IndexEntry;
 import org.sibench.trace.IndexKey;
 
 import java.io.IOException;
@@ -27,7 +28,6 @@ public final class IndexOperationTrace {
                     | INTERSECT_GROUP
                     | UNION_GROUP;
     public static final int BLOCK_RECORDS = 4096;
-    public static final int MAX_TABLE = 65535, MAX_INDEX = 1024;
 
     private IndexOperationTrace() {}
 
@@ -316,18 +316,50 @@ public final class IndexOperationTrace {
         return o.kind() == UPSERT || o.kind() == LOGICAL_DELETE;
     }
 
+    /** A version-zero baseline row entry, outside every source transaction. */
+    public static boolean isBaselineInsert(Operation o) {
+        return o.kind() == INSERT && o.version() == 0 && o.transactionId() == 0;
+    }
+
     public static boolean isControl(Operation o) {
         return o.kind() == TRANSACTION_BEGIN || o.kind() == TRANSACTION_COMMIT || o.kind() == TRANSACTION_ABORT;
     }
 
-    /** Format-level invariants checked on both write and read. */
+    /** Format-level invariants of an exported operation, including its private read context. */
     static void validate(Operation o) throws IOException {
+        validateShape(o);
+        if (!o.localWrites().isEmpty()) {
+            if (o.kind() != SEARCH || o.localWrites().size() > CommittedOperations.MAX_TRANSACTION_OPERATIONS)
+                throw new IOException("Invalid private read context");
+            com.google.protobuf.ByteString previous = null;
+            for (var write : o.localWrites()) {
+                if (!isMutation(write) || !write.localWrites().isEmpty() || write.version() != 0
+                        || write.transactionId() != 0 || write.mutationOrdinal() != 0 || write.flags() != 0
+                        || write.sourceEvent() != 0 || write.workUnitId() != 0 || write.expectedCount() != 0
+                        || write.rowId() < 0 || write.file() < 0 || write.position() < 0
+                        || write.expansionPosition() != 0 || write.expansionSize() != 1)
+                    throw new IOException("Invalid private write");
+                validateShape(write);
+                if (!o.containsWrite(write)) throw new IOException("Private write outside its read scope");
+                var encoded = new org.sibench.trace.IndexEntry(write.table(), write.index(), write.indexedValue(), write.key()).bytes();
+                if (previous != null && com.google.protobuf.ByteString.unsignedLexicographicalComparator().compare(previous, encoded) >= 0)
+                    throw new IOException("Private writes must have unique ordered keys");
+                previous = encoded;
+            }
+        }
+    }
+
+    /**
+     * The operation's own fields. A decoded Trace checks private writes against the encoded read
+     * request instead (IndexExecution.validateGet/validateScan), so its reader needs only this.
+     */
+    static void validateShape(Operation o) throws IOException {
         boolean control = isControl(o), search = o.kind() == SEARCH;
         boolean valid =
                 (o.kind() == INSERT || o.kind() == SEARCH || isMutation(o) || control)
-                        && (control ? o.table() == 0 : o.table() >= 1 && o.table() <= MAX_TABLE)
+                        && (control ? o.table() == 0 : o.table() >= 1 && o.table() <= IndexEntry.MAX_TABLE)
                         && o.index() >= 0
-                        && o.index() <= MAX_INDEX
+                        && o.index() <= IndexEntry.MAX_INDEX
                         && o.workUnitId() >= 0
                         && (!control || o.workUnitId() == 0 && o.index() == 0)
                         && (search
@@ -342,25 +374,6 @@ public final class IndexOperationTrace {
                                                         && (o.index() == 0)
                                                                 == (o.indexedValue() == null)));
         if (!valid) throw new IOException("Invalid index operation");
-        if (!o.localWrites().isEmpty()) {
-            if (!search || o.localWrites().size() > CommittedOperations.MAX_TRANSACTION_OPERATIONS)
-                throw new IOException("Invalid private read context");
-            com.google.protobuf.ByteString previous = null;
-            for (var write : o.localWrites()) {
-                if (!isMutation(write) || !write.localWrites().isEmpty() || write.version() != 0
-                        || write.transactionId() != 0 || write.mutationOrdinal() != 0 || write.flags() != 0
-                        || write.sourceEvent() != 0 || write.workUnitId() != 0 || write.expectedCount() != 0
-                        || write.rowId() < 0 || write.file() < 0 || write.position() < 0
-                        || write.expansionPosition() != 0 || write.expansionSize() != 1)
-                    throw new IOException("Invalid private write");
-                validate(write);
-                if (!o.containsWrite(write)) throw new IOException("Private write outside its read scope");
-                var encoded = new org.sibench.trace.IndexEntry(write.table(), write.index(), write.indexedValue(), write.key()).bytes();
-                if (previous != null && com.google.protobuf.ByteString.unsignedLexicographicalComparator().compare(previous, encoded) >= 0)
-                    throw new IOException("Private writes must have unique ordered keys");
-                previous = encoded;
-            }
-        }
     }
 
     static Operation privateWrite(Operation write) {

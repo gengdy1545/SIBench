@@ -15,7 +15,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.junit.Test;
-import org.sibench.config.BenchmarkSelection;
 import org.sibench.config.Engine;
 import org.sibench.config.SibenchConfig;
 import org.sibench.generation.PostgresDatabase;
@@ -56,7 +55,7 @@ public class CdcPreparationCheck {
         }
         Files.writeString(engine, yaml.dump(pixels));
         Files.writeString(config, yaml.dump(Map.of("schema_version", 1, "purpose", "sibench",
-                "benchmarks", Map.of("hybench",org.sibench.config.BenchmarkFixtures.entry(benchmark,"capture","postgres",work.resolve("trace"),"xp")),
+                "benchmarks", Map.of("hybench",org.sibench.config.BenchmarkFixtures.entry(benchmark,"postgres",work.resolve("trace"),"xp")),
                 "object_storage", parallel ? object(SibenchConfig.read(root.resolve(System.getProperty("sibench.storage.config"))), "object_storage") : Map.of(),
                 "engines", Map.of("pixels", engine.toString(), "rocksdb", "/unavailable/engine-config.yaml"))));
         var output = new java.io.ByteArrayOutputStream();var errors = new java.io.ByteArrayOutputStream();
@@ -133,11 +132,11 @@ public class CdcPreparationCheck {
         try (var database = PostgresDatabase.create(build.resolve("postgres/runtime"), output.resolve("database"), sourceSettings)) {
             try (var connection = database.connect("load")) {
                 assertEquals(baseline, Hybench.load(connection, source.source(), data));
-                PixelsGeneration.prepareSource(connection, source);
+                CdcPreparation.prepareSource(connection, source);
             }
-            PixelsGeneration.createSlot(database, source);
+            CdcPreparation.createSlot(database, source);
             try (var capture = CdcCapture.start(build, settings, output.resolve("sink"), spec, database.port())) {
-                PixelsGeneration.awaitSlot(database, capture.process(), capture::check);
+                CdcPreparation.awaitSlot(database, capture.process(), capture::check);
                 if (terminate) {
                     capture.process().destroyForcibly();
                     assertTrue(capture.process().waitFor(10, java.util.concurrent.TimeUnit.SECONDS));
@@ -173,9 +172,7 @@ public class CdcPreparationCheck {
                 assertEquals(new CdcInput.Counts(6, 8, 7, 1), counts);
             }
         }
-        var selection = new BenchmarkSelection(root.resolve("config/benchmark/hybench.yaml"), "hybench", BenchmarkSelection.Mode.CDC, Engine.PIXELS, "hybench", "xp", root.resolve("unused-trace"), false, null);
-        var input = new Generation.Input(selection, Map.of("native", Map.of("sf", "1x")), source, root, output, Map.of(), baseline, Map.of());
-        CdcInput.publish(output, input, counts, Map.of("build", identity, "csv_manifest_sha256", csv.sha256(),
+        CdcInput.publish(output, csv, counts, Map.of("build", identity,
                 "benchmark_source", Map.of("commit", source.sourceCommit(), "fingerprints", source.fingerprints())));
         try (var files = Files.list(output.resolve("cdc"))) { assertEquals(3, files.filter(p -> p.toString().endsWith(".proto")).count()); }
         Generation.deleteTree(output.resolve("database/data"));

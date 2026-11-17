@@ -54,7 +54,7 @@ public final class Generation {
                 }
                 case POSTGRES -> NativeBuildCheck.verifyPostgres(root,build);
                 case ROCKSDB -> NativeBuildCheck.verifyRocks(root,build);
-                case PIXELS -> throw new IllegalArgumentException("Use generate-pixels for PG-to-Pixels generation");
+                case PIXELS -> throw new IllegalArgumentException("Pixels Traces come from prepare-cdc and pixels-experiment");
             };
             engines.put(engine,new NativeBuild(build,identity,settings));
         }
@@ -97,7 +97,7 @@ public final class Generation {
         var inputs=new ArrayList<Input>();
         var groups=new LinkedHashMap<String,List<BenchmarkSelection>>();
         for(var selection:selections) {
-            String group=selection.benchmark().equals("hybench")?"hybench:"+selection.workload():selection.benchmark();
+            String group=selection.benchmark().equals("ycsb")?"ycsb":selection.benchmark()+":"+selection.workload();
             groups.computeIfAbsent(group,ignored->new ArrayList<>()).add(selection);
         }
         for(var group:groups.values()) {
@@ -108,10 +108,10 @@ public final class Generation {
             secondaryIndexes(document);
             requestTarget(document);
             require(integer(document,"schema_version")==1&&string(document,"purpose").equals("native_capture"),"Expected native_capture profile");
-            keys(object(document,"source"),Set.of("path","commit"));keys(object(document,"artifacts"),Set.of("directory"));
+            keys(object(document,"source"),Set.of("path"));keys(object(document,"artifacts"),Set.of("directory"));
             var source=SourceSchema.read(root,document);var nativeConfig=object(document,"native");
             validateNative(selection.benchmark(),nativeConfig);
-            if(!selection.benchmark().equals("hybench")&&!selection.workload().isEmpty()) {
+            if(!selection.benchmark().equals("hybench")) {
                 var workloads=new LinkedHashMap<String,Object>();
                 for(var member:group)workloads.put(member.workload(),object(object(nativeConfig,"workloads"),member.workload()));
                 nativeConfig.put("workloads",workloads);document.put("native",nativeConfig);
@@ -121,7 +121,7 @@ public final class Generation {
             var baselineRows=parameters.isEmpty()?ScaleInspector.nativeRows(root,document):HybenchParameters.rows(parameters);
             Path client=root.resolve(string(nativeConfig,"build_directory")).toRealPath();
             String configured=string(object(document,"artifacts"),"directory");
-            if(selection.benchmark().equals("hybench")&&selection.mode()==Mode.CAPTURE)
+            if(selection.mode()==Mode.CAPTURE)
                 configured=Path.of(configured).resolve(selection.workload()).toString();
             Path output=outputDirectory(root,csvOutput==null?configured:csvOutput.toString());
             for(var previous:inputs)require(!output.startsWith(previous.output())&&!previous.output().startsWith(output),"Overlapping generation outputs");
@@ -162,11 +162,6 @@ public final class Generation {
         return bool(trace,"secondary_indexes");
     }
 
-    static List<String> workloads(Input input) {
-        return input.selection().benchmark().equals("hybench")?List.of(input.selection().workload()):
-                List.copyOf(object(input.nativeConfig(),"workloads").keySet());
-    }
-
     static long requestTarget(Map<String,Object> document) {
         if (!document.containsKey("trace")) return 0;
         var trace = object(document,"trace");
@@ -177,10 +172,10 @@ public final class Generation {
         var common=Set.of("build_directory","timeout_minutes");
         var allowed=new java.util.HashSet<>(common);
         allowed.addAll(switch(benchmark) {
-            case "ycsb"->Set.of("table","recordcount","insertstart","insertcount","fieldcount","fieldlength",
+            case "ycsb"->Set.of("recordcount","insertstart","fieldcount","fieldlength",
                     "fieldlengthdistribution","insertorder","zeropadding","threads","load_threads","workloads","seed");
-            case "sysbench"->Set.of("tables","table-size","secondary","create-secondary","auto-inc","skip-trx",
-                    "rand-seed","rand-type","threads","prepare_threads","binary","workloads");
+            case "sysbench"->Set.of("tables","table-size","auto-inc","skip-trx",
+                    "rand-seed","rand-type","threads","prepare_threads","workloads");
             case "hybench"->Set.of("sf","clients","xp_transaction_clients","xp_query_clients",
                     "duration_minutes","phase_duration_minutes","parameters");
             default->throw new IllegalArgumentException("Unknown benchmark");
@@ -202,8 +197,7 @@ public final class Generation {
         require(positive(n,"threads")<=256,"Client threads exceeds 256");
         if(benchmark.equals("ycsb")) {
             require(integer(n,"seed")>=0,"Negative YCSB seed");
-            require(string(n,"table").equals("usertable"),"YCSB table must be usertable");
-            require(positive(n,"recordcount")==positive(n,"insertcount"),"YCSB insertcount must equal recordcount");
+            positive(n,"recordcount");
             require(integer(n,"insertstart")>=0&&integer(n,"zeropadding")>=1,"Invalid YCSB key range");
             Math.addExact(integer(n,"insertstart"),integer(n,"recordcount"));
             require(positive(n,"fieldcount")<=1024,"Too many YCSB fields");positive(n,"fieldlength");
@@ -213,17 +207,28 @@ public final class Generation {
         }else {
             require(positive(n,"tables")<=10000,"Too many sysbench tables");positive(n,"table-size");
             require(positive(n,"prepare_threads")<=64,"Too many prepare threads");
-            require(!bool(n,"secondary")&&bool(n,"create-secondary"),"sysbench requires primary and k indexes");
             bool(n,"auto-inc");bool(n,"skip-trx");require(integer(n,"rand-seed")>=0,"Negative random seed");
-            require(Set.of("uniform","gaussian","special","pareto","zipfian").contains(string(n,"rand-type")),"Invalid random distribution");
-            require(string(n,"binary").equals("src/sysbench"),"Use the verified sysbench binary");
+            // The pinned sysbench accepts only these distributions.
+            require(Set.of("uniform","gaussian","pareto","zipfian").contains(string(n,"rand-type")),"Invalid random distribution");
         }
         var workloads=object(n,"workloads");require(!workloads.isEmpty(),"At least one workload is required");
         var names=benchmark.equals("ycsb")?Set.of("workloada","workloadb","workloadc","workloadf","workloadd","workloade"):
                 Set.of("oltp_read_write","oltp_update_index","oltp_update_non_index","oltp_delete","oltp_insert","oltp_point_select");
         for(String name:workloads.keySet()) {
-            require(names.contains(name),"Unsupported workload: "+name);var workload=object(workloads,name);
-            keys(workload,benchmark.equals("ycsb")?Set.of("operationcount","properties"):Set.of("events"));
+            var workload=object(workloads,name);
+            if(benchmark.equals("sysbench")) {
+                // A workload is a named run of one script; the exponent belongs to the run, required exactly when it is used.
+                require(name.matches("[a-z0-9][a-z0-9_]*"),"Invalid sysbench workload name: "+name);
+                require(names.contains(string(workload,"script")),"Unsupported sysbench script: "+workload.get("script"));
+                boolean zipfian=string(n,"rand-type").equals("zipfian");
+                keys(workload,zipfian?Set.of("script","events","rand-zipfian-exp"):Set.of("script","events"));
+                require(zipfian==workload.containsKey("rand-zipfian-exp"),"rand-zipfian-exp is required with, and only with, rand-type zipfian: "+name);
+                if(zipfian)require(workload.get("rand-zipfian-exp") instanceof Number exponent&&Double.isFinite(exponent.doubleValue())
+                        &&exponent.doubleValue()>=0,"rand-zipfian-exp must be a finite number >= 0: "+name);
+            }else {
+                require(names.contains(name),"Unsupported workload: "+name);
+                keys(workload,Set.of("operationcount","properties"));
+            }
             positive(workload,benchmark.equals("ycsb")?"operationcount":"events");
             if(workload.containsKey("properties")) {
                 var properties=object(workload,"properties");keys(properties,Set.of("readallfields","writeallfields"));
@@ -239,11 +244,10 @@ public final class Generation {
             case POSTGRES -> reports.add(PostgresGeneration.generate(plan,input));
             case ROCKSDB -> reports.addAll(RocksGeneration.generate(plan,input));
             case DUCKDB -> reports.add(generate(plan,input));
-            case PIXELS -> throw new IllegalArgumentException("Use generate-pixels for PG-to-Pixels generation");
             }
             for(var selection:plan.selections()) {
                 if(!selection.generate()||!selection.benchmark().equals(input.selection().benchmark()))continue;
-                if(selection.benchmark().equals("hybench")&&!selection.workload().equals(input.selection().workload()))continue;
+                if(!selection.benchmark().equals("ycsb")&&!selection.workload().equals(input.selection().workload()))continue;
                 Path source=input.output();
                 if(selection.benchmark().equals("ycsb"))source=source.resolve(selection.workload());
                 persist(plan,selection,source);
@@ -321,48 +325,45 @@ public final class Generation {
                     HybenchInputs.dropLoadInputs(data,script);
                 }
                 timings.put("native_load_seconds",seconds(loadStart));long baselineStart=System.nanoTime();
-                database.setAutoCommit(false);NativeHistory.initialize(database, org.sibench.config.Engine.DUCKDB);int tableId=0;
-                for(var table:input.source().tables())NativeHistory.install(database, org.sibench.config.Engine.DUCKDB,++tableId,"main",table.name(),
-                        table.indexes().stream().filter(SourceSchema.Index::primary).findFirst().orElseThrow().column());
+                database.setAutoCommit(false);NativeHistory.initialize(database, org.sibench.config.Engine.DUCKDB);
+                var catalog=IndexCatalog.fromSchema(input.source()).definitions();
+                for(var index:catalog)
+                    if(index.indexId()==0)NativeHistory.install(database,org.sibench.config.Engine.DUCKDB,index.tableId(),"main",index.table(),index.column());
                 database.commit();
                 var budget=new RequestBudget(requestTarget(input.document()),input.timeout());
-                try(var trace=new DuckDbTrace(input.selection().mode(),input.source(),out.resolve("trace"),secondaryIndexes(input.document()),budget)) {
+                try(var trace=new DuckDbTrace(input.source(),out.resolve("trace"),secondaryIndexes(input.document()),budget)) {
                     trace.baseline(database,expected);database.commit();database.setAutoCommit(true);
                     timings.put("baseline_indexes_seconds",seconds(baselineStart));long workloadStart=System.nanoTime();
                     boolean hybench=input.selection().benchmark().equals("hybench");
-                    var names=workloads(input);
-                    int remaining=names.size();
+                    String name=input.selection().workload();
                     long rawPrefix=0;double projectionSeconds=0;
-                    Path workloads=Files.createDirectory(out.resolve("workload"));
-                    for(String name:names) {
-                        Path stageRoot=Files.createDirectory(workloads.resolve(name));
-                        budget.begin(name,remaining--,null);
-                        int batch=0;
-                        do {
-                            budget.checkTime();long before=budget.count();
-                            Path window=Files.createDirectory(stageRoot.resolve("batch-"+batch++)),raw=window.resolve("native.csv");
-                            sql(database,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation','SibenchIndex','SibenchIndexRows','SibenchConsumption'],storage_path="+literal(raw.toString())+")");
-                            Stage stage=hybench?hybench(plan,input,window,false,name,Engine.DUCKDB,DuckDbHostDriver.PREFIX+socket,null,()->{}):sysbench(plan,input,socket,window,name,false);
-                            sql(database,"CALL disable_logging()");
-                            sql(database,"SET logging_storage='memory'");
-                            long projectionStart=System.nanoTime();
-                            try(var capture=DuckDbHostDriver.open(socket)) {
-                                var counts=DuckDbFacts.load(capture,raw,rawPrefix);
-                                rawPrefix=Math.addExact(rawPrefix,counts.values().stream().mapToLong(Long::longValue).sum());
-                                var receipts=DuckDbReceipts.load(capture,stage.receipts(),window.resolve("receipts"));
-                                DuckDbStatements.bind(capture,receipts);DuckDbReceipts.bind(capture);
-                                if(stage.calls()>=0)require(number(capture,"SELECT count(*) FROM sibench_sql_calls WHERE kind='query' AND error_code=0")==stage.calls(),"sysbench source summary/receipt count mismatch");
-                                DuckDbTransactions.bind(capture,"data",trace.lastVersion());DuckDbIdentities.bind(capture);
-                                DuckDbAccesses.bind(capture,IndexCatalog.duckDbDefinitions(input.source()));DuckDbMutations.bind(capture);
-                                trace.append(capture);
-                            }
-                            projectionSeconds+=seconds(projectionStart);
-                            // The window's facts and receipts are projected and checked; they are not retained.
-                            Files.delete(raw);deleteTree(window.resolve("clients"));deleteTree(window.resolve("receipts"));
-                            if(budget.enabled())budget.requireProgress(before);
-                        } while(budget.enabled()&&!budget.reached());
-                        budget.end();
-                    }
+                    Path workloadRoot=Files.createDirectory(out.resolve("workload"));
+                    budget.begin(null);
+                    int batch=0;
+                    do {
+                        budget.checkTime();long before=budget.count();
+                        Path window=Files.createDirectory(workloadRoot.resolve("batch-"+batch++)),raw=window.resolve("native.csv");
+                        sql(database,"CALL enable_logging(['SibenchQuery','SibenchTransaction','SibenchMutation','SibenchIndex','SibenchIndexRows'],storage_path="+literal(raw.toString())+")");
+                        Stage stage=hybench?hybench(plan,input,window,false,name,Engine.DUCKDB,DuckDbHostDriver.PREFIX+socket,null,()->{}):sysbench(plan,input,socket,window,name,false);
+                        sql(database,"CALL disable_logging()");
+                        sql(database,"SET logging_storage='memory'");
+                        long projectionStart=System.nanoTime();
+                        try(var capture=DuckDbHostDriver.open(socket)) {
+                            var counts=DuckDbFacts.load(capture,raw,rawPrefix);
+                            rawPrefix=Math.addExact(rawPrefix,counts.values().stream().mapToLong(Long::longValue).sum());
+                            var receipts=DuckDbReceipts.load(capture,stage.receipts(),window.resolve("receipts"));
+                            DuckDbStatements.bind(capture,receipts);DuckDbReceipts.bind(capture);
+                            if(stage.calls()>=0)require(number(capture,"SELECT count(*) FROM sibench_sql_calls WHERE kind='query' AND error_code=0")==stage.calls(),"sysbench source summary/receipt count mismatch");
+                            DuckDbTransactions.bind(capture,"data",trace.lastVersion());DuckDbIdentities.bind(capture);
+                            DuckDbAccesses.bind(capture,catalog);DuckDbMutations.bind(capture);
+                            trace.append(capture);
+                        }
+                        projectionSeconds+=seconds(projectionStart);
+                        // The window's facts and receipts are projected and checked; they are not retained.
+                        Files.delete(raw);deleteTree(window.resolve("clients"));deleteTree(window.resolve("receipts"));
+                        if(budget.enabled())budget.requireProgress(before);
+                    } while(budget.enabled()&&!budget.reached());
+                    budget.end();
                     timings.put("workload_and_projection_seconds",seconds(workloadStart));
                     timings.put("facts_and_projection_seconds",projectionSeconds);
                     json(out.resolve("request-budget.json"),budget.finish());
@@ -373,7 +374,7 @@ public final class Generation {
                         evidence.put("load_inputs_sha256",Digests.sha256(load.resolve("inputs.json")));
                         evidence.put("parameters_sha256",Digests.sha256(out.resolve("native/parameters/parameters.toml")));
                     }
-                    draft=trace.finish(database,evidence);
+                    draft=trace.finish(evidence);
                 }
             }
             long closeStart=System.nanoTime();
@@ -407,6 +408,23 @@ public final class Generation {
                         "trace_directory",input.selection().directory().toString()));
     }
 
+    /** Source options shared by both sysbench drivers; the primary key and every k index are always created. */
+    static List<String> sysbenchOptions(Map<String,Object> n,String workload,boolean load) {
+        var options=new ArrayList<>(List.of("--secondary=off","--create-secondary=on"));
+        for(String key:List.of("tables","table-size","auto-inc","skip-trx","rand-seed","rand-type")) {
+            Object value=n.get(key);options.add("--"+key+"="+(value instanceof Boolean flag?(flag?"on":"off"):value));
+        }
+        // Loading draws no skewed values; a run takes its distribution parameter from its own workload.
+        if(!load&&object(object(n,"workloads"),workload).containsKey("rand-zipfian-exp"))
+            options.add("--rand-zipfian-exp="+object(object(n,"workloads"),workload).get("rand-zipfian-exp"));
+        return options;
+    }
+
+    /** Every script shares oltp_common's prepare, so loading uses one fixed script. */
+    static String sysbenchScript(Map<String,Object> n,String workload,boolean load) {
+        return load?"oltp_read_write":string(object(object(n,"workloads"),workload),"script");
+    }
+
     private static double seconds(long start){return (System.nanoTime()-start)/1e9;}
     /** Publishes a closed run, then discards its database; a failed publication keeps the database for diagnosis. */
     static <T> T publishThenDiscard(java.util.concurrent.Callable<T> publish,Path database,Map<String,Double> timings)throws Exception {
@@ -421,16 +439,14 @@ public final class Generation {
     static void deleteTree(Path root)throws IOException {
         try(var paths=Files.walk(root)){for(Path path:paths.sorted(java.util.Comparator.reverseOrder()).toList())Files.delete(path);}
     }
-    record Stage(List<Path> receipts,long calls,long inserted) {}
+    record Stage(List<Path> receipts,long calls) {}
     private static Stage sysbench(Plan plan,Input input,Path socket,Path stage,String workload,boolean load)throws Exception {
         var n=input.nativeConfig();Path receipts=Files.createDirectory(stage.resolve("clients"));
         long events=load?0:positive(object(object(n,"workloads"),workload),"events");
-        var args=new ArrayList<>(List.of(input.build().resolve("src/sysbench").toString(),input.build().resolve("src/lua/"+workload+".lua").toString(),
+        var args=new ArrayList<>(List.of(input.build().resolve("src/sysbench").toString(),input.build().resolve("src/lua/"+sysbenchScript(n,workload,load)+".lua").toString(),
                 "--db-driver=duckdb","--duckdb-socket="+socket,"--duckdb-ledger-dir="+receipts,"--time=0","--events="+events,
                 "--threads="+positive(n,load?"prepare_threads":"threads")));
-        for(String key:List.of("tables","table-size","secondary","create-secondary","auto-inc","skip-trx","rand-seed","rand-type")) {
-            Object value=n.get(key);args.add("--"+key+"="+(value instanceof Boolean flag?(flag?"on":"off"):value));
-        }
+        args.addAll(sysbenchOptions(n,workload,load));
         args.add(load?"prepare":"run");var result=NativeProcess.run(load?"prepare":"run",args,
                 Map.of("LUA_PATH",input.build().resolve("src/lua")+"/?.lua;;"),plan.root(),stage,input.timeout());
         require(result.exit()==0,"sysbench process failed: "+stage);long calls=-1;
@@ -439,7 +455,7 @@ public final class Generation {
             require(measured.getOrDefault("reconnects",0L)==0,"Unexpected sysbench reconnection");calls=measured.getOrDefault("total",-1L);
             require(calls>=0,"Missing sysbench statement count");json(stage.resolve("summary.json"),measured);
         }
-        var files=files(receipts);require(!files.isEmpty(),"sysbench missing session receipts");return new Stage(files,calls,0);
+        var files=files(receipts);require(!files.isEmpty(),"sysbench missing session receipts");return new Stage(files,calls);
     }
 
     /** One upstream client process; DuckDB connections leave receipts, PG sessions are captured natively. */
@@ -469,7 +485,7 @@ public final class Generation {
         var command=List.of(Path.of(System.getProperty("java.home"),"bin/java").toString(),"-Xmx512m","-cp",cp,Hybench.class.getName(),load?"generate":"run",resolved.toString(),input.build().resolve("conf/stmt_postgres.toml").toString(),stage.resolve("summary.json").toString());
         var result=NativeProcess.run(load?"generate":"run",command,stop==null?Map.of():Map.of("SIBENCH_BUDGET_STOP",stop.toString()),
                 nativeDirectory,stage,input.timeout(),check);
-        require(result.exit()==0,"HyBench process failed: "+stage);return new Stage(receipts==null?List.of():files(receipts),-1,0);
+        require(result.exit()==0,"HyBench process failed: "+stage);return new Stage(receipts==null?List.of():files(receipts),-1);
     }
 
     static void requireRows(Map<String,Long> expected,Map<String,Long> actual) throws IOException {

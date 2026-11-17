@@ -32,7 +32,7 @@ public class RocksGenerationCheck {
         assertNotNull("Set sibench.rocksdb.build", runtime); assertNotNull("Set sibench.ycsb.build", client);
         Path run = Files.createTempDirectory(root.resolve("results/capture"), "rocks-generation-check-");
         var document = DuckDbGenerationTest.profile("ycsb"); var n = object(document, "native");
-        n.put("recordcount", 1000); n.put("insertcount", 1000); n.put("build_directory", client);
+        n.put("recordcount", 1000); n.put("build_directory", client);
         var workloads = object(n, "workloads");
         for (String name : workloads.keySet()) { var workload = object(workloads, name); workload.put("operationcount", 320); workloads.put(name, workload); }
         n.put("workloads", workloads); document.put("native", n);
@@ -45,7 +45,7 @@ public class RocksGenerationCheck {
         var selections = new LinkedHashMap<String,Object>();
         for (String workload : workloads.keySet()) {
             String name = "ycsb-" + workload.charAt(workload.length()-1);
-            var entry = org.sibench.config.BenchmarkFixtures.entry(profile,"api","rocksdb",run.resolve("traces").resolve(name));
+            var entry = org.sibench.config.BenchmarkFixtures.entry(profile,"rocksdb",run.resolve("traces").resolve(name));
             entry.put("workload",workload);selections.put(name,entry);
         }
         Path config = run.resolve("runtime.json"); Files.writeString(config, json.toJson(Map.of(
@@ -65,7 +65,7 @@ public class RocksGenerationCheck {
             assertEquals(baselineIdentity,initial.get("baseline_trace_sha256"));
             var budget=object(evidence,"request_budget");
             assertTrue(((Number)budget.get("effective_requests")).longValue()>=2400);
-            assertEquals(Set.of(name),object(budget,"stages").keySet());
+            assertFalse(budget.containsKey("stages"));assertTrue(evidence.containsKey("batches"));
             long sourceReads=0;
             try(var batches=Files.list(output.resolve("workload"))) {
                 for(Path batch:batches.toList()) {
@@ -77,8 +77,7 @@ public class RocksGenerationCheck {
                     assertTrue(arguments.asList().stream().anyMatch(a->a.getAsString().equals("sibench.seed=20261019")));
                 }
             }
-            var files=(List<?>)object(result,"proto_files").get("workload");
-            @SuppressWarnings("unchecked") var file=(Map<String,Object>)files.get(0);
+            var file=object(object(result,"proto_files"),"workload");
             var statistics=object(file,"statistics");var types=object(statistics,"request_types");
             assertEquals(sourceReads,((Number)types.getOrDefault("get",0L)).longValue()
                     +((Number)types.getOrDefault("scan",0L)).longValue());
@@ -89,8 +88,8 @@ public class RocksGenerationCheck {
             assertFalse(Files.exists(trace.resolve("INCOMPLETE")));
             assertEquals("passed",org.sibench.replay.ReferenceReplay.run(trace,new org.sibench.replay.ReplayConfig(false,0,0,0,0,"operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
             var replay=new org.sibench.replay.ReplayConfig(false,0,0,0,0,"operation",2,64,10, 1);
-            var service=new org.sibench.adapters.ServiceConfig("rocksdb",null,output.resolve("index"),0,org.sibench.adapters.ValueKind.ROW_ID,null,false,true);
-            assertEquals("passed",org.sibench.adapters.ServiceReplay.run(trace,replay,service,output.resolve("replay.json")).get("status"));
+            assertEquals("passed",org.sibench.adapters.IndexTestSupport.replay(trace,replay,output.resolve("index"),
+                    org.sibench.adapters.ValueKind.ROW_ID,output.resolve("replay.json")).get("status"));
             assertFalse(TraceManifest.read(trace).has("native_data"));assertFalse(Files.exists(output.resolve("database")));
         }
         assertTrue(Files.exists(run.resolve("generated/workloadc")));

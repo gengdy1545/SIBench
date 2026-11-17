@@ -2,18 +2,13 @@ package org.sibench.generation;
 
 import static org.junit.Assert.*;
 
-import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
 
-public class NativeHistoryTest {
-    @Rule public TemporaryFolder temporary = new TemporaryFolder();
-
-    private Connection database(Path path) throws Exception {
-        var database = DuckDbDatabase.create(path);
+public class NativeHistoryTest extends DuckDbHostFixture {
+    private Connection database() throws Exception {
+        var database = connect();
         execute(database, "CREATE TABLE items(id BIGINT PRIMARY KEY, value VARCHAR)");
         execute(database, "INSERT INTO items VALUES(1,'A'), (2,'untouched')");
         database.setAutoCommit(false);
@@ -25,7 +20,7 @@ public class NativeHistoryTest {
     }
 
     @Test public void updatesKeepTheirRowIdAndReinsertionsGetNewOnes() throws Exception {
-        try (var database = database(temporary.getRoot().toPath().resolve("identities"))) {
+        try (var database = database()) {
             long original = number(database, "SELECT _sib_row_id FROM sibench_history.identities_1 WHERE id=1 AND _sib_tx=0");
             assertEquals(2, number(database, "SELECT count(DISTINCT _sib_row_id) FROM sibench_history.identities_1"));
             database.setAutoCommit(false);
@@ -45,7 +40,7 @@ public class NativeHistoryTest {
     }
 
     @Test public void rolledBackInsertsAndTriggerFailuresLeaveNoIdentity() throws Exception {
-        try (var database = database(temporary.getRoot().toPath().resolve("rollback"))) {
+        try (var database = database()) {
             database.setAutoCommit(false);
             execute(database, "INSERT INTO items VALUES(3,'discarded')");
             assertEquals(3, number(database, "SELECT count(*) FROM sibench_history.identities_1"));
@@ -60,7 +55,7 @@ public class NativeHistoryTest {
     }
 
     @Test public void rejectsPrimaryKeyPermutationsThatPreserveTheKeySet() throws Exception {
-        try (var database = database(temporary.getRoot().toPath().resolve("key-permutation"))) {
+        try (var database = database()) {
             assertThrows(SQLException.class, () -> execute(database, "UPDATE items SET id=3-id"));
             assertEquals(1, number(database, "SELECT count(*) FROM items WHERE id=1 AND value='A'"));
         }

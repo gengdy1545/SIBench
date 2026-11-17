@@ -89,9 +89,6 @@ public final class DuckDbReceipts {
                     "SQL receipts disagree with native submissions");
             reject(database,"SELECT 1 FROM temp.main.sibench_sql_submissions GROUP BY connection_id,operation "
                     +"HAVING count(*)<>1 LIMIT 1","Duplicate SQL submission receipt");
-            execute(database,"CREATE TEMP VIEW sibench_sql_statements AS SELECT s.*,r.operation,r.kind AS submission_kind,"
-                    +"r.error_code,r.returned_rows FROM temp.main.sibench_statements s JOIN temp.main.sibench_sql_submissions r "
-                    +"USING(connection_id,root_query)");
             database.commit();
         } catch(SQLException|RuntimeException failure) {
             try{database.rollback();}catch(SQLException rollback){failure.addSuppressed(rollback);}throw failure;

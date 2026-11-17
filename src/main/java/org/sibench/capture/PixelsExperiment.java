@@ -23,6 +23,9 @@ public final class PixelsExperiment {
         output = root.resolve(output).toAbsolutePath();
         var runtime = SibenchConfig.read(root.resolve(configuration));
         var experiment = PixelsExperimentConfig.settings(runtime);
+        // The Retina tracer records primary-index calls only; a Trace cannot represent the profile's secondary indexes.
+        if (bool(experiment, "trace") && Generation.secondaryIndexes(parse(Files.readString(Generation.hybenchSelection(root, runtime).config()))))
+            throw new IllegalArgumentException("Pixels CDC supports primary indexes only");
         var inputs = inputs(root, cdcDirectory, baselineDirectory, experiment);
         var columnar = inputs.baseline();
         var verified = inputs.cdc();
@@ -72,8 +75,8 @@ public final class PixelsExperiment {
         try (var host = deployment.equals("local") ? PixelsHost.local(build, output.resolve("pixels"), new Gson().toJsonTree(identity).getAsJsonObject())
                 : PixelsHost.Client.connect(deployment, hostToken(), new Gson().toJsonTree(identity).getAsJsonObject());
              var listener = tracing ? new ServerSocket(0, 1, InetAddress.getByName(host.localAddress())) : null;
-             var trace = tracing ? new PixelsTrace(output.resolve("trace"), source, Map.of(), null) : null;
-             var capture = tracing ? new PixelsCapture(trace, listener, token, null, null) : null) {
+             var trace = tracing ? new PixelsTrace(output.resolve("trace"), source) : null;
+             var capture = tracing ? new PixelsCapture(trace, listener, token) : null) {
             var request = new LinkedHashMap<String, Object>(Map.of("op", "start", "run", deployment.equals("local") ? "pixels" : "pixels-" + UUID.randomUUID(),
                     "overlay", object(settings, "properties"), "memory", object(settings, "memory"), "trace", tracing));
             request.put("data_storage", object(settings, "data_storage"));

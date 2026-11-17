@@ -215,7 +215,9 @@ public class ReliveBackendTest {
         try (var fixture = new Fixture(); var backend = new ReliveBackend(fixture.endpoint(), ValueKind.ROW_ID)) {
             var invalid = new ArrayList<Mutation>(Collections.nCopies(10001, put("a", 10, "A")));
             invalid.add(put("z", -1, "invalid"));
-            assertThrows(IllegalArgumentException.class, () -> backend.writeBatch(invalid));
+            // The service boundary validates the whole batch before the backend sees any member.
+            assertEquals(IndexStatus.INVALID, IndexTestSupport.execute(backend,
+                    WriteBatchRequest.newBuilder().addAllMutations(invalid).build()).status());
             assertTrue(fixture.writes.isEmpty());
             var writes = new ArrayList<Mutation>();
             for (int i = 0; i < 10001; i++) writes.add(put("key-" + i, i, "A"));

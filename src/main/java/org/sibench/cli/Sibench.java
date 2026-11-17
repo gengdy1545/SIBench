@@ -2,6 +2,7 @@ package org.sibench.cli;
 
 import org.sibench.replay.ReplayInput;
 import org.sibench.config.BenchmarkSelection;
+import org.sibench.config.ConfigValues;
 import org.sibench.config.SibenchConfig;
 import com.google.gson.GsonBuilder;
 
@@ -26,7 +27,6 @@ public final class Sibench {
     private static void printServiceHelp(PrintStream out) {
         out.println("       java -jar build/sibench/sibench.jar generate [--root PATH] CONFIG");
         out.println("       java -jar build/sibench/sibench.jar trace-paths CONFIG");
-        out.println("       java -jar build/sibench/sibench.jar generate-pixels [--root PATH] CONFIG");
         out.println("       java -jar build/sibench/sibench.jar prepare-pixels-baseline CONFIG CSV_INPUT_DIRECTORY OUTPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar prepare-pixels-inputs CONFIG CSV_INPUT_DIRECTORY PIXELS_BASELINE_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar check-pixels-baseline INPUT_DIRECTORY");
@@ -40,7 +40,7 @@ public final class Sibench {
         out.println("       java -jar build/sibench/sibench.jar pixels-experiment CONFIG [CDC_INPUT_DIRECTORY] PIXELS_BASELINE_DIRECTORY OUTPUT_DIRECTORY");
         out.println(
                 "       java -jar build/sibench/sibench.jar pixels-host ADDRESS:PORT BUILD WORK_ROOT TOKEN_FILE"
-                        + "   (Pixels side of CDC generation for a remote pixels_host)");
+                        + "   (Pixels side of baseline preparation and experiments for a remote pixels_host)");
         out.println(
                 "       java -jar build/sibench/sibench.jar index-server CONFIG SERVICE_CONFIG"
                         + "   (serves RocksDB / rocksdb-cloud / SlateDB, or bridges a Relive HTTP service)");
@@ -55,7 +55,7 @@ public final class Sibench {
         out.println(
                 "       java -jar build/sibench/sibench.jar analyze-locality CONFIG BENCHMARK OUTPUT"
                         + "   (static baseline layout, update windows and overlap estimate)");
-        out.println("       java -jar build/sibench/sibench.jar analyze-accesses CONFIG BENCHMARK OUTPUT WINDOW_REQUESTS SORT_MEMORY_BYTES");
+        out.println("       java -jar build/sibench/sibench.jar analyze-accesses CONFIG BENCHMARK OUTPUT");
     }
 
     public static void main(String[] args) {
@@ -75,7 +75,6 @@ public final class Sibench {
                             "inspect-scale",
                             "trace-paths",
                             "generate",
-                            "generate-pixels",
                             "prepare-pixels-baseline",
                             "prepare-pixels-inputs",
                             "check-pixels-baseline",
@@ -200,12 +199,6 @@ public final class Sibench {
                         org.sibench.capture.Generation.run(root,Path.of(profiles.get(0)))));
                 return 0;
             }
-            if (args[0].equals("generate-pixels")) {
-                if (profiles.size() != 1) throw new IllegalArgumentException("generate-pixels requires one runtime CONFIG");
-                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(
-                        org.sibench.capture.PixelsGeneration.run(root,Path.of(profiles.get(0)))));
-                return 0;
-            }
             if (args[0].equals("pixels-host")) {
                 if (profiles.size() != 4)
                     throw new IllegalArgumentException("pixels-host requires ADDRESS:PORT BUILD WORK_ROOT TOKEN_FILE");
@@ -259,7 +252,7 @@ public final class Sibench {
                             "replay-service requires REPLAY_CONFIG BENCHMARK REPORT");
                 var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
                 ReplayConfig config = ReplayConfig.from(document);
-                ServiceConfig service = ServiceConfig.ofReplay(root, document);
+                var service = org.sibench.adapters.ServiceTarget.of(document);
                 var result =
                         ServiceReplay.run(
                                 BenchmarkSelection.directory(root, document, profiles.get(1)),
@@ -274,7 +267,7 @@ public final class Sibench {
                     throw new IllegalArgumentException(
                             "verify-service requires REPLAY_CONFIG BENCHMARK REPORT");
                 var document = org.sibench.config.SibenchConfig.read(root.resolve(profiles.get(0)));
-                ServiceConfig service = ServiceConfig.ofReplay(root, document);
+                var service = org.sibench.adapters.ServiceTarget.of(document);
                 var result =
                         ServiceReplay.verify(
                                 BenchmarkSelection.directory(root, document, profiles.get(1)),
@@ -285,12 +278,13 @@ public final class Sibench {
                 return 0;
             }
             if (args[0].equals("analyze-accesses")) {
-                if (profiles.size() != 5) throw new IllegalArgumentException(
-                        "analyze-accesses requires CONFIG BENCHMARK OUTPUT WINDOW_REQUESTS SORT_MEMORY_BYTES");
+                if (profiles.size() != 3) throw new IllegalArgumentException(
+                        "analyze-accesses requires CONFIG BENCHMARK OUTPUT");
                 var document = SibenchConfig.read(root.resolve(profiles.get(0)));
+                var accesses = ConfigValues.object(ConfigValues.object(document, "analysis"), "accesses");
                 org.sibench.analysis.TraceAccesses.run(BenchmarkSelection.directory(root, document, profiles.get(1)),
-                        root.resolve(profiles.get(2)), Long.parseLong(profiles.get(3)),
-                        Long.parseLong(profiles.get(4)));
+                        root.resolve(profiles.get(2)), ConfigValues.positive(accesses, "window_requests"),
+                        ConfigValues.positive(accesses, "sort_memory_bytes"));
                 out.println(Files.readString(root.resolve(profiles.get(2)).resolve("summary.json")));
                 return 0;
             }
@@ -298,9 +292,10 @@ public final class Sibench {
                 if (profiles.size() != 3)
                     throw new IllegalArgumentException(
                             "analyze-locality requires CONFIG BENCHMARK OUTPUT_DIRECTORY");
+                var document = SibenchConfig.read(root.resolve(profiles.get(0)));
                 org.sibench.analysis.UpdateLocality.run(
-                        BenchmarkSelection.directory(root, SibenchConfig.read(root.resolve(profiles.get(0))), profiles.get(1)),
-                        root.resolve(profiles.get(0)),
+                        BenchmarkSelection.directory(root, document, profiles.get(1)),
+                        org.sibench.analysis.UpdateLocality.Config.from(document),
                         root.resolve(profiles.get(2)));
                 out.println(Files.readString(root.resolve(profiles.get(2)).resolve("summary.json")));
                 return 0;

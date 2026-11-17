@@ -137,7 +137,7 @@ public final class IndexServiceCheck {
     public static void main(String[] args) throws Exception {
         if (args.length != 2) throw new IllegalArgumentException("CONFIG FRESH_REPORT");
         var runtime = org.sibench.config.SibenchConfig.read(Path.of(args[0]));
-        var config = ServiceConfig.ofReplay(Path.of("").toAbsolutePath(), runtime);
+        var config = ServiceTarget.of(runtime);
         var replay = org.sibench.replay.ReplayConfig.from(runtime);
         Path report = Path.of(args[1]);
         if (Files.exists(report)) throw new java.io.IOException("Report already exists: " + report);

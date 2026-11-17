@@ -16,7 +16,7 @@ import org.yaml.snakeyaml.Yaml;
 /** Real capture-source generation using the configured dispatcher and portable consumers. */
 public class DuckDbGenerationCheck {
     @Rule public Timeout timeout=Timeout.seconds(600);
-    @Test public void configuredQueryAndWriteStagesAllContributeToCaptureSupply() throws Exception {
+    @Test public void aQueryOnlyWorkloadContributesToCaptureSupply() throws Exception {
         Path root=Path.of("").toRealPath();
         String client=System.getProperty("sibench.sysbench.build"),host=System.getProperty("sibench.duckdb.host");
         assertNotNull(client);assertNotNull(host);
@@ -24,9 +24,8 @@ public class DuckDbGenerationCheck {
         var document=DuckDbGenerationTest.profile("sysbench");var n=object(document,"native");
         n.put("tables",2);n.put("table-size",512);n.put("prepare_threads",2);n.put("threads",2);
         n.put("timeout_minutes",2);n.put("build_directory",client);
-        var workloads=new LinkedHashMap<String,Object>();
-        for(String name:List.of("oltp_update_index","oltp_update_non_index","oltp_delete","oltp_insert","oltp_point_select"))workloads.put(name,Map.of("events",10));
-        n.put("workloads",workloads);document.put("native",n);
+        n.put("rand-type","uniform");
+        n.put("workloads",Map.of("oltp_point_select",Map.of("script","oltp_point_select","events",10)));document.put("native",n);
         document.put("trace",Map.of("secondary_indexes",false,"workload_requests",1000));
         document.put("artifacts",Map.of("directory",root.relativize(output.resolve("generated")).toString()));
         var yaml=new Yaml();Path profile=output.resolve("profile.yaml"),engine=output.resolve("duckdb.yaml"),runtime=output.resolve("runtime.yaml");
@@ -34,22 +33,17 @@ public class DuckDbGenerationCheck {
         Files.writeString(engine,yaml.dump(Map.of("schema_version",1,"purpose","engine","engine","duckdb",
                 "build_directory",Path.of(host).getParent().toString(),"memory_limit","1GiB","threads",2)));
         Files.writeString(runtime,yaml.dump(Map.of("schema_version",1,"purpose","sibench",
-                "benchmarks",Map.of("sysbench",org.sibench.config.BenchmarkFixtures.entry(profile,"capture","duckdb",output.resolve("trace"))),
+                "benchmarks",Map.of("sysbench",org.sibench.config.BenchmarkFixtures.entry(profile,"duckdb",output.resolve("trace"))),
                 "engines",Map.of("duckdb",engine.toString()))));
         var result=Generation.run(root,runtime).get(0);
         var budget=object(object(result,"source_evidence"),"request_budget");
         assertTrue(((Number)budget.get("effective_requests")).longValue()>=1000);
-        var stages=object(budget,"stages");
-        assertEquals(5,stages.size());
-        assertTrue(stages.containsKey("oltp_point_select"));
-        assertTrue(Files.exists(output.resolve("generated/workload/oltp_point_select")));
-        var query=object(stages,"oltp_point_select");
-        assertTrue(((Number)query.get("effective_requests")).longValue()>0);
-        assertTrue(((Number)query.get("target_requests")).longValue()>0);
-        assertTrue(Files.isDirectory(output.resolve("generated/workload/oltp_point_select/batch-0")));
+        assertFalse(budget.containsKey("stages"));
+        assertTrue(((Number)budget.get("target_requests")).longValue()>0);
+        assertTrue(Files.isDirectory(output.resolve("generated/oltp_point_select/workload/batch-0")));
         assertEquals("passed",org.sibench.replay.ReferenceReplay.run(output.resolve("trace"),
                 new ReplayConfig(false,0,0,0,0,"operation", 1, 4096, 60, 1),output.resolve("reference.json")).get("status"));
-        assertFalse(Files.exists(output.resolve("generated/data")));
+        assertFalse(Files.exists(output.resolve("generated/oltp_point_select/data")));
     }
 
     @Test public void mixedCapturePublishesBothConfiguredSelectionsAndReplays()throws Exception {
@@ -80,8 +74,8 @@ public class DuckDbGenerationCheck {
             document.put("trace",Map.of("secondary_indexes",false,"workload_requests",1000));
             document.put("artifacts",Map.of("directory",root.relativize(output.resolve(benchmark)).toString()));
             Path profile=output.resolve(benchmark+".yaml");Files.writeString(profile,new Yaml().dump(document));
-            var entry=org.sibench.config.BenchmarkFixtures.entry(profile,"capture","duckdb",output.resolve("traces").resolve(benchmark));
-            if(benchmark.equals("hybench"))entry.put("workload","xp");
+            var entry=org.sibench.config.BenchmarkFixtures.entry(profile,"duckdb",output.resolve("traces").resolve(benchmark));
+            entry.put("workload",benchmark.equals("hybench")?"xp":"oltp_read_write_zipf099");
             selections.put(benchmark,entry);
         }
         Files.writeString(output.resolve("unselected.yaml"),"invalid unselected profile: [");
@@ -93,7 +87,7 @@ public class DuckDbGenerationCheck {
                 "engines",Map.of("duckdb",engine.toString())));
         Path config=output.resolve("runtime.yaml");
         var invalid=new LinkedHashMap<>(runtime);
-        var invalidEntries=new LinkedHashMap<>(selections);var bad=object(selections,"hybench");bad.put("mode","api");invalidEntries.put("hybench",bad);invalid.put("benchmarks",invalidEntries);
+        var invalidEntries=new LinkedHashMap<>(selections);var bad=object(selections,"hybench");bad.put("engine","rocksdb");invalidEntries.put("hybench",bad);invalid.put("benchmarks",invalidEntries);
         Files.writeString(config,new Yaml().dump(invalid));
         assertThrows(IllegalArgumentException.class,()->Generation.run(root,config));
         assertFalse(Files.exists(output.resolve("sysbench")));assertFalse(Files.exists(output.resolve("hybench")));
@@ -108,15 +102,14 @@ public class DuckDbGenerationCheck {
         var moved=Files.createDirectory(output.resolve("relocated"));
         for(String benchmark:List.of("sysbench","hybench")) {
             var directory=output.resolve(benchmark);
-            if(benchmark.equals("hybench"))directory=directory.resolve("xp");
+            directory=directory.resolve(benchmark.equals("hybench")?"xp":"oltp_read_write_zipf099");
             var trace=Files.move(output.resolve("traces").resolve(benchmark),moved.resolve(benchmark));
             assertEquals("passed",org.sibench.replay.ReferenceReplay.run(trace,
                     new ReplayConfig(false,0,0,0,0, "operation", 1, 4096, 60, 1),directory.resolve("reference.json")).get("status"));
             assertFalse(Files.exists(directory.resolve("data")));
-            var service=new org.sibench.adapters.ServiceConfig("rocksdb",null,directory.resolve("index"),0,
-                    org.sibench.adapters.ValueKind.ROW_ID,null,false,true);
-            assertEquals("passed",org.sibench.adapters.ServiceReplay.run(trace,
-                    new ReplayConfig(false,0,0,0,0, "operation", 1, 4096, 60, 1),service,directory.resolve("service.json")).get("status"));
+            assertEquals("passed",org.sibench.adapters.IndexTestSupport.replay(trace,
+                    new ReplayConfig(false,0,0,0,0, "operation", 1, 4096, 60, 1),directory.resolve("index"),
+                    org.sibench.adapters.ValueKind.ROW_ID,directory.resolve("service.json")).get("status"));
         }
         assertThrows(IllegalArgumentException.class,()->Generation.run(root,config));
     }

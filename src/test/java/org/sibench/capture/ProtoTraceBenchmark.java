@@ -23,7 +23,7 @@ public final class ProtoTraceBenchmark {
                         IndexOperationTrace.INSERT, 1, 0, IndexKey.ofInt(row), 0, 0, 0, row)
                         .withWorkUnitId(1 + (row - 1) / IndexOperationTrace.BLOCK_RECORDS).withExpansion(0, 1));
             }
-            files.put("baseline", ProtoTrace.file("baseline.pb.zst", baseline));
+            files.put("baseline", ProtoTrace.file(baseline));
             var workload = new ProtoTrace.Writer(directory.resolve("workload.pb.zst"), true);
             try (workload) {
                 for (long version = 1; version <= transactions; version++) {
@@ -41,7 +41,7 @@ public final class ProtoTraceBenchmark {
                             IndexOperationTrace.TRANSACTION_COMMIT, event, version, 1));
                 }
             }
-            files.put("workload", ProtoTrace.file("workload.pb.zst", workload));
+            files.put("workload", ProtoTrace.file(workload));
             Files.writeString(directory.resolve("fixture.json"), new GsonBuilder().setPrettyPrinting()
                     .create().toJson(Map.of("rows", rows, "transactions", transactions, "files", files)));
             return;
@@ -58,7 +58,7 @@ public final class ProtoTraceBenchmark {
             long[] fingerprint = {0};
             for (String name : List.of("baseline", "workload")) {
                 var file = fixture.getAsJsonObject("files").getAsJsonObject(name);
-                count += ProtoTrace.read(directory.resolve(file.get("path").getAsString()),
+                count += ProtoTrace.read(directory.resolve(name + ".pb.zst"),
                         file.get("sha256").getAsString(), file.get("logical_sha256").getAsString(), operation ->
                                 fingerprint[0] = Long.rotateLeft(fingerprint[0], 1) ^ operation.sourceEvent()
                                         ^ operation.kind() ^ operation.version() ^ operation.rowId());

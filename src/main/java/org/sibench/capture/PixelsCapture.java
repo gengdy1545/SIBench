@@ -1,11 +1,9 @@
 package org.sibench.capture;
 
-import java.io.BufferedReader;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -20,7 +18,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Receives Retina tracer facts and pixels-sink transaction reports and runs the projection on one
+ * Receives Retina tracer facts and the file sink's transaction reports and runs the projection on one
  * thread. A barrier is sent to the tracer after reported commits; its acknowledgement follows every
  * fact appended before the sink's commit, so those transactions are then complete. The bounded
  * queue applies back pressure to Retina instead of buffering an unbounded backlog.
@@ -38,26 +36,22 @@ final class PixelsCapture implements AutoCloseable {
     private record Barrier(long id, Set<Long> commits, List<CompletableFuture<Void>> waiters) {}
 
     private final PixelsTrace trace;
-    private final ServerSocket traceListener, reportListener;
-    private final String traceToken, reportToken;
+    private final ServerSocket traceListener;
+    private final String traceToken;
     private final BlockingQueue<Event> events = new ArrayBlockingQueue<>(1 << 20);
-    private final Set<Long> markers = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final List<CompletableFuture<Void>> syncWaiters = new ArrayList<>();
     private final Thread projector;
     private volatile Throwable failure;
-    private volatile boolean closing, sinkStopping;
+    private volatile boolean closing;
     private volatile Socket tracer;
-    private volatile Socket sink;
     private volatile DataOutputStream barriers;
     private Barrier outstanding;
     private long barrierId;
 
-    PixelsCapture(PixelsTrace trace, ServerSocket traceListener, String traceToken, ServerSocket reportListener, String reportToken) {
+    PixelsCapture(PixelsTrace trace, ServerSocket traceListener, String traceToken) {
         this.trace = trace;
         this.traceListener = traceListener;
         this.traceToken = traceToken;
-        this.reportListener = reportListener;
-        this.reportToken = reportToken;
         projector = new Thread(this::project, "sibench-pixels-projection");
         projector.setDaemon(true);
         projector.start();
@@ -65,7 +59,7 @@ final class PixelsCapture implements AutoCloseable {
 
     /**
      * Accepts the Retina tracer in the background: it connects when Retina first opens a primary
-     * index, which is during LOAD. Barriers wait for the connection; a missing one fails the run.
+     * index, which is during baseline import. Barriers wait for the connection; a missing one fails the run.
      */
     void acceptTracer(Duration timeout) {
         reader("sibench-pixels-facts", () -> {
@@ -96,47 +90,10 @@ final class PixelsCapture implements AutoCloseable {
         });
     }
 
-    /**
-     * Accepts the patched sink's report connection in the background; it connects at its first
-     * BEGIN. B/C lines carry Pixels timestamps, F a failure.
-     */
-    void acceptSink(Duration timeout) {
-        reader("sibench-pixels-sink", () -> {
-            reportListener.setSoTimeout((int) timeout.toMillis());
-            sink = reportListener.accept();
-            var lines = new BufferedReader(new InputStreamReader(sink.getInputStream(), StandardCharsets.UTF_8));
-            String hello = lines.readLine();
-            if (hello == null || !hello.startsWith("T ") || !same(hello.substring(2), reportToken)) throw new IOException("Unauthenticated pixels-sink");
-            for (String line; (line = lines.readLine()) != null; ) {
-                if (line.length() < 3 || line.charAt(1) != ' ') throw new IOException("Malformed sink report: " + line);
-                switch (line.charAt(0)) {
-                    case 'B' -> put(new Begin(Long.parseLong(line.substring(2))));
-                    case 'C' -> put(new Commit(Long.parseLong(line.substring(2))));
-                    case 'F' -> put(new Failed("pixels-sink: " + line.substring(2), null));
-                    default -> throw new IOException("Malformed sink report: " + line);
-                }
-            }
-            if (!closing && !sinkStopping) put(new Failed("pixels-sink report connection closed", null));
-        });
-    }
-
     /** Runs a projection step after every fact appended before now has arrived. */
     void synced(Step step, Duration timeout) throws Exception {
         call(step, true, timeout);
     }
-
-    /** Waits until the marker transaction {@code id}, and so every transaction before it, is exported. */
-    void awaitMarker(long id, Duration timeout) throws Exception {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (!markers.contains(id)) {
-            check();
-            if (System.nanoTime() > deadline) throw new IOException("Pixels window marker " + id + " not applied in time");
-            Thread.sleep(10);
-        }
-    }
-
-    /** The generator stops the sink after its last marker; the report connection may then close. */
-    void sinkStopping() { sinkStopping = true; }
 
     void begin(long timestamp) throws Exception { put(new Begin(timestamp)); }
     void commit(long timestamp) throws Exception { put(new Commit(timestamp)); }
@@ -187,7 +144,6 @@ final class PixelsCapture implements AutoCloseable {
                 } else if (event instanceof Ack ack) {
                     if (outstanding == null || ack.barrier() != outstanding.id()) throw new IOException("Unexpected tracer barrier");
                     trace.covered(outstanding.commits());
-                    markers.addAll(trace.markers());
                     var waiters = outstanding.waiters();
                     outstanding = null;
                     waiters.forEach(waiter -> waiter.complete(null));
@@ -251,7 +207,7 @@ final class PixelsCapture implements AutoCloseable {
         closing = true;
         projector.interrupt();
         IOException first = null;
-        for (var closeable : new java.io.Closeable[] {tracer, sink, traceListener, reportListener}) {
+        for (var closeable : new java.io.Closeable[] {tracer, traceListener}) {
             try {
                 if (closeable != null) closeable.close();
             } catch (IOException error) {

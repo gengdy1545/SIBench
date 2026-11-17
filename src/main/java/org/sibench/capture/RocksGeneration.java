@@ -33,7 +33,7 @@ final class RocksGeneration {
                     var binding=new RocksYcsb(rows,trace::baseline,fields);RocksYcsb.install(binding);
                     try {
                         load=stage(plan,input,binding,"load",expected,out.resolve("load"),new RequestBudget(0,input.timeout()));
-                        Generation.requireRows(input.baselineRows(),Map.of(string(n,"table"),rows.baselineRows()));
+                        Generation.requireRows(input.baselineRows(),Map.of("usertable",rows.baselineRows()));
                         rows.finishLoad();trace.finishBaseline(expected);
                     }finally{RocksYcsb.install(null);}
                 }
@@ -42,7 +42,7 @@ final class RocksGeneration {
             timings.put("initial_load_and_export_seconds",seconds(loadStarted));
             var reports=new ArrayList<Map<String,Object>>();String initialIdentity=null;
             var catalog=new LinkedHashMap<String,Object>();
-            for(String name:Generation.workloads(input)) {
+            for(String name:workloads(input)) {
                 var document=new LinkedHashMap<>(input.document());var nativeConfig=new LinkedHashMap<>(n);
                 nativeConfig.put("workloads",Map.of(name,object(object(n,"workloads"),name)));document.put("native",nativeConfig);
                 Path destination=out.resolve(name);
@@ -70,7 +70,7 @@ final class RocksGeneration {
             RocksDbRows.Settings settings,Path initial,RocksTrace.Baseline baseline,Map<String,Object> load,String expectedIdentity) throws Exception {
         long started=System.nanoTime();Path out=input.output();Files.createDirectory(out);
         var build=plan.engines().get(org.sibench.config.Engine.ROCKSDB);var n=input.nativeConfig();
-        var timings=new LinkedHashMap<String,Double>();var stages=new LinkedHashMap<String,Object>();
+        var timings=new LinkedHashMap<String,Double>();java.util.List<Map<String,Object>> batches=null;
         json(out.resolve("effective-config.json"),Generation.effectiveConfig(plan,input));
         json(out.resolve("engine-build.json"),build.identity());json(out.resolve("client-build.json"),input.buildIdentity());
         var budget=new RequestBudget(Generation.requestTarget(input.document()),input.timeout());
@@ -84,23 +84,23 @@ final class RocksGeneration {
                 var binding=new RocksYcsb(rows,trace::baseline,Math.toIntExact(positive(n,"fieldcount")));binding.budget(budget);
                 RocksYcsb.install(binding);
                 try {
-                    budget.begin(name,1,null);
+                    budget.begin(null);
                     long workloadStarted=System.nanoTime(),records=baseline.rows();
-                    var batches=new ArrayList<Map<String,Object>>();Path work=Files.createDirectory(out.resolve("workload"));
+                    batches=new ArrayList<Map<String,Object>>();Path work=Files.createDirectory(out.resolve("workload"));
                     do {
                         budget.checkTime();long before=budget.count();RocksDbTimestamps.releaseMemory();
                         var result=stage(plan,input,binding,name,records,work.resolve("batch-"+batches.size()),budget);
                         batches.add(result);records+=((Number)result.get("inserted")).longValue();
                         if(budget.enabled())budget.requireProgress(before);
                     }while(budget.enabled()&&!budget.reached());
-                    budget.end();stages.put(name,batches);json(out.resolve("request-budget.json"),budget.finish());
+                    budget.end();json(out.resolve("request-budget.json"),budget.finish());
                     timings.put("workload_and_export_seconds",seconds(workloadStarted));
                 }finally{RocksYcsb.install(null);}
                 closeStarted=System.nanoTime();
             }
             trace.close();timings.put("native_close_seconds",seconds(closeStarted));
             var evidence=Map.<String,Object>of("engine",build.identity(),"settings",build.settings(),"client",input.buildIdentity(),
-                    "stages",stages,"request_budget",budget.finish(),"baseline_rows",input.baselineRows(),
+                    "batches",batches,"request_budget",budget.finish(),"baseline_rows",input.baselineRows(),
                     "initial_state",Map.of("physical_sha256",identity,"baseline_trace_sha256",baseline.identity(),
                             "seed",integer(n,"seed"),"load",load,"cache_condition","Fresh RocksDB block cache; OS page cache is not flushed"),
                     "effective_config_sha256",Digests.sha256(out.resolve("effective-config.json")));
@@ -109,6 +109,10 @@ final class RocksGeneration {
             json(out.resolve("result.json"),Map.of("status","complete","trace",input.selection().directory().toString(),"timings",timings));
             return manifest;
         }catch(Exception|Error failure){diagnostic(out,failure);throw failure;}
+    }
+    /** YCSB workloads share one initial load and each publishes its own Trace; other benchmarks run one workload per source run. */
+    static List<String> workloads(Generation.Input input) {
+        return List.copyOf(object(input.nativeConfig(),"workloads").keySet());
     }
     private static void diagnostic(Path output,Throwable failure) {
         var stack=new java.io.StringWriter();failure.printStackTrace(new java.io.PrintWriter(stack));
@@ -121,11 +125,12 @@ final class RocksGeneration {
         boolean load = name.equals("load"); var n = input.nativeConfig();
         Files.createDirectory(stage);
         var properties = new LinkedHashMap<String, Object>();
-        for (String key : List.of("table", "fieldcount", "fieldlength", "fieldlengthdistribution", "insertorder", "zeropadding", "insertstart"))
+        properties.put("table", "usertable");
+        for (String key : List.of("fieldcount", "fieldlength", "fieldlengthdistribution", "insertorder", "zeropadding", "insertstart"))
             properties.put(key, n.get(key));
         properties.put("sibench.seed",integer(n,"seed"));
         properties.put("recordcount", records); properties.put("sibench.baseline", load);
-        long wanted = load ? positive(n, "insertcount") : positive(object(object(n, "workloads"), name), "operationcount");
+        long wanted = load ? records : positive(object(object(n, "workloads"), name), "operationcount");
         properties.put(load ? "insertcount" : "operationcount", wanted);
         properties.put("exportfile", stage.resolve("measurements.txt"));
         properties.put("maxexecutiontime", input.timeout().toSeconds());

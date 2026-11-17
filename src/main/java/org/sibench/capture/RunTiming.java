@@ -70,8 +70,7 @@ public final class RunTiming implements AutoCloseable {
     private final Map<String, Object> notes = new LinkedHashMap<>();
     private final Map<Path, Long> measured = new LinkedHashMap<>();
     private final Map<Path, Long> peaks = new LinkedHashMap<>();
-    private final long diskIntervalMillis =
-            Long.getLong("sibench.timing.disk_interval_ms", 5_000L);
+    private static final long DISK_INTERVAL_MILLIS = 5_000L;
     private Thread sampler;
     private String phase;
     private long startedNanos, events;
@@ -96,7 +95,7 @@ public final class RunTiming implements AutoCloseable {
 
     /**
      * Measures an output directory until this timing artifact closes. The first call starts a
-     * daemon sampler; the interval is {@code sibench.timing.disk_interval_ms} (5 s by default).
+     * daemon sampler that samples every five seconds.
      */
     public synchronized RunTiming measure(Path directory) {
         if (path == null || directory == null) return this;
@@ -108,7 +107,7 @@ public final class RunTiming implements AutoCloseable {
                             () -> {
                                 while (!Thread.currentThread().isInterrupted()) {
                                     try {
-                                        Thread.sleep(diskIntervalMillis);
+                                        Thread.sleep(DISK_INTERVAL_MILLIS);
                                     } catch (InterruptedException stopped) {
                                         Thread.currentThread().interrupt();
                                         return;

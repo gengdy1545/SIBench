@@ -29,7 +29,9 @@ static void CheckSnapshots(idx_t threshold, bool adopted) {
 	Connection reader(database), writer(database);
 	Query(writer, "SET index_scan_percentage=0");
 	Query(writer, "SET index_scan_max_count=" + to_string(threshold));
-	Query(writer, "CREATE TABLE items AS SELECT i % 100 AS id FROM range(10000) t(i)");
+	// Logged ART rows are identified by their single-column primary key.
+	Query(writer, "CREATE TABLE items(pk INTEGER PRIMARY KEY, id INTEGER)");
+	Query(writer, "INSERT INTO items SELECT i, i % 100 FROM range(10000) t(i)");
 	Query(writer, "CREATE INDEX items_id ON items(id)");
 	Query(writer, "CALL enable_logging(['SibenchIndex','SibenchIndexRows'])");
 	Query(reader, "BEGIN");
@@ -58,7 +60,7 @@ static void CheckSnapshots(idx_t threshold, bool adopted) {
 	        "old and new accesses must retain their actual snapshot starts");
 	Require(logs->GetValue(4, 0) != logs->GetValue(4, 1), "accesses must retain their connection context");
 	auto fetched = Query(writer,
-	                     "SELECT connection_id, sum(len(physical_rows)) AS visible "
+	                     "SELECT connection_id, sum(len(primary_keys_sql)) AS visible "
 	                     "FROM duckdb_logs_parsed('SibenchIndexRows') GROUP BY connection_id ORDER BY connection_id");
 	if (adopted) {
 		Require(fetched->RowCount() == 2, "both adopted accesses must retain fetched row facts");

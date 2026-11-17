@@ -30,8 +30,6 @@ public class ScaleInspectorTest {
         for (String profile : ScaleInspector.DEFAULT_PROFILES) {
             var report = ScaleInspector.inspect(ROOT, Path.of(profile));
             assertEquals(87_060_000L, report.get("baseline_rows"));
-            assertEquals("native", report.get("generation_mode"));
-            assertFalse((Boolean) report.get("generation_verified"));
         }
     }
 
@@ -92,9 +90,9 @@ public class ScaleInspectorTest {
     }
 
     @Test
-    public void rejectsSourcePinChanges() throws Exception {
-        String source = ycsb();
-        String commit = string(object(parse(source), "source"), "commit");
-        assertThrows(IllegalArgumentException.class, () -> inspect(source.replace(commit, "0".repeat(40))));
+    public void reportsTheSourceGitlinkAndRejectsUnpinnedSources() throws Exception {
+        var gitlink = new ProcessBuilder("git", "-C", ROOT.toString(), "rev-parse", ":benchmark/YCSB").start();
+        assertEquals(new String(gitlink.getInputStream().readAllBytes()).strip(), inspect(ycsb()).get("source_commit"));
+        assertThrows(Exception.class, () -> inspect(ycsb().replace("path: benchmark/YCSB", "path: benchmark")));
     }
 }

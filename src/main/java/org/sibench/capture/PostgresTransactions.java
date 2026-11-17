@@ -260,6 +260,37 @@ final class PostgresTransactions implements AutoCloseable {
         notifyAll();
     }
 
+    /**
+     * Native executor nesting, shared by the receiver and the projection: ExecutorEnd ends the
+     * innermost executor, a subtransaction abort frees the executors it started without their
+     * ExecutorEnd, and a transaction abort ends them all.
+     */
+    static final class ExecutorStack<T> {
+        private final ArrayDeque<T> active = new ArrayDeque<>();
+        private final ArrayDeque<Integer> subtransactions = new ArrayDeque<>();
+
+        void accept(String type, java.util.function.Supplier<T> started) throws IOException {
+            switch (type) {
+                case "executor_start" -> active.push(started.get());
+                case "executor_end" -> {
+                    if (active.isEmpty()) throw new IOException("PG executor completion has no beginning");
+                    active.pop();
+                }
+                case "subtransaction_begin" -> subtransactions.push(active.size());
+                case "subtransaction_commit", "subtransaction_abort" -> {
+                    if (subtransactions.isEmpty()) throw new IOException("PG subtransaction end has no beginning");
+                    int depth = subtransactions.pop();
+                    if (type.equals("subtransaction_abort")) while (active.size() > depth) active.pop();
+                }
+                case "transaction_abort" -> { active.clear(); subtransactions.clear(); }
+                default -> {}
+            }
+        }
+
+        /** The innermost active executor, or null. */
+        T current() { return active.peek(); }
+    }
+
     private void check() throws IOException {
         if (failure != null) throw new IOException("Direct capture failed", failure);
     }
@@ -272,7 +303,7 @@ final class PostgresTransactions implements AutoCloseable {
         boolean writer, committed;
         private final NavigableMap<Long,Long> completedRequests = new TreeMap<>();
         private final Map<Long,Subtransaction> subtransactions = new LinkedHashMap<>();
-        private final ArrayDeque<Execution> executions = new ArrayDeque<>();
+        private final ExecutorStack<Execution> executions = new ExecutorStack<>();
         private final Set<Long> completedExecutions = new HashSet<>();
         private final Map<Long,Long> lastCompletedAccess = new HashMap<>();
         private long currentSubtransaction = 1;
@@ -286,7 +317,6 @@ final class PostgresTransactions implements AutoCloseable {
 
         private final class Subtransaction {
             final long parent;
-            final int executorDepth = executions.size();
             boolean ended;
             long rollback = Long.MAX_VALUE;
             Subtransaction(long parent) { this.parent = parent; }
@@ -299,18 +329,16 @@ final class PostgresTransactions implements AutoCloseable {
         }
 
         private void execution(JsonObject event, String type) throws IOException {
-            if (type.equals("executor_start")) executions.push(new Execution(event));
-            else if (type.equals("scan_rescan") && !executions.isEmpty()) executions.peek().accessed=true;
+            var executor=executions.current();
+            if (type.equals("scan_rescan") && executor!=null) executor.accessed=true;
             else if (type.equals("executor_end") || type.equals("executor_run_end") && event.get("read_complete").getAsBoolean()) {
-                if (executions.isEmpty()) throw new IOException("PG executor completion has no beginning");
-                var executor=executions.peek();
+                if (executor==null) throw new IOException("PG executor completion has no beginning");
                 completedExecutions.add(executor.start);
                 if (completedExecutions.size()>ProtoTrace.MAX_TRANSACTION_OPERATIONS)
                     throw new IOException("PG executor completion history exceeds the operation limit");
                 if (executor.accessed) lastCompletedAccess.merge(executor.request,event.get("sequence").getAsLong(),Math::max);
-                if (type.equals("executor_end")) executions.pop();
             }
-            if (type.equals("transaction_abort")) executions.clear();
+            executions.accept(type, () -> new Execution(event));
         }
 
         boolean executionCompleted(long start) { return completedExecutions.contains(start); }
@@ -339,8 +367,6 @@ final class PostgresTransactions implements AutoCloseable {
                     throw new IOException("Invalid PG subtransaction outcome");
                 sub.ended = true;
                 if (type.equals("subtransaction_abort")) sub.rollback = event.get("sequence").getAsLong();
-                if (type.equals("subtransaction_abort"))
-                    while (executions.size()>sub.executorDepth) executions.pop();
                 currentSubtransaction = sub.parent;
             }
             if ((type.equals("transaction_commit") || type.equals("transaction_abort")) && currentSubtransaction != 1)

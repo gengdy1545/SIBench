@@ -14,7 +14,7 @@ import org.junit.Rule;
 import org.junit.rules.TemporaryFolder;
 import org.junit.rules.Timeout;
 
-/** Bounded native host lifecycle shared by explicit integration checks. */
+/** Bounded native host lifecycle shared by DuckDB tests and explicit integration checks. */
 public abstract class DuckDbHostFixture {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
     @Rule public Timeout timeout = Timeout.seconds(30);
@@ -45,4 +45,20 @@ public abstract class DuckDbHostFixture {
     }
 
     protected Connection connect() throws SQLException { return DuckDbHostDriver.open(socket); }
+
+    private int catalogs;
+
+    /** A session whose persistent fixture objects live in its own in-memory catalog of the shared host. */
+    protected Connection isolated() throws SQLException {
+        var connection = connect();
+        try (var statement = connection.createStatement()) {
+            String name = "fixture_" + ++catalogs;
+            statement.execute("ATTACH ':memory:' AS " + name);
+            statement.execute("USE " + name);
+            return connection;
+        } catch (SQLException failure) {
+            connection.close();
+            throw failure;
+        }
+    }
 }

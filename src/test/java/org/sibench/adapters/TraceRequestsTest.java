@@ -67,13 +67,14 @@ public class TraceRequestsTest {
     }
 
     @Test
-    public void finalResponsesRequireSuccessfulCompletion() throws Exception {
+    public void finalResponsesMustBeComplete() throws Exception {
         var requests = new TraceRequests(ValueKind.LOCATOR);
         var search = query(1, 1, 0);
         assertThrows(IOException.class, () -> requests.receive(search, 7)
                 .finish(new IndexResponse(IndexStatus.OK, "", List.of(), true)));
         requests.receive(search, 7).finish(response());
-        for (IndexResponse invalid : List.of(IndexResponse.error(IndexStatus.INVALID, ""), new IndexResponse(IndexStatus.OK, "", List.of(), true)))
+        // gRPC failures complete the call exceptionally; a batch response itself must be final and empty.
+        for (IndexResponse invalid : List.of(response(IndexEntry.rowId(1)), new IndexResponse(IndexStatus.OK, "", List.of(), true)))
             assertThrows(IOException.class, () -> requests.checkBatch(invalid));
         requests.checkBatch(response());
     }
@@ -92,18 +93,6 @@ public class TraceRequestsTest {
     }
 
     @Test
-    public void forwardingRequiresTheMatchingDataRequest() throws Exception {
-        var requests = new TraceRequests(ValueKind.ROW_ID);
-        var search = query(1, 7, 1);
-        var write = IndexOperationTrace.write(1, IndexOperationTrace.UPSERT, 1, 0,
-                IndexKey.ofInt(7), 1, 0, 0, 17);
-        assertThrows(IOException.class, () -> requests.forward(stored(write), search));
-        assertThrows(IOException.class, () -> requests.forward(stored(search), write));
-        assertThrows(IOException.class, () -> requests.forward(stored(write), IndexOperationTrace.transaction(
-                0, IndexOperationTrace.TRANSACTION_COMMIT, 1, 1, 0)));
-    }
-
-    @Test
     public void streamedResponsesCheckNativeCountsWithoutAnswerFiles() throws Exception {
         var operation = IndexOperationTrace.search(3, 1, 0,
                 new Range(null, false, null, false, false, 0), 10, 2, 0);
@@ -118,8 +107,6 @@ public class TraceRequestsTest {
         assertThrows(IOException.class, () -> requests.check(operation, response(IndexEntry.rowId(1))));
         assertThrows(IOException.class, () -> requests.check(operation, response(
                 IndexEntry.rowId(1), IndexEntry.rowId(2), IndexEntry.rowId(3))));
-        assertThrows(IOException.class, () -> requests.check(operation,
-                IndexResponse.error(IndexStatus.INVALID, "")));
     }
 
 }

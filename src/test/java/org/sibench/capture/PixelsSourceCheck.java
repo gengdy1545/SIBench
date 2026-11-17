@@ -32,7 +32,7 @@ public class PixelsSourceCheck {
             String indexes = "SELECT array_agg(indexdef ORDER BY tablename,indexname)::text FROM pg_indexes "
                     + "WHERE schemaname='public' AND tablename<>'sibench_marker'";
             String originalIndexes = value(connection, indexes);
-            PixelsGeneration.prepareSource(connection, source);
+            CdcPreparation.prepareSource(connection, source);
             assertEquals(originalIndexes, value(connection, indexes));
             for (var table : source.tables()) {
                 String key = table.indexes().stream().filter(SourceSchema.Index::primary).findFirst().orElseThrow().column();

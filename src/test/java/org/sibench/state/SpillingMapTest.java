@@ -62,9 +62,8 @@ public class SpillingMapTest {
                             (long) expected.getOrDefault(k, SpillingMap.ABSENT),
                             map.get(key(k)));
                 if (memory < 100) {
-                    assertTrue(map.flushes() > 0);
-                    assertTrue(map.merges() > 0);
-                    // Logarithmic merging keeps the run count small however long the stream is.
+                    // Over a hundred flushes spill here; logarithmic merging keeps the run count small.
+                    assertTrue(map.runCount() > 0);
                     assertTrue("runs " + map.runCount(), map.runCount() <= 3 * 8);
                 }
                 if (memory == 100_000) assertEquals(0, map.runCount());
@@ -139,7 +138,8 @@ public class SpillingMapTest {
             // Merges never fold the pinned run in.
             for (long k = 0; k < 500; k++) map.put(key(30_000 + k), k);
             assertEquals(5_000, map.get(key(9_998)));
-            assertTrue(map.merges() > 0);
+            // Fifty flushes leave the pinned run plus a logarithmic number of merged runs.
+            assertTrue("runs " + map.runCount(), map.runCount() <= 8);
             assertThrows(IllegalStateException.class, map::bulk);
         }
     }
@@ -329,7 +329,8 @@ public class SpillingMapTest {
                 map.putBytes(key(i), value);
                 expected.put(i, value);
             }
-            assertTrue(map.merges() > 0);
+            // Sixty-six flushes would leave as many runs without merges.
+            assertTrue("runs " + map.runCount(), map.runCount() > 0 && map.runCount() <= 8);
             for (var entry : expected.entrySet())
                 assertArrayEquals(entry.getValue(), map.getBytes(key(entry.getKey())));
             assertNull(map.getBytes(key(5_000)));

@@ -155,27 +155,11 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
     }
 
     /**
-     * A group is one source access: its members arrive consecutively with one source event, read
-     * point and count, and the group is sent whole or, when a member's index is filtered, not at
-     * all, so a filtered secondary never leaves a partial intersection behind.
+     * A group is one source access, decoded whole from one Trace record (ProtoTrace rejects
+     * members of different tables or read points). It is sent whole or, when a member's index is
+     * filtered, not at all, so a filtered secondary never leaves a partial intersection behind.
      */
     private void groupMember(Operation o) throws IOException {
-        if (o.expansionPosition() != searchGroup.size())
-            throw new IOException("Search group member out of order");
-        if (!searchGroup.isEmpty()) {
-            Operation first = searchGroup.get(0);
-            if (o.sourceEvent() != first.sourceEvent()
-                    || o.table() != first.table()
-                    || o.workUnitId() != first.workUnitId()
-                    || o.readTimestamp() != first.readTimestamp()
-                    || o.version() != first.version()
-                    || o.expectedCount() != first.expectedCount()
-                    || o.expansionSize() != first.expansionSize()
-                    || o.transactionId() != first.transactionId()
-                    || o.mutationOrdinal() != first.mutationOrdinal()
-                    || (o.flags() & GROUP_SHARED) != (first.flags() & GROUP_SHARED))
-                throw new IOException("Inconsistent search group member");
-        }
         searchGroup.add(o);
         peakSearchGroup = Math.max(peakSearchGroup, searchGroup.size());
         if (searchGroup.size() < o.expansionSize()) return;
@@ -187,11 +171,6 @@ public final class ReplayProjection implements IndexOperationTrace.Consumer, Aut
         }
         searchGroup.clear();
     }
-
-    private static final int GROUP_SHARED =
-            IndexOperationTrace.INTERSECT_GROUP
-                    | IndexOperationTrace.UNION_GROUP
-                    | IndexOperationTrace.SNAPSHOT_SEARCH;
 
     private void validateSearch(Operation o) throws IOException {
         if (o.readTimestamp() < 0 || o.version() != 0

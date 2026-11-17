@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 
 import org.sibench.schema.SourceSchema;
+import org.sibench.trace.IndexEntry;
 import org.sibench.trace.IndexKey;
 
 import java.io.IOException;
@@ -23,10 +24,6 @@ public final class IndexCatalog {
             } catch (IOException error) {
                 throw new IOException("Invalid indexed value for " + name + ": " + value, error);
             }
-        }
-
-        public boolean textual() {
-            return !type.equals("int") && !type.equals("timestamp");
         }
 
         public Map<String, Object> describe() {
@@ -132,11 +129,6 @@ public final class IndexCatalog {
         return provenance(schema, definitions);
     }
 
-    /** DuckDB CHAR is a VARCHAR alias, including its significant trailing spaces. */
-    public static List<Definition> duckDbDefinitions(SourceSchema schema) throws IOException {
-        return fromSchema(schema).definitions();
-    }
-
     public static Map<String, Object> provenance(SourceSchema schema, List<Definition> definitions) {
         var result = new LinkedHashMap<String, Object>();
         result.put("benchmark", schema.benchmark());
@@ -179,7 +171,7 @@ public final class IndexCatalog {
                 int index = d.get("index_id").getAsBigDecimal().intValueExact();
                 String name = d.get("name").getAsString(), tableName = d.get("table").getAsString();
                 String column = d.get("column").getAsString(), type = d.get("type").getAsString();
-                if (table < 1 || table > 65535 || index < 0 || index > 65535 || tableName.isBlank()
+                if (!IndexEntry.validNamespace(table, index) || tableName.isBlank()
                         || name.isBlank() || column.isBlank() || !names.add(name)
                         || !Set.of("int", "timestamp", "varchar", "text").contains(type))
                     throw new IOException("Invalid source index definition");

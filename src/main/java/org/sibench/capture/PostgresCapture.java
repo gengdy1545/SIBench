@@ -16,7 +16,6 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -45,7 +44,6 @@ final class PostgresCapture implements AutoCloseable {
         final CompletableFuture<Void> ended=new CompletableFuture<>();
         final PostgresCounts counts=new PostgresCounts();
         long completedSequence,completedCsn,acknowledgedSequence,acknowledgedConsumed,events,bytes;
-        String sha256;
         Session(int pid){this.pid=pid;}
     }
 
@@ -75,31 +73,29 @@ final class PostgresCapture implements AutoCloseable {
         Session session=null;
         try(socket;var input=new BufferedReader(new InputStreamReader(PostgresFacts.bounded(Channels.newInputStream(socket)),StandardCharsets.UTF_8),1<<16)) {
             String name=input.readLine();
-            if(name==null||!name.matches("pg-[0-9]+\\.jsonl\\.zst"))throw new IOException("Invalid PG source stream name");
+            if(name==null||!name.matches("pg-[0-9]+\\.jsonl"))throw new IOException("Invalid PG source stream name");
             int pid=Integer.parseInt(name.substring(3,name.indexOf('.')));
             session=new Session(pid);
             synchronized(this) {
                 if(sessions.putIfAbsent(pid,session)!=null)throw new IOException("Repeated PG source process");
             }
             var stream=new PostgresFacts.Stream(name);
-            var digest=org.sibench.config.Digests.digest();
             PostgresTransactions.Chunk chunk=null;
             for(String line;(line=input.readLine())!=null;) {
                 var event=PostgresFacts.parse(line);stream.accept(event);session.counts.accept(event);
-                byte[] encoded=(line+"\n").getBytes(StandardCharsets.UTF_8);digest.update(encoded);
-                session.events++;session.bytes=Math.addExact(session.bytes,encoded.length);
+                int encoded=(line+"\n").getBytes(StandardCharsets.UTF_8).length;
+                session.events++;session.bytes=Math.addExact(session.bytes,encoded);
                 String type=event.get("event").getAsString();
                 if(type.equals("capture_end")) {
                     if(chunk!=null)throw new IOException("PG source ended inside a transaction");
                     stream.finish();transactions.endStream(pid);
-                    session.sha256=HexFormat.of().formatHex(digest.digest());
                     // The backend may leave pg_stat_activity as soon as it reads the ACK; publish completion first.
                     session.ended.complete(null);
                     var ack=ByteBuffer.wrap(new byte[]{'E'});while(ack.hasRemaining())socket.write(ack);
                     return;
                 }
                 if(chunk==null)chunk=transactions.begin(pid);
-                chunk.append(line,event,encoded.length);
+                chunk.append(line,event,encoded);
                 if(type.equals("transaction_commit")||type.equals("transaction_abort")) {
                     long sequence=event.get("capture_sequence").getAsLong(),csn=event.get("csn").getAsLong();
                     synchronized(session) {
@@ -203,7 +199,7 @@ final class PostgresCapture implements AutoCloseable {
         for(var session:sessions.values()) {
             if(!session.ended.isDone())throw new IOException("PG source has not closed: "+session.pid);
             reports.add(Map.of("process",session.pid,"events",session.events,
-                    "bytes",session.bytes,"sha256",session.sha256,"counts",session.counts.report()));
+                    "bytes",session.bytes,"counts",session.counts.report()));
         }
         return reports;
     }

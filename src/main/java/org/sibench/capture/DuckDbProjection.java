@@ -14,11 +14,16 @@ import org.sibench.trace.IndexKey;
 public final class DuckDbProjection {
     private DuckDbProjection() {}
 
+    /** Receives projected operations; a known Abort is announced before its transaction begins. */
+    public interface Output extends IndexOperationTrace.Consumer {
+        default void expectAbort() throws IOException {}
+    }
+
     /**
      * Access and mutation binding must have completed. The consumer must not query this connection.
      * Mutation binding has checked every indexed column; only exported secondary keys are parsed.
      */
-    public static long write(Connection database,boolean secondaryIndexes,IndexOperationTrace.Consumer consumer) throws SQLException,IOException {
+    public static long write(Connection database,boolean secondaryIndexes,Output consumer) throws SQLException,IOException {
         if(!database.getAutoCommit())throw new SQLException("Capture projection requires an idle connection");
         database.setAutoCommit(false);
         long[] count={0};IndexOperationTrace.Consumer output=operation->{consumer.accept(operation);count[0]++;};
@@ -44,10 +49,6 @@ public final class DuckDbProjection {
                     +"JOIN temp.main.sibench_accesses a ON u.tag='search' AND u.identity=a.access_id,"
                     +"unnest(a.probes) WITH ORDINALITY AS p(probe,ordinality),"
                     +"unnest(p.probe.predicates) WITH ORDINALITY AS d(predicate,ordinality)");
-            try(var query=database.createStatement();var rows=query.executeQuery(
-                    "SELECT 1 FROM temp.main.sibench_work_units u ANTI JOIN temp.main.sibench_unit_details d USING(unit_id) LIMIT 1")) {
-                if(rows.next())throw new SQLException("Missing native operation details");
-            }
             long transaction=0,version=0,writes=0;String outcome=null;Unit unit=null;
             try(var query=database.createStatement();var rows=query.executeQuery(
                     "SELECT t.version AS resolved_version,t.transaction_id AS resolved_transaction,t.outcome,u.*,"
@@ -61,6 +62,7 @@ public final class DuckDbProjection {
                     if(nextVersion!=version) {
                         if(transaction!=0)finish(output,transaction,version,writes,outcome);
                         version=nextVersion;transaction=version;outcome=rows.getString("outcome");writes=0;
+                        if(outcome.equals("rollback"))consumer.expectAbort();
                         output.accept(IndexOperationTrace.transaction(0,IndexOperationTrace.TRANSACTION_BEGIN,transaction,version,0));
                     }
                     if(nextUnit==0)continue;
@@ -108,7 +110,7 @@ public final class DuckDbProjection {
                 int kind=action.equals("delete")?IndexOperationTrace.LOGICAL_DELETE:IndexOperationTrace.UPSERT;
                 int flags=action.equals("insert")?IndexOperationTrace.BUSINESS_INSERT:action.equals("update")?IndexOperationTrace.BUSINESS_UPDATE:0;
                 var primary=IndexOperationTrace.write(source,kind,table,flags,key,version,0,0,rowId)
-                        .withTransaction(transaction,position).withWorkUnitId(id);
+                        .withTransaction(transaction,position);
                 IndexMutation.emit(primary,before,after,output);
             } else {
                 flushProbe();var ranges=DuckDbPredicates.ranges(family,probes);
@@ -116,7 +118,7 @@ public final class DuckDbProjection {
                 if(ranges.size()>1)flags|=IndexOperationTrace.UNION_GROUP;
                 for(int i=0;i<ranges.size();i++) {
                     output.accept(IndexOperationTrace.search(source,table,index,ranges.get(i),null,readVersion,expected,flags,
-                            ranges.size()>1?i:0,ranges.size()>1?ranges.size():0).withTransaction(transaction,position).withWorkUnitId(id));
+                            ranges.size()>1?i:0,ranges.size()>1?ranges.size():0).withTransaction(transaction,position));
                 }
             }
         }

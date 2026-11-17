@@ -148,10 +148,6 @@ public final class ReplayDispatcher implements AutoCloseable {
     private volatile boolean closed;
     private Thread owner;
 
-    public ReplayDispatcher(ReplayConfig config, ReplayTarget.Factory factory) {
-        this(config, factory, 0);
-    }
-
     /** {@code warmup}: basic operations before the measured window, 0 to measure from the start. */
     public ReplayDispatcher(ReplayConfig config, ReplayTarget.Factory factory, long warmup) {
         this.config = config;
@@ -174,12 +170,9 @@ public final class ReplayDispatcher implements AutoCloseable {
 
     public int route(Operation operation) throws IOException {
         long id = operation.workUnitId();
-        if (id < 0 || id == 0 && config.clientCount() > 1)
-            throw new IOException(
-                    "Multi-client replay requires source work-unit identities; recompile the"
-                            + " capture");
-        if (id > Integer.MAX_VALUE)
-            throw new IOException("Source work-unit identity exceeds the driver index range");
+        // ReplayInput binds every workload operation to a catalogued work unit (>= 1) before replay.
+        if (id < 0 || id > Integer.MAX_VALUE)
+            throw new IOException("Source work-unit identity outside the driver index range");
         return id == 0 ? 0 : (int) ((id - 1) % config.clientCount());
     }
 
@@ -220,10 +213,6 @@ public final class ReplayDispatcher implements AutoCloseable {
         pending.failed = true;
         if (timeout) timedOutOperations += pending.members;
         else failedOperations += pending.members;
-    }
-
-    public void send(Operation operation) throws IOException {
-        send(operation, null);
     }
 
     public void send(Operation operation, TraceOperation stored) throws IOException {
@@ -362,8 +351,7 @@ public final class ReplayDispatcher implements AutoCloseable {
             localSend = handle.sent().toCompletableFuture();
             CompletableFuture<Void> response = handle.response().toCompletableFuture();
             int latencyKind = operation.kind() == IndexOperationTrace.SEARCH ? 1 : 0;
-            boolean baseline = operation.kind() == IndexOperationTrace.INSERT
-                    && operation.version() == 0 && operation.transactionId() == 0;
+            boolean baseline = IndexOperationTrace.isBaselineInsert(operation);
             Pending added = null;
             synchronized (inFlight) {
                 Pending shared = baseline ? baselineResponses.get(response) : null;
@@ -444,29 +432,8 @@ public final class ReplayDispatcher implements AutoCloseable {
                 workUnitCount++;
                 clientCounts[3]++;
             }
-            orderChecksum =
-                    Long.rotateLeft(orderChecksum, 7)
-                            ^ operation.sourceEvent()
-                            ^ Long.rotateLeft(word(operation.key()), 13)
-                            ^ operation.kind()
-                            ^ ((long) operation.table() << 48)
-                            ^ ((long) operation.index() << 40)
-                            ^ Long.rotateLeft(operation.version(), 19)
-                            ^ Long.rotateLeft(operation.readTimestamp(), 23)
-                            ^ Long.rotateLeft(operation.mutationOrdinal(), 29)
-                            ^ Long.rotateLeft(operation.workUnitId(), 31)
-                            ^ Long.rotateLeft(operation.file(), 37)
-                            ^ Long.rotateLeft(operation.position(), 41)
-                            ^ Long.rotateLeft(operation.rowId(), 43)
-                            ^ Long.rotateLeft(word(operation.indexedValue()), 47)
-                            // Objects.hash(lower, upper, limit) as it was defined.
-                            ^ Long.rotateLeft(
-                                    31 * (31 * (31 + word(operation.lower())) + word(operation.upper()))
-                                            + Long.hashCode(operation.limit()),
-                                    53)
-                            ^ Long.rotateLeft(operation.expectedCount(), 59)
-                            ^ Long.rotateLeft(operation.transactionId(), 61)
-                            ^ Long.rotateLeft(operation.flags(), 3);
+            // Compared only between configurations of one run.
+            orderChecksum = 31 * orderChecksum + operation.hashCode();
             synchronized (inFlight) {
                 checkFailure();
             }
@@ -653,10 +620,5 @@ public final class ReplayDispatcher implements AutoCloseable {
         report.put("first_send_to_last_completion_seconds", Math.max(0, lastCompletion - firstSend) / 1e9);
         report.put("drain_seconds", drainNanos / 1e9);
         return report;
-    }
-
-    /** A key's word in the order checksum: its checksum word, 0 for none. */
-    private static int word(org.sibench.trace.IndexKey key) {
-        return key == null ? 0 : key.checksumWord();
     }
 }

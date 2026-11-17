@@ -23,11 +23,11 @@ public class ServiceAcceptanceTest {
         Files.writeString(config, new com.google.gson.Gson().toJson(Map.of(
                 "schema_version", 1, "purpose", "sibench",
                 "target", Map.of("secondary_indexes", Map.of("enabled", false), "service", Map.of(
-                        "adapter", "grpc", "endpoint", "127.0.0.1:" + port,
+                        "endpoint", "127.0.0.1:" + port,
                         "value", kind == ValueKind.ROW_ID ? "row_id" : "locator")),
                 "replay", Map.of("dispatch_mode", "operation", "client_count", 1, "max_in_flight", 4,
                         "request_timeout_seconds", 5, "baseline_batch_operations", 2),
-                "benchmarks", Map.of("case", Map.of("config", "unused.yaml", "mode", "capture", "engine", "postgres",
+                "benchmarks", Map.of("case", Map.of("config", "unused.yaml", "engine", "postgres",
                         "trace", Map.of("generate", false, "directory", trace.toString(), "upload", Map.of("enabled", false)))))));
         return config;
     }
@@ -96,7 +96,7 @@ public class ServiceAcceptanceTest {
             @Override public void scan(ScanRequest request, io.grpc.stub.StreamObserver<ScanResponse> out) { out.onCompleted(); }
         }).build().start();
         try {
-            var config = new ServiceConfig("grpc", "127.0.0.1:" + raw.getPort(), null, 0, ValueKind.ROW_ID, null, false, true);
+            var config = new ServiceTarget("127.0.0.1:" + raw.getPort(), ValueKind.ROW_ID);
             assertThrows(IOException.class, () -> new GrpcIndexCheck(config, "test", 5));
         } finally { raw.shutdownNow(); }
     }

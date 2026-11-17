@@ -13,15 +13,11 @@ public final class DuckDbFacts {
     private static final String HEADER = "context_id,scope,connection_id,transaction_id,query_id,thread_id,timestamp,type,log_level,message";
     private static final Map<String, String> TYPES = Map.of(
             "query", "SibenchQuery", "transaction", "SibenchTransaction", "mutation", "SibenchMutation",
-            "index", "SibenchIndex", "index_rows", "SibenchIndexRows", "consumption", "SibenchConsumption");
+            "index", "SibenchIndex", "index_rows", "SibenchIndexRows");
 
     private DuckDbFacts() {}
 
     /** Call after source drain and logging shutdown. No benchmark rows or persistent tables are copied. */
-    public static Map<String, Long> load(Connection database, Path capture) throws IOException, SQLException {
-        return load(database,capture,0);
-    }
-
     public static Map<String, Long> load(Connection database, Path capture, long prefix) throws IOException, SQLException {
         if(prefix<0)throw new IllegalArgumentException("Negative source record prefix");
         if (!database.getAutoCommit()) throw new SQLException("Fact import requires an idle auto-commit connection");

@@ -15,8 +15,7 @@ final class GrpcIndexCheck implements IndexBackend {
     private final String binding;
     private final IndexDescription description;
 
-    GrpcIndexCheck(ServiceConfig config, String binding, long timeoutSeconds) throws IOException {
-        if (!config.adapter().equals("grpc")) throw new IllegalArgumentException("Expected a gRPC endpoint");
+    GrpcIndexCheck(ServiceTarget config, String binding, long timeoutSeconds) throws IOException {
         this.binding = binding;
         remote = new GrpcService(config.endpoint(), new TraceRequests(config.value()), binding, timeoutSeconds);
         try {

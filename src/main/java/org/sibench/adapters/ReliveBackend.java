@@ -75,10 +75,8 @@ public final class ReliveBackend implements IndexBackend {
     @Override public void write(Mutation write) throws IOException { writeBatch(List.of(write)); }
 
     @Override public void writeBatch(List<Mutation> writes) throws IOException {
-        if (writes.isEmpty()) throw new IllegalArgumentException("Empty write batch");
-        // Validate every member before the first HTTP write, including limits of the narrower transport.
+        // Check every member against the narrower transport's limits before the first HTTP write.
         for (var write : writes) {
-            IndexExecution.validateMutation(write);
             key(write.hasPut() ? write.getPut().getKey() : write.getDelete().getKey());
             if (write.hasPut() && write.getPut().getValue().size() > 65_536)
                 throw new IllegalArgumentException("Relive values are limited to 65536 bytes");
@@ -108,7 +106,7 @@ public final class ReliveBackend implements IndexBackend {
     }
 
     @Override public ByteString get(GetRequest get) throws IOException {
-        IndexExecution.validateGet(get); key(get.getKey()); requireBinding();
+        key(get.getKey()); requireBinding();
         if (get.getLocalWritesCount() != 0) {
             var local = get.getLocalWrites(0);
             return local.hasPut() ? local.getPut().getValue() : null;
@@ -120,7 +118,6 @@ public final class ReliveBackend implements IndexBackend {
     }
 
     @Override public void scan(ScanRequest scan, ValueSink sink) throws IOException {
-        IndexExecution.validateScan(scan);
         String start = scan.hasStartKey() ? key(scan.getStartKey()) : null;
         String end = scan.hasEndKey() ? key(scan.getEndKey()) : null;
         requireBinding();
