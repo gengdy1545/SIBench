@@ -13,7 +13,7 @@ TRACES = [{'name': 'hybench-tp', 'label': 'HyBench-TP'},
  {'name': 'ycsb-e', 'label': 'YCSB-E'},
  {'name': 'ycsb-f', 'label': 'YCSB-F'}]
 
-FIGURE_SIZE = (SINGLE_COLUMN_WIDTH, 2.2)
+FIGURE_SIZE = (SINGLE_COLUMN_WIDTH, 2.6)
 OPERATION_ORDER = ("get", "scan", "update", "insert")
 LEGEND_FONT_SIZE = 8
 ANNOTATION_FONT_SIZE = 7
