@@ -319,8 +319,9 @@ public final class ProtoTrace {
         var decoder = new Decoder();
         var logical = org.sibench.config.Digests.digest();
         long count = 0;
+        // Amortize NFS read/attribute checks while retaining bounded, streaming validation.
         try (var input = new DataInputStream(new BufferedInputStream(new DigestInputStream(
-                    Files.newInputStream(file), physical)))) {
+                    Files.newInputStream(file), physical), BLOCK_BYTES))) {
             if (input.readInt() != MAGIC) throw new IOException("Invalid proto Trace header");
             while (true) {
                 int records = input.readInt(), compressed = input.readInt(), length = input.readInt(), checksum = input.readInt();

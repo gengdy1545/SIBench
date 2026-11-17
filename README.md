@@ -72,7 +72,7 @@ For repeated [Pixels experiments](docs/pixels-experiment.md), prepare CSV/CDC in
 
 ## Replay and service
 
-Configure [object-storage connections](config/sibench.yaml) and the selected [backend](config/index/). Supply credentials through the named environment variables; the bucket must exist. Each new index needs a fresh local path and object prefix.
+Configure [object-storage connections](config/sibench.yaml) and the selected [backend](config/index/). Supply credentials through the named environment variables; the bucket must exist. RocksDB-Cloud and SlateDB need a fresh local path and object prefix; Relive requires a fresh CFS directory and object prefix.
 
 Start the service, then replay from another terminal:
 
@@ -87,7 +87,9 @@ java -jar build/sibench/sibench.jar replay-service config/sibench.yaml \
 
 Client and service must agree on value mode and secondary-index selection. The same immutable Trace can be reused across backends and client settings. Replay validates input integrity, response completion and expected result counts; matching counts do not certify values or order. Write acknowledgment guarantees same-instance visibility; durability depends on the backend. See the [Index Service contract](docs/index-service.md).
 
-RocksDB-Cloud and SlateDB are comparison targets. Local RocksDB supports generation and test fixtures; Relive has no replay adapter on this branch. Its independent [service](index/relive/README.md) uses [CFS/COS settings](config/index/relive.json), referencing the same runtime object-storage connections. Supply the actual CFS mount path before starting it; local disk state is rejected.
+Every backend receives the same proto requests at `target.service.endpoint` in the runtime CONFIG. Change that gRPC target for each test deployment; Trace parsing and recorded write/read timestamps stay the same. [Independent acceptance](docs/index-service.md#independent-acceptance) provides common protocol and full-value checks using that configuration.
+
+RocksDB-Cloud and SlateDB are comparison targets. Local RocksDB supports generation and test fixtures. The [Relive bridge](docs/index-service.md#relive-bridge) exposes its independent HTTP service through the same five gRPC operations; integration does not certify cloud deployment or comparison readiness. Relive uses [CFS/COS settings](config/index/relive.json), referencing the same runtime object-storage connections. Supply the actual CFS mount path before starting it; local disk state is rejected.
 
 ## Analysis
 

@@ -33,6 +33,8 @@ Inputs are immutable, including CDC's hard-linked baseline copies. Their manifes
 
 The baseline manifest also binds COS paths, row groups, hidden timestamps and index bucket count. Empty tables retain schema and zero counts without files. `check-pixels-baseline` checks local descriptors; import verifies remote content. Completed CSV/CDC inputs can be relocated without the preparation database. Preserve local capture diagnostics separately when source reproduction is required.
 
+Native LOAD renews its write-transaction lease while encoding files and publishing visibility. Before commit it waits for any in-flight renewal to finish; renewal or visibility failure fails the LOAD and prevents baseline publication. Increasing the experiment timeout does not replace lease renewal.
+
 Each run copies bound files into its own COS prefix, validates digests/footers and row counts, and rebuilds indexes and visibility with fresh physical identities. Target COS endpoint/region/bucket, bucket settings and Pixels source/patch identity must match the baseline. Restore costs are reported separately from application/query costs. The canonical baseline is immutable; repeat experiments by restoring fresh state, not replaying CDC over an updated instance.
 
 Success requires normal service shutdown before result/Trace publication, then removes owned working state and the run's COS prefix. Failure retains diagnostics and owned objects. Cleanup failure leaves any published Trace valid. This workflow reconstructs a baseline; it is not crash recovery.
@@ -123,3 +125,28 @@ External clusters need fixed, distinct, available Pixels ports (1–65535) in th
 Configure every Trino node with the matching source-built connector, Pixels hosts/ports and COS settings/credentials. Remote workers need a reachable `pixels_host: HOST:PORT`; `local` binds Pixels to loopback. SIBench records effective Pixels settings; the operator records external build/resource settings and handles restarts. Restarting Trino clears process caches, not OS/storage caches.
 
 Managed heap, query memory, total query memory, heap headroom and thread count are explicit. Total query memory plus headroom must fit the heap, with room left for Pixels/native/OS memory. Managed startup checks readiness within one minute and a successful Pixels marker scan; cloud-function execution is disabled.
+
+## Bounded integration checks
+
+After both Pixels build phases and the root Maven prerequisites, run the local LOAD and live sink checks explicitly:
+
+```bash
+mkdir -p results/capture
+mvn -Dsibench.pixels.build=build/services/pixels -Dtest=PixelsLoadLeaseCheck test
+mvn -Dsibench.pixels.build=build/services/pixels -Dtest=PixelsCdcCheck test
+```
+
+The lease check holds a four-row FIFO input open for 340 seconds, beyond the coordinator's 300-second lease, and requires a successful commit. The CDC check uses eight baseline rows and source-observed update/delete/reinsert/rollback results, and separately rejects failed visibility publication. Neither check requires COS or Trino.
+
+For a service-free check of renewal completion and rejection, compile and run the test probe against the built Pixels CLI:
+
+```bash
+mkdir -p build/sibench/pixels-probes
+javac --release 17 -cp build/services/pixels/jars/pixels-cli.jar \
+  -d build/sibench/pixels-probes src/test/native/pixels/LoadLeaseProbe.java
+PIXELS_HOME="$PWD/build/services/pixels/home" \
+  java -cp build/sibench/pixels-probes:build/services/pixels/jars/pixels-cli.jar \
+  org.sibench.pixels.LoadLeaseProbe
+```
+
+File replay checks additionally require COS credentials and a unique `sibench.storage.uri`, with connections selected by `sibench.storage.config`. Run `PixelsExperimentCheck#finiteFilesApplyWithoutTraceAndExportOptionalTrace+completePrefixAndStaticModesDoNotConsumeExtraTransactions` with the same Pixels build. They prepare eight-row CSV/CDC and columnar inputs, then check full, prefix, static and Trace-export modes. They do not establish full-scale performance or SQL correctness after updates.

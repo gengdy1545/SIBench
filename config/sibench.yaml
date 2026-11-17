@@ -6,6 +6,7 @@ target:
     enabled: false
   service:
     adapter: grpc
+    # Select the deployed Index Service for this run; all backends use the same gRPC protocol.
     endpoint: 127.0.0.1:50551
     value: row_id
 replay:

@@ -97,4 +97,32 @@ public class ServiceConfigTest {
         assertThrows(IllegalArgumentException.class,
                 () -> ServiceConfig.ofReplay(temporary.getRoot().toPath(), document));
     }
+
+    @Test
+    public void reliveBridgeOwnsNoLocalStorageOrWalPolicy() throws Exception {
+        Path root = temporary.getRoot().toPath(), config = root.resolve("relive.yaml");
+        String base = """
+                schema_version: 1
+                purpose: index_service
+                service:
+                  backend: relive
+                  endpoint: http://127.0.0.1:7001
+                  port: 50551
+                  value: row_id
+                """;
+        Files.writeString(config, base);
+        var selected = ServiceConfig.ofServer(root, config, Map.of());
+        assertEquals("relive", selected.adapter());
+        assertEquals("http://127.0.0.1:7001", selected.endpoint());
+        assertNull(selected.path());
+        assertNull(selected.objects());
+        assertTrue(selected.wal());
+        for (String forbidden : new String[] {"path: local", "storage: cos://bucket/prefix", "wal: false", "reopen: true"}) {
+            Files.writeString(config, base + "  " + forbidden + "\n");
+            assertThrows(IllegalArgumentException.class, () -> ServiceConfig.ofServer(root, config, Map.of()));
+        }
+        var replay = Map.<String, Object>of("target", Map.of("service", Map.of(
+                "adapter", "relive", "endpoint", "http://127.0.0.1:7001", "value", "row_id")));
+        assertThrows(IllegalArgumentException.class, () -> ServiceConfig.ofReplay(root, replay));
+    }
 }

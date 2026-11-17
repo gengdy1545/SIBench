@@ -30,12 +30,13 @@ public final class ServiceReplay {
             Path directory, ReplayConfig config, ServiceConfig service, Path report)
             throws IOException {
         if (Files.exists(report)) throw new IOException("Replay report already exists: " + report);
+        Path baselineReport = report.resolveSibling(report.getFileName() + ".baseline.json");
+        if (Files.exists(baselineReport)) throw new IOException("Baseline report already exists: " + baselineReport);
         // The declared value kinds come from the manifest; check them before decoding the workload.
         org.sibench.trace.TraceManifest.requireValue(directory,service.value());
         var input = ReplayInput.prepare(directory, config);
         var preflight = input.preflight();
-        String mode = service.value() == ValueKind.ROW_ID ? "rowid" : "locator";
-        String binding = ReplayInput.binding(directory, config) + " mode=" + mode;
+        String binding = binding(directory, config, service.value());
         var requests = new TraceRequests(service.value());
         IndexDescription description;
         ReplayTarget.Factory factory;
@@ -99,6 +100,20 @@ public final class ServiceReplay {
                     phaseReport.put("dispatch", projection.describe());
                     result.put(phase, phaseReport);
                 }
+                if (!runtime) {
+                    var completed = new LinkedHashMap<String, Object>();
+                    completed.put("status", "baseline_passed");
+                    completed.put("finished_at_utc", java.time.Instant.now().toString());
+                    completed.put("scope", "complete baseline integrity checks and all write ACKs passed;"
+                            + " workload, maintenance drain and independent stored-value verification are not certified");
+                    completed.put("index_binding", binding);
+                    completed.put("build_sha256", buildIdentity());
+                    completed.put("service", description);
+                    completed.put("preflight", preflight);
+                    completed.put("result", result.get("baseline"));
+                    Files.writeString(baselineReport, new GsonBuilder().setPrettyPrinting().create().toJson(completed),
+                            StandardOpenOption.CREATE_NEW);
+                }
             }
             result.put("service", description);
             result.put("rpc_by_kind", requests.rpcKinds());
@@ -152,8 +167,7 @@ public final class ServiceReplay {
         org.sibench.trace.TraceManifest.requireValue(directory,service.value());
         var input = ReplayInput.prepare(directory, config);
         var preflight = input.preflight();
-        String mode = service.value() == ValueKind.ROW_ID ? "rowid" : "locator";
-        String binding = ReplayInput.binding(directory, config) + " mode=" + mode;
+        String binding = binding(directory, config, service.value());
         var requests = new TraceRequests(service.value());
         IndexDescription description;
         ReplayTarget.Factory factory;
@@ -262,16 +276,22 @@ public final class ServiceReplay {
                         "versions", "0.." + lastVersion,
                         "updates", "committed updates only",
                         "secondary_indexes", config.secondaryIndexes()));
-        Path jar = Path.of(java.net.URI.create(
-                ServiceReplay.class.getProtectionDomain().getCodeSource().getLocation().toString()));
-        manifest.put(
-                "build_sha256",
-                Files.isRegularFile(jar) ? org.sibench.config.Digests.sha256(jar) : "N/A (not a jar)");
+        manifest.put("build_sha256", buildIdentity());
         manifest.put("replay_configuration", config.describe());
         Files.writeString(
                 report.resolveSibling(report.getFileName() + ".index-manifest.json"),
                 new GsonBuilder().setPrettyPrinting().create().toJson(manifest),
                 StandardOpenOption.CREATE_NEW);
+    }
+
+    static String binding(Path directory, ReplayConfig config, ValueKind value) throws IOException {
+        return ReplayInput.binding(directory, config) + " mode=" + (value == ValueKind.ROW_ID ? "rowid" : "locator");
+    }
+
+    private static String buildIdentity() throws IOException {
+        Path jar = Path.of(java.net.URI.create(
+                ServiceReplay.class.getProtectionDomain().getCodeSource().getLocation().toString()));
+        return Files.isRegularFile(jar) ? org.sibench.config.Digests.sha256(jar) : "N/A (not a jar)";
     }
 
 }

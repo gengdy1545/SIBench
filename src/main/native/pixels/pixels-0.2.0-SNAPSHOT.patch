@@ -61,7 +61,7 @@
              List<Long> fileIds = new ArrayList<>();
              for (LoadedInfo loadedInfo : loadedInfos)
              {
-@@ -164,12 +179,60 @@
+@@ -164,12 +179,62 @@
              throw failure;
          } finally
          {
@@ -103,9 +103,11 @@
 +
 +    private static void stopRenewal(ScheduledExecutorService renewal) throws InterruptedException, TransException
 +    {
-+        renewal.shutdownNow();
++        // Let an in-flight extension finish; interrupting its RPC would record a false lease failure.
++        renewal.shutdown();
 +        if (!renewal.awaitTermination(60, TimeUnit.SECONDS))
 +        {
++            renewal.shutdownNow();
 +            throw new TransException("LOAD lease renewal did not stop before commit");
 +        }
 +    }

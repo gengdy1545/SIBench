@@ -21,7 +21,8 @@ import java.util.Set;
  * </ul>
  *
  * {@code value} is {@code locator} or {@code row_id}: what an index entry points to. An index
- * server's {@code backend} is {@code rocksdb} for fixtures, or {@code rocksdb_cloud}/{@code slatedb} with a {@code storage} URI
+ * server's {@code backend} is {@code relive} with an HTTP endpoint, {@code rocksdb} for fixtures,
+ * or {@code rocksdb_cloud}/{@code slatedb} with a {@code storage} URI
  * resolved through the runtime configuration's AWS or COS connection.
  * {@code reopen: true} serves an index this server created before instead of a new one: after a
  * restart, or for rocksdb-cloud without its local directory, from the bucket alone. The object-storage
@@ -39,9 +40,12 @@ public record ServiceConfig(
         boolean wal) {
     public ServiceConfig {
         require(port >= 0 && port <= 65535, "Invalid index service port");
-        require(Set.of("grpc", "rocksdb", "rocksdb_cloud", "slatedb").contains(adapter), "Unknown service adapter: " + adapter);
-        require(!adapter.equals("grpc") || endpoint != null, "A gRPC target needs an endpoint");
-        require(adapter.equals("grpc") || path != null, "An index needs a path");
+        require(Set.of("grpc", "relive", "rocksdb", "rocksdb_cloud", "slatedb").contains(adapter), "Unknown service adapter: " + adapter);
+        boolean remote = adapter.equals("grpc") || adapter.equals("relive");
+        require(!remote || endpoint != null && !endpoint.isBlank(), "A remote service needs an endpoint");
+        require(remote || path != null, "An index needs a path");
+        require(!adapter.equals("relive") || path == null && objects == null && !reopen && wal,
+                "Relive owns its storage, reopening and forced journal policy");
         require(!(adapter.equals("rocksdb_cloud") || adapter.equals("slatedb")) || objects != null,
                 "An object-storage backend needs storage settings");
         require(wal || adapter.equals("rocksdb_cloud") || adapter.equals("slatedb"),
@@ -77,12 +81,18 @@ public record ServiceConfig(
         keys(
                 service,
                 Set.of(
-                        "backend", "path", "port", "value", "storage",
+                        "backend", "endpoint", "path", "port", "value", "storage",
                         "reopen", "wal"));
         String backend = string(service, "backend");
         require(
-                Set.of("rocksdb", "rocksdb_cloud", "slatedb").contains(backend),
-                "backend must be rocksdb, rocksdb_cloud or slatedb");
+                Set.of("relive", "rocksdb", "rocksdb_cloud", "slatedb").contains(backend),
+                "backend must be relive, rocksdb, rocksdb_cloud or slatedb");
+        if (backend.equals("relive")) {
+            keys(service, Set.of("backend", "endpoint", "port", "value"));
+            return new ServiceConfig(backend, string(service, "endpoint"), null,
+                    Math.toIntExact(positive(service, "port")), value(service), null, false, true);
+        }
+        require(!service.containsKey("endpoint"), "endpoint is only for the Relive bridge");
         boolean cloud = !backend.equals("rocksdb");
         for (String key : List.of("storage", "wal"))
             require(cloud == service.containsKey(key), key + " is required only for object-storage backends");
@@ -101,7 +111,8 @@ public record ServiceConfig(
     }
 
     /** This server's index, new or reopened. */
-    public VersionedIndexBackend backend() throws java.io.IOException {
+    public IndexBackend backend() throws java.io.IOException {
+        if (adapter.equals("relive")) return new ReliveBackend(endpoint, value);
         if (adapter.equals("slatedb")) return VersionedIndexBackend.slate(path, value, objects, reopen, wal);
         if (objects == null)
             return reopen ? VersionedIndexBackend.open(path, value) : VersionedIndexBackend.create(path, value);

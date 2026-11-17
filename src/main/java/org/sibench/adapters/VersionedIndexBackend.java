@@ -168,31 +168,9 @@ public final class VersionedIndexBackend implements IndexBackend {
             scanEntries(scan, (key, value) -> { sink.accept(value); return true; });
             return;
         }
-        var writes = new java.util.TreeMap<byte[], ByteString>(Arrays::compareUnsigned);
-        for (var write : scan.getLocalWritesList())
-            writes.put(entry(write.hasPut() ? write.getPut().getKey() : write.getDelete().getKey()),
-                    write.hasPut() ? write.getPut().getValue() : null);
-        var iterator = (scan.getReverse() ? writes.descendingMap() : writes).entrySet().iterator();
-        // Merge private writes before applying the result limit; they never touch the ordered store.
-        class Merge {
-            java.util.Map.Entry<byte[], ByteString> next = iterator.hasNext() ? iterator.next() : null;
-            long count;
-            boolean full() { return scan.getLimit() != 0 && count >= scan.getLimit(); }
-            void advance() { next = iterator.hasNext() ? iterator.next() : null; }
-            void emit(ByteString value) throws IOException { if (value != null && !full()) { sink.accept(value); count++; } }
-            boolean base(byte[] key, ByteString value) throws IOException {
-                while (next != null && !full()) {
-                    int order = Arrays.compareUnsigned(next.getKey(), key) * (scan.getReverse() ? -1 : 1);
-                    if (order > 0) break;
-                    emit(next.getValue()); advance();
-                    if (order == 0) return !full();
-                }
-                emit(value); return !full();
-            }
-        }
-        var merge = new Merge();
-        scanEntries(scan.toBuilder().clearLocalWrites().setLimit(0).build(), merge::base);
-        while (merge.next != null && !merge.full()) { merge.emit(merge.next.getValue()); merge.advance(); }
+        var merge = new PrivateScan(scan, sink, VersionedIndexBackend::entry);
+        scanEntries(scan.toBuilder().clearLocalWrites().setLimit(0).build(), merge::accept);
+        merge.finish();
     }
 
     @FunctionalInterface

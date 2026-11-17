@@ -43,7 +43,7 @@ public final class Sibench {
                         + "   (Pixels side of CDC generation for a remote pixels_host)");
         out.println(
                 "       java -jar build/sibench/sibench.jar index-server CONFIG SERVICE_CONFIG"
-                        + "   (serves a new or reopened RocksDB / rocksdb-cloud / SlateDB index)");
+                        + "   (serves RocksDB / rocksdb-cloud / SlateDB, or bridges a Relive HTTP service)");
         out.println(
                 "       java -jar build/sibench/sibench.jar replay-service REPLAY_CONFIG"
                         + " BENCHMARK REPORT"

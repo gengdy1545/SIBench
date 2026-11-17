@@ -99,7 +99,7 @@ RowIDs are nonnegative, table-scoped int64s. SQL/RocksDB allocate from 1 and pre
 
 Baseline version is 0. Native transaction outcomes receive canonical resolution slots, including Abort and read-only outcomes. Export retains original committed versions, so gaps remain; `last_resolved_version` is the last exported committed version or zero. DuckDB uses native resolution order; PostgreSQL uses completion order, placing XID-bearing outcomes before read-only ties and then source chunk order. Pixels versions follow its timestamps assigned at source BEGIN in commit order. Wall time and replay completion do not define snapshots.
 
-Reads select their actual native committed snapshot plus their own preceding visible writes. PostgreSQL uses each access's MVCC snapshot, command ID and subtransaction outcomes, including nested executors and savepoints. A read bound may be lowered across excluded Abort slots only after proving they contain no committed state; historical visibility is preserved.
+Writes use their recorded committed version as `ts`; reads use their recorded snapshot as `read_ts`. The read point is not replaced by the enclosing transaction's eventual commit version or a replay-time timestamp. Every backend selects the newest version at or below `read_ts`, then applies the request's private overlay. Reads select their actual native committed snapshot plus their own preceding visible writes. PostgreSQL uses each access's MVCC snapshot, command ID and subtransaction outcomes, including nested executors and savepoints. A read bound may be lowered across excluded Abort slots only after proving they contain no committed state; historical visibility is preserved.
 
 ## Work units and routing
 
@@ -136,6 +136,18 @@ YCSB Scan preserves its explicit maximum result count. Failed/partial SQL execut
 Required supply is warmup + `ceil(rate × measurement_seconds × (1 + margin))`, counted in effective requests. Insufficient supply fails before sending. Baseline and markers do not count; private entries add no requests. Warmup membership follows input order through completion. Finite supply does not establish achievable throughput, and replay has no segmented resume/checkpoint support.
 
 Baseline loading drains before workload dispatch. Snapshot reads wait for required pending write ACKs; failures cancel outstanding work. [Service validation](index-service.md#results-and-failure-handling) checks counts and completion, with independent value/order acceptance performed separately.
+
+For an explicit workload-only diagnostic after `mvn package`, run
+`java -cp build/sibench/test-classes:build/sibench/sibench.jar org.sibench.analysis.TraceProfileCheck TRACE_DIRECTORY FRESH_REPORT.json`.
+It reads the complete workload through the canonical decoder and physical/logical
+checksum checks, reports source/write/read timestamp ranges and private-context
+counts, and aggregates full encoded keys into 4,096 hash bins. Bin collisions
+prevent interpreting this as exact key hotness, unique-key counts or cache hit
+rates; Scan bins describe start keys, not returned rows or storage I/O. This
+diagnostic sends no service requests and does not replace replay preflight,
+baseline validation or source completeness evidence. Give it an explicit heap,
+time and storage budget; keep working inputs, native-library temporary files and
+reports on the deployment's permitted storage.
 
 ## Source scope
 
