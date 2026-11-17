@@ -27,7 +27,7 @@ public class TransactionLocalTraceTest {
 
     private static Operation local(long source, int key, long ordinal, long count) {
         return search(source, 1, 0, Range.equal(IndexKey.ofInt(key)), 0, count, TRANSACTION_LOCAL_SEARCH)
-                .withTransaction(1, ordinal).withVersion(1).withWorkUnitId(1);
+                .withTransaction(1, ordinal).withWorkUnitId(1);
     }
 
     @Test public void abortedReadsKeepTheirOwnWritePrefixesWithoutPublishingThoseWrites() throws Exception {
@@ -43,7 +43,7 @@ public class TransactionLocalTraceTest {
             writer.accept(change(5, LOGICAL_DELETE, 1, 10, 3));
             writer.accept(local(6, 1, 3, 0));
             writer.accept(search(7, 1, 0, new Range(IndexKey.ofInt(1), true, IndexKey.ofInt(3), true, true, 1),
-                    0, 1, TRANSACTION_LOCAL_SEARCH).withTransaction(1, 3).withVersion(1).withWorkUnitId(1));
+                    0, 1, TRANSACTION_LOCAL_SEARCH).withTransaction(1, 3).withWorkUnitId(1));
             writer.accept(transaction(0, TRANSACTION_ABORT, 1, 1, 3));
             writer.accept(search(8, 1, 0, Range.equal(IndexKey.ofInt(2)), 0, 0, SNAPSHOT_SEARCH).withWorkUnitId(2));
             writer.accept(search(9, 1, 0, Range.equal(IndexKey.ofInt(1)), 0, 1, SNAPSHOT_SEARCH).withWorkUnitId(3));
@@ -90,7 +90,7 @@ public class TransactionLocalTraceTest {
                 for (int index = 0; index < 2; index++) writer.accept(search(2, 1, index,
                         Range.equal(IndexKey.ofInt(index == 0 ? 2 : 5)), null, 0, 1,
                         TRANSACTION_LOCAL_SEARCH | INTERSECT_GROUP, index, 2)
-                        .withTransaction(1, 1).withVersion(1).withWorkUnitId(1));
+                        .withTransaction(1, 1).withWorkUnitId(1));
                 IndexMutation.emit(write(3, UPSERT, 1, BUSINESS_UPDATE, IndexKey.ofInt(2), 1, 33, 3, 30)
                         .withTransaction(1, 2).withWorkUnitId(1), java.util.Map.of(1, IndexKey.ofInt(5)),
                         java.util.Map.of(1, IndexKey.ofInt(7)), writer);

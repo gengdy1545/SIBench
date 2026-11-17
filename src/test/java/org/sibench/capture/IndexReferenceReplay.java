@@ -1090,7 +1090,7 @@ public final class IndexReferenceReplay implements AutoCloseable {
             return values.stream().limit(range.limit() == 0 ? Long.MAX_VALUE : range.limit()).toList();
         }
         boolean local = (operation.flags() & IndexOperationTrace.TRANSACTION_LOCAL_SEARCH) != 0;
-        long localVersion = local ? operation.version() : 0;
+        long localVersion = local ? operation.transactionId() : 0;
         if (operation.key() == null)
             return search(
                     operation.table(),
@@ -1188,13 +1188,13 @@ public final class IndexReferenceReplay implements AutoCloseable {
         if (operation.readTimestamp() < 0
                 || operation.expectedCount() < 0
                 || (operation.flags() & ~IndexOperationTrace.SEARCH_FLAGS) != 0
-                || (!local && operation.version() != 0))
+                || operation.version() != 0)
             throw new IOException("Invalid search metadata");
         if (local
                 && (operation.transactionId() <= 0
                         || operation.mutationOrdinal() <= 0
-                        || operation.version() != lastAppliedVersion
-                        || operation.readTimestamp() >= operation.version()
+                        || operation.transactionId() != lastAppliedVersion
+                        || operation.readTimestamp() >= operation.transactionId()
                         || (operation.flags() & IndexOperationTrace.SNAPSHOT_SEARCH) != 0))
             throw new IOException("Invalid ordered transaction-local search");
     }

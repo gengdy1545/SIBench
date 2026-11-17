@@ -55,45 +55,37 @@ RocksDB-Cloud loads `build/index/librocksdb_cloud_jni.so` by default. Select Sla
 
 ## Native generation
 
-Edit [config/sibench.yaml](config/sibench.yaml) to select benchmarks and engines. Source scale, workloads and working outputs belong to [config/benchmark/](config/benchmark/); engine paths and resources belong to [config/engine/](config/engine/).
+Select benchmarks and engines in [config/sibench.yaml](config/sibench.yaml). Source scale, workloads and working outputs live in [config/benchmark/](config/benchmark/); engine paths and resources in [config/engine/](config/engine/).
 
-**Public profiles are substantial runs:** 87,060,000 baseline rows and at least 10,000,000 exported workload requests per Trace. Create separate configurations with smaller inputs and fresh output paths for short runs. Inspect scale before generating:
+**Public profiles are substantial runs:** 87,060,000 baseline rows and at least 10,000,000 exported workload requests per Trace. Use separate configurations with smaller inputs and fresh output paths for short runs.
 
 ```bash
 java -jar build/sibench/sibench.jar inspect-scale
 java -jar build/sibench/sibench.jar generate config/sibench.yaml
 ```
 
-`generate` runs entries with `trace.generate: true` and stops on failure. Each named entry (for example `hybench-tp`, `hybench-xp` or `ycsb-a`) owns its local `trace.directory` and optional upload URI in the runtime config. HyBench entries select `tp` or `xp` and each load a fresh database; YCSB entries share one initial load and run their selected workloads independently. See [Trace selection and storage](docs/trace.md#selection-and-storage). For live PostgreSQL → Pixels capture, use `generate-pixels CONFIG` with a separate fresh output. There is no automatic engine fallback.
+`generate` runs the entries with `trace.generate: true` and stops on the first failure. Each named entry (`hybench-tp`, `hybench-xp`, `ycsb-a`, ...) owns its local `trace.directory` and optional upload URI; see [Trace selection and storage](docs/trace.md#selection-and-storage). HyBench entries each load a fresh database; YCSB entries share one initial load. `generate-pixels CONFIG` captures live PostgreSQL → Pixels into a separate fresh output. There is no engine fallback.
 
-Successful runs publish after normal shutdown, then delete working databases. Failed runs retain diagnostics and cannot resume. Existing or overlapping outputs and mismatched source/build inputs are rejected. See [Trace](docs/trace.md) for visibility, index coverage and supported accesses.
+A successful run publishes after normal shutdown and deletes its working databases. A failed run keeps diagnostics and cannot resume. Existing or overlapping outputs and mismatched source/build inputs are rejected. [Trace](docs/trace.md) defines visibility, index coverage and supported accesses.
 
-For repeated [Pixels experiments](docs/pixels-experiment.md), prepare CSV/CDC inputs and a columnar baseline once, then restore into fresh state for each run.
+For repeated [Pixels experiments](docs/pixels-experiment.md), prepare the CSV/CDC inputs and columnar baseline once and restore them into fresh state per run.
 
 ## Replay and service
 
-Configure [object-storage connections](config/sibench.yaml) and the selected [backend](config/index/). Supply credentials through the named environment variables; the bucket must exist. RocksDB-Cloud and SlateDB need a fresh local path and object prefix; Relive requires a fresh CFS directory and object prefix.
-
-Start the service, then replay from another terminal:
+Configure the [object-storage connections](config/sibench.yaml) and the [backend](config/index/); credentials come from the named environment variables and the bucket must exist. RocksDB-Cloud and SlateDB need a fresh local path and object prefix; Relive needs a fresh CFS directory and prefix.
 
 ```bash
 java -jar build/sibench/sibench.jar index-server config/sibench.yaml config/index/rocksdb_cloud.yaml
+java -jar build/sibench/sibench.jar replay-service config/sibench.yaml ycsb-a results/service.json
 ```
 
-```bash
-java -jar build/sibench/sibench.jar replay-service config/sibench.yaml \
-  ycsb-a results/service.json
-```
+Run the two commands in separate terminals. Every backend receives the same requests at `target.service.endpoint`, so one immutable Trace replays against any of them; change only that endpoint. Client and service must agree on value mode and secondary-index selection.
 
-Client and service must agree on value mode and secondary-index selection. The same immutable Trace can be reused across backends and client settings. Replay validates input integrity, response completion and expected result counts; matching counts do not certify values or order. Write acknowledgment guarantees same-instance visibility; durability depends on the backend. See the [Index Service contract](docs/index-service.md).
+Replay checks input integrity, response completion and expected result counts; matching counts do not certify values or order, which [independent acceptance](docs/index-service.md#independent-acceptance) covers. A write acknowledgment guarantees same-instance visibility; durability depends on the backend. See the [Index Service contract](docs/index-service.md).
 
-Every backend receives the same proto requests at `target.service.endpoint` in the runtime CONFIG. Change that gRPC target for each test deployment; Trace parsing and recorded write/read timestamps stay the same. [Independent acceptance](docs/index-service.md#independent-acceptance) provides common protocol and full-value checks using that configuration.
-
-RocksDB-Cloud and SlateDB are comparison targets. Local RocksDB supports generation and test fixtures. The [Relive bridge](docs/index-service.md#relive-bridge) exposes its independent HTTP service through the same five gRPC operations; integration does not certify cloud deployment or comparison readiness. Relive uses [CFS/COS settings](config/index/relive.json), referencing the same runtime object-storage connections. Supply the actual CFS mount path before starting it; local disk state is rejected.
+RocksDB-Cloud and SlateDB are the comparison targets; local RocksDB serves generation and test fixtures. The [Relive bridge](docs/index-service.md#relive-bridge) exposes Relive's HTTP service through the same gRPC operations. It reads [CFS/COS settings](config/index/relive.json) and needs a real CFS mount path (local disk state is rejected). Integration does not certify cloud deployment or comparison readiness.
 
 ## Analysis
-
-Set shared data paths in [global_config.py](graph/config/global_config.py) and select benchmark names and labels in each figure's configuration under `graph/config/`. Then run:
 
 ```bash
 python3 graph/scripts/trace/plot_operation_mix.py
@@ -101,11 +93,11 @@ python3 graph/scripts/trace/prepare_analysis.py
 python3 graph/scripts/trace/plot_access_locality.py
 ```
 
-See [plotting](graph/README.md) for dependencies, outputs and static update-layout analysis. Returned-row locality uses offline snapshot queries; layout estimates do not measure SST or compaction costs.
+Trace selection, `--runtime`/`--jar` overrides, outputs and update-layout analysis are in [plotting](graph/README.md).
 
 ## Tests
 
-After building both embedded runtimes and installing the [plotting dependencies and font](graph/README.md), run the default suites with Python 3.9+ and local socket access:
+After building both embedded runtimes, run the default suites with Python 3.9+ and local socket access:
 
 ```bash
 mvn test

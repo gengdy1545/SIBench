@@ -1,5 +1,6 @@
 """Paths, input selection and export shared by the Trace plotting entry points."""
 
+import argparse
 from copy import deepcopy
 import hashlib
 import json
@@ -15,10 +16,18 @@ from graph.config import global_config
 from graph.config.global_config import OUTPUT_FORMATS, SAVE_PARAMS
 
 
-def load_inputs(traces):
+def parse_arguments(description):
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--runtime", type=Path, help="runtime YAML (default: RUNTIME_CONFIG in global_config.py)")
+    parser.add_argument("--jar", type=Path, help="SIBench JAR (default: SIBENCH_JAR in global_config.py)")
+    return parser.parse_args()
+
+
+def load_inputs(traces, arguments):
     config = {
-        "jar": global_config.SIBENCH_JAR,
-        "runtime": global_config.RUNTIME_CONFIG,
+        # Command-line paths are relative to the working directory; ROOT / absolute keeps them unchanged.
+        "jar": arguments.jar.resolve() if arguments.jar else global_config.SIBENCH_JAR,
+        "runtime": arguments.runtime.resolve() if arguments.runtime else global_config.RUNTIME_CONFIG,
         "analysis_directory": global_config.ANALYSIS_DIRECTORY,
         "plot_directory": global_config.PLOT_DIRECTORY,
         "window_requests": global_config.WINDOW_REQUESTS,

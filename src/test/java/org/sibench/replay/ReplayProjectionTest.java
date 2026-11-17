@@ -243,7 +243,7 @@ public class ReplayProjectionTest {
     @Test
     public void rejectsLocalQueriesAndUncollapsedExpansionEvenWhenFiltered() throws Exception {
         var invalid = sourceSearch(IndexOperationTrace.search(2, 3, 0, Range.equal(IndexKey.ofInt(1)),
-                0, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH).withVersion(1), 10, 1);
+                0, 1, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH), 10, 1);
         try (var replay = new ReplayProjection(new ReplayConfig(true, 0, 0, 0, 0, "operation", 1, 4096, 60, 1), true, op -> fail())) {
             replay.accept(IndexOperationTrace.transaction(10, 6, 10, 1, 0));
             assertThrows(IOException.class, () -> replay.accept(invalid));

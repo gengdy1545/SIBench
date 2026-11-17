@@ -147,7 +147,7 @@ final class CommittedOperations {
     }
 
     private void retainAbortRead(Operation operation) throws IOException {
-        output.accept(operation.withTransaction(0, 0).withVersion(0));
+        output.accept(operation.withTransaction(0, 0));
         retainedAbortReads++;
     }
 
@@ -211,7 +211,7 @@ final class CommittedOperations {
             requireCompleteExpansion();
             if (operation.transactionId() != transaction || operation.mutationOrdinal() != ordinal)
                 throw new IOException("Search source transaction position mismatch");
-            if (local && (ordinal == 0 || operation.version() != transaction || operation.readTimestamp() >= transaction))
+            if (local && (ordinal == 0 || operation.readTimestamp() >= transaction))
                 throw new IOException("Invalid source snapshot read point");
         } else if (operation.transactionId() != 0 || operation.mutationOrdinal() != 0 || local)
             throw new IOException("Transaction-local search outside source group");
@@ -226,7 +226,7 @@ final class CommittedOperations {
             int shared = INTERSECT_GROUP | UNION_GROUP | SNAPSHOT_SEARCH | TRANSACTION_LOCAL_SEARCH;
             if (operation.sourceEvent() != searchGroup.sourceEvent() || operation.table() != searchGroup.table()
                     || operation.workUnitId() != searchGroup.workUnitId() || operation.readTimestamp() != searchGroup.readTimestamp()
-                    || operation.version() != searchGroup.version() || operation.expectedCount() != searchGroup.expectedCount()
+                    || operation.expectedCount() != searchGroup.expectedCount()
                     || operation.expansionSize() != searchGroup.expansionSize() || operation.transactionId() != searchGroup.transactionId()
                     || operation.mutationOrdinal() != searchGroup.mutationOrdinal()
                     || (operation.flags() & shared) != (searchGroup.flags() & shared))

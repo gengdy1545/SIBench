@@ -56,7 +56,7 @@ public class TransactionConsistentTraceTest {
                 writer.accept(write(1, UPSERT, 1, BUSINESS_INSERT, IndexKey.ofInt(2), 1, 0, 0, 20)
                         .withTransaction(1, 1).withWorkUnitId(1).withExpansion(0, 1));
                 writer.accept(search(2, 1, 0, Range.equal(IndexKey.ofInt(2)), 0, 1, TRANSACTION_LOCAL_SEARCH)
-                        .withTransaction(1, 1).withVersion(1).withWorkUnitId(2));
+                        .withTransaction(1, 1).withWorkUnitId(2));
                 writer.accept(transaction(0, TRANSACTION_ABORT, 1, 1, 1));
             }
             var decoded = new ArrayList<Operation>();
@@ -115,7 +115,7 @@ public class TransactionConsistentTraceTest {
                         .withTransaction(2, 1).withWorkUnitId(1).withExpansion(0, 1));
                 var failure = assertThrows(IOException.class, () -> writer.accept(
                         search(2, 1, 0, Range.equal(IndexKey.ofInt(2)), 1, 1, TRANSACTION_LOCAL_SEARCH)
-                                .withTransaction(2, 1).withVersion(2).withWorkUnitId(1)));
+                                .withTransaction(2, 1).withWorkUnitId(1)));
                 assertTrue(failure.getMessage().contains("available source snapshot"));
             } finally { assertThrows(IOException.class, writer::close); }
         }

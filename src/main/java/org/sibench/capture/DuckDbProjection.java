@@ -115,10 +115,8 @@ public final class DuckDbProjection {
                 int flags=position>0?IndexOperationTrace.TRANSACTION_LOCAL_SEARCH:IndexOperationTrace.SNAPSHOT_SEARCH;
                 if(ranges.size()>1)flags|=IndexOperationTrace.UNION_GROUP;
                 for(int i=0;i<ranges.size();i++) {
-                    var search=IndexOperationTrace.search(source,table,index,ranges.get(i),null,readVersion,expected,flags,
-                            ranges.size()>1?i:0,ranges.size()>1?ranges.size():0).withTransaction(transaction,position).withWorkUnitId(id);
-                    if(position>0)search=search.withVersion(version);
-                    output.accept(search);
+                    output.accept(IndexOperationTrace.search(source,table,index,ranges.get(i),null,readVersion,expected,flags,
+                            ranges.size()>1?i:0,ranges.size()>1?ranges.size():0).withTransaction(transaction,position).withWorkUnitId(id));
                 }
             }
         }

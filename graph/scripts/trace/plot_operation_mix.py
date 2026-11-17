@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Plot primary-only Get/Scan/Insert/Update shares from Trace manifest counts."""
 
-import argparse
 import csv
 import json
 from pathlib import Path
@@ -17,14 +16,14 @@ from matplotlib.ticker import PercentFormatter
 from matplotlib.transforms import offset_copy
 import numpy as np
 
-from _common import ROOT, load_inputs, save_figure
+from _common import ROOT, load_inputs, parse_arguments, save_figure
 from graph.config import operation_mix_config as style
 from graph.config.global_config import COLOR_PALETTE, apply_style
 
 
 def main():
-    argparse.ArgumentParser(description=__doc__).parse_args()
-    config = load_inputs(style.TRACES)
+    arguments = parse_arguments(__doc__)
+    config = load_inputs(style.TRACES, arguments)
     manifests = [str(t["directory"] / "manifest.json") for t in config["traces"]]
     with tempfile.TemporaryDirectory(prefix="sibench-operation-mix-") as temporary:
         report = Path(temporary) / "counts.json"

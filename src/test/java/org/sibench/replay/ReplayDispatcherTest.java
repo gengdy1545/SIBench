@@ -73,8 +73,12 @@ public class ReplayDispatcherTest {
     }
 
     private static Operation baseline(long event) {
+        return baseline(event, 0);
+    }
+
+    private static Operation baseline(long event, long version) {
         return IndexOperationTrace.write(event, IndexOperationTrace.INSERT, 3, 0,
-                IndexKey.ofInt(event), 0, 1, event, event).withWorkUnitId(1);
+                IndexKey.ofInt(event), version, 1, event, event).withWorkUnitId(1);
     }
 
     private static Operation groupMember(int position, int size) {
@@ -323,8 +327,8 @@ public class ReplayDispatcherTest {
         }, 3)) {
             var sender = new Thread(() -> {
                 try {
-                    dispatcher.send(baseline(1).withVersion(1).withWorkUnitId(1));
-                    dispatcher.send(baseline(2).withVersion(2).withWorkUnitId(2));
+                    dispatcher.send(baseline(1, 1).withWorkUnitId(1));
+                    dispatcher.send(baseline(2, 2).withWorkUnitId(2));
                     dispatcher.send(search(3)); // Timestamp zero is independent of both writes.
                     dispatcher.send(IndexOperationTrace.search(4, 3, 0,
                             Range.equal(IndexKey.ofInt(1)), 1, 0, 0).withWorkUnitId(4));
@@ -366,7 +370,7 @@ public class ReplayDispatcherTest {
     }
 
     private static Operation write(long unit, long version) {
-        return baseline(unit).withVersion(version).withWorkUnitId(unit);
+        return baseline(unit, version).withWorkUnitId(unit);
     }
 
     private static Operation read(long unit, long readTimestamp) {

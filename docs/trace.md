@@ -1,10 +1,10 @@
 # Trace contract
 
-A Trace is an immutable baseline and workload for isolated index replay. Native `generate`, live `generate-pixels` and Trace-enabled [Pixels experiments](pixels-experiment.md) publish the same format. Workload configuration controls source execution; export preserves supported accesses and does not promise deterministic concurrent ordering.
+A Trace is an immutable baseline plus workload for isolated index replay. Native `generate`, live `generate-pixels` and Trace-enabled [Pixels experiments](pixels-experiment.md) publish the same format. Workload configuration controls source execution; export keeps the supported accesses and does not promise a deterministic concurrent order.
 
 ## Selection and storage
 
-`config/sibench.yaml` owns named benchmark entries and object-storage connections. Each entry references one source configuration and engine. HyBench entries explicitly select `workload: tp` or `workload: xp`; YCSB entries select one workload from their shared source configuration. Scale and workload parameters remain in `config/benchmark/`. A sysbench entry without `workload` retains the source configuration's complete sequence of workloads.
+`config/sibench.yaml` holds the named benchmark entries and the object-storage connections. Each entry references one source configuration and engine; scale and workload parameters stay in `config/benchmark/`. HyBench entries set `workload: tp` or `xp`, YCSB entries pick one workload of their shared configuration, and a sysbench entry without `workload` keeps the source configuration's whole workload sequence.
 
 ```yaml
 benchmarks:
@@ -21,13 +21,13 @@ benchmarks:
         path: cos://YOUR-BUCKET/sibench/traces/ycsb-a/
 ```
 
-`trace.generate` controls only generation. Analysis and replay resolve the same named entry even when generation is disabled; they never regenerate or download implicitly. The local directory is persistent input, with no additional cache. Working databases, logs and effective configuration snapshots remain below the source configuration's `artifacts.directory`. Both working and persistent outputs must be fresh and nonoverlapping. Completed local bundles move to the persistent directory after normal native shutdown; failed moves retain the source bundle. Directory moves require the same filesystem; native and Pixels generation check this, resolved path overlaps and upload credentials before starting a database. Existing Traces are never overwritten.
+`trace.generate` only controls generation: analysis and replay resolve the same entry and never regenerate or download. The local `trace.directory` is the persistent input; there is no other cache. Working databases, logs and effective-configuration snapshots stay under the source configuration's `artifacts.directory`. Working and persistent outputs must be fresh and nonoverlapping, and existing Traces are never overwritten. A finished bundle moves to the persistent directory after normal shutdown (a failed move keeps the source bundle), which requires one filesystem. Native and Pixels generation check this, path overlaps and upload credentials before starting a database.
 
-`object_storage.aws` and `object_storage.cos` define endpoint, region, addressing (`path` or `virtual_hosted`) and credential environment-variable names. `s3://BUCKET/PREFIX` selects AWS; `cos://BUCKET/PREFIX` selects COS. Bucket and prefix belong only to the URI. Unknown schemes, traversal, ambiguous/encoded paths, queries and embedded credentials are rejected. The same resolver serves Index Service storage and reusable input transfers. Only connections actually opened read credentials; a local run needs none. A local S3-compatible service can be selected by setting the AWS connection's endpoint and addressing in an explicit test runtime config. Backend native clients keep their own I/O implementation and storage semantics.
+`object_storage.aws` and `object_storage.cos` define endpoint, region, addressing (`path` or `virtual_hosted`) and credential environment-variable names. `s3://BUCKET/PREFIX` selects AWS and `cos://BUCKET/PREFIX` selects COS; bucket and prefix belong to the URI only. Unknown schemes, traversal, ambiguous or encoded paths, queries and embedded credentials are rejected. The same resolver serves Index Service storage and input transfers. Credentials are read only for connections that are opened, so a local run needs none. A local S3-compatible service can be used by setting the AWS endpoint and addressing in an explicit test config. Backend native clients keep their own I/O and storage semantics.
 
-An enabled upload requires `path`. Successful local generation uploads through the shared input-transfer implementation, verifies complete remote payload and inventory readbacks, and records the returned inventory identity in `trace-publication.json` beside the source run's effective configuration. A failed upload leaves the persistent local Trace usable, records the failure and fails the command. Content objects live at `PREFIX/objects/<sha256>`; the immutable selection inventory is published last at `PREFIX/manifests/<sha256>.json`. Uploads neither overwrite a mutable current pointer nor delete older data. Retire superseded inventories/payloads explicitly after checking their consumers.
+An enabled upload needs `path`. After local generation the shared transfer implementation uploads the Trace, verifies full payload and inventory readbacks, and records the inventory identity in `trace-publication.json` beside the run's effective configuration. A failed upload leaves the local Trace usable, records the failure and fails the command. Content objects are `PREFIX/objects/<sha256>`; the immutable selection inventory is written last at `PREFIX/manifests/<sha256>.json`. Uploads never overwrite a current pointer or delete older data; retire superseded inventories and payloads explicitly after checking their consumers.
 
-The same transfer commands can publish a completed Trace or restore it on another host:
+The same commands publish a completed Trace or restore it on another host:
 
 ```bash
 java -jar build/sibench/sibench.jar publish-input config/sibench.yaml \
@@ -37,7 +37,7 @@ java -jar build/sibench/sibench.jar fetch-input config/sibench.yaml \
 java -jar build/sibench/sibench.jar check-replay config/sibench.yaml ycsb-a
 ```
 
-Fetch requires a fresh local directory and verifies the inventory and payload identities before exposing its manifest. Use the inventory digest returned by publication, not the digest of the Trace's own `manifest.json`. Each analysis/replay result continues to bind the actual Trace identity; editing a configuration does not change an existing Trace. Each generation records its effective configuration and build identities separately from subsequent consumer settings.
+Fetch needs a fresh local directory and verifies inventory and payload identities before exposing the manifest. Use the inventory digest returned by publication, not the digest of the Trace's `manifest.json`. Results bind the actual Trace identity, so editing a configuration never changes an existing Trace; each generation records its effective configuration and build identities separately from consumer settings.
 
 ## Native publication
 
@@ -48,39 +48,38 @@ Fetch requires a fresh local directory and verifies the inventory and payload id
 | `work-units.jsonl.zst` | Continuous work-unit IDs from 1 and their first source events. |
 | `manifest.json` | Catalog, file inventories, counts, version coverage and source/build/configuration identities. |
 
-Publication requires normal engine shutdown and validation. `INCOMPLETE` remains until atomic manifest publication; consumers reject incomplete or altered artifacts. Working databases are deleted afterward. Failures retain diagnostics and cannot resume; a later cleanup failure leaves the published Trace valid. Native rows and raw capture histories are not retained for replay.
+Publication needs normal engine shutdown and validation. The Trace stays `INCOMPLETE` until the manifest is published atomically, and consumers reject incomplete or altered artifacts. Working databases are deleted afterwards. A failure keeps diagnostics and cannot resume; a later cleanup failure leaves the published Trace valid. Native rows and raw capture histories are not kept for replay.
 
-Every catalog table must have baseline entries unless declared in `empty_baseline_tables`; declared empty tables must have none. Catalog identity binds all source index definitions, schema, benchmark and source commit, including for primary-only exports. Consumers need no source checkout. Source evidence binds expected per-table counts and completeness checks; it cannot independently certify an untrusted producer.
+Every catalog table needs baseline entries unless it is listed in `empty_baseline_tables`, in which case it must have none. The catalog identity binds all source index definitions, schema, benchmark and source commit, also for primary-only exports, so consumers need no source checkout. Source evidence binds expected per-table counts and completeness checks; it cannot certify an untrusted producer.
 
-`trace.workload_requests` targets effective requests after projection: writes and individual read members, excluding baseline and transaction markers. Every selected workload receives its budget; admitted work drains and may exceed it. No-progress batches fail. Without a target, each configured stage runs once. `request-budget.json` records counts and overshoot.
+`trace.workload_requests` targets effective requests after projection: writes and individual read members, excluding baseline and transaction markers. Every selected workload gets its budget; admitted work drains and may exceed it, and a batch with no progress fails. Without a target each configured stage runs once. `request-budget.json` records counts and overshoot.
 
-YCSB loads once, closes the database and restores identical files for each independent workload. `traces.json` indexes the resulting named persistent Trace locations. The initial-state identity binds files, seed and baseline; a workload never inherits another workload's mutations. Native block caches are fresh; OS caches are not cleared.
-
-HyBench publishes `hybench-tp` and `hybench-xp` independently from the same source configuration. TP runs the upstream TP-1–TP-18 transaction mix with `native.clients`; XP runs AT-1–AT-6 and IQ-1–IQ-6 with its explicit transaction/query client counts. TP includes read-only transactions and reads inside updates; it is not a write-only workload. Each selection generates and loads a fresh native database, with working state beneath `artifacts.directory/tp` or `artifacts.directory/xp`. The scale and schema match, but the unseeded upstream generator does not promise identical baseline contents. Inputs, effective settings and build identities are recorded for each run. Existing Trace destinations are rejected; validate replacements and switch consumers before deleting old payloads.
+- **YCSB** loads once, closes the database and restores identical files for each independent workload. `traces.json` indexes the resulting Trace locations. The initial-state identity binds files, seed and baseline; no workload inherits another's mutations. Native block caches are fresh; OS caches are not cleared.
+- **HyBench** publishes `hybench-tp` and `hybench-xp` independently from one source configuration. TP runs the upstream TP-1–TP-18 mix with `native.clients`, including read-only transactions and reads inside updates, so it is not write-only. XP runs AT-1–AT-6 and IQ-1–IQ-6 with explicit transaction and query client counts. Each selection loads a fresh native database under `artifacts.directory/tp` or `/xp`. Scale and schema match, but the unseeded upstream generator does not promise identical baseline contents. Validate replacements and switch consumers before deleting old payloads.
 
 ### Pixels host
 
-A remote host runs `pixels-host ADDRESS:PORT BUILD_DIRECTORY WORK_ROOT TOKEN_FILE`; configure `pixels_host: HOST:PORT` and supply `SIBENCH_PIXELS_HOST_TOKEN` to the client. PostgreSQL and the live sink stay on the generator. Local Pixels is the default.
+A remote host runs `pixels-host ADDRESS:PORT BUILD_DIRECTORY WORK_ROOT TOKEN_FILE`. Configure `pixels_host: HOST:PORT` and give the client `SIBENCH_PIXELS_HOST_TOKEN`; PostgreSQL and the live sink stay on the generator. Local Pixels is the default.
 
-The host authenticates requests, checks Java/native source identities and records actual host artifacts. Uploads have deadlines, reject escapes/overwrites and permit at most 4 GiB per shard. Sessions own fresh directories and child processes; only stopped, session-owned state can be deleted. Failed sessions retain diagnostics.
+The host authenticates requests, checks Java/native source identities and records the actual host artifacts. Uploads have deadlines, reject escapes and overwrites, and are limited to 4 GiB per shard. Each session owns fresh directories and child processes; only stopped, session-owned state can be deleted. Failed sessions keep diagnostics.
 
 ## Protobuf format
 
-[index_trace.proto](../proto/index_trace.proto) defines `TraceRecord`: `transaction_begin`, `operation` or `transaction_commit`. Operations reuse [service requests](../proto/index_service.proto) for Get/Put/Delete/Scan, or describe a `ReadGroup`, with required source metadata. WriteBatch is assembled during replay and is not a Trace record. There is one supported format; clients and artifacts must match.
+[index_trace.proto](../proto/index_trace.proto) defines `TraceRecord`: `transaction_begin`, `operation` or `transaction_commit`. An operation reuses a [service request](../proto/index_service.proto) (Get/Put/Delete/Scan) or describes a `ReadGroup`, with required source metadata. WriteBatch is assembled during replay and is not a Trace record. There is one supported format; clients and artifacts must match.
 
 | Element | Encoding |
 | --- | --- |
 | Prefix | Big-endian int32 magic `0x53495042`. |
-| Block header | Four big-endian int32s: message count, compressed size, uncompressed size, CRC32C of uncompressed bytes. |
+| Block header | Four big-endian int32s: message count, compressed size, uncompressed size, CRC32C of the uncompressed bytes. |
 | Payload | Independent level-3 Zstd frame of length-delimited TraceRecord messages. |
-| Bounds | Target 1 MiB/block; at most 4096 messages; one delimited request at most 32 MiB. |
-| Terminator | Four zero int32s; missing termination or trailing bytes fail. |
+| Bounds | Target 1 MiB per block; at most 4096 messages; one delimited request at most 32 MiB. |
+| Terminator | Four zero int32s; a missing terminator or trailing bytes fail. |
 
-File descriptors bind path, physical SHA-256, logical SHA-256 of uncompressed delimited messages, bytes and counts. Baseline/workload identity hashes the logical digest's 32 bytes followed by the big-endian int64 semantic operation count. Semantic counts include read members and boundary markers; `effective_requests` excludes markers.
+File descriptors bind path, physical SHA-256, logical SHA-256 of the uncompressed delimited messages, bytes and counts. A baseline or workload identity hashes the 32-byte logical digest followed by the big-endian int64 semantic operation count. Semantic counts include read members and boundary markers; `effective_requests` excludes markers.
 
-Manifest statistics distinguish primary/secondary entries, primitive operations, request types, markers, source projection, business write origins and uncompressed message bytes. Source counts can exceed exported counts. Statistics do not replace consumer validation of digests, accounting, positions and source coverage.
+Manifest statistics separate primary and secondary entries, primitive operations, request types, markers, source projection, business write origins and uncompressed message bytes. Source counts can exceed exported counts. Statistics do not replace consumer validation of digests, accounting, positions and source coverage.
 
-A read's `local_writes` is an ordered, unique-key list of scoped private Put/Delete entries with timestamp zero. Private Puts carry RowIDs; aligned `local_locators` carry alternate Locators, with empty entries for Delete or a zero Locator. Malformed encodings, missing requests/metadata, unknown fields and empty operations fail validation.
+A read's `local_writes` is an ordered, unique-key list of scoped private Put/Delete entries with timestamp zero. Private Puts carry RowIDs; the aligned `local_locators` carry alternate Locators (empty for Delete, zero for none). Malformed encodings, missing requests or metadata, unknown fields and empty operations fail validation.
 
 ## Identity and versions
 
@@ -91,63 +90,62 @@ RowID value   = row_id(i64 BE)
 Locator value = file(i64 BE) ++ position(i64 BE)
 ```
 
-`escaped` maps zero to `00 ff` and terminates a component with `00 00`, preserving unsigned byte order. Table IDs start at 1 in schema order; secondary IDs follow source index order. Nonunique secondary equality uses a prefix-range Scan; a complete secondary key uses Get.
+`escaped` maps zero to `00 ff` and ends a component with `00 00`, which preserves unsigned byte order. Table IDs start at 1 in schema order; secondary IDs follow source index order. Nonunique secondary equality is a prefix-range Scan; a complete secondary key is a Get.
 
-Typed key components use `0x02` for NULL and `0x01` for non-NULL. Signed integers are sign-bit-flipped big-endian int64; timestamps use epoch microseconds with supported infinities at the extremes. Text is NUL-terminated UTF-8; embedded NUL is unsupported. PostgreSQL CHAR keys omit trailing blanks; DuckDB CHAR preserves them. Supported types are signed integers, timestamps and binary-ordered text. Arbitrary collations and composite/expression indexes are unsupported.
+Typed key components start with `0x02` for NULL and `0x01` for non-NULL. Signed integers are sign-bit-flipped big-endian int64. Timestamps are epoch microseconds with supported infinities at the extremes. Text is NUL-terminated UTF-8 (embedded NUL is unsupported); PostgreSQL CHAR keys drop trailing blanks and DuckDB CHAR keeps them. Supported types are signed integers, timestamps and binary-ordered text. Arbitrary collations and composite or expression indexes are unsupported.
 
-RowIDs are nonnegative, table-scoped int64s. SQL/RocksDB allocate from 1 and preserve identities on update. Pixels allocates from 0 and gives replacement rows new identities. Delete/reinsert always gets a new identity. Pixels Locator positions pack `(rgId << 32) | rgRowOffset`; storage GC is disabled during capture. Stored Puts carry RowIDs and optional Locator metadata; an omitted Locator is zero. Replay accepts only manifest-declared `value_kinds`: native sources provide `row_id`, Pixels also provides `locator`.
+RowIDs are nonnegative, table-scoped int64s. SQL and RocksDB allocate from 1 and keep the identity on update; Pixels allocates from 0 and gives replacement rows new identities. Delete followed by reinsert always gets a new identity. Pixels Locator positions pack `(rgId << 32) | rgRowOffset`, and storage GC is disabled during capture. Stored Puts carry RowIDs and optional Locator metadata (omitted means zero). Replay accepts only the manifest's `value_kinds`: native sources provide `row_id`, Pixels also `locator`.
 
-Baseline version is 0. Native transaction outcomes receive canonical resolution slots, including Abort and read-only outcomes. Export retains original committed versions, so gaps remain; `last_resolved_version` is the last exported committed version or zero. DuckDB uses native resolution order; PostgreSQL uses completion order, placing XID-bearing outcomes before read-only ties and then source chunk order. Pixels versions follow its timestamps assigned at source BEGIN in commit order. Wall time and replay completion do not define snapshots.
+Baseline version is 0. Native transaction outcomes, including Abort and read-only ones, get canonical resolution slots. Export keeps the original committed versions, so gaps remain, and `last_resolved_version` is the last exported committed version or zero. DuckDB uses its native resolution order; PostgreSQL uses completion order, with XID-bearing outcomes before read-only ties and then source chunk order; Pixels versions follow the timestamps assigned at source BEGIN, in commit order. Wall time and replay completion never define snapshots.
 
-Writes use their recorded committed version as `ts`; reads use their recorded snapshot as `read_ts`. The read point is not replaced by the enclosing transaction's eventual commit version or a replay-time timestamp. Every backend selects the newest version at or below `read_ts`, then applies the request's private overlay. Reads select their actual native committed snapshot plus their own preceding visible writes. PostgreSQL uses each access's MVCC snapshot, command ID and subtransaction outcomes, including nested executors and savepoints. A read bound may be lowered across excluded Abort slots only after proving they contain no committed state; historical visibility is preserved.
+A write uses its recorded committed version as `ts`; a read uses its recorded snapshot as `read_ts`, which is never replaced by the enclosing transaction's eventual commit version or a replay-time timestamp. Every backend returns the newest version at or below `read_ts` and then applies the request's private overlay, which holds the reader's own preceding visible writes. PostgreSQL uses each access's MVCC snapshot, command ID and subtransaction outcomes, including nested executors and savepoints. A read bound may be lowered across excluded Abort slots only after proving they hold no committed state.
 
 ## Work units and routing
 
-Work units bind dispatch to source origins: statements for PostgreSQL/API, adopted accesses or row changes for DuckDB, applied transactions for Pixels. Statements with no index operation remain accounted for. Trace order follows transaction resolution and within-transaction order; source provenance can therefore differ from record order.
+Work units bind dispatch to source origins: statements for PostgreSQL and API sources, adopted accesses or row changes for DuckDB, applied transactions for Pixels. Statements without index operations stay accounted for. Trace order follows transaction resolution and the order within a transaction, so source provenance can differ from record order.
 
-Baseline units group 4096 source rows across tables, keeping a row's expanded entries together. Controls use work-unit ID 0. Routing preserves recorded order and bindings; it does not reconstruct a server-side transaction or DAG.
+Baseline units group 4096 source rows across tables and keep a row's expanded entries together. Controls use work-unit ID 0. Routing preserves recorded order and bindings and does not rebuild a server-side transaction or DAG.
 
 ## Operations and index expansion
 
-Only committed writes enter shared replay state. Each commit retains the final action per physical key; intermediate writes are coalesced. Successful reads survive source rollback, with any private writes visible at the time. Those contexts may contain intermediate or subsequently aborted values and never modify shared history.
+Only committed writes enter shared replay state, and each commit keeps the final action per physical key, so intermediate writes are coalesced. Successful reads survive source rollback with the private writes visible at the time. Those contexts may hold intermediate or later-aborted values and never modify shared history.
 
-Positive matching Begin/Commit versions delimit committed source transactions. Nested, unmatched, mismatched or unclosed boundaries fail. Aborted boundaries/writes are omitted; successful reads from aborted transactions remain standalone requests. Boundaries are provenance and scheduling controls, not RPCs.
+Matching positive Begin/Commit versions delimit committed source transactions; nested, unmatched, mismatched or unclosed boundaries fail. Aborted boundaries and writes are omitted, and successful reads from aborted transactions stay as standalone requests. Boundaries are provenance and scheduling controls, not RPCs.
 
-Source changes maintain the primary and every exported secondary index in IndexID order. A changed secondary key produces Delete(old) and Put(new); unchanged keys receive the new row version. Baseline expansion metadata validates complete row maintenance. Workload writes retain source event, work unit, mutation ordinal and business origin. The service must not expand them again.
+A source change maintains the primary and every exported secondary index in IndexID order: a changed secondary key produces Delete(old) and Put(new), an unchanged one gets the new row version. Baseline expansion metadata validates complete row maintenance. Workload writes keep source event, work unit, mutation ordinal and business origin. The service must not expand them again.
 
-`trace.secondary_indexes` defaults to false. Primary-only export omits secondary operations and whole read groups containing secondary members, while preserving committed boundaries and read visibility. The manifest declares `primary_only` or `all_source_definitions`. Replay cannot request absent indexes; full exports support either consumer selection. Pixels exports primary indexes only.
+`trace.secondary_indexes` defaults to false. A primary-only export omits secondary operations and whole read groups with secondary members, and keeps committed boundaries and read visibility. The manifest declares `primary_only` or `all_source_definitions`; replay cannot request absent indexes, and full exports support either consumer selection. Pixels exports primary indexes only.
 
-ReadGroup members share one table/read point and combine by value identity: intersection preserves the first member's order; union preserves first occurrence. Unknown combine modes fail. Within a table/snapshot, every index must identify a row with the same value and distinct visible rows must have distinct values. Each member is a separate RPC; group validation uses the combined expected count.
+ReadGroup members share one table and read point and combine by value identity: intersection keeps the first member's order, union keeps first occurrence, and unknown combine modes fail. Within a table and snapshot every index must identify a row with the same value, and distinct visible rows must have distinct values. Each member is a separate RPC, and group validation uses the combined expected count.
 
-Scan orders unsigned keys, optionally reversed, and applies its limit after snapshot selection, private merging and deletion filtering. Get returns at most one entry. Private contexts permit at most 1,000,000 entries per request and 32 MiB. Committed/unknown-outcome transaction buffers, distinct-key write maps and aggregate pending private references each permit 1,000,000 items. PostgreSQL also bounds own-write/executor/subtransaction histories to 1,000,000 items each, decoded events to 16 MiB and compressed transaction spools to 4 GiB. Exceeding limits fails generation with diagnostics.
+Scan orders unsigned keys, optionally reversed, and applies its limit after snapshot selection, private merging and deletion filtering. Get returns at most one entry.
+
+Limits: a private context holds at most 1,000,000 entries and 32 MiB per request. Committed and unknown-outcome transaction buffers, distinct-key write maps and aggregate pending private references each allow 1,000,000 items. PostgreSQL also bounds own-write, executor and subtransaction histories to 1,000,000 items each, decoded events to 16 MiB and compressed transaction spools to 4 GiB. Exceeding a limit fails generation with diagnostics.
 
 ## Access projection
 
-Captured reads describe complete native index output before SQL filtering, joins, sorting or aggregation. Sequential scans produce no synthetic index requests. Downstream LIMIT does not become a Search limit. Incomplete, ambiguous or unsupported access facts prevent publication.
+Captured reads describe the complete native index output before SQL filtering, joins, sorting or aggregation. Sequential scans produce no synthetic index requests, and a downstream LIMIT does not become a Search limit. Incomplete, ambiguous or unsupported access facts prevent publication.
 
-DuckDB supports adopted single-column ART bounds and repeated point probes, deduplicated into union groups. Abandoned/internal-history attempts are diagnostics. Interrupted primary-key equality is accepted only when identical equality predicates and one emitted matching PK prove complete output. Other interrupted outputs must exhaust base and transaction-local matches.
+DuckDB supports adopted single-column ART bounds and repeated point probes, which are deduplicated into union groups; abandoned or internal-history attempts are diagnostics only. An interrupted primary-key equality is accepted only with identical equality predicates and one emitted matching PK, which prove complete output; any other interrupted output must exhaust base and transaction-local matches.
 
-YCSB Scan preserves its explicit maximum result count. Failed/partial SQL executors do not certify reads; completed nested reads can remain valid even if later source work rolls back.
+YCSB Scan keeps its explicit maximum result count. Failed or partial SQL executors do not certify reads; completed nested reads stay valid even if later source work rolls back.
 
 ## Replay preflight
 
-`check-replay CONFIG BENCHMARK` validates without an adapter; ordinary replay performs the same preflight. It checks identities/digests, catalog, counts, version coverage, final-write uniqueness, provenance, snapshots/private contexts, routing, value capability and supply. Baseline validation is fused with loading and accepts only timestamp-zero Puts.
+`check-replay CONFIG BENCHMARK` validates without an adapter, and ordinary replay runs the same preflight. It checks identities and digests, catalog, counts, version coverage, final-write uniqueness, provenance, snapshots and private contexts, routing, value capability and supply. Baseline validation is fused with loading and accepts only timestamp-zero Puts.
 
-Required supply is warmup + `ceil(rate × measurement_seconds × (1 + margin))`, counted in effective requests. Insufficient supply fails before sending. Baseline and markers do not count; private entries add no requests. Warmup membership follows input order through completion. Finite supply does not establish achievable throughput, and replay has no segmented resume/checkpoint support.
+Required supply is warmup + `ceil(rate × measurement_seconds × (1 + margin))` effective requests; baseline, markers and private entries do not count. Too little supply fails before sending. Warmup membership follows input order through completion. Finite supply does not establish achievable throughput, and replay has no segmented resume or checkpoint.
 
-Baseline loading drains before workload dispatch. Snapshot reads wait for required pending write ACKs; failures cancel outstanding work. [Service validation](index-service.md#results-and-failure-handling) checks counts and completion, with independent value/order acceptance performed separately.
+The baseline drains before workload dispatch. Snapshot reads wait for the pending write ACKs they need, and a failure cancels outstanding work. [Service validation](index-service.md#results-and-failure-handling) checks counts and completion; independent value and order acceptance is separate.
 
-For an explicit workload-only diagnostic after `mvn package`, run
-`java -cp build/sibench/test-classes:build/sibench/sibench.jar org.sibench.analysis.TraceProfileCheck TRACE_DIRECTORY FRESH_REPORT.json`.
-It reads the complete workload through the canonical decoder and physical/logical
-checksum checks, reports source/write/read timestamp ranges and private-context
-counts, and aggregates full encoded keys into 4,096 hash bins. Bin collisions
-prevent interpreting this as exact key hotness, unique-key counts or cache hit
-rates; Scan bins describe start keys, not returned rows or storage I/O. This
-diagnostic sends no service requests and does not replace replay preflight,
-baseline validation or source completeness evidence. Give it an explicit heap,
-time and storage budget; keep working inputs, native-library temporary files and
-reports on the deployment's permitted storage.
+An explicit workload-only diagnostic, after `mvn package`:
+
+```bash
+java -cp build/sibench/test-classes:build/sibench/sibench.jar \
+  org.sibench.analysis.TraceProfileCheck TRACE_DIRECTORY FRESH_REPORT.json
+```
+
+It decodes the whole workload with the canonical decoder and checksum checks, reports source, write and read timestamp ranges and private-context counts, and aggregates full encoded keys into 4,096 hash bins. Bin collisions make this unusable as exact key hotness, unique-key counts or cache hit rates, and Scan bins describe start keys, not returned rows or I/O. It sends no service requests and does not replace preflight, baseline validation or source completeness evidence. Give it an explicit heap, time and storage budget.
 
 ## Source scope
 
@@ -155,13 +153,13 @@ Only clean pinned sources and supported schemas are accepted. Generation creates
 
 | Source | Scope and limits |
 | --- | --- |
-| YCSB | UTF-8 keys, binary fields, one primary index; independent official A–F workloads. F remains separate Read and Update calls. |
-| sysbench | sbtest tables with id primary and k secondary indexes; configured supported scripts, including native conflict retries. |
-| HyBench native | Eight tables, eight primary and thirteen secondary indexes; TP runs TP-1–TP-18 and XP runs AT/IQ. Native transaction conflicts roll back and continue; other SQL errors fail. |
-| HyBench CDC | Same CSV baseline in uninstrumented PostgreSQL and Pixels; TP/AT only. One Pixels transaction per committed source transaction. SQL reads, read-only/aborted transactions and secondary indexes are outside the exported scope. |
+| YCSB | UTF-8 keys, binary fields, one primary index; independent official A–F workloads. F stays separate Read and Update calls. |
+| sysbench | `sbtest` tables with `id` primary and `k` secondary indexes; configured supported scripts, including native conflict retries. |
+| HyBench native | Eight tables, eight primary and thirteen secondary indexes; TP runs TP-1–TP-18, XP runs AT/IQ. Native transaction conflicts roll back and continue; other SQL errors fail. |
+| HyBench CDC | Same CSV baseline in uninstrumented PostgreSQL and Pixels; TP/AT only, one Pixels transaction per committed source transaction. SQL reads, read-only or aborted transactions and secondary indexes are outside the exported scope. |
 
-Native capture rejects primary-key assignments, including later-aborted attempts. Pixels rejects actual key changes but permits unchanged-key assignments. CDC requires FULL replica identity. Its index lookups must agree with each following change; write/commit, asynchronous sink or visibility failures prevent publication because Pixels cannot undo applied index entries.
+Native capture rejects primary-key assignments, including those of later-aborted attempts. Pixels rejects actual key changes but allows unchanged-key assignments. CDC needs FULL replica identity, and its index lookups must agree with each following change. Write, commit, asynchronous sink or visibility failures prevent publication because Pixels cannot undo applied index entries.
 
-PostgreSQL HyBench `query_coverage` binds IQ-1–IQ-6 source success/failure counts, executed indexes and exported accesses; main-IQ successes must match client histograms. Indexed-access coverage is not complete SQL/HTAP coverage. CDC scope is recorded separately in `source_evidence.workload_scope`.
+PostgreSQL HyBench `query_coverage` binds IQ-1–IQ-6 source success and failure counts, executed indexes and exported accesses, and main-IQ successes must match the client histograms. Indexed-access coverage is not complete SQL/HTAP coverage. CDC scope is recorded separately in `source_evidence.workload_scope`.
 
-Setup, execution and shutdown have separate bounds; cleanup preserves the first failure. Rewrite, physical version GC, unknown-outcome write retries and crash recovery are unsupported. [Pixels experiment inputs](pixels-experiment.md#prepare-once-restore-for-each-run) contain row changes in a separate format from Index Trace.
+Setup, execution and shutdown have separate bounds, and cleanup preserves the first failure. Rewrite, physical version GC, unknown-outcome write retries and crash recovery are unsupported. [Pixels experiment inputs](pixels-experiment.md#prepare-once-restore-for-each-run) hold row changes in a format separate from the Index Trace.

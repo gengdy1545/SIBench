@@ -1,6 +1,6 @@
 # Pixels experiments
 
-`pixels-experiment CONFIG [CDC_INPUT_DIRECTORY] PIXELS_BASELINE_DIRECTORY FRESH_OUTPUT_DIRECTORY` restores a sealed COS baseline into fresh Pixels state. Updates require CDC files bound to the same CSV identity. Static runs omit CDC. File replay starts no source PostgreSQL, Debezium or HyBench process. Build both Pixels phases first.
+`pixels-experiment CONFIG [CDC_INPUT_DIRECTORY] PIXELS_BASELINE_DIRECTORY FRESH_OUTPUT_DIRECTORY` restores a sealed COS baseline into fresh Pixels state. Update runs need CDC files bound to the same CSV identity; static runs omit CDC. File replay starts no source PostgreSQL, Debezium or HyBench process. Build both Pixels phases first.
 
 ## Prepare once, restore for each run
 
@@ -10,7 +10,7 @@ Set `data_storage` in [the Pixels engine YAML](../config/engine/pixels/pixels.ya
 data_storage: cos://YOUR-BUCKET/sibench/baselines/pixels
 ```
 
-The connection comes from `object_storage.cos` in the runtime CONFIG. Use virtual-hosted addressing and supply its credential variables on the Pixels host and external Trino workers. Pixels data paths currently require `cos://`; `s3://` is explicitly rejected until its native integration is available. Reusable baselines require COS; live `generate-pixels` can use local files.
+The connection comes from `object_storage.cos` in the runtime CONFIG. Use virtual-hosted addressing and provide its credential variables on the Pixels host and external Trino workers. Pixels data paths require `cos://` (`s3://` is rejected); reusable baselines need COS, while live `generate-pixels` can use local files.
 
 ```bash
 java -jar build/sibench/sibench.jar prepare-csv config/sibench.yaml results/capture/hybench-csv
@@ -23,21 +23,21 @@ java -jar build/sibench/sibench.jar pixels-experiment config/sibench.yaml \
   results/capture/hybench results/inputs/hybench-pixels results/pixels/run
 ```
 
-`prepare-pixels-inputs` runs independent CDC and baseline branches concurrently. CDC output uses the HyBench profile's `artifacts.directory`; the explicit output receives the Pixels baseline. Separate entry points are `prepare-cdc CONFIG CSV_INPUT_DIRECTORY` and `prepare-pixels-baseline CONFIG CSV_INPUT_DIRECTORY FRESH_OUTPUT_DIRECTORY`. Preparation disables Trace, queries and freshness and uses `native.timeout_minutes`. A failed branch leaves the other's completed artifact usable.
+`prepare-pixels-inputs` runs the CDC and baseline branches concurrently: CDC goes to the HyBench profile's `artifacts.directory`, the baseline to the explicit output. Each also has its own entry point, `prepare-cdc CONFIG CSV_INPUT_DIRECTORY` and `prepare-pixels-baseline CONFIG CSV_INPUT_DIRECTORY FRESH_OUTPUT_DIRECTORY`. Preparation disables Trace, queries and freshness, uses `native.timeout_minutes`, and a failed branch leaves the other's finished artifact usable.
 
-CSV preparation needs the built HyBench client; CDC also needs the Pixels build's source PostgreSQL and sink binding on the generator, without contacting `pixels_host`. Select HyBench in CONFIG independently of its native capture engine. CSV output must be fresh and below `results/capture`; all other outputs must also be fresh. Source/schema/scale/data parameters and build identities must match; client counts and phase durations may vary.
+CSV preparation needs the built HyBench client; CDC also needs the Pixels build's source PostgreSQL and sink binding on the generator, and never contacts `pixels_host`. Select HyBench in CONFIG independently of its native capture engine. CSV output must be fresh and below `results/capture`; every other output must be fresh too. Source, schema, scale, data parameters and build identities must match, while client counts and phase durations may differ.
 
-CDC captures committed row changes from TP and XP once, with AP/IQ disabled, using configured durations and transaction-client counts. `trace.workload_requests` does not bound preparation. Primary-key changes are rejected and FULL replica identity is required. Each phase waits up to two minutes for a committed marker at the file writer, then allows 60 seconds for normal shutdown. Missing/incomplete source data or failed shutdown prevents publication and retains diagnostics/database; success deletes the working database. Marker acceptance proves capture progress, not target visibility or durability.
+CDC captures committed row changes from TP and XP once, with AP/IQ disabled, using the configured durations and transaction-client counts; `trace.workload_requests` does not bound it. Primary-key changes are rejected and FULL replica identity is required. Each phase waits up to two minutes for a committed marker at the file writer, then 60 seconds for normal shutdown. Missing or incomplete source data, or a failed shutdown, prevents publication and keeps the diagnostics and database; success deletes the working database. A marker proves capture progress, not target visibility or durability.
 
-Inputs are immutable, including CDC's hard-linked baseline copies. Their manifests bind relative paths, sizes, SHA-256, schemas, counts and source/build identities. Validation rejects symbolic links, traversal/aliases, missing/unlisted/reordered files, malformed counts, hash/schema mismatches and incomplete/unsupported transactions. Manifests and individual CDC frames are limited to 16 MiB; files contain whole transactions, with positive int32 `sink.proto.maxRecords` limiting transactions per file. CDC transaction/change totals include markers; `businessChanges` excludes marker rows and `markers` counts marker transactions. These are not distinct-row or index-operation counts.
+Inputs are immutable, including CDC's hard-linked baseline copies. Manifests bind relative paths, sizes, SHA-256, schemas, counts and source/build identities. Validation rejects symbolic links, traversal and aliases, missing, unlisted or reordered files, malformed counts, hash or schema mismatches, and incomplete or unsupported transactions. Manifests and single CDC frames are limited to 16 MiB; files hold whole transactions, with the positive int32 `sink.proto.maxRecords` limiting transactions per file. CDC totals include markers; `businessChanges` excludes marker rows and `markers` counts marker transactions. None of these are distinct-row or index-operation counts.
 
-The baseline manifest also binds COS paths, row groups, hidden timestamps and index bucket count. Empty tables retain schema and zero counts without files. `check-pixels-baseline` checks local descriptors; import verifies remote content. Completed CSV/CDC inputs can be relocated without the preparation database. Preserve local capture diagnostics separately when source reproduction is required.
+The baseline manifest also binds COS paths, row groups, hidden timestamps and the index bucket count. Empty tables keep their schema and zero counts without files. `check-pixels-baseline` checks the local descriptors and import verifies remote content. Finished CSV/CDC inputs can move without the preparation database; keep local capture diagnostics separately if source reproduction matters.
 
-Native LOAD renews its write-transaction lease while encoding files and publishing visibility. Before commit it waits for any in-flight renewal to finish; renewal or visibility failure fails the LOAD and prevents baseline publication. Increasing the experiment timeout does not replace lease renewal.
+Native LOAD renews its write-transaction lease while encoding files and publishing visibility, and waits for any in-flight renewal before commit. A renewal or visibility failure fails the LOAD and prevents baseline publication; a longer experiment timeout does not replace renewal.
 
-Each run copies bound files into its own COS prefix, validates digests/footers and row counts, and rebuilds indexes and visibility with fresh physical identities. Target COS endpoint/region/bucket, bucket settings and Pixels source/patch identity must match the baseline. Restore costs are reported separately from application/query costs. The canonical baseline is immutable; repeat experiments by restoring fresh state, not replaying CDC over an updated instance.
+Each run copies the bound files into its own COS prefix, validates digests, footers and row counts, and rebuilds indexes and visibility with fresh physical identities. The target COS endpoint, region, bucket and settings and the Pixels source/patch identity must match the baseline. Restore cost is reported apart from application and query cost. The canonical baseline is immutable: repeat an experiment by restoring fresh state, not by replaying CDC over an updated instance.
 
-Success requires normal service shutdown before result/Trace publication, then removes owned working state and the run's COS prefix. Failure retains diagnostics and owned objects. Cleanup failure leaves any published Trace valid. This workflow reconstructs a baseline; it is not crash recovery.
+Success needs a normal service shutdown before the result or Trace is published, then removes the owned working state and the run's COS prefix. A failure keeps diagnostics and owned objects, and a cleanup failure leaves a published Trace valid. This rebuilds a baseline; it is not crash recovery.
 
 ## Publish and fetch inputs
 
@@ -50,11 +50,11 @@ java -jar build/sibench/sibench.jar fetch-input config/sibench.yaml \
   cos://YOUR-BUCKET/sibench/inputs/hybench MANIFEST_SHA256 results/inputs/hybench-csv
 ```
 
-Use the returned `manifest_sha256`, not the inner input-manifest digest. Objects live below `PREFIX/objects/`; inventories at `PREFIX/manifests/<sha256>.json`. Only manifest-bound local files transfer. Columnar objects remain at their bound COS paths: retain that canonical prefix with the baseline manifest.
+Use the returned `manifest_sha256`, not the inner input-manifest digest. Objects live under `PREFIX/objects/` and inventories at `PREFIX/manifests/<sha256>.json`. Only manifest-bound local files transfer; columnar objects stay at their bound COS paths, so keep that canonical prefix with the baseline manifest.
 
-Publication reuses content objects and needs no conditional PUT or exclusive writer; keys must remain immutable under trusted producers. PUT acknowledgment does not certify remote durability/visibility. Fetch verifies exact inventories, hashes and semantic checks, requires a fresh destination and writes the canonical manifest last. Failure retains partial files without a canonical manifest. Check an existing cache with its `check-*` command instead of fetching over it.
+Publication reuses content objects and needs neither a conditional PUT nor an exclusive writer, but keys must stay immutable under trusted producers. A PUT acknowledgment does not certify remote durability or visibility. Fetch verifies exact inventories, hashes and semantic checks, needs a fresh destination and writes the canonical manifest last; a failure keeps partial files without it. Check an existing cache with its `check-*` command rather than fetching over it.
 
-Files over 64 MiB use multipart upload, aborted on failure. API calls have ten-minute total/three-minute attempt bounds; whole-input time depends on size/count. Failed uploads may leave unreferenced objects. Transfer never deletes or garbage-collects remote content.
+Files over 64 MiB use multipart upload, aborted on failure. API calls are bounded to ten minutes in total and three minutes per attempt; whole-input time depends on size and count. Failed uploads may leave unreferenced objects, and transfer never deletes or garbage-collects remote content.
 
 ## Modes and configuration
 
@@ -76,7 +76,7 @@ java -jar build/sibench/sibench.jar pixels-experiment config/sibench.yaml \
   results/inputs/hybench-pixels results/pixels/static-run
 ```
 
-Static runs read no original CSV/CDC. Update runs verify CDC hashes, complete transactions and common CSV/schema bindings; retained CSV copies are checked by descriptor/size, while preparation, fetch and `check-cdc-input` hash them fully. Trace-disabled application still verifies transaction/change totals and normal drain. File replay never loops or uses the Index Trace request budget. Phase timeouts are not whole-run resource quotas.
+Static runs read no original CSV or CDC. Update runs verify CDC hashes, complete transactions and the common CSV/schema bindings; retained CSV copies are checked by descriptor and size, and only preparation, fetch and `check-cdc-input` hash them fully. Even without Trace, application verifies transaction and change totals and a normal drain. File replay never loops and ignores the Index Trace request budget. Phase timeouts are not whole-run resource quotas.
 
 ## Query workload and results
 

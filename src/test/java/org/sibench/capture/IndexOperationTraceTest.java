@@ -78,6 +78,9 @@ public class IndexOperationTraceTest {
                     List.of(
                             IndexOperationTrace.search(1, 3, 0, point, 0, 0, 0).withWorkUnitId(-1),
                             IndexOperationTrace.search(1, 3, 0, point, 0, 2, 0),
+                            // A transaction-local read needs its source ordinal.
+                            IndexOperationTrace.search(1, 3, 0, point, 0, 0, IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
+                                    .withTransaction(1, 0),
                             IndexOperationTrace.transaction(1, 6, 1, 1, 0).withWorkUnitId(1),
                             // A limited search cannot return more than its limit.
                             IndexOperationTrace.search(

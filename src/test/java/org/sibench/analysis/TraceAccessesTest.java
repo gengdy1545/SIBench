@@ -136,9 +136,9 @@ public class TraceAccessesTest {
         for (int index = 0; index < 2; index++)
             ops.add(search(2, 1, index, Range.equal(IndexKey.ofInt(index == 0 ? 2 : 5)),
                     null, 0, 1, TRANSACTION_LOCAL_SEARCH | INTERSECT_GROUP, index, 2)
-                    .withTransaction(1, 1).withVersion(1).withWorkUnitId(1));
+                    .withTransaction(1, 1).withWorkUnitId(1));
         ops.add(search(3, 1, 0, new Range(null, false, null, false, true, 1),
-                0, 1, TRANSACTION_LOCAL_SEARCH).withTransaction(1, 1).withVersion(1).withWorkUnitId(1));
+                0, 1, TRANSACTION_LOCAL_SEARCH).withTransaction(1, 1).withWorkUnitId(1));
         ops.add(transaction(0, TRANSACTION_ABORT, 1, 1, 1));
         ops.add(get(4, 2, 0, 0));
         Path output = temporary.newFolder().toPath();

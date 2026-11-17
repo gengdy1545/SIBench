@@ -169,7 +169,7 @@ final class PixelsTrace implements AutoCloseable {
                     throw new IOException("Repeated Pixels key resolution without a change");
                 var search = search(event, table.id(), 0, Range.equal(key), version - 1, fact.rowId() >= 0 ? 1 : 0,
                         local ? TRANSACTION_LOCAL_SEARCH : SNAPSHOT_SEARCH).withTransaction(version, ordinal).withWorkUnitId(version);
-                workload.accept(local ? search.withVersion(version) : search);
+                workload.accept(search);
                 searches++;
                 continue;
             }

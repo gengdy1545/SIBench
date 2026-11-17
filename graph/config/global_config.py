@@ -1,7 +1,7 @@
 """Shared data locations, analysis settings and appearance for SIBench figures."""
 
 SIBENCH_JAR = "build/sibench/sibench.jar"
-RUNTIME_CONFIG = "develop/configs/current-traces.yaml"
+RUNTIME_CONFIG = "config/sibench.yaml"
 ANALYSIS_DIRECTORY = "results/analysis/trace"
 PLOT_DIRECTORY = "results/plots/trace"
 WINDOW_REQUESTS = 10000

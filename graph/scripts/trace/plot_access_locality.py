@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Plot exact-PK hits separately for each table and operation."""
 
-import argparse
 
 import matplotlib
 
@@ -12,14 +11,14 @@ from matplotlib.ticker import EngFormatter
 import numpy as np
 import pandas as pd
 
-from _common import load_analysis, load_inputs, save_figure
+from _common import load_analysis, load_inputs, parse_arguments, save_figure
 from graph.config import access_locality_config as style
 from graph.config.global_config import apply_style
 
 
 def main():
-    argparse.ArgumentParser(description=__doc__).parse_args()
-    config = load_inputs(style.TRACES)
+    arguments = parse_arguments(__doc__)
+    config = load_inputs(style.TRACES, arguments)
     apply_style()
     for trace in config["traces"]:
         directory, summary = load_analysis(config, trace)

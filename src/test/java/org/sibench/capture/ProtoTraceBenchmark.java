@@ -36,7 +36,7 @@ public final class ProtoTraceBenchmark {
                     workload.append(IndexOperationTrace.search(event - 1, 1, 0,
                             IndexOperationTrace.Range.equal(IndexKey.ofInt(row)), version - 1, 1,
                             IndexOperationTrace.TRANSACTION_LOCAL_SEARCH)
-                            .withVersion(version).withTransaction(event, 1).withWorkUnitId(version));
+                            .withTransaction(event, 1).withWorkUnitId(version));
                     workload.append(IndexOperationTrace.transaction(event,
                             IndexOperationTrace.TRANSACTION_COMMIT, event, version, 1));
                 }

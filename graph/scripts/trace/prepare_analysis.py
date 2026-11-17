@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """Extract exact Trace row-access distributions with the Java analyzer."""
 
-import argparse
 import hashlib
 import json
 from pathlib import Path
 import subprocess
 
-from _common import ROOT, load_inputs
+from _common import ROOT, load_inputs, parse_arguments
 from graph.config import access_locality_config, global_config
 
 
 def main():
-    argparse.ArgumentParser(description=__doc__).parse_args()
+    arguments = parse_arguments(__doc__)
     config_bytes = {Path(module.__file__): Path(module.__file__).read_bytes()
                     for module in (global_config, access_locality_config)}
-    config = load_inputs(access_locality_config.TRACES)
+    config = load_inputs(access_locality_config.TRACES, arguments)
     runtime_bytes = config["runtime"].read_bytes()
     jar = config["jar"]
     if not jar.is_file():
