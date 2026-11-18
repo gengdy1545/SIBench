@@ -91,6 +91,9 @@ RocksDB-Cloud and SlateDB are the comparison targets; local RocksDB serves gener
 python3 graph/scripts/trace/plot_operation_mix.py
 python3 graph/scripts/trace/prepare_analysis.py
 python3 graph/scripts/trace/plot_access_locality.py
+java -jar build/sibench/sibench.jar count-access-keys config/sibench.yaml > results/analysis/trace/access_key_counts.json
+python3 graph/scripts/trace/plot_access_coverage.py
+python3 graph/scripts/trace/plot_access_concentration.py
 ```
 
 Trace selection, `--runtime`/`--jar` overrides, outputs and update-layout analysis are in [plotting](graph/README.md).

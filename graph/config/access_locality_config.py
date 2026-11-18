@@ -1,4 +1,4 @@
-"""Trace selection and appearance for per-table, per-operation exact-PK locality."""
+"""Trace selection and appearance for per-table, per-operation access locality."""
 
 from graph.config.global_config import ANNOTATION_FONT_SIZE, DOUBLE_COLUMN_WIDTH, MUTED_TEXT_COLOR
 
@@ -13,17 +13,14 @@ TRACES = [{'name': 'hybench-tp', 'label': 'HyBench-TP'},
  {'name': 'ycsb-e', 'label': 'YCSB-E'},
  {'name': 'ycsb-f', 'label': 'YCSB-F'}]
 
-FIGURE_SIZE = (DOUBLE_COLUMN_WIDTH, 3)
-X_LABEL = "Workload request sequence ({window_requests:,} requests/window)"
-Y_LABEL = "Primary key"
-POINT_STYLE = {"s": 1, "linewidths": 0, "rasterized": True}
-KEY_TICKS = 5
-Y_PADDING_FRACTION = 0.02
-MIN_Y_PADDING = 0.5
-Y_TICK_FORMAT = {"style": "plain", "useOffset": False}
-EMPTY_TEXT = "No hits"
-EMPTY_TEXT_POSITION = (0.5, 0.5)
+FIGURE_SIZE = (DOUBLE_COLUMN_WIDTH, 4.8)
+KEY_BINS = 256
+WINDOWS_PER_HEATMAP_COLUMN = 10
+HEATMAP_SHARE_LIMITS = (0.0001, 1)
+X_LABEL = "Workload request sequence ({window_requests:,} requests per reuse window)"
+REUSE_LINES = {
+    "Repeat hit in this window": {"color": "#355c7d"},
+    "Key hit in the previous window": {"color": "#b35440"},
+}
 EMPTY_TEXT_STYLE = {"ha": "center", "va": "center", "color": MUTED_TEXT_COLOR,
                     "fontsize": ANNOTATION_FONT_SIZE}
-COLORBAR_STYLE = {"fraction": 0.035, "pad": 0.04,
-                  "label": "Hits per PK per window (log)"}

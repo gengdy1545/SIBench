@@ -56,6 +56,7 @@ public final class Sibench {
                 "       java -jar build/sibench/sibench.jar analyze-locality CONFIG BENCHMARK OUTPUT"
                         + "   (static baseline layout, update windows and overlap estimate)");
         out.println("       java -jar build/sibench/sibench.jar analyze-accesses CONFIG BENCHMARK OUTPUT");
+        out.println("       java -jar build/sibench/sibench.jar count-access-keys CONFIG [BENCHMARK ...]");
     }
 
     public static void main(String[] args) {
@@ -92,7 +93,8 @@ public final class Sibench {
                             "replay-service",
                             "verify-service",
                             "analyze-locality",
-                            "analyze-accesses")
+                            "analyze-accesses",
+                            "count-access-keys")
                     .contains(args[0])) {
                 throw new IllegalArgumentException("Unknown command: " + args[0]);
             }
@@ -286,6 +288,23 @@ public final class Sibench {
                         root.resolve(profiles.get(2)), ConfigValues.positive(accesses, "window_requests"),
                         ConfigValues.positive(accesses, "sort_memory_bytes"));
                 out.println(Files.readString(root.resolve(profiles.get(2)).resolve("summary.json")));
+                return 0;
+            }
+            if (args[0].equals("count-access-keys")) {
+                if (profiles.isEmpty()) throw new IllegalArgumentException(
+                        "count-access-keys requires CONFIG [BENCHMARK ...]");
+                var document = SibenchConfig.read(root.resolve(profiles.get(0)));
+                var accesses = ConfigValues.object(ConfigValues.object(document, "analysis"), "accesses");
+                var directories = new LinkedHashMap<>(BenchmarkSelection.directories(root, document));
+                if (profiles.size() > 1) {
+                    var selected = profiles.subList(1, profiles.size());
+                    if (!directories.keySet().containsAll(selected))
+                        throw new IllegalArgumentException("Unknown benchmark selection: " + selected);
+                    directories.keySet().retainAll(selected);
+                }
+                var result = org.sibench.analysis.TraceKeyCounts.run(directories,
+                        ConfigValues.positive(accesses, "sort_memory_bytes"));
+                out.println(new GsonBuilder().setPrettyPrinting().create().toJson(result));
                 return 0;
             }
             if (args[0].equals("analyze-locality")) {

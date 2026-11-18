@@ -16,20 +16,25 @@ from graph.config import global_config
 from graph.config.global_config import OUTPUT_FORMATS, SAVE_PARAMS
 
 
-def parse_arguments(description):
+def parse_arguments(description, *, analysis_paths=False):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--runtime", type=Path, help="runtime YAML (default: RUNTIME_CONFIG in global_config.py)")
     parser.add_argument("--jar", type=Path, help="SIBench JAR (default: SIBENCH_JAR in global_config.py)")
+    if analysis_paths:
+        parser.add_argument("--analysis-directory", type=Path, help="reuse an existing analysis directory")
+        parser.add_argument("--out", type=Path, help="output directory (default: PLOT_DIRECTORY in global_config.py)")
     return parser.parse_args()
 
 
 def load_inputs(traces, arguments):
+    analysis_directory = getattr(arguments, "analysis_directory", None)
+    plot_directory = getattr(arguments, "out", None)
     config = {
         # Command-line paths are relative to the working directory; ROOT / absolute keeps them unchanged.
         "jar": arguments.jar.resolve() if arguments.jar else global_config.SIBENCH_JAR,
         "runtime": arguments.runtime.resolve() if arguments.runtime else global_config.RUNTIME_CONFIG,
-        "analysis_directory": global_config.ANALYSIS_DIRECTORY,
-        "plot_directory": global_config.PLOT_DIRECTORY,
+        "analysis_directory": analysis_directory.resolve() if analysis_directory else global_config.ANALYSIS_DIRECTORY,
+        "plot_directory": plot_directory.resolve() if plot_directory else global_config.PLOT_DIRECTORY,
         "traces": deepcopy(traces),
     }
     for key in ("jar", "analysis_directory", "plot_directory", "runtime"):

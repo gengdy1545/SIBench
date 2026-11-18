@@ -18,6 +18,7 @@ import org.sibench.capture.IndexMutation;
 import org.sibench.capture.IndexCatalog;
 import org.sibench.capture.IndexOperationTrace;
 import org.sibench.capture.ProtoTrace;
+import org.sibench.state.ExternalSort;
 import org.sibench.trace.IndexKey;
 
 public class TraceAccessesTest {
@@ -60,6 +61,28 @@ public class TraceAccessesTest {
 
     private static List<IndexCatalog.Definition> tables() {
         return List.of(new IndexCatalog.Definition(1, "records", 0, "records_pk", "id", "int"));
+    }
+
+    @Test public void keyUniverseUsesDistinctPutsPerWorkloadAndIncludesPrivateReads() throws Exception {
+        var base = List.of(put(0, 10, 10, 0), put(0, 20, 20, 0),
+                write(0, INSERT, 2, 0, IndexKey.ofInt(10), 0, 0, 0, 10).withExpansion(0, 1));
+        var first = List.of(transaction(0, TRANSACTION_BEGIN, 1, 1, 0),
+                put(1, 10, 10, 1), put(2, 15, 15, 1).withTransaction(1, 2),
+                write(3, LOGICAL_DELETE, 1, 0, IndexKey.ofInt(20), 1, 0, 0, 20)
+                        .withTransaction(1, 3).withWorkUnitId(3).withExpansion(0, 1),
+                transaction(0, TRANSACTION_COMMIT, 1, 1, 3),
+                transaction(0, TRANSACTION_BEGIN, 2, 2, 0), put(4, 20, 21, 2),
+                transaction(0, TRANSACTION_COMMIT, 2, 2, 1),
+                transaction(0, TRANSACTION_BEGIN, 3, 3, 0), put(5, 40, 40, 3),
+                search(6, 1, 0, Range.equal(IndexKey.ofInt(40)), 2, 1, TRANSACTION_LOCAL_SEARCH)
+                        .withTransaction(3, 1).withWorkUnitId(6),
+                transaction(0, TRANSACTION_ABORT, 3, 3, 1));
+        var second = List.of(transaction(0, TRANSACTION_BEGIN, 1, 1, 0), put(1, 15, 16, 1),
+                transaction(0, TRANSACTION_COMMIT, 1, 1, 1));
+        try (var sort = new ExternalSort(temporary.newFolder().toPath().resolve("keys"), 128)) {
+            assertArrayEquals(new long[]{3, 2, 1},
+                    TraceKeyCounts.count(export(base), List.of(export(first), export(second)), sort));
+        }
     }
 
     @Test public void differentPrimaryKeysInOneWindowRemainSeparate() throws Exception {
