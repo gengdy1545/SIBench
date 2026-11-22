@@ -1,7 +1,8 @@
 # Plotting
 
-Figures are rendered from analysis tables and Trace manifests. Trace decoding, key
-interpretation and transaction semantics stay in the Java analysis layer.
+Figures are rendered from analysis tables, Trace manifests and replay reports.
+Trace decoding, key interpretation and transaction semantics stay in the Java
+analysis layer.
 
 ## Setup
 
@@ -13,22 +14,25 @@ python3 -m pip install -r graph/requirements.txt
 sudo apt-get install fonts-linuxlibertine   # Ubuntu/Debian
 ```
 
-Build `build/sibench/sibench.jar` first (`mvn package`); every entry point uses it to
-resolve Trace paths.
+For Trace figures, build `build/sibench/sibench.jar` first (`mvn package`); their
+entry points use it to resolve Trace paths. Replay figures read saved reports and
+need only the plotting dependencies.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
 | `scripts/trace/` | Operation mix, access locality, access coverage, access concentration and update locality. |
+| `scripts/replay/` | Index Service replay performance. |
 | `config/global_config.py` | Paths, widths, typography, colors, export. |
 | `config/*_config.py` | One file per figure: `TRACES` selection, size, labels and local overrides. |
 
-Run scripts from any directory; paths resolve from the repository root. Outputs use
-fixed names under `results/analysis/trace/` and `results/plots/trace/`, so a rerun
-overwrites them.
+Run scripts from any directory; configured paths resolve from the repository root
+and command-line paths from the working directory. Outputs use fixed names under
+`results/analysis/trace/`, `results/plots/trace/` and `results/plots/replay/`, so a
+rerun overwrites them.
 
-## Input selection
+## Trace input selection
 
 `RUNTIME_CONFIG` (default `config/sibench.yaml`) names the runtime YAML whose
 benchmark entries locate the local Traces. Select entries and display labels with
@@ -189,6 +193,33 @@ axis. Outputs are `access_concentration.{pdf,png,csv}`.
 
 ```bash
 python3 -m unittest discover -s src/test/python -p test_access_concentration.py
+```
+
+## Replay performance
+
+```bash
+python3 graph/scripts/replay/plot_replay_performance.py --results path/to/sweep
+```
+
+Six vertically stacked bar panels share the Trace axis: baseline load and workload
+throughput, workload read P50/P99 and write P50/P99. Each Trace has one bar per
+backend. `replay_performance_config.py` selects the sweep directory
+(`RESULTS_DIRECTORY`, default `results/replay/`, holding
+`<trace>/<backend>/report.json` from `replay-service`),
+`TRACES`, `BACKENDS` and the report field of each panel (`METRICS`). Latency panels use a
+logarithmic axis. A missing report or a status other than `passed` stops plotting; a
+latency without samples (no workload writes in YCSB-C) is shown as n/a. Invalid
+numeric measurements, including nonpositive sampled latency on a log axis, are
+rejected. Read latency
+combines Get and Scan, as in the [replay report](../docs/index-service.md#replay-and-measurement).
+`--results PATH` and `--out PATH` override the input and output directories. Outputs are
+`replay_performance.{pdf,png,csv}` under `results/plots/replay/`; the CSV keeps every
+value in source units (operations/s or ms) with its report SHA-256; unsampled
+latencies have an empty value. The plots summarize the selected reports and do not
+establish equivalent experiment settings or independent value correctness.
+
+```bash
+python3 -m unittest discover -s src/test/python -p test_replay_performance.py
 ```
 
 ## Update locality

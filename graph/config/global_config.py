@@ -4,6 +4,7 @@ SIBENCH_JAR = "build/sibench/sibench.jar"
 RUNTIME_CONFIG = "config/sibench.yaml"
 ANALYSIS_DIRECTORY = "results/analysis/trace"
 PLOT_DIRECTORY = "results/plots/trace"
+REPLAY_PLOT_DIRECTORY = "results/plots/replay"
 
 # Figure widths in inches, following retina-graph's layout constants.
 SINGLE_COLUMN_WIDTH = 3.3374
