@@ -15,9 +15,9 @@ public class ServiceConfigTest {
     @Test public void serverPortMustFitTheNetworkPortRange() {
         for (int port : new int[] {-1, 65536})
             assertThrows(IllegalArgumentException.class, () -> new ServiceConfig("rocksdb", null,
-                    temporary.getRoot().toPath(), port, ValueKind.ROW_ID, null, false, true));
+                    temporary.getRoot().toPath(), port, ValueKind.ROW_ID, null, false, true, new ServiceConfig.Execution(4, 2, temporary.getRoot().toPath().resolve("stats.jsonl"))));
         assertThrows(IllegalArgumentException.class, () -> new ServiceConfig("rocksdb", null,
-                temporary.getRoot().toPath(), 0, ValueKind.ROW_ID, null, false, false));
+                temporary.getRoot().toPath(), 0, ValueKind.ROW_ID, null, false, false, new ServiceConfig.Execution(4, 2, temporary.getRoot().toPath().resolve("stats.jsonl"))));
     }
 
     @Test
@@ -26,6 +26,10 @@ public class ServiceConfigTest {
         String current = """
                 schema_version: 1
                 purpose: index_service
+                execution:
+                  read_threads: 4
+                  write_threads: 2
+                  statistics: statistics.jsonl
                 service:
                   backend: rocksdb
                   path: index
@@ -33,7 +37,16 @@ public class ServiceConfigTest {
                   value: row_id
                 """;
         Files.writeString(config, current);
-        assertEquals("rocksdb", ServiceConfig.ofServer(temporary.getRoot().toPath(), config, Map.of()).adapter());
+        var parsed = ServiceConfig.ofServer(temporary.getRoot().toPath(), config, Map.of());
+        assertEquals("rocksdb", parsed.adapter());
+        assertEquals(new ServiceConfig.Execution(4, 2, temporary.getRoot().toPath().resolve("statistics.jsonl")), parsed.execution());
+        for (String invalid : new String[]{current.replace("read_threads: 4", "read_threads: 0"),
+                current.replace("write_threads: 2", "write_threads: -1"),
+                current.replace("write_threads: 2", "write_threads: 1.5"),
+                current.replace("statistics: statistics.jsonl", "unknown: statistics.jsonl")}) {
+            Files.writeString(config, invalid);
+            assertThrows(IllegalArgumentException.class, () -> ServiceConfig.ofServer(temporary.getRoot().toPath(), config, Map.of()));
+        }
         Files.writeString(config, current + "  unknown_option: true\n");
         var error = assertThrows(IllegalArgumentException.class,
                 () -> ServiceConfig.ofServer(temporary.getRoot().toPath(), config, Map.of()));
@@ -73,6 +86,10 @@ public class ServiceConfigTest {
             String base = """
                     schema_version: 1
                     purpose: index_service
+                    execution:
+                      read_threads: 4
+                      write_threads: 2
+                      statistics: statistics.jsonl
                     service:
                       backend: %s
                       path: index
@@ -103,6 +120,10 @@ public class ServiceConfigTest {
         String base = """
                 schema_version: 1
                 purpose: index_service
+                execution:
+                  read_threads: 4
+                  write_threads: 2
+                  statistics: statistics.jsonl
                 service:
                   backend: relive
                   endpoint: http://127.0.0.1:7001

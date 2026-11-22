@@ -90,7 +90,7 @@ public class ServiceReplayTest {
 
     @Test public void completedBaselineSurvivesWorkloadFailureWithoutClaimingFullReplay() throws Exception {
         for (String outcome : List.of("passed", "wrong-result", "failed-write")) {
-            var backend = new IndexBackend() {
+            var backend = new IndexTestSupport.BlockingBackend() {
                 int writes;
                 public IndexDescription describe() { return new IndexDescription("test", ValueKind.ROW_ID,
                         Acknowledgement.ACK_MEMORY, false, "test memory", "test"); }
@@ -106,7 +106,7 @@ public class ServiceReplayTest {
                 public void close() {}
             };
             Path input = trace(temporary.newFolder().toPath()), report = input.resolve("replay.json");
-            try (var server = IndexServer.start(0, backend)) {
+            try (var server = IndexTestSupport.start(0, backend)) {
                 var service = new ServiceTarget("127.0.0.1:" + server.port(), ValueKind.ROW_ID);
                 var config = new ReplayConfig(false, 0, 0, 0, 0, "operation", 1, 2, 5, 1);
                 if (outcome.equals("passed")) assertEquals("passed", ServiceReplay.run(input, config, service, report).get("status"));

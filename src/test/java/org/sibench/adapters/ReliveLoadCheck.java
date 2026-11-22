@@ -60,10 +60,10 @@ public final class ReliveLoadCheck {
     }
 
     static boolean drained(com.google.gson.JsonObject stats) {
-        return stats.get("memoryCharge").getAsLong() == 0
-                && stats.get("frozenMemtables").getAsLong() == 0
+        return stats.get("activeSegments").getAsLong() == 0
+                && stats.get("sealedSegments").getAsLong() == 0
                 && stats.get("compactionEligibleBytes").getAsLong() == 0
-                && !stats.get("backgroundFlushing").getAsBoolean()
+                && !stats.get("backgroundConverting").getAsBoolean()
                 && !stats.get("backgroundCompacting").getAsBoolean();
     }
 
@@ -121,8 +121,8 @@ public final class ReliveLoadCheck {
         var channels = new ArrayList<ManagedChannel>();
         try (var backend = new ReliveBackend(args[0], ValueKind.ROW_ID);
              var follower = new ReliveBackend(args[1], ValueKind.ROW_ID);
-             var server = IndexServer.start(0, backend);
-             var observer = IndexServer.start(0, follower)) {
+             var server = IndexTestSupport.start(0, backend);
+             var observer = IndexTestSupport.start(0, follower)) {
             var writers = new ArrayList<IndexServiceGrpc.IndexServiceBlockingStub>();
             for (int i = 0; i < clients + 2; i++) {
                 var channel = IndexServerTest.channel(i == clients + 1 ? observer.port() : server.port());

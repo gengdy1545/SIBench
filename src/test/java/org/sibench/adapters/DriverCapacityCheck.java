@@ -140,7 +140,7 @@ public final class DriverCapacityCheck {
         var requests = new TraceRequests(ValueKind.ROW_ID);
         IndexDescription description;
         try (var backend = VersionedIndexBackend.create(output.resolve("index"), ValueKind.ROW_ID);
-                var executor = new IndexExecutor(backend)) {
+                var executor = IndexTestSupport.executor(backend)) {
             description = backend.describe();
             var baselineRequests = new TraceRequests(ValueKind.ROW_ID);
             baselineRequests.baselineBatch(64);
@@ -243,7 +243,7 @@ public final class DriverCapacityCheck {
             }
             if (data.read() != -1) throw new IOException("Extra fixture records");
         }
-        IndexBackend backend = new IndexBackend() {
+        IndexBackend backend = new IndexTestSupport.BlockingBackend() {
             public IndexDescription describe() {
                 return new IndexDescription("recorded-response-fixture",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,false,
                         "diagnostic responses; no persistent index",fixture.toString());
@@ -273,7 +273,7 @@ public final class DriverCapacityCheck {
             public String location() { return fixture.toString(); }
             public void close() {}
         };
-        var server = IndexServer.start(port,backend);
+        var server = IndexTestSupport.start(port,backend);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> { try { server.close(); } catch(IOException ignored) {} }));
         System.out.println("READY port=" + server.port());
         server.awaitTermination();

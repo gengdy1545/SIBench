@@ -7,6 +7,7 @@ import org.sibench.adapters.proto.Mutation;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * A KV index service implementation behind the SIBench index protocol (proto). It owns
@@ -17,13 +18,17 @@ import java.util.List;
 public interface IndexBackend extends AutoCloseable {
     IndexDescription describe();
 
-    /** Applies one write; later normal reads at applicable versions see its effect once this returns. */
-    void write(Mutation write) throws IOException;
-
-    /** Applies validated writes; all are visible once this returns, without an atomicity promise. */
-    default void writeBatch(List<Mutation> writes) throws IOException {
-        for (var write : writes) write(write);
+    /** Later reads at applicable versions see the write after successful completion. */
+    default CompletableFuture<Void> writeAsync(Mutation write) throws IOException {
+        return writeBatchAsync(List.of(write));
     }
+
+    /**
+     * Success acknowledges every write at the declared durability, without an atomicity promise.
+     * A synchronous binding may perform the work before returning a completed future; a remote binding
+     * may return while transport is pending. Only successful completion establishes visibility.
+     */
+    CompletableFuture<Void> writeBatchAsync(List<Mutation> writes) throws IOException;
 
     /** Receives search results one at a time, in result order. */
     @FunctionalInterface
@@ -37,8 +42,11 @@ public interface IndexBackend extends AutoCloseable {
     /** The visible entries of a half-open byte range, at most its limit. */
     void scan(ScanRequest scan, ValueSink sink) throws IOException;
 
-    /** Every write that returned is durable to the level {@link #describe()} declares. */
+    /** Persists completed writes; the caller must drain outstanding write futures before final persistence. */
     void flush() throws IOException;
+
+    /** Optional engine measurements. The service owns call timings and statistics output for every backend. */
+    default java.util.Map<String, Object> statistics() throws IOException { return java.util.Map.of(); }
 
     /**
      * Binds the index to the trace it holds: recorded on first use, durable after the next

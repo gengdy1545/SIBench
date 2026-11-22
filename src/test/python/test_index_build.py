@@ -42,6 +42,11 @@ class IndexBuildTest(unittest.TestCase):
             self.git(self.root, "update-index", "--add", "--cacheinfo",
                      f"160000,{self.pins[source]},{source.relative_to(self.root)}")
         (self.root / "bin").mkdir()
+        for name, content in (("id", "#!/bin/sh\necho 1000\n"),
+                              ("sudo", '#!/bin/sh\nexec "$@"\n')):
+            tool = self.root / "bin" / name
+            tool.write_text(content)
+            tool.chmod(0o755)
         yum = self.root / "bin/yum"
         yum.write_text('#!/bin/sh\necho "dependency installation reached"\nexit 73\n')
         yum.chmod(0o755)

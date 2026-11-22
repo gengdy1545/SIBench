@@ -24,7 +24,7 @@ public class ServiceValueCheckTest {
         if (calls == 0) assertEquals(0.0, total, 0.0);
     }
 
-    private static final class Answers implements IndexBackend {
+    private static final class Answers implements IndexTestSupport.BlockingBackend {
         ByteString value;
         final List<ByteString> values;
         final List<Mutation> written = new ArrayList<>();
@@ -41,7 +41,7 @@ public class ServiceValueCheckTest {
         }
         public void writeBatch(List<Mutation> batch) throws IOException {
             batches++;
-            IndexBackend.super.writeBatch(batch);
+            IndexTestSupport.BlockingBackend.super.writeBatch(batch);
         }
         public ByteString get(GetRequest request) { return value; }
         public void scan(ScanRequest request, ValueSink sink) throws IOException {
@@ -177,7 +177,7 @@ public class ServiceValueCheckTest {
         var actual = new Answers(null, java.util.Collections.nCopies(17000, bytes("actual")));
         var reference = new Answers(null, java.util.Collections.nCopies(17000, bytes("wrong")));
         try (var check = new ServiceValueCheck(actual, reference)) {
-            var server = IndexServer.start(0, check);
+            var server = IndexTestSupport.start(0, check);
             var channel = IndexServerTest.channel(server.port());
             try {
                 var results = IndexServiceGrpc.newBlockingStub(channel).scan(ScanRequest.getDefaultInstance());

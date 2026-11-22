@@ -216,7 +216,7 @@ public final class Sibench {
                 RunTiming.current().measure(service.path());
                 var backend = service.backend();
                 IndexServer server;
-                try { server = IndexServer.start(service.port(), backend); }
+                try { server = IndexServer.start(service.port(), backend, service.execution()); }
                 catch (Exception failure) {
                     try { backend.close(); } catch (Exception close) { failure.addSuppressed(close); }
                     throw failure;

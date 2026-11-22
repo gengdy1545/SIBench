@@ -22,7 +22,13 @@ public class CloudRocksStoreTest {
         counts[9] = 2;
         String text = "write " + Arrays.stream(counts).mapToObj(Long::toString).collect(Collectors.joining(" "));
         assertArrayEquals(counts, OrderedStore.parseRequests(text + "\n").get("write"));
-        var stats = VersionedIndexBackend.objectRequestStats(counts);
+        // Service call timing uses the same bucket rule as the native request counters.
+        var times = new CallTimes();
+        for (long micros : new long[] {0, 1, 2, 5, 6, 7, 8, 17, 32}) times.record(micros * 1000, micros != 2);
+        long[] recorded = times.snapshot();
+        recorded[2] = counts[2];
+        assertArrayEquals(counts, recorded);
+        var stats = CallTimes.describe(counts);
         assertEquals(9L, stats.get("requests"));
         assertEquals(1L, stats.get("failed"));
         var histogram = (java.util.Map<?, ?>) stats.get("latency_micros");
@@ -31,11 +37,11 @@ public class CloudRocksStoreTest {
         assertEquals(32L, histogram.get("p95_upper_bound"));
         assertEquals(32L, histogram.get("p99_upper_bound"));
         counts = new long[36];
-        histogram = (java.util.Map<?, ?>) VersionedIndexBackend.objectRequestStats(counts).get("latency_micros");
+        histogram = (java.util.Map<?, ?>) CallTimes.describe(counts).get("latency_micros");
         assertEquals(0L, histogram.get("samples"));
         assertEquals(0L, histogram.get("p99_upper_bound"));
         counts[35] = 1;
-        histogram = (java.util.Map<?, ?>) VersionedIndexBackend.objectRequestStats(counts).get("latency_micros");
+        histogram = (java.util.Map<?, ?>) CallTimes.describe(counts).get("latency_micros");
         assertEquals(Long.MAX_VALUE, histogram.get("p99_upper_bound"));
     }
 

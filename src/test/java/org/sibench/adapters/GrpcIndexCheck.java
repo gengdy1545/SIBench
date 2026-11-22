@@ -9,7 +9,7 @@ import java.util.concurrent.ExecutionException;
 import org.sibench.adapters.proto.*;
 
 /** Acceptance-only backend view of the ordinary gRPC transport; never interprets Trace. */
-final class GrpcIndexCheck implements IndexBackend {
+final class GrpcIndexCheck implements IndexTestSupport.BlockingBackend {
     private final GrpcService remote;
     private final ServiceClient client;
     private final String binding;

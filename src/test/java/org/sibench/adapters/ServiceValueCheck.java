@@ -19,7 +19,7 @@ import org.sibench.adapters.proto.Mutation;
 import org.sibench.adapters.proto.ScanRequest;
 
 /** Explicit acceptance bridge; reference work is included in its latency, never backend performance. */
-public final class ServiceValueCheck implements IndexBackend {
+public final class ServiceValueCheck implements IndexTestSupport.BlockingBackend {
     private final IndexBackend actual, reference;
     private final AtomicReference<IOException> failure = new AtomicReference<>();
     private final AtomicLong writes = new AtomicLong(), gets = new AtomicLong(), scans = new AtomicLong();
@@ -81,16 +81,16 @@ public final class ServiceValueCheck implements IndexBackend {
 
     @Override public void write(Mutation mutation) throws IOException {
         checked(() -> {
-            timed(actualWrites, () -> actual.write(mutation));
-            timed(referenceWrites, () -> reference.write(mutation));
+            timed(actualWrites, () -> IndexTestSupport.awaitWrite(actual.writeAsync(mutation)));
+            timed(referenceWrites, () -> IndexTestSupport.awaitWrite(reference.writeAsync(mutation)));
             writes.incrementAndGet();
         });
     }
 
     @Override public void writeBatch(List<Mutation> batch) throws IOException {
         checked(() -> {
-            timed(actualWrites, () -> actual.writeBatch(batch));
-            timed(referenceWrites, () -> reference.writeBatch(batch));
+            timed(actualWrites, () -> IndexTestSupport.awaitWrite(actual.writeBatchAsync(batch)));
+            timed(referenceWrites, () -> IndexTestSupport.awaitWrite(reference.writeBatchAsync(batch)));
             writes.addAndGet(batch.size());
         });
     }
@@ -189,7 +189,7 @@ public final class ServiceValueCheck implements IndexBackend {
             actual = new GrpcIndexCheck(service, binding, replay.requestTimeoutSeconds());
             reference = VersionedIndexBackend.create(referencePath, service.value());
             checker = new ServiceValueCheck(actual, reference);
-            server = IndexServer.start(0, checker);
+            server = IndexTestSupport.start(0, checker);
             var checkedService = new ServiceTarget("127.0.0.1:" + server.port(), service.value());
             ServiceReplay.run(trace, replay, checkedService, report);
         } catch (Exception | Error error) {

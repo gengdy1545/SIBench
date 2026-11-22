@@ -36,10 +36,9 @@ public class VersionedIndexBackendTest {
                         if(method.getName().equals("close")){closed[0]++;throw new java.io.IOException("injected close failure");}
                         throw original;
                     });
-            var method=VersionedIndexBackend.class.getDeclaredMethod(action,OrderedStore.class,ValueKind.class,java.nio.file.Path.class);
+            var method=VersionedIndexBackend.class.getDeclaredMethod(action,OrderedStore.class,ValueKind.class);
             method.setAccessible(true);
-            var error=assertThrows(java.lang.reflect.InvocationTargetException.class,()->method.invoke(null,store,ValueKind.ROW_ID,
-                    temporary.getRoot().toPath().resolve(action)));
+            var error=assertThrows(java.lang.reflect.InvocationTargetException.class,()->method.invoke(null,store,ValueKind.ROW_ID));
             assertSame(original,error.getCause());assertEquals(1,closed[0]);
             assertEquals("injected close failure",original.getSuppressed()[0].getMessage());
         }
@@ -116,7 +115,7 @@ public class VersionedIndexBackendTest {
         var mutation = Mutation.newBuilder();
         if (deleted) mutation.setDelete(DeleteRequest.newBuilder().setKey(key).setTs(version));
         else mutation.setPut(PutRequest.newBuilder().setKey(key).setTs(version).setValue(IndexEntry.rowId(rowId)));
-        backend.write(mutation.build());
+        backend.writeAsync(mutation.build());
     }
 
     private static LookupResult row(int pk, long version, long rowId) {
@@ -134,12 +133,12 @@ public class VersionedIndexBackendTest {
         ByteString a = keys.get(3), ab = keys.get(5), updated = ByteString.copyFromUtf8("new");
         try (var backend = load(List.of(), ValueKind.ROW_ID)) {
             // Arrival order differs from timestamp order; values have no RowID/Locator shape.
-            backend.write(Mutation.newBuilder().setPut(PutRequest.newBuilder()
+            backend.writeAsync(Mutation.newBuilder().setPut(PutRequest.newBuilder()
                     .setKey(a).setTs(4).setValue(updated)).build());
-            for (var key : keys) backend.write(Mutation.newBuilder().setPut(PutRequest.newBuilder()
+            for (var key : keys) backend.writeAsync(Mutation.newBuilder().setPut(PutRequest.newBuilder()
                     .setKey(key).setTs(1).setValue(key)).build());
-            backend.write(Mutation.newBuilder().setDelete(DeleteRequest.newBuilder().setKey(a).setTs(3)).build());
-            backend.write(Mutation.newBuilder().setDelete(DeleteRequest.newBuilder().setKey(ab).setTs(5)).build());
+            backend.writeAsync(Mutation.newBuilder().setDelete(DeleteRequest.newBuilder().setKey(a).setTs(3)).build());
+            backend.writeAsync(Mutation.newBuilder().setDelete(DeleteRequest.newBuilder().setKey(ab).setTs(5)).build());
             for (long ts : new long[] {0, 1, 3, 4, 5, Long.MAX_VALUE}) {
                 var expected = new java.util.LinkedHashMap<ByteString, ByteString>();
                 for (var key : keys) {
@@ -306,6 +305,9 @@ public class VersionedIndexBackendTest {
             put(backend, 0, 0, 7, 0, 70, false);
             put(backend, 0, 0, 7, 42, 71, false);
             backend.flush();
+            var statistics = backend.statistics();
+            assertEquals("N/A", statistics.get("object_requests"));
+            assertTrue(statistics.get("rocksdb.stats").toString().contains("Compaction Stats"));
         }
         try (var backend = VersionedIndexBackend.open(path, ValueKind.ROW_ID)) {
             same("retained old value", List.of(row(7, 0, 70)), IndexTestSupport.scan(backend, search(0, Range.equal(IndexKey.ofInt(7)), 41)), true);
@@ -315,12 +317,6 @@ public class VersionedIndexBackendTest {
             assertThrows(java.io.IOException.class, () -> backend.bind("trace-b"));
             assertEquals(path.toAbsolutePath().toString(), backend.describe().location());
         }
-        var stats = java.nio.file.Files.readAllLines(path.resolveSibling("reopen.engine-stats.jsonl"));
-        assertEquals(1, stats.size());
-        var line = com.google.gson.JsonParser.parseString(stats.get(0)).getAsJsonObject();
-        assertEquals(1, line.get("flush").getAsLong());
-        assertEquals("N/A", line.get("object_requests").getAsString());
-        assertTrue(line.get("rocksdb.stats").getAsString().contains("Compaction Stats"));
         assertThrows(java.io.IOException.class, () -> VersionedIndexBackend.open(path, ValueKind.LOCATOR));
         assertThrows(
                 java.io.IOException.class,

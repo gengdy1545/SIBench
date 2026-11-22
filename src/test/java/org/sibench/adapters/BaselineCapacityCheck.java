@@ -43,7 +43,7 @@ public final class BaselineCapacityCheck {
         }
         Map<String,Long> summary() { return Map.of("members",count.sum(),"sum64",sum.sum(),"xor64",xor.get()); }
     }
-    static final class Sink implements IndexBackend {
+    static final class Sink implements IndexTestSupport.BlockingBackend {
         final Fingerprint received=new Fingerprint();final Path report;final boolean dropFirst;final AtomicBoolean dropped=new AtomicBoolean();String binding="";
         Sink(Path report,boolean dropFirst) { this.report=report;this.dropFirst=dropFirst; }
         public IndexDescription describe() { return new IndexDescription("baseline-transport-field-check-sink",ValueKind.ROW_ID,Acknowledgement.ACK_MEMORY,false,"diagnostic field receiver; no index storage",location()); }
@@ -98,7 +98,7 @@ public final class BaselineCapacityCheck {
     }
     public static void main(String[] args) throws Exception {
         if (args[0].startsWith("serve")) {
-            var sink=new Sink(Path.of(args[2]),args[0].equals("serve-drop"));var server=IndexServer.start(Integer.parseInt(args[1]),sink);
+            var sink=new Sink(Path.of(args[2]),args[0].equals("serve-drop"));var server=IndexTestSupport.start(Integer.parseInt(args[1]),sink);
             Runtime.getRuntime().addShutdownHook(new Thread(() -> { try {server.close();}catch(IOException ignored){} }));System.out.println("READY "+server.port());server.awaitTermination();
         } else if(args[0].equals("series")) {
             Path trace=Path.of(args[1]),receiver=Path.of(args[3]),output=Path.of(args[4]);

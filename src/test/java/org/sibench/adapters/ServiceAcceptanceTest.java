@@ -40,7 +40,7 @@ public class ServiceAcceptanceTest {
         for (var kind : ValueKind.values()) {
             Path root = temporary.newFolder().toPath();
             try (var backend = VersionedIndexBackend.create(root.resolve("index"), kind);
-                 var server = IndexServer.start(0, backend)) {
+                 var server = IndexTestSupport.start(0, backend)) {
                 Path config = config(root, server.port(), root.resolve("unused-trace"), kind);
                 Path report = root.resolve("protocol.json");
                 IndexServiceCheck.main(new String[]{config.toString(), report.toString()});
@@ -60,8 +60,8 @@ public class ServiceAcceptanceTest {
             try (var store = VersionedIndexBackend.create(root.resolve("index"), ValueKind.ROW_ID)) {
                 var backend = new IndexBackend() {
                     public IndexDescription describe() { return store.describe(); }
-                    public void write(Mutation mutation) throws IOException { store.write(mutation); }
-                    public void writeBatch(java.util.List<Mutation> writes) throws IOException { store.writeBatch(writes); }
+                    public java.util.concurrent.CompletableFuture<Void> writeAsync(Mutation mutation) throws IOException { return store.writeAsync(mutation); }
+                    public java.util.concurrent.CompletableFuture<Void> writeBatchAsync(java.util.List<Mutation> writes) throws IOException { return store.writeBatchAsync(writes); }
                     public ByteString get(GetRequest get) throws IOException {
                         return wrong ? org.sibench.trace.IndexEntry.rowId(999) : store.get(get);
                     }
@@ -70,7 +70,7 @@ public class ServiceAcceptanceTest {
                     public void flush() throws IOException { store.flush(); }
                     public void close() {}
                 };
-                try (var server = IndexServer.start(0, backend)) {
+                try (var server = IndexTestSupport.start(0, backend)) {
                     Path config = config(root, server.port(), trace, ValueKind.ROW_ID);
                     Path report = root.resolve("replay.json");
                     String[] args = {config.toString(), "case", root.resolve("reference").toString(), report.toString()};

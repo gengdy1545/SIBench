@@ -30,15 +30,25 @@ public record ServiceConfig(
         ValueKind value,
         ObjectStore objects,
         boolean reopen,
-        boolean wal) {
+        boolean wal,
+        Execution execution) {
+    /** SIBench service/bridge resources, independent of the backend's internal worker pools. */
+    public record Execution(int readThreads, int writeThreads, Path statistics) {
+        public Execution {
+            require(readThreads > 0 && writeThreads > 0, "Execution thread counts must be positive");
+            require(statistics != null, "Execution needs a statistics output path");
+        }
+    }
+
     public ServiceConfig {
+        require(execution != null, "An index service needs execution settings");
         require(port >= 0 && port <= 65535, "Invalid index service port");
         require(Set.of("relive", "rocksdb", "rocksdb_cloud", "slatedb").contains(adapter), "Unknown service backend: " + adapter);
         boolean relive = adapter.equals("relive");
         require(!relive || endpoint != null && !endpoint.isBlank(), "The Relive bridge needs an endpoint");
         require(relive || path != null, "An index needs a path");
         require(!adapter.equals("relive") || path == null && objects == null && !reopen && wal,
-                "Relive owns its storage, reopening and forced journal policy");
+                "Relive owns its storage, reopening and durability policy");
         require(!(adapter.equals("rocksdb_cloud") || adapter.equals("slatedb")) || objects != null,
                 "An object-storage backend needs storage settings");
         require(wal || adapter.equals("rocksdb_cloud") || adapter.equals("slatedb"),
@@ -48,9 +58,13 @@ public record ServiceConfig(
     /** A server with visible mutation acknowledgements and versioned reads. */
     public static ServiceConfig ofServer(Path root, Path path, Map<String, Object> runtime) throws java.io.IOException {
         Map<String, Object> document = parse(Files.readString(root.resolve(path)));
-        keys(document, Set.of("schema_version", "purpose", "service"));
+        keys(document, Set.of("schema_version", "purpose", "service", "execution"));
         require(integer(document, "schema_version") == 1, "Expected index service config v1");
         require(string(document, "purpose").equals("index_service"), "Expected index_service purpose");
+        var settings = object(document, "execution");
+        keys(settings, Set.of("read_threads", "write_threads", "statistics"));
+        var execution = new Execution(Math.toIntExact(positive(settings, "read_threads")),
+                Math.toIntExact(positive(settings, "write_threads")), root.resolve(string(settings, "statistics")));
         var service = object(document, "service");
         keys(
                 service,
@@ -64,7 +78,7 @@ public record ServiceConfig(
         if (backend.equals("relive")) {
             keys(service, Set.of("backend", "endpoint", "port", "value"));
             return new ServiceConfig(backend, string(service, "endpoint"), null,
-                    Math.toIntExact(positive(service, "port")), value(service), null, false, true);
+                    Math.toIntExact(positive(service, "port")), value(service), null, false, true, execution);
         }
         require(!service.containsKey("endpoint"), "endpoint is only for the Relive bridge");
         boolean cloud = !backend.equals("rocksdb");
@@ -81,7 +95,7 @@ public record ServiceConfig(
                                 runtime, string(service, "storage"))
                         : null,
                 service.containsKey("reopen") && bool(service, "reopen"),
-                !cloud || bool(service, "wal"));
+                !cloud || bool(service, "wal"), execution);
     }
 
     /** This server's index, new or reopened. */

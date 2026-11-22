@@ -16,6 +16,8 @@ class CloudBuildTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
+        self.tool("id", "#!/bin/sh\necho 1000\n")
+        self.tool("sudo", '#!/bin/sh\nexec "$@"\n')
         (self.root / "scripts").mkdir()
         shutil.copy(Path(__file__).resolve().parents[3] / "scripts/build-rocksdb-cloud.sh", self.root / "scripts")
         self.git(self.root, "init", "-q")

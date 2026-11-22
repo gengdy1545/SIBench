@@ -47,7 +47,7 @@ public class ReliveIntegrationCheck {
             start.setAccessible(true);
             Method address = loader.loadClass("org.relive.IndexServer").getMethod("address");
             for (boolean maintain : List.of(true, false)) {
-                Path directory = temporary.getRoot().toPath().resolve(maintain ? "flushed" : "journal");
+                Path directory = temporary.getRoot().toPath().resolve(maintain ? "sorted" : "active-segment");
                 try (var first = (AutoCloseable) start.invoke(null, directory, 0);
                      var second = (AutoCloseable) start.invoke(null, directory, 0)) {
                     exercise((String) address.invoke(first), (String) address.invoke(second), maintain);
@@ -61,18 +61,18 @@ public class ReliveIntegrationCheck {
 
     /** Explicit real-deployment check; the caller owns fresh service state and process restart. */
     public static void main(String[] args) throws Exception {
-        if (args.length == 3 && (args[0].equals("populate") || args[0].equals("populate-journal")))
+        if (args.length == 3 && (args[0].equals("populate") || args[0].equals("populate-active")))
             exercise(args[1], args[2], args[0].equals("populate"));
         else if (args.length == 2 && args[0].equals("reopen")) checkReopened(args[1]);
-        else throw new IllegalArgumentException("populate URL_A URL_B | populate-journal URL_A URL_B | reopen URL");
+        else throw new IllegalArgumentException("populate URL_A URL_B | populate-active URL_A URL_B | reopen URL");
         System.out.println("Relive gRPC " + args[0] + " semantic check passed");
     }
 
     private static void exercise(String endpoint, String otherEndpoint, boolean maintain) throws Exception {
         try (var left = new ReliveBackend(endpoint, ValueKind.ROW_ID);
              var right = new ReliveBackend(otherEndpoint, ValueKind.ROW_ID);
-             var server = IndexServer.start(0, left);
-             var observer = IndexServer.start(0, right)) {
+             var server = IndexTestSupport.start(0, left);
+             var observer = IndexTestSupport.start(0, right)) {
             assertEquals(left.describe().location(), right.describe().location());
             var writerChannel = IndexServerTest.channel(server.port());
             var readerChannel = IndexServerTest.channel(server.port());
@@ -114,10 +114,10 @@ public class ReliveIntegrationCheck {
                                 .timeout(Duration.ofSeconds(10)).build(), HttpResponse.BodyHandlers.ofString());
                         assertEquals(response.body(), 200, response.statusCode());
                         var stats = com.google.gson.JsonParser.parseString(response.body()).getAsJsonObject();
-                        assertEquals("Journal-only check requires no flushed files", 0, stats.get("runCount").getAsInt());
-                        assertTrue(stats.get("memoryCharge").getAsLong() > 0);
-                        assertTrue(stats.get("walBytes").getAsLong() > 0);
-                        assertEquals(0, stats.get("frozenMemtables").getAsInt());
+                        assertEquals("Active-segment check requires no sorted files", 0, stats.get("runCount").getAsInt());
+                        assertTrue(stats.get("activeSegments").getAsLong() > 0);
+                        assertTrue(stats.get("activeSegmentBytes").getAsLong() > 0);
+                        assertEquals(0, stats.get("sealedSegments").getAsInt());
                         assertEquals(0, stats.getAsJsonObject("objectStorage").get("uploadedObjectBytes").getAsLong());
                     }
                 }
@@ -129,7 +129,7 @@ public class ReliveIntegrationCheck {
 
     private static void checkReopened(String endpoint) throws Exception {
         try (var backend = new ReliveBackend(endpoint, ValueKind.ROW_ID);
-             var server = IndexServer.start(0, backend)) {
+             var server = IndexTestSupport.start(0, backend)) {
             var channel = IndexServerTest.channel(server.port());
             try {
                 var api = bound(channel, "relive-integration", ValueKind.ROW_ID);

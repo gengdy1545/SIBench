@@ -1,7 +1,7 @@
 #!/bin/bash
 # Builds the rocksdb-cloud JNI binding (build/index/librocksdb_cloud_jni.so) on a target host.
 # Upstream sources are pinned by submodule gitlinks in index/ and third_party/.
-# Needs root for yum prerequisites. All generated files stay under build/index/.
+# Installs prerequisites with yum or apt-get (root or sudo). All generated files stay under build/index/.
 # Build on a system compatible with the hosts that load the library.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -41,8 +41,14 @@ PY
 }
 EXPECTED_INPUTS=$(inputs)
 
-yum install -y -q cmake libcurl-devel openssl-devel zlib-devel bzip2-devel lz4-devel \
-    libzstd-devel snappy-devel java-17-openjdk-devel
+SUDO=; [ "$(id -u)" -eq 0 ] || SUDO=sudo
+if command -v yum >/dev/null; then
+    $SUDO yum install -y -q cmake libcurl-devel openssl-devel zlib-devel bzip2-devel lz4-devel \
+        libzstd-devel snappy-devel java-17-openjdk-devel
+else
+    $SUDO apt-get install -y -q cmake libcurl4-openssl-dev libssl-dev zlib1g-dev libbz2-dev liblz4-dev \
+        libzstd-dev libsnappy-dev openjdk-17-jdk-headless
+fi
 export JAVA_HOME=${JAVA_HOME:-$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")}
 
 mkdir -p "$AWS_BUILD/source" "$ROCKS"
@@ -51,9 +57,10 @@ git -C "$ROOT/index/rocksdb-cloud" archive "$CLOUD_PIN" | tar -x -C "$ROCKS"
 git -C "$ROOT/third_party/aws-sdk-cpp" archive "$AWS_PIN" | tar -x -C "$AWS_BUILD/source"
 patch --batch --forward -d "$ROCKS" -p1 < "$ROOT/src/main/native/index/rocksdb_cloud/rocksdb-cloud-9.1.1.patch"
 cd "$AWS_BUILD"
-cmake -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTING=OFF -DBUILD_SHARED_LIBS=OFF \
+# The SDK and its nested C dependencies (which read only CFLAGS) append -Werror; -w keeps newer gcc warnings from failing pinned sources.
+CFLAGS=-w cmake -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTING=OFF -DBUILD_SHARED_LIBS=OFF \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON '-DBUILD_ONLY=kinesis;core;s3;transfer' \
-    -DCMAKE_INSTALL_PREFIX="$SDK" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_CXX_FLAGS='-Wno-error' "$AWS_BUILD/source"
+    -DCMAKE_INSTALL_PREFIX="$SDK" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_CXX_FLAGS=-w "$AWS_BUILD/source"
 make -j"$JOBS" && make install
 
 cd "$ROCKS"

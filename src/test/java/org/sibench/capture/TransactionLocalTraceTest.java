@@ -10,7 +10,6 @@ import java.util.List;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.sibench.adapters.IndexExecution;
 import org.sibench.adapters.IndexStatus;
 import org.sibench.adapters.TraceRequests;
 import org.sibench.adapters.ValueKind;
@@ -103,7 +102,7 @@ public class TransactionLocalTraceTest {
             var requests = new TraceRequests(mode);
             try (var backend = VersionedIndexBackend.create(directory.resolve("index"), mode)) {
                 org.sibench.adapters.InProcessService.Executor executor = (request, partial) -> {
-                    var response = IndexExecution.execute(backend, request, partial);
+                    var response = IndexTestSupport.execute(backend, request, partial);
                     if (request instanceof org.sibench.adapters.proto.GetRequest || request instanceof org.sibench.adapters.proto.ScanRequest)
                         answers.add(response.values());
                     return java.util.concurrent.CompletableFuture.completedFuture(response);

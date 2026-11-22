@@ -15,11 +15,11 @@ public final class IndexServer implements AutoCloseable {
 
     private IndexServer(Server server, IndexExecutor executor) { this.server = server; this.executor = executor; }
 
-    public static IndexServer start(int port, IndexBackend backend) throws IOException {
+    public static IndexServer start(int port, IndexBackend backend, ServiceConfig.Execution execution) throws IOException {
         var description = backend.describe();
         description.require(description.valueKind());
         byte[] metadata = new com.google.gson.Gson().toJson(description).getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        var executor = new IndexExecutor(backend);
+        var executor = new IndexExecutor(backend, execution);
         var service = new IndexServiceGrpc.IndexServiceImplBase() {
             private <T> void submit(Message request, StreamObserver<T> out, Function<IndexResponse,T> result) {
                 executor.submit(request).thenAccept(response -> finish(response, out, result));

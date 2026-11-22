@@ -35,7 +35,7 @@ public class IndexServerTest {
 
     @Test(timeout=10000) public void emptyScanStillReturnsAndValidatesTheDeploymentDescription() throws Exception {
         try (var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("empty-scan"),ValueKind.ROW_ID);
-             var server=IndexServer.start(0,backend);
+             var server=IndexTestSupport.start(0,backend);
              var grpc=new GrpcService("127.0.0.1:"+server.port(),new TraceRequests(ValueKind.ROW_ID),"empty",2)) {
             var query=IndexOperationTrace.search(1,1,0,new IndexOperationTrace.Range(null,false,null,false,false,0),0,0,0);
             send(grpc.factory().open(0), 1,query).response().toCompletableFuture().get(3,TimeUnit.SECONDS);
@@ -59,12 +59,12 @@ public class IndexServerTest {
         var entered=new CountDownLatch(1); var release=new CountDownLatch(1);
         try(var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("visible"),ValueKind.ROW_ID)) {
             var blocked=(IndexBackend)java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{IndexBackend.class},(proxy,method,args)->{
-                if(method.getName().equals("write") && ((Mutation)args[0]).getPut().getTs()==1) {
+                if(method.getName().equals("writeAsync") && ((Mutation)args[0]).getPut().getTs()==1) {
                     entered.countDown(); if(!release.await(5,TimeUnit.SECONDS)) throw new IOException("release timeout");
                 }
                 try { return method.invoke(backend,args); } catch(java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
             });
-            try(var server=IndexServer.start(0,blocked); var client=new GrpcService("127.0.0.1:"+server.port(),new TraceRequests(ValueKind.ROW_ID),"visible",5)) {
+            try(var server=IndexTestSupport.start(0,blocked); var client=new GrpcService("127.0.0.1:"+server.port(),new TraceRequests(ValueKind.ROW_ID),"visible",5)) {
                 var target=client.factory().open(0);
                 send(target, 1,IndexOperationTrace.write(1,IndexOperationTrace.INSERT,1,0,IndexKey.ofInt(7),0,0,0,70)).response().toCompletableFuture().get(3,TimeUnit.SECONDS);
                 var ack=send(target, 2,IndexOperationTrace.write(2,IndexOperationTrace.UPSERT,1,0,IndexKey.ofInt(7),1,0,0,71)).response().toCompletableFuture();
@@ -89,7 +89,7 @@ public class IndexServerTest {
 
     @Test(timeout=10000) public void wrongTraceAndWrongValueModeAreRejectedBeforeWriting() throws Exception {
         try(var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("binding"),ValueKind.ROW_ID);
-                var server=IndexServer.start(0,backend)) {
+                var server=IndexTestSupport.start(0,backend)) {
             backend.bind("original");
             for(var value:List.of(ValueKind.ROW_ID,ValueKind.LOCATOR)) {
                 try(var client=new GrpcService("127.0.0.1:"+server.port(),new TraceRequests(value),value==ValueKind.ROW_ID?"foreign":"original",2)) {
@@ -210,7 +210,7 @@ public class IndexServerTest {
     @Test(timeout=30000) public void scansStreamCompleteOrderedResultsAndRejectTruncation() throws Exception {
         int rows=IndexExecution.CHUNK_RESULTS+4464;
         try(var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("scan"),ValueKind.ROW_ID);
-                var server=IndexServer.start(0,backend)) {
+                var server=IndexTestSupport.start(0,backend)) {
             var channel=channel(server.port());
             try {
                 var api=stub(channel); var batch=WriteBatchRequest.newBuilder();
@@ -242,7 +242,7 @@ public class IndexServerTest {
 
     @Test(timeout=10000) public void genericBatchAcceptsVersionsAndDeletesAndPrevalidatesAllMembers() throws Exception {
         try(var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("batch"),ValueKind.ROW_ID);
-                var server=IndexServer.start(0,backend)) {
+                var server=IndexTestSupport.start(0,backend)) {
             var channel=channel(server.port());
             try {
                 var api=stub(channel);
@@ -270,7 +270,7 @@ public class IndexServerTest {
 
     @Test(timeout=10000) public void opaqueKeysAndEmptyValuesRoundTripAndUnknownFieldsAreRejected() throws Exception {
         try (var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("opaque"),ValueKind.ROW_ID);
-             var server=IndexServer.start(0,backend)) {
+             var server=IndexTestSupport.start(0,backend)) {
             var channel=channel(server.port());
             try {
                 var api=stub(channel);
@@ -296,7 +296,7 @@ public class IndexServerTest {
         var sizes=new ArrayList<Integer>();
         try(var backend=VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("one-call"),ValueKind.ROW_ID)) {
             var wrapped=(IndexBackend)java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{IndexBackend.class},(proxy,method,args)->{
-                if(method.getName().equals("writeBatch")) sizes.add(((List<?>)args[0]).size());
+                if(method.getName().equals("writeBatchAsync")) sizes.add(((List<?>)args[0]).size());
                 try { return method.invoke(backend,args); } catch(java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
             });
             var batch=WriteBatchRequest.newBuilder(); for(int k=1;k<=3;k++) batch.addMutations(Mutation.newBuilder().setPut(put(k,0,k)));
@@ -321,7 +321,7 @@ public class IndexServerTest {
                 try { return method.invoke(backend,args); } catch(java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
             });
             var requests=new TraceRequests(ValueKind.ROW_ID);
-            try(var server=IndexServer.start(0,synthetic);var grpc=new GrpcService("127.0.0.1:"+server.port(),requests,"partial",5)) {
+            try(var server=IndexTestSupport.start(0,synthetic);var grpc=new GrpcService("127.0.0.1:"+server.port(),requests,"partial",5)) {
                 var target=grpc.factory().open(0);
                 var query=IndexOperationTrace.search(1,1,0,new IndexOperationTrace.Range(null,false,null,false,false,0),0,rows,0);
                 send(target, 1,query).response().toCompletableFuture().get(5,TimeUnit.SECONDS);
@@ -344,7 +344,7 @@ public class IndexServerTest {
                 }
                 try { return method.invoke(backend,args); } catch(java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
             });
-            try(var server=IndexServer.start(0,synthetic)) {
+            try(var server=IndexTestSupport.start(0,synthetic)) {
                 var channel=channel(server.port());
                 try {
                     var chunks=stub(channel).scan(ScanRequest.newBuilder().build());

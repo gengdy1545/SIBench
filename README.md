@@ -19,7 +19,7 @@ Use Linux/glibc x86-64, JDK 17 (`JAVA_HOME`), Maven and Git. Builds need fresh d
 | PostgreSQL | C compiler, make, patch, Perl, Bison and Flex; run as an unprivileged user. |
 | Benchmark clients | sysbench needs autotools, pkg-config, libtool, libaio and libpq headers; HyBench/YCSB use Maven. |
 | Pixels | C/C++, CMake, make, curl, PostgreSQL build tools and network access to Maven Central/GitHub. |
-| Cloud backends | RocksDB-Cloud: yum-based build host, root for dependency installation and C/C++ tools. SlateDB: Python 3, C/C++ linker and rustup with its pinned toolchain. |
+| Cloud backends | RocksDB-Cloud: yum or apt-get build host, root or sudo for dependency installation and C/C++ tools. SlateDB: Python 3, C/C++ linker and rustup with its pinned toolchain. |
 
 Build the embedded RocksDB runtime and the DuckDB host, then the application:
 
@@ -72,7 +72,7 @@ For repeated [Pixels experiments](docs/pixels-experiment.md), prepare the CSV/CD
 
 ## Replay and service
 
-Configure the [object-storage connections](config/sibench.yaml) and the [backend](config/index/); credentials come from the named environment variables and the bucket must exist. RocksDB-Cloud and SlateDB need a fresh local path and object prefix; Relive needs a fresh CFS directory and prefix.
+Configure the [object-storage connections](config/sibench.yaml) and the [backend](config/index/); credentials come from the named environment variables and the bucket must exist. RocksDB-Cloud and SlateDB need a fresh local path and object prefix; Relive needs a fresh CFS directory and prefix. Every service configuration also selects [SIBench execution threads and a fresh statistics path](docs/index-service.md#service-execution-and-statistics).
 
 ```bash
 java -jar build/sibench/sibench.jar index-server config/sibench.yaml config/index/rocksdb_cloud.yaml
@@ -83,7 +83,7 @@ Run the two commands in separate terminals. Every backend receives the same requ
 
 Replay checks input integrity, response completion and expected result counts; matching counts do not certify values or order, which [independent acceptance](docs/index-service.md#independent-acceptance) covers. A write acknowledgment guarantees same-instance visibility; durability depends on the backend. See the [Index Service contract](docs/index-service.md).
 
-RocksDB-Cloud and SlateDB are the comparison targets; local RocksDB serves generation and test fixtures. The [Relive bridge](docs/index-service.md#relive-bridge) exposes Relive's HTTP service through the same gRPC operations. It reads [CFS/COS settings](config/index/relive.json) and needs a real CFS mount path (local disk state is rejected). Integration does not certify cloud deployment or comparison readiness.
+RocksDB-Cloud and SlateDB are the comparison targets; local RocksDB serves generation and test fixtures. The [Relive bridge](docs/index-service.md#relive-bridge) exposes Relive's HTTP service through the same gRPC operations. Relive reads [CFS/COS settings](config/index/relive.json) and needs a real CFS mount path (local disk state is rejected); the bridge selects its loopback HTTP endpoint and SIBench execution budget. Integration does not certify cloud deployment or comparison readiness.
 
 ## Analysis
 

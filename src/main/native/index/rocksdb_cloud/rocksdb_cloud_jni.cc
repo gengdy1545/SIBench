@@ -16,10 +16,12 @@
 #include <aws/s3/S3Client.h>
 
 #include "rocksdb/cloud/cloud_file_system.h"
+#include "rocksdb/cache.h"
 #include "rocksdb/cloud/db_cloud.h"
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
+#include "rocksdb/table.h"
 #include "rocksdb/version.h"
 #include "rocksdb/write_batch.h"
 
@@ -173,6 +175,13 @@ JNIEXPORT jlong JNICALL Java_org_sibench_adapters_CloudRocksStore_openStore(
   store->env = CloudFileSystemEnv::NewCompositeEnv(Env::Default(), store->fs);
   Options options;
   options.env = store->env.get();
+  // Comparison settings shared with the SlateDB binding: LZ4 blocks, a 1 GiB data block cache and
+  // four concurrent compactions (one flush job plus four compaction jobs).
+  options.compression = kLZ4Compression;
+  options.max_background_jobs = 5;
+  BlockBasedTableOptions table;
+  table.block_cache = NewLRUCache(size_t{1} << 30);
+  options.table_factory.reset(NewBlockBasedTableFactory(table));
   // Reopening may start from the bucket alone; the caller refuses a database it did not create.
   options.create_if_missing = true;
   options.error_if_exists = create;

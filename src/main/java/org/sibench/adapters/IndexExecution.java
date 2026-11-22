@@ -6,6 +6,8 @@ import com.google.protobuf.ByteString;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 /** Validates and executes opaque versioned KV requests: the service trust boundary, ahead of every backend. */
 public final class IndexExecution {
@@ -13,33 +15,41 @@ public final class IndexExecution {
     static final int MAX_MESSAGE_BYTES = 32 * 1024 * 1024;
     private IndexExecution() {}
 
-    public static IndexResponse execute(IndexBackend backend, Message request,
+    static CompletableFuture<IndexResponse> executeAsync(IndexBackend backend, Message request,
             java.util.function.Consumer<IndexResponse> partial) {
         try {
             if (request instanceof PutRequest put) {
                 var mutation = Mutation.newBuilder().setPut(put).build();
-                validateMutation(mutation); backend.write(mutation);
+                validateMutation(mutation); return written(backend.writeAsync(mutation));
             } else if (request instanceof DeleteRequest delete) {
                 var mutation = Mutation.newBuilder().setDelete(delete).build();
-                validateMutation(mutation); backend.write(mutation);
+                validateMutation(mutation); return written(backend.writeAsync(mutation));
             } else if (request instanceof WriteBatchRequest batch) {
                 known(batch);
                 if (batch.getMutationsCount() == 0) throw new IllegalArgumentException("Empty write batch");
                 for (var mutation : batch.getMutationsList()) validateMutation(mutation);
-                backend.writeBatch(batch.getMutationsList());
+                return written(backend.writeBatchAsync(batch.getMutationsList()));
             } else if (request instanceof GetRequest get) {
                 validateGet(get);
                 var result = backend.get(get);
-                return IndexResponse.ok(result == null ? List.of() : List.of(result));
+                return CompletableFuture.completedFuture(IndexResponse.ok(result == null ? List.of() : List.of(result)));
             } else if (request instanceof ScanRequest scan) {
-                validateScan(scan); return scan(backend, scan, partial);
+                validateScan(scan); return CompletableFuture.completedFuture(scan(backend, scan, partial));
             } else throw new IllegalArgumentException("Expected an individual data operation");
-            return IndexResponse.ok(List.of());
-        } catch (IllegalArgumentException invalid) {
-            return IndexResponse.error(IndexStatus.INVALID, String.valueOf(invalid.getMessage()));
         } catch (IOException | RuntimeException error) {
-            return IndexResponse.error(IndexStatus.UNAVAILABLE, String.valueOf(error));
+            return CompletableFuture.completedFuture(failed(error));
         }
+    }
+
+    private static CompletableFuture<IndexResponse> written(CompletableFuture<Void> write) {
+        return write.handle((ignored, error) -> error == null ? IndexResponse.ok(List.of()) : failed(error));
+    }
+
+    private static IndexResponse failed(Throwable error) {
+        while (error instanceof CompletionException && error.getCause() != null) error = error.getCause();
+        return error instanceof IllegalArgumentException
+                ? IndexResponse.error(IndexStatus.INVALID, String.valueOf(error.getMessage()))
+                : IndexResponse.error(IndexStatus.UNAVAILABLE, String.valueOf(error));
     }
     public static void known(Message message) {
         if (!message.getUnknownFields().asMap().isEmpty()) throw new IllegalArgumentException("Unsupported fields");

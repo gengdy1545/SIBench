@@ -14,6 +14,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 /** Versioned opaque KV over an ordered store. Escaped keys delimit histories, including key prefixes. */
 public final class VersionedIndexBackend implements IndexBackend {
@@ -22,34 +23,30 @@ public final class VersionedIndexBackend implements IndexBackend {
             TRACE_BINDING = metadata("trace_binding");
     private final OrderedStore store;
     private final ValueKind valueKind;
-    /** One JSON line per internal persistence cycle: the engine's state and object-storage requests so far. */
-    private final Path engineStats;
-    private long flushes;
     private volatile String bound;
 
-    private VersionedIndexBackend(OrderedStore store, ValueKind valueKind, Path path) {
+    private VersionedIndexBackend(OrderedStore store, ValueKind valueKind) {
         this.store = store;
         this.valueKind = valueKind;
-        this.engineStats = path.resolveSibling(path.getFileName() + ".engine-stats.jsonl");
     }
 
     /** A new, empty index in {@code path}; an existing directory is refused, never reused. */
     public static VersionedIndexBackend create(Path path, ValueKind valueKind) throws IOException {
         prepare(path, valueKind);
-        return created(LocalRocksStore.create(path), valueKind, path);
+        return created(LocalRocksStore.create(path), valueKind);
     }
 
     /** A new, empty rocksdb-cloud index: local files in {@code path}, objects in the store. */
     static VersionedIndexBackend cloud(Path path, ValueKind valueKind, ObjectStore objects, boolean wal)
             throws IOException {
         prepare(path, valueKind);
-        return created(CloudRocksStore.create(path, objects, wal), valueKind, path);
+        return created(CloudRocksStore.create(path, objects, wal), valueKind);
     }
 
     /** An index this class created in {@code path}, reopened, e.g. after a restart. */
     public static VersionedIndexBackend open(Path path, ValueKind valueKind) throws IOException {
         if (!Files.isDirectory(path)) throw new IOException("No index directory: " + path);
-        return reopened(LocalRocksStore.open(path), valueKind, path);
+        return reopened(LocalRocksStore.open(path), valueKind);
     }
 
     /**
@@ -59,17 +56,17 @@ public final class VersionedIndexBackend implements IndexBackend {
     static VersionedIndexBackend openCloud(Path path, ValueKind valueKind, ObjectStore objects, boolean wal)
             throws IOException {
         Files.createDirectories(path.getParent());
-        return reopened(CloudRocksStore.open(path, objects, wal), valueKind, path);
+        return reopened(CloudRocksStore.open(path, objects, wal), valueKind);
     }
 
     static VersionedIndexBackend slate(Path path, ValueKind valueKind, ObjectStore objects,
             boolean reopen, boolean wal) throws IOException {
         if (reopen) {
             Files.createDirectories(path.getParent());
-            return reopened(SlateDbStore.open(path, objects, wal), valueKind, path);
+            return reopened(SlateDbStore.open(path, objects, wal), valueKind);
         }
         prepare(path, valueKind);
-        return created(SlateDbStore.create(path, objects, wal), valueKind, path);
+        return created(SlateDbStore.create(path, objects, wal), valueKind);
     }
 
     private static void prepare(Path path, ValueKind valueKind) throws IOException {
@@ -79,7 +76,7 @@ public final class VersionedIndexBackend implements IndexBackend {
         Files.createDirectories(path.getParent());
     }
 
-    private static VersionedIndexBackend created(OrderedStore store, ValueKind valueKind, Path path)
+    private static VersionedIndexBackend created(OrderedStore store, ValueKind valueKind)
             throws IOException {
         try {
             store.put(VALUE_KIND, new byte[] {valueKindByte(valueKind)});
@@ -87,10 +84,10 @@ public final class VersionedIndexBackend implements IndexBackend {
             try { store.close(); } catch (IOException | RuntimeException cleanup) { error.addSuppressed(cleanup); }
             throw error;
         }
-        return new VersionedIndexBackend(store, valueKind, path);
+        return new VersionedIndexBackend(store, valueKind);
     }
 
-    private static VersionedIndexBackend reopened(OrderedStore store, ValueKind valueKind, Path path)
+    private static VersionedIndexBackend reopened(OrderedStore store, ValueKind valueKind)
             throws IOException {
         try {
             byte[] stored = store.get(VALUE_KIND);
@@ -105,7 +102,7 @@ public final class VersionedIndexBackend implements IndexBackend {
                     entries.next();
                 }
             }
-            return new VersionedIndexBackend(store, valueKind, path);
+            return new VersionedIndexBackend(store, valueKind);
         } catch (IOException | RuntimeException error) {
             try { store.close(); } catch (IOException | RuntimeException cleanup) { error.addSuppressed(cleanup); }
             throw error;
@@ -127,14 +124,20 @@ public final class VersionedIndexBackend implements IndexBackend {
     }
 
     @Override
-    public void write(Mutation mutation) throws IOException {
+    public CompletableFuture<Void> writeAsync(Mutation mutation) throws IOException {
         boolean put = mutation.hasPut();
         ByteString key = put ? mutation.getPut().getKey() : mutation.getDelete().getKey();
         long ts = put ? mutation.getPut().getTs() : mutation.getDelete().getTs();
         store.put(versioned(entry(key), ts), value(put, mutation.getPut().getValue()));
+        return CompletableFuture.completedFuture(null);
     }
 
     @Override
+    public CompletableFuture<Void> writeBatchAsync(List<Mutation> mutations) throws IOException {
+        writeBatch(mutations);
+        return CompletableFuture.completedFuture(null);
+    }
+
     public void writeBatch(List<Mutation> mutations) throws IOException {
         var keys = new ArrayList<byte[]>(mutations.size());
         var values = new ArrayList<byte[]>(mutations.size());
@@ -153,9 +156,7 @@ public final class VersionedIndexBackend implements IndexBackend {
             var write = get.getLocalWrites(0);
             return write.hasPut() ? write.getPut().getValue() : null;
         }
-        try (var cursor = store.cursor(null, null)) {
-            return visible(cursor, entry(get.getKey()), get.getReadTs());
-        }
+        return visible(entry(get.getKey()), get.getReadTs());
     }
 
     @Override
@@ -194,12 +195,12 @@ public final class VersionedIndexBackend implements IndexBackend {
                         }
                     }
                 }
-            } else try (var versions = store.cursor(null, null)) {
+            } else {
                 cursor.seekForPrev(end);
                 while (cursor.valid() && Arrays.compareUnsigned(cursor.key(), end) >= 0) cursor.prev();
                 while (cursor.valid() && (limit == 0 || found < limit)) {
                     byte[] entry = logical(cursor.key());
-                    ByteString result = visible(versions, entry, scan.getReadTs());
+                    ByteString result = visible(entry, scan.getReadTs());
                     if (result != null) { if (!sink.accept(entry, result)) return; found++; }
                     cursor.seekForPrev(entry);
                 }
@@ -207,9 +208,13 @@ public final class VersionedIndexBackend implements IndexBackend {
         }
     }
 
-    private ByteString visible(OrderedStore.Cursor cursor, byte[] entry, long readTs) throws IOException {
-        cursor.seek(versioned(entry, readTs));
-        return visibleAt(cursor, entry);
+    /** Bounded to the entry's own versions: an open-ended cursor makes range-scan engines (SlateDB) read every overlapping SST. */
+    private ByteString visible(byte[] entry, long readTs) throws IOException {
+        byte[] start = versioned(entry, readTs);
+        try (var cursor = store.cursor(start, ByteKeys.successor(entry))) {
+            cursor.seek(start);
+            return visibleAt(cursor, entry);
+        }
     }
 
     private static boolean sameEntry(byte[] key, byte[] entry) {
@@ -245,7 +250,6 @@ public final class VersionedIndexBackend implements IndexBackend {
     @Override
     public void flush() throws IOException {
         store.flush();
-        recordEngineStats();
     }
 
     private static final List<String> ENGINE_PROPERTIES =
@@ -256,12 +260,16 @@ public final class VersionedIndexBackend implements IndexBackend {
                     "rocksdb.estimate-pending-compaction-bytes",
                     "rocksdb.num-running-compactions",
                     "rocksdb.num-running-flushes",
-                    "rocksdb.stats");
+                    "rocksdb.num-immutable-mem-table",
+                    "rocksdb.num-files-at-level0",
+                    "rocksdb.is-write-stopped",
+                    "rocksdb.actual-delayed-write-rate",
+                    "rocksdb.stats",
+                    "slatedb.metrics");
 
-    private synchronized void recordEngineStats() throws IOException {
+    @Override
+    public java.util.Map<String, Object> statistics() throws IOException {
         var line = new java.util.LinkedHashMap<String, Object>();
-        line.put("time_millis", System.currentTimeMillis());
-        line.put("flush", ++flushes);
         line.put("engine", store.name());
         for (String name : ENGINE_PROPERTIES) line.put(name, store.property(name));
         var requests = store.objectRequests();
@@ -270,40 +278,10 @@ public final class VersionedIndexBackend implements IndexBackend {
             var byType = new java.util.LinkedHashMap<String, Object>();
             requests.forEach(
                     (type, counts) ->
-                            byType.put(type, objectRequestStats(counts)));
+                            byType.put(type, CallTimes.describe(counts)));
             line.put("object_requests", byType);
         }
-        Files.writeString(
-                engineStats,
-                new com.google.gson.Gson().toJson(line) + "\n",
-                java.nio.file.StandardOpenOption.CREATE,
-                java.nio.file.StandardOpenOption.APPEND);
-    }
-
-    static java.util.Map<String, Object> objectRequestStats(long[] counts) {
-        long[] buckets = Arrays.copyOfRange(counts, 4, 36);
-        long[] upperBounds = new long[32];
-        for (int i = 0; i < 31; i++) upperBounds[i] = 1L << i;
-        upperBounds[31] = Long.MAX_VALUE;
-        long samples = Arrays.stream(buckets).sum();
-        return java.util.Map.of(
-                "requests", counts[0], "failed", counts[1], "bytes", counts[2], "micros", counts[3],
-                "latency_micros", java.util.Map.of(
-                        "samples", samples, "bucket_counts", buckets,
-                        "bucket_upper_bounds", upperBounds, "overflow_after", 1L << 30,
-                        "p50_upper_bound", latencyBound(buckets, samples, 50),
-                        "p95_upper_bound", latencyBound(buckets, samples, 95),
-                        "p99_upper_bound", latencyBound(buckets, samples, 99)));
-    }
-
-    private static long latencyBound(long[] buckets, long samples, int percentile) {
-        if (samples == 0) return 0;
-        long rank = (samples / 100) * percentile + ((samples % 100) * percentile + 99) / 100;
-        for (int i = 0; i < buckets.length; i++) {
-            rank -= buckets[i];
-            if (rank <= 0) return i == 31 ? Long.MAX_VALUE : 1L << i;
-        }
-        throw new IllegalArgumentException("Incomplete request latency histogram");
+        return line;
     }
 
     @Override

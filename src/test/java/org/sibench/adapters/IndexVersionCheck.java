@@ -24,7 +24,7 @@ public final class IndexVersionCheck {
             var write=Mutation.newBuilder();
             if(version==2) write.setDelete(DeleteRequest.newBuilder().setKey(KEY).setTs(version));
             else write.setPut(PutRequest.newBuilder().setKey(KEY).setTs(version).setValue(IndexEntry.rowId(70+version)));
-            backend.write(write.build());
+            backend.writeAsync(write.build());
         }
         for(int pass=0;pass<2;pass++) {
             for(int timestamp=0;timestamp<=5;timestamp++) {

@@ -148,7 +148,7 @@ public final class IndexServiceCheck {
         evidence.put("scope", "hand-derived version, deletion, private-context and ordered-value cases through one service instance; not cross-instance visibility, durability or performance");
         Throwable failure = null;
         try (var actual = new GrpcIndexCheck(config, binding, replay.requestTimeoutSeconds());
-             var server = IndexServer.start(0, actual)) {
+             var server = IndexTestSupport.start(0, actual)) {
             evidence.put("service", actual.describe());
             var writerChannel = IndexServerTest.channel(server.port());
             var readerChannel = IndexServerTest.channel(server.port());

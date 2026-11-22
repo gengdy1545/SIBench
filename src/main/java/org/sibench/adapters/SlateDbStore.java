@@ -82,7 +82,11 @@ final class SlateDbStore implements OrderedStore {
     }
     @Override public byte[] get(byte[] key) throws IOException { requireOpen(); return nativeGet(handle, key); }
     @Override public void flush() throws IOException { requireOpen(); nativeFlush(handle); }
-    @Override public String property(String name) throws IOException { requireOpen(); return null; }
+    /** {@code slatedb.metrics}: the engine's registered metrics as text; no other property exists. */
+    @Override public String property(String name) throws IOException {
+        requireOpen();
+        return name.equals("slatedb.metrics") ? nativeMetrics(handle) : null;
+    }
     @Override public Map<String, long[]> objectRequests() throws IOException {
         requireOpen();
         return OrderedStore.parseRequests(nativeRequests(handle));
@@ -116,6 +120,7 @@ final class SlateDbStore implements OrderedStore {
             boolean virtualHosted, String access, String secret, String token, String mirror, boolean create,
             boolean wal) throws IOException;
     private static native String nativeRequests(long handle) throws IOException;
+    private static native String nativeMetrics(long handle) throws IOException;
     private static native void nativePut(long handle, byte[] key, byte[] value) throws IOException;
     private static native void nativePutAll(long handle, byte[][] keys, byte[][] values) throws IOException;
     private static native byte[] nativeGet(long handle, byte[] key) throws IOException;

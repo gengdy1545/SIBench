@@ -8,7 +8,11 @@ use jni::{
     JNIEnv,
 };
 use slatedb::{
-    config::{ScanOptions, Settings},
+    config::{CompressionCodec, ScanOptions, Settings},
+    db_cache::{
+        foyer::{FoyerCache, FoyerCacheOptions},
+        DbCache, SplitCache, DEFAULT_META_CACHE_CAPACITY,
+    },
     object_store::{
         aws::AmazonS3Builder, path::Path, CopyOptions, GetOptions, GetResult, ListResult,
         MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions,
@@ -16,6 +20,7 @@ use slatedb::{
     },
     Db, DbIterator, DbSnapshot, IterationOrder, SlateDbMirrorPolicy, WriteBatch,
 };
+use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 use slatedb_mirror::ObjectStoreMirror;
 use std::{
     collections::HashMap,
@@ -109,6 +114,7 @@ struct Store {
     runtime: Runtime,
     db: Db,
     requests: Arc<Requests>,
+    metrics: Arc<DefaultMetricsRecorder>,
 }
 
 /// Remote request statistics in the rocksdb-cloud layout: per type, the count, failures, bytes,
@@ -437,6 +443,8 @@ fn call<T: Default>(mut env: JNIEnv, body: impl FnOnce(&mut JNIEnv) -> Result<T>
     }
 }
 
+const BLOCK_CACHE_BYTES: u64 = 1 << 30;
+
 impl Store {
     /// `mirror` keeps the compacted SSTs on local disk, as rocksdb-cloud keeps its SST files.
     /// Without `wal`, writes go straight to the memtable and become durable only when it is flushed.
@@ -449,9 +457,12 @@ impl Store {
     ) -> Result<Self> {
         install_log();
         let requests = Arc::new(Requests::default());
+        let metrics = Arc::new(DefaultMetricsRecorder::new());
         let objects: Arc<dyn ObjectStore> = Arc::new(Counted::new(objects, requests.clone()));
+        // Scan block fetches run on these workers; a fixed small pool capped the service below the host's cores.
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+            .worker_threads(workers)
             .enable_all()
             .build()
             .map_err(error)?;
@@ -502,12 +513,28 @@ impl Store {
                 .map_err(error)?,
                 None => objects,
             };
+            // Comparison settings shared with the rocksdb-cloud binding: LZ4 blocks and a 1 GiB data block cache.
+            let block_cache: Arc<dyn DbCache> = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+                max_capacity: BLOCK_CACHE_BYTES,
+                ..Default::default()
+            }));
+            let meta_cache: Arc<dyn DbCache> = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+                max_capacity: DEFAULT_META_CACHE_CAPACITY,
+                ..Default::default()
+            }));
+            let cache = SplitCache::new()
+                .with_block_cache(Some(block_cache))
+                .with_meta_cache(Some(meta_cache))
+                .build();
             Db::builder(prefix, main)
                 .with_settings(Settings {
                     object_store_max_retries: Some(3),
                     wal_enabled: wal,
+                    compression_codec: Some(CompressionCodec::Lz4),
                     ..Settings::default()
                 })
+                .with_db_cache(Arc::new(cache), 0)
+                .with_metrics_recorder(metrics.clone())
                 .build()
                 .await
                 .map_err(error)
@@ -516,7 +543,23 @@ impl Store {
             runtime,
             db,
             requests,
+            metrics,
         })
+    }
+
+    /// SlateDB's registered metrics, one `name{labels} value` line each; histograms give count, sum and max.
+    fn metrics_text(&self) -> String {
+        let mut out = String::new();
+        for metric in self.metrics.snapshot().all() {
+            let labels: Vec<String> = metric.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let value = match &metric.value {
+                MetricValue::Counter(v) => v.to_string(),
+                MetricValue::Gauge(v) | MetricValue::UpDownCounter(v) => v.to_string(),
+                MetricValue::Histogram { count, sum, max, .. } => format!("count={count} sum={sum} max={max}"),
+            };
+            out.push_str(&format!("{}{{{}}} {}\n", metric.name, labels.join(","), value));
+        }
+        out
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -790,6 +833,18 @@ pub extern "system" fn Java_org_sibench_adapters_SlateDbStore_nativeFlush(
     id: jlong,
 ) {
     call(env, |_| store(id)?.flush())
+}
+#[no_mangle]
+pub extern "system" fn Java_org_sibench_adapters_SlateDbStore_nativeMetrics(
+    env: JNIEnv,
+    _: JClass,
+    id: jlong,
+) -> jstring {
+    call(env, |env| {
+        env.new_string(store(id)?.metrics_text())
+            .map(|s| s.into_raw())
+            .map_err(error)
+    })
 }
 #[no_mangle]
 pub extern "system" fn Java_org_sibench_adapters_SlateDbStore_nativeRequests(
@@ -1138,6 +1193,17 @@ mod tests {
             s3_endpoint("http://127.0.0.1:8333", "b-1", false),
             "http://127.0.0.1:8333"
         );
+    }
+
+    #[test]
+    fn metrics_text_reports_engine_counters() {
+        let store = Store::open(Arc::new(InMemory::new()), "metrics-test", None, true, false).unwrap();
+        store.put(b"k", b"v").unwrap();
+        store.flush().unwrap();
+        let text = store.metrics_text();
+        assert!(text.lines().any(|l| l.starts_with("slatedb.db.write_ops{} ") && !l.ends_with(" 0")), "{text}");
+        assert!(text.contains("slatedb.db.l0_sst_count{} "), "{text}");
+        store.close().unwrap();
     }
 
     #[test]

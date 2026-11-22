@@ -45,12 +45,12 @@ public class ReliveLoadCheckTest {
 
     @Test public void drainRejectsEachKindOfOutstandingMaintenanceAndMissingEvidence() {
         var idle = com.google.gson.JsonParser.parseString("""
-                {"memoryCharge":0,"frozenMemtables":0,"compactionEligibleBytes":0,
-                 "backgroundFlushing":false,"backgroundCompacting":false}
+                {"activeSegments":0,"sealedSegments":0,"compactionEligibleBytes":0,
+                 "backgroundConverting":false,"backgroundCompacting":false}
                 """).getAsJsonObject();
         assertTrue(ReliveLoadCheck.drained(idle));
-        for (String key : List.of("memoryCharge", "frozenMemtables", "compactionEligibleBytes",
-                "backgroundFlushing", "backgroundCompacting")) {
+        for (String key : List.of("activeSegments", "sealedSegments", "compactionEligibleBytes",
+                "backgroundConverting", "backgroundCompacting")) {
             var active = idle.deepCopy();
             if (key.startsWith("background")) active.addProperty(key, true);
             else active.addProperty(key, 1);

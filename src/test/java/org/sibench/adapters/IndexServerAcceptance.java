@@ -8,7 +8,7 @@ public final class IndexServerAcceptance {
     public static void main(String[] args) throws Exception {
         if (args.length != 2) throw new IllegalArgumentException("Expected CONFIG SERVICE_CONFIG");
         var config = ServiceConfig.ofServer(Path.of("").toAbsolutePath(), Path.of(args[1]), org.sibench.config.SibenchConfig.read(Path.of(args[0])));
-        try (var backend = config.backend(); var server = IndexServer.start(config.port(), backend)) {
+        try (var backend = config.backend(); var server = IndexServer.start(config.port(), backend, config.execution())) {
             System.out.println("READY " + server.port());
             System.out.flush();
             var input = new java.io.BufferedReader(new java.io.InputStreamReader(System.in, StandardCharsets.UTF_8));

@@ -24,7 +24,7 @@ public class PrivateReadTest {
     @Test public void privateScansMergeBeforeOrderingAndLimitWithoutChangingStoredSnapshots() throws Exception {
         try (var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("index"), ValueKind.ROW_ID)) {
             for (var write : List.of(put("k", "base-k", 0), put("ka", "base-ka", 0), put("z", "base-z", 0), put("ka", "future-ka", 2)))
-                backend.write(write);
+                backend.writeAsync(write);
             var scan = ScanRequest.newBuilder().setStartKey(bytes("")).setEndKey(bytes("zzz")).setReadTs(0)
                     .addAllLocalWrites(List.of(put("j", "", 0), delete("k"), put("ka", "private-ka", 0), put("zz", "private-zz", 0))).build();
             assertEquals(List.of(bytes(""), bytes("private-ka"), bytes("base-z"), bytes("private-zz")), IndexTestSupport.scan(backend, scan));
@@ -41,7 +41,7 @@ public class PrivateReadTest {
 
     @Test public void invalidPrivateContextsAreRejectedWithoutSideEffects() throws Exception {
         try (var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("index"), ValueKind.ROW_ID)) {
-            backend.write(put("k", "base", 0));
+            backend.writeAsync(put("k", "base", 0));
             for (var writes : List.of(List.of(put("k", "wrong-ts", 1)), List.of(put("j", "outside", 0)),
                     List.of(put("k", "one", 0), delete("k")), List.of(Mutation.getDefaultInstance()))) {
                 var read = GetRequest.newBuilder().setKey(bytes("k")).addAllLocalWrites(writes).build();
@@ -56,7 +56,7 @@ public class PrivateReadTest {
 
     @Test(timeout = 15000) public void concurrentGrpcRequestsHaveIndependentPrivateContexts() throws Exception {
         try (var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("index"), ValueKind.ROW_ID);
-                var server = IndexServer.start(0, backend)) {
+                var server = IndexTestSupport.start(0, backend)) {
             var executor = java.util.concurrent.Executors.newFixedThreadPool(2);
             var start = new java.util.concurrent.CountDownLatch(1);
             var futures = new ArrayList<java.util.concurrent.Future<?>>();

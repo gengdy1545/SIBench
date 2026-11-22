@@ -34,7 +34,7 @@ public class ValueResultsTest {
         var keys = List.of(bytes("a"), bytes("b"), bytes("c"), bytes("d"));
         var initial = List.of(bytes("z"), bytes("a"), bytes("z"), ByteString.EMPTY);
         try (var backend = VersionedIndexBackend.create(temporary.getRoot().toPath().resolve("rpc"), ValueKind.ROW_ID);
-             var server = IndexServer.start(0, backend)) {
+             var server = IndexTestSupport.start(0, backend)) {
             var channel = IndexServerTest.channel(server.port());
             try {
                 var api = IndexServerTest.stub(channel);
