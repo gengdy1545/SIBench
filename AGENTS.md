@@ -1,342 +1,282 @@
-# Repository organization
+# Working agreement
 
-- Organize code, tests, configuration, benchmarks, and documentation by domain,
-  responsibility, or purpose. Do not introduce permanent `phase1`, `step2`, or
-  other development-stage directories.
-- Use stable names that describe the contents or behavior. Avoid `misc`, `temp`,
-  `new`, and `final` as organizational names.
-- Keep upstream benchmark sources in `benchmark/` submodules. Store generated
-  builds under `build/benchmarks/` and local service state under `build/services/`.
-- Keep index-backend upstream sources in `index/` submodules, pinned by gitlinks,
-  and general third-party source dependencies in `third_party/` submodules.
-  Document build prerequisites and entry points in README; preserve upstream
-  licenses in the submodules. Keep historical toolchains and test-service binary
-  identities in local development notes. Build index backends and their
-  dependencies into `build/index/`.
-- For new submodules, record the verified upstream default branch in
-  `.gitmodules`; the gitlink remains the authoritative source pin. Branch settings
-  guide explicit updates, not automatic upgrades during builds or tests.
-- Keep one public configuration per benchmark under `config/benchmark/`, named
-  for the source without a scale suffix. Defaults use 87,060,000 baseline rows
-  (HyBench SF10); exact scale stays in the file and each run's effective snapshot.
-  Keep index/backend configuration under `config/index/`, generation engine
-  settings under `config/engine/` (one file or folder per engine), and tool
-  runtime settings and engine selection in `config/sibench.yaml`.
-  Do not add scale, client-count or mode variants to the public directory.
-  Keep experiment variants in `develop/configs/`
-  and required test inputs in test resources or temporary directories.
-  Test profiles distinguished by scale use actual total-row suffixes such as
-  `1k`, `2k` or `1b`, or an explicit upstream scale such as `sf1`;
-  avoid `small` and `large`. Keep only inputs needed by the tests and use test
-  placeholders for required runtime locations; construct case-specific variants
-  in memory or temporary files.
-  Use explicit settings and simple orchestration, not an inheritance framework.
-- Give each setting and dependency pin one authoritative owner; derive required
-  copies rather than maintaining parallel values. Use the owning language's build
-  system for published dependencies and gitlinks for upstream source dependencies.
-  Keep build dependencies with the component that consumes them; runtime
-  configuration is not a dependency inventory. Preserve effective run snapshots.
-- Build PostgreSQL, DuckDB, RocksDB and Pixels (with pixels-sink) generation
-  engines from their pinned `third_party/` sources. Keep project patches under `src/main/native/` and apply
-  them to build copies, leaving upstream checkouts clean. Use matching source and
-  build inputs for headers, native libraries and JNI; bind artifacts to their
-  build identities. Maven consumes and packages the resulting Java/JNI artifacts
-  without a separate upstream runtime pin or prebuilt fallback. Choose source or
-  published artifacts for other dependencies according to their integration needs.
-- Implement the core in Java under `src/main/java/org/sibench/`, organized by
-  responsibility, including configuration, generation, trace, replay and adapters.
-  Keep Java tests under `src/test/java/org/sibench/` and core builds under
-  `build/sibench/`. Use JDK 17 and the root Maven project.
-- Keep necessary native instrumentation and thin backend adapters under
-  `src/main/native/`. Use the backend's required language for thin bindings, but
-  do not duplicate core Trace interpretation or workload semantics outside Java.
-  SIBench owns replay scheduling, adaptation and result validation; backend
-  repositories own their engines. Replay integration does not by itself authorize
-  redesigning a backend engine.
-- Use Python/Shell for orchestration, offline analysis and reporting; call the
-  Java CLI instead of duplicating core configuration or workload semantics.
-- Keep build, capture and report entry points in `scripts/`. Keep plotting scripts
-  under `graph/scripts/`, styles under `graph/config/`, and plotting dependencies
-  and usage in `graph/`. Put manual
-  development probes in ignored `develop/scripts/`; required runtime validation
-  and default tests must remain independent of that directory.
-- Ship the tests, fixtures and checks needed to maintain delivered behavior,
-  including native and Python tests under `src/test/`. Development-only execution
-  or implementation language is not a reason to move them into `develop/`.
-  Document their entry points and prerequisites; do not duplicate core semantics
-  in orchestration tests, but preserve independent correctness oracles.
-- Keep test fixtures, fault injection, synthetic responses and test-only helpers
-  under `src/test/`, outside production artifacts and execution paths. Do not add
-  runtime flags, environment/system-property switches or mutable hooks solely
-  for tests, or bypass production validation to make tests pass. Exercise real boundaries
-  from tests; retain dependency injection only when the abstraction also serves
-  production responsibilities. Move test-only machinery without weakening
-  runtime validation, error handling or independent regression coverage.
-  Language-native test modules are allowed in their owning build layout when
-  production compilation and artifacts exclude them entirely.
-- Keep delivered Trace and Index Service contracts under `docs/`.
-  Keep development guides, experiment notes and diagnostic configurations in the
-  ignored `develop/` directory. Required test fixtures belong under test resources
-  or temporary directories, never in `develop/`.
-- Keep development milestones in local development notes, not directory names.
-  Local plans, machine settings and experiment history are excluded from source
-  delivery. Keep retained logs and manifests as recorded; document relocations
-  separately.
+## Scope and reading
 
-## Naming
+- Work within the user's requested scope. Discussion, research and review do not
+  by themselves authorize implementation, deployment or an experiment. Local
+  notes describe decisions and evidence; reading them does not activate old tasks.
+- If `develop/README.md` exists, read its index and the current task first, then
+  only relevant linked records. Local notes are optional and ignored; building,
+  testing and understanding the delivered project must not depend on them.
+- Run shell commands through `rtk`. Use CodeGraph for symbols, callers/callees and
+  impact when its index is usable; use `rtk rg` for exact text, configuration or a
+  missing/stale index. Index only when needed and source reads are authorized.
+- Verify behavior in source and actual consumers. Existing code, design proposals,
+  passing tests and historical results are different kinds of evidence.
+- Proceed autonomously within the authorized task, without another model's
+  sign-off. Before implementation, state the evidence, affected behavior and
+  smallest meaningful validation. Raise unresolved research-semantic choices or
+  costs beyond scope; do not create a plan document for every edit.
+- Preserve unrelated changes, staging boundaries, active jobs and fixed comparison
+  builds. Notes do not grant permission to stage, commit, deploy, update submodules
+  or take over processes.
+- Report actual coverage and unexamined areas. Repository-wide cleanup or merge
+  readiness requires the intended diff, relevant current code and consumers,
+  build/test entry points, configuration and documentation; a search or unit suite
+  alone is insufficient.
 
-- Follow language conventions consistently: Java class files use UpperCamelCase
-  matching the declared class, and Java packages use lowercase names. Proto,
-  C/C++ source and header files, Python scripts and configuration files use
-  lower_snake_case. Shell scripts and Markdown documents use lower-kebab-case.
-- Preserve conventional names such as README.md, AGENTS.md and Makefile, upstream
-  naming and generated filenames. Versioned patches retain their upstream release
-  in the name, such as postgresql-14.24.patch. Apply these rules to new
-  project-owned files; do not mass-rename existing files for appearance. Necessary
-  renames must update callers, tests, fixtures, build files, scripts and
-  documentation references together.
-- Use the same domain terms across languages; casing and separators may differ.
-  Do not introduce synonyms for the same concept without a semantic distinction.
+## Repository and configuration
 
-## Development records
+- Organize production code, tests, configuration and documentation by responsibility,
+  using stable names. Avoid `phase1`, `step2`, `misc`, `temp`, `new` and `final`
+  directories. Research iterations belong in ignored notes, not product structure.
+- Keep benchmark sources in `benchmark/`, index engines in `index/`, and general
+  source dependencies in `third_party/`, all as pinned submodules. New submodules
+  record the verified default branch in `.gitmodules`; gitlinks own pins, and
+  builds/tests never upgrade them automatically. Preserve upstream licenses.
+- Use JDK 17 and root Maven. Java core code belongs in
+  `src/main/java/org/sibench/`, Java tests in `src/test/java/org/sibench/`.
+  Build core, benchmarks and index engines into `build/sibench/`,
+  `build/benchmarks/` and `build/index/`; local service state belongs in
+  `build/services/`. Historical build locations belong in local records.
+- Java owns configuration, generation, Trace interpretation, scheduling, replay
+  adaptation and result validation. Native instrumentation and thin bindings belong
+  in `src/main/native/`; backend repositories own engine mechanisms. Integration
+  does not authorize redesigning an engine. Python/Shell orchestrate the Java CLI
+  and perform offline analysis/reporting without duplicating core semantics.
+- Keep build/capture/report entry points in `scripts/`; plotting scripts, styles
+  and dependencies/usage in `graph/scripts/`, `graph/config/` and `graph/`.
+  Manual probes may use `develop/scripts/`; required checks cannot depend on it.
+- Keep one public configuration per benchmark in `config/benchmark/`, named for
+  its source without a scale suffix. Defaults use 87,060,000 baseline rows
+  (HyBench SF10); exact scale belongs in configuration and effective snapshots.
+  Put backend settings in `config/index/`, one engine file/folder in `config/engine/`
+  and runtime selection/settings in `config/sibench.yaml`. Use explicit settings,
+  not inheritance or public scale/client/mode variants; experiments use
+  `develop/configs/`, tests use resources or temporary files.
+- Test scale names use actual row counts (`1k`, `2k`, `1b`) or upstream scales
+  (`sf1`), not `small`/`large`. Retain required inputs, use placeholders for runtime
+  locations, and construct case-specific variants in memory or temporary files.
+- Give each setting and dependency pin one owner. Use the consuming language's
+  build system for published dependencies and gitlinks for source dependencies;
+  runtime configuration is not a dependency inventory. Derive copies and preserve
+  effective run snapshots.
+- Build PostgreSQL, DuckDB, RocksDB and Pixels/pixels-sink generation engines from
+  pinned `third_party/` sources. Apply `src/main/native/` patches to build copies,
+  leaving upstream clean. Bind matching headers, libraries and JNI/Java artifacts
+  to build identities; Maven consumes/packages them without a separate upstream
+  runtime pin or prebuilt fallback. Choose other dependency forms by integration need.
+- Ship necessary Java, native and Python tests, fixtures, fault injection and
+  synthetic responses under `src/test/`, outside production artifacts and paths.
+  Native-language test modules may use their owning build layout if excluded from
+  production compilation. Do not add runtime flags, mutable hooks or validation
+  bypasses solely for tests; injection abstractions must serve production
+  responsibilities. Preserve independent oracles and documented test entry points.
+- Java classes/files use UpperCamelCase and packages lowercase; proto, C/C++,
+  Python and configuration names use lower_snake_case; Shell/Markdown names use
+  lower-kebab-case. Preserve conventional, upstream and generated names, and
+  release-named patches such as `postgresql-14.24.patch`. Do not mass-rename for
+  appearance; necessary renames update all consumers together. Keep domain terms
+  consistent across languages.
 
-- If `develop/README.md` exists locally, read that index and the current task
-  first, then load only the relevant linked notes. The directory is optional,
-  ignored, and must not become a build or test dependency.
-- Local development notes, when present, hold current goals, design choices,
-  dependencies, remaining tasks, machine settings and experiment history. They
-  are not a prerequisite for building, testing or understanding the repository.
-- Integrate updates into the relevant current sections; remove completed tasks
-  from remaining work. Separate implemented behavior, unverified choices and
-  historical evidence. Keep the input/build identities needed by retained facts.
-- Give each maintained fact one current home. Consolidate overlapping local
-  guides, update their consumers, and remove superseded prose instead of adding
-  an archive. Retain experiment configurations and helper scripts only for a
-  named current use or necessary evidence; verify recoverable copies before
-  removing unique inputs. Keep proposed workflow changes distinct from behavior
-  already implemented and validated.
+## Research ideation and assessment
 
-## Current design and compatibility
+- Apply this workflow to idea generation, research positioning, novelty review
+  and requested architecture exploration, not automatically to routine fixes.
+  Keep valuable problems open while questioning mechanisms and claims. Similar
+  work is neither an automatic rejection nor evidence of novelty.
+- Develop the strongest plausible formulation, then actively seek counterevidence.
+  Separate external requirements from changeable design choices. Hypotheses may
+  start from mechanism analysis or cost models; label them unverified rather than
+  requiring an implementation or measured benefit before discussion.
+- Investigate the closest relevant primary sources within a stated search scope.
+  Check problem settings, assumptions, guarantees, mechanisms and contribution
+  boundaries in the paper's substance, not only titles/abstracts. Cite precise
+  evidence for decisive comparisons; disclose inaccessible sources, uncertain
+  interpretations and missing coverage. No search proves absolute novelty.
+- Compare strong relevant baselines and straightforward adaptations/combinations
+  of existing methods. Identify inherited ideas and the actual added contribution.
+  A different name, deployment or combination needs an explanation of the meaningful
+  difficulty it resolves. Do not manufacture novelty through weaker semantics,
+  extra resources or selective comparisons.
+- Assess these dimensions separately, without hiding decisive gaps in a total score:
 
-- Use one fresh database of the explicitly selected native engine for loading,
-  RowID identities and workload capture. Reject existing working/output directories
-  and preserve native transaction and snapshot semantics. The database is working
-  state: keep only what Trace export needs, publish the Trace after normal host
-  shutdown and then delete the database. Retain failure diagnostics; do not add
-  crash recovery or reusable initial-state caches without an explicit need.
-  Named benchmark entries in the runtime configuration own persistent local Trace
-  directories, generation switches and optional upload URIs. Analysis and replay
-  use those same entries without an additional cache. Keep one current selection
-  per benchmark/workload. Share AWS/COS connection settings and environment-variable
-  credential references in the runtime configuration; URI schemes select the store.
-  Verify published counterparts before deleting the only local copy. Record accepted losses of
-  historical reproducibility when retiring obsolete Trace payloads, and preserve
-  selected raw reports, logs and manifests. Input integrity and source-completeness
-  checks remain required in normal generation.
-- Maintain the current design by default. Do not add or retain superseded APIs,
-  format readers, compatibility flags, fallback implementations or transition
-  branches for backward compatibility that has not been explicitly required.
-- When replacing a design, update implementation, callers, configuration, build
-  files, scripts, tests, fixtures and documentation together. Trace actual consumers
-  beyond the initially reported file; remove the replaced path and its obsolete
-  tests. Preserve tests of current invariants and rejection of unsupported inputs;
-  implementation age alone does not make a diagnostic reference or independent
-  oracle obsolete.
-- Trace and Index Service currently ship as one coordinated implementation with
-  one supported format and protocol. Do not add format revision fields, versioned
-  protocol namespaces or legacy readers merely to record development iterations.
-  Introduce explicit version negotiation only for an established independent
-  consumer or compatibility requirement. This does not remove type/layout checks,
-  integrity checks, data commit/snapshot versions, upstream dependency versions,
-  or build/input identities. Judge other version-like fields by their actual role;
-  do not delete them by name alone.
-- Before removing an existing compatibility path, identify actual consumers and
-  whether required artifacts can be regenerated or migrated without inventing
-  missing facts. If removal would make necessary data unusable or destroy required
-  reproducibility, explain the concrete impact and obtain a user decision on that
-  tradeoff. Do not silently keep compatibility or discard required evidence.
-- Any explicitly retained compatibility must name its consumer, reason and removal
-  condition. Prefer a bounded migration when feasible over permanent dual paths.
-  Keep selected reports, logs and manifests as recorded; retaining evidence does
-  not require the current executable to support every historical format.
-- A fixed comparison binary and its build/input identities are experiment evidence,
-  not a reason to keep old source implementations or compatibility branches.
-  Before removing one-run configurations from `config/`, preserve the effective
-  snapshots needed to reproduce recorded runs and update maintained references;
-  leave retained logs unchanged and document relocated evidence.
-- Apply cleanup to the design being changed. Do not turn unrelated tasks into
-  repository-wide legacy removal or introduce migration frameworks speculatively.
+  | Dimension | Required question |
+  | --- | --- |
+  | Novelty | What contribution is not already covered by the closest work? |
+  | Significance | Which meaningful need or limitation does it address, and under what conditions? |
+  | Feasibility | What mechanism could deliver it, with which correctness, cost and capacity risks? |
+  | Evaluability | Which baseline, ablation or counterexample distinguishes the claim, and what would refute it? |
 
-## Documentation responsibilities
+- Write claims only as strongly as evidence permits. Outcomes may be continue,
+  revise the mechanism/claim, reject the current claim as covered, or insufficient
+  evidence. Name concrete overlaps when rejecting and substantive new distinctions
+  when revising; do not endlessly repackage a covered idea.
+- Choose the next investigation by the uncertainty it resolves. Distinguish sources,
+  facts, inferences, hypotheses and experimental results. Negative results apply to
+  tested mechanisms and conditions, not automatically to the whole problem.
+  Research proposals do not authorize code changes or costly runs.
 
-- Use English for all project-owned documentation, code comments, docstrings,
-  configuration explanations, CLI help, and other maintained prose. Translate
-  existing non-English prose when bringing the repository into compliance;
-  update affected links and anchors together. Preserve program identifiers,
-  required Unicode test data, upstream content, and recorded raw evidence.
-- Keep Chinese reading notes only in the ignored `develop/` directory. Do not
-  stage or commit those notes, force-add them, or link delivered documentation
-  to them.
-- Keep `README.md` concise: build prerequisites, usage, supported inputs and test
-  entry points. Keep externally relevant formats, service semantics, failure
-  behavior and limits in `docs/`. Readers must be able to build, use and test the
-  delivered project without local development notes.
-- Organize public documentation around complete user workflows. Keep input
-  preparation, validation and transfer with the workflow that consumes them;
-  Pixels CSV/CDC and columnar input instructions belong in the Pixels experiment
-  guide. Do not split implementation components into separate user guides.
-  Prefer short commands, tables and links over repeated explanations; remove
-  redundant pages and update their references together.
-- Put source investigations, build implementation details, tuning, detailed
-  validation procedures and experiment records in `develop/`, indexed for reading
-  on demand. When moving prose there, preserve public prerequisites and contracts;
-  required scripts, checks and fixtures remain delivered repository files.
-- Give each documented fact one maintained home; summarize and link instead of
-  duplicating configuration inventories, contracts or test procedures. Do not link
-  delivered documentation to ignored notes or results. Publish experiment claims
-  only with matching reproducible evidence available to readers.
-- Update affected documentation with a behavior change. Keep current behavior and
-  limits explicit; retain only the historical conclusions and evidence still needed.
-  Keep AGENTS.md focused on durable working rules; put task progress, machine
-  setup, dependency versions and experiment parameters in their owning files.
+## Implementation and compatibility
 
-## Evidence retention
-
-- Maintain the latest complete acceptance record for the current design. Replace
-  superseded experiment prose and results after the new acceptance passes; do not
-  accumulate a run history. Keep older evidence only for a retained comparison,
-  current regression case or active investigation, and remove claims that lose
-  their evidence. Preserve the inputs and certifications needed for regeneration.
-- Retained conclusions need matching build/input identities,
-  effective configuration, correctness results and same-run resource measurements.
-- Keep one necessary copy of a comparison binary or diagnostic state. Do not retain
-  every candidate build, repeated index, temporary cache, setup failure or superseded
-  derived summary. Check consumers and required canonical inputs before pruning;
-  do not discard unique facts needed by a retained conclusion or open investigation.
-- Preserve the contents of selected raw reports, logs and manifests. Correct derived
-  analysis separately, remove invalid/redundant derivatives, and describe material
-  pruning or relocation in the relevant development record or commit description.
-  Evidence retention does not require a new archival framework.
+- Maintain the confirmed design during implementation unless changing it is in
+  scope. Research may challenge it; an untested proposal is not implemented behavior.
+  Public contracts live in `docs/`.
+- Preserve native generation's lifecycle: one fresh database of the explicitly
+  selected engine for loading, RowIDs and capture; reject existing work/output
+  directories; preserve native transactions/snapshots. Publish Trace after normal
+  host shutdown, then delete the working database; retain only working data needed
+  for export. Keep failure diagnostics; do not add recovery or reusable initial-state
+  caches without need. Runtime benchmark
+  entries own selected Trace paths, generation switches and upload URIs; analysis
+  and replay share them without another cache. Shared AWS/COS settings and
+  environment-variable credential references belong in runtime configuration;
+  URI schemes select stores. Keep one
+  current selection per benchmark/workload.
+- When replacing a design, update implementation, actual consumers, configuration,
+  builds, scripts, tests, fixtures and documentation together. Remove superseded
+  paths without unrelated cleanup or speculative migration frameworks. Preserve
+  current invariant/rejection tests, independent oracles and useful diagnostics.
+- Do not retain superseded APIs, readers, fallbacks or transition flags for
+  hypothetical compatibility. Before removal, identify real consumers and whether
+  necessary artifacts can be regenerated/migrated without invented facts. Obtain
+  a user decision if necessary data or reproducibility would be lost. Retained
+  compatibility names its consumer, reason and removal condition; prefer bounded
+  migration over permanent dual paths.
+- Trace and Index Service are one coordinated implementation with one supported
+  format/protocol. Add version negotiation only for an established independent
+  consumer or compatibility requirement, not to label development iterations.
+  Preserve type/layout/integrity checks, commit/snapshot versions, dependency
+  versions and build/input identities; judge version-like fields by their role.
 
 ## Validation
 
-- For documentation-only changes, check links, cross-references and consistency;
-  do not run a Benchmark merely to validate prose.
-- Document production generation, backend evaluation and independent acceptance
-  as explicit workflows with their own triggers and costs. Do not attach a
-  development-only reference, oracle or recovery suite to every generation run.
-  Normal generation stops on failure and retains diagnostics; cross-host fault
-  migration is not part of that workflow.
-- Distinguish source registration, build/deployment, semantic integration and
-  full acceptance. Adding a backend submodule does not enroll it in formal tests
-  or certify support. Keep the selected test roster and readiness in the current
-  development plan, separate from research references and engines under development.
-- Before admitting a backend to a shared comparison, verify its mapping of read
-  timestamps, retained versions, deletion, Abort, transaction-local reads and
-  complete-commit publication. Native snapshots or batch/file APIs alone do not
-  establish equivalent semantics. Report unsupported capabilities and resolve
-  the comparison scope rather than dropping operations or weakening the contract.
-- Verify required storage publication primitives on the actual deployment;
-  S3-compatible access alone does not establish atomic publication or fencing.
-  Measure acknowledgment, remote durability and cross-instance visibility
-  separately. Align resource/cache budgets and include adapter, coordination,
-  storage and maintenance costs. Report different storage environments separately
-  and identify ports that change an upstream system's data path.
-- Review validation across benchmark data generation, capture, index-operation
-  extraction, Trace compilation and Index Service replay. For each production
-  check, identify the failure it detects, the boundary responsible for it, its
-  trigger and its cost. Remove redundant checks or checks for failures prevented
-  by enforced current invariants only after verifying that reasoning in the code.
-  Fuse checks with necessary reads and reuse identity-bound evidence where valid;
-  avoid repeated full scans or per-operation checks of already established facts.
-- Preserve trust-boundary validation, input integrity, source completeness,
-  service capability and result correctness checks, and errors that prevent data
-  loss. Unit tests cannot certify a particular run's inputs or execution. Reuse
-  requires matching inputs, configuration and relevant implementation semantics;
-  do not assume mutable inputs still match prior evidence. Expensive independent audits
-  may be explicit acceptance steps when the remaining runtime checks still enforce
-  the contract; do not silently turn required validation into an optional probe.
-- Tests protect current behavior and invariants, not historical implementation
-  details. A fixed bug is not by itself a reason to delete its regression test.
-  Remove tests for abandoned semantics and consolidate genuinely duplicate cases
-  only when distinct failure modes remain covered. Keep counterexamples that can
-  catch future regressions; do not count tests or mirror implementation logic as
-  evidence of adequate coverage.
-- During code iteration, run targeted tests first; run the root Maven `mvn test`
-  check before delivering a coherent code task. Repeat broader checks only after
-  relevant changes, failures or unresolved risks justify them. Record integration
-  environments and results separately; unit tests do not establish real-service
-  correctness or performance.
-- For semantic changes, add a counterexample or independent validation that can
-  distinguish the old behavior from the intended behavior. Matching old checksums
-  or byte-identical recompilation establishes regression equivalence only.
-- Derive critical expected results from hand-checkable cases, original database
-  observations or an independent oracle, not solely from the implementation under
-  test. For bug fixes, show that the regression detects the old defect; for result
-  validators, demonstrate rejection of deliberately wrong results. Do not weaken
-  assertions, skip failures or regenerate expected outputs just to make tests pass;
-  any changed expectation needs a semantic justification and independent evidence.
-- Reuse verified inputs at the affected boundary: backend changes normally reuse
-  Trace, compiler changes reuse raw captures, and capture changes require affected
-  source runs. Use short checks first and full validation when the affected boundary
-  requires it. Small tests cannot replace required scale, recovery or end-to-end checks.
-- Cover configuration combinations and controlled interleavings on small inputs;
-  use representative full inputs to validate complete results and cumulative
-  resource risks. Add large variants for distinct semantic or capacity risks,
-  rather than multiplying every axis by default. Record what each run proves and
-  which still-valid evidence it reuses; do not replace full-input correctness with
-  a short test or preflight.
-- Start with lightweight validation. Large captures, long benchmarks and paid
-  experiments need an authorized scope with inputs, resource budget, duration and
-  stop conditions; their presence in local notes alone does not authorize execution.
-- When acceptance fails, switch to the smallest diagnostic experiment that retains
-  the failing conditions. State the hypothesis, expected observation and stop
-  condition before each run. Repeat expensive acceptance only when a fix or new
-  evidence justifies it; an occasional pass does not resolve an intermittent failure.
-- Distinguish the first failure from subsequent drain, close or process-cleanup
-  waits. Bound setup, execution and teardown separately, preserve the original
-  error and capture diagnostics before stopping the affected run. Do not treat a
-  cleanup stack alone as proof of the original failure's cause.
-- Give each experiment a unique run ID and output directory. Bind build, config
-  and input identities; pair logs, results and timing only from that same run.
-  Preserve meaningful failed evidence. Do not overwrite prior runs or combine a successful
-  result with another run's timing; mark uncertain provenance unusable for combined
-  conclusions until its identity is recovered. Use existing reports and simple
-  orchestration rather than building a new experiment framework for this rule.
+- For documentation-only work, check links, references and consistency. For code,
+  run targeted tests first and root `rtk mvn test` before delivering a coherent
+  task, plus affected native/Python/build checks. Broaden or repeat only for relevant
+  changes, failures or unresolved risks. Unit tests do not establish real-service
+  correctness, a particular run's inputs or performance.
+- Semantic changes need a counterexample or independent validation distinguishing
+  intended from old behavior. Derive critical expectations from hand-checkable
+  cases, original database observations or independent oracles. Bug regressions
+  must detect the old defect; validators must reject deliberately wrong results.
+  Do not weaken assertions, skip failures or regenerate expectations just to pass.
+  Byte-identical output establishes regression equivalence only.
+- Tests protect current invariants, not historical implementation details. Remove
+  abandoned semantics and consolidate duplicates only while preserving distinct
+  failure modes. Fixed bugs do not make counterexamples obsolete; test counts or
+  checks mirroring implementation are not correctness evidence.
+- Cover generation, capture, extraction, Trace compilation and replay. Each
+  production check needs a failure, responsible boundary, trigger and cost.
+  Preserve trust-boundary validation, input integrity, source completeness, service
+  capabilities, result correctness and data-loss prevention. Remove redundancy
+  only after verifying enforced invariants; fuse checks with necessary reads and
+  reuse evidence only when input/configuration/semantic identities still match.
+- Keep production generation, backend evaluation and independent acceptance as
+  explicit workflows with distinct triggers and costs. Normal generation fails
+  with diagnostics; do not attach development oracles or cross-host recovery to
+  every run. Independent audits may be explicit acceptance steps only while runtime
+  checks enforce the contract; required validation must not silently become optional.
+- Reuse inputs at the changed boundary: backend work normally reuses Trace,
+  compiler work reuses available raw capture, capture work needs affected source
+  runs. Small cases cover combinations/interleavings; representative full inputs
+  cover complete results and cumulative resources. Add large variants for distinct
+  risks, not every axis. Short tests cannot replace required scale, recovery or
+  end-to-end acceptance; state which existing evidence remains valid.
+- Separate source registration, build/deployment, semantic integration and full
+  acceptance. Registration does not enroll/certify a backend. Before comparison,
+  verify read timestamps, retained versions, deletion, Abort, transaction-local
+  reads and complete-commit publication. Native snapshots/batches alone are
+  insufficient. Resolve unsupported scope without dropping operations or weakening
+  semantics; keep the selected roster in the current work record.
+- Verify publication primitives on the actual deployment; S3-compatible access
+  does not establish atomic publication or fencing. Measure ACK, remote durability
+  and cross-instance visibility separately. Align resource/cache budgets and include
+  adapters, coordination, storage and maintenance; separate storage environments
+  and identify ports that change an upstream data path.
 
-## Autonomous execution and optimization
+## Experiments and performance
 
-- Proceed within the authorized task without requiring another model's review at
-  each step. Before changing code, briefly identify the evidence, affected behavior
-  and smallest meaningful validation; do not create a separate planning document
-  for each edit. Raise unresolved research-semantic choices or costs beyond the
-  authorized budget rather than silently changing scope.
-- For performance work, identify a measured bottleneck, expected end-to-end benefit
-  and a bounded comparison before optimizing. Compare the same input, environment,
-  cache conditions and correctness checks; record variation and resource tradeoffs.
-  Keep changes attributable. Do not run a full capture after every micro-optimization.
-- Fix a correct comparison build, inputs, effective configs and available results
-  before a batch of changes; label missing baseline metrics and fill essential gaps
-  with bounded runs. Use short comparisons for hot-path or state changes during
-  iteration, then combine full correctness acceptance with final time/space
-  regression measurement. Investigate unexpected growth before stacking more
-  changes; report noise and justified correctness costs, not only speedups.
-- Parallelize independent checks on separate resources within their budgets.
-  Isolate performance comparisons from competing experiments. Reuse a verified
-  initial backend state only where the current backend supports it, recording
-  identity, restore cost and cache conditions; measure fresh loading when loading
-  itself is under test. Do not add checkpoint support merely to save a few runs.
-- Stop or revert your isolated optimization when benefit is indistinguishable from
-  noise or complexity outweighs the gain; do not revert unrelated work. Report a
-  no-gain result instead of trying endless variants. Correctness fixes and required
-  capacity improvements are not conditional on a throughput gain.
-- At task delivery, report commands, input/build identities, results, untested
-  boundaries and evidence paths concisely. For optimization, include before/after
-  measurements and the retain/revert decision. Mark a stage complete only when its
-  required acceptance checks pass; implementation, partial validation and blocked
-  validation must remain distinguishable. No external supervisor sign-off is required.
-- Claims of repository-wide cleanup or merge readiness require explicit coverage
-  of the intended merge diff, relevant current code and consumers, build/test
-  entry points, configuration and documentation. Report findings and unexamined
-  areas against that scope; a local fix, text search or passing unit suite alone
-  does not establish overall completion.
+- Start lightweight. Large captures, long benchmarks and paid runs need authorized
+  inputs, resource budget, duration and stop conditions; a local note is not run
+  authorization. Bound setup, execution and teardown separately.
+- Before optimizing an implementation, identify a measured bottleneck, expected
+  end-to-end benefit and bounded comparison. Fix a correct comparison build, inputs,
+  effective configs and results before a batch of changes; label missing metrics
+  and fill essential gaps with bounded runs. Compare the same input, environment,
+  cache conditions and correctness checks; record variation and resource costs.
+- Keep changes attributable. Use short comparisons during iteration, investigate
+  unexpected growth before stacking changes, then combine required full correctness
+  acceptance with final time/space measurement. Do not run full capture after every
+  micro-optimization. Noise and justified correctness costs must remain visible.
+- Parallelize independent checks on separate resources within budget; isolate
+  performance comparisons. Reuse initial backend state only where supported, binding
+  identity, restore cost and cache conditions; measure fresh loading when under
+  test. Do not add checkpoints merely to save runs.
+- On failure, state a hypothesis, expected observation and stop condition for the
+  smallest diagnostic retaining the failure conditions. Preserve the first error
+  and collect diagnostics before stopping; distinguish it from drain/close waits.
+  Repeat expensive acceptance only after a fix or new evidence, not to obtain an
+  occasional pass for an unresolved intermittent failure.
+- Stop or revert isolated optimization when benefit is noise or complexity outweighs
+  it, preserving unrelated work and necessary correctness/capacity fixes. Limit
+  no-gain conclusions to tested conditions. Report before/after results, resource
+  tradeoffs and the retain/revert decision.
+- Every run has a unique ID/output and matching source/build, input, configuration,
+  correctness and same-run resource evidence. Never overwrite or combine different
+  runs' results/timing. Mark uncertain provenance unusable for combined conclusions.
+  Report commands, identities, evidence paths and untested boundaries; distinguish
+  implementation, partial validation and completed acceptance. No external sign-off
+  is required beyond the user's authorization for the work.
+
+## Documentation and development records
+
+- Use English for delivered documentation, comments, docstrings, configuration
+  explanations and CLI help. Preserve identifiers, required Unicode test data,
+  upstream content and raw evidence. Chinese local notes may live only in ignored
+  `develop/`; never stage/force-add them or link delivered docs to ignored records.
+- Keep public README concise: prerequisites, usage, supported inputs and tests.
+  Put external formats, service semantics, failure behavior and limits in `docs/`,
+  organized by complete user workflows. Pixels input preparation/validation/transfer
+  belong with Pixels experiments. Preserve public prerequisites when moving internal
+  investigations, tuning, build details or detailed procedures into local notes.
+- Give each maintained fact one home; summarize/link elsewhere. Update affected
+  docs with behavior. AGENTS owns durable rules, not current tasks, machine settings,
+  dependency inventories or experiment parameters. Publish claims only with matching
+  evidence available to readers.
+- Local records have explicit roles: README indexes work and procedures;
+  `design.md` or `architecture.md` owns current design/rationale; the work list owns
+  remaining actions; the results/acceptance index owns selected evidence and limits.
+  Separate work/environment/storage files only for distinct responsibilities; do not
+  rename established files merely to fit a template.
+- Label proposed, implemented and validated states. Record meaningful research or
+  design decisions under `iterations/` by topic when needed, not once per commit
+  or minor edit. Include the question, alternatives/closest work where relevant,
+  hypothesis, decision, evidence and unresolved uncertainty. Rejected approaches
+  may remain when their reasoning supports a current decision; they are not a
+  second active specification. Ordinary fixes need no separate iteration document.
+- Maintain current sections in place, remove completed actions and superseded
+  duplicate prose, and update consumers/links together. Backend notes own backend
+  mechanisms; SIBench notes own shared inputs, contracts and integration. Reference
+  shared facts instead of copying them; immutable experiment snapshots stay as run.
+
+## Evidence retention
+
+- Keep the latest complete acceptance for the current design until a replacement
+  passes. Retain older evidence only for a named comparison, regression, active
+  investigation or still-relevant design decision, including meaningful negative
+  results. Do not accumulate every run/commit or discard useful reasoning merely
+  because implementation changed. Remove claims whose evidence is lost.
+- Keep required input/build identities, effective configurations, correctness and
+  same-run resource measurements, plus inputs/certifications needed for regeneration.
+  A comparison binary is evidence, not a reason to retain superseded source/readers.
+  Preserve effective snapshots before removing one-run public configurations.
+- Check consumers, canonical inputs and recoverable copies before pruning. Verify
+  published counterparts before deleting the sole local copy; obtain decisions for
+  required reproducibility losses under the compatibility rule and record accepted
+  losses. Keep one necessary comparison binary/diagnostic state, not all candidate
+  builds, repeated indexes, caches or superseded derived summaries.
+- Preserve selected raw reports, logs and manifests as recorded. Correct derived
+  analysis separately; document material pruning/relocation and preserve meaningful
+  failures. Required tests and validation stay delivered, not in ignored notes.
+  Evidence retention needs no additional archival framework.
