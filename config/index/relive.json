@@ -1,5 +1,0 @@
-{
-  "cfs_directory": "/mnt/cfs/sibench/relive",
-  "l1_uri": "cos://replace-with-your-bucket-APPID/sibench/work/index/relive/RUN-ID/",
-  "runtime_config": "../sibench.yaml"
-}

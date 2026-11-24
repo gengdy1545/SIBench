@@ -13,7 +13,7 @@ import java.util.Set;
 
 /**
  * What an index server serves ({@code service} of an index_service config). Its
- * {@code backend} is {@code relive} with an HTTP endpoint, {@code rocksdb} for fixtures,
+ * {@code backend} is {@code relive} with an embedded client configuration, {@code rocksdb} for fixtures,
  * or {@code rocksdb_cloud}/{@code slatedb} with a {@code storage} URI
  * resolved through the runtime configuration's AWS or COS connection. {@code value} is
  * {@code locator} or {@code row_id}: what an index entry points to.
@@ -24,7 +24,8 @@ import java.util.Set;
  */
 public record ServiceConfig(
         String adapter,
-        String endpoint,
+        Path client,
+        int clients,
         Path path,
         int port,
         ValueKind value,
@@ -32,7 +33,7 @@ public record ServiceConfig(
         boolean reopen,
         boolean wal,
         Execution execution) {
-    /** SIBench service/bridge resources, independent of the backend's internal worker pools. */
+    /** SIBench service resources, independent of the backend's internal worker pools. */
     public record Execution(int readThreads, int writeThreads, Path statistics) {
         public Execution {
             require(readThreads > 0 && writeThreads > 0, "Execution thread counts must be positive");
@@ -45,9 +46,9 @@ public record ServiceConfig(
         require(port >= 0 && port <= 65535, "Invalid index service port");
         require(Set.of("relive", "rocksdb", "rocksdb_cloud", "slatedb").contains(adapter), "Unknown service backend: " + adapter);
         boolean relive = adapter.equals("relive");
-        require(!relive || endpoint != null && !endpoint.isBlank(), "The Relive bridge needs an endpoint");
+        require(!relive || client != null && clients > 0, "Relive needs a client configuration and a positive client count");
         require(relive || path != null, "An index needs a path");
-        require(!adapter.equals("relive") || path == null && objects == null && !reopen && wal,
+        require(!relive || path == null && objects == null && !reopen && wal,
                 "Relive owns its storage, reopening and durability policy");
         require(!(adapter.equals("rocksdb_cloud") || adapter.equals("slatedb")) || objects != null,
                 "An object-storage backend needs storage settings");
@@ -69,24 +70,26 @@ public record ServiceConfig(
         keys(
                 service,
                 Set.of(
-                        "backend", "endpoint", "path", "port", "value", "storage",
+                        "backend", "client", "clients", "path", "port", "value", "storage",
                         "reopen", "wal"));
         String backend = string(service, "backend");
         require(
                 Set.of("relive", "rocksdb", "rocksdb_cloud", "slatedb").contains(backend),
                 "backend must be relive, rocksdb, rocksdb_cloud or slatedb");
         if (backend.equals("relive")) {
-            keys(service, Set.of("backend", "endpoint", "port", "value"));
-            return new ServiceConfig(backend, string(service, "endpoint"), null,
+            keys(service, Set.of("backend", "client", "clients", "port", "value"));
+            return new ServiceConfig(backend, root.resolve(string(service, "client")),
+                    Math.toIntExact(positive(service, "clients")), null,
                     Math.toIntExact(positive(service, "port")), value(service), null, false, true, execution);
         }
-        require(!service.containsKey("endpoint"), "endpoint is only for the Relive bridge");
+        require(!service.containsKey("client") && !service.containsKey("clients"), "client settings are only for Relive");
         boolean cloud = !backend.equals("rocksdb");
         for (String key : List.of("storage", "wal"))
             require(cloud == service.containsKey(key), key + " is required only for object-storage backends");
         return new ServiceConfig(
                 backend,
                 null,
+                0,
                 root.resolve(string(service, "path")),
                 Math.toIntExact(positive(service, "port")),
                 value(service),
@@ -100,7 +103,7 @@ public record ServiceConfig(
 
     /** This server's index, new or reopened. */
     public IndexBackend backend() throws java.io.IOException {
-        if (adapter.equals("relive")) return new ReliveBackend(endpoint, value);
+        if (adapter.equals("relive")) return new ReliveBackend(client, clients, value);
         if (adapter.equals("slatedb")) return VersionedIndexBackend.slate(path, value, objects, reopen, wal);
         if (objects == null)
             return reopen ? VersionedIndexBackend.open(path, value) : VersionedIndexBackend.create(path, value);

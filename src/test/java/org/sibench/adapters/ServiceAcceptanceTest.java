@@ -14,7 +14,7 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.sibench.adapters.proto.*;
 
-/** Exercises the public acceptance commands against configured non-Relive gRPC services. */
+/** Exercises the public acceptance commands against configured gRPC services. */
 public class ServiceAcceptanceTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 

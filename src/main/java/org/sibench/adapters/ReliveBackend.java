@@ -1,417 +1,212 @@
 package org.sibench.adapters;
 
-import com.google.gson.*;
-import com.google.gson.stream.JsonReader;
-import com.google.gson.stream.JsonToken;
 import com.google.protobuf.ByteString;
-import org.sibench.adapters.proto.*;
+import org.relive.Protocol;
+import org.relive.ReliveClient;
+import org.relive.ReliveClientConfig;
+import org.sibench.adapters.proto.GetRequest;
+import org.sibench.adapters.proto.Mutation;
+import org.sibench.adapters.proto.ScanRequest;
 
-import java.io.*;
-import java.net.URI;
-import java.net.http.*;
-import java.nio.ByteBuffer;
-import java.nio.charset.CodingErrorAction;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.Flow;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 
-/** SIBench's gRPC backend over Relive's loopback HTTP boundary; it never interprets Trace. */
+/**
+ * SIBench's backend over embedded Relive clients in this process. Each of the {@code clients}
+ * instances owns its metadata connection and manifest cache, as independent callers would; requests
+ * rotate among them. The index uses one shard; every write is durable when its future completes.
+ */
 public final class ReliveBackend implements IndexBackend {
-    private static final int MAX_WRITE_BYTES = 8 << 20, MAX_ROWS = 10_000;
-    private static final long TIMEOUT_SECONDS = 60;
-    private final URI endpoint;
-    private final ValueKind valueKind;
-    private final String location;
-    private final HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
-    private final Set<Body> active = ConcurrentHashMap.newKeySet();
-    private final Set<CompletableFuture<JsonObject>> replies = ConcurrentHashMap.newKeySet();
-    private volatile boolean closed;
-    private String binding;
+    private static final int MAX_ROWS = 10_000;
+    // Leave room for the request envelope below Relive's 8 MiB payload limit.
+    private static final int MAX_WRITE_BYTES = 7 << 20;
+    private static final String DATA_PREFIX = "00";
+    // Outside the "00" data namespace: the Trace binding, written once at timestamp zero.
+    private static final String BINDING_KEY = "01";
+    private static final Protocol.Scan BINDING_SCAN = point(BINDING_KEY);
 
-    public ReliveBackend(String endpoint, ValueKind value) throws IOException {
+    private final List<ReliveClient> clients;
+    private final String shard;
+    private final String location;
+    private final ValueKind valueKind;
+    private final AtomicInteger next = new AtomicInteger();
+    private volatile String binding;
+
+    public ReliveBackend(Path clientConfig, int count, ValueKind value) throws IOException {
+        if (count < 1) throw new IllegalArgumentException("Relive needs at least one client");
+        valueKind = Objects.requireNonNull(value);
+        var config = ReliveClientConfig.load(clientConfig);
+        if (config.shards().size() != 1) throw new IOException("The Relive backend serves a single-shard index");
+        shard = config.shards().get(0);
+        location = config.cfsRoot() + " " + config.metastore().endpoint() + "/" + config.metastore().table();
+        ReliveClient.initialize(config);
+        var opened = new ArrayList<ReliveClient>();
         try {
-            this.endpoint = URI.create(endpoint);
-            if (!"http".equals(this.endpoint.getScheme()) || this.endpoint.getHost() == null
-                    || this.endpoint.getUserInfo() != null || this.endpoint.getQuery() != null
-                    || this.endpoint.getFragment() != null || !Set.of("", "/").contains(this.endpoint.getPath()))
-                throw new IllegalArgumentException("Relive requires an HTTP origin without credentials or a path");
-            valueKind = Objects.requireNonNull(value);
-            var description = call("/describe", null);
-            location = string(description, "location");
-            if (location.isBlank()) throw new IOException("Missing Relive storage location");
-            if (!"relive".equals(string(description, "name")) || !bool(description, "versionedKeys")
-                    || !bool(description, "streamingReads") || bool(description, "transactionLocalReads")
-                    || bool(description, "searchGroups") || number(description, "maxWriteRows") != MAX_ROWS
-                    || !"shared_nfs_fsync".equals(string(description, "durability"))
-                    || !"object_storage".equals(string(description, "levelOneStorage")))
-                throw new IOException("Unsupported Relive deployment description");
-        } catch (IllegalArgumentException invalid) { throw new IOException("Invalid Relive endpoint or description", invalid); }
+            for (int i = 0; i < count; i++) opened.add(ReliveClient.open(config));
+        } catch (IOException | RuntimeException error) {
+            opened.forEach(ReliveClient::close);
+            throw error;
+        }
+        clients = List.copyOf(opened);
     }
+
+    private ReliveClient client() { return clients.get(Math.floorMod(next.getAndIncrement(), clients.size())); }
 
     @Override public IndexDescription describe() {
-        return new IndexDescription("relive", valueKind, Acknowledgement.ACK_WAL, true,
-                "shared_nfs_fsync", location);
+        return new IndexDescription("relive", valueKind, Acknowledgement.ACK_WAL, true, "cfs_fsync_metadata_commit", location);
     }
 
-    @Override public synchronized void bind(String supplied) throws IOException {
+    @Override public void bind(String supplied) throws IOException {
         if (supplied == null || supplied.isBlank()) throw new IOException("Missing Trace binding");
         String selected = "sibench " + valueKind.name() + " " + supplied;
         if (selected.equals(binding)) return;
-        if (binding != null) throw new IOException("Relive bridge belongs to another input");
-        var request = new JsonObject(); request.addProperty("binding", selected);
-        var answer = call("/bind", request.toString());
-        fields(answer, "binding", "identity", "location");
-        if (!selected.equals(string(answer, "binding")) || string(answer, "identity").isBlank()
-                || string(answer, "location").isBlank()) throw new IOException("Invalid Relive binding response");
-        binding = selected;
+        synchronized (this) {
+            if (selected.equals(binding)) return;
+            if (binding != null) throw new IOException("Relive index belongs to another input");
+            byte[] identity = selected.getBytes(StandardCharsets.UTF_8);
+            String value = HexFormat.of().formatHex(identity);
+            var client = client();
+            try {
+                // A deterministic request ID makes concurrent binders of the same input one commit.
+                client.write(shard, UUID.nameUUIDFromBytes(identity),
+                        new Protocol.Write(List.of(new Protocol.Mutation(BINDING_KEY, 0, value))));
+            } catch (ReliveClient.Conflict other) {
+                throw new IOException("Relive index holds another input than " + selected, other);
+            }
+            String[] stored = {null};
+            client.stream(shard, new Protocol.Read(0, List.of(BINDING_SCAN)), sink((key, found) -> stored[0] = found));
+            if (!value.equals(stored[0])) throw new IOException("Relive index holds another input than " + selected);
+            binding = selected;
+        }
     }
 
-    private synchronized void requireBinding() throws IOException {
-        if (closed) throw new IOException("Relive bridge is closed");
+    private void requireBinding() throws IOException {
         if (binding == null) bind("ordinary-callers");
     }
 
+    /** The common backend interface permits synchronous work before returning a completed future. */
     @Override public CompletableFuture<Void> writeBatchAsync(List<Mutation> writes) throws IOException {
-        writes = List.copyOf(writes);
-        // Check every member against the narrower transport's limits before the first HTTP write.
-        for (var write : writes) {
-            checkKeySize(write.hasPut() ? write.getPut().getKey() : write.getDelete().getKey());
-            if (write.hasPut() && write.getPut().getValue().size() > 65_536)
-                throw new IllegalArgumentException("Relive values are limited to 65536 bytes");
-        }
         requireBinding();
-        return writeChunks(writes, 0);
-    }
-
-    private CompletableFuture<Void> writeChunks(List<Mutation> writes, int first) {
-        var batch = new StringBuilder("{\"rows\":[");
-        int count = 0, next = first;
-        for (; next < writes.size(); next++) {
-            var write = writes.get(next);
-            var row = new JsonObject();
-            row.addProperty("key", encodeKey(write.hasPut() ? write.getPut().getKey() : write.getDelete().getKey()));
-            row.addProperty("ts", write.hasPut() ? write.getPut().getTs() : write.getDelete().getTs());
-            row.addProperty("value", write.hasPut() ? HexFormat.of().formatHex(write.getPut().getValue().toByteArray()) : null);
-            String encoded = row.toString();
-            if (count == MAX_ROWS || batch.length() + encoded.length() + 3 > MAX_WRITE_BYTES) break;
-            if (count++ > 0) batch.append(',');
-            batch.append(encoded);
+        var rows = new ArrayList<Protocol.Mutation>(Math.min(writes.size(), MAX_ROWS));
+        long bytes = 0;
+        var client = client();
+        for (var write : writes) {
+            var row = encodeMutation(write);
+            long size = row.key().length() + (row.value() == null ? 0 : row.value().length()) + 64L;
+            if (rows.size() == MAX_ROWS || bytes + size > MAX_WRITE_BYTES) {
+                commit(client, rows);
+                rows.clear();
+                bytes = 0;
+            }
+            rows.add(row);
+            bytes += size;
         }
-        int following = next;
-        return sendBatch(batch, count).thenCompose(ignored -> following < writes.size()
-                ? writeChunks(writes, following) : CompletableFuture.completedFuture(null));
+        if (!rows.isEmpty()) commit(client, rows);
+        return CompletableFuture.completedFuture(null);
     }
 
-    private CompletableFuture<Void> sendBatch(StringBuilder batch, int count) {
-        String request = batch.append("]}").toString();
-        return callAsync("/write", request).thenAccept(response -> {
-            try {
-                fields(response, "rows");
-                if (number(response, "rows") != count) throw new IOException("Incomplete Relive write acknowledgement");
-            } catch (IOException invalid) { throw new CompletionException(invalid); }
-        });
+    private void commit(ReliveClient client, List<Protocol.Mutation> rows) throws IOException {
+        var ack = client.write(shard, UUID.randomUUID(), new Protocol.Write(rows));
+        if (ack.rows() != rows.size()) throw new IOException("Incomplete Relive write acknowledgement");
+    }
+
+    private static Protocol.Mutation encodeMutation(Mutation mutation) {
+        if (mutation.hasPut()) {
+            var put = mutation.getPut();
+            return new Protocol.Mutation(encodeKey(put.getKey()), put.getTs(),
+                    HexFormat.of().formatHex(put.getValue().toByteArray()));
+        }
+        var delete = mutation.getDelete();
+        return new Protocol.Mutation(encodeKey(delete.getKey()), delete.getTs(), null);
     }
 
     @Override public ByteString get(GetRequest get) throws IOException {
-        String key = key(get.getKey());
         requireBinding();
         if (get.getLocalWritesCount() != 0) {
             var local = get.getLocalWrites(0);
             return local.hasPut() ? local.getPut().getValue() : null;
         }
         ByteString[] found = {null};
-        read(get.getReadTs(), key, true, key, true, false, 1,
-                (ignored, value) -> found[0] = value);
+        client().stream(shard, new Protocol.Read(get.getReadTs(), List.of(point(encodeKey(get.getKey())))),
+                sink((key, value) -> found[0] = ByteString.copyFrom(HexFormat.of().parseHex(value))));
         return found[0];
     }
 
     @Override public void scan(ScanRequest scan, ValueSink sink) throws IOException {
-        String start = scan.hasStartKey() ? key(scan.getStartKey()) : null;
-        String end = scan.hasEndKey() ? key(scan.getEndKey()) : null;
         requireBinding();
-        if (start != null && end != null && start.compareTo(end) >= 0) return;
+        String start = scan.hasStartKey() ? encodeKey(scan.getStartKey()) : DATA_PREFIX;
+        String end = scan.hasEndKey() ? encodeKey(scan.getEndKey()) : BINDING_KEY;
+        if (start.compareTo(end) >= 0) return;
         var merge = new PrivateScan(scan, sink, ByteString::toByteArray);
-        read(scan.getReadTs(), start, true, end, false, scan.getReverse(),
-                scan.getLocalWritesCount() == 0 ? scan.getLimit() : 0, merge::accept);
+        long limit = scan.getLocalWritesCount() == 0 ? scan.getLimit() : 0;
+        var request = new Protocol.Read(scan.getReadTs(),
+                List.of(new Protocol.Scan(start, true, end, false, scan.getReverse(), limit)));
+        IOException[] failure = {null};
+        client().stream(shard, request, sink((key, value) -> {
+            if (failure[0] != null) return;
+            try { merge.accept(decodeKey(key), ByteString.copyFrom(HexFormat.of().parseHex(value))); }
+            catch (IOException error) { failure[0] = error; }
+        }));
+        if (failure[0] != null) throw failure[0];
         merge.finish();
     }
 
-    @FunctionalInterface private interface Entries { void accept(byte[] key, ByteString value) throws IOException; }
+    @FunctionalInterface private interface Entries { void accept(String key, String value); }
 
-    private void read(long ts, String lower, boolean lowerInclusive, String upper, boolean upperInclusive,
-                      boolean reverse, long limit, Entries sink) throws IOException {
-        var scan = new JsonObject();
-        scan.addProperty("lower", lower); scan.addProperty("lowerInclusive", lowerInclusive);
-        scan.addProperty("upper", upper); scan.addProperty("upperInclusive", upperInclusive);
-        scan.addProperty("descending", reverse); scan.addProperty("limit", limit);
-        var scans = new JsonArray(); scans.add(scan);
-        var request = new JsonObject(); request.addProperty("ts", ts); request.add("scans", scans);
-        try (var body = open("/stream", request.toString())) {
-            var header = json(body.line()); fields(header, "ts", "scans");
-            if (number(header, "ts") != ts || number(header, "scans") != 1)
-                throw new IOException("Relive stream header differs from request");
-            long count = 0;
-            String previous = null;
-            for (;;) {
-                var frame = json(body.line());
-                if (frame.has("done")) {
-                    fields(frame, "done", "counts");
-                    var counts = frame.getAsJsonArray("counts");
-                    if (!bool(frame, "done") || counts.size() != 1 || number(counts.get(0)) != count)
-                        throw new IOException("Invalid Relive terminal count");
-                    if (body.line() != null) throw new IOException("Trailing Relive stream data");
-                    return;
-                }
-                fields(frame, "scan", "entry");
-                if (number(frame, "scan") != 0) throw new IOException("Unexpected Relive scan index");
-                var entry = frame.getAsJsonObject("entry"); fields(entry, "key", "ts", "value");
-                String key = string(entry, "key"), value = string(entry, "value");
-                byte[] decoded = decodeKey(key);
-                if (number(entry, "ts") > ts || lower != null && (key.compareTo(lower) < 0 || !lowerInclusive && key.equals(lower))
-                        || upper != null && (key.compareTo(upper) > 0 || !upperInclusive && key.equals(upper))
-                        || previous != null && (reverse ? key.compareTo(previous) >= 0 : key.compareTo(previous) <= 0)
-                        || limit != 0 && count >= limit)
-                    throw new IOException("Relive returned an invalid version, range, order or limit");
-                sink.accept(decoded, ByteString.copyFrom(hex(value, 131072)));
-                previous = key; count++;
-            }
-        } catch (RuntimeException invalid) { throw new IOException("Malformed Relive stream", invalid); }
-    }
-
-    private static void checkKeySize(ByteString key) {
-        if (key.size() > 65_535) throw new IllegalArgumentException("Relive keys are limited to 65535 bytes");
-    }
-
-    private static String key(ByteString key) {
-        checkKeySize(key);
-        return encodeKey(key);
-    }
-
-    // A common leading byte preserves byte order and lets Relive represent the empty SIBench key.
-    private static String encodeKey(ByteString key) {
-        return "00" + HexFormat.of().formatHex(key.toByteArray());
-    }
-    private static byte[] decodeKey(String key) throws IOException {
-        if (!key.startsWith("00")) throw new IOException("Relive key lacks the SIBench namespace");
-        byte[] decoded = hex(key, 131072);
-        return Arrays.copyOfRange(decoded, 1, decoded.length);
-    }
-    private static byte[] hex(String value, int maximum) throws IOException {
-        if (value.length() > maximum || (value.length() & 1) != 0 || !value.matches("[0-9a-f]*"))
-            throw new IOException("Invalid Relive hexadecimal bytes");
-        return HexFormat.of().parseHex(value);
-    }
-
-    @Override public void flush() throws IOException { if (closed) throw new IOException("Relive bridge is closed"); }
-    @Override public void close() {
-        closed = true;
-        replies.forEach(reply -> reply.completeExceptionally(new IOException("Relive bridge is closed")));
-        active.forEach(Body::close);
-    }
-
-    private JsonObject call(String path, String request) throws IOException {
-        try (var body = open(path, request)) { return json(body.all()); }
-        catch (RuntimeException invalid) { throw new IOException("Malformed Relive response", invalid); }
-    }
-    private Body open(String path, String request) throws IOException {
-        if (closed) throw new IOException("Relive bridge is closed");
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
-        try { return response(client.send(request(path, request), HttpResponse.BodyHandlers.ofPublisher()), deadline); }
-        catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt(); throw new IOException("Relive HTTP interrupted; write outcome may be unknown", interrupted);
-        }
-    }
-
-    private CompletableFuture<JsonObject> callAsync(String path, String request) {
-        if (closed) return CompletableFuture.failedFuture(new IOException("Relive bridge is closed"));
-        var result = new CompletableFuture<JsonObject>();
-        var body = new ReplyBody();
-        replies.add(result);
-        // Covers headers and the entire bounded body, without parking a callback worker on network I/O.
-        result.orTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        final CompletableFuture<HttpResponse<byte[]>> exchange;
-        try { exchange = client.sendAsync(request(path, request), ignored -> body); }
-        catch (RuntimeException error) {
-            replies.remove(result); result.completeExceptionally(error); body.close(); return result;
-        }
-        result.whenComplete((ignored, error) -> {
-            replies.remove(result);
-            if (error != null) { body.close(); exchange.cancel(true); }
-        });
-        exchange.whenComplete((answer, error) -> {
-            if (error != null) { result.completeExceptionally(error); return; }
-            try {
-                String text = decodeText(answer.body());
-                if (answer.statusCode() != 200) throw new IOException("Relive HTTP " + answer.statusCode() + ": " + text);
-                result.complete(json(text));
-            } catch (IOException invalid) { result.completeExceptionally(invalid); }
-            catch (RuntimeException invalid) { result.completeExceptionally(new IOException("Malformed Relive response", invalid)); }
-        });
-        if (closed) result.completeExceptionally(new IOException("Relive bridge is closed"));
-        return result;
-    }
-
-    /** Write ACKs are small; collect them by demand instead of blocking on the streaming read queue. */
-    private static final class ReplyBody implements HttpResponse.BodySubscriber<byte[]>, AutoCloseable {
-        private final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        private final CompletableFuture<byte[]> result = new CompletableFuture<>();
-        private volatile Flow.Subscription subscription;
-
-        @Override public CompletionStage<byte[]> getBody() { return result; }
-        @Override public void onSubscribe(Flow.Subscription subscription) {
-            this.subscription = subscription;
-            if (result.isDone()) subscription.cancel(); else subscription.request(1);
-        }
-        @Override public void onNext(List<ByteBuffer> buffers) {
-            if (result.isDone()) return;
-            for (var buffer : buffers) {
-                if (buffer.remaining() > (64 << 10) - bytes.size()) {
-                    result.completeExceptionally(new IOException("Relive response exceeds byte limit"));
-                    subscription.cancel(); return;
-                }
-                byte[] part = new byte[buffer.remaining()];
-                buffer.get(part); bytes.writeBytes(part);
-            }
-            if (!result.isDone()) subscription.request(1);
-        }
-        @Override public void onError(Throwable error) { result.completeExceptionally(error); }
-        @Override public void onComplete() { result.complete(bytes.toByteArray()); }
-        @Override public void close() {
-            result.completeExceptionally(new IOException("Relive response closed"));
-            if (subscription != null) subscription.cancel();
-        }
-    }
-
-    private static String decodeText(byte[] bytes) throws IOException {
-        return StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
-                .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes)).toString();
-    }
-
-    private HttpRequest request(String path, String request) {
-        var builder = HttpRequest.newBuilder(endpoint.resolve(path)).timeout(Duration.ofSeconds(TIMEOUT_SECONDS));
-        if (request == null) builder.GET();
-        else builder.header("Content-Type", "application/json").POST(requestBody(request));
-        return builder.build();
-    }
-
-    private Body response(HttpResponse<Flow.Publisher<List<ByteBuffer>>> response, long deadline) throws IOException {
-        var body = new Body(deadline);
-        active.add(body); response.body().subscribe(body);
-        if (closed) { body.close(); throw new IOException("Relive bridge is closed"); }
-        if (response.statusCode() != 200) {
-            try (body) { throw new IOException("Relive HTTP " + response.statusCode() + ": " + body.all()); }
-        }
-        return body;
-    }
-
-    static HttpRequest.BodyPublisher requestBody(String request) {
-        var delegate = HttpRequest.BodyPublishers.ofString(request);
-        var subscribed = new java.util.concurrent.atomic.AtomicBoolean();
-        return new HttpRequest.BodyPublisher() {
-            public long contentLength() { return delegate.contentLength(); }
-            public void subscribe(Flow.Subscriber<? super ByteBuffer> subscriber) {
-                // Refuse payload replay even when JVM-wide HTTP retry settings enable POST retries.
-                if (subscribed.compareAndSet(false, true)) { delegate.subscribe(subscriber); return; }
-                subscriber.onSubscribe(new Flow.Subscription() {
-                    public void request(long count) {}
-                    public void cancel() {}
-                });
-                subscriber.onError(new IOException("Relive request body cannot be retransmitted; write outcome may be unknown"));
-            }
+    private static ReliveClient.ReadSink sink(Entries entries) {
+        return new ReliveClient.ReadSink() {
+            @Override public void begin(long ts, int scans) {}
+            @Override public void entry(int scan, Protocol.Entry entry) { entries.accept(entry.key(), entry.value()); }
         };
     }
 
-    /** Demand and a fixed deadline bound streamed body buffering and stalls after HTTP headers. */
-    private final class Body implements Flow.Subscriber<List<ByteBuffer>>, AutoCloseable {
-        private final BlockingQueue<Object> queue = new ArrayBlockingQueue<>(2);
-        private final ArrayDeque<ByteBuffer> buffers = new ArrayDeque<>();
-        private final long deadline;
-        private volatile Flow.Subscription subscription;
-        private boolean end, requested = true;
-        private volatile boolean cancelled;
-        Body(long deadline) { this.deadline = deadline; }
-        public void onSubscribe(Flow.Subscription subscription) {
-            this.subscription = subscription;
-            if (cancelled) subscription.cancel(); else subscription.request(1);
-        }
-        public void onNext(List<ByteBuffer> bytes) { queue.offer(bytes); }
-        public void onError(Throwable error) { queue.offer(error); }
-        public void onComplete() { queue.offer(Boolean.TRUE); }
-        private int read() throws IOException {
-            for (;;) {
-                while (!buffers.isEmpty()) {
-                    var buffer = buffers.peekFirst();
-                    if (buffer.hasRemaining()) return Byte.toUnsignedInt(buffer.get());
-                    buffers.removeFirst();
-                }
-                if (end) return -1;
-                if (System.nanoTime() >= deadline) throw new IOException("Relive HTTP body deadline exceeded");
-                if (!requested && subscription != null) { subscription.request(1); requested = true; }
-                Object next;
-                try { next = queue.poll(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS); }
-                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Relive body interrupted", interrupted); }
-                if (next == null) throw new IOException("Relive HTTP body deadline exceeded");
-                if (next instanceof Throwable error) throw new IOException("Relive HTTP body failed", error);
-                if (next == Boolean.TRUE) { end = true; continue; }
-                @SuppressWarnings("unchecked") var bytes = (List<ByteBuffer>) next;
-                buffers.addAll(bytes); requested = false;
-            }
-        }
-        String line() throws IOException { return text(true, 512 << 10); }
-        String all() throws IOException { return text(false, 64 << 10); }
-        private String text(boolean line, int limit) throws IOException {
-            var bytes = new ByteArrayOutputStream();
-            for (;;) {
-                int value = read();
-                if (value == -1) {
-                    if (line && bytes.size() != 0) throw new IOException("Unterminated Relive frame");
-                    if (bytes.size() == 0 && line) return null;
-                    break;
-                }
-                if (line && value == '\n') break;
-                if (bytes.size() == limit) throw new IOException("Relive response exceeds byte limit");
-                bytes.write(value);
-            }
-            return decodeText(bytes.toByteArray());
-        }
-        @Override public void close() {
-            cancelled = true;
-            if (subscription != null) subscription.cancel();
-            queue.clear(); queue.offer(new IOException("Relive response closed")); active.remove(this);
-        }
+    private static Protocol.Scan point(String key) { return new Protocol.Scan(key, true, key, true, false, 1); }
+
+    // A common leading byte preserves byte order and lets Relive represent the empty SIBench key.
+    private static String encodeKey(ByteString key) {
+        if (key.size() > 65_535) throw new IllegalArgumentException("Relive keys are limited to 65535 bytes");
+        return DATA_PREFIX + HexFormat.of().formatHex(key.toByteArray());
     }
 
-    private static JsonObject json(String text) throws IOException {
-        if (text == null) throw new IOException("Missing Relive terminal frame");
-        try (var reader = new JsonReader(new StringReader(text))) {
-            reader.setStrictness(Strictness.STRICT);
-            var value = JsonParser.parseReader(reader);
-            if (!value.isJsonObject() || reader.peek() != JsonToken.END_DOCUMENT) throw new IOException("Invalid Relive JSON object");
-            return value.getAsJsonObject();
-        } catch (RuntimeException invalid) { throw new IOException("Malformed Relive JSON", invalid); }
+    private static byte[] decodeKey(String key) throws IOException {
+        if (!key.startsWith(DATA_PREFIX)) throw new IOException("Relive key lacks the SIBench namespace");
+        return HexFormat.of().parseHex(key, DATA_PREFIX.length(), key.length());
     }
-    private static void fields(JsonObject object, String... names) throws IOException {
-        if (!object.keySet().equals(Set.of(names))) throw new IOException("Unexpected Relive response fields");
+
+    @Override public Map<String, Object> statistics() {
+        var totals = new LinkedHashMap<String, Object>();
+        long requests = 0, retries = 0, metadataNanos = 0, casNanos = 0, stageNanos = 0, readNanos = 0;
+        for (var client : clients) {
+            var stats = client.stats();
+            requests += stats.databaseRequests();
+            retries += stats.casRetries();
+            metadataNanos += stats.metadataNanos();
+            casNanos += stats.casNanos();
+            stageNanos += stats.stageNanos();
+            readNanos += stats.readNanos();
+        }
+        totals.put("clients", clients.size());
+        totals.put("metadata_requests", requests);
+        totals.put("cas_retries", retries);
+        totals.put("metadata_nanos", metadataNanos);
+        totals.put("cas_nanos", casNanos);
+        totals.put("stage_nanos", stageNanos);
+        totals.put("read_nanos", readNanos);
+        return totals;
     }
-    private static String string(JsonObject object, String name) throws IOException {
-        var value = object.get(name);
-        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString())
-            throw new IOException("Expected Relive string: " + name);
-        return value.getAsString();
-    }
-    private static boolean bool(JsonObject object, String name) throws IOException {
-        var value = object.get(name);
-        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean())
-            throw new IOException("Expected Relive boolean: " + name);
-        return value.getAsBoolean();
-    }
-    private static long number(JsonObject object, String name) throws IOException { return number(object.get(name)); }
-    private static long number(JsonElement value) throws IOException {
-        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()
-                || !value.getAsString().matches("[0-9]+")) throw new IOException("Expected nonnegative Relive integer");
-        try { return value.getAsBigInteger().longValueExact(); }
-        catch (ArithmeticException invalid) { throw new IOException("Relive number exceeds int64", invalid); }
-    }
+
+    // Each successful write already forced its files and committed its metadata.
+    @Override public void flush() {}
+
+    @Override public void close() { clients.forEach(ReliveClient::close); }
 }

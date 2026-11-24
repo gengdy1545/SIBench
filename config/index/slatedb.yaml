@@ -1,6 +1,6 @@
 schema_version: 1
 purpose: index_service
-# SIBench service/bridge budgets; independent of engine worker counts.
+# SIBench service budgets; independent of engine worker counts.
 execution:
   read_threads: 16
   write_threads: 8

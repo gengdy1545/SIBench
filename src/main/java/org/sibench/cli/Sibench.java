@@ -43,7 +43,7 @@ public final class Sibench {
                         + "   (Pixels side of baseline preparation and experiments for a remote pixels_host)");
         out.println(
                 "       java -jar build/sibench/sibench.jar index-server CONFIG SERVICE_CONFIG"
-                        + "   (serves RocksDB / rocksdb-cloud / SlateDB, or bridges a Relive HTTP service)");
+                        + "   (serves RocksDB / rocksdb-cloud / SlateDB / embedded Relive)");
         out.println(
                 "       java -jar build/sibench/sibench.jar replay-service REPLAY_CONFIG"
                         + " BENCHMARK REPORT"

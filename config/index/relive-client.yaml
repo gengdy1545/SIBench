@@ -1,0 +1,12 @@
+# Relive client settings (index/relive/README.md). cfs_root must be on a cached NFSv4 mount.
+cfs_root: /mnt/cfs/sibench/relive/RUN-ID
+index: sibench
+shards: [default]
+metastore:
+  backend: dynamodb
+  endpoint: http://127.0.0.1:8000
+  region: us-east-1
+  table: relive_metadata
+  namespace: RUN-ID
+  access_key_env: AWS_ACCESS_KEY_ID
+  secret_key_env: AWS_SECRET_ACCESS_KEY

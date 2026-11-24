@@ -14,9 +14,9 @@ public class ServiceConfigTest {
 
     @Test public void serverPortMustFitTheNetworkPortRange() {
         for (int port : new int[] {-1, 65536})
-            assertThrows(IllegalArgumentException.class, () -> new ServiceConfig("rocksdb", null,
+            assertThrows(IllegalArgumentException.class, () -> new ServiceConfig("rocksdb", null, 0,
                     temporary.getRoot().toPath(), port, ValueKind.ROW_ID, null, false, true, new ServiceConfig.Execution(4, 2, temporary.getRoot().toPath().resolve("stats.jsonl"))));
-        assertThrows(IllegalArgumentException.class, () -> new ServiceConfig("rocksdb", null,
+        assertThrows(IllegalArgumentException.class, () -> new ServiceConfig("rocksdb", null, 0,
                 temporary.getRoot().toPath(), 0, ValueKind.ROW_ID, null, false, false, new ServiceConfig.Execution(4, 2, temporary.getRoot().toPath().resolve("stats.jsonl"))));
     }
 
@@ -115,7 +115,7 @@ public class ServiceConfigTest {
     }
 
     @Test
-    public void reliveBridgeOwnsNoLocalStorageOrWalPolicy() throws Exception {
+    public void embeddedReliveOwnsNoLocalStorageOrWalPolicy() throws Exception {
         Path root = temporary.getRoot().toPath(), config = root.resolve("relive.yaml");
         String base = """
                 schema_version: 1
@@ -126,19 +126,31 @@ public class ServiceConfigTest {
                   statistics: statistics.jsonl
                 service:
                   backend: relive
-                  endpoint: http://127.0.0.1:7001
+                  client: relive-client.yaml
+                  clients: 8
                   port: 50551
                   value: row_id
                 """;
         Files.writeString(config, base);
         var selected = ServiceConfig.ofServer(root, config, Map.of());
         assertEquals("relive", selected.adapter());
-        assertEquals("http://127.0.0.1:7001", selected.endpoint());
+        assertEquals(root.resolve("relive-client.yaml"), selected.client());
+        assertEquals(8, selected.clients());
         assertNull(selected.path());
         assertNull(selected.objects());
         assertTrue(selected.wal());
-        for (String forbidden : new String[] {"path: local", "storage: cos://bucket/prefix", "wal: false", "reopen: true"}) {
+        for (String forbidden : new String[] {"path: local", "storage: cos://bucket/prefix", "wal: false",
+                "reopen: true", "endpoint: http://127.0.0.1:7001"}) {
             Files.writeString(config, base + "  " + forbidden + "\n");
+            assertThrows(IllegalArgumentException.class, () -> ServiceConfig.ofServer(root, config, Map.of()));
+        }
+        for (String invalid : new String[] {
+                base.replace("clients: 8", "clients: 0"),
+                base.replace("clients: 8", "clients: -1"),
+                base.replace("  clients: 8\n", ""),
+                base.replace("  client: relive-client.yaml\n", ""),
+                base.replace("client: relive-client.yaml\n  clients: 8", "endpoint: http://127.0.0.1:7001")}) {
+            Files.writeString(config, invalid);
             assertThrows(IllegalArgumentException.class, () -> ServiceConfig.ofServer(root, config, Map.of()));
         }
     }

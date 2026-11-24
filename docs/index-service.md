@@ -68,13 +68,13 @@ execution:
 
 These positive thread counts set SIBench's read and write worker pools for every backend. Synchronous bindings occupy a worker until they return; asynchronous writes release it after submission and complete the RPC only when the backend future succeeds. `write_threads` therefore limits submission workers, not outstanding asynchronous writes. The replay client's `max_in_flight` controls its outstanding requests; there is no separate service-wide admission limit for unrelated clients. Size these budgets for the deployment, including concurrent Scan buffering and downstream flow control.
 
-Replay admission and gRPC calls are common to all backends. Backend adapters translate those calls into the backend's API; engine HTTP workers, caches, compaction and storage scheduling remain engine settings. An engine's worker count does not determine the bridge's worker budget. Increasing SIBench concurrency alone does not establish higher engine or end-to-end throughput.
+Replay admission and gRPC calls are common to all backends. Backend adapters translate those calls into the backend's API; engine worker pools, caches, compaction and storage scheduling remain engine settings. An engine's worker count does not determine the service's worker budget. Increasing SIBench concurrency alone does not establish higher engine or end-to-end throughput.
 
 SIBench creates `execution.statistics` as a fresh JSONL file, relative to the project root unless absolute. Use a new path for each service start, including reopening an index; an existing file is rejected. Each persistence check (about every five seconds, also without writes) and drained shutdown writes a cumulative sample containing `time_millis`, `backend` (deployment description), `execution` (thread counts), `service` (common call timings) and `engine` (optional backend measurements). Statistics output failure rejects subsequent calls and fails controlled shutdown, preserving an earlier persistence error if present.
 
 `service.read_queue` and `write_queue` measure submission-to-worker wait; `read_execute` and `write_execute` measure worker start through backend completion, including adapter and network waits. `flush_call` measures explicit persistence calls, including failures. Each contains request/failure counts, cumulative microseconds and histogram percentile upper bounds; `bytes` is unused for service calls. Cumulative parallel time is not wall time or engine CPU time. Concurrent samples are approximate; use the final drained sample for complete counts. These timings are separate from replay's client API-to-response latency.
 
-`engine` may be empty, as for Relive. The cloud bindings expose RocksDB properties or SlateDB's `slatedb.metrics` text and remote-request counters below local copies. Remote latency percentiles include successes and failures; SDK-internal retries are not separate requests. Missing engine measurements are N/A, while common service measurements remain available for every backend.
+`engine` may be empty. The cloud bindings expose RocksDB properties or SlateDB's `slatedb.metrics` text and remote-request counters below local copies. Remote latency percentiles include successes and failures; SDK-internal retries are not separate requests. Missing engine measurements are N/A, while common service measurements remain available for every backend.
 
 ## Persistence and reopening
 
@@ -137,57 +137,31 @@ Setup issues one empty-range Scan to bind the index and read the service descrip
 
 Choose reference, temporary and report paths by the deployment's resource budget, and account separately for the RocksDB JNI extraction into `java.io.tmpdir`, reference memory and disk, both services, setup and shutdown. `call_timing` groups Put/Delete/WriteBatch as `write` and records Get/Scan calls for the actual and reference implementations; concurrent durations overlap and the actual Scan includes downstream delivery. These are validation costs, not backend throughput or client ACK latency. The reference shares request and private-write helpers with the client, so the hand-derived cases remain necessary, and a small run does not establish full-Trace capacity.
 
-`ServiceAcceptanceTest` runs both commands against configured non-Relive gRPC services, including a wrong value with the correct count; `ServiceValueCheckTest` keeps the wrong-value, ordering, framing, partial-write and incomplete-stream counterexamples.
+`ServiceAcceptanceTest` runs both commands against configured gRPC services, including a wrong value with the correct count; `ServiceValueCheckTest` keeps the wrong-value, ordering, framing, partial-write and incomplete-stream counterexamples.
 
-## Relive bridge
+## Relive
 
-The [Relive HTTP service](../index/relive/README.md) runs on the same host as the SIBench gRPC bridge. Relive owns the active segments, L0, metadata and any working or delta files on CFS, plus the L1 checkpoints on COS/S3. The bridge keeps no index files or disk cache. Put this service configuration in your deployment directory and start it with `index-server CONFIG SERVICE_CONFIG`:
+The [Relive client](../index/relive/README.md) runs embedded in the index server; there is no separate Relive process. Build and install it before building SIBench, as shown in the [build instructions](../README.md#build), and repeat that step after changing Relive. Select it with [relive.yaml](../config/index/relive.yaml):
 
 ```yaml
-schema_version: 1
-purpose: index_service
-execution:
-  read_threads: 16
-  write_threads: 8
-  statistics: build/services/index/relive-run.stats.jsonl
 service:
   backend: relive
-  endpoint: http://127.0.0.1:7001
+  client: config/index/relive-client.yaml
+  clients: 8
   port: 50551
   value: row_id
 ```
 
-Replay targets the bridge's gRPC endpoint like any other service. The bridge reuses the existing request validation, private-write merge, binding metadata, flow control and completion checks, and preserves each write's `ts` and each read's `read_ts`. Private writes stay in the Java request context and never reach Relive's write endpoint; ReadGroup composition and snapshot ACK dependencies stay in the replay client. No source transaction is re-executed.
+`client` names the [Relive client configuration](../config/index/relive-client.yaml), relative to the project root: a fresh CFS directory and DynamoDB metadata namespace per run. `clients` opens that many independent Relive clients, each with its own metadata connection and manifest cache; requests rotate among them. The index has one shard.
 
-Put, Delete and WriteBatch implement the common asynchronous backend interface through Relive's HTTP API, releasing the submission worker while Relive publishes the segment commit boundary. Bounded response subscribers collect write ACKs without blocking a callback thread on network input; one stalled body does not occupy a common-pool worker needed by other ACKs. Each chunk must return HTTP 200, valid UTF-8, one complete JSON object within 64 KiB and its exact row count. Each RPC responds only after every chunk succeeds. The bridge tracks the storage call after response cancellation. Controlled shutdown waits for those calls before final persistence or handle closure; transport errors and deadlines can still leave the write outcome unknown.
+Keys are the hex of `00 ++ key`, which keeps unsigned order and represents the empty key; key `01` at timestamp 0 holds the Trace binding, so a populated index refuses another Trace. A batch is split at 10,000 rows and about 7 MiB; each part commits separately. The adapter does not resubmit failed writes; the client handles metadata contention within its publication attempt budget. Writes run on the SIBench write workers until durable; private writes stay in the request context.
 
-Get and Scan occupy the configured SIBench read workers while streaming. Relive's optional `readConcurrency` description field is an engine worker hint, not a bridge capability or resource budget, and is ignored. These changes adapt transport and completion to the shared service contract; they do not tune Relive's commit, storage or maintenance implementation.
+Keys are limited to 65,535 bytes and values to 65,536 bytes. Oversized entries fail; a failed later part can leave earlier parts committed. Callers without binding metadata reserve `ordinary-callers` on first access, including their selected value mode; that index then rejects a different Trace binding.
 
-**Encoding.** A key is the lowercase hex of `00 ++ full opaque key`. The fixed prefix keeps unsigned order, prefix keys and the empty key without changing Relive's nonempty-key protocol, and needs a fresh store. Values are plain hex, with null reserved for a tombstone. Keys are limited to 65,535 bytes and values to 65,536 bytes, and larger input fails. A batch is validated in full, then split at Relive's 10,000-row/8 MiB JSON limits; a failed later chunk can leave earlier chunks applied, and nothing is retried.
+The description reports `ACK_WAL` with `cfs_fsync_metadata_commit` durability: the write's file and directory were forced on CFS and its metadata commit succeeded. `flush` does nothing. Relive's separate compactor currently reports backlog only; compaction, cold-data upload and reclamation are not implemented.
 
-**Reads.** Get and Scan use `POST /stream` and require its header, ordered in-range entries, matching terminal counts and a normal EOF. Missing completion, malformed or trailing output fails the RPC even after partial values. Each HTTP exchange has a 60-second absolute deadline, stream bodies included; an overlong scan fails and is never truncated or retried. The bridge checks representation and completion only, so value correctness still needs an independent oracle.
-
-**Binding.** A persistent binding holds the Trace binding and value mode. On first access, a headerless caller reserves the `ordinary-callers` binding for its value mode. A populated ordinary store cannot later accept another Trace, and a Trace-bound store requires its original binding. The bridge caches the accepted binding and description. Keep its HTTP target on the same store, and restart the bridge with a new binding when moving to another index.
-
-**Durability.** The description reports `ACK_WAL` with `shared_nfs_fsync` durability. For Relive this acknowledgment means that its active segment data and block index have been forced and the commit boundary has been atomically published and directory-synced. Bridge flush forces neither L1 upload nor maintenance drain. Count the submitted writes, stop new submissions, and measure maintenance separately from Relive's [maintenance statistics](../index/relive/docs/local-protocol.md); a full compaction can rewrite stable L1 and overlap background work, so its duration is not a drain measurement. Compare this ACK only with equivalent guarantees, or report it separately from memory ACKs. The reported location names the engine's CFS directory and object-storage identity. CFS durability and cross-host visibility need deployment acceptance.
-
-The default tests use an HTTP boundary fixture. To check the real engine, HTTP and gRPC path with hand-derived historical values (not CFS/COS acceptance, full-Trace validation or a performance run), package Relive and run its integration check:
+`ReliveBackendCheck` covers history, deletion, reinsertion, binding, private writes and the common gRPC value oracle across independent backends and reopening. It requires a writable CFS directory, a running DynamoDB endpoint and the credential environment variables named in the client configuration. This check does not establish cross-host visibility, full-Trace correctness or performance:
 
 ```bash
-mvn -f index/relive/pom.xml -Drelive.build.directory="$PWD/build/index/relive" package
-mvn -Dtest=ReliveIntegrationCheck \
-  -Drelive.test.jar="$PWD/build/index/relive/relive.jar" \
-  -Drelive.test.classes="$PWD/build/index/relive/test-classes" test
+mvn -Dtest=ReliveBackendCheck -Dsibench.relive.cfs=/mnt/cfs/DIR -Dsibench.relive.dynamodb=http://127.0.0.1:8000 test
 ```
-
-Explicit cloud checks use the same test classpath (SIBench JAR, test classes, JUnit, Hamcrest) and fresh engine state with explicit memory and process budgets. Bound process shutdown separately, and keep Java temporary files and run evidence on cloud storage.
-
-| Entry point | Check |
-| --- | --- |
-| `ReliveIntegrationCheck populate HTTP_A HTTP_B` | The common oracle through two bridges to two Relive processes sharing one fresh CFS directory and COS prefix (300 s). |
-| `ReliveIntegrationCheck reopen HTTP` | After stopping both processes, retained history, empty values, binding and private-write isolation (120 s). |
-| `ReliveWriteProbe FRESH_HTTP FRESH_REPORT` | Two waves of 256 individual gRPC Puts through the HTTP bridge, with ordered values checked at snapshots before, between and after the two versions. Rejects nonempty state. Each write phase allows 90 s and each oracle Scan 30 s; use a 240 s outer limit, 512 MiB engine heap, 256 MiB driver heap, at least a 1 MiB Memtable, 1.5 GiB aggregate RSS and 4 MiB CFS state. No L1 upload is expected. This finite insertion/update diagnostic does not establish Trace or steady-state throughput. |
-| `ReliveIntegrationCheck populate-active HTTP_A HTTP_B` | Use separate fresh state with a segment size large enough to hold the oracle's writes. Require positive active segment bytes, zero sealed segments and zero sorted files. Kill both engines without graceful shutdown, reopen and run `reopen` to verify acknowledged versions and tombstones. Record Stats before termination and after reopening. |
-| `ReliveLoadCheck HTTP_WRITER HTTP_OBSERVER CLIENTS FRESH_REPORT [MUTATIONS]` | 1 or 4 write clients, 64–8,192 mutations in multiples of 64 (default 64) and half as many snapshot-zero Gets. Versions are fixed before submission and delivered in descending order over eight keys, keeping deletion and reinsertion histories. After all write ACKs it observes another instance, seals and converts the selected segments, waits for both instances' background maintenance to be idle and checks old, middle and latest snapshots, without a final compaction. Deadlines: 600 s workload, 30 s per data RPC, 120 s drain. |
-
-These are single-host functional and diagnostic checks. The process-loss check does not certify host power loss, storage-server failure or cross-host durability. `ReliveLoadCheck` reports the ACK-to-observer interval as an upper bound on index visibility ending at one correct Scan, not a lakehouse commit metric. Its last-write-submission and last-write-ACK to observed-idle fields include remaining foreground reads and the polling interval, so they do not timestamp the instant background work became idle. Neither check establishes sustained throughput or full-Trace acceptance; use the normal replay and verification workflow for selected Traces.

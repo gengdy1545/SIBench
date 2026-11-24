@@ -1,0 +1,15 @@
+schema_version: 1
+purpose: index_service
+# SIBench service budgets. Relive writes run on the write workers until durable.
+execution:
+  read_threads: 16
+  write_threads: 64
+  statistics: build/services/index/relive.stats.jsonl
+# Embedded Relive: the client configuration names the CFS root and DynamoDB endpoint. Use a fresh index per run.
+service:
+  backend: relive
+  client: config/index/relive-client.yaml
+  # Independent ReliveClient instances in this process; requests rotate among them.
+  clients: 8
+  port: 50551
+  value: row_id
