@@ -82,14 +82,18 @@ public final class Generation {
         }
     }
 
-    static BenchmarkSelection hybenchSelection(Path root,Map<String,Object> runtime)throws IOException {
-        return BenchmarkSelection.read(root,runtime).stream().filter(s->s.benchmark().equals("hybench"))
-                .findFirst().orElseThrow(()->new IllegalArgumentException("Preparation requires one HyBench benchmark selection"));
+    /** Preparation has one source workload; mixed selections must be split into separate runs. */
+    static BenchmarkSelection preparationSelection(Path root,Map<String,Object> runtime,String... benchmarks)throws IOException {
+        var supported=Set.of(benchmarks);
+        var selected=BenchmarkSelection.read(root,runtime).stream()
+                .filter(s->supported.contains(s.benchmark())).toList();
+        require(selected.size()==1,"Preparation requires exactly one selected workload from: "+String.join(", ",benchmarks));
+        return selected.get(0);
     }
 
     static Plan csvPlan(Path root,Path configuration,Path output)throws Exception {
         root=root.toRealPath();var runtime=SibenchConfig.read(root.resolve(configuration));
-        return inputs(root,runtime,List.of(hybenchSelection(root,runtime)),Map.of(),output);
+        return inputs(root,runtime,List.of(preparationSelection(root,runtime,"hybench")),Map.of(),output);
     }
 
     static Plan inputs(Path root,Map<String,Object> runtime,List<BenchmarkSelection> selections,
@@ -221,7 +225,11 @@ public final class Generation {
                 require(name.matches("[a-z0-9][a-z0-9_]*"),"Invalid sysbench workload name: "+name);
                 require(names.contains(string(workload,"script")),"Unsupported sysbench script: "+workload.get("script"));
                 boolean zipfian=string(n,"rand-type").equals("zipfian");
-                keys(workload,zipfian?Set.of("script","events","rand-zipfian-exp"):Set.of("script","events"));
+                var options=new java.util.HashSet<>(Set.of("script","events","point-selects","range-selects"));
+                if(zipfian)options.add("rand-zipfian-exp");
+                keys(workload,options);
+                if(workload.containsKey("point-selects"))require(integer(workload,"point-selects")>=0,"Negative point-selects");
+                if(workload.containsKey("range-selects"))bool(workload,"range-selects");
                 require(zipfian==workload.containsKey("rand-zipfian-exp"),"rand-zipfian-exp is required with, and only with, rand-type zipfian: "+name);
                 if(zipfian)require(workload.get("rand-zipfian-exp") instanceof Number exponent&&Double.isFinite(exponent.doubleValue())
                         &&exponent.doubleValue()>=0,"rand-zipfian-exp must be a finite number >= 0: "+name);
@@ -417,6 +425,10 @@ public final class Generation {
         // Loading draws no skewed values; a run takes its distribution parameter from its own workload.
         if(!load&&object(object(n,"workloads"),workload).containsKey("rand-zipfian-exp"))
             options.add("--rand-zipfian-exp="+object(object(n,"workloads"),workload).get("rand-zipfian-exp"));
+        if(!load)for(String key:List.of("point-selects","range-selects")) {
+            Object value=object(object(n,"workloads"),workload).get(key);
+            if(value!=null)options.add("--"+key+"="+(value instanceof Boolean flag?(flag?"on":"off"):value));
+        }
         return options;
     }
 

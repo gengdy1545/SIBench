@@ -90,13 +90,14 @@ public final class SourceSchema {
     }
 
     /** Layout and provenance bound by a published CDC artifact, independent of a source checkout. */
-    public static SourceSchema captured(Path ddl, String sourceCommit, String expectedDigest) throws IOException {
+    public static SourceSchema captured(Path ddl, String sourceCommit, String expectedDigest, String benchmark) throws IOException {
+        require(Set.of("hybench", "sysbench").contains(benchmark), "Unsupported captured benchmark");
         byte[] bytes;
         try (var input = Files.newInputStream(ddl)) { bytes = input.readNBytes((16 << 20) + 1); }
         String digest = HexFormat.of().formatHex(org.sibench.config.Digests.digest().digest(bytes));
         if (bytes.length > 16 << 20 || !digest.equals(expectedDigest)) throw new IOException("Captured source DDL changed");
         var layout = SimpleDdl.read(new String(bytes, StandardCharsets.UTF_8), "");
-        return new SourceSchema("hybench", ddl.getParent(), layout.tables(),
+        return new SourceSchema(benchmark, ddl.getParent(), layout.tables(),
                 Map.of("schema.sql", digest), List.of(), null, sourceCommit);
     }
 

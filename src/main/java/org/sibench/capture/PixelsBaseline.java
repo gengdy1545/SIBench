@@ -19,9 +19,11 @@ public final class PixelsBaseline {
     public static Map<String, Object> prepareInputs(Path root, Path configuration, Path csvDirectory, Path baselineOutput) throws Exception {
         root = root.toRealPath();
         var plan = CdcPreparation.plan(root, configuration);
+        require(plan.inputs().get(0).selection().benchmark().equals("hybench"),
+                "Sysbench exports its baseline during prepare-cdc; use prepare-pixels-baseline afterwards");
         // Each branch hashes the CSV bytes it consumes: CDC after PostgreSQL loads its copies, Pixels while converting.
         var csv = CsvInput.bind(root.resolve(csvDirectory));
-        CsvInput.requireCompatible(csv, plan.inputs().get(0));
+        HybenchInputs.requireCompatible(csv, plan.inputs().get(0));
         Path output = root.resolve(baselineOutput).toAbsolutePath().normalize(), cdcOutput = plan.inputs().get(0).output();
         require(!Files.exists(output), "Preparation outputs must be fresh");
         InputFiles.requireSeparate(output, cdcOutput, csv.directory());
@@ -52,12 +54,14 @@ public final class PixelsBaseline {
         root = root.toRealPath(); output = root.resolve(output).toAbsolutePath().normalize();
         // Conversion reads and hashes every table CSV before any use; the descriptors suffice here.
         var csv = CsvInput.bind(root.resolve(csvDirectory));
-        var profile = object(parse(Files.readString(Generation.hybenchSelection(root, SibenchConfig.read(root.resolve(configuration))).config())), "native");
-        Generation.validateNative("hybench", profile);
+        var selected = Generation.preparationSelection(root, SibenchConfig.read(root.resolve(configuration)), "hybench", "sysbench");
+        require(selected.benchmark().equals(CsvInput.benchmark(csv.manifest())), "Selected benchmark differs from CSV input");
+        var profile = object(parse(Files.readString(selected.config())), "native");
+        Generation.validateNative(selected.benchmark(), profile);
         return prepare(root, configuration, csv, output, Duration.ofMinutes(positive(profile, "timeout_minutes")));
     }
 
-    /** Preparation is bounded by the HyBench profile's native timeout, like the CDC branch, not by experiment settings. */
+    /** Preparation uses the selected source profile's native timeout, like the CDC branch. */
     private static Map<String, Object> prepare(Path root, Path configuration, CsvInput.Verified csv, Path output, Duration timeout) throws Exception {
         InputFiles.requireSeparate(output, csv.directory());
         var runtime = SibenchConfig.read(root.resolve(configuration));
@@ -66,9 +70,7 @@ public final class PixelsBaseline {
         Path build = root.resolve(string(settings, "build_directory")).toRealPath();
         var identity = PixelsBuild.verify(root, build);
         var document = csv.manifest();
-        var ddl = document.getAsJsonObject("source_ddl");
-        var source = SourceSchema.captured(csv.directory().resolve(ddl.get("path").getAsString()),
-                document.getAsJsonObject("source_evidence").getAsJsonObject("benchmark_source").get("commit").getAsString(), ddl.get("sha256").getAsString());
+        var source = CsvInput.source(csv.directory(), document);
         Files.createDirectories(output.getParent()); Files.createDirectory(output);
         json(output.resolve("effective-config.json"), runtime);
         json(output.resolve("engine-build.json"), identity);

@@ -21,17 +21,8 @@ final class PostgresSysbench {
         var previous=load?List.<Map<String,Object>>of():capture.completedSessions();
         long events=load?0:positive(object(object(config,"workloads"),workload),"events");
         Path script=build.resolve("src/lua/"+Generation.sysbenchScript(config,workload,load)+".lua");
-        var command=new ArrayList<>(List.of(build.resolve("src/sysbench").toString(),script.toString(),
-                "--db-driver=pgsql","--pgsql-host=127.0.0.1","--pgsql-port="+database.port(),
-                "--pgsql-user=sibench","--pgsql-db=postgres","--report-interval=0","--time=0","--events="+events,
-                "--threads="+positive(config,load?"prepare_threads":"threads")));
-        command.addAll(Generation.sysbenchOptions(config,workload,load));
-        command.add(load?"prepare":"run");
-        var result=NativeProcess.run(load?"prepare":"run",command,
-                Map.of("LUA_PATH",build.resolve("src/lua")+"/?.lua;;","PGAPPNAME",load?"sibench-load":"sibench:sysbench",
-                        "SIBENCH_BUDGET_STOP",load?"":stop.toString()),
-                root,logs,Duration.ofMinutes(positive(config,"timeout_minutes")),()->{if(capture!=null)capture.check();});
-        if(result.exit()!=0)throw new IOException("sysbench exited with "+result.exit()+"; see "+logs);
+        var result=execute(root,build,config,database,logs,workload,load,load?"":stop.toString(),
+                ()->{if(capture!=null)capture.check();});
         if(load)return Map.of();
         try(var control=database.connect("source-counts")){capture.awaitSources(control);}
         var sessions=new ArrayList<>(capture.completedSessions());sessions.removeAll(previous);
@@ -59,6 +50,39 @@ final class PostgresSysbench {
         Files.writeString(logs.resolve("summary.json"),new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(report),
                 java.nio.file.StandardOpenOption.CREATE_NEW);
         return report;
+    }
+
+    /** CDC uses the same upstream driver, without native Index Trace instrumentation or request budgets. */
+    static Map<String,Long> cdc(Generation.Plan plan,Generation.Input input,PostgresDatabase database,
+            Path logs,boolean load,NativeProcess.Check check)throws Exception {
+        var result=execute(plan.root(),input.build(),input.nativeConfig(),database,logs,input.selection().workload(),load,"",check);
+        if(load)return Map.of();
+        var measured=SysbenchSummary.parse(result.stdout());
+        long events=positive(object(object(input.nativeConfig(),"workloads"),input.selection().workload()),"events");
+        if(measured.getOrDefault("transactions",-1L)!=events||measured.getOrDefault("reconnects",-1L)!=0
+                ||measured.getOrDefault("read",-1L)!=0)
+            throw new IOException("Sysbench CDC requires all configured transactions, no reconnects and zero business SELECTs: "+measured);
+        Files.writeString(logs.resolve("summary.json"),new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(measured),
+                java.nio.file.StandardOpenOption.CREATE_NEW);
+        return measured;
+    }
+
+    private static NativeProcess.Result execute(Path root,Path build,Map<String,Object> config,PostgresDatabase database,
+            Path logs,String workload,boolean load,String stop,NativeProcess.Check check)throws Exception {
+        long events=load?0:positive(object(object(config,"workloads"),workload),"events");
+        Path script=build.resolve("src/lua/"+Generation.sysbenchScript(config,workload,load)+".lua");
+        var command=new ArrayList<>(List.of(build.resolve("src/sysbench").toString(),script.toString(),
+                "--db-driver=pgsql","--pgsql-host=127.0.0.1","--pgsql-port="+database.port(),
+                "--pgsql-user=sibench","--pgsql-db=postgres","--report-interval=0","--time=0","--events="+events,
+                "--threads="+positive(config,load?"prepare_threads":"threads")));
+        command.addAll(Generation.sysbenchOptions(config,workload,load));
+        command.add(load?"prepare":"run");
+        var result=NativeProcess.run(load?"prepare":"run",command,
+                Map.of("LUA_PATH",build.resolve("src/lua")+"/?.lua;;","PGAPPNAME",load?"sibench-load":"sibench:sysbench",
+                        "SIBENCH_BUDGET_STOP",stop),
+                root,logs,Duration.ofMinutes(positive(config,"timeout_minutes")),check);
+        if(result.exit()!=0)throw new IOException("sysbench exited with "+result.exit()+"; see "+logs);
+        return result;
     }
 
     static long certifiedExecutions(String script,Map<String,Long> counts,long requests,long aborts,long failed)throws IOException {

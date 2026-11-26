@@ -27,10 +27,7 @@ public class PixelsBaselineTest {
     @Test public void conversionRejectsACsvChangedAfterBinding() throws Exception {
         var input = CsvInputTest.fixture(temporary.newFolder("csv").toPath());
         var csv = CsvInput.bind(input.output());
-        var ddl = csv.manifest().getAsJsonObject("source_ddl");
-        var source = org.sibench.schema.SourceSchema.captured(csv.directory().resolve(ddl.get("path").getAsString()),
-                csv.manifest().getAsJsonObject("source_evidence").getAsJsonObject("benchmark_source").get("commit").getAsString(),
-                ddl.get("sha256").getAsString());
+        var source = CsvInput.source(csv.directory(), csv.manifest());
         PixelsBaseline.convert(csv, source, temporary.getRoot().toPath().resolve("ok"), 1000);
         Path file = input.output().resolve("native/Data_1x/customer.csv");
         String text = Files.readString(file);

@@ -155,14 +155,14 @@ public final class HybenchQueries {
         if (instances < 1 || instances > 1000) throw new IllegalArgumentException("Query instances must be between 1 and 1000");
         root = root.toRealPath();
         var runtime = org.sibench.config.SibenchConfig.read(root.resolve(configuration));
-        var input = Generation.inputs(root, runtime, List.of(Generation.hybenchSelection(root, runtime)), Map.of(),
+        var input = Generation.inputs(root, runtime, List.of(Generation.preparationSelection(root, runtime, "hybench")), Map.of(),
                 root.resolve(output)).inputs().get(0);
         var settings = org.sibench.config.SibenchConfig.cdcSource(root, runtime);
         var build = NativeBuildCheck.engineDirectory(root, settings, "pixels").toRealPath();
         var engine = PixelsBuild.verifySource(root, build);
         // PostgreSQL COPY reads the table files itself; their contents are verified after it has read them.
         var csv = CsvInput.bind(root.resolve(csvDirectory));
-        CsvInput.requireCompatible(csv, input);
+        HybenchInputs.requireCompatible(csv, input);
         var directory = input.output();
         InputFiles.requireSeparate(directory, csv.directory());
         var templateFile = input.build().resolve("conf/stmt_postgres.toml");

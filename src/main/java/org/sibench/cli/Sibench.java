@@ -34,7 +34,7 @@ public final class Sibench {
         out.println("       java -jar build/sibench/sibench.jar check-csv-input INPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar publish-input CONFIG OBJECT_URI INPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar fetch-input CONFIG OBJECT_URI MANIFEST_SHA256 OUTPUT_DIRECTORY");
-        out.println("       java -jar build/sibench/sibench.jar prepare-cdc [--root PATH] CONFIG CSV_INPUT_DIRECTORY");
+        out.println("       java -jar build/sibench/sibench.jar prepare-cdc [--root PATH] CONFIG [CSV_INPUT_DIRECTORY]");
         out.println("       java -jar build/sibench/sibench.jar check-cdc-input INPUT_DIRECTORY");
         out.println("       java -jar build/sibench/sibench.jar render-queries CONFIG CSV_INPUT_DIRECTORY OUTPUT_DIRECTORY SEED INSTANCES");
         out.println("       java -jar build/sibench/sibench.jar pixels-experiment CONFIG [CDC_INPUT_DIRECTORY] PIXELS_BASELINE_DIRECTORY OUTPUT_DIRECTORY");
@@ -166,7 +166,7 @@ public final class Sibench {
             if (args[0].equals("prepare-csv")) {
                 if (profiles.size() != 2) throw new IllegalArgumentException("prepare-csv requires CONFIG OUTPUT_DIRECTORY");
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(
-                        org.sibench.capture.CsvInput.prepare(root, Path.of(profiles.get(0)), Path.of(profiles.get(1)))));
+                        org.sibench.capture.HybenchInputs.prepare(root, Path.of(profiles.get(0)), Path.of(profiles.get(1)))));
                 return 0;
             }
             if (args[0].equals("check-csv-input")) {
@@ -176,9 +176,9 @@ public final class Sibench {
                 return 0;
             }
             if (args[0].equals("prepare-cdc")) {
-                if (profiles.size() != 2) throw new IllegalArgumentException("prepare-cdc requires CONFIG CSV_INPUT_DIRECTORY");
+                if (profiles.size() < 1 || profiles.size() > 2) throw new IllegalArgumentException("prepare-cdc requires CONFIG [CSV_INPUT_DIRECTORY]");
                 out.println(new GsonBuilder().setPrettyPrinting().create().toJson(
-                        org.sibench.capture.CdcPreparation.run(root, Path.of(profiles.get(0)), Path.of(profiles.get(1)))));
+                        org.sibench.capture.CdcPreparation.run(root, Path.of(profiles.get(0)), profiles.size() == 2 ? Path.of(profiles.get(1)) : null)));
                 return 0;
             }
             if (args[0].equals("check-cdc-input")) {

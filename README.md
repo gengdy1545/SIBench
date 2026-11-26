@@ -7,7 +7,7 @@ SIBench captures native benchmark index operations into reusable Traces and repl
 | YCSB | RocksDB (`api`) | A–F, each restored from the same initial files. |
 | sysbench | PostgreSQL or DuckDB (`capture`) | `oltp_read_write` under zipfian exponents 0.8 and 0.99, one Trace each. |
 | HyBench | PostgreSQL or DuckDB (`capture`) | Separate TP (TP-1–TP-18) and XP (concurrent AT/IQ) Traces. TP includes reads. |
-| HyBench → Pixels | Recorded PostgreSQL CDC files → pixels-sink → Pixels (`cdc`) | TP/AT changes captured once with AP/IQ disabled; a [Pixels experiment](docs/pixels-experiment.md) with `trace: true` exports Pixels primary-index calls. |
+| HyBench / Sysbench → Pixels | Recorded PostgreSQL CDC files → pixels-sink → Pixels (`cdc`) | HyBench TP/AT changes with AP/IQ disabled, or Sysbench `oltp_read_write` with business SELECTs disabled; a [Pixels experiment](docs/pixels-experiment.md) with `trace: true` exports Pixels primary-index calls. |
 
 ## Build
 

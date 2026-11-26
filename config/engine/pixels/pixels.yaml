@@ -1,5 +1,5 @@
 # Pixels engine for the file-based CDC workflow, selected independently of the native benchmark engine.
-# prepare-cdc records HyBench changes from an uninstrumented source PostgreSQL with pixels-sink and
+# prepare-cdc records HyBench or Sysbench changes from an uninstrumented source PostgreSQL with pixels-sink and
 # verifies only this build's source PostgreSQL and sink artifacts, without reading target storage/properties,
 # starting Pixels or contacting pixels_host. prepare-pixels-baseline and pixels-experiment use the whole
 # engine; an experiment's sink applies CDC files to Retina, whose primary-index calls can form a Trace.

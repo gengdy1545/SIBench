@@ -228,7 +228,7 @@ public final class InputStore implements AutoCloseable {
             var manifest = InputFiles.manifest(input).document();
             if (manifest.has("output")) return org.sibench.trace.TraceManifest.read(input);
             return switch (manifest.get("kind").getAsString()) {
-                case "hybench_csv_input" -> CsvInput.open(input).manifest();
+                case "hybench_csv_input", "sysbench_csv_input" -> CsvInput.open(input).manifest();
                 case "pixels_cdc_input" -> CdcInput.open(input).manifest();
                 case "pixels_baseline_input" -> PixelsBaseline.open(input).manifest();
                 default -> throw new IOException("Unsupported input artifact kind");

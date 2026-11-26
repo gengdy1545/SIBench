@@ -15,19 +15,25 @@ import java.nio.file.Path;
 public class SibenchTest {
     @org.junit.Rule public org.junit.rules.TemporaryFolder temporary = new org.junit.rules.TemporaryFolder();
 
-    @Test public void staticPixelsCommandAcceptsBaselineWithoutCdc() throws Exception {
+    @Test public void staticPixelsCommandUsesInputsWithoutBenchmarkProfiles() throws Exception {
         Path root = temporary.getRoot().toPath();
-        var settings = org.sibench.config.ConfigValues.object(org.sibench.config.SibenchConfig.read(java.nio.file.Path.of("config/sibench.yaml")), "pixels_experiment");
+        var settings = org.sibench.config.ConfigValues.object(org.sibench.config.SibenchConfig.read(Path.of("config/sibench.yaml")), "pixels_experiment");
         settings.put("updates", false);
-        java.nio.file.Files.writeString(root.resolve("runtime.json"), new com.google.gson.Gson().toJson(java.util.Map.of(
-                "schema_version", 1, "purpose", "sibench", "pixels_experiment", settings)));
-        var output = new ByteArrayOutputStream(); var errors = new ByteArrayOutputStream();
-        try (var out = new PrintStream(output); var err = new PrintStream(errors)) {
-            assertEquals(1, Sibench.run(new String[] {"pixels-experiment", "--root", root.toString(),
-                    "runtime.json", "missing-baseline", "output"}, out, err));
+        for (boolean trace : new boolean[] {false, true}) for (boolean configured : new boolean[] {false, true}) {
+            settings.put("trace", trace);
+            var runtime = new java.util.LinkedHashMap<String, Object>(java.util.Map.of(
+                    "schema_version", 1, "purpose", "sibench", "pixels_experiment", settings));
+            if (configured) runtime.put("benchmarks", java.util.Map.of("hybench",
+                    org.sibench.config.BenchmarkFixtures.entry(root.resolve("missing-profile.yaml"), "postgres", root.resolve("trace"), "xp")));
+            java.nio.file.Files.writeString(root.resolve("runtime.json"), new com.google.gson.Gson().toJson(runtime));
+            var output = new ByteArrayOutputStream(); var errors = new ByteArrayOutputStream();
+            try (var out = new PrintStream(output); var err = new PrintStream(errors)) {
+                assertEquals(1, Sibench.run(new String[] {"pixels-experiment", "--root", root.toString(),
+                        "runtime.json", "missing-baseline", "output"}, out, err));
+            }
+            assertTrue(errors.toString(StandardCharsets.UTF_8), errors.toString(StandardCharsets.UTF_8).contains("missing-baseline"));
+            assertEquals(0, output.size());
         }
-        assertTrue(errors.toString(StandardCharsets.UTF_8), errors.toString(StandardCharsets.UTF_8).contains("missing-baseline"));
-        assertEquals(0, output.size());
     }
 
     @Test
@@ -78,8 +84,7 @@ public class SibenchTest {
 
     @Test
     public void rejectsUnknownCommandsEvenForHelp() {
-        // generate-pixels was the removed live Pixels workflow; file-based CDC replaces it.
-        for (String[] args : new String[][] {{"no-such-command"}, {"no-such-command", "--help"}, {"generate-pixels", "config/sibench.yaml"}}) {
+        for (String[] args : new String[][] {{"no-such-command"}, {"no-such-command", "--help"}}) {
             var output = new ByteArrayOutputStream();
             var errors = new ByteArrayOutputStream();
             try (var out = new PrintStream(output); var err = new PrintStream(errors)) {

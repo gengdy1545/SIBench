@@ -20,7 +20,7 @@ public class CsvInputTest {
     @Test public void independentConsumersBindTheSamePublishedInput() throws Exception {
         var fixture = fixture();
         var csv = CsvInput.open(fixture.output());
-        CsvInput.requireCompatible(csv, fixture);
+        HybenchInputs.requireCompatible(csv, fixture);
         var pool = Executors.newFixedThreadPool(2);
         try {
             Path capture = temporary.newFolder("capture").toPath(), pixels = temporary.newFolder("pixels").toPath();
@@ -58,11 +58,11 @@ public class CsvInputTest {
         var input = fixture(output);
         var inspected = new java.util.HashMap<>(PixelsInputs.inspect(input.source(), output.resolve("native/Data_1x")).sha256());
         Files.delete(output.resolve("manifest.json"));
-        CsvInput.publish(output, input, inspected, Map.of("benchmark_source", Map.of("commit", input.source().sourceCommit(), "files", input.source().fingerprints())));
+        HybenchInputs.publish(output, input, inspected, Map.of("benchmark_source", Map.of("commit", input.source().sourceCommit(), "files", input.source().fingerprints())));
         // A table changed between the inventory and inspection reads produces another digest.
         Files.delete(output.resolve("manifest.json"));
         inspected.put("customer", "0".repeat(64));
-        var failure = assertThrows(java.io.IOException.class, () -> CsvInput.publish(output, input, inspected, Map.of()));
+        var failure = assertThrows(java.io.IOException.class, () -> HybenchInputs.publish(output, input, inspected, Map.of()));
         assertTrue(failure.getMessage(), failure.getMessage().contains("changed after source loading"));
         assertFalse(Files.exists(output.resolve("manifest.json")));
     }
@@ -72,9 +72,27 @@ public class CsvInputTest {
         var csv = CsvInput.open(fixture.output());
         var changed = new Generation.Input(fixture.selection(), fixture.document(), fixture.source(), fixture.build(),
                 fixture.output(), fixture.buildIdentity(), fixture.baselineRows(), Map.of("customer_number", 2L));
-        assertThrows(java.io.IOException.class, () -> CsvInput.requireCompatible(csv, changed));
+        assertThrows(java.io.IOException.class, () -> HybenchInputs.requireCompatible(csv, changed));
         Path parameters = fixture.output().resolve("native/parameters/parameters.toml");
         Files.writeString(parameters, "[1x]\ncustomer_number = 2\n");
+        assertThrows(java.io.IOException.class, () -> CsvInput.open(fixture.output()));
+    }
+
+    @Test public void benchmarkIdentityMustBeExplicitOrBoundToRetainedHybenchDdl() throws Exception {
+        var fixture = fixture();
+        var document = CsvInput.open(fixture.output()).manifest();
+        var evidence = document.getAsJsonObject("source_evidence");
+        assertEquals("hybench", evidence.get("benchmark").getAsString());
+        evidence.addProperty("benchmark", "sysbench");
+        Path manifest = fixture.output().resolve("manifest.json");
+        Files.writeString(manifest, document.toString());
+        assertThrows(java.io.IOException.class, () -> CsvInput.open(fixture.output()));
+        // The retained SF10 artifact has no benchmark tag, but binds the original HyBench DDL.
+        evidence.remove("benchmark");
+        Files.writeString(manifest, document.toString());
+        assertEquals("hybench", CsvInput.source(fixture.output(), CsvInput.open(fixture.output()).manifest()).benchmark());
+        evidence.getAsJsonObject("benchmark_source").getAsJsonObject("files").addProperty("conf/ddl_pg.sql", "0".repeat(64));
+        Files.writeString(manifest, document.toString());
         assertThrows(java.io.IOException.class, () -> CsvInput.open(fixture.output()));
     }
 
@@ -107,7 +125,7 @@ public class CsvInputTest {
                 new com.moandjiezana.toml.TomlWriter().write(Map.of("1x", parameters)));
         var selection = new BenchmarkSelection(root.resolve("config/benchmark/hybench.yaml"), "hybench", BenchmarkSelection.Mode.CDC, Engine.PIXELS, "hybench", "xp", root.resolve("unused-trace"), false, null);
         var input = new Generation.Input(selection, Map.of("native", Map.of("sf", "1x")), source, root, output, Map.of(), rows, parameters);
-        CsvInput.publish(output, input, inspected.sha256(), Map.of("benchmark_source", Map.of("commit", source.sourceCommit(), "files", source.fingerprints())));
+        HybenchInputs.publish(output, input, inspected.sha256(), Map.of("benchmark_source", Map.of("commit", source.sourceCommit(), "files", source.fingerprints())));
         return input;
     }
 }

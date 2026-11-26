@@ -3,77 +3,23 @@ package org.sibench.capture;
 import static org.sibench.config.ConfigValues.*;
 import static org.sibench.capture.InputFiles.*;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.security.DigestInputStream;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.sibench.config.Digests;
-import org.sibench.config.Engine;
+import org.sibench.schema.SourceSchema;
 
-/** Published HyBench data shared by independent source-capture and Pixels preparation tasks. */
+/** Published baseline data shared by source capture and Pixels preparation tasks. */
 public final class CsvInput {
     private CsvInput() {}
 
     record Table(int id, int columns) {}
 
     record Verified(Path directory, JsonObject manifest, String sha256) {}
-
-    public static Map<String, Object> prepare(Path root, Path configuration, Path outputDirectory) throws Exception {
-        var plan = Generation.csvPlan(root, configuration, outputDirectory);
-        var input = plan.inputs().get(0);
-        Path output = input.output();
-        Files.createDirectories(output.getParent());
-        Files.createDirectory(output);
-        try {
-            Path load = Files.createDirectory(output.resolve("load"));
-            Generation.hybench(plan, input, load, true, null, Engine.POSTGRES, "", null, () -> {});
-            Path data = output.resolve("native/Data_" + string(input.nativeConfig(), "sf"));
-            HybenchInputs.record(data, input.source().source().resolve("conf/load_data_pg.sql"), load.resolve("inputs.json"));
-            Files.copy(input.source().source().resolve("conf/ddl_pg.sql"), output.resolve("schema.sql"));
-            var inspected = PixelsInputs.inspect(input.source(), data);
-            Generation.requireRows(input.baselineRows(), inspected.rows());
-            Files.writeString(output.resolve("pixels-schema.tsv"), inspected.schema().text(), StandardOpenOption.CREATE_NEW);
-            var evidence = new LinkedHashMap<String, Object>();
-            evidence.put("benchmark_source", Map.of("commit", input.source().sourceCommit(), "files", input.source().fingerprints()));
-            evidence.put("client", input.buildIdentity());
-            Path code = NativeProcess.self();
-            evidence.put("core_sha256", Files.isDirectory(code) ? PixelsBuild.treeSha256(code) : Digests.sha256(code));
-            Files.writeString(output.resolve("effective-config.json"), new GsonBuilder().setPrettyPrinting().create()
-                    .toJson(Map.of("benchmark", input.document())), StandardOpenOption.CREATE_NEW);
-            return publish(output, input, inspected.sha256(), evidence);
-        } catch (Exception | Error failure) {
-            var stack = new java.io.StringWriter();
-            failure.printStackTrace(new java.io.PrintWriter(stack));
-            try { Files.writeString(output.resolve("failure.txt"), stack.toString(), StandardOpenOption.CREATE_NEW); }
-            catch (IOException diagnostic) { failure.addSuppressed(diagnostic); }
-            throw failure;
-        }
-    }
-
-    /** {@code tableHashes} are the digests of exactly the table bytes inspected for the schema and row counts. */
-    static Map<String, Object> publish(Path output, Generation.Input input, Map<String, String> tableHashes,
-            Map<String, Object> evidence) throws IOException {
-        var document = baseline(output, input, tableHashes);
-        document.addProperty("kind", "hybench_csv_input");
-        document.addProperty("status", "complete");
-        document.addProperty("sf", string(input.nativeConfig(), "sf"));
-        document.add("parameters", new Gson().toJsonTree(input.parameters()));
-        document.add("parameter_file", file(output, output.resolve("native/parameters/parameters.toml")));
-        document.add("load_inventory", file(output, output.resolve("load/inputs.json")));
-        document.add("source_evidence", new Gson().toJsonTree(evidence));
-        validate(output, document, false);
-        Files.writeString(output.resolve("manifest.json"), new GsonBuilder().setPrettyPrinting().create().toJson(document),
-                StandardOpenOption.CREATE_NEW);
-        return new Gson().fromJson(document, Map.class);
-    }
 
     public static Map<String, Object> check(Path directory) throws IOException {
         var input = open(directory);
@@ -97,33 +43,18 @@ public final class CsvInput {
         }
     }
 
-    private static void validate(Path root, JsonObject document, boolean hashes) throws IOException {
-        require(document.get("kind").getAsString().equals("hybench_csv_input")
+    static void validate(Path root, JsonObject document, boolean hashes) throws IOException {
+        require(java.util.Set.of("hybench_csv_input", "sysbench_csv_input").contains(document.get("kind").getAsString())
                 && document.get("status").getAsString().equals("complete"), "Unpublished or unsupported CSV input");
         validateBaseline(root, document, false);
-        String sf = document.get("sf").getAsString();
-        require(sf.matches("[1-9][0-9]*x"), "Invalid CSV scale");
-        Path parameters = verified(root, document.getAsJsonObject("parameter_file"));
-        var values = new Gson().fromJson(document.getAsJsonObject("parameters"), Map.class);
-        var actual = new com.moandjiezana.toml.Toml().read(parameters.toFile()).getTable(sf);
-        require(actual != null && new Gson().toJsonTree(actual.toMap()).equals(new Gson().toJsonTree(values)),
-                "CSV parameters differ from the generator input");
-        Path inventory = verified(root, document.getAsJsonObject("load_inventory"));
-        var hashesByName = JsonParser.parseString(Files.readString(inventory)).getAsJsonObject().getAsJsonObject("data_sha256");
         var files = document.getAsJsonObject("baseline_files");
-        require(files.keySet().equals(hashesByName.keySet()), "CSV inventory differs from baseline files");
-        for (var entry : files.entrySet()) {
-            var file = entry.getValue().getAsJsonObject();
-            require(entry.getKey().matches("[A-Za-z0-9_.]+")
-                    && file.get("path").getAsString().equals("native/Data_" + sf + "/" + entry.getKey())
-                    && file.get("sha256").equals(hashesByName.get(entry.getKey())), "CSV inventory identity differs");
+        if (document.get("kind").getAsString().equals("sysbench_csv_input")) {
+            SysbenchInputs.validate(root, document);
+        } else {
+            HybenchInputs.validate(root, document);
         }
-        require(files.keySet().containsAll(HybenchInputs.RUNTIME_INPUTS), "Missing HyBench workload inputs");
         if (hashes) {
-            var ddl = document.getAsJsonObject("source_ddl");
-            var source = org.sibench.schema.SourceSchema.captured(resolve(root, ddl.get("path").getAsString()),
-                    document.getAsJsonObject("source_evidence").getAsJsonObject("benchmark_source").get("commit").getAsString(),
-                    ddl.get("sha256").getAsString());
+            var source = source(root, document);
             var tables = new LinkedHashMap<String, Path>();
             for (var item : files.entrySet()) {
                 var file = item.getValue().getAsJsonObject();
@@ -143,40 +74,27 @@ public final class CsvInput {
         }
     }
 
-    /** Descriptors take the load inventory's digests; inspected table digests must match them. */
-    private static JsonObject baseline(Path output, Generation.Input input, Map<String, String> tableHashes) throws IOException {
-        var document = new JsonObject();
-        document.add("baseline_rows", new Gson().toJsonTree(input.baselineRows()));
-        document.add("schema", file(output, output.resolve("pixels-schema.tsv")));
-        document.add("source_ddl", file(output, output.resolve("schema.sql")));
-        var baseline = new JsonObject();
-        var original = JsonParser.parseString(Files.readString(output.resolve("load/inputs.json")))
-                .getAsJsonObject().getAsJsonObject("data_sha256");
-        Path data = output.resolve("native/Data_" + org.sibench.config.ConfigValues.string(input.nativeConfig(), "sf"));
-        var csvTables = new HashMap<String, String>();
-        for (String line : Files.readAllLines(input.source().source().resolve("conf/load_data_pg.sql"))) {
-            if (line.isBlank()) continue;
-            String[] copy = HybenchInputs.copyStatement(line);
-            require(copy != null, "Invalid baseline load mapping");
-            csvTables.put(copy[1], copy[0].toLowerCase(java.util.Locale.ROOT));
+    /** Retained HyBench CSV/baseline artifacts omit benchmark; their source DDL fingerprint identifies them. */
+    static String benchmark(JsonObject document) throws IOException {
+        var evidence = document.getAsJsonObject("source_evidence");
+        require(evidence != null, "Missing input source evidence");
+        if (evidence.has("benchmark")) {
+            String benchmark = evidence.get("benchmark").getAsString();
+            require(java.util.Set.of("hybench", "sysbench").contains(benchmark), "Unsupported input benchmark");
+            return benchmark;
         }
-        require(tableHashes.keySet().equals(new java.util.HashSet<>(csvTables.values())), "Inspected tables differ from the load mapping");
-        for (var entry : original.entrySet()) {
-            var value = new JsonObject();
-            Path path = data.resolve(entry.getKey());
-            value.addProperty("path", output.relativize(path).toString());
-            value.addProperty("bytes", Files.size(path));
-            value.add("sha256", entry.getValue());
-            if (csvTables.containsKey(entry.getKey())) {
-                String table = csvTables.get(entry.getKey());
-                require(entry.getValue().getAsString().equals(tableHashes.get(table)), "Baseline input changed after source loading: " + entry.getKey());
-                value.addProperty("table", table);
-                value.addProperty("rows", input.baselineRows().get(table));
-            }
-            baseline.add(entry.getKey(), value);
-        }
-        document.add("baseline_files", baseline);
-        return document;
+        var source = evidence.getAsJsonObject("benchmark_source");
+        var files = source == null ? null : source.getAsJsonObject("files");
+        require(files != null && document.getAsJsonObject("source_ddl").get("sha256").equals(files.get("conf/ddl_pg.sql")),
+                "Missing input benchmark identity");
+        return "hybench";
+    }
+
+    static SourceSchema source(Path directory, JsonObject document) throws IOException {
+        var ddl = document.getAsJsonObject("source_ddl");
+        return SourceSchema.captured(resolve(directory, ddl.get("path").getAsString()),
+                document.getAsJsonObject("source_evidence").getAsJsonObject("benchmark_source").get("commit").getAsString(),
+                ddl.get("sha256").getAsString(), benchmark(document));
     }
 
     static Map<String, Table> validateBaseline(Path directory, JsonObject document, boolean baselineHashes) throws IOException {
@@ -233,19 +151,6 @@ public final class CsvInput {
         require(bytes == number(file, "bytes")
                 && java.util.HexFormat.of().formatHex(digest.digest()).equals(file.get("sha256").getAsString()), "Baseline input changed: " + path);
         if (file.has("table")) require(rows == number(file, "rows"), "Baseline CSV row count differs: " + path);
-    }
-
-    static void requireCompatible(Verified csv, Generation.Input input) throws IOException {
-        var manifest = csv.manifest();
-        require(manifest.get("sf").getAsString().equals(string(input.nativeConfig(), "sf"))
-                && manifest.get("parameters").equals(new Gson().toJsonTree(input.parameters()))
-                && manifest.get("baseline_rows").equals(new Gson().toJsonTree(input.baselineRows())),
-                "CSV scale, parameters or row counts differ from the capture configuration");
-        require(manifest.getAsJsonObject("source_ddl").get("sha256").getAsString()
-                .equals(Digests.sha256(input.source().source().resolve("conf/ddl_pg.sql"))), "CSV source DDL differs");
-        var source = manifest.getAsJsonObject("source_evidence").getAsJsonObject("benchmark_source");
-        require(source.get("commit").getAsString().equals(input.source().sourceCommit())
-                && source.get("files").equals(new Gson().toJsonTree(input.source().fingerprints())), "CSV benchmark source differs");
     }
 
     /** Every local payload descriptor a CSV-derived manifest binds; consumers without a field simply lack those files. */

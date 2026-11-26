@@ -23,9 +23,6 @@ public final class PixelsExperiment {
         output = root.resolve(output).toAbsolutePath();
         var runtime = SibenchConfig.read(root.resolve(configuration));
         var experiment = PixelsExperimentConfig.settings(runtime);
-        // The Retina tracer records primary-index calls only; a Trace cannot represent the profile's secondary indexes.
-        if (bool(experiment, "trace") && Generation.secondaryIndexes(parse(Files.readString(Generation.hybenchSelection(root, runtime).config()))))
-            throw new IllegalArgumentException("Pixels CDC supports primary indexes only");
         var inputs = inputs(root, cdcDirectory, baselineDirectory, experiment);
         var columnar = inputs.baseline();
         var verified = inputs.cdc();
@@ -199,12 +196,7 @@ public final class PixelsExperiment {
             require(integer(experiment, "max_transactions") <= cdc.counts().transactions(),
                     "Requested transaction prefix exceeds the published CDC input");
         }
-        var manifest = baseline.manifest();
-        var ddl = manifest.getAsJsonObject("source_ddl");
-        String commit = manifest.getAsJsonObject("source_evidence")
-                .getAsJsonObject("benchmark_source").get("commit").getAsString();
-        var source = SourceSchema.captured(baseline.directory().resolve(ddl.get("path").getAsString()),
-                commit, ddl.get("sha256").getAsString());
+        var source = CsvInput.source(baseline.directory(), baseline.manifest());
         return new Inputs(baseline, cdc, source);
     }
 

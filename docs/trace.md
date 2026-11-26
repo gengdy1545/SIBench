@@ -156,6 +156,7 @@ Only clean pinned sources and supported schemas are accepted. Generation creates
 | sysbench | `sbtest` tables with `id` primary and `k` secondary indexes; configured supported scripts, including native conflict retries. Skewed ids are not scrambled, so each table's hottest rows are its smallest ids. |
 | HyBench native | Eight tables, eight primary and thirteen secondary indexes; TP runs TP-1–TP-18, XP runs AT/IQ. Native transaction conflicts roll back and continue; other SQL errors fail. |
 | HyBench CDC | Same CSV baseline in uninstrumented PostgreSQL and Pixels; TP/AT only, one Pixels transaction per committed source transaction. SQL reads, read-only or aborted transactions and secondary indexes are outside the exported scope. |
+| Sysbench CDC | Baseline exported from the same PostgreSQL database that runs `oltp_read_write` with point and range SELECTs disabled. Pixels applies the actual committed changes, including DELETE/reinsert; UPDATEs affecting zero rows produce no row changes. The Trace covers Pixels primary-index calls, not source SQL reads or secondary indexes. |
 
 Native capture rejects primary-key assignments, including those of later-aborted attempts. Pixels rejects actual key changes but allows unchanged-key assignments. CDC needs FULL replica identity, and its index lookups must agree with each following change. Write, commit, asynchronous sink or visibility failures prevent publication because Pixels cannot undo applied index entries.
 

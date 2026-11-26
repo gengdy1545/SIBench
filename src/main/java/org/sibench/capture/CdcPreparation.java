@@ -20,7 +20,7 @@ import org.sibench.config.SibenchConfig;
 import org.sibench.generation.PostgresDatabase;
 import org.sibench.schema.SourceSchema;
 
-/** One-time real HyBench/PostgreSQL CDC preparation; retains its original baseline and closed files. */
+/** One fresh PostgreSQL source; retains its original baseline and closed CDC files. */
 public final class CdcPreparation {
     private static final Duration DRAIN = Duration.ofMinutes(2), CONNECT = Duration.ofMinutes(5);
     private static final String MARKER = "sibench_marker";
@@ -28,31 +28,39 @@ public final class CdcPreparation {
 
     public static Map<String, Object> run(Path root, Path configuration, Path csvDirectory) throws Exception {
         // PostgreSQL COPY reads the table CSVs itself; publication hashes the materialized copies afterwards.
-        return generate(plan(root, configuration), CsvInput.bind(root.resolve(csvDirectory)));
+        var plan = plan(root, configuration);
+        boolean sysbench = plan.inputs().get(0).selection().benchmark().equals("sysbench");
+        require(sysbench == (csvDirectory == null), sysbench
+                ? "Sysbench CDC exports its own baseline; omit CSV_INPUT_DIRECTORY"
+                : "HyBench CDC requires CSV_INPUT_DIRECTORY");
+        return generate(plan, csvDirectory == null ? null : CsvInput.bind(root.resolve(csvDirectory)));
     }
 
-    /** CDC selects HyBench and only the source-side Pixels build; it consumes no target service, storage or property file. */
+    /** CDC needs only the source-side Pixels build; it consumes no target service or storage. */
     static Generation.Plan plan(Path root, Path configuration) throws Exception {
         root = root.toRealPath();
         var runtime = SibenchConfig.read(root.resolve(configuration));
-        var selected = Generation.hybenchSelection(root, runtime);
+        var selected = Generation.preparationSelection(root, runtime, "hybench", "sysbench");
         var selection = new BenchmarkSelection(selected.config(), selected.benchmark(), BenchmarkSelection.Mode.CDC, Engine.PIXELS,
                 selected.name(), selected.workload(), selected.directory(), selected.generate(), selected.upload());
         var settings = SibenchConfig.cdcSource(root, runtime);
         Path build = NativeBuildCheck.engineDirectory(root, settings, "pixels").toRealPath();
-        return Generation.inputs(root, runtime, List.of(selection),
+        var plan = Generation.inputs(root, runtime, List.of(selection),
                 Map.of(Engine.PIXELS, new Generation.NativeBuild(build, PixelsBuild.verifySource(root, build), settings)), null);
+        if (selected.benchmark().equals("sysbench")) SysbenchInputs.requireWorkload(plan.inputs().get(0));
+        return plan;
     }
 
     static Map<String, Object> generate(Generation.Plan plan, CsvInput.Verified csv) throws Exception {
         var input = plan.inputs().get(0);
         var build = plan.engines().get(Engine.PIXELS);
-        CsvInput.requireCompatible(csv, input);
+        boolean sysbench = input.selection().benchmark().equals("sysbench");
+        if (!sysbench) HybenchInputs.requireCompatible(csv, input);
         Path output = input.output();
-        InputFiles.requireSeparate(output, csv.directory());
+        if (csv != null) InputFiles.requireSeparate(output, csv.directory());
         Files.createDirectories(output.getParent());
         Files.createDirectory(output);
-        CsvInput.materialize(csv, output);
+        if (csv != null) CsvInput.materialize(csv, output);
         long started = System.nanoTime();
         var timings = new LinkedHashMap<String, Double>();
         var settings = new LinkedHashMap<>(org.sibench.config.SibenchConfig.postgresSettings(
@@ -69,10 +77,17 @@ public final class CdcPreparation {
                 json(output.resolve("engine-build.json"), build.identity());
                 json(output.resolve("client-build.json"), input.buildIdentity());
                 String url = "jdbc:postgresql://127.0.0.1:" + database.port() + "/postgres?user=sibench&ApplicationName=sibench:hybench";
-                Path data = output.resolve("native/Data_" + string(input.nativeConfig(), "sf"));
                 Path spec = output.resolve("pixels-schema.tsv");
+                if (sysbench) {
+                    PostgresSysbench.cdc(plan, input, database, output.resolve("load"), true, () -> {});
+                    try (var connection = database.connect("baseline-export")) {
+                        csv = SysbenchInputs.export(output.resolve("baseline-input"), input, connection);
+                    }
+                    CsvInput.materialize(csv, output);
+                }
                 try (var connection = database.connect("load")) {
-                    Generation.requireRows(input.baselineRows(), Hybench.load(connection, input.source().source(), data));
+                    if (!sysbench) Generation.requireRows(input.baselineRows(), Hybench.load(connection, input.source().source(),
+                            output.resolve("native/Data_" + string(input.nativeConfig(), "sf"))));
                     prepareSource(connection, input.source());
                 }
                 timings.put("baseline_preparation_seconds", seconds(started));
@@ -81,15 +96,21 @@ public final class CdcPreparation {
                     awaitSlot(database, capture.process(), capture::check);
                     var stages = new LinkedHashMap<String, Object>();
                     int marker = 0;
-                    for (String phase : List.of("tp", "xp")) {
+                    for (String phase : sysbench ? List.of(input.selection().workload()) : List.of("tp", "xp")) {
                         Path stage = Files.createDirectory(output.resolve(phase));
                         long phaseStart = System.nanoTime();
-                        Generation.hybench(plan, input, stage, false, phase, Engine.POSTGRES, url, null, capture::check);
+                        if (sysbench) PostgresSysbench.cdc(plan, input, database, stage, false, capture::check);
+                        else Generation.hybench(plan, input, stage, false, phase, Engine.POSTGRES, url, null, capture::check);
                         String id = marker(database, capture, ++marker);
                         stages.put(phase, Map.of("marker_transaction", id, "counts", capture.counts(),
                                 "seconds", seconds(phaseStart), "summary_sha256", Digests.sha256(stage.resolve("summary.json"))));
                     }
                     capture.finish();
+                    if (sysbench) {
+                        long events = positive(object(object(input.nativeConfig(), "workloads"), input.selection().workload()), "events");
+                        require(capture.counts().transactions() == events + 1 && capture.counts().markers() == 1,
+                                "Sysbench captured transaction count differs from completed source events");
+                    }
                     database.close();
                     var evidence = new LinkedHashMap<String, Object>();
                     evidence.put("engine", build.identity());
@@ -97,11 +118,15 @@ public final class CdcPreparation {
                     evidence.put("benchmark_source", Map.of("commit", input.source().sourceCommit(), "files", input.source().fingerprints()));
                     Path core = NativeProcess.self();
                     evidence.put("core_sha256", Files.isDirectory(core) ? PixelsBuild.treeSha256(core) : Digests.sha256(core));
-                    evidence.put("workload_scope", "HyBench TP/AT; AP and IQ disabled; configured phase durations, no Index Trace request budget");
+                    evidence.put("benchmark", input.selection().benchmark());
+                    evidence.put("workload_scope", sysbench
+                            ? "Sysbench oltp_read_write; point/range SELECTs disabled; configured transaction events, no Index Trace request budget"
+                            : "HyBench TP/AT; AP and IQ disabled; configured phase durations, no Index Trace request budget");
                     evidence.put("stages", stages);
                     evidence.put("effective_config_sha256", Digests.sha256(output.resolve("effective-config.json")));
-                    evidence.put("parameters_sha256", Digests.sha256(output.resolve("native/parameters/parameters.toml")));
-                    var manifest = Generation.publishThenDiscard(() -> CdcInput.publish(output, csv, capture.counts(), evidence), database.data(), timings);
+                    if (!sysbench) evidence.put("parameters_sha256", Digests.sha256(output.resolve("native/parameters/parameters.toml")));
+                    var baseline = csv;
+                    var manifest = Generation.publishThenDiscard(() -> CdcInput.publish(output, baseline, capture.counts(), evidence), database.data(), timings);
                     timings.put("total_seconds", seconds(started));
                     json(output.resolve("result.json"), Map.of("status", "complete", "input", output.toString(), "timings", timings));
                     return manifest;

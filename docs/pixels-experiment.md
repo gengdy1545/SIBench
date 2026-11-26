@@ -1,6 +1,6 @@
 # Pixels experiments
 
-`pixels-experiment CONFIG [CDC_INPUT_DIRECTORY] PIXELS_BASELINE_DIRECTORY FRESH_OUTPUT_DIRECTORY` restores a sealed COS baseline into fresh Pixels state. Update runs need CDC files bound to the same CSV identity; static runs omit CDC. File replay starts no source PostgreSQL, Debezium or HyBench process. Build both Pixels phases first.
+`pixels-experiment CONFIG [CDC_INPUT_DIRECTORY] PIXELS_BASELINE_DIRECTORY FRESH_OUTPUT_DIRECTORY` restores a sealed COS baseline into fresh Pixels state. Update runs need CDC files bound to the same CSV identity; static runs omit CDC. File replay starts no source PostgreSQL, Debezium or benchmark client. Build both Pixels phases first.
 
 ## Prepare once, restore for each run
 
@@ -11,6 +11,8 @@ data_storage: cos://YOUR-BUCKET/sibench/baselines/pixels
 ```
 
 The connection comes from `object_storage.cos` in the runtime CONFIG. Use virtual-hosted addressing and provide its credential variables on the Pixels host and external Trino workers. Pixels data paths require `cos://` (`s3://` is rejected); reusable baselines need COS.
+
+Preparation requires one unambiguous source selection. For the following HyBench commands, keep one HyBench entry in the runtime's `benchmarks` map and remove the other entries from that run's configuration. For Sysbench, keep its selected workload instead. The public runtime lists multiple workloads for native generation and index replay; it must be narrowed before Pixels preparation.
 
 ```bash
 java -jar build/sibench/sibench.jar prepare-csv config/sibench.yaml results/capture/hybench-csv
@@ -29,7 +31,15 @@ CSV preparation needs the built HyBench client; CDC also needs the Pixels build'
 
 CDC captures committed row changes from TP and XP once, with AP/IQ disabled, using the configured durations and transaction-client counts; `trace.workload_requests` does not bound it. Primary-key changes are rejected and FULL replica identity is required. Each phase waits up to two minutes for a committed marker at the file writer, then 60 seconds for normal shutdown. Missing or incomplete source data, or a failed shutdown, prevents publication and keeps the diagnostics and database; success deletes the working database. A marker proves capture progress, not target visibility or durability.
 
+For Sysbench, select exactly one Sysbench workload in the runtime configuration and run `prepare-cdc CONFIG` without a CSV argument. The selected `oltp_read_write` workload must explicitly set `point-selects: 0` and `range-selects: false`, with `skip-trx: false`. Its `events` counts completed source transactions; it is independent of `trace.workload_requests`. The source retains both UPDATE statements and the same-key DELETE/INSERT pair. Internal index lookups remain part of the captured workload.
+
+Sysbench preparation runs upstream `prepare` in one fresh PostgreSQL database, exports its actual initial rows to a sealed `baseline-input/` CSV artifact inside the configured capture directory, and then runs the selected workload in that same database. It checks zero client SELECTs and complete transaction counts; actual row changes are checked against the original CDC transaction metadata, not inferred from SQL counts. Concurrent UPDATEs can affect zero rows. The source database is closed before CDC publication and deleted only on success. Use that run's `baseline-input/` with `prepare-pixels-baseline`, then replay its CDC directory with `pixels-experiment`; `publish-input` and `fetch-input` support the Sysbench CSV artifact too. `prepare-csv` and the combined `prepare-pixels-inputs` command remain HyBench workflows. Baseline preparation requires one unambiguous HyBench or Sysbench selection and rejects a different input benchmark. File replay obtains its source identity and schema from the sealed inputs and does not read benchmark profiles or run their workloads.
+
+The Pixels LOAD helper has a 4 GiB Java heap, separate from `memory.retina_heap` and `memory.sink_heap`. Its concurrent encoding buffers depend on row width and `load.threads`; increasing the daemon heaps does not increase this helper's heap. Start Sysbench's wide-row baseline preparation with `load.threads: 2` in the selected engine configuration. `load.rows_per_file` bounds each prepared shard. These loading settings do not change source transaction clients or index replay concurrency.
+
 Inputs are immutable, including CDC's hard-linked baseline copies. Preparation binds the sealed CSV by descriptors and sizes; CDC hashes its copies once at publication, after the PostgreSQL load, and the Pixels branch hashes them during conversion. Manifests bind relative paths, sizes, SHA-256, schemas, counts and source/build identities. Validation rejects symbolic links, traversal and aliases, missing, unlisted or reordered files, malformed counts, hash or schema mismatches, and incomplete or unsupported transactions. Manifests and single CDC frames are limited to 16 MiB; files hold whole transactions, with the positive int32 `sink.proto.maxRecords` limiting transactions per file. CDC totals include markers; `businessChanges` excludes marker rows and `markers` counts marker transactions. None of these are distinct-row or index-operation counts.
+
+New CSV publications record the benchmark explicitly in `source_evidence`; derived Pixels baselines preserve it. Retained HyBench CSV/baseline artifacts without that tag remain readable only when the recorded `conf/ddl_pg.sql` fingerprint matches their sealed source DDL. This bounded compatibility preserves the existing SF10 inputs and can be removed after those selected artifacts are replaced or migrated. Missing identity in any other input is rejected.
 
 The baseline manifest also binds COS paths, row groups, hidden timestamps and the index bucket count. Empty tables keep their schema and zero counts without files. `check-pixels-baseline` checks the local descriptors and import verifies remote content. Finished CSV/CDC inputs can move without the preparation database; keep local capture diagnostics separately if source reproduction matters.
 
@@ -63,7 +73,7 @@ Files over 64 MiB use multipart upload, aborted on failure. API calls are bounde
 | Setting | Behavior |
 | --- | --- |
 | `updates` | Defaults true; requires CDC. False rejects a CDC argument, update prefix and freshness. |
-| `trace` | Defaults false. True exports index reconstruction and actual calls from this run; rejects queries/freshness and a HyBench profile with `trace.secondary_indexes: true` (Pixels exports primary indexes only). |
+| `trace` | Defaults false. True exports primary-index reconstruction and actual calls from this run; rejects queries/freshness. Trace metadata declares primary-only coverage, unsupported index calls fail capture, and secondary-index consumption is rejected during index replay. |
 | `max_transactions` | 0 applies all input once; positive values select a complete transaction prefix, including markers, within the input count. |
 | `queries.enabled` | Defaults false; `timing` is `after` updates or `during` application. |
 | `freshness.enabled` | Defaults false; independent of business queries, requires updates. |
@@ -149,3 +159,5 @@ PIXELS_HOME="$PWD/build/services/pixels/home" \
 ```
 
 File replay checks additionally require COS credentials and a unique `sibench.storage.uri`, with connections selected by `sibench.storage.config`. Run `PixelsExperimentCheck#finiteFilesApplyWithoutTraceAndExportOptionalTrace+completePrefixAndStaticModesDoNotConsumeExtraTransactions` with the same Pixels build. They prepare eight-row CSV/CDC and columnar inputs, then check full, prefix, static and Trace-export modes. They do not establish full-scale performance or SQL correctness after updates.
+
+For the Sysbench source integration, run `mvn -Dtest=SysbenchCdcCheck -Dsibench.pixels.build=build/services/pixels -Dsibench.sysbench.build=build/benchmarks/sysbench test`. It checks a 1,000-row baseline and 100 source transactions, zero client SELECTs, committed DELETE/reinsert identities, and an independently synchronized PostgreSQL case where concurrent replacement makes an UPDATE affect zero rows. It needs the built source PostgreSQL and Sysbench client, but no Pixels service or COS credentials. Final index correctness and full-scale acceptance require the separate Pixels and index replay workflows.

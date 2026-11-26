@@ -18,11 +18,11 @@ public class SourceSchemaTest {
         Path ddl = Files.writeString(directory.resolve("schema.sql"), "CREATE TABLE a(id int PRIMARY KEY);\n");
         try {
             String digest = org.sibench.config.Digests.sha256(ddl);
-            var source = SourceSchema.captured(ddl, "captured-source", digest);
+            var source = SourceSchema.captured(ddl, "captured-source", digest, "hybench");
             assertEquals("captured-source", source.sourceCommit());
             assertEquals("a", source.tables().get(0).name());
             Files.writeString(ddl, "CREATE TABLE b(id int PRIMARY KEY);\n");
-            assertThrows(IOException.class, () -> SourceSchema.captured(ddl, "captured-source", digest));
+            assertThrows(IOException.class, () -> SourceSchema.captured(ddl, "captured-source", digest, "hybench"));
         } finally { Files.delete(ddl);Files.delete(directory); }
     }
     static Map<String, Object> config(String path) throws IOException {

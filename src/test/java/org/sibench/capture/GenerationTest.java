@@ -3,6 +3,7 @@ package org.sibench.capture;
 import static org.junit.Assert.*;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.junit.Rule;
@@ -94,9 +95,19 @@ public class GenerationTest {
     @Test public void preparationSelectsHybenchWithoutRequiringItsNativeOrPixelsEngine()throws Exception {
         var root=temporary.getRoot().toPath();
         Files.writeString(root.resolve("hybench.yaml"),"benchmark: hybench\n");
-        var selected=Generation.hybenchSelection(root,Map.of("benchmarks",Map.of("hybench",org.sibench.config.BenchmarkFixtures.entry(java.nio.file.Path.of("hybench.yaml"),"postgres",root.resolve("trace"),"xp"))));
+        var entry=org.sibench.config.BenchmarkFixtures.entry(Path.of("hybench.yaml"),"postgres",root.resolve("trace"),"xp");
+        var selected=Generation.preparationSelection(root,Map.of("benchmarks",Map.of("hybench",entry)),"hybench");
         assertEquals("hybench",selected.benchmark());
         assertEquals(org.sibench.config.Engine.POSTGRES,selected.engine());
+        var other=org.sibench.config.BenchmarkFixtures.entry(Path.of("hybench.yaml"),"postgres",root.resolve("other-trace"),"tp");
+        var ambiguous=Map.<String,Object>of("benchmarks",Map.of("first",entry,"second",other));
+        assertThrows(IllegalArgumentException.class,()->Generation.preparationSelection(root,ambiguous,"hybench"));
+        assertThrows(IllegalArgumentException.class,()->Generation.preparationSelection(root,ambiguous,"hybench","sysbench"));
+        Files.writeString(root.resolve("sysbench.yaml"),"benchmark: sysbench\nnative:\n  workloads:\n    writes: {}\n");
+        var sysbench=org.sibench.config.BenchmarkFixtures.entry(Path.of("sysbench.yaml"),"postgres",root.resolve("sysbench-trace"),"writes");
+        var runtime=Map.<String,Object>of("benchmarks",Map.of("sysbench",sysbench));
+        assertEquals("sysbench",Generation.preparationSelection(root,runtime,"hybench","sysbench").benchmark());
+        assertThrows(IllegalArgumentException.class,()->Generation.preparationSelection(root,runtime,"hybench"));
     }
 
     @Test public void ycsbRunsEveryConfiguredWorkloadWithOrWithoutARequestTarget() throws Exception {

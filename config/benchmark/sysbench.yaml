@@ -25,6 +25,9 @@ native:
       script: oltp_read_write
       events: 10000000
       rand-zipfian-exp: 0.99
+      # Disable business SELECTs for the PG-to-Pixels CDC workload; index lookups remain captured.
+      point-selects: 0
+      range-selects: false
 trace:
   secondary_indexes: false
   workload_requests: 10000000

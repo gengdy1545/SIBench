@@ -37,24 +37,6 @@ public class PixelsExperimentTest {
         }
     }
 
-    @Test public void traceExportRejectsASecondaryIndexProfileBeforeReadingInputs() throws Exception {
-        Path root = Path.of("").toRealPath(), config = temporary.newFile().toPath(), profile = temporary.newFile().toPath();
-        Files.writeString(profile, "benchmark: hybench\ntrace:\n  secondary_indexes: true\n");
-        var experiment = org.sibench.config.ConfigValues.object(org.sibench.config.SibenchConfig.read(root.resolve("config/sibench.yaml")), "pixels_experiment");
-        experiment.put("updates", false);
-        for (boolean trace : new boolean[] {true, false}) {
-            experiment.put("trace", trace);
-            Files.writeString(config, new org.yaml.snakeyaml.Yaml().dump(Map.of("schema_version", 1, "purpose", "sibench",
-                    "benchmarks", Map.of("hybench", org.sibench.config.BenchmarkFixtures.entry(profile, "postgres", temporary.getRoot().toPath().resolve("trace"), "xp")),
-                    "engines", Map.of("pixels", "missing.yaml"), "pixels_experiment", experiment)));
-            var run = (org.junit.function.ThrowingRunnable) () -> PixelsExperiment.run(root, config, null,
-                    temporary.getRoot().toPath().resolve("missing-baseline"), temporary.getRoot().toPath().resolve("run"));
-            // Only a Trace export needs the profile's index scope; otherwise the run proceeds to bind its inputs.
-            if (trace) assertEquals("Pixels CDC supports primary indexes only", assertThrows(IllegalArgumentException.class, run).getMessage());
-            else assertThrows(NoSuchFileException.class, run);
-        }
-    }
-
     @Test public void plainSqlRunsWithoutReferenceAnswersAndStillConsumesAllResults() throws Exception {
         Path root = temporary.getRoot().toPath();
         Path sql = Files.writeString(root.resolve("query.sql"), "SELECT 1");
