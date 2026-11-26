@@ -26,7 +26,7 @@ def parse_arguments(description, *, analysis_paths=False):
     return parser.parse_args()
 
 
-def load_inputs(traces, arguments):
+def load_inputs(arguments):
     analysis_directory = getattr(arguments, "analysis_directory", None)
     plot_directory = getattr(arguments, "out", None)
     config = {
@@ -35,7 +35,7 @@ def load_inputs(traces, arguments):
         "runtime": arguments.runtime.resolve() if arguments.runtime else global_config.RUNTIME_CONFIG,
         "analysis_directory": analysis_directory.resolve() if analysis_directory else global_config.ANALYSIS_DIRECTORY,
         "plot_directory": plot_directory.resolve() if plot_directory else global_config.PLOT_DIRECTORY,
-        "traces": deepcopy(traces),
+        "traces": deepcopy(global_config.TRACES),
     }
     for key in ("jar", "analysis_directory", "plot_directory", "runtime"):
         config[key] = ROOT / config[key]

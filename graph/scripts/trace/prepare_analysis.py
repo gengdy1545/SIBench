@@ -7,14 +7,14 @@ from pathlib import Path
 import subprocess
 
 from _common import ROOT, load_inputs, parse_arguments
-from graph.config import access_locality_config, global_config
+from graph.config import global_config
 
 
 def main():
     arguments = parse_arguments(__doc__)
     config_bytes = {Path(module.__file__): Path(module.__file__).read_bytes()
-                    for module in (global_config, access_locality_config)}
-    config = load_inputs(access_locality_config.TRACES, arguments)
+                    for module in (global_config,)}
+    config = load_inputs(arguments)
     runtime_bytes = config["runtime"].read_bytes()
     jar = config["jar"]
     if not jar.is_file():

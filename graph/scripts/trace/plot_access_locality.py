@@ -164,7 +164,7 @@ def plot_operation(output, title, integer_keys, summary, grid, totals, repeats, 
 
 def main():
     arguments = parse_arguments(__doc__, analysis_paths=True)
-    config = load_inputs(style.TRACES, arguments)
+    config = load_inputs(arguments)
     apply_style()
     groups = defaultdict(list)
     expected = {}

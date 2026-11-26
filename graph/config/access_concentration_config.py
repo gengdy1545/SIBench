@@ -1,6 +1,6 @@
-"""Selection and appearance for the cumulative share of hits by PK popularity."""
+"""Appearance for the cumulative share of hits by PK popularity."""
 
-from graph.config.access_coverage_config import COLOR_MAP, LINE_STYLES, TRACES
+from graph.config.access_coverage_config import COLOR_MAP, LINE_STYLES
 from graph.config.global_config import DOUBLE_COLUMN_WIDTH
 
 FIGURE_SIZE = (DOUBLE_COLUMN_WIDTH, 3.5)

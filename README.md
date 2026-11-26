@@ -56,7 +56,7 @@ RocksDB-Cloud loads `build/index/librocksdb_cloud_jni.so` by default. Select Sla
 
 ## Native generation
 
-Select benchmarks and engines in [config/sibench.yaml](config/sibench.yaml). Source scale, workloads and working outputs live in [config/benchmark/](config/benchmark/); engine paths and resources in [config/engine/](config/engine/).
+Select benchmarks and engines in [config/sibench.yaml](config/sibench.yaml). The runtime defaults to two retained Pixels Traces with generation disabled; native alternatives are commented out. For a native run, replace the selection and explicitly enable `trace.generate` with fresh output paths. Source scale, workloads and working outputs live in [config/benchmark/](config/benchmark/); engine paths and resources in [config/engine/](config/engine/).
 
 **Public profiles are substantial runs:** 87,060,000 baseline rows and at least 10,000,000 exported workload requests per Trace. Use separate configurations with smaller inputs and fresh output paths for short runs.
 
@@ -77,7 +77,7 @@ Configure the [object-storage connections](config/sibench.yaml) and the [backend
 
 ```bash
 java -jar build/sibench/sibench.jar index-server config/sibench.yaml config/index/rocksdb_cloud.yaml
-java -jar build/sibench/sibench.jar replay-service config/sibench.yaml ycsb-a results/service.json
+java -jar build/sibench/sibench.jar replay-service config/sibench.yaml hybench-pixels-sf10 results/service.json
 ```
 
 Run the two commands in separate terminals. Every backend receives the same requests at `target.service.endpoint`, so one immutable Trace replays against any of them; change only that endpoint. Client and service must agree on value mode and secondary-index selection.

@@ -77,18 +77,19 @@ public class SibenchConfigTest {
     }
 
     @Test
-    public void publicGenerationSelectsThreeNativeModesAndOwnsEngineBuildLocations() throws Exception {
+    public void publicRuntimeReusesPixelsTracesAndOwnsEngineBuildLocations() throws Exception {
         Path root = Path.of("").toAbsolutePath();
         var document = SibenchConfig.read(root.resolve("config/sibench.yaml"));
         var selected = BenchmarkSelection.read(root, document);
-        assertEquals(java.util.List.of("hybench-tp", "hybench-xp", "sysbench-zipf080", "sysbench-zipf099", "ycsb-a", "ycsb-b", "ycsb-c", "ycsb-d", "ycsb-e", "ycsb-f"),
+        assertEquals(java.util.List.of("hybench-pixels-sf10", "sysbench-pixels-zipf099"),
                 selected.stream().map(BenchmarkSelection::name).toList());
-        assertEquals(6, selected.stream().filter(s -> s.engine() == Engine.ROCKSDB).count());
-        assertEquals(4, selected.stream().filter(s -> s.engine() == Engine.POSTGRES).count());
-        // The two sysbench Traces replay one script with different zipfian exponents from one profile.
-        var sysbench = selected.stream().filter(s -> s.benchmark().equals("sysbench")).toList();
-        assertEquals(java.util.List.of("oltp_read_write_zipf080", "oltp_read_write_zipf099"), sysbench.stream().map(BenchmarkSelection::workload).toList());
-        assertEquals(sysbench.get(0).config(), sysbench.get(1).config());
+        assertTrue(selected.stream().noneMatch(BenchmarkSelection::generate));
+        assertTrue(selected.stream().allMatch(s -> s.upload() == null));
+        assertTrue(selected.stream().allMatch(s -> s.engine() == Engine.POSTGRES));
+        assertEquals(java.util.List.of("xp", "oltp_read_write_zipf099"),
+                selected.stream().map(BenchmarkSelection::workload).toList());
+        for (var selection : selected)
+            assertEquals(root.resolve("results/traces").resolve(selection.name()), selection.directory());
         var postgres = SibenchConfig.engine(root, document, Engine.POSTGRES);
         assertEquals("build/services/postgres", ConfigValues.string(postgres, "build_directory"));
         SibenchConfig.postgresSettings(ConfigValues.object(postgres, "settings"));

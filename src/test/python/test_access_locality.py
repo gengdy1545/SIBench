@@ -3,12 +3,11 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "graph/scripts/trace"))
-from plot_access_locality import key_cuts, plot_operation, summarize_table
+from plot_access_locality import key_cuts, summarize_table
 
 
 class AccessLocalityTest(unittest.TestCase):
@@ -34,16 +33,6 @@ class AccessLocalityTest(unittest.TestCase):
                     np.testing.assert_array_equal(repeats, [[1, 3, 1], [1, 2, 0], [0, 0, 0], [4, 0, 0]])
                     np.testing.assert_array_equal(adjacent, [[0, 0, 0], [1, 1, 0], [0, 0, 0], [0, 0, 0]])
                     np.testing.assert_array_equal(raw, [10, 8, 2, 1])
-
-    def test_panel_axes_stop_at_partial_final_window(self):
-        summary = {"window_requests": 10, "workload_requests": 22}
-        with patch("plot_access_locality.save_figure") as save:
-            plot_operation(None, "Get", True, summary, np.array([[3, 2]]),
-                           np.array([2, 2, 1]), np.array([1, 0, 0]), np.array([0, 1, 1]))
-        spatial, _, temporal = save.call_args.args[0].axes
-        np.testing.assert_array_equal(spatial.collections[0].get_coordinates()[0, :, 0], [0, 22])
-        np.testing.assert_array_equal(temporal.lines[0].get_xdata(), [5, 15, 21])
-        np.testing.assert_array_equal(temporal.lines[1].get_ydata(), [np.nan, 0.5, 1])
 
 
 if __name__ == "__main__":

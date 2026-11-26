@@ -93,8 +93,8 @@ def main():
     # Command-line paths are relative to the working directory; ROOT / absolute keeps them unchanged.
     results = ROOT / (arguments.results.resolve() if arguments.results else style.RESULTS_DIRECTORY)
     out = ROOT / (arguments.out.resolve() if arguments.out else global_config.REPLAY_PLOT_DIRECTORY) / style.OUTPUT_NAME
-    table = load_results(results, style.TRACES, style.BACKENDS, style.METRICS)
-    fig = plot(table, style.TRACES, style.BACKENDS, style.METRICS)
+    table = load_results(results, global_config.TRACES, style.BACKENDS, style.METRICS)
+    fig = plot(table, global_config.TRACES, style.BACKENDS, style.METRICS)
     save_figure(fig, out)
     plt.close(fig)
     with out.with_suffix(".csv").open("w", newline="") as stream:

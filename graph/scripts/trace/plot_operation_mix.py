@@ -23,7 +23,7 @@ from graph.config.global_config import COLOR_PALETTE, apply_style
 
 def main():
     arguments = parse_arguments(__doc__)
-    config = load_inputs(style.TRACES, arguments)
+    config = load_inputs(arguments)
     manifests = [str(t["directory"] / "manifest.json") for t in config["traces"]]
     with tempfile.TemporaryDirectory(prefix="sibench-operation-mix-") as temporary:
         report = Path(temporary) / "counts.json"

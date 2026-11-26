@@ -6,6 +6,24 @@ ANALYSIS_DIRECTORY = "results/analysis/trace"
 PLOT_DIRECTORY = "results/plots/trace"
 REPLAY_PLOT_DIRECTORY = "results/plots/replay"
 
+# Shared selection and display order for analysis preparation and comparison plots.
+# Names resolve through RUNTIME_CONFIG; replay reports use the same names.
+TRACES = [
+    {"name": "hybench-pixels-sf10", "label": "HyBench / Pixels"},
+    {"name": "sysbench-pixels-zipf099", "label": "Sysbench 0.99 / Pixels"},
+    # Retained native Traces: enable the desired entries and select their runtime paths.
+    # {"name": "hybench-tp", "label": "HyBench-TP"},
+    # {"name": "hybench-xp", "label": "HyBench-XP"},
+    # {"name": "sysbench-zipf080", "label": "sysbench-0.8"},
+    # {"name": "sysbench-zipf099", "label": "sysbench-0.99"},
+    # {"name": "ycsb-a", "label": "YCSB-A"},
+    # {"name": "ycsb-b", "label": "YCSB-B"},
+    # {"name": "ycsb-c", "label": "YCSB-C"},
+    # {"name": "ycsb-d", "label": "YCSB-D"},
+    # {"name": "ycsb-e", "label": "YCSB-E"},
+    # {"name": "ycsb-f", "label": "YCSB-F"},
+]
+
 # Figure widths in inches, following retina-graph's layout constants.
 SINGLE_COLUMN_WIDTH = 3.3374
 DOUBLE_COLUMN_WIDTH = 2 * SINGLE_COLUMN_WIDTH

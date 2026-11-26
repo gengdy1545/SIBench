@@ -1,17 +1,6 @@
-"""Benchmark selection and appearance for the workload operation-mix figure."""
+"""Appearance for the workload operation-mix figure."""
 
 from graph.config.global_config import BACKGROUND_COLOR, SINGLE_COLUMN_WIDTH
-
-TRACES = [{'name': 'hybench-tp', 'label': 'HyBench-TP'},
- {'name': 'hybench-xp', 'label': 'HyBench-XP'},
- {'name': 'sysbench-zipf080', 'label': 'sysbench-0.8'},
- {'name': 'sysbench-zipf099', 'label': 'sysbench-0.99'},
- {'name': 'ycsb-a', 'label': 'YCSB-A'},
- {'name': 'ycsb-b', 'label': 'YCSB-B'},
- {'name': 'ycsb-c', 'label': 'YCSB-C'},
- {'name': 'ycsb-d', 'label': 'YCSB-D'},
- {'name': 'ycsb-e', 'label': 'YCSB-E'},
- {'name': 'ycsb-f', 'label': 'YCSB-F'}]
 
 FIGURE_SIZE = (SINGLE_COLUMN_WIDTH, 2.6)
 OPERATION_ORDER = ("get", "scan", "update", "insert")

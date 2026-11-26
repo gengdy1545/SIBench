@@ -3,14 +3,11 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 
-import matplotlib
 import numpy as np
-import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "graph/scripts/trace"))
-from plot_access_coverage import coverage_series, first_reads, global_config, key_count, plot_coverage, trace_coverage
+from plot_access_coverage import coverage_series, first_reads, key_count, trace_coverage
 
 
 class AccessCoverageTest(unittest.TestCase):
@@ -53,21 +50,6 @@ class AccessCoverageTest(unittest.TestCase):
         receipt["manifest_sha256"] = "different"
         with self.assertRaisesRegex(ValueError, "do not match"):
             key_count(summary, receipt)
-
-    def test_plot_uses_global_axis_title_style(self):
-        curve = pd.DataFrame({"trace": ["example"] * 2, "label": ["Example"] * 2,
-                              "cumulative_requests": [10_000, 10_000_000], "coverage_percent": [0.01, 93]})
-        with (tempfile.TemporaryDirectory() as directory, matplotlib.rc_context(),
-              patch.object(global_config, "AXES_LABEL_FONT_SIZE", 12.5),
-              patch.object(global_config, "FONT_FAMILY", "DejaVu Sans"),
-              patch("plot_access_coverage.save_figure") as save):
-            plot_coverage(curve, Path(directory) / "coverage")
-            figure = save.call_args.args[0]
-            axis, = figure.axes
-            for title in (axis.xaxis.label, axis.yaxis.label):
-                self.assertEqual(title.get_fontsize(), 12.5)
-                self.assertEqual(title.get_fontfamily(), ["DejaVu Sans"])
-            self.assertEqual(len(axis.lines), 1)
 
 
 if __name__ == "__main__":

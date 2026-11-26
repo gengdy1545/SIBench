@@ -24,8 +24,8 @@ need only the plotting dependencies.
 | --- | --- |
 | `scripts/trace/` | Operation mix, access locality, access coverage, access concentration and update locality. |
 | `scripts/replay/` | Index Service replay performance. |
-| `config/global_config.py` | Paths, widths, typography, colors, export. |
-| `config/*_config.py` | One file per figure: `TRACES` selection, size, labels and local overrides. |
+| `config/global_config.py` | Shared Trace selection, paths, widths, typography, colors, export. |
+| `config/*_config.py` | One file per figure: size, axis labels, metrics and local style overrides. |
 
 Run scripts from any directory; configured paths resolve from the repository root
 and command-line paths from the working directory. Outputs use fixed names under
@@ -36,11 +36,25 @@ rerun overwrites them.
 
 `RUNTIME_CONFIG` (default `config/sibench.yaml`) names the runtime YAML whose
 benchmark entries locate the local Traces. Select entries and display labels with
-`TRACES` in each figure's configuration; list order is the vertical order. To use
-another runtime or JAR for one run, pass `--runtime PATH` and `--jar PATH`.
+`TRACES` in `config/global_config.py`; list order determines the display order.
+Analysis preparation, operation mix, access locality, coverage, concentration and
+replay performance all use this list. The defaults select the retained HyBench
+SF10 and Sysbench Zipfian 0.99 Pixels index Traces. The ten native entries remain
+commented out beside them for switching or selecting a subset.
+
+Each selected name must have a matching runtime benchmark entry. The public
+runtime defaults to the two Pixels inputs with generation disabled and keeps the
+native alternatives commented out. When switching to native inputs, select the
+matching runtime entries too, or pass `--runtime PATH` with an existing native
+consumer runtime. Use `--jar PATH` to override the analyzer JAR. Missing selected
+inputs fail explicitly; unselected inputs are not analyzed or plotted.
 
 Plotting never generates or downloads a Trace. Fetch one with the
 [transfer workflow](../docs/trace.md#selection-and-storage).
+
+Validate rendering by running the relevant plotting script with selected inputs
+and inspecting its PNG or PDF output. The numerical analysis checks below cover
+counts, deduplication and ratios; rendering has no separate unit-test suite.
 
 ## Operation mix
 
@@ -80,7 +94,7 @@ its private writes. It rejects result-count mismatches.
 
 ```bash
 java -jar build/sibench/sibench.jar analyze-accesses \
-  config/sibench.yaml ycsb-a results/analysis/trace/ycsb-a/accesses
+  config/sibench.yaml hybench-pixels-sf10 results/analysis/trace/hybench-pixels-sf10/accesses
 ```
 
 The runtime configuration's `analysis.accesses` sets requests per window
@@ -206,7 +220,8 @@ throughput, workload read P50/P99 and write P50/P99. Each Trace has one bar per
 backend. `replay_performance_config.py` selects the sweep directory
 (`RESULTS_DIRECTORY`, default `results/replay/`, holding
 `<trace>/<backend>/report.json` from `replay-service`),
-`TRACES`, `BACKENDS` and the report field of each panel (`METRICS`). Latency panels use a
+`BACKENDS` and the report field of each panel (`METRICS`). Trace selection comes
+from `global_config.TRACES`, using the same names in report directory paths. Latency panels use a
 logarithmic axis. A missing report or a status other than `passed` stops plotting; a
 latency without samples (no workload writes in YCSB-C) is shown as n/a. Invalid
 numeric measurements, including nonpositive sampled latency on a log axis, are
@@ -218,17 +233,13 @@ value in source units (operations/s or ms) with its report SHA-256; unsampled
 latencies have an empty value. The plots summarize the selected reports and do not
 establish equivalent experiment settings or independent value correctness.
 
-```bash
-python3 -m unittest discover -s src/test/python -p test_replay_performance.py
-```
-
 ## Update locality
 
 ```bash
 java -jar build/sibench/sibench.jar analyze-locality \
-  config/sibench.yaml ycsb-a results/analysis/trace/ycsb-a
+  config/sibench.yaml hybench-pixels-sf10 results/analysis/trace/hybench-pixels-sf10
 python3 graph/scripts/trace/plot_update_locality.py \
-  results/analysis/trace/ycsb-a --out results/plots/trace/ycsb-a
+  results/analysis/trace/hybench-pixels-sf10 --out results/plots/trace/hybench-pixels-sf10
 ```
 
 The input directory needs `summary.json`, `windows.csv` and `heatmap.csv.gz`; with

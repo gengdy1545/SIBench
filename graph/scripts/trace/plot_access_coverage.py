@@ -120,7 +120,7 @@ def plot_coverage(series, output):
 
 
 def main():
-    config = load_inputs(style.TRACES, parse_arguments(__doc__, analysis_paths=True))
+    config = load_inputs(parse_arguments(__doc__, analysis_paths=True))
     counts_path = config["analysis_directory"] / "access_key_counts.json"
     if not counts_path.is_file():
         raise FileNotFoundError(f"Missing {counts_path}; run count-access-keys first")

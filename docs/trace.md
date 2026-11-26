@@ -26,7 +26,7 @@ benchmarks:
 
 An enabled upload needs `path`. After local generation the shared transfer implementation uploads the Trace, verifies full payload and inventory readbacks, and records the inventory identity in `trace-publication.json` beside the run's effective configuration. A failed upload leaves the local Trace usable, records the failure and fails the command. Content objects are `PREFIX/objects/<sha256>`; the immutable selection inventory is written last at `PREFIX/manifests/<sha256>.json`. Uploads never overwrite a current pointer or delete older data; retire superseded inventories and payloads explicitly after checking their consumers.
 
-The same commands publish a completed Trace or restore it on another host:
+The same commands publish a completed Trace or restore it on another host. For this example, select the `ycsb-a` entry above in the runtime:
 
 ```bash
 java -jar build/sibench/sibench.jar publish-input config/sibench.yaml \

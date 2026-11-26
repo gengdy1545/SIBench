@@ -33,106 +33,127 @@ object_storage:
     secret_key_env: COS_SECRET_KEY
     session_token_env: COS_SESSION_TOKEN
 benchmarks:
-  hybench-tp:
-    config: config/benchmark/hybench.yaml
-    engine: postgres
-    workload: tp
-    trace:
-      generate: true
-      directory: results/traces/hybench-tp
-      upload:
-        enabled: false
-        # path: cos://YOUR-BUCKET/sibench/traces/hybench-tp/
-  hybench-xp:
+  # Reuse retained Pixels index Traces. Fetch them into these paths before replay/analysis.
+  hybench-pixels-sf10:
     config: config/benchmark/hybench.yaml
     engine: postgres
     workload: xp
     trace:
-      generate: true
-      directory: results/traces/hybench-xp
+      generate: false
+      directory: results/traces/hybench-pixels-sf10
       upload:
         enabled: false
-        # path: cos://YOUR-BUCKET/sibench/traces/hybench-xp/
-  sysbench-zipf080:
-    config: config/benchmark/sysbench.yaml
-    engine: postgres
-    workload: oltp_read_write_zipf080
-    trace:
-      generate: true
-      directory: results/traces/sysbench-zipf080
-      upload:
-        enabled: false
-        # path: cos://YOUR-BUCKET/sibench/traces/sysbench-zipf080/
-  sysbench-zipf099:
+  sysbench-pixels-zipf099:
     config: config/benchmark/sysbench.yaml
     engine: postgres
     workload: oltp_read_write_zipf099
     trace:
-      generate: true
-      directory: results/traces/sysbench-zipf099
+      generate: false
+      directory: results/traces/sysbench-pixels-zipf099
       upload:
         enabled: false
-        # path: cos://YOUR-BUCKET/sibench/traces/sysbench-zipf099/
-  ycsb-a:
-    config: config/benchmark/ycsb.yaml
-    engine: rocksdb
-    workload: workloada
-    trace:
-      generate: true
-      directory: results/traces/ycsb-a
-      upload:
-        enabled: false
-        # path: cos://YOUR-BUCKET/sibench/traces/ycsb-a/
-  ycsb-b:
-    config: config/benchmark/ycsb.yaml
-    engine: rocksdb
-    workload: workloadb
-    trace:
-      generate: true
-      directory: results/traces/ycsb-b
-      upload:
-        enabled: false
-        # path: cos://YOUR-BUCKET/sibench/traces/ycsb-b/
-  ycsb-c:
-    config: config/benchmark/ycsb.yaml
-    engine: rocksdb
-    workload: workloadc
-    trace:
-      generate: true
-      directory: results/traces/ycsb-c
-      upload:
-        enabled: false
-        # path: cos://YOUR-BUCKET/sibench/traces/ycsb-c/
-  ycsb-d:
-    config: config/benchmark/ycsb.yaml
-    engine: rocksdb
-    workload: workloadd
-    trace:
-      generate: true
-      directory: results/traces/ycsb-d
-      upload:
-        enabled: false
-        # path: cos://YOUR-BUCKET/sibench/traces/ycsb-d/
-  ycsb-e:
-    config: config/benchmark/ycsb.yaml
-    engine: rocksdb
-    workload: workloade
-    trace:
-      generate: true
-      directory: results/traces/ycsb-e
-      upload:
-        enabled: false
-        # path: cos://YOUR-BUCKET/sibench/traces/ycsb-e/
-  ycsb-f:
-    config: config/benchmark/ycsb.yaml
-    engine: rocksdb
-    workload: workloadf
-    trace:
-      generate: true
-      directory: results/traces/ycsb-f
-      upload:
-        enabled: false
-        # path: cos://YOUR-BUCKET/sibench/traces/ycsb-f/
+  # Native alternatives: replace the active selection with the required entries.
+  # Each benchmark/workload has one selection; generation remains opt-in.
+  # hybench-tp:
+  #   config: config/benchmark/hybench.yaml
+  #   engine: postgres
+  #   workload: tp
+  #   trace:
+  #     generate: false
+  #     directory: results/traces/hybench-tp
+  #     upload:
+  #       enabled: false
+  #       # path: cos://YOUR-BUCKET/sibench/traces/hybench-tp/
+  # hybench-xp:
+  #   config: config/benchmark/hybench.yaml
+  #   engine: postgres
+  #   workload: xp
+  #   trace:
+  #     generate: false
+  #     directory: results/traces/hybench-xp
+  #     upload:
+  #       enabled: false
+  #       # path: cos://YOUR-BUCKET/sibench/traces/hybench-xp/
+  # sysbench-zipf080:
+  #   config: config/benchmark/sysbench.yaml
+  #   engine: postgres
+  #   workload: oltp_read_write_zipf080
+  #   trace:
+  #     generate: false
+  #     directory: results/traces/sysbench-zipf080
+  #     upload:
+  #       enabled: false
+  #       # path: cos://YOUR-BUCKET/sibench/traces/sysbench-zipf080/
+  # sysbench-zipf099:
+  #   config: config/benchmark/sysbench.yaml
+  #   engine: postgres
+  #   workload: oltp_read_write_zipf099
+  #   trace:
+  #     generate: false
+  #     directory: results/traces/sysbench-zipf099
+  #     upload:
+  #       enabled: false
+  #       # path: cos://YOUR-BUCKET/sibench/traces/sysbench-zipf099/
+  # ycsb-a:
+  #   config: config/benchmark/ycsb.yaml
+  #   engine: rocksdb
+  #   workload: workloada
+  #   trace:
+  #     generate: false
+  #     directory: results/traces/ycsb-a
+  #     upload:
+  #       enabled: false
+  #       # path: cos://YOUR-BUCKET/sibench/traces/ycsb-a/
+  # ycsb-b:
+  #   config: config/benchmark/ycsb.yaml
+  #   engine: rocksdb
+  #   workload: workloadb
+  #   trace:
+  #     generate: false
+  #     directory: results/traces/ycsb-b
+  #     upload:
+  #       enabled: false
+  #       # path: cos://YOUR-BUCKET/sibench/traces/ycsb-b/
+  # ycsb-c:
+  #   config: config/benchmark/ycsb.yaml
+  #   engine: rocksdb
+  #   workload: workloadc
+  #   trace:
+  #     generate: false
+  #     directory: results/traces/ycsb-c
+  #     upload:
+  #       enabled: false
+  #       # path: cos://YOUR-BUCKET/sibench/traces/ycsb-c/
+  # ycsb-d:
+  #   config: config/benchmark/ycsb.yaml
+  #   engine: rocksdb
+  #   workload: workloadd
+  #   trace:
+  #     generate: false
+  #     directory: results/traces/ycsb-d
+  #     upload:
+  #       enabled: false
+  #       # path: cos://YOUR-BUCKET/sibench/traces/ycsb-d/
+  # ycsb-e:
+  #   config: config/benchmark/ycsb.yaml
+  #   engine: rocksdb
+  #   workload: workloade
+  #   trace:
+  #     generate: false
+  #     directory: results/traces/ycsb-e
+  #     upload:
+  #       enabled: false
+  #       # path: cos://YOUR-BUCKET/sibench/traces/ycsb-e/
+  # ycsb-f:
+  #   config: config/benchmark/ycsb.yaml
+  #   engine: rocksdb
+  #   workload: workloadf
+  #   trace:
+  #     generate: false
+  #     directory: results/traces/ycsb-f
+  #     upload:
+  #       enabled: false
+  #       # path: cos://YOUR-BUCKET/sibench/traces/ycsb-f/
 engines:
   duckdb: config/engine/duckdb.yaml
   postgres: config/engine/postgres.yaml

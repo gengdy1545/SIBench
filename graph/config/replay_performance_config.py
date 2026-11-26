@@ -1,22 +1,9 @@
-"""Replay results, Trace and backend selection and appearance for the replay performance figure."""
+"""Replay results, backend selection and appearance for the replay performance figure."""
 
 from graph.config.global_config import DOUBLE_COLUMN_WIDTH, MUTED_TEXT_COLOR
 
 # One sweep directory holding <trace>/<backend>/report.json for every selected pair.
 RESULTS_DIRECTORY = "results/replay"
-
-TRACES = [
-    {'name': 'hybench-xp', 'label': 'HyBench-XP'},
-    {'name': 'hybench-tp', 'label': 'HyBench-TP'},
-    {'name': 'sysbench-zipf080', 'label': 'sysbench-0.8'},
-    {'name': 'sysbench-zipf099', 'label': 'sysbench-0.99'},
-    {'name': 'ycsb-a', 'label': 'YCSB-A'},
-    {'name': 'ycsb-b', 'label': 'YCSB-B'},
-    {'name': 'ycsb-c', 'label': 'YCSB-C'},
-    {'name': 'ycsb-d', 'label': 'YCSB-D'},
-    {'name': 'ycsb-e', 'label': 'YCSB-E'},
-    {'name': 'ycsb-f', 'label': 'YCSB-F'},
-]
 
 # Colors follow list order through COLOR_PALETTE; the hatch is the non-color identity cue.
 BACKENDS = [
